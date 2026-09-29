@@ -83,6 +83,13 @@ fn catch_up_policy_to_str(policy: CatchUpPolicy) -> &'static str {
     }
 }
 
+/// Parse a `modified_at` token (as read into `ScheduledTask::modified_at`)
+/// for a conditional write.
+fn parse_modified_at(raw: &str) -> Result<DateTime<Utc>, String> {
+    raw.parse()
+        .map_err(|e| format!("expected modified_at '{raw}': {e}"))
+}
+
 /// Serialize a task's conditions for the `conditions` JSONB column.
 fn conditions_to_json(
     conditions: Option<&ScheduleConditions>,
@@ -102,7 +109,7 @@ fn conditions_from_json(
 ) -> Result<Option<ScheduleConditions>, String> {
     raw.map(|value| {
         serde_json::from_value(value).map_err(|e| {
-            format!("task {task_id}: stored conditions are unreadable ({e}); refusing to load it")
+            format!("task {task_id}: stored conditions are unreadable ({e}); refusing to run it")
         })
     })
     .transpose()
@@ -116,18 +123,44 @@ fn condition_status_from_text(task_id: &str, raw: Option<String>) -> Option<Cond
     match serde_json::from_str(&raw) {
         Ok(status) => Some(status),
         Err(e) => {
-            warn!("task {task_id}: stored condition_status is unreadable ({e}); restarting the wait");
+            warn!(
+                "task {task_id}: stored condition_status is unreadable ({e}); restarting the wait"
+            );
             None
         }
     }
 }
 
-/// Map rows to tasks, dropping (with an ERROR log) any whose conditions are
-/// unreadable — such a task must not run, and running it ungated is the only
-/// alternative a loader has.
+/// A scheduled-task row as stored, for the task-management API: the task,
+/// plus why its stored `conditions` could not be read, if they could not.
+/// When `conditions_error` is `Some`, `task.conditions` is `None` — which is
+/// NOT "no conditions", so only the API sees this shape (to show the row and
+/// let a PUT replace the conditions); everything that RUNS tasks goes through
+/// [`PgDb::get_all_scheduled_tasks`] / [`PgDb::get_scheduled_task`], which
+/// refuse such a row (fail closed).
+#[derive(Debug, Clone)]
+pub struct StoredScheduledTask {
+    pub task: ScheduledTask,
+    pub conditions_error: Option<String>,
+}
+
+impl StoredScheduledTask {
+    /// The task for something that will RUN it: `Err` when its conditions are
+    /// unreadable.
+    fn runnable(self) -> Result<ScheduledTask, String> {
+        match self.conditions_error {
+            None => Ok(self.task),
+            Some(e) => Err(e),
+        }
+    }
+}
+
+/// Map rows to runnable tasks, dropping (with an ERROR log) any whose
+/// conditions are unreadable — such a task must not run, and running it
+/// ungated is the only alternative a loader has.
 fn rows_to_scheduled_tasks(rows: &[tokio_postgres::Row]) -> Vec<ScheduledTask> {
     rows.iter()
-        .filter_map(|row| match row_to_scheduled_task(row) {
+        .filter_map(|row| match row_to_scheduled_task(row).runnable() {
             Ok(task) => Some(task),
             Err(e) => {
                 tracing::error!("scheduler: {e}");
@@ -137,13 +170,13 @@ fn rows_to_scheduled_tasks(rows: &[tokio_postgres::Row]) -> Vec<ScheduledTask> {
         .collect()
 }
 
-/// Map a tokio_postgres Row to a ScheduledTask. `Err` when the row's
-/// `conditions` cannot be parsed (see [`conditions_from_json`]).
+/// Map a tokio_postgres Row to a [`StoredScheduledTask`]. Unreadable
+/// `conditions` (see [`conditions_from_json`]) land in `conditions_error`.
 #[expect(
     clippy::disallowed_methods,
     reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
 )]
-fn row_to_scheduled_task(row: &tokio_postgres::Row) -> Result<ScheduledTask, String> {
+fn row_to_scheduled_task(row: &tokio_postgres::Row) -> StoredScheduledTask {
     let schedule_type: String = row.get(4);
     let schedule_value: String = row.get(5);
     let task_config_json: String = row.get(6);
@@ -194,10 +227,13 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> Result<ScheduledTask, Str
     let consecutive_launch_failures: i32 = row.get(16);
     let launch_failure_backoff_seconds: i32 = row.get(17);
     let id: String = row.get(0);
-    let conditions = conditions_from_json(&id, row.get(18))?;
+    let (conditions, conditions_error) = match conditions_from_json(&id, row.get(18)) {
+        Ok(conditions) => (conditions, None),
+        Err(e) => (None, Some(e)),
+    };
     let condition_status = condition_status_from_text(&id, row.get(19));
 
-    Ok(ScheduledTask {
+    let task = ScheduledTask {
         id,
         name: row.get(1),
         description: row.get(2),
@@ -220,7 +256,11 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> Result<ScheduledTask, Str
         catch_up_grace_seconds: catch_up_grace_seconds.max(0) as u32,
         consecutive_launch_failures: consecutive_launch_failures.max(0) as u32,
         launch_failure_backoff_seconds: launch_failure_backoff_seconds.max(0) as u32,
-    })
+    };
+    StoredScheduledTask {
+        task,
+        conditions_error,
+    }
 }
 
 /// Convert a ScheduleExpression to (type, value) strings for storage.
@@ -353,7 +393,57 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_scheduled_task {}: {}", id, e))?;
 
-        row.as_ref().map(row_to_scheduled_task).transpose()
+        row.as_ref()
+            .map(|row| row_to_scheduled_task(row).runnable())
+            .transpose()
+    }
+
+    /// Every scheduled-task row as stored, INCLUDING rows whose conditions
+    /// are unreadable (flagged, not dropped). For the task-management API
+    /// only — never for anything that runs a task.
+    pub async fn get_all_stored_scheduled_tasks(
+        &self,
+    ) -> Result<Vec<StoredScheduledTask>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT {} FROM scheduled_tasks ORDER BY created_at",
+                    SELECT_TASK_COLS
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_stored_scheduled_tasks", &e))?;
+        Ok(rows.iter().map(row_to_scheduled_task).collect())
+    }
+
+    /// One scheduled-task row as stored, flagged rather than refused when
+    /// its conditions are unreadable. For the task-management API only.
+    pub async fn get_stored_scheduled_task(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredScheduledTask>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM scheduled_tasks WHERE id = $1",
+                    SELECT_TASK_COLS
+                ),
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_stored_scheduled_task {}: {}", id, e))?;
+        Ok(row.as_ref().map(row_to_scheduled_task))
     }
 
     /// Insert a new scheduled task.
@@ -436,21 +526,27 @@ impl PgDb {
         Ok(())
     }
 
-    /// Update an existing scheduled task (full replacement of mutable fields)
-    /// as a CONDITIONAL write: it lands only if the row's `modified_at` still
+    /// Update an existing scheduled task's USER-editable fields as a
+    /// CONDITIONAL write: it lands only if the row's `modified_at` still
     /// equals `expected_modified_at`, the value the caller read before
-    /// building `task`. Returns `Ok(false)` when it did not (another writer —
-    /// an operator edit, or the scheduler's own status/next-run writes — moved
-    /// the row since), so a caller holding a stale snapshot cannot overwrite a
-    /// newer change; the HTTP handler answers that with 409.
+    /// building `task`. Returns `Ok(false)` when it did not (another user edit
+    /// moved the row since), so a caller holding a stale snapshot cannot
+    /// overwrite a newer change; the HTTP handler answers that with 409.
+    ///
+    /// Executor-owned columns (`last_run_id`, `consecutive_launch_failures`)
+    /// are NOT written — a user edit must not reset a run the executor
+    /// recorded after the edit's read. `conditions` / `condition_status` are
+    /// written only when `write_conditions` is set (the request carried
+    /// `conditions`): otherwise the stored values are left exactly as they are,
+    /// which is also what lets a PUT repair other fields of a row whose stored
+    /// conditions are unreadable without the loader ever parsing them.
     pub async fn update_scheduled_task(
         &self,
         task: &ScheduledTask,
         expected_modified_at: &str,
+        write_conditions: bool,
     ) -> Result<bool, String> {
-        let expected: DateTime<Utc> = expected_modified_at
-            .parse()
-            .map_err(|e| format!("expected modified_at '{expected_modified_at}': {e}"))?;
+        let expected = parse_modified_at(expected_modified_at)?;
         let conn = self
             .pool
             .get()
@@ -459,12 +555,9 @@ impl PgDb {
         let (stype, svalue) = schedule_to_parts(&task.schedule);
         let task_config = serde_json::to_string(&task.task)
             .map_err(|e| format!("Serialize task_config: {}", e))?;
-        let last_run_id = task.last_run.as_ref().map(|r| r.execution_id.clone());
         let catch_up_policy_str = catch_up_policy_to_str(task.catch_up_policy).to_string();
         let catch_up_grace_seconds_i32: i32 =
             task.catch_up_grace_seconds.min(i32::MAX as u32) as i32;
-        let consecutive_launch_failures_i32: i32 =
-            task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
         let conditions_json = conditions_to_json(task.conditions.as_ref())?;
@@ -490,14 +583,12 @@ impl PgDb {
                 success_criteria = $9,
                 modified_at = $10,
                 next_run = $11,
-                last_run_id = $12,
-                catch_up_policy = $13,
-                catch_up_grace_seconds = $14,
-                consecutive_launch_failures = $15,
-                launch_failure_backoff_seconds = $16,
-                conditions = $19,
-                condition_status = $20
-            WHERE id = $17 AND modified_at = $18
+                catch_up_policy = $12,
+                catch_up_grace_seconds = $13,
+                launch_failure_backoff_seconds = $14,
+                conditions = CASE WHEN $17 THEN $18 ELSE conditions END,
+                condition_status = CASE WHEN $17 THEN $19 ELSE condition_status END
+            WHERE id = $15 AND modified_at = $16
             "#,
                 &[
                     &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -517,13 +608,12 @@ impl PgDb {
                         .next_run
                         .as_deref()
                         .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
-                    &last_run_id,
                     &catch_up_policy_str,
                     &catch_up_grace_seconds_i32,
-                    &consecutive_launch_failures_i32,
                     &launch_failure_backoff_seconds_i32,
                     &task.id,
                     &expected,
+                    &write_conditions,
                     &conditions_json,
                     &condition_status_text,
                 ],
@@ -551,7 +641,17 @@ impl PgDb {
     // Execution helpers (single-column updates)
     // ========================================================================
 
-    /// Set or clear the last_run_id on a task.
+    // Every write below is an EXECUTOR write, not a user edit, so none of them
+    // bumps `modified_at`: `modified_at` is the last USER modification, the
+    // token `update_scheduled_task`'s conditional write (and these) compare
+    // against. The two a tick derives from a task snapshot — `next_run` and
+    // `condition_status` — are CONDITIONAL on the snapshot's `modified_at`:
+    // if a user PUT landed since the snapshot was read they write nothing
+    // and return `Ok(false)`, and the caller re-reads on its next tick instead
+    // of overwriting the user's change with state derived from the old row.
+
+    /// Set or clear the last_run_id on a task (executor-owned; never written
+    /// by a user PUT).
     pub async fn update_task_last_run(
         &self,
         task_id: &str,
@@ -562,12 +662,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now();
         conn.execute(
-            "UPDATE scheduled_tasks SET last_run_id = $1, modified_at = $2 WHERE id = $3",
+            "UPDATE scheduled_tasks SET last_run_id = $1 WHERE id = $2",
             &[
                 &last_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &task_id,
             ],
         )
@@ -576,30 +674,35 @@ impl PgDb {
         Ok(())
     }
 
-    /// Set or clear the next_run timestamp on a task.
+    /// Set or clear the next_run timestamp on a task, only if the row's
+    /// `modified_at` still equals `expected_modified_at` (the snapshot the
+    /// value was computed from). `Ok(false)` = a user edit landed since; the
+    /// edit recomputed `next_run` itself, so nothing is lost.
     pub async fn update_task_next_run(
         &self,
         task_id: &str,
         next_run: Option<&str>,
-    ) -> Result<(), String> {
+        expected_modified_at: &str,
+    ) -> Result<bool, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now();
         let next: Option<DateTime<Utc>> = next_run.and_then(|s| s.parse().ok());
-        conn.execute(
-            "UPDATE scheduled_tasks SET next_run = $1, modified_at = $2 WHERE id = $3",
-            &[
-                &next as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
-                &task_id,
-            ],
-        )
-        .await
-        .map_err(|e| format!("PG update_task_next_run for {}: {}", task_id, e))?;
-        Ok(())
+        let expected = parse_modified_at(expected_modified_at)?;
+        let updated = conn
+            .execute(
+                "UPDATE scheduled_tasks SET next_run = $1 WHERE id = $2 AND modified_at = $3",
+                &[
+                    &next as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &task_id,
+                    &expected,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_task_next_run for {}: {}", task_id, e))?;
+        Ok(updated == 1)
     }
 
     /// Persist `consecutive_launch_failures` for a task without rewriting
@@ -608,7 +711,7 @@ impl PgDb {
     /// successful launch. Other columns (especially `next_run`) are
     /// updated separately so callers can sequence the writes
     /// independently and one transient PG error doesn't roll back the
-    /// reschedule.
+    /// reschedule. Executor-owned: a user PUT never writes this column.
     pub async fn update_task_launch_failure_counter(
         &self,
         task_id: &str,
@@ -619,13 +722,11 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now();
         let counter_i32: i32 = consecutive_launch_failures.min(i32::MAX as u32) as i32;
         conn.execute(
-            "UPDATE scheduled_tasks SET consecutive_launch_failures = $1, modified_at = $2 WHERE id = $3",
+            "UPDATE scheduled_tasks SET consecutive_launch_failures = $1 WHERE id = $2",
             &[
                 &counter_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &task_id,
             ],
         )
@@ -639,32 +740,34 @@ impl PgDb {
         Ok(())
     }
 
-    /// Set or clear the condition_status JSON on a task.
+    /// Set or clear the condition_status JSON on a task, only if the row's
+    /// `modified_at` still equals `expected_modified_at` (the snapshot the
+    /// status was evaluated against). `Ok(false)` = a user edit landed since;
+    /// the caller re-evaluates on its next tick.
     pub async fn update_task_condition_status(
         &self,
         task_id: &str,
         status: Option<&str>,
-    ) -> Result<(), String> {
+        expected_modified_at: &str,
+    ) -> Result<bool, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now();
-        let result = conn
+        let expected = parse_modified_at(expected_modified_at)?;
+        let updated = conn
             .execute(
-                "UPDATE scheduled_tasks SET condition_status = $1, modified_at = $2 WHERE id = $3",
+                "UPDATE scheduled_tasks SET condition_status = $1 WHERE id = $2 AND modified_at = $3",
                 &[
                     &status as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &now as &(dyn tokio_postgres::types::ToSql + Sync),
                     &task_id,
+                    &expected,
                 ],
             )
-            .await;
-        if let Err(e) = result {
-            tracing::debug!("PG condition_status update skipped: {}", e);
-        }
-        Ok(())
+            .await
+            .map_err(|e| format!("PG update_task_condition_status for {}: {}", task_id, e))?;
+        Ok(updated == 1)
     }
 
     // ========================================================================
@@ -1057,6 +1160,32 @@ mod tests {
         assert_eq!(back.waiting_since, status.waiting_since);
     }
 
+    /// The two executor writes a tick derives from a snapshot are conditional
+    /// on its `modified_at`, and no executor write bumps `modified_at`.
+    #[test]
+    fn executor_writes_are_conditional_and_do_not_bump_modified_at() {
+        let src = include_str!("scheduler.rs");
+        let (_, executor) = src
+            .split_once("// Every write below is an EXECUTOR write")
+            .expect("executor section");
+        let (executor, _) = executor.split_once("// History").expect("section end");
+        assert!(executor
+            .contains("UPDATE scheduled_tasks SET next_run = $1 WHERE id = $2 AND modified_at = $3"));
+        assert!(executor.contains(
+            "UPDATE scheduled_tasks SET condition_status = $1 WHERE id = $2 AND modified_at = $3"
+        ));
+        assert!(!executor.contains("modified_at = $2"), "no executor write bumps modified_at");
+        let heal = include_str!("mod.rs");
+        let (_, heal) = heal
+            .split_once("project.scheduled_tasks.conditions (JSONB)")
+            .expect("self-heal");
+        let (heal, _) = heal.split_once("END $$;").expect("self-heal block");
+        assert!(
+            heal.contains("information_schema.columns") && heal.contains("column_name = 'conditions'"),
+            "the ALTER must be guarded by a column-existence check"
+        );
+    }
+
     // PG-gated, per the `database/pg/*` convention (see event_log.rs):
     //   DATABASE_URL=... cargo test --bin qontinui-runner \
     //     database::pg::scheduler -- --ignored
@@ -1091,38 +1220,147 @@ mod tests {
             .iter()
             .any(|t| t.id == task.id && t.conditions.is_some()));
 
-        // condition_status written by the tick path reads back.
+        // condition_status written by the tick path reads back, and the
+        // executor write does not move modified_at.
         let mut status = crate::scheduler::condition_status_default();
         status.probe_met = Some(false);
         status.probe_detail = Some("exit 1".to_string());
-        db.update_task_condition_status(
-            &task.id,
-            Some(&serde_json::to_string(&status).unwrap()),
-        )
-        .await
-        .expect("status write");
-        let read = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert!(db
+            .update_task_condition_status(
+                &task.id,
+                Some(&serde_json::to_string(&status).unwrap()),
+                &read.modified_at,
+            )
+            .await
+            .expect("status write"));
+        let after_status = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
         assert_eq!(
-            read.condition_status.as_ref().and_then(|s| s.probe_detail.clone()),
+            after_status
+                .condition_status
+                .as_ref()
+                .and_then(|s| s.probe_detail.clone()),
             Some("exit 1".to_string())
         );
+        assert_eq!(after_status.modified_at, read.modified_at);
 
-        // An update clears the conditions, conditionally on modified_at.
-        let mut edited = read.clone();
-        edited.conditions = None;
-        edited.condition_status = None;
-        edited.touch();
+        // A user edit (conditional on what it read) lands; a PUT that does not
+        // carry conditions leaves them untouched.
+        let mut renamed = after_status.clone();
+        renamed.name = "renamed".to_string();
+        renamed.conditions = None;
+        renamed.touch();
         assert!(db
-            .update_scheduled_task(&edited, &read.modified_at)
+            .update_scheduled_task(&renamed, &after_status.modified_at, false)
             .await
-            .expect("update"));
-        // A second write against the now-stale snapshot is refused.
+            .expect("rename"));
+        let after_rename = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(after_rename.name, "renamed");
+        assert!(after_rename.conditions.is_some(), "a PUT without conditions keeps them");
+
+        // A tick holding the PRE-edit snapshot can no longer write.
         assert!(!db
-            .update_scheduled_task(&edited, &read.modified_at)
+            .update_task_condition_status(&task.id, None, &after_status.modified_at)
+            .await
+            .expect("stale status write"));
+        assert!(!db
+            .update_task_next_run(&task.id, None, &after_status.modified_at)
+            .await
+            .expect("stale next_run write"));
+        // A second user write against the stale snapshot is refused too.
+        assert!(!db
+            .update_scheduled_task(&renamed, &after_status.modified_at, false)
             .await
             .expect("stale update"));
+
+        // A PUT carrying conditions (here: none) replaces them.
+        let mut cleared = after_rename.clone();
+        cleared.conditions = None;
+        cleared.condition_status = None;
+        cleared.touch();
+        assert!(db
+            .update_scheduled_task(&cleared, &after_rename.modified_at, true)
+            .await
+            .expect("clear"));
         let read = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
         assert!(read.conditions.is_none() && read.condition_status.is_none());
+
+        db.delete_scheduled_task(&task.id).await.expect("cleanup");
+    }
+
+    /// A row whose stored conditions are unreadable: the scheduler refuses it
+    /// (fail closed), the API sees it flagged, and a PUT that carries
+    /// conditions repairs it without the stored value ever being parsed.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn an_unreadable_conditions_row_is_flagged_refused_and_repairable() {
+        let db = PgDb::new_for_test().await;
+        let task = ScheduledTask::new(
+            "phase-4c unreadable conditions".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        db.insert_scheduled_task(&task).await.expect("insert");
+        {
+            let conn = db.pool.get().await.expect("pool");
+            let bad = serde_json::json!({ "requireProbe": { "enabled": "yes" } });
+            conn.execute(
+                "UPDATE scheduled_tasks SET conditions = $1 WHERE id = $2",
+                &[&bad as &(dyn tokio_postgres::types::ToSql + Sync), &task.id],
+            )
+            .await
+            .expect("corrupt the conditions");
+        }
+
+        // Fail closed for everything that runs tasks.
+        assert!(db.get_scheduled_task(&task.id).await.is_err());
+        assert!(!db
+            .get_all_scheduled_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.id == task.id));
+
+        // Visible, flagged, to the API.
+        let stored = db
+            .get_stored_scheduled_task(&task.id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert!(stored.conditions_error.is_some());
+        assert!(stored.task.conditions.is_none());
+        assert!(db
+            .get_all_stored_scheduled_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.task.id == task.id && t.conditions_error.is_some()));
+
+        // A PUT without conditions does not erase the unreadable value (that
+        // would read as "ungated").
+        let mut renamed = stored.task.clone();
+        renamed.name = "still unreadable".to_string();
+        renamed.touch();
+        assert!(db
+            .update_scheduled_task(&renamed, &stored.task.modified_at, false)
+            .await
+            .unwrap());
+        assert!(db.get_scheduled_task(&task.id).await.is_err());
+
+        // A PUT carrying conditions repairs it.
+        let stored = db.get_stored_scheduled_task(&task.id).await.unwrap().unwrap();
+        let mut repaired = stored.task.clone();
+        repaired.conditions = Some(probe_conditions());
+        repaired.touch();
+        assert!(db
+            .update_scheduled_task(&repaired, &stored.task.modified_at, true)
+            .await
+            .unwrap());
+        let read = db.get_scheduled_task(&task.id).await.unwrap().expect("row");
+        assert_eq!(
+            read.conditions.and_then(|c| c.require_probe),
+            probe_conditions().require_probe
+        );
 
         db.delete_scheduled_task(&task.id).await.expect("cleanup");
     }

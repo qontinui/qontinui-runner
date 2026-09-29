@@ -149,16 +149,36 @@ pub(crate) fn refuse_untrusted_probe(
 // Handlers
 // ============================================================================
 
-/// List all scheduled tasks
+/// A stored task as the API serves it: the task, plus a `conditionsError`
+/// string when its stored conditions are unreadable (then `conditions` is
+/// null, and the scheduler refuses to run the task until a PUT that carries
+/// `conditions` replaces them).
+pub(crate) fn stored_task_json(
+    stored: crate::database::pg::scheduler::StoredScheduledTask,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(&stored.task).unwrap_or_else(|e| {
+        serde_json::json!({ "id": stored.task.id, "serializeError": e.to_string() })
+    });
+    if let (Some(error), Some(object)) = (stored.conditions_error, value.as_object_mut()) {
+        object.insert("conditionsError".to_string(), serde_json::Value::String(error));
+    }
+    value
+}
+
+/// List all scheduled tasks — every stored row, including one whose stored
+/// conditions are unreadable (flagged with `conditionsError`, so it can be
+/// seen and repaired; the scheduler does not run it).
 pub async fn list_scheduled_tasks(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<crate::scheduler::ScheduledTask>>>, ReadError> {
+) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, ReadError> {
     let pg = &state.app_state.pg_db;
     let tasks = pg
-        .get_all_scheduled_tasks()
+        .get_all_stored_scheduled_tasks()
         .await
         .map_err(|e| read_failed("scheduled tasks", e))?;
-    Ok(Json(ApiResponse::success(tasks)))
+    Ok(Json(ApiResponse::success(
+        tasks.into_iter().map(stored_task_json).collect(),
+    )))
 }
 
 /// Create a new scheduled task
@@ -234,15 +254,15 @@ pub async fn create_scheduled_task(
     ))
 }
 
-/// Get a single scheduled task by ID
+/// Get a single scheduled task by ID (flagged with `conditionsError`, not
+/// refused, when its stored conditions are unreadable).
 pub async fn get_scheduled_task(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
     let task = pg
-        .get_scheduled_task(&id)
+        .get_stored_scheduled_task(&id)
         .await
         .map_err(|e| {
             (
@@ -257,7 +277,7 @@ pub async fn get_scheduled_task(
             )
         })?;
 
-    Ok(Json(ApiResponse::success(task)))
+    Ok(Json(ApiResponse::success(stored_task_json(task))))
 }
 
 /// Update an existing scheduled task
@@ -266,11 +286,16 @@ pub async fn update_scheduled_task(
     principal: Option<axum::Extension<RequesterPrincipal>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateScheduledTaskRequest>,
-) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
-    let mut scheduled_task = pg
-        .get_scheduled_task(&id)
+    // The STORED row, flagged rather than refused when its conditions are
+    // unreadable: a PUT that carries `conditions` is how such a row is
+    // repaired (the stored value is replaced, never parsed). A PUT without
+    // `conditions` leaves the stored conditions untouched in the database
+    // (`write_conditions` below), so it can neither erase them to "ungated"
+    // nor revert a newer value.
+    let stored = pg
+        .get_stored_scheduled_task(&id)
         .await
         .map_err(|e| {
             (
@@ -284,6 +309,9 @@ pub async fn update_scheduled_task(
                 Json(api_error(format!("Task not found: {}", id))),
             )
         })?;
+    let conditions_error = stored.conditions_error;
+    let mut scheduled_task = stored.task;
+    let write_conditions = request.conditions.is_some();
 
     if let Some(name) = request.name {
         scheduled_task.name = name;
@@ -354,7 +382,7 @@ pub async fn update_scheduled_task(
     let read_modified_at = scheduled_task.modified_at.clone();
     scheduled_task.touch();
     let written = pg
-        .update_scheduled_task(&scheduled_task, &read_modified_at)
+        .update_scheduled_task(&scheduled_task, &read_modified_at, write_conditions)
         .await
         .map_err(|e| {
             (
@@ -376,7 +404,17 @@ pub async fn update_scheduled_task(
         scheduled_task.name,
         scheduled_task.id
     );
-    Ok(Json(ApiResponse::success(scheduled_task)))
+    Ok(Json(ApiResponse::success(stored_task_json(
+        crate::database::pg::scheduler::StoredScheduledTask {
+            task: scheduled_task,
+            // Replaced by this PUT, or still stored (and still unreadable).
+            conditions_error: if write_conditions {
+                None
+            } else {
+                conditions_error
+            },
+        },
+    ))))
 }
 
 /// Delete a scheduled task
@@ -509,11 +547,18 @@ pub async fn update_scheduler_settings(
                 for task in tasks.iter().filter(|t| t.enabled) {
                     let next = crate::scheduler::compute_next_run(&task.schedule, now, zone)
                         .map(|dt| dt.to_rfc3339());
-                    if let Err(e) = pg.update_task_next_run(&task.id, next.as_deref()).await {
-                        tracing::warn!(
+                    match pg
+                        .update_task_next_run(&task.id, next.as_deref(), &task.modified_at)
+                        .await
+                    {
+                        Ok(true) => {}
+                        // Edited since this read; the edit recomputed next_run
+                        // in the new zone itself.
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
                             "scheduler: timezone changed but next_run for task {} was not recomputed: {e}",
                             task.id
-                        );
+                        ),
                     }
                 }
             }
@@ -760,11 +805,13 @@ mod tests {
             .expect("update handler ends");
         let (before_touch, _) = body.split_once("scheduled_task.touch();").expect("touch");
         assert!(before_touch.contains("let read_modified_at = scheduled_task.modified_at.clone();"));
-        assert!(body.contains(".update_scheduled_task(&scheduled_task, &read_modified_at)"));
+        assert!(body.contains(
+            ".update_scheduled_task(&scheduled_task, &read_modified_at, write_conditions)"
+        ));
         assert!(body.contains("StatusCode::CONFLICT"));
 
         let pg = include_str!("../database/pg/scheduler.rs");
-        assert!(pg.contains("WHERE id = $17 AND modified_at = $18"));
+        assert!(pg.contains("WHERE id = $15 AND modified_at = $16"));
         assert!(pg.contains("Ok(updated == 1)"));
     }
 
@@ -784,5 +831,55 @@ mod tests {
         let wake = include_str!("../wake_handler.rs");
         assert!(wake.contains("service.try_tick().await"));
         assert!(!wake.contains("service.tick().await"));
+    }
+
+    /// A row with unreadable conditions is served, flagged: `conditions`
+    /// null plus a `conditionsError` string.
+    #[test]
+    fn a_row_with_unreadable_conditions_is_served_flagged() {
+        use crate::scheduler::ScheduledTaskExt;
+        let task = crate::scheduler::ScheduledTask::new(
+            "t".to_string(),
+            None,
+            crate::scheduler::ScheduleExpression::Cron("0 0 * * * *".to_string()),
+            crate::scheduler::scheduled_task_type_default(),
+        );
+        let flagged = stored_task_json(crate::database::pg::scheduler::StoredScheduledTask {
+            task: task.clone(),
+            conditions_error: Some("unreadable".to_string()),
+        });
+        assert_eq!(flagged["conditionsError"], "unreadable");
+        assert!(flagged.get("conditions").is_none_or(|c| c.is_null()));
+        assert_eq!(flagged["id"], task.id.as_str());
+        let clean = stored_task_json(crate::database::pg::scheduler::StoredScheduledTask {
+            task,
+            conditions_error: None,
+        });
+        assert!(clean.get("conditionsError").is_none());
+    }
+
+    /// list/get/update read the STORED (flagged) row; update writes
+    /// conditions only when the request carried them.
+    #[test]
+    fn the_task_api_reads_stored_rows_and_writes_conditions_only_when_sent() {
+        let src = include_str!("scheduler.rs");
+        for handler in [
+            "pub async fn list_scheduled_tasks(",
+            "pub async fn get_scheduled_task(",
+            "pub async fn update_scheduled_task(",
+        ] {
+            let (_, body) = src.split_once(handler).expect(handler);
+            let (body, _) = body.split_once("\n}\n").expect("handler ends");
+            assert!(
+                body.contains("get_all_stored_scheduled_tasks()")
+                    || body.contains("get_stored_scheduled_task(&id)"),
+                "{handler} must read the stored row"
+            );
+        }
+        let (_, update) = src
+            .split_once("pub async fn update_scheduled_task(")
+            .unwrap();
+        assert!(update.contains("let write_conditions = request.conditions.is_some();"));
+        assert!(update.contains("&read_modified_at, write_conditions)"));
     }
 }
