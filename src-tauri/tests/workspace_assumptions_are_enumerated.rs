@@ -65,7 +65,13 @@
 //! removed, a new one added), regeneration also refuses any unreviewed row
 //! under a `(class, file, symbol)` key the checked-in roster does not carry,
 //! until the dispositions file names that key (reviewed, or an explicit
-//! `disposition = "unreviewed"` acknowledgement). It does **not** fail on `defect` counts (parent
+//! `disposition = "unreviewed"` acknowledgement). The base for that rule is
+//! the roster at `merge-base HEAD origin/main` (then `main`), never the
+//! working-tree JSON, and it runs in both modes; when that base cannot be read
+//! (no git, a shallow clone) the test prints `SWAP RULE UNKNOWN: <why>` and
+//! does not fail. Its granularity is the KEY: a swap WITHIN a key the base
+//! already carries (one line of a symbol replaced by another) is caught only
+//! if it raises the net count. It does **not** fail on `defect` counts (parent
 //! Non-goal 2 stands). It prints
 //! `unreviewed=<n> unreviewed_ceiling=<n> defect=<n> scanned_files=<n> skipped_files=<n (reason)>`,
 //! so "0 hits" is distinguishable from "scanned nothing".
@@ -248,13 +254,15 @@ const RUNNER_REFINEMENTS: &[(&str, LocalPattern)] = &[
     // A bare `9875` port CONSTANT in code (`("supervisor", 9875)`, `9875u16,`).
     // The vocabulary deliberately needs a port context in TEXT (a bare 9875
     // there hits `PR #9875`); in code with literals and chars blanked, a bare
-    // integer 9875 is a port. `#`, `:`, `.` before it are excluded (`#9875`,
-    // `:9875` — already the vocabulary's — and `1.9875`).
+    // integer 9875 is a port — with any integer suffix (`9875u16`, `9875_i32`)
+    // and as a range end (`0..9875`, `0..=9875`). `#`, `:`, a lone `.` before it
+    // are excluded (`#9875`, `:9875` — already the vocabulary's — `1.9875`), and
+    // so is a fractional tail (`9875.0`).
     (
         "supervisor_dependency",
         LocalPattern {
             target: Target::Skel,
-            pattern: r"(?:^|[^0-9A-Za-z_#:.])9875(?:u16|u32|usize)?(?:[^0-9A-Za-z_]|$)",
+            pattern: r"(?:^|[^0-9A-Za-z_#:.]|\.\.=?)9875(?:_?[ui](?:8|16|32|64|128|size))?(?:[^0-9A-Za-z_.]|\.[^0-9]|$)",
             exclude: None,
         },
     ),
@@ -1664,7 +1672,80 @@ fn check_ceiling(fresh: &[Row], checked: &[Row], ceiling: usize) -> Result<(), S
     Ok(())
 }
 
-/// Unreviewed rows under a `(class, file, symbol)` key the checked-in roster
+/// A `git` invocation in `repo` with the repository-selecting variables an
+/// enclosing hook or worktree may export removed, so `current_dir` is
+/// authoritative (the same hazard `fleet_skills/.../lib/git-scope.sh` names).
+fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_NAMESPACE")
+        .args(args)
+        .output()
+        .map_err(|e| format!("`git {}` could not run: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {}` exited {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The roster JSON at `merge-base HEAD <main>` (trying `origin/main`, then
+/// `main`), with a label naming what was read. `Err` says why it could not be
+/// read (no git, no main ref, a shallow clone with no merge base, the file
+/// absent there) — the caller reports that as UNKNOWN.
+fn merge_base_roster(repo: &Path) -> Result<(String, Vec<Row>), String> {
+    let mut why = Vec::new();
+    for main in ["origin/main", "main"] {
+        let spec = format!("{main}^{{commit}}");
+        if let Err(e) = git_in(repo, &["rev-parse", "--verify", "--quiet", &spec]) {
+            why.push(format!("{main}: no such ref ({e})"));
+            continue;
+        }
+        let base = match git_in(repo, &["merge-base", "HEAD", main]) {
+            Ok(b) => b.trim().to_string(),
+            Err(e) => {
+                let shallow = git_in(repo, &["rev-parse", "--is-shallow-repository"])
+                    .map(|s| s.trim() == "true")
+                    .unwrap_or(false);
+                why.push(format!(
+                    "{main}: no merge base{} ({e})",
+                    if shallow {
+                        " — the clone is SHALLOW"
+                    } else {
+                        ""
+                    }
+                ));
+                continue;
+            }
+        };
+        let object = format!("{base}:docs/workspace-assumptions.json");
+        let text = match git_in(repo, &["show", &object]) {
+            Ok(t) => t,
+            Err(e) => {
+                why.push(format!(
+                    "{main}: roster unreadable at merge base {base} ({e})"
+                ));
+                continue;
+            }
+        };
+        let roster: Roster = serde_json::from_str(&text)
+            .map_err(|e| format!("roster at merge base {base} ({main}) does not parse: {e}"))?;
+        return Ok((format!("merge-base({main}) {base}"), roster.rows));
+    }
+    Err(why.join("; "))
+}
+
+/// Unreviewed rows under a `(class, file, symbol)` key the base roster
 /// does not carry at all and the dispositions file does not name. The net
 /// count ratchet cannot see a SWAP (one assumption removed, a new one added);
 /// this can, so regeneration refuses such a row until its author either
@@ -2064,6 +2145,48 @@ fn workspace_assumption_roster_is_fresh() {
         .unwrap_or_default();
     let ceiling = check_ceiling(rows, &checked_rows, built.unreviewed_ceiling);
 
+    // The swap rule's base is the roster at the MERGE BASE, never the
+    // working-tree JSON — which a regenerate (after an acknowledgement that is
+    // then deleted) or a hand edit can make carry the new key. Unreadable base
+    // is UNKNOWN: said loudly, never a silent pass.
+    let repo_root = root.parent().unwrap_or(&root).to_path_buf();
+    let unacked: Option<Vec<String>> = match merge_base_roster(&repo_root) {
+        Ok((base, base_rows)) => {
+            println!("swap rule: known keys from the roster at {base}");
+            Some(unacknowledged_new_keys(
+                rows,
+                &base_rows,
+                &built.explicit_keys,
+            ))
+        }
+        Err(why) => {
+            let line = format!("SWAP RULE UNKNOWN: {why}");
+            println!("{line}");
+            eprintln!("{line}");
+            if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+                use std::io::Write;
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&summary)
+                {
+                    let _ = writeln!(f, "workspace assumptions: `{line}`");
+                }
+            }
+            None
+        }
+    };
+    let unacked_message = |u: &[String]| {
+        format!(
+            "NEW UNREVIEWED ASSUMPTION(S) under a key the merge-base roster does not carry:\n    \
+             {}\nReview each in {DISPOSITIONS_TOML} (a disposition with its `reviewed` \
+             excerpt), or acknowledge it there with an explicit `disposition = \"unreviewed\"` \
+             entry and a note — the net unreviewed count cannot see a swap, so a new key is \
+             never admitted silently.",
+            u.join("\n    ")
+        )
+    };
+
     if std::env::var(UPDATE_ENV).is_ok_and(|v| v == "1") {
         assert!(
             built.orphan_dispositions.is_empty(),
@@ -2076,16 +2199,9 @@ fn workspace_assumption_roster_is_fresh() {
         if unreviewed > built.unreviewed_ceiling {
             panic!("{}", ceiling.expect_err("above the ceiling is an error"));
         }
-        let unacked = unacknowledged_new_keys(rows, &checked_rows, &built.explicit_keys);
-        assert!(
-            unacked.is_empty(),
-            "NEW UNREVIEWED ASSUMPTION(S) under a key the checked-in roster does not carry:\n    \
-             {}\nReview each in {DISPOSITIONS_TOML} (a disposition with its `reviewed` \
-             excerpt), or acknowledge it there with an explicit `disposition = \"unreviewed\"` \
-             entry and a note — the net unreviewed count cannot see a swap, so a new key is \
-             never admitted silently.",
-            unacked.join("\n    ")
-        );
+        if let Some(u) = unacked.as_ref().filter(|u| !u.is_empty()) {
+            panic!("{}", unacked_message(u));
+        }
         if let Err(e) = &ceiling {
             println!("NOTE: {e}");
         }
@@ -2119,6 +2235,9 @@ fn workspace_assumption_roster_is_fresh() {
     }
     if let Err(e) = ceiling {
         problems.push(e);
+    }
+    if let Some(u) = unacked.as_ref().filter(|u| !u.is_empty()) {
+        problems.push(unacked_message(u));
     }
     assert!(
         problems.is_empty(),
@@ -2542,4 +2661,119 @@ fn runner_refinements_restore_bare_sibling_names_and_port_constants() {
                  fn m() -> &'static str { \"qontinui-runner\" }\n";
     let got = hits(clean);
     assert!(got.is_empty(), "look-alikes produced hits: {got:?}");
+}
+
+fn git_ok(repo: &Path, args: &[&str]) {
+    let mut full = vec![
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ];
+    full.extend_from_slice(args);
+    git_in(repo, &full).unwrap_or_else(|e| panic!("{e}"));
+}
+
+fn write_roster(repo: &Path, rows: Vec<Row>) {
+    let dir = repo.join("docs");
+    fs::create_dir_all(&dir).expect("mkdir docs");
+    let roster = Roster {
+        schema: 1,
+        generator: "t".into(),
+        plan: "t".into(),
+        rows,
+    };
+    fs::write(dir.join("workspace-assumptions.json"), to_json(&roster)).expect("write roster");
+}
+
+/// Both bypasses of a working-tree base: (a) acknowledge → regenerate →
+/// delete the acknowledgement, and (b) hand-edit the JSON. Either way the
+/// working-tree roster CARRIES the new key; the merge-base roster does not,
+/// so the rule still names the row — committed or not.
+#[test]
+fn swap_rule_base_is_the_merge_base_not_the_working_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    git_ok(repo, &["init", "-q", "-b", "main"]);
+    write_roster(repo, vec![row("dev_ports", "old", "unreviewed")]);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "-q", "-m", "base"]);
+    git_ok(repo, &["checkout", "-q", "-b", "feature"]);
+
+    let fresh = vec![
+        row("dev_ports", "old", "unreviewed"),
+        row("dev_ports", "brand_new", "unreviewed"),
+    ];
+    // The bypass state: the working-tree (and even committed) roster already
+    // carries `brand_new`, and no acknowledgement names it.
+    write_roster(repo, fresh.clone());
+    for commit in [false, true] {
+        if commit {
+            git_ok(repo, &["commit", "-q", "-am", "regenerated / hand-edited"]);
+        }
+        let working: Roster = serde_json::from_str(
+            &fs::read_to_string(repo.join("docs/workspace-assumptions.json")).expect("read"),
+        )
+        .expect("parse");
+        assert!(
+            unacknowledged_new_keys(&fresh, &working.rows, &BTreeSet::new()).is_empty(),
+            "precondition: a working-tree base would admit the row"
+        );
+        let (label, base) = merge_base_roster(repo).unwrap_or_else(|e| panic!("{e}"));
+        assert!(label.contains("merge-base(main)"), "{label}");
+        let got = unacknowledged_new_keys(&fresh, &base, &BTreeSet::new());
+        assert_eq!(got.len(), 1, "commit={commit}: {got:?}");
+        assert!(got[0].contains(":: brand_new ::"), "{got:?}");
+    }
+}
+
+/// No main ref to take a merge base against is UNKNOWN with a reason, not an
+/// empty base (which would flag everything) and not a pass.
+#[test]
+fn swap_rule_base_unreadable_is_an_error_with_the_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    git_ok(repo, &["init", "-q", "-b", "trunk"]);
+    write_roster(repo, vec![]);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "-q", "-m", "only"]);
+    let err = merge_base_roster(repo).expect_err("no main ref");
+    assert!(
+        err.contains("origin/main") && err.contains("main:"),
+        "{err}"
+    );
+}
+
+/// The widened bare-port refinement: suffixes and range ends hit; a
+/// fractional `9875.0` does not.
+#[test]
+fn bare_port_refinement_covers_suffixes_and_ranges() {
+    let st = Structure::new();
+    let classes = compile_classes();
+    let sup = |src: &str| {
+        scan_source(&st, &classes, "fixture.rs", src, false)
+            .iter()
+            .any(|h| h.class == "supervisor_dependency")
+    };
+    for hit in [
+        "fn a() -> u64 { 9875u64 }",
+        "fn a() -> i32 { 9875_i32 }",
+        "fn a() -> u16 { 9875_u16 }",
+        "fn a() { for p in 0..9875 {} }",
+        "fn a() { for p in 0..=9875 {} }",
+        "fn a() -> String { 9875.to_string() }",
+    ] {
+        assert!(sup(hit), "expected a hit: {hit}");
+    }
+    for miss in [
+        "fn a() -> f64 { 9875.0 }",
+        "fn a() -> f64 { 1.9875 }",
+        "fn a() -> u32 { 98750 }",
+    ] {
+        assert!(!sup(miss), "expected no hit: {miss}");
+    }
 }
