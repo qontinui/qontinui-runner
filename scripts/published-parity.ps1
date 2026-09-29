@@ -789,9 +789,37 @@ if ($NegativeControl) {
         exit 2
     }
 
-    # WITH a workspace: whatever this checkout resolves. Derived from this
-    # script's own location, never hardcoded.
-    $withRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+    # WITH a workspace: a SYNTHETIC one this control builds itself.
+    #
+    # It used to be the real workspace root above this checkout, which worked on
+    # a dev box and cannot work in CI: qontinui-runner is PUBLIC and
+    # qontinui-claude-config is PRIVATE, so no job here can check the latter out
+    # (see the note in published-parity.yml). With no checkout present, leg A and
+    # leg B would BOTH resolve the embedded floor, no row would move, and this
+    # control would report the instrument BLIND -- a false alarm about the one
+    # thing it exists to certify.
+    #
+    # Synthesising is legitimate HERE and would be fabrication in a parity leg.
+    # The difference is what is being measured: a parity number is a claim about
+    # two artifacts, so an invented input corrupts it; this control is a claim
+    # about THIS HARNESS's sensitivity, and the honest way to test that is to
+    # feed it a difference we constructed and check that it notices. Nothing from
+    # this fixture reaches a parity count -- the control writes no JSON artifact
+    # and emits no parity-count output.
+    $withRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("parity-synthetic-root-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $synthClaude = Join-Path (Join-Path $withRoot 'qontinui-claude-config') '.claude'
+    foreach ($leaf in @('agents', 'commands')) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $synthClaude $leaf) | Out-Null
+    }
+    # The shape the resolvers look for: <root>/qontinui-claude-config/.claude/agents/*.md
+    # (agent_runtime.rs provision_agent_definitions_from_root) and the sibling
+    # commands dir the registry overlays.
+    "# synthetic agent definition, negative control only" |
+        Out-File -FilePath (Join-Path (Join-Path $synthClaude 'agents') 'parity-control-a.md') -Encoding ascii
+    "# synthetic agent definition, negative control only" |
+        Out-File -FilePath (Join-Path (Join-Path $synthClaude 'agents') 'parity-control-b.md') -Encoding ascii
+    "# synthetic command body, negative control only" |
+        Out-File -FilePath (Join-Path (Join-Path $synthClaude 'commands') 'parity-control.md') -Encoding ascii
     # WITHOUT one: an empty directory. Not an unset variable -- unset would let
     # the runner fall back to its own resolution and the two legs would not
     # differ by the one thing under test.
@@ -799,7 +827,7 @@ if ($NegativeControl) {
     New-Item -ItemType Directory -Force -Path $emptyRoot | Out-Null
 
     Write-Host "negative control: the SAME development build, two environments"
-    Write-Host "  leg A  QONTINUI_ROOT = $withRoot"
+    Write-Host "  leg A  QONTINUI_ROOT = $withRoot   (a synthetic checkout this control built)"
     Write-Host "  leg B  QONTINUI_ROOT = $emptyRoot   (an empty directory)"
     Write-Host ""
 
@@ -809,6 +837,7 @@ if ($NegativeControl) {
         -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs -EnvOverrides @{ "QONTINUI_ROOT" = $emptyRoot }
 
     Remove-Item -LiteralPath $emptyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $withRoot -Recurse -Force -ErrorAction SilentlyContinue
 
     $ncFailed = @()
     if ($null -eq $legA.Manifest) { $ncFailed += "leg A ($($legA.Door)): $($legA.Error)" }

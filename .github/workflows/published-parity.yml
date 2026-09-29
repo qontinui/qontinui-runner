@@ -277,18 +277,28 @@ jobs:
         with:
           repo: qontinui/ui-bridge
 
-      # The DEV leg's checkout-resolved capabilities need a real
-      # qontinui-claude-config on disk. Without it both legs are
-      # operator-shaped installs with no checkout, `agent_definitions` and the
-      # two registry rows resolve to the same embedded floor on each side, and
-      # the run structurally cannot see the class the metric's baseline defect
-      # belongs to (plan
-      # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
-      # Phase 5). Checked out as a SIBLING, at the depth QONTINUI_ROOT expects.
-      - name: Check out sibling qontinui-claude-config
-        uses: ./.github/actions/checkout-sibling
-        with:
-          repo: qontinui/qontinui-claude-config
+      # NO qontinui-claude-config SIBLING HERE, AND THERE CANNOT BE ONE.
+      #
+      # The dev leg's checkout-resolved capabilities would need one on disk: with
+      # no checkout, `agent_definitions` and the two registry rows resolve to the
+      # same embedded floor on BOTH legs, and this run structurally cannot see
+      # the class the metric's baseline defect belongs to. A first version of
+      # this step checked one out and it 404'd every time: qontinui-runner is
+      # PUBLIC and qontinui-claude-config is PRIVATE, so this job's GITHUB_TOKEN
+      # cannot read it, and the only fix would be an operator-provisioned read
+      # PAT held as a secret in a public repo. That trade is already refused, in
+      # writing, by qontinui-claude-config's own
+      # .github/workflows/fleet-commands-parity.yml header -- which is why the
+      # bundle-parity check lives on the ccfg side rather than here.
+      #
+      # So the consequence is STATED rather than engineered around: on a hosted
+      # runner this comparison cannot observe the command/agent-definition class
+      # at all. Those rows read the embedded floor on both legs, that reads as
+      # agreement, and agreement between two operator-shaped installs is not
+      # evidence about an operator WITH a checkout. Seeing that class needs a box
+      # that has one. The negative-control job below therefore builds a SYNTHETIC
+      # checkout instead, which is legitimate for measuring the instrument and
+      # would be fabrication in a parity leg.
 
       # Same guard, same size, same reason as ci.yml's windows leg ("Configure
       # pagefile (Windows -- guard against link-time OOM)"): windows-latest
@@ -1032,18 +1042,28 @@ jobs:
         with:
           repo: qontinui/ui-bridge
 
-      # The DEV leg's checkout-resolved capabilities need a real
-      # qontinui-claude-config on disk. Without it both legs are
-      # operator-shaped installs with no checkout, `agent_definitions` and the
-      # two registry rows resolve to the same embedded floor on each side, and
-      # the run structurally cannot see the class the metric's baseline defect
-      # belongs to (plan
-      # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
-      # Phase 5). Checked out as a SIBLING, at the depth QONTINUI_ROOT expects.
-      - name: Check out sibling qontinui-claude-config
-        uses: ./.github/actions/checkout-sibling
-        with:
-          repo: qontinui/qontinui-claude-config
+      # NO qontinui-claude-config SIBLING HERE, AND THERE CANNOT BE ONE.
+      #
+      # The dev leg's checkout-resolved capabilities would need one on disk: with
+      # no checkout, `agent_definitions` and the two registry rows resolve to the
+      # same embedded floor on BOTH legs, and this run structurally cannot see
+      # the class the metric's baseline defect belongs to. A first version of
+      # this step checked one out and it 404'd every time: qontinui-runner is
+      # PUBLIC and qontinui-claude-config is PRIVATE, so this job's GITHUB_TOKEN
+      # cannot read it, and the only fix would be an operator-provisioned read
+      # PAT held as a secret in a public repo. That trade is already refused, in
+      # writing, by qontinui-claude-config's own
+      # .github/workflows/fleet-commands-parity.yml header -- which is why the
+      # bundle-parity check lives on the ccfg side rather than here.
+      #
+      # So the consequence is STATED rather than engineered around: on a hosted
+      # runner this comparison cannot observe the command/agent-definition class
+      # at all. Those rows read the embedded floor on both legs, that reads as
+      # agreement, and agreement between two operator-shaped installs is not
+      # evidence about an operator WITH a checkout. Seeing that class needs a box
+      # that has one. The negative-control job below therefore builds a SYNTHETIC
+      # checkout instead, which is legitimate for measuring the instrument and
+      # would be fabrication in a parity leg.
 
       # Same guard, same size, same reason as ci.yml's windows leg ("Configure
       # pagefile (Windows -- guard against link-time OOM)"): windows-latest
