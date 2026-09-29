@@ -447,6 +447,12 @@ function Dump-ParityRunnerDiagnostics {
 # Manifest is $null when the read failed; Error says why. Never throws past the
 # caller -- a failed leg is a reported inability, not a crash.
 # ---------------------------------------------------------------------------
+# NOTE: ConvertFrom-VerbatimPath lives in lib/parity-diff.ps1 (dot-sourced
+# above) so scripts/tests/test-parity-diff.ps1 -- which CI runs FIRST, under real
+# Windows PowerShell 5.1, before any compile -- pins it. It was here first, and a
+# defect in it cost both legs of a negative-control run (36615500004) precisely
+# because nothing tested it.
+
 # ---------------------------------------------------------------------------
 # Provisioning drive (plan
 # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
@@ -592,7 +598,9 @@ function Invoke-ParityProvisioningDrive {
             -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
         $probeParsed = $resp.Content | ConvertFrom-Json
         if ($probeParsed -and $probeParsed.provisioned_into) {
-            $drive.probe_workdir = [string]$probeParsed.provisioned_into
+            # Normalize HERE, at the boundary. Everything downstream -- Join-Path,
+            # Test-Path, Get-ChildItem -- then sees a path 5.1 can carry.
+            $drive.probe_workdir = ConvertFrom-VerbatimPath ([string]$probeParsed.provisioned_into)
         }
         $drive.provision_probe = 'ok'
         Write-Host "    provisioning drive: provision-probe ok (wrote into $($drive.probe_workdir))"
@@ -638,8 +646,9 @@ function Get-ParityProvisionWitness {
             # is the precise conflation this whole file exists to prevent. Two
             # fabricated `row_claims_units_but_directory_is_empty` findings per
             # leg, on every Windows run, about the instrument itself.
-            if     ($Dir -like '\\?\UNC\*') { $Dir = '\\' + $Dir.Substring(8) }
-            elseif ($Dir -like '\\?\*')      { $Dir = $Dir.Substring(4) }
+            # Belt and braces: the boundary normalization above is what actually
+            # fixes this, but a path reaching here verbatim must not throw.
+            $Dir = ConvertFrom-VerbatimPath $Dir
 
             # Test-Path lives INSIDE the try on purpose. $ErrorActionPreference
             # is script-scope 'Stop', so a provider that cannot interpret the
@@ -693,7 +702,18 @@ function Get-ManifestOverHttp {
         # ledger is process-wide state, so the read below carries whatever the
         # drive just recorded. Same step, same workdir shape, on both legs.
         $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label -TerminalRetrySecs $TerminalRetrySecs
-        $witness = Get-ParityProvisionWitness -Workdir $drive.workdir -ProbeWorkdir $drive.probe_workdir
+        # The witness is CORROBORATION. It must never be able to cost us the
+        # manifest read it exists to check: on CI run 36615500004 a throw in here
+        # was caught below as a manifest-read failure and lost both legs. A
+        # witness that cannot be taken is an all-unknown witness, which the
+        # comparator rules already treat as "contradicts nothing".
+        $witness = $null
+        try {
+            $witness = Get-ParityProvisionWitness -Workdir $drive.workdir -ProbeWorkdir $drive.probe_workdir
+        } catch {
+            Write-Host "    provisioning witness: could not be taken ($($_.Exception.Message)) -- reporting UNKNOWN, keeping the leg"
+            $witness = [PSCustomObject]@{ commands = $null; skills = $null; agents = $null }
+        }
         Write-Host ("    provisioning witness: commands={0} skills={1} agents={2}" -f `
             $(if ($null -eq $witness.commands) { 'unknown' } else { $witness.commands }), `
             $(if ($null -eq $witness.skills) { 'unknown' } else { $witness.skills }), `

@@ -767,3 +767,29 @@ function Get-ParitySlashCommandsStatus {
     if ($p -lt $d) { return "provisioned_fewer(dev=$d,published=$p)" }
     return "provisioned_more(dev=$d,published=$p)"
 }
+
+# ---------------------------------------------------------------------------
+# Normalize a path that came from another process.
+#
+# Rust's `std::fs::canonicalize` returns a VERBATIM path on Windows
+# (`\\?\D:\a\...`, or `\\?\UNC\server\share\...`), and the probe's
+# `provisioned_into` is exactly that. Windows PowerShell 5.1 cannot carry those:
+# `Join-Path` fails with *"the value of argument \"drive\" is null"* because it
+# tries to resolve `\\?\D:` as a drive qualifier, and the FileSystem provider
+# reads the leading `\\` as UNC.
+#
+# MEASURED, not theorised: the first version of this harness stripped the prefix
+# inside the directory-counting scriptblock, which is too LATE -- the `Join-Path`
+# calls that build the path run before it. On CI run 36615500004 that threw out of
+# Get-ParityProvisionWitness, was caught as a manifest-read failure, and lost BOTH
+# legs of the negative control ("NEGATIVE-CONTROL-UNAVAILABLE manifest_read").
+# So normalization happens HERE, once, at the boundary where the foreign path
+# enters this script, and every consumer downstream sees a 5.1-usable path.
+# ---------------------------------------------------------------------------
+function ConvertFrom-VerbatimPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path -like '\\?\UNC\*') { return '\\' + $Path.Substring(8) }
+    if ($Path -like '\\?\*')      { return $Path.Substring(4) }
+    return $Path
+}

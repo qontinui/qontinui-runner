@@ -468,6 +468,41 @@ Assert-Equal "dev unreadable"       'unknown(no_command_listing_on_the_dev_leg)'
 Assert-Equal "published unreadable" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 5 }) -PublishedWitness ([PSCustomObject]@{ commands = $null }))
 Assert-Equal "neither leg"          'unknown(no_command_listing_on_either_leg)'        (Get-ParitySlashCommandsStatus -DevWitness $null -PublishedWitness $null)
 
+Write-Host "[13] ConvertFrom-VerbatimPath (the CI defect that lost both control legs)"
+# Rust's std::fs::canonicalize hands back a VERBATIM path on Windows, and the
+# provision-probe's `provisioned_into` is exactly that. PowerShell cannot carry
+# it: `Join-Path` throws *"the value of argument \"drive\" is null"*. Measured on
+# run 36615500004 -- the throw escaped the witness, was caught as a manifest-read
+# failure, and reported NEGATIVE-CONTROL-UNAVAILABLE for BOTH legs, so the
+# instrument certified nothing while the job stayed green.
+Assert-Equal "verbatim drive path is stripped"  'D:\a\_temp\x\probe-abc' (ConvertFrom-VerbatimPath '\\?\D:\a\_temp\x\probe-abc')
+Assert-Equal "verbatim UNC becomes a real UNC"  '\\srv\share\x'          (ConvertFrom-VerbatimPath '\\?\UNC\srv\share\x')
+Assert-Equal "an ordinary path is untouched"    'D:\plain\path'            (ConvertFrom-VerbatimPath 'D:\plain\path')
+Assert-Equal "a posix path is untouched"        '/tmp/x'                   (ConvertFrom-VerbatimPath '/tmp/x')
+Assert-Equal "empty in, empty out"              ''                         (ConvertFrom-VerbatimPath '')
+# `[string]$Path` coerces $null to '', which is the safe landing: every caller
+# guards with IsNullOrWhiteSpace, so '' and $null behave identically downstream.
+Assert-Equal "null in, empty out"               ''                         (ConvertFrom-VerbatimPath $null)
+# The property that actually matters: the OUTPUT no longer carries the prefix
+# that PowerShell cannot parse. Asserted as a STRING, because `Join-Path`
+# resolves drive qualifiers against the LOCAL platform -- a `D:` assertion throws
+# "Cannot find drive" on Linux and would make this suite platform-bound, while
+# the whole point of it is that it runs anywhere and gates on 5.1.
+Assert-True  "the result carries no verbatim prefix" (-not ((ConvertFrom-VerbatimPath '\\?\D:\a\x') -like '\\?\*'))
+Assert-Equal "and is the plain drive path"      'D:\a\x' (ConvertFrom-VerbatimPath '\\?\D:\a\x')
+
+# The Join-Path half is the real regression, so pin it where it is meaningful:
+# on Windows, where the drive exists and the raw form is what threw in CI.
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    $joined = Join-Path (ConvertFrom-VerbatimPath ('\\?\' + $env:SystemDrive + '\a\x')) '.claude'
+    Assert-True  "the normalized result joins on Windows" ($joined -like '*a\x\.claude')
+    $threw = $false
+    try { $null = Join-Path ('\\?\' + $env:SystemDrive + '\a\x') '.claude' } catch { $threw = $true }
+    Assert-True  "and the raw verbatim form still throws" $threw
+} else {
+    Write-Host "  skip Join-Path arms (not Windows; drive qualifiers do not resolve here)" -ForegroundColor DarkGray
+}
+
 Write-Host ""
 if ($failures -gt 0) {
     Write-Host "PARITY-DIFF-TESTS FAILED: $failures of $checks checks" -ForegroundColor Red
