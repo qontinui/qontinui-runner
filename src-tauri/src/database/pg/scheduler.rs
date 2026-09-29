@@ -401,9 +401,7 @@ impl PgDb {
     /// Every scheduled-task row as stored, INCLUDING rows whose conditions
     /// are unreadable (flagged, not dropped). For the task-management API
     /// only — never for anything that runs a task.
-    pub async fn get_all_stored_scheduled_tasks(
-        &self,
-    ) -> Result<Vec<StoredScheduledTask>, String> {
+    pub async fn get_all_stored_scheduled_tasks(&self) -> Result<Vec<StoredScheduledTask>, String> {
         let conn = self
             .pool
             .get()
@@ -1169,19 +1167,24 @@ mod tests {
             .split_once("// Every write below is an EXECUTOR write")
             .expect("executor section");
         let (executor, _) = executor.split_once("// History").expect("section end");
-        assert!(executor
-            .contains("UPDATE scheduled_tasks SET next_run = $1 WHERE id = $2 AND modified_at = $3"));
+        assert!(executor.contains(
+            "UPDATE scheduled_tasks SET next_run = $1 WHERE id = $2 AND modified_at = $3"
+        ));
         assert!(executor.contains(
             "UPDATE scheduled_tasks SET condition_status = $1 WHERE id = $2 AND modified_at = $3"
         ));
-        assert!(!executor.contains("modified_at = $2"), "no executor write bumps modified_at");
+        assert!(
+            !executor.contains("modified_at = $2"),
+            "no executor write bumps modified_at"
+        );
         let heal = include_str!("mod.rs");
         let (_, heal) = heal
             .split_once("project.scheduled_tasks.conditions (JSONB)")
             .expect("self-heal");
         let (heal, _) = heal.split_once("END $$;").expect("self-heal block");
         assert!(
-            heal.contains("information_schema.columns") && heal.contains("column_name = 'conditions'"),
+            heal.contains("information_schema.columns")
+                && heal.contains("column_name = 'conditions'"),
             "the ALTER must be guarded by a column-existence check"
         );
     }
@@ -1208,8 +1211,12 @@ mod tests {
             .expect("read")
             .expect("row");
         assert_eq!(
-            read.conditions.as_ref().and_then(|c| c.require_probe.clone()),
-            task.conditions.as_ref().and_then(|c| c.require_probe.clone()),
+            read.conditions
+                .as_ref()
+                .and_then(|c| c.require_probe.clone()),
+            task.conditions
+                .as_ref()
+                .and_then(|c| c.require_probe.clone()),
             "require_probe must survive insert -> read"
         );
         assert!(read.has_conditions());
@@ -1255,7 +1262,10 @@ mod tests {
             .expect("rename"));
         let after_rename = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
         assert_eq!(after_rename.name, "renamed");
-        assert!(after_rename.conditions.is_some(), "a PUT without conditions keeps them");
+        assert!(
+            after_rename.conditions.is_some(),
+            "a PUT without conditions keeps them"
+        );
 
         // A tick holding the PRE-edit snapshot can no longer write.
         assert!(!db
@@ -1348,7 +1358,11 @@ mod tests {
         assert!(db.get_scheduled_task(&task.id).await.is_err());
 
         // A PUT carrying conditions repairs it.
-        let stored = db.get_stored_scheduled_task(&task.id).await.unwrap().unwrap();
+        let stored = db
+            .get_stored_scheduled_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap();
         let mut repaired = stored.task.clone();
         repaired.conditions = Some(probe_conditions());
         repaired.touch();

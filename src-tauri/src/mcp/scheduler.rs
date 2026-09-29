@@ -156,11 +156,14 @@ pub(crate) fn refuse_untrusted_probe(
 pub(crate) fn stored_task_json(
     stored: crate::database::pg::scheduler::StoredScheduledTask,
 ) -> serde_json::Value {
-    let mut value = serde_json::to_value(&stored.task).unwrap_or_else(|e| {
-        serde_json::json!({ "id": stored.task.id, "serializeError": e.to_string() })
-    });
+    let mut value = serde_json::to_value(&stored.task).unwrap_or_else(
+        |e| serde_json::json!({ "id": stored.task.id, "serializeError": e.to_string() }),
+    );
     if let (Some(error), Some(object)) = (stored.conditions_error, value.as_object_mut()) {
-        object.insert("conditionsError".to_string(), serde_json::Value::String(error));
+        object.insert(
+            "conditionsError".to_string(),
+            serde_json::Value::String(error),
+        );
     }
     value
 }
