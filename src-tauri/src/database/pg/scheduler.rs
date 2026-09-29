@@ -391,8 +391,9 @@ impl PgDb {
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
 
-        let updated = conn.execute(
-            r#"
+        let updated = conn
+            .execute(
+                r#"
             UPDATE scheduled_tasks SET
                 name = $1,
                 description = $2,
@@ -412,35 +413,35 @@ impl PgDb {
                 launch_failure_backoff_seconds = $16
             WHERE id = $17 AND modified_at = $18
             "#,
-            &[
-                &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
-                &task.description,
-                &task.enabled,
-                &stype.to_string(),
-                &svalue,
-                &task_config,
-                &task.skip_if_completed,
-                &task.auto_fix_on_failure,
-                &task.success_criteria,
-                &task
-                    .modified_at
-                    .parse::<DateTime<Utc>>()
-                    .unwrap_or_else(|_| Utc::now()),
-                &task
-                    .next_run
-                    .as_deref()
-                    .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
-                &last_run_id,
-                &catch_up_policy_str,
-                &catch_up_grace_seconds_i32,
-                &consecutive_launch_failures_i32,
-                &launch_failure_backoff_seconds_i32,
-                &task.id,
-                &expected,
-            ],
-        )
-        .await
-        .map_err(|e| format!("PG update_scheduled_task {}: {}", task.id, e))?;
+                &[
+                    &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &task.description,
+                    &task.enabled,
+                    &stype.to_string(),
+                    &svalue,
+                    &task_config,
+                    &task.skip_if_completed,
+                    &task.auto_fix_on_failure,
+                    &task.success_criteria,
+                    &task
+                        .modified_at
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                    &task
+                        .next_run
+                        .as_deref()
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                    &last_run_id,
+                    &catch_up_policy_str,
+                    &catch_up_grace_seconds_i32,
+                    &consecutive_launch_failures_i32,
+                    &launch_failure_backoff_seconds_i32,
+                    &task.id,
+                    &expected,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_scheduled_task {}: {}", task.id, e))?;
 
         Ok(updated == 1)
     }
