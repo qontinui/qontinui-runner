@@ -499,7 +499,7 @@ pub(crate) enum PairProgress {
 /// Compact coord-credential health the runner stamps into its
 /// `coord.device_status.details` on every heartbeat (plan 2026-06-13 Phase 1b).
 /// Coord's `fleet_health::evaluate()` reads this to derive the device-scoped
-/// `coord_credentials_missing` alert; the runner itself never touches coord's
+/// `runner_coord_credentials_missing` alert; the runner itself never touches coord's
 /// alert machinery.
 ///
 /// Wire shape (under `details.coord_credential`):
@@ -555,11 +555,20 @@ pub(crate) fn coord_credential_health(
             Some(PairProgress::BailNoDefaultBinding {
                 usable_tenants,
                 refusal,
-            }) => CoordCredentialHealth::bad(format!(
-                "a valid per-tenant coord credential is held (tenant(s) {usable_tenants:?}) but \
-                 paired_user.json names no default binding and the self-heal refused: \
-                 {refusal} — sign in to re-pair"
-            )),
+            }) => {
+                let held = if usable_tenants.is_empty() {
+                    "a valid coord credential is held (the legacy access_token slot)".to_string()
+                } else {
+                    format!(
+                        "a valid per-tenant coord credential is held (tenant(s) \
+                         {usable_tenants:?})"
+                    )
+                };
+                CoordCredentialHealth::bad(format!(
+                    "{held} but paired_user.json names no default binding and the self-heal \
+                     refused: {refusal} — sign in to re-pair"
+                ))
+            }
             Some(PairProgress::BailNoTenant) => CoordCredentialHealth::bad(
                 "no resolvable tenant_id (OAuth claim, outgoing device-JWT, or \
                  machine.json::active_tenant_id all absent)",
@@ -1678,9 +1687,10 @@ impl CoordCredentialPosture {
             }
             CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding) => {
                 "a coord credential IS present (a valid per-tenant slot), but no default \
-                 binding points at it: paired_user.json is missing or unreadable and the \
-                 runner's self-heal refused to rebuild it. Sessions spawned now have no \
-                 default-scope coord access."
+                 binding points at it: paired_user.json is missing or unreadable, the \
+                 runner's self-heal refused to rebuild it, and the legacy access_token slot \
+                 holds no usable token either. Sessions spawned now have no default-scope \
+                 coord access; a session pinned to a tenant with a live slot still works."
             }
         }
     }
@@ -3448,14 +3458,15 @@ pub struct CoordCredentialStatus {
     /// first shape `None` is a MATCH against an unpinned session and refusing
     /// is correct, on the second it is UNKNOWN and refusing would take out a
     /// session whose own credential works. `true` on every slot-derived
-    /// publish, `false` only on the orphan arm — and on a
-    /// `Dark(NoDefaultBinding)` publish while the legacy slot still holds a
-    /// usable token (see [`DefaultBindingVerdict::SlotWithoutBinding`]).
+    /// publish, `false` only on the orphan arm.
     pub attributable: bool,
-    /// The state-specific WHY the posture's fixed [`CoordCredentialPosture::message`]
-    /// cannot carry, or `None`. Today only `Dark(NoDefaultBinding)` sets it:
-    /// the heal's refusal reason, which names the guard that refused — so a
-    /// state that outlives one tick says which guard, as the plan asks.
+    /// The state-specific fact the posture's fixed
+    /// [`CoordCredentialPosture::message`] cannot carry, or `None`. Set in two
+    /// shapes: on `Dark(NoDefaultBinding)`, the heal's refusal reason, which
+    /// names the guard that refused — so a state that outlives one tick says
+    /// which guard, as the plan asks; and on an ANSWERING posture, the note
+    /// that no default binding exists while the legacy slot still serves
+    /// unpinned sessions (review finding 3).
     pub detail: Option<String>,
 }
 
@@ -3465,6 +3476,9 @@ impl CoordCredentialStatus {
     /// `reason`, the heartbeat bag's `reason` and the banner body all carry.
     pub fn reason(&self) -> String {
         match self.detail.as_deref() {
+            Some(d) if !d.trim().is_empty() && self.posture.can_answer() => {
+                format!("{} Note: {d}", self.posture.message())
+            }
             Some(d) if !d.trim().is_empty() => format!("{} Why: {d}", self.posture.message()),
             _ => self.posture.message().to_string(),
         }
@@ -3758,9 +3772,18 @@ fn publish_coord_credential_posture_with(
 /// The refresher tick's `paired_user.json` heal leaves its verdict in
 /// [`default_binding_verdict`]'s cell. When that verdict is
 /// [`DefaultBindingVerdict::SlotWithoutBinding`] — a usable slot, no default
-/// binding, heal refused — `dark(no_default_binding)` enters the fold FIRST
-/// (so a real slot at the same severity still wins a tie), carrying the heal's
-/// refusal as [`CoordCredentialStatus::detail`]. It is derived HERE, on every
+/// binding, heal refused — AND the legacy `access_token` slot holds nothing
+/// usable, `dark(no_default_binding)` enters the fold FIRST (so a real slot at
+/// the same severity still wins a tie), carrying the heal's refusal as
+/// [`CoordCredentialStatus::detail`].
+///
+/// While the legacy slot IS usable, unpinned sessions still reach coord with
+/// it, so no dark candidate is published: `dark` would set `/health`
+/// `canAnswer: false`, send the heartbeat bag `ok: false` (coord's
+/// `runner_coord_credentials_missing` alert) and tell the operator the
+/// default scope has no access — an outage that does not exist (review
+/// finding 3). The missing binding is still surfaced, as the `detail` of the
+/// answering posture that wins. It is derived HERE, on every
 /// pass, rather than published once from the refresher's bail: a publish from
 /// the bail alone would be overwritten by the slot pass's `live` on the next
 /// tick and flap `live` / `dark` — a "Coord access restored" banner every five
@@ -3788,31 +3811,45 @@ pub(crate) fn derive_and_publish_posture_with(
         exp: Option<i64>,
         outcome: Option<TenantSlotOutcome>,
         signal: UpstreamSignal,
-        attributable: bool,
         detail: Option<String>,
     }
 
     // The no-default-binding candidate: it describes the DEFAULT scope — the
-    // legacy slot an unpinned session presents — so `tenant_id: None`. It is
-    // attributable (and so locally refuses unpinned sessions) only while that
-    // legacy slot holds nothing usable; if it still does, an unpinned
-    // session's call still carries a working credential, and refusing it
-    // would manufacture the outage this posture reports.
-    let no_default_binding = match default_binding {
+    // legacy slot an unpinned session presents — so `tenant_id: None`, and it
+    // is published only while that legacy slot holds nothing usable. With a
+    // usable legacy slot an unpinned session's call still carries a working
+    // credential, so the fact becomes a NOTE on the answering posture instead
+    // (review finding 3).
+    let (no_default_binding, binding_note) = match default_binding {
         DefaultBindingVerdict::SlotWithoutBinding {
             refusal,
-            legacy_slot_usable,
+            legacy_slot_usable: false,
             ..
-        } => Some(Candidate {
-            posture: CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
-            tenant_id: None,
-            exp: None,
-            outcome: None,
-            signal: upstream_signal_for(None),
-            attributable: !legacy_slot_usable,
-            detail: Some(refusal.clone()),
-        }),
-        _ => None,
+        } => (
+            Some(Candidate {
+                posture: CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
+                tenant_id: None,
+                exp: None,
+                outcome: None,
+                signal: upstream_signal_for(None),
+                detail: Some(refusal.clone()),
+            }),
+            None,
+        ),
+        DefaultBindingVerdict::SlotWithoutBinding {
+            refusal,
+            legacy_slot_usable: true,
+            ..
+        } => (
+            None,
+            Some(format!(
+                "paired_user.json names no default binding and the self-heal refused \
+                 ({refusal}); unpinned sessions are still served by the legacy access_token \
+                 slot, so coord access is not interrupted — sign in to re-pair before it \
+                 expires"
+            )),
+        ),
+        _ => (None, None),
     };
 
     // One usable slot means the default-slot bucket describes the same
@@ -3834,7 +3871,6 @@ pub(crate) fn derive_and_publish_posture_with(
             exp: None,
             outcome: None,
             signal,
-            attributable: true,
             detail: None,
         }
     });
@@ -3853,11 +3889,19 @@ pub(crate) fn derive_and_publish_posture_with(
                 exp: o.exp,
                 outcome: o.outcome,
                 signal,
-                attributable: true,
                 detail: None,
             }
         }))
-        .max_by_key(|c| c.posture.severity());
+        .max_by_key(|c| c.posture.severity())
+        .map(|mut c| {
+            // The missing-binding note rides the ANSWERING posture only: on a
+            // non-answering one its "Why:" would misattribute that posture's
+            // cause.
+            if c.detail.is_none() && c.posture.can_answer() {
+                c.detail = binding_note.clone();
+            }
+            c
+        });
 
     // N1 — the unattributable arm, as a MAP DIFF rather than a special case
     // for the default key. See [`unclaimed_upstream_verdict`] for the class
@@ -3945,10 +3989,10 @@ pub(crate) fn derive_and_publish_posture_with(
         // ATTRIBUTABLE: `worst` is a real slot candidate (or the unserved
         // pin), so `tenant_id` names the slot this posture is about —
         // including when it is `None`, which is the LEGACY default slot and
-        // is exactly the credential an unpinned session presents. The one
-        // exception is the no-default-binding candidate while the legacy slot
-        // still serves unpinned sessions (see its construction above).
-        worst.attributable,
+        // is exactly the credential an unpinned session presents — and the
+        // no-default-binding candidate is only ever built while that legacy
+        // slot holds nothing usable, so it too describes that credential.
+        true,
         worst.detail,
     )
 }
@@ -4715,9 +4759,12 @@ pub(crate) enum DefaultBindingVerdict {
     /// this runner genuinely holds no coord credential a binding could point
     /// at. Today's `absent` / [`PairProgress::BailNoBearer`] reading is true.
     NoCredential,
-    /// (b) The file names no binding, at least one per-tenant slot holds a
-    /// USABLE JWT, and the heal refused — the 2026-09-28 shape. Published as
-    /// `dark(no_default_binding)`, never as `absent`.
+    /// (b) The file names no binding, at least one credential (a per-tenant
+    /// slot or the legacy slot) holds a USABLE JWT, and the heal refused — the
+    /// 2026-09-28 shape. Published as `dark(no_default_binding)` (never as
+    /// `absent`) while the legacy slot holds nothing usable; with a usable
+    /// legacy slot unpinned sessions still reach coord, so it is only a
+    /// `detail` note on the answering posture (review finding 3).
     SlotWithoutBinding {
         /// The tenants whose slots are usable (ascending).
         usable_tenants: Vec<uuid::Uuid>,
@@ -4745,7 +4792,7 @@ pub(crate) fn classify_default_binding(
         H::NotNeeded | H::Healed { .. } => DefaultBindingVerdict::Bound,
         H::NothingToHealFrom => DefaultBindingVerdict::NoCredential,
         H::Refused(why) => match census {
-            Some(Ok(c)) if !c.usable_tenant_slots.is_empty() => {
+            Some(Ok(c)) if !c.usable_tenant_slots.is_empty() || c.legacy_slot_usable => {
                 DefaultBindingVerdict::SlotWithoutBinding {
                     usable_tenants: c.usable_tenant_slots.clone(),
                     legacy_slot_usable: c.legacy_slot_usable,
@@ -4753,8 +4800,9 @@ pub(crate) fn classify_default_binding(
                 }
             }
             // Slots exist but none is usable (every one expired, mis-keyed or
-            // unreadable): there is no live credential for a binding to point
-            // at, so "no coord credential" is the honest reading.
+            // unreadable) and neither is the legacy slot: there is no live
+            // credential for a binding to point at, so "no coord credential"
+            // is the honest reading.
             Some(Ok(_)) => DefaultBindingVerdict::NoCredential,
             Some(Err(e)) => DefaultBindingVerdict::Unknown(e.clone()),
             None => DefaultBindingVerdict::Unknown(
@@ -11019,6 +11067,58 @@ mod tenant_slot_refresh_tests {
         );
     }
 
+    /// Every cause the runner can put on the `autonomy-credential-dark` event
+    /// (`notify_posture_transition`: a non-answering posture's `cause()`, else
+    /// its `as_str()`, plus the Cognito cause) must be a member of the banner's
+    /// `CredentialDarkCause` union — the TS `Record` then makes a missing title
+    /// a compile error. The union is hand-maintained; this pins it to the Rust
+    /// source of truth. The `match` makes a new posture or `DarkCause` a
+    /// compile error here until it is listed (review finding 11).
+    #[test]
+    fn the_banner_union_names_every_cause_the_runner_emits() {
+        use CoordCredentialPosture as P;
+        let all = [
+            P::Live,
+            P::Expiring,
+            P::Expired,
+            P::Absent,
+            P::Unrefreshable,
+            P::Dark(DarkCause::UpstreamRejected),
+            P::Dark(DarkCause::NoDefaultBinding),
+        ];
+        for p in all {
+            match p {
+                P::Live
+                | P::Expiring
+                | P::Expired
+                | P::Absent
+                | P::Unrefreshable
+                | P::Dark(DarkCause::UpstreamRejected)
+                | P::Dark(DarkCause::NoDefaultBinding) => {}
+            }
+        }
+        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/components/web-integration-banner-logic.ts");
+        let ts = std::fs::read_to_string(&ts_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", ts_path.display()));
+        let start = ts
+            .find("export type CredentialDarkCause =")
+            .expect("the CredentialDarkCause union");
+        let union = &ts[start..start + ts[start..].find(';').expect("union terminator")];
+        let emitted = all
+            .iter()
+            .filter(|p| !p.can_answer())
+            .map(|p| p.cause().unwrap_or_else(|| p.as_str()))
+            .chain(["cognito_hard"]);
+        for wire in emitted {
+            assert!(
+                union.contains(&format!("\"{wire}\"")),
+                "CredentialDarkCause in {} is missing \"{wire}\" — add it (and its title)",
+                ts_path.display()
+            );
+        }
+    }
+
     #[test]
     fn no_default_binding_severity_ranks_with_the_other_dark_cause() {
         use CoordCredentialPosture as P;
@@ -11068,15 +11168,24 @@ mod tenant_slot_refresh_tests {
             classify_default_binding(&H::NothingToHealFrom, None),
             DefaultBindingVerdict::NoCredential
         );
-        // (a) slots exist, none usable.
+        // (a) slots exist, none usable, legacy slot unusable too.
         assert_eq!(
-            classify_default_binding(&refused, Some(&census(&[], true))),
+            classify_default_binding(&refused, Some(&census(&[], false))),
             DefaultBindingVerdict::NoCredential
         );
         // (b) a usable slot, the heal refused.
         assert_eq!(
             classify_default_binding(&refused, Some(&census(&[tenant(0)], false))),
             slot_without_binding(false)
+        );
+        // (b) only the legacy slot is usable: a credential IS held.
+        assert_eq!(
+            classify_default_binding(&refused, Some(&census(&[], true))),
+            DefaultBindingVerdict::SlotWithoutBinding {
+                usable_tenants: vec![],
+                legacy_slot_usable: true,
+                refusal: HEAL_REFUSAL.to_string(),
+            }
         );
         // Unmeasured is UNKNOWN — never (a), never (b).
         assert!(matches!(
@@ -11202,22 +11311,58 @@ mod tenant_slot_refresh_tests {
             None
         );
 
-        // A still-usable legacy slot serves unpinned sessions: reported, but
-        // it must not locally refuse them.
-        derive_and_publish_posture_with(
+        // A still-usable legacy slot serves unpinned sessions: NOT dark —
+        // `/health` still answers, the heartbeat bag stays `ok`, and the
+        // missing binding rides the answering posture as a note (review
+        // finding 3).
+        let t = derive_and_publish_posture_with(
             &obs,
             PosturePinInputs::UNPINNED,
             &slot_without_binding(true),
             now,
+        )
+        .expect("dark -> live is a transition");
+        assert_eq!(t.to, CoordCredentialPosture::Live);
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.posture, CoordCredentialPosture::Live);
+        assert!(status.posture.can_answer());
+        let note = status
+            .detail
+            .clone()
+            .expect("the missing binding is surfaced");
+        assert!(note.contains(HEAL_REFUSAL), "{note}");
+        assert!(note.contains("still served by the legacy"), "{note}");
+        assert!(status.reason().contains("Note:"), "{}", status.reason());
+        assert_eq!(status.to_json()["canAnswer"], true);
+        assert_eq!(status.to_json()["detail"], serde_json::json!(note));
+        let bag = coord_credential_bag(
+            &coord_credential_health(Decision::Idle, None),
+            Some(&status),
+        );
+        assert!(
+            bag.ok,
+            "no runner_coord_credentials_missing alert for a working default"
+        );
+        assert_eq!(bag.cause, None);
+
+        // Healed: the verdict turns Bound — still `live`, and the note is gone.
+        derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::Bound,
+            now,
         );
         let status = coord_credential_posture().expect("published");
-        assert_eq!(
-            status.posture,
-            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding)
-        );
-        assert!(!status.attributable);
+        assert_eq!(status.posture, CoordCredentialPosture::Live);
+        assert_eq!(status.detail, None);
 
-        // Healed: the verdict turns Bound and the slot's `live` returns.
+        // From dark, a heal is a recovery transition.
+        derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &slot_without_binding(false),
+            now,
+        );
         let t = derive_and_publish_posture_with(
             &obs,
             PosturePinInputs::UNPINNED,
@@ -11226,7 +11371,6 @@ mod tenant_slot_refresh_tests {
         )
         .expect("recovery is a transition");
         assert_eq!(t.to, CoordCredentialPosture::Live);
-        assert_eq!(coord_credential_posture().expect("published").detail, None);
     }
 
     /// A real slot that is itself non-answering at the same severity still

@@ -417,6 +417,11 @@ pub struct AuthManager {
     /// [`Self::with_storage_force_keychain`] for why this exists.
     #[cfg(test)]
     force_keychain_enabled: bool,
+    /// Test-only override that forces [`Self::keychain_enabled`] to `false`
+    /// regardless of `QONTINUI_DISABLE_KEYCHAIN` — see
+    /// [`Self::with_storage_no_keychain`].
+    #[cfg(test)]
+    force_keychain_disabled: bool,
 }
 
 impl AuthManager {
@@ -433,6 +438,8 @@ impl AuthManager {
             machine_file: crate::machine_identity::machine_file_path(),
             #[cfg(test)]
             force_keychain_enabled: false,
+            #[cfg(test)]
+            force_keychain_disabled: false,
         }
     }
 
@@ -445,6 +452,10 @@ impl AuthManager {
         #[cfg(test)]
         if self.force_keychain_enabled {
             return true;
+        }
+        #[cfg(test)]
+        if self.force_keychain_disabled {
+            return false;
         }
         keychain_enabled_env()
     }
@@ -474,6 +485,21 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
+        }
+    }
+
+    /// As [`Self::with_storage`], but [`Self::keychain_enabled`] always
+    /// returns `false` for this instance: no keychain read or write at all,
+    /// whatever `QONTINUI_DISABLE_KEYCHAIN` says, and without mutating that
+    /// process-global env var (which would race every parallel test reading
+    /// it). For hermetic tests that store and read tokens and must never
+    /// block on — or leave entries in — a real OS keychain.
+    #[cfg(test)]
+    pub fn with_storage_no_keychain(secure_storage: SecureStorage) -> Self {
+        Self {
+            force_keychain_disabled: true,
+            ..Self::with_storage(secure_storage)
         }
     }
 
@@ -499,6 +525,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: None,
             force_keychain_enabled: true,
+            force_keychain_disabled: false,
         }
     }
 
@@ -515,6 +542,7 @@ impl AuthManager {
             service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
             machine_file: Some(machine_file),
             force_keychain_enabled: false,
+            force_keychain_disabled: false,
         }
     }
 
