@@ -106,9 +106,9 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 ///    verify this device's JWT). NEW: closes the prod/local device-JWT split
 ///    where a debug relay verified against local while pairing minted against
 ///    prod. See `plans/2026-07-08-runner-relay-honor-persisted-backend-url.md`.
-///    [`api_base_url_inputs_from`] drops a value byte-equal to the build
-///    default, so a debug build's own default written back by a settings save
-///    is attributed to rung 5, not reported as configured.
+///    In a DEBUG build [`persisted_input`] drops a value equal to the build
+///    default, so the default written back by a settings save is attributed to
+///    rung 5, not reported as configured. Release builds keep it (see there).
 /// 5. build default: debug `http://127.0.0.1:8000` (IPv4 — the backend only
 ///    binds IPv4; `localhost` may resolve to IPv6 `::1` first) / release
 ///    `PROD_API_BASE_URL`.
@@ -458,8 +458,8 @@ pub(crate) struct ApiBaseUrlInputs {
     pub profile_api_url: Option<String>,
     /// The persisted paired backend, present only when web-integration is
     /// ENABLED (a disabled integration means "don't reach web", so its stored
-    /// URL must not override the build default). A value byte-equal to the
-    /// build default is dropped by [`api_base_url_inputs_from`]: the URL is the
+    /// URL must not override the build default). In debug builds a value equal
+    /// to the build default is dropped by [`persisted_input`]: the URL is the
     /// same either way, only the attribution differs.
     pub persisted: Option<String>,
     /// Whether this is a debug build (selects which build default applies).
@@ -513,23 +513,48 @@ pub(crate) fn gather_api_base_url_inputs() -> ApiBaseUrlInputs {
 /// overlay; that would be the second-copy defect this module's `(value, arm)`
 /// shape exists to prevent.
 pub(crate) fn api_base_url_inputs_from(s: &crate::settings::Settings) -> ApiBaseUrlInputs {
-    let build_default = crate::settings::default_web_integration_backend_url();
+    let is_debug = cfg!(debug_assertions);
     ApiBaseUrlInputs {
         env_web: std::env::var("QONTINUI_WEB_BACKEND_URL").ok(),
         env_api: std::env::var("QONTINUI_API_URL").ok(),
         profile_api_url: qontinui_runner_lib::profiles::api_url_with_source().map(|(url, _)| url),
-        // A persisted value equal to the build default is not a choice: any
-        // settings save writes the default back (the struct is serialized
-        // whole), so on disk it is indistinguishable from one. Treat it as
-        // unset so it is attributed to the build-default arm. The resolved URL
-        // is identical either way.
-        persisted: s
-            .web_integration
-            .enabled
-            .then(|| s.web_integration.backend_url.clone())
-            .filter(|v| v.trim() != build_default),
-        is_debug: cfg!(debug_assertions),
+        persisted: persisted_input(s, is_debug),
+        is_debug,
     }
+}
+
+/// The persisted rung's input from a `Settings`, for the given build flavour.
+///
+/// Present only when web-integration is enabled. In a DEBUG build a value equal
+/// to the build default (`http://127.0.0.1:8000`) is dropped: any settings save
+/// writes the default back (the struct is serialized whole), so on disk it is
+/// indistinguishable from a choice, and treating it as unset attributes it to
+/// the build-default arm. The comparison is over `trim().trim_end_matches('/')`
+/// on both sides.
+///
+/// RELEASE builds never drop it. The URL is identical either way (the release
+/// default is `PROD_API_BASE_URL`), but dropping it would flip the arm to
+/// `BuildDefaultRelease`, which [`configured_only`] maps to `None`, so every
+/// "configured, else unconfigured" reader (body-sync, tenant-sync) would treat
+/// an untouched release `settings.json` as unconfigured and stop using the URL.
+pub(crate) fn persisted_input(s: &crate::settings::Settings, is_debug: bool) -> Option<String> {
+    persisted_input_with_default(
+        s,
+        is_debug,
+        &crate::settings::default_web_integration_backend_url(),
+    )
+}
+
+fn persisted_input_with_default(
+    s: &crate::settings::Settings,
+    is_debug: bool,
+    build_default: &str,
+) -> Option<String> {
+    let norm = |v: &str| v.trim().trim_end_matches('/').to_string();
+    s.web_integration
+        .enabled
+        .then(|| s.web_integration.backend_url.clone())
+        .filter(|v| !is_debug || norm(v) != norm(build_default))
 }
 
 /// [`resolve_api_base_url`] over a `Settings` the caller already holds: the
@@ -1093,8 +1118,7 @@ mod tests {
         ];
         for is_debug in [true, false] {
             for candidate in loopback.iter().chain(remote.iter()) {
-                let (_, arm) =
-                    resolve(None, None, Some((*candidate).to_string()), is_debug);
+                let (_, arm) = resolve(None, None, Some((*candidate).to_string()), is_debug);
                 let ladder_refused = arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected;
                 assert_eq!(
                     persisted_backend_url_refused(candidate, is_debug),
@@ -1160,9 +1184,9 @@ mod tests {
                         // shows up as the loopback-rejected arm and nothing else.
                         let refused_persisted = e.is_none()
                             && p.is_none()
-                            && persisted.as_deref().is_some_and(|v| {
-                                persisted_backend_url_refused(v.trim(), is_debug)
-                            });
+                            && persisted
+                                .as_deref()
+                                .is_some_and(|v| persisted_backend_url_refused(v.trim(), is_debug));
                         assert_eq!(
                             refused_persisted,
                             arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
@@ -1419,7 +1443,11 @@ mod tests {
     #[test]
     fn precedence_chain_across_all_rungs_at_both_build_settings() {
         for is_debug in [true, false] {
-            let mut i = inputs_all("https://profile.example", "https://persisted.example", is_debug);
+            let mut i = inputs_all(
+                "https://profile.example",
+                "https://persisted.example",
+                is_debug,
+            );
             assert_eq!(
                 resolve_api_base_url(&i),
                 (
@@ -1565,6 +1593,76 @@ mod tests {
                 ApiBaseUrlArm::PersistedBackendUrl
             )
         );
+    }
+
+    /// Drives the readers' actual mapping (`persisted_input` + resolve +
+    /// `configured_only`) with an explicit build flavour, since
+    /// `cfg!(debug_assertions)` is fixed per build.
+    fn configured_via_readers(
+        persisted: &str,
+        is_debug: bool,
+    ) -> ((String, ApiBaseUrlArm), Option<(String, ApiBaseUrlArm)>) {
+        let mut settings = crate::settings::Settings::default();
+        settings.web_integration.enabled = true;
+        settings.web_integration.backend_url = persisted.to_string();
+        let resolved = resolve_api_base_url(&ApiBaseUrlInputs {
+            env_web: None,
+            env_api: None,
+            profile_api_url: None,
+            persisted: persisted_input(&settings, is_debug),
+            is_debug,
+        });
+        (resolved.clone(), configured_only(resolved))
+    }
+
+    #[test]
+    fn release_keeps_a_default_equal_persisted_value_configured() {
+        for v in [PROD_API_BASE_URL, "https://api.qontinui.io/"] {
+            let (resolved, configured) = configured_via_readers(v, false);
+            assert_eq!(resolved.1, ApiBaseUrlArm::PersistedBackendUrl, "{v}");
+            assert_eq!(
+                configured,
+                Some((
+                    v.trim_end_matches('/').to_string(),
+                    ApiBaseUrlArm::PersistedBackendUrl
+                )),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_treats_a_default_equal_persisted_value_as_unconfigured() {
+        for v in ["http://127.0.0.1:8000", " http://127.0.0.1:8000/ "] {
+            let (resolved, configured) = (|| {
+                let mut s = crate::settings::Settings::default();
+                s.web_integration.enabled = true;
+                s.web_integration.backend_url = v.to_string();
+                let p = persisted_input_with_default(&s, true, "http://127.0.0.1:8000");
+                let r = resolve_api_base_url(&ApiBaseUrlInputs {
+                    env_web: None,
+                    env_api: None,
+                    profile_api_url: None,
+                    persisted: p,
+                    is_debug: true,
+                });
+                (r.clone(), configured_only(r))
+            })();
+            assert_eq!(resolved.1, ApiBaseUrlArm::BuildDefaultDebug, "{v:?}");
+            assert_eq!(configured, None, "{v:?}");
+        }
+        // A non-default persisted value stays configured in debug.
+        let (_, configured) = configured_via_readers("https://elsewhere.example", true);
+        assert!(configured.is_some());
+    }
+
+    #[test]
+    fn disabled_web_integration_yields_no_persisted_input() {
+        let mut s = crate::settings::Settings::default();
+        s.web_integration.enabled = false;
+        s.web_integration.backend_url = "https://elsewhere.example".to_string();
+        assert_eq!(persisted_input(&s, true), None);
+        assert_eq!(persisted_input(&s, false), None);
     }
 
     #[test]

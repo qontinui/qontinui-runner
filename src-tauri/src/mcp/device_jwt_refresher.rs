@@ -4514,10 +4514,14 @@ pub(crate) async fn refresh_cognito_bearer(
 /// A configured value comes from [`crate::api_config::configured_api_base_from`],
 /// the one ladder, so this can not disagree with the relay by construction
 /// (a release build's refusal of a loopback persisted value included; plan
-/// 2026-07-08's prod/local device-JWT split). A non-blank persisted value that
-/// the ladder did not honour was refused, so the base is what the relay
-/// actually dials, with its arm. Otherwise `("", None)`: callers keep their
-/// empty-means-unconfigured guard.
+/// 2026-07-08's prod/local device-JWT split). When the ladder yields nothing
+/// but a non-blank persisted value exists, the value was not honoured as
+/// configured: it was refused (release loopback), equal to the build default
+/// (debug), or web-integration is disabled. In each case the base is what the
+/// relay actually dials, with its arm. NOTE the disabled case is a deliberate
+/// behaviour change: the refresher used to ignore `web_integration.enabled`
+/// and now falls back to the relay's base instead. Otherwise `("", None)`:
+/// callers keep their empty-means-unconfigured guard.
 fn resolve_pair_base(
     settings: &crate::settings::Settings,
 ) -> (String, Option<crate::api_config::ApiBaseUrlArm>) {
@@ -5198,29 +5202,59 @@ pub mod commands {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn pair_base_origin_names_label_and_remedy_for_every_arm() {
         use crate::api_config::ApiBaseUrlArm as A;
-        for arm in [
-            A::EnvWebBackendUrl,
-            A::EnvApiUrl,
-            A::ProfileApiUrl,
-            A::PersistedBackendUrl,
-            A::BuildDefaultDebug,
-            A::BuildDefaultRelease,
-            A::BuildDefaultReleaseLoopbackRejected,
+        for (arm, label, needles) in [
+            (
+                A::EnvWebBackendUrl,
+                "env:QONTINUI_WEB_BACKEND_URL",
+                &["QONTINUI_WEB_BACKEND_URL"][..],
+            ),
+            (
+                A::EnvApiUrl,
+                "env:QONTINUI_API_URL",
+                &["QONTINUI_API_URL"][..],
+            ),
+            (A::ProfileApiUrl, "profile:api_url", &["profiles.json"][..]),
+            (
+                A::PersistedBackendUrl,
+                "persisted:web_integration.backend_url",
+                &["web_integration.backend_url"][..],
+            ),
+            (
+                A::BuildDefaultDebug,
+                "build_default:debug",
+                &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
+            ),
+            (
+                A::BuildDefaultRelease,
+                "build_default:release",
+                &["QONTINUI_WEB_BACKEND_URL", "profiles.json"][..],
+            ),
+            (
+                A::BuildDefaultReleaseLoopbackRejected,
+                "build_default:release:persisted_loopback_rejected",
+                &["web_integration.backend_url"][..],
+            ),
         ] {
             let o = pair_base_origin(Some(arm));
-            assert_eq!(o.label, arm.as_str());
-            assert_eq!(o.remedy, arm.remedy());
-            assert!(!o.remedy.is_empty());
+            assert_eq!(o.label, label);
+            for n in needles {
+                assert!(
+                    o.remedy.contains(n),
+                    "{arm:?} remedy {:?} must mention {n}",
+                    o.remedy
+                );
+            }
         }
         let none = pair_base_origin(None);
         assert_eq!(none.label, "unconfigured");
         assert!(none.remedy.contains("profiles.json"));
+        assert!(none.remedy.contains("QONTINUI_WEB_BACKEND_URL"));
     }
-
-    use super::*;
 
     #[test]
     fn decides_no_refresh_when_jwt_fresh() {
