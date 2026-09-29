@@ -76,7 +76,7 @@ pub(crate) const AI_SESSION_SUPERVISOR_RESTART_RECIPE: &str = r#"## Development 
 
 (Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervisor_base}} when this session was spawned.)
 
-The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop, optionally rebuild, and restart the runner, then resume this session (`trigger_auto_continue`), instead of the user restarting the application by hand. On this machine, carrying out a restart the user explicitly asked for, through this route, is the user's restart, not yours - so it does not break the rules above.
+The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop and restart the runner instead of the user restarting the application by hand. Nothing resumes this session afterwards - forcing the restart ends it, and the user continues after the restart. So commit, and tell the user what state you left, BEFORE sending the request. On this machine, carrying out a restart the user explicitly asked for, through this route, is the user's restart, not yours - so it does not break the rules above; it still ends this session.
 
 Use it only when ALL of these hold:
 1. The user has explicitly asked, in this session, for the runner to be restarted. Needing to load your own change is not that request: tell the user, quote the readiness verdict, and offer this route.
@@ -89,19 +89,19 @@ Otherwise follow the rules above: finish, commit, and tell the user. To check a 
 
 **Restarting Runner via Supervisor** (only when all three conditions above hold, and the force condition just stated holds):
 ```bash
-# Simple restart (no rebuild)
-curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "trigger_auto_continue": true}'
+# Restart (no rebuild)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true}'
 
-# Restart with REBUILD (after you modified runner Rust code)
-curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true, "trigger_auto_continue": true}'
+# Restart with REBUILD (only if the user asked for a rebuild - see below)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true}'
 ```
 From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Post` with the same URL and body.
 
 **Supervisor API ({{supervisor_base}}):**
 - GET /health - Check if supervisor is running
-- POST /runner/restart - Restart runner (options: force, rebuild, trigger_auto_continue, wait_timeout_seconds)
+- POST /runner/restart - Restart runner (body: force, rebuild, from_working_tree, use_lkg; query: ?wait=)
 
-**IMPORTANT:** When the user has asked for the restart and you modified runner Rust code, use `"rebuild": true` to recompile before restart.
+**About `"rebuild": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can take ~40 minutes); and the request returns 202 and runs detached, so a refusal shows up in `GET {{supervisor_base}}/builds`, not as a synchronous 409. To exercise an unmerged runner change, use a temporary runner from `POST {{supervisor_base}}/runners/spawn-test` instead of restarting the runner hosting you.
 
 ---
 
@@ -3004,6 +3004,19 @@ mod tests {
         // No literal port: the rendered text carries only the CONFIGURED
         // supervisor base, which on a default box does happen to be :9875.
         assert!(!AI_SESSION_SUPERVISOR_RESTART_RECIPE.contains("9875"));
+        // Fields the supervisor's RestartRequest does not have.
+        assert!(!up.text.contains("trigger_auto_continue"), "{}", up.text);
+        assert!(!up.text.contains("wait_timeout_seconds"), "{}", up.text);
+        assert!(
+            !up.text.contains("from_working_tree\": true"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("Nothing resumes this session"),
+            "{}",
+            up.text
+        );
     }
 
     /// A served body with the LEGACY supervisor shape is refused on the

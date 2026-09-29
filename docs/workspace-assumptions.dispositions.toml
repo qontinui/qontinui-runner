@@ -253,8 +253,9 @@ reviewed = [
     "(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...",
     "**Supervisor API ({{supervisor_base}}):**",
     "Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo ...",
-    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"rebuild\": true, \"trigger_...",
-    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"trigger_auto_continue\": t...",
+    "**About `\"rebuild\": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can ...",
+    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"rebuild\": true}'",
+    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true}'",
 ]
 
 [[disposition]]
