@@ -11,6 +11,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::mcp::origin_guard::{OriginClass, RequesterPrincipal};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::scheduler::{ScheduledTaskExt, TaskExecutionRecordExt};
 
@@ -101,6 +102,50 @@ fn read_failed(what: &str, e: impl std::fmt::Display) -> ReadError {
 }
 
 // ============================================================================
+// requireProbe authorization
+// ============================================================================
+
+/// Refuse a `requireProbe` the requester may not set.
+///
+/// A probe is a command the scheduler execs as this device's user, so writing
+/// one is command execution. `POST /scheduler/tasks` and
+/// `PUT /scheduler/tasks/{id}` are `TRUSTED_ROUTES` (the qontinui-web dev
+/// frontend manages tasks through them), and under the default
+/// `EnforceDoors` route policy a Foreign browser origin reaching them is only
+/// SHADOWED, i.e. admitted. Moving the two routes to `CREDENTIAL_DOORS` would
+/// cut the web frontend off from task management altogether, so the gate is
+/// narrower and lives here: only a NonBrowser caller (an agent, a script,
+/// `curl`) or the runner's own webview (FirstParty) may set or change a
+/// probe. Every browser class — Trusted included, because an operator-added
+/// Trusted origin gets every other command-execution door refused — is
+/// answered 403. An absent principal (a request that did not pass the origin
+/// guard) is UNKNOWN and refused, never read as trusted.
+///
+/// `existing` is the stored probe on an update: re-sending it unchanged (a web
+/// UI echoing a task back while renaming it) grants nothing new and passes.
+/// `Err` carries the refusal message; the handlers answer it with 403.
+pub(crate) fn refuse_untrusted_probe(
+    principal: Option<&RequesterPrincipal>,
+    requested: Option<&crate::scheduler::ProbeCondition>,
+    existing: Option<&crate::scheduler::ProbeCondition>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if existing == Some(requested) {
+        return Ok(());
+    }
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "requireProbe runs a command as this device's user; only a non-browser caller \
+             or the runner's own UI may set or change it (requester class: {})",
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -119,6 +164,7 @@ pub async fn list_scheduled_tasks(
 /// Create a new scheduled task
 pub async fn create_scheduled_task(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<RequesterPrincipal>>,
     Json(request): Json<CreateScheduledTaskRequest>,
 ) -> Result<
     (
@@ -130,6 +176,12 @@ pub async fn create_scheduled_task(
     let pg = &state.app_state.pg_db;
 
     if let Some(conditions) = &request.conditions {
+        refuse_untrusted_probe(
+            principal.as_ref().map(|p| &p.0),
+            conditions.require_probe.as_ref(),
+            None,
+        )
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
         crate::scheduler_probe::validate_conditions(conditions)
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     }
@@ -211,6 +263,7 @@ pub async fn get_scheduled_task(
 /// Update an existing scheduled task
 pub async fn update_scheduled_task(
     State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<RequesterPrincipal>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateScheduledTaskRequest>,
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
@@ -258,6 +311,15 @@ pub async fn update_scheduled_task(
     }
     if let Some(conditions) = request.conditions {
         if let Some(conditions) = &conditions {
+            refuse_untrusted_probe(
+                principal.as_ref().map(|p| &p.0),
+                conditions.require_probe.as_ref(),
+                scheduled_task
+                    .conditions
+                    .as_ref()
+                    .and_then(|c| c.require_probe.as_ref()),
+            )
+            .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
             crate::scheduler_probe::validate_conditions(conditions)
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
         }
@@ -557,7 +619,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::UpdateSchedulerSettingsRequest;
+    use super::*;
 
     /// Phase 5a: the three shapes of `timezone` on a settings PUT are three
     /// different requests, and `null` (clear back to local time) must not fold
@@ -573,5 +635,82 @@ mod tests {
         let set: UpdateSchedulerSettingsRequest =
             serde_json::from_str(r#"{"timezone":"Europe/Berlin"}"#).unwrap();
         assert_eq!(set.timezone, Some(Some("Europe/Berlin".to_string())));
+    }
+
+    fn probe(cmd: &str) -> crate::scheduler::ProbeCondition {
+        crate::scheduler::ProbeCondition {
+            enabled: true,
+            command: vec!["sh".into(), "-c".into(), cmd.into()],
+            poll_seconds: 60,
+            timeout_seconds: 10,
+        }
+    }
+
+    fn principal(class: OriginClass) -> RequesterPrincipal {
+        RequesterPrincipal {
+            class,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn only_non_browser_and_first_party_may_set_a_probe() {
+        let p = probe("exit 0");
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_untrusted_probe(Some(&principal(class)), Some(&p), None).is_ok());
+        }
+        for class in [
+            OriginClass::Trusted,
+            OriginClass::Extension,
+            OriginClass::Foreign,
+        ] {
+            let refusal =
+                refuse_untrusted_probe(Some(&principal(class)), Some(&p), None).unwrap_err();
+            assert!(refusal.contains(class.as_str()), "{refusal}");
+        }
+        // No principal = UNKNOWN, refused.
+        assert!(refuse_untrusted_probe(None, Some(&p), None)
+            .unwrap_err()
+            .contains("unknown"));
+        // No probe in the request: nothing to gate.
+        assert!(
+            refuse_untrusted_probe(Some(&principal(OriginClass::Foreign)), None, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn echoing_the_stored_probe_back_unchanged_is_not_a_new_grant() {
+        let stored = probe("exit 0");
+        let foreign = principal(OriginClass::Trusted);
+        assert!(refuse_untrusted_probe(Some(&foreign), Some(&stored), Some(&stored)).is_ok());
+        let changed = probe("id > /tmp/pwned");
+        assert!(refuse_untrusted_probe(Some(&foreign), Some(&changed), Some(&stored)).is_err());
+        let mut enabled = stored.clone();
+        enabled.enabled = false;
+        assert!(
+            refuse_untrusted_probe(Some(&foreign), Some(&stored), Some(&enabled)).is_err(),
+            "enabling a stored probe is a change"
+        );
+    }
+
+    /// Both write handlers gate the probe on the requester BEFORE persisting.
+    #[test]
+    fn both_task_write_handlers_gate_the_probe_before_persisting() {
+        let src = include_str!("scheduler.rs");
+        for (handler, write) in [
+            ("pub async fn create_scheduled_task(", "pg.insert_scheduled_task("),
+            ("pub async fn update_scheduled_task(", "pg.update_scheduled_task("),
+        ] {
+            let (_, body) = src.split_once(handler).expect(handler);
+            let (before_gate, _) = body
+                .split_once("refuse_untrusted_probe(")
+                .expect("gate call");
+            let (before_persist, _) = body.split_once(write).expect("persist call");
+            assert!(
+                before_gate.len() < before_persist.len(),
+                "{handler} must refuse before {write}"
+            );
+            assert!(before_gate.contains("Option<axum::Extension<RequesterPrincipal>>"));
+        }
     }
 }
