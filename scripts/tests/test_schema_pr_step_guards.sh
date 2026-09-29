@@ -293,7 +293,7 @@ if [ "${1:-}" = "api" ]; then
     *" graphql "*)   key="graphql" ;;
     *"/check-runs"*) key="check-runs" ;;
     *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
-    *"/pulls/"*)     key="pr-body" ;;
+    *"/pulls/"*)     if [ "$method" = "PATCH" ]; then key="pr-close"; else key="pr-body"; fi ;;
     *)               key="api:unhandled" ;;
   esac
 fi
@@ -313,11 +313,12 @@ case "$key" in
   list)      printf '%s\n' "${GH_STUB_LIST_OPEN:-}" ;;
   list:ready)
     if [ "${GH_STUB_READY_LINE:-}" != "none" ]; then
-      printf '%s\n' "${GH_STUB_READY_LINE:-$(printf '4242\ttrue\t%s\tPR_kwDOtest4242\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak' a47f223e3a47f223e3a47f223e3a47f223e3a47f)}"
+      printf '%s\n' "${GH_STUB_READY_LINE:-$(printf '4242\ttrue\t%s\tPR_kwDOtest4242\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak\tMERGEABLE\tCLEAN' a47f223e3a47f223e3a47f223e3a47f223e3a47f)}"
     fi
     ;;
   check-runs)    printf '%s\n' "${GH_STUB_CHECKS:-3}" ;;
   graphql)       printf '%s\n' "${GH_STUB_GRAPHQL_ISDRAFT:-false}" ;;
+  pr-close)      echo "closed" ;;
   comments-read) if [ -n "${GH_STUB_COMMENTS:-}" ] && [ -f "$GH_STUB_COMMENTS" ]; then cat "$GH_STUB_COMMENTS"; fi ;;
   pr-body)       printf '%s\n' "${GH_STUB_PR_BODY:-}" ;;
   view:isDraft)  printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
@@ -357,6 +358,17 @@ fi
 # gh stub's ready lookup reports, so the ready script's --expect-head converges.
 if [ "${1:-}" = "rev-parse" ]; then
   echo "a47f223e3a47f223e3a47f223e3a47f223e3a47f"
+fi
+# `git ls-remote origin refs/heads/<b>` is the sweep's head pin.
+# GIT_STUB_REMOTE_HEAD: the sha to report (default: the same head the gh stub
+# reports), "none" for an absent branch, "fail" for a refused call.
+if [ "${1:-}" = "ls-remote" ]; then
+  case "${GIT_STUB_REMOTE_HEAD:-}" in
+    fail) echo "fatal: could not read from remote repository" >&2; exit 128 ;;
+    none) : ;;
+    "")   printf 'a47f223e3a47f223e3a47f223e3a47f223e3a47f\trefs/heads/%s\n' "${3#refs/heads/}" ;;
+    *)    printf '%s\trefs/heads/%s\n' "$GIT_STUB_REMOTE_HEAD" "${3#refs/heads/}" ;;
+  esac
 fi
 exit 0
 STUB
@@ -766,6 +778,7 @@ sweep_if="$(extract_if "$SWEEP_STEP")"
 
 echo ""
 echo "Static properties of the sweep step:"
+assert "the PR step's own lookup ignores fork PRs" 1 "$(grep -c 'select(.isCrossRepository == false)' "$code_only" || true)"
 assert "sweep calls the script with --max-age-hours 48" 1 "$(grep -c 'bash scripts/ci/ready-bot-draft-pr.sh .*--max-age-hours 48' "$sweep_body" || true)"
 assert "sweep: no '|| true'" 0 "$(grep -vE '^[[:space:]]*#' "$sweep_body" | grep -c '|| true' || true)"
 # Belt and braces over the behavioural case below: the sweep's selector must
@@ -823,8 +836,17 @@ run_fresh() {
 }
 
 # run_sweep — echoes the exit code; stdout+stderr in $work/sweep.log, gh keys in
-# $work/gh.log, summary in $work/sweep.summary.md.
+# $work/gh.log, summary in $work/sweep.summary.md. DRIFT is fresh_check's
+# output unless SWEEP_DRIFT_OVERRIDE is set (to model an empty/unknown one,
+# set it to "EMPTY").
 run_sweep() {
+  local drift
+  drift="$(sed -n 's/^drift=//p' "$work/fresh.out")"
+  case "${SWEEP_DRIFT_OVERRIDE:-}" in
+    "") : ;;
+    EMPTY) drift="" ;;
+    *) drift="$SWEEP_DRIFT_OVERRIDE" ;;
+  esac
   : > "$work/gh.log"
   : > "$work/sweep.summary.md"
   local rc=0
@@ -840,6 +862,9 @@ run_sweep() {
     REPO="qontinui/qontinui-runner" \
     BRANCH="chore/schema-pg-sql-refresh" \
     HEALED="$(sed -n 's/^healed=//p' "$work/fresh.out")" \
+    DRIFT="$drift" \
+    GIT_STUB_LOG="$work/git.log" \
+    GIT_STUB_REMOTE_HEAD="${GIT_STUB_REMOTE_HEAD:-}" \
     RUNNER_TEMP="$runner_temp" \
     GITHUB_STEP_SUMMARY="$work/sweep.summary.md" \
     bash "$sweep_body"
@@ -878,9 +903,11 @@ assert "drift + self-heal: summary names the drifted table" 1 "$(grep -c 'coord.
 assert "drift + self-heal: PR step runs" "true" "$(eval_if "$pr_if" "$work/fresh.out")"
 assert "drift + self-heal: sweep step runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out")"
 
-# A2. An EARLIER step failed (poetry, alembic, regeneration): that night
-#     delivers nothing, and a parked PR still needs its re-decide and page.
-#     fresh_check writes self_heal first, so the output is set.
+# A2. A step failed AFTER fresh_check wrote self_heal (a regeneration fault or
+#     shape guard inside fresh_check, or the PR step): the parked PR still
+#     needs its re-decide and page. (A poetry/alembic/Atlas failure comes
+#     BEFORE fresh_check, leaves self_heal '', and skips the sweep — covered
+#     by case C's shape: an empty self_heal never runs it.)
 assert "upstream failure: PR step does not run" "false" "$(eval_if "$pr_if" "$work/fresh.out" failed)"
 assert "upstream failure: sweep step still runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out" failed)"
 
@@ -897,8 +924,14 @@ assert "drift, no self-heal: exit code (red)" 1 "$rc"
 assert "drift, no self-heal: healed=false" "false" "$(out_of healed)"
 assert "drift, no self-heal: no HEALED summary" 0 "$(grep -c 'drift HEALED' "$work/fresh.summary.md" || true)"
 
+# ready_line <isDraft> <mergeable> <mergeStateStatus> — the ready script's
+# lookup row (pre-filtered TSV, as the stub returns it).
+ready_line() {
+  printf '4242\t%s\ta47f223e3a47f223e3a47f223e3a47f223e3a47f\tPR_kwDOtest4242\t2026-01-01T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak\t%s\t%s' "$1" "$2" "$3"
+}
+
 # E. The sweep over an already-ready PR, and over no PR at all, is a green no-op.
-GH_STUB_READY_LINE="$(printf '4242\tfalse\ta47f223e3a47f223e3a47f223e3a47f223e3a47f\tPR_kwDOtest4242\t2026-01-01T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/4242\tjspinak')"
+GH_STUB_READY_LINE="$(ready_line false MERGEABLE CLEAN)"
 run_fresh true "$base_dump" > /dev/null
 rc="$(run_sweep)"
 assert "sweep over a ready PR: exit code" 0 "$rc"
@@ -908,6 +941,45 @@ rc="$(run_sweep)"
 GH_STUB_READY_LINE=""
 assert "sweep with no PR: exit code" 0 "$rc"
 assert "sweep with no PR: no-pr" "no-pr" "$(tail -n1 "$work/sweep.log")"
+
+# F. An OBSOLETE conflicting PR: closed only on an explicit no-drift night.
+#    (#1505 reads CONFLICTING/DIRTY today; on a night whose drift=false,
+#    main is already current and its change is obsolete.)
+GH_STUB_READY_LINE="$(ready_line false CONFLICTING DIRTY)"
+run_fresh true "$base_dump" > /dev/null
+rc="$(run_sweep)"
+assert "no-drift night + conflicting PR: exit code" 0 "$rc"
+assert "no-drift night + conflicting PR: sweep passes the flag -> closed" "closed-obsolete #4242" "$(tail -n1 "$work/sweep.log")"
+assert "no-drift night + conflicting PR: close call made" 1 "$(grep -c '^pr-close$' "$work/gh.log" || true)"
+run_fresh true "$drift_dump" > /dev/null
+rc="$(run_sweep)"
+assert "drift night + conflicting PR: exit code" 0 "$rc"
+assert "drift night + conflicting PR: no flag -> not closed" 0 "$(grep -c '^pr-close$' "$work/gh.log" || true)"
+run_fresh true "$base_dump" > /dev/null
+SWEEP_DRIFT_OVERRIDE=EMPTY
+rc="$(run_sweep)"
+SWEEP_DRIFT_OVERRIDE=""
+assert "empty drift output + conflicting PR: exit code" 0 "$rc"
+assert "empty drift output + conflicting PR: no flag -> not closed" 0 "$(grep -c '^pr-close$' "$work/gh.log" || true)"
+GH_STUB_READY_LINE=""
+
+# G. The sweep pins the head via `git ls-remote`: a lookup still reporting a
+#    stale head decides nothing; an absent branch pins nothing; a refused
+#    ls-remote is a red, not "no branch".
+run_fresh true "$base_dump" > /dev/null
+GIT_STUB_REMOTE_HEAD="c69f445a5c69f445a5c69f445a5c69f445a5c69f"
+rc="$(run_sweep)"
+assert "sweep, stale head: exit code" 0 "$rc"
+assert "sweep, stale head: head-mismatch" "head-mismatch #4242" "$(tail -n1 "$work/sweep.log")"
+assert "sweep, stale head: not readied" 0 "$(grep -c '^graphql$' "$work/gh.log" || true)"
+GIT_STUB_REMOTE_HEAD="none"
+rc="$(run_sweep)"
+assert "sweep, no remote branch: decided without a pin" "readied #4242" "$(tail -n1 "$work/sweep.log")"
+GIT_STUB_REMOTE_HEAD="fail"
+rc="$(run_sweep)"
+GIT_STUB_REMOTE_HEAD=""
+assert "sweep, ls-remote refused: exit code" 1 "$rc"
+assert "sweep, ls-remote refused: never decided" 0 "$(grep -c '^graphql$' "$work/gh.log" || true)"
 
 # --- Mutation proofs ----------------------------------------------------------
 if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
@@ -964,6 +1036,14 @@ if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
      in_sweep && /^        if: / { \$0 = \"        if: steps.fresh_check.outputs.self_heal == 'true'\"; in_sweep = 0 }
      { print }" \
     "upstream failure: sweep step still runs"
+  # Pass --close-if-obsolete unconditionally: a drift night would close.
+  mutate close-flag-unconditional \
+    '$0 == "          if [ \"$DRIFT\" = \"false\" ]; then" { $0 = "          if true; then" } { print }' \
+    "drift night + conflicting PR: no flag -> not closed"
+  # Drop the sweep's ls-remote head pin.
+  mutate sweep-head-pin-dropped \
+    '$0 == "            extra_args+=(--expect-head \"$remote_head\")" { $0 = "            :" } { print }' \
+    "sweep, stale head: head-mismatch"
   # Drop the head pin at the PR step's call site.
   mutate expect-head-dropped \
     '{ sub(/ --expect-head "\$pushed_sha"/, "") } { print }' \

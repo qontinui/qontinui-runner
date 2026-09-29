@@ -485,7 +485,9 @@ jobs:
 
           # Resolve any existing PR BEFORE touching the branch. No `|| true`:
           # a gh failure here must not read as "no PR exists".
-          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          # Same-repository PRs only: a fork PR whose branch shares the name is
+          # never this workflow's to edit, comment on or force-push under.
+          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
 
           # Identity of THIS run's regenerated dump, banner stripped (the
           # banner is client noise, same rule as fresh_check's comparison).
@@ -706,6 +708,7 @@ jobs:
           case "$pr_state" in
             "readied #"*|"already-ready #"*) pr_state_word="ready for review ($pr_state)" ;;
             "head-mismatch #"*) pr_state_word="still a DRAFT: GitHub had not yet reported the pushed head $pushed_sha ($pr_state); the sweep step re-decides" ;;
+            "draft-conflicting #"*) pr_state_word="still a DRAFT: GitHub reports it conflicting with main ($pr_state); it is not readied, and the next run re-decides" ;;
             "draft-no-checks #"*) pr_state_word="still a DRAFT: its head carries no Actions check runs yet ($pr_state); the sweep step re-decides every night" ;;
             *)
               echo "::warning::The PR was written moments ago but the draft->ready lookup reported '$pr_state'; the sweep step re-decides it."
@@ -725,17 +728,27 @@ jobs:
       # decides at one instant; a PR created on the GITHUB_TOKEN arm, or before
       # its checks registered, would otherwise stay a draft until the next
       # drift. Keyed on `self_heal` (the same selector as the PR step, minus the
-      # drift term) under `!cancelled()`, NOT the default success(): a night
-      # whose poetry install, alembic chain or regeneration FAILED is exactly a
-      # night that delivers nothing new, and the parked PR still needs its
-      # re-decide and its page. The sweep's own failure still reds the run.
-      # `self_heal` is written as fresh_check's FIRST line, so it is set on
-      # every run that reached that step; if an EARLIER step failed, the output
-      # is '' and the condition reads false — the sweep is skipped on a run
-      # that never got far enough to know it may self-heal. Accepted.
+      # drift term) under `!cancelled()` rather than the default success().
+      # Say exactly what that buys: `self_heal` is written as fresh_check's
+      # FIRST line, so the sweep still runs when fresh_check ITSELF fails after
+      # that line (a regeneration fault, a shape guard) or when the PR step
+      # fails. It does NOT run when poetry, the alembic chain or the Atlas
+      # apply fails: those steps come BEFORE fresh_check, so `self_heal` is ''
+      # and the condition reads false. Accepted — such a night reaches the
+      # parked PR again the next night. The sweep's own failure still reds.
       # It is the LAST step that touches the PR, after every draft read.
-      # --max-age-hours 48 (two nightlies) pages once, on the PR, when a draft
-      # with zero check runs has sat past the budget.
+      #
+      # What it passes the script:
+      #   --max-age-hours 48  (two nightlies) page once on a draft parked past
+      #                       the budget (no Actions checks, or conflicting).
+      #   --expect-head       the branch's head per `git ls-remote`, so the
+      #                       decision is on the commit the branch carries now;
+      #                       an absent branch passes none.
+      #   --close-if-obsolete ONLY when fresh_check reported drift=false
+      #                       EXPLICITLY: main is already current, so a PR that
+      #                       conflicts with it carries an obsolete change. An
+      #                       empty `drift` (fresh_check failed before deciding)
+      #                       is UNKNOWN and never closes anything.
       - name: Sweep the refresh PR (ready it once it carries checks; page if parked)
         id: sweep
         if: ${{ !cancelled() && steps.fresh_check.outputs.self_heal == 'true' }}
@@ -746,10 +759,24 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: chore/schema-pg-sql-refresh
           HEALED: ${{ steps.fresh_check.outputs.healed }}
+          DRIFT: ${{ steps.fresh_check.outputs.drift }}
         run: |
           set -euo pipefail
           sweep_log="$RUNNER_TEMP/ready-bot-draft-pr.sweep.log"
-          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 | tee "$sweep_log"; then
+          extra_args=()
+          # No `|| true`: an unanswered ls-remote is not "no branch".
+          if ! remote_line="$(git ls-remote origin "refs/heads/$BRANCH")"; then
+            echo "::error::git ls-remote for '$BRANCH' failed (see above); refusing to decide on an unpinned head."
+            exit 1
+          fi
+          remote_head="${remote_line%%$'\t'*}"
+          if [ -n "$remote_head" ]; then
+            extra_args+=(--expect-head "$remote_head")
+          fi
+          if [ "$DRIFT" = "false" ]; then
+            extra_args+=(--close-if-obsolete)
+          fi
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 "${extra_args[@]}" | tee "$sweep_log"; then
             echo "::error::The refresh-PR sweep could not decide the draft/ready state of '$BRANCH''s PR on $REPO (see the ::error:: above)."
             echo "::error::It runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal means that permissions block has drifted."
             exit 1
@@ -757,7 +784,7 @@ jobs:
           {
             echo "### schema.pg.sql.generated refresh-PR sweep"
             echo ""
-            echo "healed=$HEALED; sweep outcome: \`$(tail -n1 "$sweep_log")\`"
+            echo "healed=$HEALED; drift=${DRIFT:-unknown}; sweep outcome: \`$(tail -n1 "$sweep_log")\`"
             echo ""
             echo '```'
             cat "$sweep_log"
