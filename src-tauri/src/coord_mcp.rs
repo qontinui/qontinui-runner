@@ -1365,10 +1365,17 @@ pub(crate) fn runner_credential_remedy(
              automatic rung exists. Your nonce is fine and a new session will not help. \
              Re-pair this runner (operator action); meanwhile use a credential-free door."
         }
-        P::Dark(_) => {
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected) => {
             "Coord is REJECTING this runner's credential even though it has not expired \
              locally (revoked jti, rotated key, or a token bound to another tenant). Your \
              nonce is fine. Re-pair this runner; meanwhile use a credential-free door."
+        }
+        P::Dark(crate::mcp::device_jwt_refresher::DarkCause::NoDefaultBinding) => {
+            "This runner HOLDS a valid per-tenant coord credential, but paired_user.json names \
+             no default binding pointing at it and the runner's self-heal refused (the runner \
+             log line `paired_user.json heal refused: …` and /health coordCredential.detail \
+             name the guard). Your nonce is fine. A session pinned to a tenant with a live slot \
+             still works; re-pair this runner (operator sign-in) to restore the default."
         }
     }
 }
@@ -23602,6 +23609,22 @@ mod runner_credential_tests {
             runner_credential_refusal_code(P::Dark(DarkCause::UpstreamRejected)),
             Some("runner_credential_dark")
         );
+        // A new `dark` CAUSE rides the existing token rather than minting a
+        // fifth one nothing downstream knows (plan
+        // 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3).
+        assert_eq!(
+            runner_credential_refusal_code(P::Dark(DarkCause::NoDefaultBinding)),
+            Some("runner_credential_dark")
+        );
+        assert_eq!(
+            runner_credential_breadcrumb_verdict(P::Dark(DarkCause::NoDefaultBinding)),
+            runner_credential_breadcrumb_verdict(P::Dark(DarkCause::UpstreamRejected)),
+        );
+        assert!(
+            runner_credential_remedy(P::Dark(DarkCause::NoDefaultBinding))
+                .contains("paired_user.json"),
+            "the remedy must name the missing file, not blame coord"
+        );
         // The two that CAN answer have no code, because they are not refused.
         assert_eq!(runner_credential_refusal_code(P::Live), None);
         assert_eq!(runner_credential_refusal_code(P::Expiring), None);
@@ -24717,6 +24740,7 @@ mod spawn_tenant_credential_tests {
             attributable: true,
             composed_reason: None,
             pinned_tenant: false,
+            detail: None,
         };
 
         let b_path =

@@ -19630,6 +19630,7 @@ mod coord_provision_session_gate_tests {
             CoordCredentialPosture::Absent,
             CoordCredentialPosture::Unrefreshable,
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
         ];
         for posture in dark {
             let v =

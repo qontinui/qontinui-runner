@@ -1465,6 +1465,7 @@ mod tests {
             attributable: true,
             composed_reason: None,
             pinned_tenant: false,
+            detail: None,
         }
     }
 
