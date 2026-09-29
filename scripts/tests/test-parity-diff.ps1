@@ -454,7 +454,7 @@ Assert-Equal "hashtable: full dirs agree with observed rows"  (@(Get-ParitySelfR
 Assert-Equal "hashtable: the verdict resolves, not unknown" 'provisioned_fewer(dev=93,published=72)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 93 } -PublishedWitness @{ commands = 72 })
 # An absent key is still "could not look", on either shape.
 Assert-Equal "hashtable: an absent key is unknown, not zero" 'unknown(no_command_listing_on_the_dev_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ skills = 1 } -PublishedWitness @{ commands = 5 })
-Assert-Equal "hashtable: a present \$null key is unknown too" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 5 } -PublishedWitness @{ commands = $null })
+Assert-Equal 'hashtable: a present $null key is unknown too' 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 5 } -PublishedWitness @{ commands = $null })
 
 Write-Host "[12] the typed slash-commands verdict (Phase 5, exit (d))"
 Assert-Equal "equal counts" 'provisioned_equal' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 73 }) -PublishedWitness ([PSCustomObject]@{ commands = 73 }))

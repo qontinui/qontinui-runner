@@ -910,19 +910,27 @@ struct ProvisionProbeBody {
     /// `.claude/agents/` into. Caller-supplied and caller-owned: the probe
     /// creates nothing outside it and removes nothing.
     ///
-    /// `default` on purpose: without it an absent field is rejected by the `Json`
-    /// extractor as a 422 before the handler runs, which contradicts this
+    /// `Option` + `default` on purpose: without them an absent field — and,
+    /// with a bare `#[serde(default)]`, an explicit `null` — is rejected by the
+    /// `Json` extractor as a 422 before the handler runs, which contradicts this
     /// route's contract that every refusal is typed and names the next action.
+    /// Both shapes now land on the same 400 as an empty string.
     #[serde(default)]
-    workdir: String,
+    workdir: Option<String>,
 }
 
 /// What `POST /capability-manifest/provision-probe` answers with.
 #[derive(Debug, serde::Serialize)]
 struct ProvisionProbeResponse {
     /// Echoed back so a caller driving several probes can match answers to
-    /// requests without relying on ordering.
+    /// requests without relying on ordering. This is the CANONICAL form of what
+    /// the caller asked for, which on Windows is a verbatim `\\?\C:\...` path.
     workdir: String,
+    /// Where the provisioning actually landed: a fresh directory the probe
+    /// created inside `workdir`, never `workdir` itself. A caller that wants to
+    /// witness the files on disk — as the parity harness does — must list THIS
+    /// path, because `<workdir>/.claude` is deliberately never written.
+    provisioned_into: String,
     /// The `agent_definitions` report this pass recorded — ONE entry, not both
     /// rows. The embedded `fleet_agents` floor is recorded by the same call from
     /// inside `provision_agent_definitions_from_root`, which does not hand it
@@ -973,7 +981,7 @@ async fn capability_manifest_provision_probe(
             .into_response()
     };
 
-    let requested = body.workdir.trim().to_string();
+    let requested = body.workdir.unwrap_or_default().trim().to_string();
     if requested.is_empty() {
         return refuse("workdir is required and must be an absolute path".to_string());
     }
@@ -1020,17 +1028,55 @@ async fn capability_manifest_provision_probe(
     // so writing there would overwrite the operator's own hand-authored defs
     // with this binary's embedded snapshot. No git guard catches it: a home dir
     // is not a work tree.
-    if let Some(home) = dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok()) {
-        if path == home || home.starts_with(&path) {
-            return refuse(format!(
-                "workdir {requested:?} resolves to {workdir:?}, which is the home directory \
-                 {home:?} or an ancestor of it. Provisioning there would overwrite the \
-                 user-scoped ~/.claude/agents definitions. Point it at a scratch directory."
-            ));
+    match dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok()) {
+        Some(home) => {
+            // `path == home` or `path` is an ANCESTOR of home. The descendant
+            // direction is deliberately absent: on Windows the harness's own
+            // scratch dir lives under %USERPROFILE%\AppData\Local\Temp.
+            if path == home || home.starts_with(&path) {
+                return refuse(format!(
+                    "workdir {requested:?} resolves to {workdir:?}, which is the home directory \
+                     {home:?} or an ancestor of it. Provisioning there would overwrite the \
+                     user-scoped ~/.claude/agents definitions. Point it at a scratch directory."
+                ));
+            }
         }
+        // FAIL LOUD, not open. A container or service account with no resolvable
+        // home skips this guard; on a route whose purpose is making UNKNOWN
+        // legible, that must not be silent.
+        None => tracing::warn!(
+            workdir = %workdir,
+            "provision probe: the home directory could not be resolved, so the \
+             home-directory guard did NOT run for this call"
+        ),
     }
 
-    let workdir_for_task = workdir.clone();
+    // THE GUARDS ABOVE VET `path`. THE PROVISIONERS WRITE `path/.claude/agents`.
+    //
+    // Guarding only the workdir leaves the same bypass one level down: the
+    // provisioners reach the target with `create_dir_all` / `fs::write` /
+    // `fs::copy`, all of which FOLLOW symlinks, so a `.claude` link pre-placed
+    // inside an otherwise-innocent scratch dir writes straight into a checkout
+    // while every check above passes.
+    //
+    // Rather than inspect what is there — which is both racy and easy to get
+    // subtly wrong — the probe writes into a directory it CREATES ITSELF.
+    // `create_dir` (not `create_dir_all`) is atomic and fails with
+    // `AlreadyExists` rather than following anything, and a directory that did
+    // not exist a moment ago cannot contain a pre-placed link. That closes the
+    // write-through entirely and bounds the residual TOCTOU to a race against a
+    // name the caller cannot predict.
+    let target = path.join(format!("probe-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::create_dir(&target) {
+        return refuse(format!(
+            "could not create the probe's own target directory under {workdir:?}: {e}. \
+             The probe never writes into a directory it did not create, so it cannot \
+             continue."
+        ));
+    }
+    let provisioned_into = target.display().to_string();
+
+    let workdir_for_task = provisioned_into.clone();
     let recorded = match spawn_blocking_tracked(move || {
         crate::agent_runtime::provision_agent_definitions_recorded(&workdir_for_task)
     })
@@ -1054,7 +1100,12 @@ async fn capability_manifest_provision_probe(
         }
     };
 
-    Json(ProvisionProbeResponse { workdir, recorded }).into_response()
+    Json(ProvisionProbeResponse {
+        workdir,
+        provisioned_into,
+        recorded,
+    })
+    .into_response()
 }
 
 /// The git work tree `path` sits in, if any — the directory holding a `.git`
@@ -20087,7 +20138,7 @@ mod provision_probe_tests {
     /// Drive the handler and return `(status, body)`.
     async fn probe(workdir: &str) -> (axum::http::StatusCode, String) {
         let resp = capability_manifest_provision_probe(Json(ProvisionProbeBody {
-            workdir: workdir.to_string(),
+            workdir: Some(workdir.to_string()),
         }))
         .await;
         let status = resp.status();
@@ -20200,6 +20251,52 @@ mod provision_probe_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// THE BYPASS ONE LEVEL DOWN, found by the review of the first fix: the
+    /// workdir itself is clean, but `<workdir>/.claude` is a symlink into a
+    /// checkout, and every provisioner reaches the target with calls that follow
+    /// symlinks. The probe writes into a directory it creates itself, so a
+    /// pre-placed link is never followed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_dot_claude_inside_the_workdir_is_not_written_through() {
+        let root =
+            std::env::temp_dir().join(format!("parity-probe-dotclaude-{}", std::process::id()));
+        let repo = root.join("repo");
+        let repo_claude = repo.join(".claude");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(repo_claude.join("agents")).expect("create repo/.claude/agents");
+        std::fs::write(repo.join(".git"), b"gitdir: /elsewhere\n").expect("write .git");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        // The trap: an innocent-looking scratch dir whose .claude points into the repo.
+        std::os::unix::fs::symlink(&repo_claude, scratch.join(".claude")).expect("symlink");
+        let canary = repo_claude.join("agents").join("merge-specialist.md");
+        std::fs::write(&canary, b"HAND-AUTHORED\n").expect("write canary");
+
+        let (status, body) = probe(&scratch.display().to_string()).await;
+
+        // The call may succeed -- the scratch dir IS outside any work tree. What
+        // must hold is that nothing reached the repository through the link.
+        assert_eq!(
+            std::fs::read_to_string(&canary).expect("canary still readable"),
+            "HAND-AUTHORED\n",
+            "the hand-authored definition must be untouched (status {status}, body {body})"
+        );
+        if status == axum::http::StatusCode::OK {
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let into = parsed["provisioned_into"].as_str().expect("provisioned_into");
+            assert!(
+                std::path::Path::new(into).starts_with(&scratch),
+                "provisioning must land inside the caller's own scratch dir, not {into}"
+            );
+            assert!(
+                !std::path::Path::new(into).starts_with(&repo),
+                "and never inside the repository"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A home directory is not a git work tree, and `~/.claude/agents` holds the
     /// operator's own hand-authored definitions. The git guard cannot catch it.
     #[tokio::test(flavor = "multi_thread")]
@@ -20235,8 +20332,10 @@ mod provision_probe_tests {
         let dir = std::env::temp_dir().join(format!("parity-probe-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch");
         // Guard the guard: a temp dir that happens to sit inside a repo would
-        // make this test assert the wrong arm.
-        if enclosing_git_work_tree(&dir).is_some() {
+        // make this test assert the wrong arm. Check the CANONICAL path, which
+        // is what the handler checks — on macOS /var resolves to /private/var.
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if enclosing_git_work_tree(&canonical).is_some() {
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
@@ -20250,6 +20349,22 @@ mod provision_probe_tests {
         assert!(
             body.contains("\"workdir\""),
             "the workdir is echoed so concurrent probes can be matched: {body}"
+        );
+        // The probe never writes into the caller's directory itself.
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let into = parsed["provisioned_into"].as_str().expect("provisioned_into");
+        assert_ne!(
+            std::path::Path::new(into),
+            canonical.as_path(),
+            "provisioning must land in a directory the probe created, not the workdir"
+        );
+        assert!(
+            std::path::Path::new(into).starts_with(&canonical),
+            "and that directory must be inside the workdir: {into}"
+        );
+        assert!(
+            !canonical.join(".claude").exists(),
+            "so <workdir>/.claude is never created at all"
         );
 
         std::fs::remove_dir_all(&dir).ok();

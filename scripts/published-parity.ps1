@@ -158,6 +158,14 @@ param(
     # 409 (coord's drain state is Unknown until its first read folds). Bounded so
     # the whole drive stays inside the CI step's own timeout; see the sizing note
     # on the workflow's -TimeoutSec.
+    #
+    # TRADE-OFF, stated rather than buried: 60s is a THIRD less patience than the
+    # 90s this started at. If a box's drain fold takes longer than this, the
+    # terminal never gets created and four provisioning rows stay `unknown` on
+    # both legs. That reads as UNKNOWN with the refusing door named -- honest,
+    # but it is a real cut in the harness's chance of filling those rows. If
+    # `terminal_create_refused` starts appearing in the artifact, raise this
+    # before concluding anything about the rows it left unread.
     [int]$TerminalRetrySecs = 60,
     # INSTRUMENT SELF-CHECK, not a parity run. Boots the DEVELOPMENT build twice
     # -- once with QONTINUI_ROOT pointed at a real workspace, once at an empty
@@ -494,6 +502,12 @@ function Invoke-ParityProvisioningDrive {
         terminal       = 'not_attempted'
         slash_sync     = 'not_attempted'
         provision_probe = 'not_attempted'
+        # Where the probe actually wrote. It creates its OWN directory inside
+        # $workdir rather than writing <workdir>/.claude -- a pre-placed .claude
+        # symlink would otherwise be followed straight into a checkout -- so the
+        # agents listing has to follow it there. $null when the probe did not
+        # answer, or answered without the field (an artifact predating it).
+        probe_workdir  = $null
     }
 
     # --- 1. POST /terminals -------------------------------------------------
@@ -576,8 +590,12 @@ function Invoke-ParityProvisioningDrive {
         $body = @{ workdir = $workdir } | ConvertTo-Json -Compress
         $resp = Invoke-WebRequest -Uri "$base/capability-manifest/provision-probe" -Method Post `
             -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        $probeParsed = $resp.Content | ConvertFrom-Json
+        if ($probeParsed -and $probeParsed.provisioned_into) {
+            $drive.probe_workdir = [string]$probeParsed.provisioned_into
+        }
         $drive.provision_probe = 'ok'
-        Write-Host "    provisioning drive: provision-probe ok"
+        Write-Host "    provisioning drive: provision-probe ok (wrote into $($drive.probe_workdir))"
     } catch {
         $code = $null
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
@@ -600,7 +618,12 @@ function Invoke-ParityProvisioningDrive {
 # the second can contradict a row (see Get-ParitySelfReportDisagreements).
 # ---------------------------------------------------------------------------
 function Get-ParityProvisionWitness {
-    param([string]$Workdir)
+    # $ProbeWorkdir is where the provision-probe wrote, which is NOT $Workdir:
+    # the probe creates its own directory so a pre-placed .claude symlink cannot
+    # be followed. The commands and skills come from the terminal chokepoint and
+    # do land in $Workdir. Passing $null leaves the agents count $null (UNKNOWN),
+    # never 0 -- "the probe did not answer" is not "the probe wrote nothing".
+    param([string]$Workdir, [string]$ProbeWorkdir = $null)
 
     $count = {
         param([string]$Dir, [string]$Filter, [bool]$Recurse)
@@ -614,10 +637,14 @@ function Get-ParityProvisionWitness {
     }
 
     $claude = Join-Path $Workdir '.claude'
+    $agentsCount = $null
+    if (-not [string]::IsNullOrWhiteSpace($ProbeWorkdir)) {
+        $agentsCount = & $count (Join-Path (Join-Path $ProbeWorkdir '.claude') 'agents') '*.md' $false
+    }
     return [PSCustomObject]@{
         commands = & $count (Join-Path $claude 'commands') '*.md' $false
         skills   = & $count (Join-Path $claude 'skills') 'SKILL.md' $true
-        agents   = & $count (Join-Path $claude 'agents') '*.md' $false
+        agents   = $agentsCount
     }
 }
 
@@ -646,7 +673,7 @@ function Get-ManifestOverHttp {
         # ledger is process-wide state, so the read below carries whatever the
         # drive just recorded. Same step, same workdir shape, on both legs.
         $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label -TerminalRetrySecs $TerminalRetrySecs
-        $witness = Get-ParityProvisionWitness -Workdir $drive.workdir
+        $witness = Get-ParityProvisionWitness -Workdir $drive.workdir -ProbeWorkdir $drive.probe_workdir
         Write-Host ("    provisioning witness: commands={0} skills={1} agents={2}" -f `
             $(if ($null -eq $witness.commands) { 'unknown' } else { $witness.commands }), `
             $(if ($null -eq $witness.skills) { 'unknown' } else { $witness.skills }), `
@@ -905,7 +932,7 @@ $observability = [PSCustomObject]@{
     # name: the command bodies provisioned into a session workdir, NOT the
     # `slash_commands` capability row (a different mechanism -- the import of a
     # checkout's commands as runner workflows, which writes nothing here).
-    slash_commands_status_source = 'session_workdir_command_listing(.claude/commands/*.md)' 
+    slash_commands_status_source = 'session_workdir_command_listing(.claude/commands/*.md)'
     session_ledger_limitation  = ("These rows are filled by the Phase 3 provisioning ledger, which records at " +
                                   "SESSION SPAWN. This harness now DRIVES that provisioning through the " +
                                   "artifact's own doors before reading the manifest (POST /terminals for the " +

@@ -239,13 +239,24 @@ jobs:
         run: |
           set -euo pipefail
           route='/capability-manifest/provision-probe'
-          for f in src-tauri/src/mcp_api.rs src-tauri/src/mcp/origin_guard.rs scripts/published-parity.ps1; do
-            if ! grep -qF "$route" "$f"; then
-              echo "::error file=$f::the probe route '$route' is not spelled here. All three spellings must agree, or a 404 reads as 'the artifact predates the probe'."
-              exit 1
+          # Pin the LIVE spellings, not any mention. All three files discuss the
+          # route in prose, so a bare grep for the path is satisfied by a comment
+          # while the real `.route()` / `-Uri` carries a typo -- which is exactly
+          # the failure this step exists to catch, wearing the disguise of "the
+          # artifact predates the probe".
+          fail=0
+          check() {  # <file> <literal> <what>
+            if grep -qF -- "$2" "$1"; then
+              echo "ok: $3"
+            else
+              echo "::error file=$1::the live $3 does not carry '$2'. All three spellings must agree, or a 404 reads as 'the artifact predates the probe' on a build compiled from this very commit."
+              fail=1
             fi
-            echo "ok: $f"
-          done
+          }
+          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route registration"
+          check src-tauri/src/mcp/origin_guard.rs   "\"POST ${route}\"," "credential-door entry"
+          check scripts/published-parity.ps1        "\$base${route}\"" "harness request URL"
+          exit $fail
         shell: bash
 
       # Siblings. qontinui-schemas is a hard compile dependency
@@ -372,10 +383,14 @@ jobs:
       # story behind this number -- a killed run does not bank the cache on
       # its way out (see save-if below) -- so a cold night here means ci.yml's
       # own `test`-job cache is cold or its key moved, which is rare and is
-      # not this job's to fix. Effective ladder with this bound: 65 (the four
+      # not this job's to fix. Effective ladder with this bound: 75 (the four
       # already-bounded steps, by their INNER TimeoutSec bounds, not the outer
-      # backstops) + 60 + ~4.5 of unbounded scaffolding + 5 (the behavioural
-      # axis, below) = ~134.5 of the job's 150-minute budget.
+      # backstops -- the manifest step's own moved 900s -> 1500s when Phase 5
+      # added the provisioning drive) + 60 + ~4.5 of unbounded scaffolding + 5
+      # (the behavioural axis, below) = ~144.5 of the job's 150-minute budget.
+      # That margin is now 5.5 minutes, not 15.5: the next step bound raised
+      # here needs the JOB bound raised with it, or a cold night is cancelled
+      # rather than reported.
       - name: Build Tauri app (development)
         timeout-minutes: 60
         run: pnpm run tauri build --debug --no-bundle
@@ -868,9 +883,14 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     # Dev build only: no install, no release download, no second boot of a
-    # 320 MB installed binary. Sized from the parity job's own measurements
-    # (warm dev build 20.6-28.4 min, cold completions up to 54) plus two boots.
-    timeout-minutes: 90
+    # 320 MB installed binary. The ladder inside it: build 60 + control 30 = 90
+    # of step budget, plus checkout, three sibling checkouts, pagefile, pnpm /
+    # node / rust setup, `pnpm install`, the PS unit tests and the two grep
+    # gates (~15 realistically). A JOB timeout is not survivable by
+    # `continue-on-error` -- it cancels the job, and `cancelled` is exactly the
+    # #1511 shape the scoping above exists to avoid -- so the job budget must
+    # exceed the ladder rather than meet it.
+    timeout-minutes: 115
 
     steps:
       - uses: actions/checkout@v5
@@ -970,13 +990,24 @@ jobs:
         run: |
           set -euo pipefail
           route='/capability-manifest/provision-probe'
-          for f in src-tauri/src/mcp_api.rs src-tauri/src/mcp/origin_guard.rs scripts/published-parity.ps1; do
-            if ! grep -qF "$route" "$f"; then
-              echo "::error file=$f::the probe route '$route' is not spelled here. All three spellings must agree, or a 404 reads as 'the artifact predates the probe'."
-              exit 1
+          # Pin the LIVE spellings, not any mention. All three files discuss the
+          # route in prose, so a bare grep for the path is satisfied by a comment
+          # while the real `.route()` / `-Uri` carries a typo -- which is exactly
+          # the failure this step exists to catch, wearing the disguise of "the
+          # artifact predates the probe".
+          fail=0
+          check() {  # <file> <literal> <what>
+            if grep -qF -- "$2" "$1"; then
+              echo "ok: $3"
+            else
+              echo "::error file=$1::the live $3 does not carry '$2'. All three spellings must agree, or a 404 reads as 'the artifact predates the probe' on a build compiled from this very commit."
+              fail=1
             fi
-            echo "ok: $f"
-          done
+          }
+          check src-tauri/src/mcp_api.rs            "\"${route}\"," "axum route registration"
+          check src-tauri/src/mcp/origin_guard.rs   "\"POST ${route}\"," "credential-door entry"
+          check scripts/published-parity.ps1        "\$base${route}\"" "harness request URL"
+          exit $fail
         shell: bash
 
       # Siblings. qontinui-schemas is a hard compile dependency
@@ -1103,10 +1134,10 @@ jobs:
       # story behind this number -- a killed run does not bank the cache on
       # its way out (see save-if below) -- so a cold night here means ci.yml's
       # own `test`-job cache is cold or its key moved, which is rare and is
-      # not this job's to fix. Effective ladder with this bound: 65 (the four
-      # already-bounded steps, by their INNER TimeoutSec bounds, not the outer
-      # backstops) + 60 + ~4.5 of unbounded scaffolding + 5 (the behavioural
-      # axis, below) = ~134.5 of the job's 150-minute budget.
+      # not this job's to fix. NOTE: the ladder arithmetic that sat here in the
+      # parity job does not apply to THIS job, which has a different budget
+      # (115) and a different ladder (build 60 + control 30 + ~15 scaffolding).
+      # See the job-level timeout-minutes comment above for the real numbers.
       - name: Build Tauri app (development)
         # REPORT-ONLY in this job, unlike the parity job's identical step. A cold
         # build that times out here would otherwise render as a failed job on a
@@ -1135,36 +1166,61 @@ jobs:
           pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
             -ScriptPath scripts/published-parity.ps1 -LogPath negative-control.log -TimeoutSec 1500 `
             -NegativeControl
-          exit $LASTEXITCODE
+          $code = $LASTEXITCODE
+          # The verdict step gates on THIS, not on a grep: a marker can be lost
+          # to a truncated redirect, an exit code cannot. Written before the
+          # step's own exit so `continue-on-error` cannot swallow it.
+          "exit-code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit $code
         shell: pwsh
 
-      # THE ONE GATING STEP IN THIS WORKFLOW, and it reads exactly one value.
+      # THE ONE GATING STEP IN THIS WORKFLOW, and it reads the control's EXIT
+      # CODE -- the value the control itself sets, which a truncated or missing
+      # log cannot forge:
       #
-      #   1  the control ran and the instrument is BLIND          -> RED
-      #   0  the control ran and the instrument sees the class    -> green
-      #   2  the control could not run (no dev exe, boot failed)  -> green + warning
-      #   anything else / no outcome (a cancelled or timed-out step) -> green + warning
+      #   1  the control ran and the instrument is BLIND             -> RED
+      #   0  the control ran and the instrument sees the class       -> green
+      #   2  the control could not run (no dev exe, boot failed)     -> green + warning
+      #   empty (the step was cancelled, timed out, or never ran)    -> green + warning
       #
       # "Could not look" is never "blind" -- resolving an unknown into a red here
       # would reproduce the #1511 shape this file already paid four days for.
+      # The log markers are read only as CORROBORATION, and a disagreement
+      # between the two is itself reported rather than silently resolved.
       - name: Negative control verdict
         if: always()
         env:
           OUTCOME: ${{ steps.control.outcome }}
           CODE: ${{ steps.control.outputs.exit-code }}
         run: |
-          echo "control step outcome: ${OUTCOME:-<none>}"
-          if grep -q 'NEGATIVE-CONTROL FAILED' negative-control.log 2>/dev/null; then
-            echo "::error::The parity harness is BLIND: taking the entire qontinui-claude-config checkout away changed no checkout-sensitive capability row. Its defect count -- including a 0 -- carries no information until this is fixed."
-            sed -n '/Negative control verdict/,$p' negative-control.log 2>/dev/null || true
-            exit 1
-          fi
-          if grep -q 'NEGATIVE-CONTROL OK' negative-control.log 2>/dev/null; then
-            echo "The instrument demonstrably sees the class."
-            exit 0
-          fi
-          echo "::warning::The negative control produced no verdict (outcome '${OUTCOME:-none}'). That is UNKNOWN, not a pass and not a failure -- read the uploaded log."
-          exit 0
+          echo "control step outcome: ${OUTCOME:-<none>}   exit code: ${CODE:-<none>}"
+          marker="none"
+          if grep -q 'NEGATIVE-CONTROL FAILED' negative-control.log 2>/dev/null; then marker="failed"; fi
+          if grep -q 'NEGATIVE-CONTROL OK'     negative-control.log 2>/dev/null; then marker="ok"; fi
+          echo "log marker: ${marker}"
+
+          case "${CODE:-}" in
+            1)
+              echo "::error::The parity harness is BLIND: taking the entire qontinui-claude-config checkout away changed no checkout-sensitive capability row. Its defect count -- including a 0 -- carries no information until this is fixed."
+              sed -n '/Negative control verdict/,$p' negative-control.log 2>/dev/null || true
+              exit 1
+              ;;
+            0)
+              if [ "${marker}" != "ok" ]; then
+                echo "::warning::The control exited 0 but its log carries no OK marker (marker='${marker}'). Reporting the exit code, and flagging the disagreement."
+              fi
+              echo "The instrument demonstrably sees the class."
+              exit 0
+              ;;
+            2)
+              echo "::warning::The negative control could not run (exit 2) -- no dev exe, or a leg failed to boot. That is UNKNOWN, not a pass and not a failure; read the uploaded log."
+              exit 0
+              ;;
+            *)
+              echo "::warning::The negative control produced no exit code (step outcome '${OUTCOME:-none}', log marker '${marker}'). UNKNOWN -- read the uploaded log."
+              exit 0
+              ;;
+          esac
         shell: bash
 
       - name: Upload the negative control log
