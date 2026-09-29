@@ -194,6 +194,37 @@ pub(crate) struct LocalBindingSet {
     /// Every locally-held binding (deduped; always contains
     /// `default_tenant`).
     pub(crate) tenant_ids: Vec<uuid::Uuid>,
+    /// Which source answered — it decides which credential a request made on
+    /// the strength of this set can present ([`Self::bearer_scope`]).
+    pub(crate) source: BindingSource,
+}
+
+/// Where [`resolve_binding_set`] found the binding set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingSource {
+    /// `paired_user.json`.
+    PairedUserFile,
+    /// The legacy `access_token` slot's `tenant_id` claim.
+    LegacySlotClaim,
+    /// The per-tenant `device_jwt:<tenant>` slots' own claims — the
+    /// last-resort source when the file is gone and the legacy slot is dead.
+    TenantSlotClaims,
+}
+
+impl LocalBindingSet {
+    /// The credential scope a device-level request resolved from this set
+    /// presents. `Device` (the legacy slot) everywhere it can answer; when the
+    /// set came from the per-tenant slots the legacy slot is by construction
+    /// dead or empty, so `Device` would send the request unauthenticated —
+    /// `Owned(default)` presents the default's own usable slot instead.
+    pub(crate) fn bearer_scope(&self) -> crate::auth::TenantScope {
+        match self.source {
+            BindingSource::TenantSlotClaims => crate::auth::TenantScope::Owned(self.default_tenant),
+            BindingSource::PairedUserFile | BindingSource::LegacySlotClaim => {
+                crate::auth::TenantScope::Device
+            }
+        }
+    }
 }
 
 /// Resolve the device's binding set for coord-side requests
@@ -202,44 +233,86 @@ pub(crate) struct LocalBindingSet {
 /// 1. `paired_user.json` — the v2-migrated binding set (legacy files
 ///    yield their one synthesized entry); the default is
 ///    `default_tenant_id`/`tenant_id`.
-/// 2. JWT-claim fallback — decode `tenant_id` from the cached
-///    device-token JWT via
-///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]; the set
-///    is that single tenant. (The pre-8a opportunistic disk backfill is
-///    gone — the register response's `tenant_ids` reconciliation is the
-///    file's healer now, and per-tick resolution works without the
-///    write-back.)
-/// 3. `None` — no source has a usable tenant. Callers must skip the
+/// 2. A USABLE legacy `access_token` JWT's `tenant_id` claim
+///    ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]); the set is
+///    that single tenant. (The pre-8a opportunistic disk backfill is gone —
+///    the register response's `tenant_ids` reconciliation is the file's
+///    healer now, and per-tick resolution works without the write-back.)
+/// 3. The per-tenant slots' own claims
+///    ([`qontinui_runner_lib::pair::usable_slot_claim_tenants`]) — plan
+///    `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+///    review finding 1. With the file gone and the legacy slot dead, the
+///    heartbeat was never sent, so `coord_bound_tenants.json` was never
+///    re-stamped, the bound set aged to UNKNOWN after
+///    `BINDING_GAP_ASK_MAX_AGE_SECS`, and the heal's Guard 1 refused forever.
+///    The heartbeat presents that slot's JWT ([`LocalBindingSet::bearer_scope`]).
+/// 4. A present-but-DEAD legacy JWT's claim — the historical branch 2, kept
+///    last so a runner with nothing better still names its tenant.
+/// 5. `None` — no source has a usable tenant. Callers must skip the
 ///    request (coord rejects with `400 tenant_id_required`).
 pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
-    // Branch 1 — paired_user.json (v2-migrated view)
-    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
-        if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
-            let mut tenant_ids = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
-            if !tenant_ids.contains(&default_tenant) {
-                tenant_ids.insert(0, default_tenant);
-            }
-            return Some(LocalBindingSet {
+    choose_binding_set(
+        || {
+            let s = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()?;
+            let default_tenant = uuid::Uuid::parse_str(s.trim()).ok()?;
+            Some((
                 default_tenant,
-                tenant_ids,
-            });
-        }
-    }
+                qontinui_runner_lib::pair::read_paired_binding_tenant_ids(),
+            ))
+        },
+        || {
+            let token = crate::auth::AuthManager::new()
+                .get_access_token()
+                .ok()
+                .unwrap_or_default();
+            if token.is_empty() {
+                return None;
+            }
+            let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
+            let tenant = uuid::Uuid::parse_str(claim.trim()).ok()?;
+            Some((tenant, crate::auth::slot_jwt_is_usable(&token)))
+        },
+        qontinui_runner_lib::pair::usable_slot_claim_tenants,
+    )
+}
 
-    // Branch 2 — cached device-token JWT (the legacy/default slot)
-    let token = crate::auth::AuthManager::new()
-        .get_access_token()
-        .ok()
-        .unwrap_or_default();
-    if token.is_empty() {
-        return None;
+/// Pure-over-injected-sources core of [`resolve_binding_set`], so the branch
+/// order is testable without a credential store. `file` is branch 1;
+/// `legacy` yields the legacy slot's claim tenant and whether that token is
+/// USABLE (branches 2 and 4); `slots` is branch 3. Each source is read only
+/// when every earlier branch missed.
+pub(crate) fn choose_binding_set(
+    file: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    legacy: impl FnOnce() -> Option<(uuid::Uuid, bool)>,
+    slots: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+) -> Option<LocalBindingSet> {
+    if let Some((default_tenant, mut tenant_ids)) = file() {
+        if !tenant_ids.contains(&default_tenant) {
+            tenant_ids.insert(0, default_tenant);
+        }
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::PairedUserFile,
+        });
     }
-    let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
-    let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
-    Some(LocalBindingSet {
-        default_tenant: parsed,
-        tenant_ids: vec![parsed],
-    })
+    let legacy = legacy();
+    let single = |t: uuid::Uuid| LocalBindingSet {
+        default_tenant: t,
+        tenant_ids: vec![t],
+        source: BindingSource::LegacySlotClaim,
+    };
+    if let Some((t, true)) = legacy {
+        return Some(single(t));
+    }
+    if let Some((default_tenant, tenant_ids)) = slots() {
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::TenantSlotClaims,
+        });
+    }
+    legacy.map(|(t, _)| single(t))
 }
 
 /// Single-tenant convenience over [`resolve_binding_set`]: the DEFAULT
@@ -1880,6 +1953,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             });
         }
     };
+    let bearer_scope = bindings.bearer_scope();
 
     let claude_code_available = claude_code_probe();
 
@@ -1955,8 +2029,12 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
-    // coord-tenant-scope(device): device registration -- the payload already carries tenant_id = bindings.default_tenant and tenant_ids (:1374-1388); the default binding IS the right answer here.
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
+    // The bearer follows the binding set's source (`LocalBindingSet::bearer_scope`):
+    // the default binding's legacy slot normally, and the default tenant's OWN
+    // per-tenant slot when the set came from those slots — the legacy slot is
+    // dead then, and an unauthenticated register is what let the bound set age
+    // to UNKNOWN (plan 2026-09-29-vanished-paired-user-json-…, review finding 1).
+    let resp = crate::auth::attach_device_auth_for(client.post(&url).json(&payload), bearer_scope)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
@@ -8801,6 +8879,108 @@ mod tests {",
             skill_parity_record_path_from(None, None),
             None,
             "no state dir and no ~/.qontinui is None, which the caller warns about"
+        );
+    }
+}
+
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
+/// review finding 1: with `paired_user.json` gone AND the legacy slot dead,
+/// the heartbeat must still resolve a binding set — from the per-tenant slots
+/// — and present that slot's credential, so it keeps re-stamping
+/// `coord_bound_tenants.json` and the heal's Guard 1 never locks out.
+#[cfg(test)]
+mod binding_set_resolution_tests {
+    use super::*;
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn the_file_wins_and_presents_the_default_slot() {
+        let set = choose_binding_set(
+            || Some((t(1), vec![t(2)])),
+            || panic!("the legacy slot is not read when the file answers"),
+            || panic!("the per-tenant slots are not read when the file answers"),
+        )
+        .expect("file");
+        assert_eq!(set.default_tenant, t(1));
+        assert_eq!(set.tenant_ids, vec![t(1), t(2)]);
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    #[test]
+    fn a_usable_legacy_slot_answers_before_the_per_tenant_slots() {
+        let set = choose_binding_set(
+            || None,
+            || Some((t(3), true)),
+            || panic!("slots are not read when a usable legacy JWT answers"),
+        )
+        .expect("legacy");
+        assert_eq!(set.tenant_ids, vec![t(3)]);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    /// THE lockout shape: no file, legacy slot empty or dead, a usable
+    /// per-tenant slot. The heartbeat is sent, under that slot's credential.
+    #[test]
+    fn no_file_and_a_dead_or_empty_legacy_slot_fall_back_to_the_per_tenant_slots() {
+        for legacy in [None, Some((t(9), false))] {
+            let set = choose_binding_set(|| None, || legacy, || Some((t(5), vec![t(4), t(5)])))
+                .expect("the heartbeat must still resolve a binding set");
+            assert_eq!(set.default_tenant, t(5));
+            assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+            assert_eq!(set.source, BindingSource::TenantSlotClaims);
+            // Device would present the dead/empty legacy slot, i.e. nothing.
+            assert_eq!(
+                set.bearer_scope(),
+                crate::auth::TenantScope::Owned(t(5)),
+                "{legacy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_legacy_claim_is_the_last_resort_and_nothing_is_none() {
+        let set =
+            choose_binding_set(|| None, || Some((t(7), false)), || None).expect("dead legacy");
+        assert_eq!(set.tenant_ids, vec![t(7)]);
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        assert!(choose_binding_set(|| None, || None, || None).is_none());
+    }
+
+    /// End to end over a real store: the slot-backed scope resolves to the
+    /// slot's own JWT, so the register is authenticated rather than anonymous.
+    #[test]
+    fn the_slot_backed_scope_presents_the_slots_jwt_while_device_presents_nothing() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.path().join("t.enc"))
+            .expect("storage");
+        let am = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let tenant = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let payload = format!(
+            r#"{{"sub":"device:d","tenant_id":"{tenant}","user_id":"22222222-2222-4222-8222-222222222222","exp":{}}}"#,
+            chrono::Utc::now().timestamp() + 3600
+        );
+        let jwt = format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"none"}"#),
+            enc(payload.as_bytes())
+        );
+        am.store_tenant_device_jwt(&tenant, &jwt).expect("slot");
+        let set = choose_binding_set(|| None, || None, || Some((tenant, vec![tenant])))
+            .expect("slot-backed set");
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, set.bearer_scope(), None, 1).as_deref(),
+            Some(jwt.as_str())
+        );
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, crate::auth::TenantScope::Device, None, 1),
+            None,
+            "the legacy slot is empty: Device would send the heartbeat anonymously"
         );
     }
 }

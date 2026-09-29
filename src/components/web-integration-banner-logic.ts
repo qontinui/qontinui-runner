@@ -259,10 +259,11 @@ export function formatSince(since: number): string {
 /**
  * Every cause the runner can emit on the `autonomy-credential-dark` event or
  * the posture snapshot: the Cognito cause, each non-answering posture, and each
- * `dark` cause (`DarkCause::as_str` in `device_jwt_refresher.rs`). Typing the
- * titles `Record` over this union makes a new cause a compile error until it
- * has a title — a missing one would render the generic fallback, which is how
- * a specific state ends up misreported.
+ * `dark` cause (`DarkCause::as_str` in `device_jwt_refresher.rs`). A cause
+ * added to this union without a title fails to compile, because the titles
+ * `Record` is typed over it. The union itself mirrors the Rust wire strings BY
+ * HAND; the Rust test `the_banner_union_names_every_cause_the_runner_emits`
+ * reads this file and fails when a cause the runner emits is missing here.
  */
 export type CredentialDarkCause =
   | "cognito_hard"

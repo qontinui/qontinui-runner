@@ -3864,11 +3864,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // candidate set is one path and this is a no-op.
                 let _ = qontinui_runner_lib::pair::converge_binding_store();
                 // After convergence, heal a canonical `paired_user.json` that
-                // is absent or blank while valid per-tenant slots coord still
-                // binds exist (plan 2026-09-29-vanished-paired-user-json-…,
-                // Phase 1). Logs its own outcome; the refresher repeats it
-                // every tick.
-                let _ = qontinui_runner_lib::pair::heal_vanished_paired_user();
+                // is absent or blank while valid credentials coord still binds
+                // exist (plan 2026-09-29-vanished-paired-user-json-…, Phase 1).
+                // OFF the setup thread, fire-and-forget: a heal that has work
+                // to do opens the credential store and may write the legacy
+                // slot, and a keychain call can block up to its timeout —
+                // which on this thread stalls window creation. It logs its own
+                // outcome, and the refresher repeats it every tick, so a
+                // thread that fails to spawn loses nothing but latency.
+                if let Err(e) = std::thread::Builder::new()
+                    .name("paired-user-heal".into())
+                    .spawn(|| {
+                        let _ = qontinui_runner_lib::pair::heal_vanished_paired_user();
+                    })
+                {
+                    tracing::debug!(
+                        "startup paired_user.json heal thread did not spawn ({e}); the \
+                         refresher's next tick runs it"
+                    );
+                }
 
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =

@@ -423,6 +423,15 @@ impl PairedUserFile {
             .or_else(|| self.tenant_id.clone())
     }
 
+    /// Does this parsed file carry a binding — a non-empty legacy `user_id`,
+    /// or at least one (v2 or synthesized-legacy) binding entry? THE paired
+    /// predicate: [`device_is_paired_at`] is this over a parsed file, and the
+    /// heal's "needs healing" is exactly its negation, so the two can never
+    /// disagree about a file.
+    pub(crate) fn names_a_binding(&self) -> bool {
+        !self.user_id.trim().is_empty() || !self.effective_bindings().is_empty()
+    }
+
     /// Is this file in the v2 multi-entry shape (vs pure legacy)?
     fn is_v2(&self) -> bool {
         !self.bindings.is_empty() || self.default_tenant_id.is_some()
@@ -437,18 +446,58 @@ fn read_paired_user_file_at(path: &std::path::Path) -> Option<PairedUserFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Serializes every read-modify-write of `paired_user.json` in this process.
+///
+/// Five writers share the file — [`persist_pairing_with`],
+/// [`reconcile_paired_bindings_with`], [`backfill_paired_tenant_id`],
+/// [`converge_binding_store_with`] and [`heal_vanished_paired_user_with`] —
+/// and each READS the file, decides, then WRITES it. Without one lock two of
+/// them interleave and the later rename silently discards the earlier one's
+/// change (a heal landing over a pairing that was just written, or a
+/// reconcile's drop resurrected by a stale backfill). Held across the whole
+/// read-decide-write, never nested: none of the five calls another while
+/// holding it (plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
+/// review finding 4).
+static PAIRED_USER_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`PAIRED_USER_WRITE`]. A poisoned lock is recovered: it guards no
+/// data, only ordering, so a panicked holder leaves nothing inconsistent.
+fn paired_user_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    PAIRED_USER_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Atomic write of `paired_user.json` (tmp + rename), pretty-printed —
-/// the shared writer for [`persist_pairing`], [`backfill_paired_tenant_id`]
-/// and [`reconcile_paired_bindings`].
+/// the shared writer for [`persist_pairing`], [`backfill_paired_tenant_id`],
+/// [`reconcile_paired_bindings`], [`converge_binding_store`] and
+/// [`heal_vanished_paired_user`]. Callers hold [`paired_user_write_lock`].
+///
+/// The temp name is unique per write (`<file>.tmp.<pid>.<n>`): a shared
+/// `paired_user.json.tmp` let two processes on one storage dir (a primary and
+/// an instance runner, or the CLI) truncate each other's half-written temp.
 fn write_paired_user_file(path: &std::path::Path, pf: &PairedUserFile) -> Result<(), String> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let pretty =
         serde_json::to_vec_pretty(pf).map_err(|e| format!("serialize paired_user.json: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "paired_user.json".to_string());
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}.{seq}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &pretty) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write tmp: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename: {e}"));
+    }
     Ok(())
 }
 
@@ -524,10 +573,7 @@ pub fn device_is_paired() -> bool {
 /// `user_id`, or at least one v2 `bindings` entry. A missing or unparseable
 /// file is `false` (see the promote-only note on [`device_is_paired`]).
 pub fn device_is_paired_at(path: &std::path::Path) -> bool {
-    let Some(pf) = read_paired_user_file_at(path) else {
-        return false;
-    };
-    !pf.user_id.trim().is_empty() || !pf.effective_bindings().is_empty()
+    read_paired_user_file_at(path).is_some_and(|pf| pf.names_a_binding())
 }
 
 /// Read the cached DEFAULT tenant_id from `paired_user.json`. Returns
@@ -595,6 +641,7 @@ pub(crate) fn read_paired_binding_tenant_ids_at(path: &std::path::Path) -> Vec<u
 /// Scheduled for deletion in Phase 10 item 4 (with the echo-heal).
 pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let _write = paired_user_write_lock();
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -725,6 +772,15 @@ struct CoordBoundTenantsFile {
     tenant_ids: Vec<String>,
     /// Unix seconds when a register echo last carried this set.
     observed_at: i64,
+    /// The echo BEFORE `tenant_ids` (sorted, distinct), so a reader that
+    /// must not act on a single echo can take `tenant_ids ∪ prior_tenant_ids`
+    /// — the same two-echo union [`drop_confirmed_coord_set`] gives the
+    /// reconciler (plan
+    /// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
+    /// review finding 2). `None` on a sidecar written before the field
+    /// existed, which reads as "no prior echo" (current only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_tenant_ids: Option<Vec<String>>,
 }
 
 /// Past this age a recorded set is UNKNOWN, not evidence: coord may have
@@ -760,21 +816,33 @@ pub(crate) fn record_coord_bound_tenants_at(
     let mut ids: Vec<String> = coord_set.iter().map(|t| t.to_string()).collect();
     ids.sort();
     ids.dedup();
-    if let Some(existing) = std::fs::read(path)
+    let existing = std::fs::read(path)
         .ok()
-        .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok())
-    {
+        .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok());
+    if let Some(existing) = &existing {
         let age = now_unix - existing.observed_at;
-        if existing.tenant_ids == ids && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age) {
+        // Skip only when BOTH echoes already equal this one: a set that just
+        // changed is written once more when it repeats, so `prior_tenant_ids`
+        // stops carrying a tenant the last two echoes both omit.
+        if existing.tenant_ids == ids
+            && existing.prior_tenant_ids.as_ref() == Some(&ids)
+            && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age)
+        {
             return Ok(false);
         }
     }
+    // The previous echo becomes the prior. With no readable previous record
+    // there is no earlier echo, so the prior is this echo itself: the union
+    // a two-echo reader takes is then exactly this echo, and a steady state
+    // needs no second write to settle.
+    let prior_tenant_ids = Some(existing.map_or_else(|| ids.clone(), |e| e.tenant_ids));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let body = serde_json::to_vec_pretty(&CoordBoundTenantsFile {
         tenant_ids: ids,
         observed_at: now_unix,
+        prior_tenant_ids,
     })
     .map_err(|e| format!("serialize coord_bound_tenants.json: {e}"))?;
     // Its own tmp name: never the `json.tmp` `write_paired_user_file` uses.
@@ -874,32 +942,89 @@ pub fn coord_bound_tenants_at_within(
     now_unix: i64,
     max_age_secs: i64,
 ) -> CoordBoundTenantsRead {
+    match read_coord_bound_tenants_file(path, now_unix, max_age_secs) {
+        Ok(file) => CoordBoundTenantsRead::Known(parse_tenant_set(file.tenant_ids.iter())),
+        Err(why) => CoordBoundTenantsRead::Unknown(why),
+    }
+}
+
+/// Coord's bound-tenant set over the last TWO register echoes (`current ∪
+/// prior`), fresh enough to ACT on ([`BINDING_GAP_ASK_MAX_AGE_SECS`]).
+///
+/// What the `paired_user.json` heal reads: one short echo omitting tenant X
+/// right before a heal must not cost X its binding for good — the healed file
+/// would then exist, the heal never re-run, and reconcile only ever report X
+/// `coord_only`. The reconciler already demands two echoes before a DROP
+/// ([`drop_confirmed_coord_set`]); the heal takes the same union, so a tenant
+/// in EITHER echo with a valid slot is healed (review finding 2). A sidecar
+/// with no prior echo recorded reads as the current echo alone.
+pub fn coord_bound_tenants_two_echo_for_ask() -> CoordBoundTenantsRead {
+    let Some(path) = coord_bound_tenants_path() else {
+        return CoordBoundTenantsRead::Unknown(
+            "the secure-storage dir could not be resolved, so coord_bound_tenants.json \
+             has no path on this box",
+        );
+    };
+    coord_bound_tenants_two_echo_at_within(
+        &path,
+        chrono::Utc::now().timestamp(),
+        BINDING_GAP_ASK_MAX_AGE_SECS,
+    )
+}
+
+/// Path-parameterized core of [`coord_bound_tenants_two_echo_for_ask`]. The
+/// freshness rules are [`coord_bound_tenants_at_within`]'s, verbatim (one
+/// reader), and apply to the record's `observed_at`.
+pub fn coord_bound_tenants_two_echo_at_within(
+    path: &std::path::Path,
+    now_unix: i64,
+    max_age_secs: i64,
+) -> CoordBoundTenantsRead {
+    match read_coord_bound_tenants_file(path, now_unix, max_age_secs) {
+        Ok(file) => CoordBoundTenantsRead::Known(parse_tenant_set(
+            file.tenant_ids
+                .iter()
+                .chain(file.prior_tenant_ids.iter().flatten()),
+        )),
+        Err(why) => CoordBoundTenantsRead::Unknown(why),
+    }
+}
+
+/// Sorted, distinct, well-formed UUIDs out of stringified ids.
+fn parse_tenant_set<'a>(ids: impl Iterator<Item = &'a String>) -> Vec<uuid::Uuid> {
+    ids.filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The ONE reader of `coord_bound_tenants.json`: parse it and apply the
+/// freshness window, or say why nothing was established.
+fn read_coord_bound_tenants_file(
+    path: &std::path::Path,
+    now_unix: i64,
+    max_age_secs: i64,
+) -> Result<CoordBoundTenantsFile, &'static str> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return CoordBoundTenantsRead::Unknown(
+            return Err(
                 "coord_bound_tenants.json is ABSENT — the heartbeat has never recorded \
                  coord's binding set for this device here, so the bound set is UNKNOWN \
                  (not zero)",
             )
         }
-        Err(_) => {
-            return CoordBoundTenantsRead::Unknown(
-                "coord_bound_tenants.json could not be read (permissions or I/O)",
-            )
-        }
+        Err(_) => return Err("coord_bound_tenants.json could not be read (permissions or I/O)"),
     };
     let Ok(file) = serde_json::from_slice::<CoordBoundTenantsFile>(&bytes) else {
-        return CoordBoundTenantsRead::Unknown(
-            "coord_bound_tenants.json is malformed — nothing was established",
-        );
+        return Err("coord_bound_tenants.json is malformed — nothing was established");
     };
     let age = now_unix - file.observed_at;
     // A reader that ACTS demands a tighter window than the 24 h report; say
     // which window refused it.
     let is_act_window = max_age_secs < COORD_BOUND_TENANTS_MAX_AGE_SECS;
     if age > max_age_secs && is_act_window {
-        return CoordBoundTenantsRead::Unknown(
+        return Err(
             "coord_bound_tenants.json is older than the window this reader may ACT on \
              (BINDING_GAP_ASK_MAX_AGE_SECS) — a live heartbeat restamps it hourly, so the \
              heartbeat is down or coord stopped echoing tenant_ids, and an unbind since \
@@ -911,26 +1036,19 @@ pub fn coord_bound_tenants_at_within(
         // Getting here means the heartbeat is down or coord stopped echoing
         // `tenant_ids` — an unpair seen by neither would otherwise be counted
         // forever, and a stale set is not evidence.
-        return CoordBoundTenantsRead::Unknown(
+        return Err(
             "coord_bound_tenants.json is older than COORD_BOUND_TENANTS_MAX_AGE_SECS \
              (24h) — the heartbeat is down or coord stopped echoing tenant_ids, so the \
              bound set is UNKNOWN (not zero)",
         );
     }
     if age < -300 {
-        return CoordBoundTenantsRead::Unknown(
+        return Err(
             "coord_bound_tenants.json is stamped implausibly in the future — the clock \
              moved, so the record is not evidence",
         );
     }
-    CoordBoundTenantsRead::Known(
-        file.tenant_ids
-            .iter()
-            .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-    )
+    Ok(file)
 }
 
 /// Reconcile the local binding state (`paired_user.json` v2 entries +
@@ -1158,6 +1276,7 @@ pub(crate) fn reconcile_paired_bindings_at(
 ) -> Result<BindingReconcileReport, String> {
     // One pass is one critical section: decide, then clear, with no pairing
     // able to interleave (persist_pairing_with takes the same lock).
+    let _write = paired_user_write_lock();
     let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
     let mut report = BindingReconcileReport::default();
 
@@ -1494,7 +1613,7 @@ pub fn drop_confirmed_coord_set(
 pub enum PairedUserHeal {
     /// `paired_user.json` parses and carries a binding: nothing to heal.
     NotNeeded,
-    /// The file was rebuilt from the per-tenant slots.
+    /// The file was rebuilt from the held credentials.
     Healed {
         /// Why the file needed healing: `absent`, `unparseable` or `blank`.
         cause: &'static str,
@@ -1504,12 +1623,13 @@ pub enum PairedUserHeal {
         /// `access_token` slot).
         default_tenant: uuid::Uuid,
     },
-    /// The file needs healing but holds no per-tenant device-JWT slot at all
-    /// — an unpaired runner, which has nothing to heal from. Nothing was
-    /// written, and no guard refused.
+    /// The file needs healing but this device holds no credential at all —
+    /// no per-tenant device-JWT slot and no usable legacy `access_token` — an
+    /// unpaired runner, which has nothing to heal from. Nothing was written,
+    /// and no guard refused.
     NothingToHealFrom,
-    /// The file needs healing, slots exist, but a guard refused — and why.
-    /// Nothing was written.
+    /// The file needs healing, credentials exist, but a guard refused — and
+    /// why. Nothing was written.
     Refused(String),
 }
 
@@ -1517,9 +1637,11 @@ pub enum PairedUserHeal {
 /// not. `Err` when the read FAILED for a reason other than absence: an
 /// unreadable file established nothing, and overwriting it is not a heal.
 ///
-/// "Needs healing" is the predicate every reader of the file answers `None`
-/// / `false` on ([`device_is_paired_at`]'s negation): absent, unparseable, or
-/// parsed with no v2 `bindings` and no legacy `user_id`.
+/// "Needs healing" is EXACTLY [`device_is_paired_at`]'s negation over a file
+/// that could be read — both go through [`PairedUserFile::names_a_binding`] —
+/// split three ways only for the log: `absent`, `unparseable`, or `blank`
+/// (parsed, names no binding). A legacy `{"user_id":"","tenant_id":"T"}` names
+/// a binding (its synthesized entry), so it is paired and is left alone.
 fn paired_user_vanished_cause(path: &std::path::Path) -> Result<Option<&'static str>, String> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -1528,15 +1650,26 @@ fn paired_user_vanished_cause(path: &std::path::Path) -> Result<Option<&'static 
     };
     match serde_json::from_slice::<PairedUserFile>(&bytes) {
         Err(_) => Ok(Some("unparseable")),
-        Ok(pf) if pf.bindings.is_empty() && pf.user_id.trim().is_empty() => Ok(Some("blank")),
-        Ok(_) => Ok(None),
+        Ok(pf) if pf.names_a_binding() => Ok(None),
+        Ok(_) => Ok(Some("blank")),
     }
 }
 
+/// Why THIS process's `paired_user.json` needs healing (`absent`,
+/// `unparseable`, `blank`), `Ok(None)` when it names a binding. The ONE
+/// predicate the heal acts on and `coord doctor` reports, so the doctor's
+/// wording can never describe a state the heal does not.
+pub fn paired_user_heal_cause() -> Result<Option<&'static str>, String> {
+    let path = paired_user_path()
+        .ok_or_else(|| "the secure-storage dir could not be resolved".to_string())?;
+    paired_user_vanished_cause(&path)
+}
+
 /// Heal a vanished `paired_user.json` for THIS process's storage dir, from
-/// the per-tenant device-JWT slots and coord's act-grade bound set
-/// ([`coord_bound_tenants_for_ask`]). See [`heal_vanished_paired_user_with`]
-/// for the rule. Blocking (file + credential-store reads).
+/// the held device JWTs and coord's act-grade bound set over its last two
+/// register echoes ([`coord_bound_tenants_two_echo_for_ask`]). See
+/// [`heal_vanished_paired_user_with`] for the rule. Blocking (file +
+/// credential-store reads).
 ///
 /// Cheap when there is nothing to heal: the file is classified BEFORE the
 /// credential store is opened, so a healthy runner pays one small file read.
@@ -1551,7 +1684,7 @@ pub fn heal_vanished_paired_user() -> PairedUserHeal {
         return PairedUserHeal::NotNeeded;
     }
     let mgr = crate::auth::AuthManager::new();
-    let heal = heal_vanished_paired_user_with(&mgr, &path, &coord_bound_tenants_for_ask());
+    let heal = heal_vanished_paired_user_with(&mgr, &path, &coord_bound_tenants_two_echo_for_ask());
     if let PairedUserHeal::Refused(why) = &heal {
         log_heal_refusal_on_change(why);
     }
@@ -1569,34 +1702,58 @@ fn log_heal_refusal_on_change(why: &str) {
     }
 }
 
+/// One credential that qualified as a heal source.
+struct HealSource {
+    binding: PairedBinding,
+    tenant: uuid::Uuid,
+    jwt: String,
+}
+
 /// Parameterized core of [`heal_vanished_paired_user`] — explicit
 /// `AuthManager`, file path and bound-set read, so the unit tests run against
 /// a temp store and never the operator's real credentials.
 ///
-/// When `paired_user.json` is absent, unparseable, or carries no binding and
-/// no legacy `user_id`, rebuild ONE binding per per-tenant slot that passes
-/// ALL of these guards:
+/// When `paired_user.json` is absent, unparseable, or names no binding
+/// (`!device_is_paired_at`), rebuild ONE binding per held credential that
+/// passes ALL of these guards. The credentials considered are every
+/// per-tenant `device_jwt:<tenant>` slot AND the legacy `access_token` slot —
+/// the latter because on a legacy-only install it is the default binding's
+/// ONLY credential, and healing from the per-tenant slots alone would then
+/// pick another tenant as default and overwrite it (review finding 5):
 ///
 /// 1. `bound` is [`CoordBoundTenantsRead::Known`]. `Unknown` heals nothing:
 ///    a coord-side unbind must never be resurrected (09-25 vet correction 11),
-///    and an unread set cannot rule one out.
-/// 2. the slot's tenant is IN that known set;
-/// 3. the slot's JWT is VALID — decodable and unexpired
-///    ([`crate::auth::read_tenant_slot`] → `Usable`, the same predicate the
-///    bearer selector applies) — and its own `tenant_id` claim names the slot's
-///    tenant, and it carries a `user_id` claim (a device JWT's `sub` is
-///    `device:<id>`, never the user, so there is no fallback to it).
+///    and an unread set cannot rule one out. Production passes the union of
+///    coord's last TWO echoes, the same union the reconciler requires before
+///    a drop, so one short echo cannot cost a tenant its binding (review
+///    finding 2).
+/// 2. the credential is VALID — decodable and unexpired
+///    ([`crate::auth::read_tenant_slot`] / [`crate::auth::read_legacy_slot`]
+///    → `Usable`, the same predicate the bearer selector applies) — its own
+///    `tenant_id` claim names the slot's tenant (for the legacy slot, the
+///    claim IS the tenant), and it carries a `user_id` claim (a device JWT's
+///    `sub` is `device:<id>`, never the user, so there is no fallback to it);
+/// 3. that tenant is IN the known set.
 ///
 /// Each binding is rebuilt from the JWT's `user_id` + `tenant_id` claims with
 /// `paired_at = None`, so any real pairing outranks a heal under
-/// [`most_recently_paired`]. The default is the tenant the legacy
-/// `access_token` slot's usable JWT already names when that tenant was healed
-/// (D4: that slot IS the default binding's credential, so this keeps the
-/// device's previous default); otherwise [`most_recently_paired`] over the
-/// healed set, which — every `paired_at` being `None` and the set written in
+/// [`most_recently_paired`]. The default is the tenant the legacy slot's
+/// usable JWT names when that tenant was healed (D4: that slot IS the default
+/// binding's credential, so this keeps the device's previous default and
+/// writes nothing to it); otherwise [`most_recently_paired`] over the healed
+/// set, which — every `paired_at` being `None` and the set written in
 /// ascending tenant order — deterministically picks the GREATEST tenant id.
-/// The chosen default's slot JWT is then copied into the legacy slot unless it
-/// is already there.
+/// The chosen default's JWT is then copied into the legacy slot — after any
+/// usable legacy credential for a tenant with no usable per-tenant slot of
+/// its own is first preserved in that tenant's slot, so the copy never
+/// destroys a credential.
+///
+/// The recheck, the rename-aside of an unparseable file, the write and the
+/// legacy-slot copy all run under [`paired_user_write_lock`], so a pairing
+/// that lands while the slots were being read is never overwritten
+/// (review finding 4). An unparseable file is renamed aside to
+/// `paired_user.json.unparseable-<UTC timestamp>` before the write, never
+/// silently destroyed (review finding 7).
 ///
 /// Never reads a `.superseded-*` sibling: the slot claims plus coord's known
 /// set are sufficient and authoritative, and the siblings' mtimes are
@@ -1612,6 +1769,19 @@ pub(crate) fn heal_vanished_paired_user_with(
     mgr: &crate::auth::AuthManager,
     path: &std::path::Path,
     bound: &CoordBoundTenantsRead,
+) -> PairedUserHeal {
+    heal_vanished_paired_user_hooked(mgr, path, bound, &|| {})
+}
+
+/// [`heal_vanished_paired_user_with`] with a hook run after the credentials
+/// are read and immediately BEFORE the write lock is taken — the window a
+/// concurrent pairing can land in. Production passes a no-op; the recheck
+/// test lands a real pairing there.
+fn heal_vanished_paired_user_hooked(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    bound: &CoordBoundTenantsRead,
+    before_write: &dyn Fn(),
 ) -> PairedUserHeal {
     let cause = match paired_user_vanished_cause(path) {
         Ok(Some(cause)) => cause,
@@ -1636,7 +1806,11 @@ pub(crate) fn heal_vanished_paired_user_with(
             ))
         }
     };
-    if slot_tenants.is_empty() {
+    let legacy_jwt = match crate::auth::read_legacy_slot(mgr) {
+        crate::auth::SlotRead::Usable(tok) => Some(tok),
+        _ => None,
+    };
+    if slot_tenants.is_empty() && legacy_jwt.is_none() {
         // A runner that never paired (or was unpaired): no credential exists
         // to heal from, and that is not a guard refusing.
         return PairedUserHeal::NothingToHealFrom;
@@ -1652,15 +1826,17 @@ pub(crate) fn heal_vanished_paired_user_with(
         }
     };
 
-    let mut healed: Vec<(PairedBinding, String)> = Vec::new();
+    let user_of = |jwt: &str| {
+        tenant_id_from_jwt_claim(jwt, "user_id").and_then(|u| uuid::Uuid::parse_str(u.trim()).ok())
+    };
+    let mut healed: Vec<HealSource> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    // Usable credentials whose tenant coord does NOT list as bound — held,
+    // but not healable (review finding 9: say so rather than "no slot").
+    let mut usable_outside_known: Vec<uuid::Uuid> = Vec::new();
+    let mut usable_slot_tenants: Vec<uuid::Uuid> = Vec::new();
     for t in slot_tenants {
-        // Guard 2: the slot's tenant is one coord says this device is bound to.
-        if !known.contains(&t) {
-            skipped.push(format!("{t}: not in coord's bound set"));
-            continue;
-        }
-        // Guard 3: a valid JWT that is this tenant's and names its user.
+        // Guard 2: a valid JWT that is this tenant's and names its user.
         let jwt = match crate::auth::read_tenant_slot(mgr, &t) {
             crate::auth::SlotRead::Usable(jwt) => jwt,
             other => {
@@ -1672,60 +1848,132 @@ pub(crate) fn heal_vanished_paired_user_with(
             skipped.push(format!("{t}: slot JWT's tenant_id claim does not name it"));
             continue;
         }
-        let Some(user_id) = tenant_id_from_jwt_claim(&jwt, "user_id")
-            .and_then(|u| uuid::Uuid::parse_str(u.trim()).ok())
-        else {
+        usable_slot_tenants.push(t);
+        let Some(user_id) = user_of(&jwt) else {
             skipped.push(format!("{t}: slot JWT carries no user_id claim"));
             continue;
         };
-        healed.push((
-            PairedBinding {
+        // Guard 3: the tenant is one coord says this device is bound to.
+        if !known.contains(&t) {
+            usable_outside_known.push(t);
+            skipped.push(format!("{t}: not in coord's bound set"));
+            continue;
+        }
+        healed.push(HealSource {
+            binding: PairedBinding {
                 tenant_id: t.to_string(),
                 user_id: user_id.to_string(),
                 paired_at: None,
             },
+            tenant: t,
             jwt,
-        ));
+        });
+    }
+    // The legacy slot, under the same guards. Its claim IS its tenant.
+    let legacy_tenant = legacy_jwt
+        .as_deref()
+        .and_then(crate::auth::jwt_tenant_claim);
+    let mut legacy_is_default_source = false;
+    match (&legacy_jwt, legacy_tenant) {
+        (None, _) => {}
+        (Some(_), None) => skipped.push("legacy slot: JWT carries no tenant_id claim".into()),
+        (Some(_), Some(lt)) if healed.iter().any(|h| h.tenant == lt) => {
+            // Already healed from its own slot: the legacy slot is that
+            // binding's credential, so it stays the default.
+            legacy_is_default_source = true;
+        }
+        (Some(jwt), Some(lt)) => match user_of(jwt) {
+            None => skipped.push(format!("legacy slot ({lt}): JWT carries no user_id claim")),
+            Some(_) if !known.contains(&lt) => {
+                if !usable_outside_known.contains(&lt) {
+                    usable_outside_known.push(lt);
+                }
+                skipped.push(format!("legacy slot ({lt}): not in coord's bound set"));
+            }
+            Some(user_id) => {
+                healed.push(HealSource {
+                    binding: PairedBinding {
+                        tenant_id: lt.to_string(),
+                        user_id: user_id.to_string(),
+                        paired_at: None,
+                    },
+                    tenant: lt,
+                    jwt: jwt.clone(),
+                });
+                legacy_is_default_source = true;
+            }
+        },
     }
     if healed.is_empty() {
+        usable_outside_known.sort();
+        let outside_only = !usable_outside_known.is_empty()
+            && usable_slot_tenants
+                .iter()
+                .all(|t| usable_outside_known.contains(t));
+        if outside_only {
+            return PairedUserHeal::Refused(format!(
+                "paired_user.json is {cause}, and the ONLY usable credential(s) held belong to \
+                 tenant(s) {usable_outside_known:?}, which coord does NOT list as bound to this \
+                 device (coord's bound set: {known:?}) — coord unbound them, so they are not \
+                 healed; sign in to pair a tenant coord binds (skipped: [{}])",
+                skipped.join("; ")
+            ));
+        }
         return PairedUserHeal::Refused(format!(
-            "paired_user.json is {cause}, but no per-tenant slot qualifies for a heal \
+            "paired_user.json is {cause}, but no held credential qualifies for a heal \
              (coord's bound set: {known:?}; skipped: [{}])",
             skipped.join("; ")
         ));
     }
+    healed.sort_by_key(|h| h.tenant);
 
-    let bindings: Vec<PairedBinding> = healed.iter().map(|(b, _)| b.clone()).collect();
-    let tenants: Vec<uuid::Uuid> = bindings
-        .iter()
-        .filter_map(|b| uuid::Uuid::parse_str(&b.tenant_id).ok())
-        .collect();
-    let legacy_tenant = match crate::auth::read_legacy_slot(mgr) {
-        crate::auth::SlotRead::Usable(tok) => {
-            crate::auth::jwt_tenant_claim(&tok).filter(|t| tenants.contains(t))
-        }
-        _ => None,
-    };
-    let Some(default_tenant) = legacy_tenant.or_else(|| {
+    let bindings: Vec<PairedBinding> = healed.iter().map(|h| h.binding.clone()).collect();
+    let tenants: Vec<uuid::Uuid> = healed.iter().map(|h| h.tenant).collect();
+    let legacy_default = legacy_tenant.filter(|_| legacy_is_default_source);
+    let Some(default_tenant) = legacy_default.or_else(|| {
         most_recently_paired(&bindings).and_then(|b| uuid::Uuid::parse_str(&b.tenant_id).ok())
     }) else {
         // Unreachable: `bindings` is non-empty and every tenant_id was
         // produced from a Uuid above.
         return PairedUserHeal::Refused("no default binding could be chosen".to_string());
     };
-    let (default_binding, default_jwt) = healed
-        .iter()
-        .find(|(b, _)| b.tenant_id == default_tenant.to_string())
-        .cloned()
-        .expect("default_tenant was chosen from the healed set");
+    let Some(default_source) = healed.iter().find(|h| h.tenant == default_tenant) else {
+        return PairedUserHeal::Refused(
+            "the chosen default is not among the healed bindings".to_string(),
+        );
+    };
 
-    // A real pairing may have landed while the slots were read. Re-check the
-    // predicate immediately before writing so a heal never clobbers it.
-    if !matches!(paired_user_vanished_cause(path), Ok(Some(_))) {
-        return PairedUserHeal::NotNeeded;
+    before_write();
+    let _write = paired_user_write_lock();
+    // A real pairing may have landed while the credentials were read.
+    // Re-check the predicate under the lock so a heal never clobbers it.
+    let cause = match paired_user_vanished_cause(path) {
+        Ok(Some(c)) => c,
+        Ok(None) => return PairedUserHeal::NotNeeded,
+        Err(e) => {
+            return PairedUserHeal::Refused(format!(
+                "paired_user.json became unreadable before the heal could write ({e}) — left \
+                 alone"
+            ))
+        }
+    };
+    if cause == "unparseable" {
+        match set_aside_unparseable(path) {
+            Ok(aside) => tracing::warn!(
+                "paired_user.json heal: the unparseable file was renamed aside to {} before \
+                 the rebuild (nothing reads it; kept for inspection)",
+                aside.display()
+            ),
+            Err(e) => {
+                return PairedUserHeal::Refused(format!(
+                    "paired_user.json is unparseable and could not be renamed aside ({e}) — \
+                     refusing to overwrite it"
+                ))
+            }
+        }
     }
     let out = PairedUserFile {
-        user_id: default_binding.user_id.clone(),
+        user_id: default_source.binding.user_id.clone(),
         tenant_id: Some(default_tenant.to_string()),
         bindings,
         default_tenant_id: Some(default_tenant.to_string()),
@@ -1737,8 +1985,9 @@ pub(crate) fn heal_vanished_paired_user_with(
         ));
     }
     // D4: the legacy access_token slot holds the DEFAULT binding's JWT.
-    if legacy_tenant != Some(default_tenant) {
-        if let Err(e) = mgr.store_tokens(&default_jwt, "") {
+    if legacy_default != Some(default_tenant) {
+        preserve_legacy_credential(mgr, legacy_jwt.as_deref(), legacy_tenant);
+        if let Err(e) = mgr.store_tokens(&default_source.jwt, "") {
             tracing::warn!(
                 "paired_user.json heal: default {default_tenant} chosen but the legacy \
                  access_token write failed: {e:#} (the per-tenant slot still serves it)"
@@ -1746,9 +1995,9 @@ pub(crate) fn heal_vanished_paired_user_with(
         }
     }
     tracing::warn!(
-        "paired_user.json was {cause} at {} while valid per-tenant device JWTs existed — \
-         HEALED it from those slots' claims for tenant(s) {tenants:?} (all in coord's bound \
-         set), default {default_tenant}; skipped: [{}]",
+        "paired_user.json was {cause} at {} while valid device JWTs existed — HEALED it from \
+         those credentials' claims for tenant(s) {tenants:?} (all in coord's bound set), \
+         default {default_tenant}; skipped: [{}]",
         path.display(),
         skipped.join("; ")
     );
@@ -1757,6 +2006,92 @@ pub(crate) fn heal_vanished_paired_user_with(
         tenants,
         default_tenant,
     }
+}
+
+/// Before the heal overwrites the legacy slot with the default's JWT: a
+/// USABLE legacy credential whose claim names a tenant with no usable
+/// per-tenant slot of its own is that tenant's ONLY copy, so it is written to
+/// `device_jwt:<tenant>` first. Best-effort and logged; a claimless token has
+/// no slot to go to and is overwritten, as before.
+fn preserve_legacy_credential(
+    mgr: &crate::auth::AuthManager,
+    legacy_jwt: Option<&str>,
+    legacy_tenant: Option<uuid::Uuid>,
+) {
+    let (Some(jwt), Some(lt)) = (legacy_jwt, legacy_tenant) else {
+        return;
+    };
+    if matches!(
+        crate::auth::read_tenant_slot(mgr, &lt),
+        crate::auth::SlotRead::Usable(_)
+    ) {
+        return;
+    }
+    match mgr.store_tenant_device_jwt(&lt, jwt) {
+        Ok(()) => tracing::warn!(
+            "paired_user.json heal: the legacy access_token held tenant {lt}'s only usable \
+             credential — preserved it in its per-tenant slot before re-pointing the default"
+        ),
+        Err(e) => tracing::warn!(
+            "paired_user.json heal: could not preserve tenant {lt}'s legacy credential in its \
+             per-tenant slot ({e:#}) before re-pointing the default"
+        ),
+    }
+}
+
+/// Rename an unparseable `paired_user.json` aside to
+/// `paired_user.json.unparseable-<UTC timestamp>` (suffixed `.<n>` on a
+/// collision). Nothing reads the result; it exists so a heal never silently
+/// destroys bytes someone may want to inspect.
+fn set_aside_unparseable(path: &std::path::Path) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "paired_user.json".to_string());
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let base = format!("{file_name}.unparseable-{stamp}");
+    let mut aside = path.with_file_name(&base);
+    let mut n = 1u32;
+    while aside.exists() {
+        aside = path.with_file_name(format!("{base}.{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &aside).map_err(|e| format!("rename to {}: {e}", aside.display()))?;
+    Ok(aside)
+}
+
+/// The tenants whose per-tenant slot holds a USABLE JWT whose own
+/// `tenant_id` claim names that slot — and, of those, the one a binding-less
+/// device would call its default (the greatest id: the same deterministic
+/// pick [`heal_vanished_paired_user_with`] makes when no legacy credential
+/// names one). `None` when there is none, or the slot store is unreadable.
+///
+/// The register heartbeat's last-resort binding source (`fleet::
+/// resolve_binding_set`): with `paired_user.json` gone AND the legacy slot
+/// dead, without this the heartbeat is never sent, `coord_bound_tenants.json`
+/// is never re-stamped, the bound set ages to UNKNOWN, and the heal's Guard 1
+/// refuses forever — the lockout this plan exists to end (review finding 1).
+pub fn usable_slot_claim_tenants() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    usable_slot_claim_tenants_with(&crate::auth::AuthManager::new())
+}
+
+/// [`usable_slot_claim_tenants`] over an explicit store.
+pub(crate) fn usable_slot_claim_tenants_with(
+    mgr: &crate::auth::AuthManager,
+) -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    let mut tenants: Vec<uuid::Uuid> = mgr
+        .try_list_tenant_device_jwt_tenants()
+        .ok()?
+        .into_iter()
+        .filter(|t| match crate::auth::read_tenant_slot(mgr, t) {
+            crate::auth::SlotRead::Usable(jwt) => crate::auth::jwt_tenant_claim(&jwt) == Some(*t),
+            _ => false,
+        })
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+    let default = *tenants.last()?;
+    Some((default, tenants))
 }
 
 /// The credentials this device HOLDS, by validity — what a default binding
@@ -2872,6 +3207,7 @@ pub(crate) fn persist_pairing_with(
     resp: &PairCompleteResponse,
     tenant_id: uuid::Uuid,
 ) -> Result<(), String> {
+    let _write = paired_user_write_lock();
     // 1. The paired tenant's slot ALWAYS gets the fresh JWT.
     //
     // `_fresh` (overwrite a present-but-unreadable store) because `persist_pairing`
@@ -5651,6 +5987,7 @@ pub(crate) fn converge_binding_store_with(
     others: &[PathBuf],
     holds_credential: &dyn Fn(&uuid::Uuid, bool) -> Option<bool>,
 ) -> BindingStoreMergeReport {
+    let _write = paired_user_write_lock();
     let mut report = BindingStoreMergeReport::default();
 
     // The canonical file is the base. A missing one is not an invitation to
@@ -6483,10 +6820,11 @@ mod converge_retains_every_absorbed_copy_tests {
 /// Phase 1 (+ Phase 4's code half): a vanished `paired_user.json` is rebuilt
 /// from VALID per-tenant slots coord still binds — and from nothing else.
 ///
-/// Hermetic: every test gets its own temp dir, `SecureStorage::with_path` and
-/// `AuthManager::with_storage` (a per-instance keychain service name), and
-/// reads every file through the path-parameterized `_at` readers — never the
-/// operator's real config.
+/// Hermetic: every test gets its own auto-cleaned `tempfile::tempdir()`,
+/// `SecureStorage::with_path` and `AuthManager::with_storage_no_keychain` (no
+/// OS keychain read or write, without touching the process-global
+/// `QONTINUI_DISABLE_KEYCHAIN`), and reads every file through the
+/// path-parameterized `_at` readers — never the operator's real config.
 #[cfg(test)]
 mod vanished_paired_user_heal_tests {
     use super::*;
@@ -6507,16 +6845,15 @@ mod vanished_paired_user_heal_tests {
         uuid::Uuid::parse_str(T_C).unwrap()
     }
 
-    /// A fresh temp store: `(dir, paired_user.json path, AuthManager)`.
-    fn store(test: &str) -> (PathBuf, PathBuf, crate::auth::AuthManager) {
-        let dir = std::env::temp_dir()
-            .join("qontinui_test_paired_heal")
-            .join(format!("{test}_{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).expect("mkdir tempdir");
-        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
-            .expect("test storage");
-        let mgr = crate::auth::AuthManager::with_storage(storage);
-        let path = dir.join("paired_user.json");
+    /// A fresh temp store: `(dir guard, paired_user.json path, AuthManager)`.
+    /// The dir is removed when the guard drops.
+    fn store(_test: &str) -> (tempfile::TempDir, PathBuf, crate::auth::AuthManager) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            crate::secure_storage::SecureStorage::with_path(dir.path().join("tokens.enc"))
+                .expect("test storage");
+        let mgr = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let path = dir.path().join("paired_user.json");
         (dir, path, mgr)
     }
 
@@ -6600,7 +6937,7 @@ mod vanished_paired_user_heal_tests {
         // (`holds == Ok(true)` ⇒ admitted; `Ok(false)` ⇒ NotPaired). The
         // default binding reads Bound again and the legacy slot now holds its
         // credential, so the default tenant is held through BOTH routes.
-        let binding = crate::auth::default_binding_tenant_in(&dir);
+        let binding = crate::auth::default_binding_tenant_in(dir.path());
         assert_eq!(binding, crate::auth::BindingTenantRead::Bound(ta()));
         let held = crate::auth::HeldDeviceTenants::read_with_count(
             &mgr,
@@ -6896,6 +7233,298 @@ mod vanished_paired_user_heal_tests {
             held_credential_census_with(&mgr)
                 .expect("census")
                 .legacy_slot_usable
+        );
+    }
+
+    // ---- review fixes (findings 2, 4, 5, 6, 7, 9, 1) ----
+
+    /// Finding 2: a heal reads BOTH recorded echoes. One short echo omitting
+    /// T_B right before the heal must not cost B its binding.
+    #[test]
+    fn heal_uses_the_two_echo_union_so_one_short_echo_does_not_lose_a_tenant() {
+        let (dir, path, mgr) = store("two_echo");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        let now = chrono::Utc::now().timestamp();
+        record_coord_bound_tenants_at(&sidecar, &[ta(), tb()], now - 60).expect("echo 1");
+        record_coord_bound_tenants_at(&sidecar, &[ta()], now).expect("short echo 2");
+        // The single-echo read the reconciler's `prior` uses sees only A…
+        assert_eq!(
+            coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS),
+            known(&[ta()])
+        );
+        // …the heal's read is the union.
+        let bound =
+            coord_bound_tenants_two_echo_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        assert_eq!(bound, known(&[ta(), tb()]));
+        let heal = heal_vanished_paired_user_with(&mgr, &path, &bound);
+        assert!(
+            matches!(&heal, PairedUserHeal::Healed { tenants, .. } if tenants == &vec![ta(), tb()]),
+            "{heal:?}"
+        );
+        assert_eq!(read_paired_binding_tenant_ids_at(&path), vec![ta(), tb()]);
+
+        // A tenant BOTH echoes omit is not healed.
+        record_coord_bound_tenants_at(&sidecar, &[ta()], now + 1).expect("echo 3 confirms");
+        assert_eq!(
+            coord_bound_tenants_two_echo_at_within(&sidecar, now + 1, BINDING_GAP_ASK_MAX_AGE_SECS),
+            known(&[ta()])
+        );
+    }
+
+    /// Finding 2 (compat): a sidecar written before `prior_tenant_ids`
+    /// existed reads as the current echo alone; a repeated set is written
+    /// once more so the prior catches up, then the restamp skip resumes.
+    #[test]
+    fn an_old_sidecar_without_a_prior_echo_reads_current_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar = dir.path().join("coord_bound_tenants.json");
+        let now = chrono::Utc::now().timestamp();
+        std::fs::write(
+            &sidecar,
+            format!(r#"{{"tenant_ids":["{T_A}"],"observed_at":{now}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            coord_bound_tenants_two_echo_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS),
+            known(&[ta()])
+        );
+        // Same set again: written once (prior was absent)…
+        assert_eq!(
+            record_coord_bound_tenants_at(&sidecar, &[ta()], now + 1),
+            Ok(true)
+        );
+        // …then skipped: both echoes already equal it.
+        assert_eq!(
+            record_coord_bound_tenants_at(&sidecar, &[ta()], now + 2),
+            Ok(false)
+        );
+    }
+
+    /// Finding 4: a real pairing that lands after the credentials were read
+    /// and before the write is seen by the locked recheck — the heal writes
+    /// nothing and touches neither the file nor the legacy slot.
+    #[test]
+    fn a_pairing_that_lands_before_the_write_is_never_overwritten() {
+        let (_dir, path, mgr) = store("recheck");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER_2))
+            .expect("slot B");
+        let paired_jwt = live(T_A, USER);
+        let heal = heal_vanished_paired_user_hooked(&mgr, &path, &known(&[ta(), tb()]), &|| {
+            persist_pairing_with(&mgr, &path, &pair_resp_for(&paired_jwt), ta())
+                .expect("the concurrent pairing");
+        });
+        assert_eq!(heal, PairedUserHeal::NotNeeded);
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1, "{pf:?}");
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+        assert!(
+            pf.bindings[0].paired_at.is_some(),
+            "the real pairing survives"
+        );
+        assert_eq!(
+            mgr.get_access_token().ok().as_deref(),
+            Some(paired_jwt.as_str()),
+            "the pairing's legacy-slot write is not overwritten"
+        );
+    }
+
+    /// Finding 4: temp names are unique per write, so two writers never
+    /// truncate one shared `paired_user.json.tmp`, and none is left behind.
+    #[test]
+    fn writes_leave_no_temp_file_and_never_use_the_shared_tmp_name() {
+        let (dir, path, _mgr) = store("tmp_names");
+        let pf = PairedUserFile {
+            user_id: USER.into(),
+            tenant_id: Some(T_A.into()),
+            bindings: vec![],
+            default_tenant_id: None,
+        };
+        write_paired_user_file(&path, &pf).expect("write 1");
+        write_paired_user_file(&path, &pf).expect("write 2");
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["paired_user.json".to_string()], "{names:?}");
+    }
+
+    /// Finding 5: a legacy-only credential for Known tenant X (no per-tenant
+    /// slot) is a heal source and the default; a slot for Y is healed beside
+    /// it, and X's only credential is not overwritten.
+    #[test]
+    fn a_legacy_only_credential_is_healed_as_the_default_and_never_clobbered() {
+        let (_dir, path, mgr) = store("legacy_only");
+        let jwt_x = live(T_A, USER);
+        mgr.store_tokens(&jwt_x, "").expect("legacy = A");
+        // `store_tokens` mirrors into the claim tenant's slot; remove it to
+        // model a legacy-only install.
+        mgr.clear_tenant_device_jwt(&ta()).expect("legacy-only");
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_none());
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER_2))
+            .expect("slot B");
+        let heal = heal_vanished_paired_user_with(&mgr, &path, &known(&[ta(), tb()]));
+        assert_eq!(
+            heal,
+            PairedUserHeal::Healed {
+                cause: "absent",
+                tenants: vec![ta(), tb()],
+                default_tenant: ta(),
+            }
+        );
+        assert_eq!(read_paired_tenant_id_at(&path).as_deref(), Some(T_A));
+        assert_eq!(read_paired_user_id_at(&path).as_deref(), Some(USER));
+        assert_eq!(mgr.get_access_token().ok().as_deref(), Some(jwt_x.as_str()));
+    }
+
+    /// Finding 5: a legacy credential that does NOT qualify (tenant outside
+    /// the known set) is preserved in its own slot before the default's JWT
+    /// is copied over it — the copy never destroys a credential.
+    #[test]
+    fn a_non_qualifying_legacy_credential_is_preserved_before_it_is_replaced() {
+        let (_dir, path, mgr) = store("legacy_preserve");
+        let jwt_c = live(T_C, USER);
+        mgr.store_tokens(&jwt_c, "").expect("legacy = C");
+        mgr.clear_tenant_device_jwt(&tc()).expect("legacy-only");
+        let jwt_b = live(T_B, USER_2);
+        mgr.store_tenant_device_jwt(&tb(), &jwt_b).expect("slot B");
+        let heal = heal_vanished_paired_user_with(&mgr, &path, &known(&[tb()]));
+        assert!(
+            matches!(heal, PairedUserHeal::Healed { default_tenant, .. } if default_tenant == tb()),
+            "{heal:?}"
+        );
+        assert_eq!(mgr.get_access_token().ok().as_deref(), Some(jwt_b.as_str()));
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tc()).unwrap().as_deref(),
+            Some(jwt_c.as_str()),
+            "C's only credential was moved to its slot, not destroyed"
+        );
+    }
+
+    /// Finding 6: the heal's "needs healing" is exactly `!device_is_paired_at`.
+    /// A legacy `{"user_id":"","tenant_id":"T"}` names a binding (its
+    /// synthesized entry), so it is paired AND left alone.
+    #[test]
+    fn the_heal_predicate_is_the_negation_of_device_is_paired() {
+        let (dir, path, mgr) = store("predicate");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        let cases: [&[u8]; 5] = [
+            br#"{"user_id":"","tenant_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#,
+            br#"{"user_id":""}"#,
+            br#"{"user_id":"u"}"#,
+            b"{not json",
+            br#"{"user_id":"","bindings":[{"tenant_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","user_id":"u"}]}"#,
+        ];
+        for bytes in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let paired = device_is_paired_at(&path);
+            let cause = paired_user_vanished_cause(&path).expect("readable");
+            assert_eq!(
+                cause.is_none(),
+                paired,
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(!device_is_paired_at(&path));
+        assert_eq!(paired_user_vanished_cause(&path), Ok(Some("absent")));
+
+        let legacy = br#"{"user_id":"","tenant_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#;
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(
+            heal_vanished_paired_user_with(&mgr, &path, &known(&[ta()])),
+            PairedUserHeal::NotNeeded
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), legacy.to_vec());
+        drop(dir);
+    }
+
+    /// Finding 7: an unparseable file is renamed aside
+    /// (`paired_user.json.unparseable-<UTC>`), bytes intact, before the heal
+    /// writes the rebuilt file.
+    #[test]
+    fn an_unparseable_file_is_renamed_aside_before_the_heal_writes() {
+        let (dir, path, mgr) = store("aside");
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        std::fs::write(&path, b"{corrupt").unwrap();
+        assert!(matches!(
+            heal_vanished_paired_user_with(&mgr, &path, &known(&[ta()])),
+            PairedUserHeal::Healed {
+                cause: "unparseable",
+                ..
+            }
+        ));
+        let asides: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("paired_user.json.unparseable-")
+            })
+            .collect();
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert_eq!(std::fs::read(&asides[0]).unwrap(), b"{corrupt".to_vec());
+        assert!(device_is_paired_at(&path));
+    }
+
+    /// Finding 9: when the only usable credentials belong to tenants coord no
+    /// longer binds, the refusal says exactly that — not "no slot".
+    #[test]
+    fn the_refusal_names_usable_slots_that_coord_has_unbound() {
+        let (_dir, path, mgr) = store("outside_only");
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        let PairedUserHeal::Refused(why) =
+            heal_vanished_paired_user_with(&mgr, &path, &known(&[ta()]))
+        else {
+            panic!("must refuse");
+        };
+        assert!(why.contains("ONLY usable credential"), "{why}");
+        assert!(why.contains("does NOT list as bound"), "{why}");
+        assert!(why.contains(T_B), "{why}");
+
+        // A mixed store (one expired in-set slot, one usable unbound slot)
+        // still names the unbound one as the only USABLE credential.
+        mgr.store_tenant_device_jwt(&ta(), &device_jwt(T_A, Some(USER), -60))
+            .expect("expired slot A");
+        let PairedUserHeal::Refused(why) =
+            heal_vanished_paired_user_with(&mgr, &path, &known(&[ta()]))
+        else {
+            panic!("must refuse");
+        };
+        assert!(why.contains("does NOT list as bound"), "{why}");
+    }
+
+    /// Finding 1: the heartbeat's last-resort binding source — the per-tenant
+    /// slots whose own claim names them, usable only; the default is the
+    /// greatest (the heal's own deterministic pick).
+    #[test]
+    fn usable_slot_claim_tenants_counts_only_usable_self_naming_slots() {
+        let (_dir, _path, mgr) = store("slot_claims");
+        assert_eq!(usable_slot_claim_tenants_with(&mgr), None);
+        mgr.store_tenant_device_jwt(&ta(), &live(T_A, USER))
+            .expect("slot A");
+        mgr.store_tenant_device_jwt(&tb(), &device_jwt(T_B, Some(USER), -60))
+            .expect("expired slot B");
+        mgr.store_tenant_device_jwt(&tc(), &live(T_A, USER))
+            .expect("mis-keyed slot C");
+        assert_eq!(
+            usable_slot_claim_tenants_with(&mgr),
+            Some((ta(), vec![ta()]))
+        );
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B refreshed");
+        assert_eq!(
+            usable_slot_claim_tenants_with(&mgr),
+            Some((tb(), vec![ta(), tb()]))
         );
     }
 }
