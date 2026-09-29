@@ -35,10 +35,14 @@ use crate::worktree::run_git_command;
 /// The store's directory name under the agent-worktree root.
 pub(crate) const SIBLING_STORE_DIRNAME: &str = ".siblings";
 
-/// The completeness marker, written at an entry's root after a fully successful
-/// extraction and BEFORE the atomic rename, so it lands with the entry or not at
-/// all. Shared contract with `allocate-worktree.sh`: an entry without it is
-/// never adopted and never backs a cargo config.
+/// The completeness marker: an empty file named `.qontinui-sibling-complete` at
+/// an entry's root. Shared contract with qontinui-claude-config's
+/// `scripts/allocate-worktree.sh`, which writes and requires the same file:
+/// - it is written only after a fully successful extraction, inside the temp
+///   dir and BEFORE the atomic rename, so it lands with the entry or not at all;
+/// - it is required for adoption: an entry without it is never adopted and
+///   never backs a cargo config (see [`adopt_existing`] and
+///   [`missing_override_entries`]).
 pub(crate) const COMPLETE_MARKER: &str = ".qontinui-sibling-complete";
 
 /// `git archive` of a sibling repo is tens of MB; bounded like every other
@@ -156,7 +160,16 @@ fn adopt_existing(target: &Path) -> Result<bool, String> {
                 trash.display()
             );
             match std::fs::rename(target, &trash) {
-                Ok(()) => Ok(false),
+                Ok(()) => {
+                    // The marker was absent when checked, but a writer may have
+                    // completed the entry between that check and the rename.
+                    if restore_if_completed(target, &trash) {
+                        touch_entry(target);
+                        Ok(target.join(COMPLETE_MARKER).is_file())
+                    } else {
+                        Ok(false)
+                    }
+                }
                 Err(_) if !target.exists() => Ok(false),
                 Err(e) => Err(format!(
                     "incomplete entry {} could not be set aside: {e}",
@@ -180,6 +193,35 @@ fn adopt_existing(target: &Path) -> Result<bool, String> {
             std::fs::remove_file(target)
                 .map(|()| false)
                 .map_err(|e| format!("remove non-directory {}: {e}", target.display()))
+        }
+    }
+}
+
+/// The TOCTOU guard for setting a partial entry aside: when the tree just moved
+/// to `trash` turns out to carry [`COMPLETE_MARKER`] after all, move it back to
+/// `target`. Returns whether it was restored. A failed move back (typically
+/// because a peer has published `target` again meanwhile) leaves `trash` for the
+/// reaper; the caller then treats `target` as absent and re-reads it.
+fn restore_if_completed(target: &Path, trash: &Path) -> bool {
+    if !trash.join(COMPLETE_MARKER).is_file() {
+        return false;
+    }
+    match std::fs::rename(trash, target) {
+        Ok(()) => {
+            info!(
+                "sibling store: {} was completed while being set aside — restored",
+                target.display()
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "sibling store: completed tree {} could not be moved back to {} ({e}) — \
+                 left for the reaper",
+                trash.display(),
+                target.display()
+            );
+            false
         }
     }
 }
@@ -277,11 +319,16 @@ fn extract_archive(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let file = std::fs::File::open(tar_file.path())
-        .map_err(|e| format!("open archive {tar_path}: {e}"))?;
+    unpack_file(tar_file.path(), dest).map_err(|e| format!("archive of {sha}: {e}"))
+}
+
+/// Unpack the tar at `tar_path` into `dest`.
+fn unpack_file(tar_path: &Path, dest: &Path) -> Result<(), String> {
+    let file =
+        std::fs::File::open(tar_path).map_err(|e| format!("open {}: {e}", tar_path.display()))?;
     tar::Archive::new(std::io::BufReader::new(file))
         .unpack(dest)
-        .map_err(|e| format!("unpack archive of {sha} into {}: {e}", dest.display()))
+        .map_err(|e| format!("unpack into {}: {e}", dest.display()))
 }
 
 /// Mark every regular file under `dir` read-only, on every platform. Directories
@@ -630,6 +677,71 @@ mod tests {
         assert!(got.join(COMPLETE_MARKER).is_file());
         assert!(got.join("rust/Cargo.toml").is_file());
         assert!(!got.join("rust/half.rs").exists());
+    }
+
+    #[test]
+    fn a_tree_completed_while_being_set_aside_is_restored() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = ws.path().join(format!("qontinui-schemas@{SHA_A}"));
+        let trash = trash_path(&target);
+
+        // No marker in the trash → nothing moves back.
+        std::fs::create_dir_all(&trash).unwrap();
+        assert!(!restore_if_completed(&target, &trash));
+        assert!(trash.is_dir() && !target.exists());
+
+        // The marker appeared between the check and the rename → restored.
+        std::fs::write(trash.join(COMPLETE_MARKER), "").unwrap();
+        assert!(restore_if_completed(&target, &trash));
+        assert!(target.join(COMPLETE_MARKER).is_file());
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn a_completed_trash_stays_put_when_the_entry_was_republished() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = ws.path().join(format!("qontinui-schemas@{SHA_A}"));
+        std::fs::create_dir_all(target.join("rust")).unwrap();
+        std::fs::write(target.join(COMPLETE_MARKER), "").unwrap();
+        let trash = trash_path(&target);
+        std::fs::create_dir_all(trash.join("rust")).unwrap();
+        std::fs::write(trash.join(COMPLETE_MARKER), "").unwrap();
+
+        assert!(!restore_if_completed(&target, &trash));
+        assert!(trash.join(COMPLETE_MARKER).is_file(), "left for the reaper");
+        assert!(target.join(COMPLETE_MARKER).is_file());
+    }
+
+    /// A failure AFTER the temp extraction dir and temp archive exist (here
+    /// `git archive` failing on a missing blob, past `ensure_commit`) must leave
+    /// neither behind, and publish no entry.
+    #[test]
+    fn a_failure_after_temp_creation_leaves_no_temp_behind() {
+        let ws = tempfile::tempdir().unwrap();
+        let (repo, sha) = fixture_repo(ws.path());
+        let blob = git(&repo, &["rev-parse", &format!("{sha}:rust/Cargo.toml")]);
+        let (dir, file) = blob.split_at(2);
+        std::fs::remove_file(repo.join(".git/objects").join(dir).join(file)).unwrap();
+
+        let store = ws.path().join(".siblings");
+        let err = materialize(&store, &repo, "qontinui-schemas", &sha).unwrap_err();
+        assert!(err.contains("git archive"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    #[test]
+    fn a_corrupt_archive_fails_to_unpack_cleanly() {
+        let ws = tempfile::tempdir().unwrap();
+        let tar = ws.path().join("bad.tar");
+        std::fs::write(&tar, vec![0xAB; 1536]).unwrap();
+        let dest = ws.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(unpack_file(&tar, &dest).is_err());
     }
 
     #[test]
