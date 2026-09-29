@@ -909,6 +909,11 @@ struct ProvisionProbeBody {
     /// Absolute path to a scratch directory the probe may write
     /// `.claude/agents/` into. Caller-supplied and caller-owned: the probe
     /// creates nothing outside it and removes nothing.
+    ///
+    /// `default` on purpose: without it an absent field is rejected by the `Json`
+    /// extractor as a 422 before the handler runs, which contradicts this
+    /// route's contract that every refusal is typed and names the next action.
+    #[serde(default)]
     workdir: String,
 }
 
@@ -918,9 +923,12 @@ struct ProvisionProbeResponse {
     /// Echoed back so a caller driving several probes can match answers to
     /// requests without relying on ordering.
     workdir: String,
-    /// The reports this pass RECORDED into the session-provisioning ledger.
-    /// `agent_definitions` here; the embedded `fleet_agents` floor is recorded
-    /// from inside the same call and is visible on the next manifest read.
+    /// The `agent_definitions` report this pass recorded — ONE entry, not both
+    /// rows. The embedded `fleet_agents` floor is recorded by the same call from
+    /// inside `provision_agent_definitions_from_root`, which does not hand it
+    /// back, so it is visible on the next manifest read rather than here. A
+    /// caller that needs both reads the manifest, which is what the parity
+    /// harness does anyway.
     recorded: Vec<crate::capability_manifest::ProvisionReport>,
 }
 
@@ -965,41 +973,86 @@ async fn capability_manifest_provision_probe(
             .into_response()
     };
 
-    let workdir = body.workdir.trim().to_string();
-    if workdir.is_empty() {
+    let requested = body.workdir.trim().to_string();
+    if requested.is_empty() {
         return refuse("workdir is required and must be an absolute path".to_string());
     }
-    let path = std::path::Path::new(&workdir);
-    if !path.is_absolute() {
+    let requested_path = std::path::Path::new(&requested);
+    if !requested_path.is_absolute() {
         return refuse(format!(
-            "workdir must be an absolute path; got {workdir:?}. \
+            "workdir must be an absolute path; got {requested:?}. \
              The probe resolves nothing against a cwd it does not own."
         ));
     }
+    // CANONICALIZE BEFORE EVERY OTHER CHECK, and act on the canonical path.
+    //
+    // `is_dir()` and the writes below FOLLOW symlinks while a lexical parent
+    // walk does not, so a link whose target sits inside a checkout would pass a
+    // guard applied to the link's own path and then clobber `.claude/agents` in
+    // the repository. Resolving first collapses that gap: every check below, and
+    // the provisioning itself, see the same real directory.
+    let path = match std::fs::canonicalize(requested_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return refuse(format!(
+                "workdir {requested:?} could not be resolved: {e}. \
+                 Create the scratch dir first; the probe never creates its own target."
+            ))
+        }
+    };
+    let workdir = path.display().to_string();
     if !path.is_dir() {
         return refuse(format!(
-            "workdir {workdir:?} is not an existing directory. \
-             Create the scratch dir first; the probe never creates its own target."
+            "workdir {requested:?} resolves to {workdir:?}, which is not a directory. \
+             Point it at an existing scratch directory."
         ));
     }
-    if let Some(repo_root) = enclosing_git_work_tree(path) {
+    if let Some(repo_root) = enclosing_git_work_tree(&path) {
         return refuse(format!(
-            "workdir {workdir:?} is inside the git work tree at {repo_root:?}. \
-             This probe overwrites .claude/agents/*.md unconditionally, which in a \
-             checkout would clobber hand-authored definitions and leave the tree dirty. \
+            "workdir {requested:?} resolves to {workdir:?}, inside the git work tree at \
+             {repo_root:?}. This probe overwrites .claude/agents/*.md unconditionally, which \
+             in a checkout would clobber hand-authored definitions and leave the tree dirty. \
              Point it at a scratch directory outside any repository."
         ));
     }
+    // A HOME DIRECTORY IS NOT A CHECKOUT, AND IS JUST AS VALUABLE. `~/.claude`
+    // is the user-scoped location `claude` resolves subagent definitions from,
+    // so writing there would overwrite the operator's own hand-authored defs
+    // with this binary's embedded snapshot. No git guard catches it: a home dir
+    // is not a work tree.
+    if let Some(home) = dirs::home_dir().and_then(|h| std::fs::canonicalize(h).ok()) {
+        if path == home || home.starts_with(&path) {
+            return refuse(format!(
+                "workdir {requested:?} resolves to {workdir:?}, which is the home directory \
+                 {home:?} or an ancestor of it. Provisioning there would overwrite the \
+                 user-scoped ~/.claude/agents definitions. Point it at a scratch directory."
+            ));
+        }
+    }
 
     let workdir_for_task = workdir.clone();
-    let recorded = spawn_blocking_tracked(move || {
+    let recorded = match spawn_blocking_tracked(move || {
         crate::agent_runtime::provision_agent_definitions_recorded(&workdir_for_task)
     })
     .await
-    .unwrap_or_else(|e| {
-        tracing::error!("provision probe task panicked: {e}");
-        Vec::new()
-    });
+    {
+        Ok(reports) => reports,
+        Err(e) => {
+            // A panicked pass answering 200 with `recorded: []` would read to the
+            // harness exactly like a pass that recorded nothing, and its caller
+            // branches on the status code. Say 500 instead.
+            tracing::error!("provision probe task panicked: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "the provisioning pass panicked and recorded nothing verifiable: {e}"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
 
     Json(ProvisionProbeResponse { workdir, recorded }).into_response()
 }
@@ -20064,9 +20117,18 @@ mod provision_probe_tests {
         let _ = std::fs::remove_dir_all(&missing);
         let (status, body) = probe(&missing.display().to_string()).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        // Since the canonicalize-first fix this is caught one step earlier, by
+        // the resolution itself, so the wording is "could not be resolved"
+        // rather than "not an existing directory". What the test actually
+        // guards is unchanged and is what matters: a 400 that NAMES the path
+        // and tells the caller what to do, rather than a failure further in.
         assert!(
-            body.contains("not an existing directory"),
-            "refusal says the dir is missing rather than failing later: {body}"
+            body.contains("could not be resolved"),
+            "refusal says the path did not resolve rather than failing later: {body}"
+        );
+        assert!(
+            body.contains("parity-probe-does-not-exist"),
+            "and it names the path the caller gave: {body}"
         );
     }
 
@@ -20094,6 +20156,76 @@ mod provision_probe_tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE BYPASS THIS GUARD WAS FIRST WRITTEN WITHOUT.
+    ///
+    /// `is_dir()` and the provisioning writes follow symlinks; a lexical parent
+    /// walk does not. So a link outside any repo whose TARGET sits inside one
+    /// passed every check and then clobbered `.claude/agents` in the checkout.
+    /// The fix is to canonicalize before checking, and this test is the proof —
+    /// it fails against the pre-fix handler.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_into_a_git_work_tree_is_refused() {
+        let root = std::env::temp_dir().join(format!("parity-probe-symlink-{}", std::process::id()));
+        let repo = root.join("repo");
+        let inside = repo.join("sub");
+        std::fs::create_dir_all(&inside).expect("create repo/sub");
+        std::fs::write(repo.join(".git"), b"gitdir: /elsewhere\n").expect("write .git");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("symlink");
+
+        // The link itself is outside any work tree by a lexical walk...
+        assert!(
+            enclosing_git_work_tree(&link).is_none(),
+            "precondition: the lexical walk cannot see through the link"
+        );
+        // ...and the handler must refuse it anyway.
+        let (status, body) = probe(&link.display().to_string()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a symlink into a checkout must be refused: {body}"
+        );
+        assert!(
+            body.contains("git work tree"),
+            "and the refusal must name why: {body}"
+        );
+        assert!(
+            !inside.join(".claude").exists(),
+            "nothing may have been written inside the repository"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A home directory is not a git work tree, and `~/.claude/agents` holds the
+    /// operator's own hand-authored definitions. The git guard cannot catch it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_home_directory_is_refused() {
+        let Some(home) = dirs::home_dir() else { return };
+        let (status, body) = probe(&home.display().to_string()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the home dir must be refused: {body}"
+        );
+        assert!(
+            body.contains("home directory"),
+            "and the refusal must say so: {body}"
+        );
+    }
+
+    /// An absent `workdir` must reach the handler's own typed refusal rather than
+    /// serde's 422, which the route's contract promises.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_absent_workdir_field_is_a_typed_refusal() {
+        let resp = capability_manifest_provision_probe(Json(
+            serde_json::from_str::<ProvisionProbeBody>("{}").expect("an absent workdir deserializes"),
+        ))
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     /// A scratch dir outside any repo is accepted, and the answer carries the

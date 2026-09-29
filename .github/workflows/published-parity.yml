@@ -17,8 +17,26 @@ name: published-build parity
 # operator's machine looks like.
 #
 # =============================================================================
-# THIS GATES NOTHING, AND THAT IS DELIBERATE
+# THIS GATES NOTHING -- WITH ONE NAMED EXCEPTION, ADDED DELIBERATELY
 # =============================================================================
+#
+# THE PARITY JOB gates nothing, unchanged: every parity outcome reports and
+# nothing below can stop a merge or a release.
+#
+# THE `negative-control` JOB CAN GO RED, and that is its purpose. It never judges
+# a parity outcome -- it judges whether this harness can SEE a difference at all,
+# by taking the whole qontinui-claude-config checkout away and requiring a row to
+# move. A green parity run from a blind instrument is worse than no run, so the
+# REPORTER is the one thing here worth gating on.
+#
+# It is scoped so it cannot repeat the incident this file already records below
+# (a cold-build timeout rendering as `cancelled`, which coord's merge gate reads
+# as ci-not-green -- four days on qontinui-runner#1511):
+#   * it runs on `pull_request` only for PRs that touch the harness itself;
+#   * its build and control steps are `continue-on-error`, so a cold build, a
+#     hung install or an UNAVAILABLE control (exit 2) cannot redden the job;
+#   * exactly one step fails the job: the verdict check, and only on exit 1 --
+#     the instrument demonstrably blind. "Could not look" is never "blind".
 #
 # Not a required context. Does not block `publish-update-json`. Does not touch
 # the Windows-sole-hard-gate rule in release.yml. Nothing here can stop a merge
@@ -207,6 +225,27 @@ jobs:
             exit $bad
           ' || status=1
           exit $status
+        shell: bash
+
+      # 5-B: the probe route is spelled in THREE places -- the axum route, the
+      # origin-guard door entry, and the URL the harness POSTs to. A Rust test
+      # pins the first two against each other; nothing pinned the third, and a
+      # typo there reports as `unknown(door_404_artifact_predates_probe)` on a
+      # build compiled from this very commit -- a wiring mistake wearing the
+      # disguise of an old artifact. On the negative-control job, where both legs
+      # are the same build, it would surface as "the instrument is BLIND" with
+      # the wrong diagnosis. One grep closes that.
+      - name: The provision-probe URL matches the registered route
+        run: |
+          set -euo pipefail
+          route='/capability-manifest/provision-probe'
+          for f in src-tauri/src/mcp_api.rs src-tauri/src/mcp/origin_guard.rs scripts/published-parity.ps1; do
+            if ! grep -qF "$route" "$f"; then
+              echo "::error file=$f::the probe route '$route' is not spelled here. All three spellings must agree, or a 404 reads as 'the artifact predates the probe'."
+              exit 1
+            fi
+            echo "ok: $f"
+          done
         shell: bash
 
       # Siblings. qontinui-schemas is a hard compile dependency
@@ -581,14 +620,22 @@ jobs:
       - name: Capability-manifest parity (development vs published)
         id: parity
         continue-on-error: true
-        timeout-minutes: 20
+        # 30, was 20. Phase 5 added the provisioning drive, which costs, per leg,
+        # up to: terminal retry 60s (the deadline is checked at the TOP of the
+        # loop, so an attempt starting at 59s still runs its own 30s) + close 20s
+        # + slash sync 30s + probe 60s, on top of the 180s boot. Two legs put the
+        # worst case near 800s of drive and boot alone, so the previous inner
+        # -TimeoutSec 900 could expire mid-drive and report an empty
+        # parity-count -- the silent failure this workflow's ASCII step comment
+        # was written about.
+        timeout-minutes: 30
         env:
           # Same degraded-boot flag ci.yml's contract-smoke step uses: the
           # manifest door needs no database rows.
           QONTINUI_ALLOW_NO_DB: "1"
         run: |
           pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
-            -ScriptPath scripts/published-parity.ps1 -LogPath parity-report/published-parity.log -TimeoutSec 900 `
+            -ScriptPath scripts/published-parity.ps1 -LogPath parity-report/published-parity.log -TimeoutSec 1500 `
             -JsonOut parity-report/published-parity.json `
             -SummaryOut "$env:GITHUB_STEP_SUMMARY" `
             -Annotate
@@ -911,6 +958,27 @@ jobs:
           exit $status
         shell: bash
 
+      # 5-B: the probe route is spelled in THREE places -- the axum route, the
+      # origin-guard door entry, and the URL the harness POSTs to. A Rust test
+      # pins the first two against each other; nothing pinned the third, and a
+      # typo there reports as `unknown(door_404_artifact_predates_probe)` on a
+      # build compiled from this very commit -- a wiring mistake wearing the
+      # disguise of an old artifact. On the negative-control job, where both legs
+      # are the same build, it would surface as "the instrument is BLIND" with
+      # the wrong diagnosis. One grep closes that.
+      - name: The provision-probe URL matches the registered route
+        run: |
+          set -euo pipefail
+          route='/capability-manifest/provision-probe'
+          for f in src-tauri/src/mcp_api.rs src-tauri/src/mcp/origin_guard.rs scripts/published-parity.ps1; do
+            if ! grep -qF "$route" "$f"; then
+              echo "::error file=$f::the probe route '$route' is not spelled here. All three spellings must agree, or a 404 reads as 'the artifact predates the probe'."
+              exit 1
+            fi
+            echo "ok: $f"
+          done
+        shell: bash
+
       # Siblings. qontinui-schemas is a hard compile dependency
       # (src-tauri/Cargo.toml's `qontinui-types = { path = "../../qontinui-schemas/rust" }`);
       # ui-bridge carries the UI_BRIDGE_ROUTES source that contract-smoke parses
@@ -1040,13 +1108,24 @@ jobs:
       # backstops) + 60 + ~4.5 of unbounded scaffolding + 5 (the behavioural
       # axis, below) = ~134.5 of the job's 150-minute budget.
       - name: Build Tauri app (development)
+        # REPORT-ONLY in this job, unlike the parity job's identical step. A cold
+        # build that times out here would otherwise render as a failed job on a
+        # PR, which coord's merge gate reads as ci-not-green -- the #1511 shape
+        # this workflow already paid four days for. A genuine build break is
+        # caught by ci.yml, which gates PRs properly; if the build does not
+        # produce an exe the control below reports UNAVAILABLE (exit 2) and the
+        # verdict step warns rather than reddens.
+        continue-on-error: true
         timeout-minutes: 60
         run: pnpm run tauri build --debug --no-bundle
 
-      # The control itself. NOT continue-on-error: a blind instrument is exactly
-      # what this job exists to redden.
+      # The control itself. `continue-on-error` so that a cold build, a boot
+      # failure or any "could not look" outcome does not redden the job -- the
+      # verdict step below is the only thing that can, and only on exit 1.
       - name: Negative control -- can this harness see a missing checkout?
-        timeout-minutes: 20
+        id: control
+        continue-on-error: true
+        timeout-minutes: 30
         env:
           # Same as the parity job's manifest step: the harness boots runners on
           # a box with no database and must be allowed to degrade rather than
@@ -1054,10 +1133,39 @@ jobs:
           QONTINUI_ALLOW_NO_DB: "1"
         run: |
           pwsh -File scripts/lib/invoke-ps51-detached.ps1 `
-            -ScriptPath scripts/published-parity.ps1 -LogPath negative-control.log -TimeoutSec 900 `
+            -ScriptPath scripts/published-parity.ps1 -LogPath negative-control.log -TimeoutSec 1500 `
             -NegativeControl
           exit $LASTEXITCODE
         shell: pwsh
+
+      # THE ONE GATING STEP IN THIS WORKFLOW, and it reads exactly one value.
+      #
+      #   1  the control ran and the instrument is BLIND          -> RED
+      #   0  the control ran and the instrument sees the class    -> green
+      #   2  the control could not run (no dev exe, boot failed)  -> green + warning
+      #   anything else / no outcome (a cancelled or timed-out step) -> green + warning
+      #
+      # "Could not look" is never "blind" -- resolving an unknown into a red here
+      # would reproduce the #1511 shape this file already paid four days for.
+      - name: Negative control verdict
+        if: always()
+        env:
+          OUTCOME: ${{ steps.control.outcome }}
+          CODE: ${{ steps.control.outputs.exit-code }}
+        run: |
+          echo "control step outcome: ${OUTCOME:-<none>}"
+          if grep -q 'NEGATIVE-CONTROL FAILED' negative-control.log 2>/dev/null; then
+            echo "::error::The parity harness is BLIND: taking the entire qontinui-claude-config checkout away changed no checkout-sensitive capability row. Its defect count -- including a 0 -- carries no information until this is fixed."
+            sed -n '/Negative control verdict/,$p' negative-control.log 2>/dev/null || true
+            exit 1
+          fi
+          if grep -q 'NEGATIVE-CONTROL OK' negative-control.log 2>/dev/null; then
+            echo "The instrument demonstrably sees the class."
+            exit 0
+          fi
+          echo "::warning::The negative control produced no verdict (outcome '${OUTCOME:-none}'). That is UNKNOWN, not a pass and not a failure -- read the uploaded log."
+          exit 0
+        shell: bash
 
       - name: Upload the negative control log
         if: always()

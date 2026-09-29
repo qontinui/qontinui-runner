@@ -154,6 +154,11 @@ param(
     # Emit one ::warning:: workflow annotation per differing row.
     [switch]$Annotate,
     [int]$BootTimeoutSecs = 180,
+    # How long the provisioning drive re-asks POST /terminals while it answers
+    # 409 (coord's drain state is Unknown until its first read folds). Bounded so
+    # the whole drive stays inside the CI step's own timeout; see the sizing note
+    # on the workflow's -TimeoutSec.
+    [int]$TerminalRetrySecs = 60,
     # INSTRUMENT SELF-CHECK, not a parity run. Boots the DEVELOPMENT build twice
     # -- once with QONTINUI_ROOT pointed at a real workspace, once at an empty
     # directory -- drives provisioning on both, and requires the comparator to
@@ -472,7 +477,7 @@ function Dump-ParityRunnerDiagnostics {
 # partial that reads as a clean bill of health.
 # ---------------------------------------------------------------------------
 function Invoke-ParityProvisioningDrive {
-    param([int]$Port, [string]$Label, [int]$TerminalRetrySecs = 90)
+    param([int]$Port, [string]$Label, [int]$TerminalRetrySecs = 60)
 
     $base = "http://127.0.0.1:$Port"
     # RUNNER_TEMP on a GitHub runner, the OS temp dir otherwise. Either way this
@@ -500,6 +505,7 @@ function Invoke-ParityProvisioningDrive {
     # has to happen first. A bounded wait distinguishes "not yet folded" from
     # "refused", which a single attempt cannot.
     $terminalId = $null
+    $created = $false
     $deadline = (Get-Date).AddSeconds($TerminalRetrySecs)
     $lastRefusal = $null
     while ((Get-Date) -lt $deadline) {
@@ -509,7 +515,13 @@ function Invoke-ParityProvisioningDrive {
                 -ContentType 'application/json' -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
             $parsed = $resp.Content | ConvertFrom-Json
             if ($parsed.data -and $parsed.data.id) { $terminalId = [string]$parsed.data.id }
-            $drive.terminal = $(if ($terminalId) { "created($terminalId)" } else { 'created(no id in body)' })
+            # CREATED is created. A 2xx with no id in the body means provisioning
+            # ran (that happens inside the handler before the PTY) but this
+            # harness cannot close what it opened -- a different and lesser
+            # problem than a refusal, and it must not be reported as one with an
+            # empty reason.
+            $created = $true
+            $drive.terminal = $(if ($terminalId) { "created($terminalId)" } else { 'created(no id in body; cannot close it)' })
             break
         } catch {
             $code = $null
@@ -523,9 +535,12 @@ function Invoke-ParityProvisioningDrive {
             break
         }
     }
-    if (-not $terminalId) {
-        $drive.terminal = "unknown(terminal_create_refused: $lastRefusal)"
-        Write-Host "    provisioning drive: POST /terminals did not create a terminal -- $lastRefusal"
+    if (-not $created) {
+        $reason = $(if ($lastRefusal) { $lastRefusal } else { 'no response and no error recorded' })
+        $drive.terminal = "unknown(terminal_create_refused: $reason)"
+        Write-Host "    provisioning drive: POST /terminals did not create a terminal -- $reason"
+    } elseif (-not $terminalId) {
+        Write-Host "    provisioning drive: terminal created in $workdir but the body carried no id"
     } else {
         Write-Host "    provisioning drive: terminal $terminalId created in $workdir"
         # Close ONLY what this harness opened. Exercising a live surface must
@@ -607,7 +622,8 @@ function Get-ParityProvisionWitness {
 }
 
 function Get-ManifestOverHttp {
-    param([string]$ExePath, [string]$Label, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null)
+    param([string]$ExePath, [string]$Label, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null,
+          [int]$TerminalRetrySecs = 60)
 
     $port = Get-FreeParityPort
     $runner = $null
@@ -629,7 +645,7 @@ function Get-ManifestOverHttp {
         # Fill the session-provisioning rows BEFORE reading the manifest: the
         # ledger is process-wide state, so the read below carries whatever the
         # drive just recorded. Same step, same workdir shape, on both legs.
-        $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label
+        $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label -TerminalRetrySecs $TerminalRetrySecs
         $witness = Get-ParityProvisionWitness -Workdir $drive.workdir
         Write-Host ("    provisioning witness: commands={0} skills={1} agents={2}" -f `
             $(if ($null -eq $witness.commands) { 'unknown' } else { $witness.commands }), `
@@ -680,12 +696,13 @@ function Get-ManifestOverCli {
 }
 
 function Get-Manifest {
-    param([string]$ExePath, [string]$Label, [string]$Mode, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null)
+    param([string]$ExePath, [string]$Label, [string]$Mode, [int]$TimeoutSecs, [hashtable]$EnvOverrides = $null,
+          [int]$TerminalRetrySecs = 60)
     # The CLI door takes no overrides: it is a cold process this function does
     # not launch through Start-ParityRunner, so an override would be silently
     # dropped. -NegativeControl refuses the cli door up front for that reason.
     if ($Mode -eq 'cli') { return Get-ManifestOverCli -ExePath $ExePath -Label $Label }
-    return Get-ManifestOverHttp -ExePath $ExePath -Label $Label -TimeoutSecs $TimeoutSecs -EnvOverrides $EnvOverrides
+    return Get-ManifestOverHttp -ExePath $ExePath -Label $Label -TimeoutSecs $TimeoutSecs -EnvOverrides $EnvOverrides -TerminalRetrySecs $TerminalRetrySecs
 }
 
 # ===========================================================================
@@ -740,9 +757,9 @@ if ($NegativeControl) {
     Write-Host ""
 
     $legA = Get-Manifest -ExePath $devPath -Label "ncontrol-with-checkout" -Mode $Door `
-        -TimeoutSecs $BootTimeoutSecs -EnvOverrides @{ "QONTINUI_ROOT" = $withRoot }
+        -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs -EnvOverrides @{ "QONTINUI_ROOT" = $withRoot }
     $legB = Get-Manifest -ExePath $devPath -Label "ncontrol-empty-root" -Mode $Door `
-        -TimeoutSecs $BootTimeoutSecs -EnvOverrides @{ "QONTINUI_ROOT" = $emptyRoot }
+        -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs -EnvOverrides @{ "QONTINUI_ROOT" = $emptyRoot }
 
     Remove-Item -LiteralPath $emptyRoot -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -773,7 +790,14 @@ if ($NegativeControl) {
     # "this instrument can see the class" means. `agent_definitions` is the one
     # that must move: leg A overlays the checkout's defs, leg B finds no
     # claude-config dir and reports the embedded floor / unresolved instead.
-    $sensitive = @('agent_definitions', 'agent_commands_registry', 'agent_skills_registry', 'workspace_root', 'slash_commands')
+    # Only rows that CAN move when the checkout is taken away. Two that look
+    # eligible are not, and listing them would overstate how many independent
+    # signals back this control: `slash_commands` is `unknown` on both legs
+    # wherever the sync has no database (so `unobserved`, never a defect), and
+    # `workspace_root` resolves on BOTH legs because an empty directory is an
+    # accepted QONTINUI_ROOT. `agent_definitions` is the row that carries this
+    # assertion; the registries are genuine secondary signals.
+    $sensitive = @('agent_definitions', 'agent_commands_registry', 'agent_skills_registry')
     $moved = @($nc.Rows | Where-Object {
         ($sensitive -contains $_.Id) -and
         ($_.Disposition -eq 'defect' -or $_.Disposition -eq 'only_in_dev') })
@@ -820,8 +844,8 @@ if ($Door -eq 'cli') {
     Write-Host ""
 }
 
-$devRead = Get-Manifest -ExePath $devPath -Label "dev" -Mode $Door -TimeoutSecs $BootTimeoutSecs
-$pubRead = Get-Manifest -ExePath $pubPath -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs
+$devRead = Get-Manifest -ExePath $devPath -Label "dev" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
+$pubRead = Get-Manifest -ExePath $pubPath -Label "published" -Mode $Door -TimeoutSecs $BootTimeoutSecs -TerminalRetrySecs $TerminalRetrySecs
 
 $failed = @()
 if ($null -eq $devRead.Manifest) { $failed += "development ($($devRead.Door)): $($devRead.Error)" }
@@ -877,6 +901,11 @@ $observability = [PSCustomObject]@{
     }
     self_report_disagrees      = @($selfReportDisagreements)
     slash_commands_status      = $slashCommandsStatus
+    # WHAT that verdict was measured over, so nobody has to infer it from the
+    # name: the command bodies provisioned into a session workdir, NOT the
+    # `slash_commands` capability row (a different mechanism -- the import of a
+    # checkout's commands as runner workflows, which writes nothing here).
+    slash_commands_status_source = 'session_workdir_command_listing(.claude/commands/*.md)' 
     session_ledger_limitation  = ("These rows are filled by the Phase 3 provisioning ledger, which records at " +
                                   "SESSION SPAWN. This harness now DRIVES that provisioning through the " +
                                   "artifact's own doors before reading the manifest (POST /terminals for the " +
@@ -977,8 +1006,8 @@ if ($SummaryOut) {
             }
             $md.Add("")
         }
-        $md.Add("Rows unobservable by this harness today (filled only at agent-session spawn): " +
-                (($sessionLedgerRows | ForEach-Object { "``$_``" }) -join ", ") + ". This harness never fabricates a spawn, so a clean report says nothing about them.")
+        $md.Add("Provisioning rows, driven through the artifact's own doors before the manifest read: " +
+                (($sessionLedgerRows | ForEach-Object { "``$_``" }) -join ", ") + ". A row still reading ``unknown`` means the door it needed refused -- see ``provisioning_drive`` in the JSON artifact for which one and why. Nothing here fabricates a spawn.")
     }
     $md.Add("")
     $md.Add("Development build: ``$($result.Identity.DevAppVersion)`` / ``$($result.Identity.DevGitSha)`` via ``$($result.Identity.DevDoor)``  ")

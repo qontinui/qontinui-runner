@@ -8245,6 +8245,27 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
 /// why. The control flow is unchanged: it still returns `Ok` and the spawn
 /// still proceeds.
+fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
+    let Some(root) = qontinui_root_dir() else {
+        warn!(
+            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
+             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
+        );
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            Path::new(worktree_cwd)
+                .join(".claude")
+                .join("agents")
+                .display()
+                .to_string(),
+            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
+             cannot be located — the normal state on a published install",
+        ));
+    };
+    provision_agent_definitions_from_root(&root, worktree_cwd)
+}
+
 /// Provision the named-subagent defs into `workdir` and RECORD both layers'
 /// session-ledger rows — [`provision_agent_definitions`]'s `agent_definitions`
 /// report here, and the embedded `fleet_agents` floor from inside
@@ -8262,8 +8283,11 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// leaves a ROW, because an errored pass that leaves no record is the invisible
 /// degradation the ledger exists to end.
 ///
-/// Returns the reports it recorded, so an HTTP caller can be told what landed
-/// without re-reading the whole manifest. The spawn path ignores the value.
+/// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
+/// `fleet_agents` floor is recorded from inside
+/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// is observable on the next manifest read rather than in this value. The spawn
+/// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
     let report = match provision_agent_definitions(workdir) {
         Ok(report) => report,
@@ -8285,27 +8309,6 @@ pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<Provisi
     let echo = report.clone();
     capability_manifest::record_provision(workdir, report);
     vec![echo]
-}
-
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
-    let Some(root) = qontinui_root_dir() else {
-        warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
-        );
-        return Ok(ProvisionReport::unresolved(
-            "agent_definitions",
-            0,
-            Path::new(worktree_cwd)
-                .join(".claude")
-                .join("agents")
-                .display()
-                .to_string(),
-            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
-             cannot be located — the normal state on a published install",
-        ));
-    };
-    provision_agent_definitions_from_root(&root, worktree_cwd)
 }
 
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in

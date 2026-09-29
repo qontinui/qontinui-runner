@@ -416,20 +416,45 @@ Assert-Equal "agreement reports nothing" 0 (@($disOk).Count)
 # ... and the partially-observed manifest against the same listing reports
 # exactly the rows that took no reading.
 $disPartial = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessFull)
-# THREE, not four: the witness map covers seven provisioning rows, three were
-# given a rung above, and of the four remaining one has no row in this fixture at
-# all -- `agent_skills_registry`, which did not exist when the fixture was
-# emitted on 2026-09-02 (the fixture carries nine rows; the binary now emits
-# ten). A capability the manifest does not carry is SKIPPED rather than invented,
-# which is the behaviour this number pins -- and it is the arm that matters when
-# the published leg is an older release whose roster is genuinely shorter.
-Assert-Equal "only the unread rows present in the manifest are named" 3 (@($disPartial).Count)
-Assert-True  "and all of them in the unknown-row direction" (@($disPartial | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -eq 3)
+# TWO. The witness map covers SIX provisioning rows (slash_commands is
+# deliberately not one -- it writes nothing into a session workdir), three were
+# given a rung above, and of the three remaining one has no row in this fixture
+# at all: `agent_skills_registry`, which did not exist when the fixture was
+# emitted on 2026-09-02. A capability the manifest does not carry is SKIPPED
+# rather than invented, which is the behaviour this number pins -- and it is the
+# arm that matters when the published leg is an older release whose roster is
+# genuinely shorter.
+Assert-Equal "only the unread rows present in the manifest are named" 2 (@($disPartial).Count)
+Assert-True  "and all of them in the unknown-row direction" (@($disPartial | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -eq 2)
 Assert-Equal "a capability absent from the manifest is never invented" 0 (@($disPartial | Where-Object { $_.id -eq 'agent_skills_registry' }).Count)
+# The regression this pins: `slash_commands` is an IMPORT of a checkout's
+# commands, not a provision into the session workdir, so the workdir listing can
+# neither confirm nor contradict it. Mapping it to .claude/commands made every
+# run emit a finding about this harness whose note was false in both halves --
+# and the first version of this suite pinned that wrong behaviour as "3".
+Assert-Equal "slash_commands is never witnessed against a workdir listing" 0 (@($disPartial | Where-Object { $_.id -eq 'slash_commands' }).Count)
+$disAll = @(Get-ParitySelfReportDisagreements -Manifest $mUnknown -Witness $witnessFull)
+Assert-Equal "not even when every row is unknown and the dirs are full" 0 (@($disAll | Where-Object { $_.id -eq 'slash_commands' }).Count)
 
 # (e) a missing manifest or witness is UNKNOWN, never a finding.
 Assert-Equal "null manifest yields nothing" 0 (@(Get-ParitySelfReportDisagreements -Manifest $null -Witness $witnessFull).Count)
 Assert-Equal "null witness yields nothing"  0 (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $null).Count)
+
+Write-Host "[11b] a HASHTABLE witness behaves exactly like a PSCustomObject one"
+# The shape this file's own doc comments describe. The two need different
+# accessors and the difference is SILENT -- on a hashtable
+# `$w.PSObject.Properties.Name` enumerates IsReadOnly/Keys/Count/... and never
+# the keys, so a rule written for one shape reports "nothing to say" for the
+# other. That is a false clean, which is the one failure class this file exists
+# to prevent, so both shapes are pinned here.
+$htEmpty = @{ commands = 0; skills = 0; agents = 0 }
+$htFull  = @{ commands = 73; skills = 12; agents = 9 }
+Assert-Equal "hashtable: empty dirs contradict observed rows" (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessEmpty).Count) (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $htEmpty).Count)
+Assert-Equal "hashtable: full dirs agree with observed rows"  (@(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $witnessFull).Count) (@(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $htFull).Count)
+Assert-Equal "hashtable: the verdict resolves, not unknown" 'provisioned_fewer(dev=93,published=72)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 93 } -PublishedWitness @{ commands = 72 })
+# An absent key is still "could not look", on either shape.
+Assert-Equal "hashtable: an absent key is unknown, not zero" 'unknown(no_command_listing_on_the_dev_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ skills = 1 } -PublishedWitness @{ commands = 5 })
+Assert-Equal "hashtable: a present \$null key is unknown too" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 5 } -PublishedWitness @{ commands = $null })
 
 Write-Host "[12] the typed slash-commands verdict (Phase 5, exit (d))"
 Assert-Equal "equal counts" 'provisioned_equal' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 73 }) -PublishedWitness ([PSCustomObject]@{ commands = 73 }))

@@ -614,14 +614,50 @@ function ConvertTo-ParityReportObject {
 # Which directory each provisioning row's units land in. A row absent from this
 # map has no filesystem footprint to witness (workspace_root, spec_pages, ...)
 # and is skipped rather than guessed at.
+# `slash_commands` is DELIBERATELY ABSENT. It is not a provision-into-a-workdir
+# at all: capability_manifest.rs describes it as the IMPORT of
+# <workspace-root>/qontinui-claude-config/.claude/commands/*.md as runner
+# workflows, and slash_commands.rs points its report at that CHECKOUT directory.
+# It writes nothing into the session workdir, so the workdir listing can neither
+# confirm nor contradict it -- and mapping it here made every run emit a
+# `directory_has_units_but_row_is_unknown` finding whose note ("provisioning ran
+# and the ledger did not record it") was false in both halves. A row with no
+# footprint in the witnessed tree belongs with workspace_root and spec_pages:
+# outside this map.
 $script:ParityWitnessDirs = @{
     'fleet_commands'          = 'commands'
-    'slash_commands'          = 'commands'
     'agent_commands_registry' = 'commands'
     'fleet_skills'            = 'skills'
     'agent_skills_registry'   = 'skills'
     'fleet_agents'            = 'agents'
     'agent_definitions'       = 'agents'
+}
+
+# Read one field from a witness that may be either a [PSCustomObject] (what
+# Get-ParityProvisionWitness returns) or a [hashtable] (what this file's own doc
+# comments describe, and what a caller is most likely to hand-build).
+#
+# The two need different accessors and the difference is SILENT: on a hashtable
+# `$w.PSObject.Properties.Name` enumerates IsReadOnly/Keys/Count/... and never
+# the keys, so a membership test written for one shape reports "absent" for the
+# other and the rules above resolve to "nothing to say". That is the false-clean
+# this file exists to prevent, so both shapes are handled here rather than in
+# each rule.
+#
+# Returns a 2-element tuple: ($present, $value). $present distinguishes "the key
+# is not there" from "the key is there and is $null" -- which is the whole
+# unknown-vs-zero distinction these rules turn on.
+function Get-ParityWitnessField {
+    param($Witness, [string]$Name)
+    if ($null -eq $Witness) { return @($false, $null) }
+    if ($Witness -is [System.Collections.IDictionary]) {
+        if ($Witness.Contains($Name)) { return @($true, $Witness[$Name]) }
+        return @($false, $null)
+    }
+    if ($Witness.PSObject.Properties.Name -contains $Name) {
+        return @($true, $Witness.$Name)
+    }
+    return @($false, $null)
 }
 
 function Get-ParityManifestRow {
@@ -652,8 +688,9 @@ function Get-ParitySelfReportDisagreements {
 
     foreach ($id in ($script:ParityWitnessDirs.Keys | Sort-Object)) {
         $dirKey = $script:ParityWitnessDirs[$id]
-        if (-not ($Witness.PSObject.Properties.Name -contains $dirKey)) { continue }
-        $count = $Witness.$dirKey
+        $field = Get-ParityWitnessField -Witness $Witness -Name $dirKey
+        if (-not $field[0]) { continue }
+        $count = $field[1]
         # UNKNOWN count: a listing that could not be taken contradicts nothing.
         if ($null -eq $count) { continue }
 
@@ -689,6 +726,16 @@ function Get-ParitySelfReportDisagreements {
 
 # The typed slash-commands verdict the metric's baseline defect is stated in.
 #
+# WHAT IT IS MEASURED OVER, stated because the name invites the wrong reading:
+# the COMMAND BODIES PROVISIONED INTO A SESSION WORKDIR (`.claude/commands/*.md`
+# -- the `fleet_commands` bundle plus any `agent_commands_registry` overlay), on
+# each leg. That is the operator-facing question the metric asks ("does a
+# published install give a session the fleet commands"), and it is NOT the
+# `slash_commands` capability row, which is a different mechanism entirely (the
+# import of a checkout's commands as runner workflows -- see the note on
+# $script:ParityWitnessDirs). The artifact carries
+# `slash_commands_status_source` beside this value so no reader has to infer it.
+#
 # Exactly one of:
 #   provisioned_equal                  both legs provisioned the same count
 #   provisioned_fewer(dev=N,published=M)  published provisioned fewer
@@ -702,14 +749,10 @@ function Get-ParitySelfReportDisagreements {
 function Get-ParitySlashCommandsStatus {
     param($DevWitness, $PublishedWitness)
 
-    $devCount = $null
-    $pubCount = $null
-    if ($null -ne $DevWitness -and ($DevWitness.PSObject.Properties.Name -contains 'commands')) {
-        $devCount = $DevWitness.commands
-    }
-    if ($null -ne $PublishedWitness -and ($PublishedWitness.PSObject.Properties.Name -contains 'commands')) {
-        $pubCount = $PublishedWitness.commands
-    }
+    $devField = Get-ParityWitnessField -Witness $DevWitness -Name 'commands'
+    $pubField = Get-ParityWitnessField -Witness $PublishedWitness -Name 'commands'
+    $devCount = $devField[1]
+    $pubCount = $pubField[1]
 
     if ($null -eq $devCount -and $null -eq $pubCount) {
         return 'unknown(no_command_listing_on_either_leg)'
