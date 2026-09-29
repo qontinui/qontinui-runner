@@ -480,9 +480,22 @@ assert "conflicting ready, no flag: no comment" 0 "$(count comment "$work/gh.log
 reset "$CONFLICT_DRAFT" "23"
 rc="$(run_script --close-if-obsolete)"
 assert "conflicting draft + flag: closed" "closed-obsolete #4242" "$(last_line)"
+# With the flag main is already current, so EVERY open bot PR is obsolete —
+# a mergeable one too: readying it could land stale content.
+reset "[$(pr false "$CREATED_FRESH")]" "23"
+rc="$(run_script --close-if-obsolete)"
+assert "non-conflicting ready + flag: closed" "closed-obsolete #4242" "$(last_line)"
+assert "non-conflicting ready + flag: close call made once" 1 "$(count pr-close "$work/gh.log")"
 reset "$DRAFT_FRESH" "23"
 rc="$(run_script --close-if-obsolete)"
-assert "mergeable draft + flag: readied, not closed" "readied #4242 0" "$(last_line) $(count pr-close "$work/gh.log")"
+assert "non-conflicting draft w/ checks + flag: closed" "closed-obsolete #4242" "$(last_line)"
+assert "non-conflicting draft w/ checks + flag: never readied" 0 "$(count graphql "$work/gh.log")"
+reset "$DRAFT_FRESH" "23"
+rc="$(run_script)"
+assert "non-conflicting draft w/ checks, no flag: readied, not closed" "readied #4242 0" "$(last_line) $(count pr-close "$work/gh.log")"
+reset "[$(pr true "$CREATED_FRESH")]" "23"
+rc="$(run_script --close-if-obsolete --expect-head "$NEW_SHA")"
+assert "flag + stale head: head pin first, nothing closed" "head-mismatch #4242 0" "$(last_line) $(count pr-close "$work/gh.log")"
 assert "--print-close-marker prints the close comment's marker" "$CLOSE_MARKER" "$(bash "$script" --print-close-marker)"
 assert "--print-close-marker calls no gh" 0 "$( { PATH="$bin:$PATH" GH_STUB_LOG="$work/gh.log" bash "$script" --print-close-marker > /dev/null; : > "$work/gh.log"; bash "$script" --print-close-marker > /dev/null; wc -l < "$work/gh.log"; } | tr -d ' ')"
 reset "$CONFLICT_READY" "23"
@@ -580,8 +593,12 @@ if [ -z "${READY_BOT_MUTANT:-}" ]; then
     "conflicting draft w/ checks: not readied"
   # (g) the close branch never taken
   mutate close-branch-dropped \
-    's/^if \[ "\$close_if_obsolete" = "true" \] \&\& is_conflicting; then/if false; then/' \
+    's/^if \[ "\$close_if_obsolete" = "true" \]; then/if false; then/' \
     "conflicting ready + flag: closed"
+  # (h) the close restricted to conflicting PRs again (round-3 N5)
+  mutate close-conflicting-only \
+    's/^if \[ "\$close_if_obsolete" = "true" \]; then/if [ "$close_if_obsolete" = "true" ] \&\& is_conflicting; then/' \
+    "non-conflicting ready + flag: closed"
   # (e) the fork filter dropped
   mutate fork-filter-dropped \
     's/\[\.\[\] | select(\.isCrossRepository == false)\] | \.\[0\]/.[0]/' \

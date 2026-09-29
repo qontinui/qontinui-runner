@@ -117,7 +117,9 @@ name: schema.pg.sql.generated nightly freshness
 # by MEASUREMENT — >= 1 check run on the head => ready; 0 => stays a draft and,
 # past 48h, is paged once on the PR. The `Sweep the refresh PR` step re-decides
 # on every scheduled/dispatched main run, drift or not, so one bad night does
-# not park the PR forever.
+# not park the PR forever — and on a night that finds NO drift it closes the
+# open refresh PR as obsolete (main already carries the dump; readying it
+# could land stale schema).
 # Plan: plans/2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it.md
 #
 # So a red night means "I found drift and could NOT hand you the fix", which is
@@ -745,10 +747,13 @@ jobs:
       #                       decision is on the commit the branch carries now;
       #                       an absent branch passes none.
       #   --close-if-obsolete ONLY when fresh_check reported drift=false
-      #                       EXPLICITLY: main is already current, so a PR that
-      #                       conflicts with it carries an obsolete change. An
-      #                       empty `drift` (fresh_check failed before deciding)
-      #                       is UNKNOWN and never closes anything.
+      #                       EXPLICITLY: main is already current, so the open
+      #                       refresh PR — conflicting or not — carries an
+      #                       obsolete dump, and readying it could land stale
+      #                       schema (e.g. re-add a table web has since
+      #                       dropped); it is closed. An empty `drift`
+      #                       (fresh_check failed before deciding) is UNKNOWN
+      #                       and never closes anything.
       - name: Sweep the refresh PR (ready it once it carries checks; page if parked)
         id: sweep
         if: ${{ !cancelled() && steps.fresh_check.outputs.self_heal == 'true' }}

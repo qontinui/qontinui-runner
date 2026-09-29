@@ -84,7 +84,9 @@ name: sibling pin bump
 # workflow's selftest — marks it ready once its head carries >= 1 check run,
 # leaves a zero-check PR a draft, and pages once on a draft parked past 48h.
 # It runs right after the PR is written AND in the last step of every
-# scheduled/dispatched default-branch run, drift or not.
+# scheduled/dispatched default-branch run, drift or not; a run whose scan
+# finds NO pin to move closes the open bump PR as obsolete (readying it could
+# land stale pins).
 # Plan: plans/2026-09-17-atlas-self-heal-files-its-own-fix-as-a-draft-and-nothing-lands-it.md
 #
 # ---------------------------------------------------------------------------
@@ -942,14 +944,19 @@ jobs:
             existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
               --json number,mergedAt,isCrossRepository --jq 'map(select(.mergedAt == null and .isCrossRepository == false)) | first | .number // empty')"
             # A PR that scripts/ci/ready-bot-draft-pr.sh closed as OBSOLETE
-            # (the sweep found main already current and the PR conflicting)
-            # is NOT the maintainer-closed case above: this genuine move
-            # deserves a fresh PR, and the old one's branch has been
-            # force-pushed since it was closed, which GitHub refuses to
-            # reopen. Recognised by the hidden marker that script's close
-            # comment carries — read from the script itself, so there is one
+            # is NOT the maintainer-closed case above. The bot closed it
+            # because a sweep found main already current (no pin to move), so
+            # the change it carried was not needed; this is a NEW, genuine
+            # move, and it gets a fresh PR rather than a resurrected one.
+            # Recognised by the hidden marker that script's close comment
+            # carries — read from the script itself, so there is one
             # definition. Comments are read via REST --paginate into a file
             # (no page cap; no `gh | grep -q` SIGPIPE), with no `|| true`.
+            #
+            # Unverified, and pre-existing for the maintainer-closed path
+            # below (tracked separately): GitHub MAY refuse to reopen a PR
+            # whose branch changed after it was closed, and this step has
+            # already force-pushed the branch by the time it reopens.
             if [ -n "$existing_num" ]; then
               close_marker="$(bash scripts/ci/ready-bot-draft-pr.sh --print-close-marker)"
               if ! gh api --paginate "repos/$REPO/issues/$existing_num/comments" \
@@ -1050,9 +1057,10 @@ jobs:
           if [ -n "$remote_head" ]; then
             extra_args+=(--expect-head "$remote_head")
           fi
-          # Close a CONFLICTING bump PR as obsolete ONLY on an explicit
-          # no-move night: main is already current, so its change is not
-          # needed. An empty `drift` (the scan failed before deciding) is
+          # Close the open bump PR as obsolete ONLY on an explicit no-move
+          # night: main is already current, so its change is not needed —
+          # conflicting or not; readying a mergeable one could land stale
+          # pins. An empty `drift` (the scan failed before deciding) is
           # UNKNOWN and never closes anything.
           if [ "$DRIFT" = "false" ]; then
             extra_args+=(--close-if-obsolete)

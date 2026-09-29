@@ -30,8 +30,9 @@
 # page (`--paginate` emits one number per page).
 #
 # A draft that CONFLICTS with main (mergeable CONFLICTING, or mergeStateStatus
-# DIRTY) is never readied — coord cannot land it — and with
-# --close-if-obsolete a conflicting PR is closed instead (see OUTCOMES).
+# DIRTY) is never readied — coord cannot land it. With --close-if-obsolete
+# (the caller found main already current) the open PR is closed instead,
+# conflicting or not (see OUTCOMES).
 #
 # With --expect-head, the head GitHub reports must equal the commit the caller
 # just pushed before anything is decided: right after a force-push the lookup
@@ -70,10 +71,13 @@
 #                             reports it as the head; if it never does, decide
 #                             NOTHING and report head-mismatch.
 #   --close-if-obsolete       the caller found main already current (no drift,
-#                             no pin move). A PR (draft or ready) that
-#                             conflicts with main then carries an obsolete
-#                             change: comment (once, hidden marker) and close
-#                             it. Nothing else is deleted — the branch stays.
+#                             no pin move), so the open PR — draft or ready,
+#                             conflicting or not — carries a change main does
+#                             not need; readying it could land STALE content
+#                             (e.g. re-adding a table since dropped). Comment
+#                             (once, hidden marker) and close it, after the
+#                             head pin. Nothing else is deleted — the branch
+#                             stays.
 #   --print-close-marker      print that comment's hidden marker and exit 0
 #                             (callers match on it; takes no other argument).
 #
@@ -89,8 +93,8 @@
 #                           draft-no-checks (the page names the cause)
 #   head-mismatch #<n>      --expect-head never became the reported head within
 #                           the budget; nothing decided, with a ::warning::
-#   closed-obsolete #<n>    --close-if-obsolete and the PR conflicts with main:
-#                           commented on and closed
+#   closed-obsolete #<n>    --close-if-obsolete was passed and an open PR
+#                           existed: commented on and closed
 #
 # When $GITHUB_OUTPUT is set, also writes result=<word>, pr=<n>, url=<url>,
 # checks=<count> and paged=<true|false|already|n/a> to it.
@@ -261,12 +265,13 @@ if [ -n "$expect_head" ]; then
   fi
 fi
 
-# --- 3. An obsolete conflicting PR is closed (only when the caller says so) ---
+# --- 3. An obsolete PR is closed (only when the caller says so) --------------
 # The caller passes --close-if-obsolete only on a run that found main already
-# current (no drift / no pin move): a conflicting PR then carries a change main
-# no longer needs, and nothing else will ever clear it. Draft or ready alike.
-if [ "$close_if_obsolete" = "true" ] && is_conflicting; then
-  echo "::warning::PR #$pr_num ($pr_url) conflicts with main ($mergeable/$merge_status) and this run found main already current, so its change is obsolete. Closing it; the next drift run opens a fresh one."
+# current (no drift / no pin move). EVERY open bot PR is then obsolete, not
+# just a conflicting one: a mergeable PR would otherwise be readied here and
+# coord could land its stale content. Draft or ready, conflicting or not.
+if [ "$close_if_obsolete" = "true" ]; then
+  echo "::warning::This run found main already current, so PR #$pr_num ($pr_url; $mergeable/$merge_status) carries an obsolete change. Closing it; the next run that finds drift opens a fresh one."
   close_comments="$(mktemp)"
   close_body="$(mktemp)"
   trap 'rm -f "$close_comments" "$close_body"' EXIT
@@ -278,7 +283,7 @@ if [ "$close_if_obsolete" = "true" ] && is_conflicting; then
   else
     {
       echo "$CLOSE_MARKER"
-      printf '**Closing: this bot-filed PR is obsolete.** It conflicts with `main` (`%s` / `%s`), and the scheduled run that swept it found `main` already current — no drift, no pin to move — so the change this PR carries is no longer needed.\n\n' "$mergeable" "$merge_status"
+      printf '**Closing: this bot-filed PR is obsolete.** The scheduled run that swept it found `main` already current — no drift, no pin to move — so the change this PR carries is no longer needed, and landing it could put stale content on `main`. (Mergeability at close: `%s` / `%s`.)\n\n' "$mergeable" "$merge_status"
       printf 'Nothing is lost: the next run that finds drift rebuilds the branch from `main` and opens a fresh PR. The branch itself is left in place.\n'
     } > "$close_body"
     if ! gh api -X POST "repos/$repo/issues/$pr_num/comments" -F "body=@$close_body" --jq '.html_url'; then
