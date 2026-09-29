@@ -532,6 +532,40 @@ pub(crate) fn api_base_url_inputs_from(s: &crate::settings::Settings) -> ApiBase
     }
 }
 
+/// [`resolve_api_base_url`] over a `Settings` the caller already holds: the
+/// ladder's answer for readers that hold a settings snapshot instead of going
+/// through [`get_api_base_url_with_source`].
+pub(crate) fn resolve_api_base_url_from(
+    settings: &crate::settings::Settings,
+) -> (String, ApiBaseUrlArm) {
+    resolve_api_base_url(&api_base_url_inputs_from(settings))
+}
+
+/// The backend base URL the operator CONFIGURED, with the rung that supplied
+/// it, or `None` when nothing was: the "configured, else unconfigured"
+/// question readers ask when they must not guess (the always-answering
+/// [`get_api_base_url`] falls through to a build default). `Some` only for the
+/// four configured arms; the three build-default arms yield `None`.
+pub(crate) fn configured_api_base_from(
+    settings: &crate::settings::Settings,
+) -> Option<(String, ApiBaseUrlArm)> {
+    configured_only(resolve_api_base_url_from(settings))
+}
+
+/// The pure half of [`configured_api_base_from`]: keep a resolution only when
+/// a configured rung produced it.
+fn configured_only(resolved: (String, ApiBaseUrlArm)) -> Option<(String, ApiBaseUrlArm)> {
+    match resolved.1 {
+        ApiBaseUrlArm::EnvWebBackendUrl
+        | ApiBaseUrlArm::EnvApiUrl
+        | ApiBaseUrlArm::ProfileApiUrl
+        | ApiBaseUrlArm::PersistedBackendUrl => Some(resolved),
+        ApiBaseUrlArm::BuildDefaultDebug
+        | ApiBaseUrlArm::BuildDefaultRelease
+        | ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected => None,
+    }
+}
+
 /// Which rung of [`resolve_api_base_url`]'s documented five-rung order produced
 /// the value — the house `(value, source)` shape that `profiles::CoordBaseSource`
 /// already has and this resolver does not.
@@ -1101,6 +1135,73 @@ mod tests {
                     !is_debug && loopback.contains(candidate),
                     "unexpected verdict for {candidate} (is_debug={is_debug})"
                 );
+            }
+        }
+    }
+
+    /// One shared input table drives the ladder, the configured-only helper
+    /// and the three out-of-ladder readers' mappings, so none can drift: the
+    /// helper answers exactly for the four configured arms; a persisted value
+    /// the readers must treat as REFUSED (non-blank, not honoured, not the
+    /// build default) is exactly the loopback-rejected arm, whose URL is the
+    /// release default they defer to; and a blank or default-equal persisted
+    /// value is plainly unconfigured (helper `None`, not refused).
+    #[test]
+    fn configured_helper_and_reader_mappings_agree_over_one_table() {
+        let persisted_values = [
+            None,
+            Some("".to_string()),
+            Some("   ".to_string()),
+            Some("http://127.0.0.1:8000".to_string()),
+            Some("http://[::1]:8000".to_string()),
+            Some("https://api.qontinui.io".to_string()),
+            Some("http://192.168.1.50:8000".to_string()),
+        ];
+        let env = [None, Some("https://env.example".to_string())];
+        let profile = [None, Some("https://profile.example".to_string())];
+        for is_debug in [true, false] {
+            for persisted in &persisted_values {
+                for e in &env {
+                    for p in &profile {
+                        let resolved = resolve_api_base_url(&ApiBaseUrlInputs {
+                            env_web: e.clone(),
+                            env_api: None,
+                            profile_api_url: p.clone(),
+                            persisted: persisted.clone(),
+                            is_debug,
+                        });
+                        let (url, arm) = resolved.clone();
+                        let configured = configured_only(resolved);
+                        let ctx = format!("{persisted:?} env={e:?} profile={p:?} debug={is_debug}");
+                        let is_configured_arm = matches!(
+                            arm,
+                            ApiBaseUrlArm::EnvWebBackendUrl
+                                | ApiBaseUrlArm::EnvApiUrl
+                                | ApiBaseUrlArm::ProfileApiUrl
+                                | ApiBaseUrlArm::PersistedBackendUrl
+                        );
+                        assert_eq!(configured.is_some(), is_configured_arm, "{ctx}");
+                        if let Some((cu, ca)) = &configured {
+                            assert_eq!((cu, *ca), (&url, arm), "{ctx}");
+                        }
+                        // Readers' refusal fallback: a refused persisted value
+                        // shows up as the loopback-rejected arm and nothing else.
+                        let refused_persisted = e.is_none()
+                            && p.is_none()
+                            && persisted.as_deref().is_some_and(|v| {
+                                persisted_backend_url_refused(v.trim(), is_debug)
+                            });
+                        assert_eq!(
+                            refused_persisted,
+                            arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
+                            "{ctx}"
+                        );
+                        if refused_persisted {
+                            assert!(configured.is_none(), "{ctx}");
+                            assert_eq!(url, PROD_API_BASE_URL, "{ctx}");
+                        }
+                    }
+                }
             }
         }
     }

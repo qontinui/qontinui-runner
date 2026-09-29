@@ -2301,63 +2301,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // "return None rather than guess" guard and point a release
                     // runner's 1,100-artifact sync at production.
                     let settings = settings::load_settings();
-                    let persisted_backend_url = settings
-                        .web_integration
-                        .enabled
-                        .then(|| settings.web_integration.backend_url.clone());
-                    // ...and the release-build refusal of a MACHINE-LOCAL
-                    // persisted value applies here too. This is the third
-                    // reader of that field that never goes through the
-                    // `get_api_base_url` ladder, so without this it would keep
-                    // honouring exactly the value every other subsystem now
-                    // refuses — which is not a refusal, it is a divergence.
-                    //
-                    // Refused resolves to None (NOT to the release default)
-                    // because this call site's whole contract, stated above, is
-                    // "return None rather than guess": the operator's persisted
-                    // intent was a local backend, and silently redirecting a
+                    // The ladder's configured base (env, profile, persisted);
+                    // `None` when nothing is configured, and a release build's
+                    // refusal of a MACHINE-LOCAL persisted value is `None` too,
+                    // NOT the release default: this call site's contract is
+                    // "return None rather than guess", and redirecting a
                     // 1,100-artifact bulk upload to production on the strength
-                    // of a value we just rejected is precisely the guess that
-                    // guard exists to prevent. None makes the body sync no-op,
-                    // and `spawn_if_configured` already warns when it is
-                    // enabled with no backend — but that warning says "no
-                    // backend is configured", which is the wrong cause here, so
-                    // name the real one before it fires.
-                    //
-                    // The refusal is unconditional; only the WARNING is gated
-                    // on the sync actually being on — which, now that the sync
-                    // is on by default, means it fires on every release runner
-                    // whose persisted backend is machine-local. That is
-                    // correct: a refused target is a configuration the
-                    // operator must see. Only a runner killed with
-                    // QONTINUI_PLAN_LIBRARY_SYNC=0 stays quiet, because there
-                    // the decision changed nothing.
-                    let persisted_backend_url = match persisted_backend_url {
-                        Some(raw)
-                            if crate::api_config::persisted_backend_url_refused(
-                                &raw,
-                                cfg!(debug_assertions),
-                            ) =>
+                    // of a value we just rejected is that guess. Build-default
+                    // arms are never mapped to `Some(default)` for the same
+                    // reason.
+                    let persisted_backend_url =
+                        crate::api_config::configured_api_base_from(&settings).map(|(url, _)| url);
+                    // Name the real cause before `spawn_if_configured` warns
+                    // "no backend is configured", which would be wrong when a
+                    // persisted value was refused. Only gated on the sync being
+                    // on (it is by default; QONTINUI_PLAN_LIBRARY_SYNC=0 stays
+                    // quiet).
+                    if persisted_backend_url.is_none() {
+                        let (_, arm) = crate::api_config::resolve_api_base_url_from(&settings);
+                        if arm == crate::api_config::ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected
+                            && qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled()
                         {
-                            use qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled;
-                            if body_sync_enabled() {
-                                warn!(
-                                    rejected_backend_url = %raw,
-                                    "plan library: REFUSING persisted \
-                                     web_integration.backend_url '{raw}' as the body-sync \
-                                     target: it is a MACHINE-LOCAL address and this is a \
-                                     RELEASE build (same refusal as \
-                                     api_config::resolve_api_base_url). The body sync (on by \
-                                     default) will NOT run rather than guess a backend. FIX: set \
-                                     web_integration.backend_url in settings.json to the \
-                                     backend this runner actually paired with, then start a \
-                                     new runner."
-                                );
-                            }
-                            None
+                            let raw = &settings.web_integration.backend_url;
+                            warn!(
+                                rejected_backend_url = %raw,
+                                "plan library: REFUSING persisted                                  web_integration.backend_url '{raw}' as the body-sync                                  target: it is a MACHINE-LOCAL address and this is a                                  RELEASE build (same refusal as                                  api_config::resolve_api_base_url). The body sync (on by                                  default) will NOT run rather than guess a backend. FIX: set                                  web_integration.backend_url in settings.json to the                                  backend this runner actually paired with, then start a                                  new runner."
+                            );
                         }
-                        other => other,
-                    };
+                    }
                     // The tenant-wide `plan_capture` dial. Read per cycle (a
                     // closure, not a snapshot) so an operator flipping it takes
                     // effect on the next tick rather than needing a restart.
