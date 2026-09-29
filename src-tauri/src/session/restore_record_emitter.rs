@@ -146,10 +146,11 @@ pub struct RestoreRecordEmitter {
     /// ([`super::session_tenant_stamp`]) so a replay after a restart can still
     /// present the right credential. The process-wide lookup by default.
     tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
-    /// Whether this device is CURRENTLY bound to a tenant. A record's saved
-    /// `tenant_id` is trusted only when it is: a stale or foreign one names a
-    /// tenant no credential will ever be issued for, and its rows would be
-    /// held until they aged out. Reads `paired_user.json` by default.
+    /// Whether a record's saved `tenant_id` may be trusted: false only when
+    /// this device's binding list is KNOWN and omits it — a stale or foreign
+    /// tenant no credential will ever be issued for, whose rows would be held
+    /// until they aged out. UNKNOWN bindings trust the record. Reads
+    /// `paired_user.json` by default.
     bound_to: Box<dyn Fn(Uuid) -> bool + Send + Sync>,
 }
 
@@ -186,8 +187,11 @@ impl RestoreRecordEmitter {
             last_emitted: Mutex::new(HashMap::new()),
             skipped: Mutex::new(HashSet::new()),
             tenant_of: Box::new(super::session_tenant_stamp::lookup),
+            // UNKNOWN bindings (unreadable, or a file that states none) keep
+            // the record's own tenant: only a KNOWN binding list that omits it
+            // makes it untrustworthy.
             bound_to: Box::new(|t| {
-                crate::auth::device_bound_tenants().is_some_and(|b| b.contains(&t))
+                crate::auth::device_bound_tenants().is_none_or(|b| b.contains(&t))
             }),
         }
     }

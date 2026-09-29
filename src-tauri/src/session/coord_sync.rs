@@ -1665,32 +1665,39 @@ impl DrainState {
 /// The all-sessions cap on held bytes: HALF the outbox's post-trim target.
 ///
 /// The outbox file enforces its own byte cap by dropping the OLDEST unacked
-/// rows of every kind, uncounted by any held-row reason. Before this phase a
-/// dark credential sent these rows anonymously; now they accumulate, and
-/// across many sessions the per-session cap alone does not keep them under
-/// the file cap. Keeping held rows under half of `trim_target(max_bytes)`
-/// leaves the other half for every other kind, so the file trim is reached
-/// only by a backlog of non-held rows (a real coord outage) — and a held row
-/// is dropped HERE first, oldest first, under its own counted reason.
+/// rows of every kind, counted only in the writer's `dropped_unacked` (which
+/// does not say whether a row was held). Before this phase a dark credential
+/// sent these rows anonymously; now they accumulate, and across many sessions
+/// the per-session cap alone does not keep them under the file cap. Keeping
+/// held rows under half of `trim_target(max_bytes)` leaves the other half for
+/// every other kind, so held rows alone never push the file into its trim and
+/// are shed HERE, oldest first, under their own counted reason.
+///
+/// It is NOT a guarantee that the file trim never takes a held row: under a
+/// real coord outage a large NON-held backlog can still fill the file, and the
+/// trim then drops the oldest rows whatever they are — held rows included,
+/// counted only in `dropped_unacked`.
 fn global_held_cap(outbox_max_bytes: u64) -> u64 {
     super::local_store::trim_target(outbox_max_bytes) / 2
 }
 
 /// The held rows to drop, as `(per-session drops, global drops)`.
 ///
-/// Held rows are the owner-only rows of sessions in `holding`. First, per
+/// Held rows are exactly the rows in `held` — owner-only rows whose OWN
+/// credential scope is credential-pending. A row of a live scope stalled by an
+/// outage is not held and is never dropped under these counters. First, per
 /// session, its oldest (lowest seq) until the rest fit `per_session_cap`.
 /// Then, across all sessions, the oldest by `recorded_at` until the total
 /// fits `global_cap`. `pending` is in `(session_id, seq)` order.
 fn credential_pending_over_caps(
     pending: &[OutboxRecord],
-    holding: &HashSet<Uuid>,
+    held: &HashSet<(Uuid, i64)>,
     per_session_cap: u64,
     global_cap: u64,
 ) -> (Vec<(Uuid, i64)>, Vec<(Uuid, i64)>) {
     let mut per_session: HashMap<Uuid, Vec<&OutboxRecord>> = HashMap::new();
     for r in pending {
-        if holding.contains(&r.session_id) && is_credential_gated_kind(&r.event_kind) {
+        if held.contains(&(r.session_id, r.seq)) {
             per_session.entry(r.session_id).or_default().push(r);
         }
     }
@@ -1858,10 +1865,36 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     // the all-sessions cap, go first, oldest first — counted and logged,
     // never silently, and never left for the outbox FILE trim to take
     // uncounted (see `global_held_cap`).
+    //
+    // A row is HELD only when its OWN scope is credential-pending: resolve the
+    // scope of every owner-only row of a holding session once, forget timers
+    // for scopes with no pending row left, and key everything below on rows.
     let holding = state.holding_sessions();
+    let row_scope: HashMap<(Uuid, i64), HeldScope> = pending
+        .iter()
+        .filter(|r| holding.contains(&r.session_id) && is_credential_gated_kind(&r.event_kind))
+        .map(|r| {
+            (
+                (r.session_id, r.seq),
+                held_scope_key(record_session_tenant(inner, r)),
+            )
+        })
+        .collect();
+    let live_scopes: HashSet<(Uuid, HeldScope)> = row_scope
+        .iter()
+        .map(|((sid, _), scope)| (*sid, *scope))
+        .collect();
+    state
+        .credential_pending
+        .retain(|key, _| live_scopes.contains(key));
+    let held_rows: HashSet<(Uuid, i64)> = row_scope
+        .iter()
+        .filter(|((sid, _), scope)| state.credential_pending.contains_key(&(*sid, **scope)))
+        .map(|(key, _)| *key)
+        .collect();
     let (session_drops, global_drops) = credential_pending_over_caps(
         &pending,
-        &holding,
+        &held_rows,
         state.credential_pending_cap(),
         state.credential_pending_global_cap(&inner.outbox),
     );
@@ -1904,9 +1937,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         }
         // A quarantined session's HELD rows stay in the main file under their
         // own posture: they are waiting on a credential, not refused by coord,
-        // and the sidecar is never retried. Only its other rows go there.
+        // and the sidecar is never retried. Only its other rows go there —
+        // including owner-only rows of a LIVE scope, which a held row of
+        // another scope in the same session must not shield.
         if state.quarantined.contains(&rec.session_id)
-            && !(holding.contains(&rec.session_id) && is_credential_gated_kind(&rec.event_kind))
+            && !held_rows.contains(&(rec.session_id, rec.seq))
         {
             to_quarantine.push(rec);
             continue;
@@ -9853,5 +9888,208 @@ mod tests {
             "kept for retry"
         );
         assert_eq!(rec.lock().await.outputs.len(), 1);
+    }
+
+    // ---- round-3 review of 55e8fe867 ---------------------------------------
+
+    /// A multi-bound device (`a` default, `b`) holding a live slot for `a`
+    /// only, with coord answering `status` on the output route.
+    async fn multi_bound_with_output_status(
+        status: u16,
+    ) -> (
+        crate::test_env::IsolatedAmbient,
+        Uuid,
+        tempfile::TempDir,
+        Arc<OutboxWriter>,
+        Arc<TokMutex<CoordRecorder>>,
+        CoordSync,
+    ) {
+        let amb = with_dark_device_credential();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        bind_device_to(&amb, &[a, b]);
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&a, &device_jwt_for(&a))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_status = Some(status);
+        let coord = quiet_coord(outbox.clone(), base);
+        (amb, a, dir, outbox, rec, coord)
+    }
+
+    /// Only rows whose OWN scope is credential-pending escape quarantine: a
+    /// held `Unresolved` row must not shield the same session's failing
+    /// live-tenant rows, which would otherwise dodge the sidecar forever.
+    /// MUTATION: key the exemption by session (any held scope in the session)
+    /// and the live-tenant row stays in the main file — this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quarantine_exemption_is_per_scope_not_per_session() {
+        let (_amb, a, _dir, outbox, _rec, coord) = multi_bound_with_output_status(500).await;
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let unresolved = record_output(&outbox, machine, session, 0, "aGk=");
+        let live = record_stamped_output(&outbox, machine, session, 2, a);
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(state.credential_pending.contains_key(&(session, None)));
+        assert!(
+            !state.credential_pending.contains_key(&(session, Some(a))),
+            "a 500 on a live scope is a failure, not credential-pending"
+        );
+
+        state.quarantined.insert(session);
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![(session, unresolved.seq)],
+            "only the held Unresolved row stays in the main file"
+        );
+        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap_or_default();
+        assert!(
+            sidecar.contains(&format!("\"seq\":{}", live.seq)),
+            "the failing live-tenant row is quarantined: {sidecar}"
+        );
+    }
+
+    /// The byte caps count only rows whose own scope is held. A live-tenant
+    /// backlog stalled by coord failing is not credential-pending and is never
+    /// dropped under those counters; and a scope's timer is forgotten once no
+    /// pending row of that scope is left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outage_backlog_on_a_live_scope_is_not_capped_as_credential_pending() {
+        let (_amb, a, _dir, outbox, _rec, coord) = multi_bound_with_output_status(500).await;
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let unresolved = record_output(&outbox, machine, session, 0, "aGk=");
+        let live: Vec<i64> = (0..3)
+            .map(|i| record_stamped_output(&outbox, machine, session, 2 + i, a).seq)
+            .collect();
+        let mut state = DrainState {
+            // One held row (256 + 4 bytes) fits; the four rows together
+            // (~1040 bytes) would not.
+            credential_pending_cap_bytes: Some(400),
+            credential_pending_global_cap_bytes: Some(400),
+            ..DrainState::default()
+        };
+
+        for _ in 0..3 {
+            if let Some(r) = state.retry.get_mut(&session) {
+                r.next_attempt_at = Instant::now();
+            }
+            drain_tick(&coord.inner, &mut state).await;
+        }
+
+        assert_eq!(state.dropped_credential_pending_over_cap, 0);
+        assert_eq!(state.dropped_credential_pending_over_global_cap, 0);
+        let left = pending_keys(&outbox);
+        for seq in &live {
+            assert!(left.contains(&(session, *seq)), "live-scope row {seq} kept");
+        }
+        assert!(left.contains(&(session, unresolved.seq)));
+
+        // The held row goes (delivered elsewhere / dropped); its scope's
+        // timer must not outlive it while the session still has live rows.
+        outbox.ack(&[(session, unresolved.seq)]).unwrap();
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            !state.credential_pending.contains_key(&(session, None)),
+            "a scope with no pending row left is no longer credential-pending"
+        );
+    }
+
+    /// `device_bound_tenants` is UNKNOWN (`None`) both when `paired_user.json`
+    /// is unreadable and when it states no binding at all.
+    #[test]
+    fn device_bindings_are_unknown_when_unreadable_or_empty() {
+        let amb = crate::test_env::isolated_ambient();
+        assert_eq!(crate::auth::device_bound_tenants(), None, "no file");
+        std::fs::write(amb.dir().join("paired_user.json"), r#"{"bindings":[]}"#).unwrap();
+        assert_eq!(
+            crate::auth::device_bound_tenants(),
+            None,
+            "states no binding"
+        );
+        let a = Uuid::now_v7();
+        bind_device_to(&amb, &[a]);
+        assert_eq!(
+            crate::auth::device_bound_tenants(),
+            Some(std::collections::BTreeSet::from([a]))
+        );
+    }
+
+    /// UNKNOWN bindings keep a restore record's own tenant (both arms: no
+    /// file, and a file that states no binding).
+    #[test]
+    fn restore_record_keeps_its_tenant_when_bindings_are_unknown() {
+        for empty_file in [false, true] {
+            let amb = crate::test_env::isolated_ambient();
+            if empty_file {
+                std::fs::write(amb.dir().join("paired_user.json"), r#"{"bindings":[]}"#).unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (session, own, live) = (Uuid::new_v4(), Uuid::now_v7(), Uuid::now_v7());
+            let em = crate::session::restore_record_emitter::RestoreRecordEmitter::with_gate(
+                outbox.clone(),
+                Uuid::new_v4(),
+                Box::new(move |_t: &str| Some(session)),
+                Box::new(|| true),
+            )
+            .with_tenant_lookup(Box::new(move |_| Some(live)));
+            let mut rec = crate::session::restore_record_emitter::sample_record("s", "t");
+            rec.tenant_id = Some(own.to_string());
+            em.emit(&rec, None);
+            let rows = outbox.pending().unwrap();
+            assert_eq!(
+                rows[0].payload["tenant_id"],
+                json!(own.to_string()),
+                "empty_file={empty_file}: UNKNOWN bindings trust the record"
+            );
+        }
+    }
+
+    /// UNKNOWN bindings never age a stamped held row out as "unbound" (both
+    /// arms): only a KNOWN binding list that omits the tenant does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_bindings_never_age_out_a_stamped_row() {
+        for empty_file in [false, true] {
+            let amb = with_live_device_credential();
+            if empty_file {
+                std::fs::write(amb.dir().join("paired_user.json"), r#"{"bindings":[]}"#).unwrap();
+            }
+            let tenant = Uuid::now_v7();
+            let dir = tempfile::tempdir().unwrap();
+            let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+            let old = OutboxRecord {
+                machine_id: machine,
+                session_id: session,
+                seq: 1,
+                event_kind: SessionEventKind::OutputChunk.as_str().to_string(),
+                payload: json!({
+                    "stream": "transcript", "chunk_offset": 0, "payload_b64": "aGk=",
+                    "tenant_id": tenant.to_string(),
+                }),
+                recorded_at: Utc::now()
+                    - chrono::Duration::days(UNRESOLVABLE_PENDING_MAX_AGE_DAYS + 1),
+                acked_at: None,
+            };
+            std::fs::write(
+                dir.path().join("outbox.jsonl"),
+                format!("{}\n", serde_json::to_string(&old).unwrap()),
+            )
+            .unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, _rec) = spawn_fake_coord().await;
+            let coord = quiet_coord(outbox.clone(), base);
+            let mut state = DrainState::default();
+
+            drain_tick(&coord.inner, &mut state).await;
+
+            assert_eq!(
+                state.dropped_credential_pending_unresolvable, 0,
+                "empty_file={empty_file}"
+            );
+            assert_eq!(pending_keys(&outbox), vec![(session, 1)], "still held");
+        }
     }
 }
