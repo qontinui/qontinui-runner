@@ -4542,6 +4542,19 @@ fn resolve_pair_base(settings: &crate::settings::Settings) -> String {
     }
 }
 
+/// One refresher-tick hook for plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// Phase 1: [`qontinui_runner_lib::pair::heal_vanished_paired_user`] on the
+/// blocking pool (it may read the credential store). The heal logs its own
+/// outcome; a join failure only defers it to the next tick.
+async fn heal_vanished_binding_store() {
+    if let Err(e) =
+        spawn_blocking_tracked(qontinui_runner_lib::pair::heal_vanished_paired_user).await
+    {
+        debug!("device_jwt_refresher: paired_user.json heal task failed ({e}) — next tick retries");
+    }
+}
+
 async fn refresher_loop(
     api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -4565,6 +4578,12 @@ async fn refresher_loop(
             info!("Device-JWT refresher shutting down");
             return;
         }
+
+        // Heal a vanished `paired_user.json` from valid per-tenant slots
+        // BEFORE anything below reads it, so the tier (`device_is_paired`),
+        // the sweep inputs and the Pair arm's `user_id` read all see the
+        // rewritten file instead of idling "not paired yet".
+        heal_vanished_binding_store().await;
 
         // Snapshot settings + needs-refresh decision once per iteration.
         let settings_snapshot = settings::load_settings();
