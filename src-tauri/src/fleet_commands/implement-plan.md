@@ -3699,9 +3699,9 @@ supersedes unit_ready for the dependency-gated case".)
   `time_elapsed`; metric condition → `metric_threshold` (explicit `labels` — e.g.
   `coord_ci_runner_count` MUST filter `{status:"idle"}`); a vetted plan that is
   ready, dispatchable work → `unit_ready` `{work_unit_id, ready_status}` —
-  transition the unit FIRST and set `ready_status` to the status that actually
-  landed (`vetted`, else the Free fallback `vetted_unattested`); a hardcoded
-  Attested value on a unit you own never clears, since an owner may not attest
+  transition the unit FIRST (one `→ vetted` call carrying an `independence`
+  declaration) and key `ready_status` on `vetted`; never on the status a
+  REFUSED transition left, which on a fresh unit is `""` and clears at once
   (canonical: `_gate-registration`). (**NOT**
   `operator_approval` — `operator_approval` is for genuine human decisions, not a
   work queue); schema/alembic-at-head → `migration_at_head` `{schema}`; infra drift

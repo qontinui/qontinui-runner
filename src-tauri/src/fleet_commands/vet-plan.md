@@ -254,7 +254,7 @@ carrying a declaration was **accepted by the schema rather than refused by
 name**, reaching the CAS guard (`from_status mismatch`).
 
 ⚠️ **That settles SERVED and nothing more — do not over-read it.** The CAS is
-checked BEFORE the attestation authz (§5.4 Step C), so **no authorization
+checked BEFORE the attestation authz (§5.4 Step B), so **no authorization
 verdict was obtained**, and the declaration's well-formedness — evaluated inside
 `authorize_target_transition`, which never ran — was never tested. What the
 probe establishes is exactly one thing: the field was not refused by name, and
@@ -276,9 +276,8 @@ So read the DOOR: `coord-revive.sh tools`, then look for `independence` in that
 tool's `inputSchema`. If your own tool list is the stale one, send the
 declaration with `coord-revive.sh call coord_work_unit_transition '<json>'`
 rather than the tool your session advertises, and verify by read — a zero exit
-is not evidence the write landed. How the declaration is built, and when it
-is sent at all, is §5.4 Step B; its shape is in Step C's
-`self_attestation_forbidden` bullet.
+is not evidence the write landed. The worked call, declaration included, is
+§5.4 Step B.
 
 Caveats, all live. A well-formed declaration is still refused
 `attester_unresolved` when your token derives no SoD actor key — a declaration
@@ -1844,8 +1843,8 @@ decisions only — see the predicate guidance in `_gate-registration`).
 >
 > The one escape is a sweep tick landing in the few seconds between step 5 and
 > step 6. **Measured 2026-09-04 across 26 work units: won 18/25 times (72%), lost
-> 6/25 (24%)** — 3 gates still rotting open on `status 'shipped', waiting for
-> 'vetted_unattested'`, plus 4 withdrawn, 3 of which name this defect verbatim in
+> 6/25 (24%)** — 3 gates still rotting open on `status 'shipped'`, waiting for
+> the since-retired Free fallback status, plus 4 withdrawn, 3 of which name this defect verbatim in
 > their withdrawal reason. In the vet of the plan that fixed this, the race was
 > won by **1.2 seconds**.
 >
@@ -1897,10 +1896,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > continuation makes coord ALSO queue a fresh runner-terminal session for
 > it — a duplicate, parallel run of the same work (the exact concurrent-WIP clobber
 > the coordination layer exists to prevent). So by default: still upsert the work
-> unit, transition its status (per the registry step below — attempt `vetted`, fall
-> back to `vetted_unattested` (self path, or a subagent-path refusal per §5.4
-> Step C's prologue)), and register the `unit_ready` gate for
-> registry/dashboard visibility keyed on whichever status actually landed (it
+> unit, transition its status (per the registry step below — one `→ vetted`
+> call, or REFUSED with the status unchanged), and register the `unit_ready` gate for
+> registry/dashboard visibility keyed on `vetted` (it
 > auto-clears by predicate), but with NO continuation of any kind.
 >
 > ⚠️ **On the `unit_ready` gate this is not a default — it is UNCONDITIONAL
@@ -1911,8 +1909,8 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > makes a `unit_ready` gate **born cleared**, and a continuation on a born-cleared
 > gate is not a safety net at all. `ready_verdict` is a bare
 > `status != ready_status` compare, step 4 transitions the unit BEFORE step 5
-> registers the gate keyed on the status that landed — so `status == ready_status`
-> by construction — and a freshly-upserted unit has no open siblings. So the
+> registers the gate keyed on `vetted` — so once the attestation lands,
+> `status == ready_status` by construction — and a freshly-upserted unit has no open siblings. So the
 > FIRST evaluation returns `Cleared`: the 10 s `run_gate_sweep` clears the gate
 > and dispatches its continuation within ONE tick of registration.
 > Measured 2026-08-26 (gate `87e8e72b`): dispatched, then
@@ -2229,9 +2227,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
 4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms.** This
    is the "Set the work unit's registry status" block below
-   (read current → attempt `vetted` → fall back to `vetted_unattested` (self
-   path, or a subagent-path refusal per §5.4 Step C's prologue)); do it
-   here, before registering, and carry the status that landed into step 5. It is
+   (read current → ONE `→ vetted` call carrying the `independence` declaration
+   and the manifest → on refusal, status unchanged and the attestation OWED); do
+   it here, before registering, and carry its outcome into step 5. It is
    written out after this list only because it is long.
 
    ⚠️ **Do NOT skip this because step 5 is skipped.** It reads as "the
@@ -2258,36 +2256,43 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    token works on the same route when no device identity is held. The legacy
    operator-only `/coord/plans/upsert` + `/coord/gates/register` are removed (coord
    P4) — do not fall back to them.
-   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>", "ready_status": "<the status the registry step below ACTUALLY landed>"}`
+   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>", "ready_status": "vetted"}`
      — coord auto-clears it when the work unit's `status` column reaches
      `ready_status` AND every other gate anchored to this unit is cleared. (The
      `register-gate` endpoint accepts any **predicate-cleared** kind; only
      `operator_approval` — a human decision — is rejected 403, so it can never
      become a work-queue-as-decision fallback.)
 
-     > ⚠️ **Do the registry transition FIRST, then register the gate with the status
-     > that landed.** `ready_status` is compared by exact `!=` against
+     > ⚠️ **Do the registry transition FIRST, then register the gate keyed on
+     > `vetted`.** `ready_status` is compared by exact `!=` against
      > `coord.work_units.status`, so a gate keyed on a status the unit will never
      > reach pins open forever — and it fails **OPEN**, not `failed`, so no
      > `gate_unclearable_terminal` alert fires and nothing surfaces it until the
      > ~7-day stale-open sweep.
      >
-     > That is exactly what a hardcoded `ready_status: "vetted"` used to do here.
-     > `vetted` is an **Attested** status: coord refuses it unless the attester's
-     > actor key differs from the unit's recorded owner, and step 1's upsert makes
-     > THIS session the owner (ownership is claimed by the first non-attesting
-     > write — creation counts, even with no `status` field). So the session that
-     > registers the gate was the one actor barred from satisfying it.
+     > That is what a hardcoded `ready_status: "vetted"` used to do here, before a
+     > vet could carry an `independence` declaration. `vetted` is an **Attested**
+     > status: without a declaration coord refuses it unless the attester's actor
+     > key differs from the unit's recorded owner, and step 1's upsert makes THIS
+     > session the owner (ownership is claimed by the first non-attesting write —
+     > creation counts, even with no `status` field). So the session that
+     > registers the gate was the one actor barred from satisfying it. §5.4 Step
+     > B's declaration removes that bar, and that is why `vetted` is now the only
+     > key.
      >
-     > Ordering the transition first removes the guesswork: `vetted` when the
-     > attestation genuinely lands, `vetted_unattested` when it is refused and
-     > §5.4 Step C is taken (self path, or a subagent-path refusal per its
-     > prologue) — never the read status of a refused transition, and nothing
-     > at all when Step A's status is UNKNOWN. (Step A's skip arm, which keys on
-     > an already-past status it read, is the one exception.) Never
+     > Ordering the transition first makes the outcome observed, not guessed. When
+     > the attestation lands, the gate is born cleared. When it is REFUSED, the
+     > status is unchanged and the attestation is OWED. The gate keyed on `vetted`
+     > then stays Open until the owed `→ vetted` lands, and that open row is the
+     > visible record of the debt. Never key it on the unchanged status: on a
+     > fresh unit that is `""`, and a `ready_status: ""` gate clears at once,
+     > which is the false green Step A forbids. Never key it on a status coord
+     > does not recognise either: the old Free fallback status is retired, and a
+     > coord carrying the change that retired it refuses the write. Never
      > `in_progress` — that is what `/implement-plan` Step 0.5 writes, and reusing
      > it makes "vetted, waiting to start" and "already being implemented"
-     > indistinguishable.
+     > indistinguishable. (Step A's skip arm, which keys on an already-past status
+     > it READ, is the one exception.)
    - **Anchor:** the plan (work unit). The `work_unit_id` comes from the step-1
      upsert; pass `phase_name` (the plan title, or a synthetic label like
      `"vet→implement handoff"` for a whole-plan gate — `phase_name` is **required**,
@@ -2563,10 +2568,10 @@ work-unit surface hasn't landed — report the gate as NOT registered with the
 reason, rather than silently registering an `operator_approval` fallback that would
 re-create the work-queue-as-decision antipattern.)
 
-**Set the work unit's registry status — attempt `vetted`, fall back on refusal.**
+**Set the work unit's registry status — ONE attested call; on refusal the status stays where it is.**
 When you stamp VETTED in the plan file, transition the coord work-unit registry so
 the `unit_ready` predicate above has something to match. Do this BEFORE registering
-the gate, and key the gate on whichever status lands.
+the gate, and key the gate on `vetted` (step 5 says why).
 
 **Step A — know the current status first. It may already be past you.**
 
@@ -2579,7 +2584,7 @@ shape from `coord_work_unit_upsert` (MCP) and `POST /coord/work-units/upsert`
 - **`previous_status: null`, `transitioned: true`** — step 1 *created* the row.
   There is no prior status to protect: proceed to Step B. **The row is not
   status-less, though — a status-omitting INSERT seeds the empty string**
-  (`VALUES (…, COALESCE($3::text, ''), …)`), so the value Step C's CAS guard
+  (`VALUES (…, COALESCE($3::text, ''), …)`), so the value Step B's CAS guard
   needs here is `from_status: ""`, not `null` and not `"draft"`.
 - **`previous_status: ""`, `transitioned: false`** — same empty seed, seen on a
   re-run: the row exists and was created by an earlier status-omitting upsert.
@@ -2609,19 +2614,19 @@ derivation this whole ordering exists to protect.
 > The unprefixed read is the operator dashboard's `TenantId`-tier route and answers
 > a device JWT **403 `tenant_not_resolved`**. The split is by VERB, not by prefix:
 > the `POST` writes under `/coord/work-units/…` (`/upsert`, `/transition`,
-> `/register-gate`, …) *are* device-authed, which is why Steps B and C below keep
+> `/register-gate`, …) *are* device-authed, which is why Step B's HTTP rung below keeps
 > that path — it is only the `GET`s that moved to `agent-work-units`. Same
 > operator-vs-`agent-` door split the transport blockquote above already calls
 > out; it is restated here because getting it wrong is not cosmetic. A 403 yields
 > no status, so the skip
-> rule cannot fire AND Step C has no value for its `from_status` guard — **both**
+> rule cannot fire AND Step B has no value for its `from_status` guard — **both**
 > protections against demoting an attested unit fail from one wrong URL, and the
 > failure reads as a credential problem rather than a wrong door.
 >
 > If the status is genuinely unavailable — you discarded the upsert response AND
 > the re-read fails — that is **UNKNOWN, not `draft`**. Do not invent a
 > `from_status`: a guessed one CAS-fails against every real row, and omitting it
-> turns Step C into the unconditional write this ordering exists to prevent.
+> turns Step B into the unconditional write this ordering exists to prevent.
 > Report the registry transition as **not made** and say why.
 >
 > **And do NOT register the `unit_ready` gate on a guessed `ready_status`.**
@@ -2640,51 +2645,93 @@ derivation this whole ordering exists to protect.
 > place. The reachable version of this branch is the narrower one: the upsert
 > succeeded, its response was discarded, and the re-read then failed.)
 
-**Step B — attempt the real thing.**
+**Step B — ONE call that attests and stores, over the door that authenticates.**
 
+The transition carries BOTH controls in the same request: the `independence`
+declaration, which is what authorizes an Attested `→ vetted` from the session
+that owns the unit, and the §2a manifest, which is the evidence coord stores in
+the same transaction as the status write. There is no second call and no
+fallback transition.
+
+```json
+{"slug": "<plan stem>", "to_status": "vetted",
+ "from_status": "<what Step A read>",
+ "reason": "vetted: <one line>",
+ "independence": {
+   "verified": "premises re-derived against origin/main; phase sizing recounted",
+   "against":  "plans/<stem>.md at origin/main <sha>",
+   "context":  "fresh-context subagent; received the plan body, not the author's rationale"},
+ "vet_evidence": [ <the manifest you built in §2a, verbatim> ]}
 ```
-POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
-     {to_status:"vetted", by_actor:"<this session>",
-      vet_evidence:[ <the manifest you built in §2a> ],
-      independence:{ <on the subagent path ONLY — see below> }}
-```
 
-**On the subagent path (Step 1.5 spawned), send the `independence`
-declaration.** Build it from the SAME facts as Step 5's `Vetted-by:` line — one
-source, two readers: the stamp is what a human reads, `metadata.attestations`
-is what a machine reads, and they cannot disagree if neither is composed
-separately.
+> ⚠️ **The `independence` declaration — what it is, and what it is not.**
+> [policy: `independence-is-context-not-credential`] (verification-and-evidence
+> v9, operator-decided 2026-09-03) settles what "independent" means here, and it
+> is not identity: *"independence means the actor did not hold the AUTHOR'S
+> CONTEXT. It does not mean a different credential, session id, device or
+> token shape. A SUBAGENT QUALIFIES … it needs no distinct session id."*
+>
+> When the declaration is present and well-formed it AUTHORIZES the Attested
+> transition and is stored on the unit at `metadata.attestations`. Do the
+> vetting in a fresh-context subagent (hand it the plan body and NOT your
+> reasoning), then send what it verified, what it verified that against, and how
+> it came by a context free of yours. Every field must be non-blank (zero-width
+> characters count as blank) and at most
+> `work_unit_registry::INDEPENDENCE_FIELD_MAX` bytes; a field that fails either
+> answers `422 independence_declaration_malformed`. Fix the field and re-send
+> ONCE; that 422 is a bug in what you sent, not a refusal of the witness.
+>
+> **Do not fabricate the declaration to get past a refusal.** It is
+> unfalsifiable by construction — the policy says so in the same breath as
+> requiring it — which is exactly why it is STORED: the control is
+> auditability, not prevention. A declaration asserting an independence you
+> did not have is a false witness statement with your actor key next to it.
+> A vet this session performed in its own context has no honest declaration to
+> send: send the call WITHOUT `independence`, expect `self_attestation_forbidden`,
+> and take the REFUSED arm below.
 
-| Field | Built from |
-|---|---|
-| `verified` | the verdict's **checks** line — what the subagent verified |
-| `against` | the verdict's **read list** — every `repo@sha`, plus the plan at `origin/main <sha>`, or "working-tree body (not on origin/main)" when Step 1.5 passed that, exactly as `Vetted-by:` says |
-| `context` | how the Step 1.5 prompt was constructed — the `Vetted-by:` text, naming each input it received and that no authoring context was passed |
-
-⚠️ **The door is `coord_work_unit_transition` (or the `/transition` POST above)
-— NEVER `coord_work_unit_upsert`.** The upsert takes a `status` and has no
+⚠️ **The door is `coord_work_unit_transition` (or its HTTP twin) — NEVER
+`coord_work_unit_upsert`, for the attestation.** The upsert has no
 `independence` field, so a `vetted` sent through it carries no declaration and
-cannot attest by context at all. Coord finding `05a215f1` is that
-shape measured: two plans vetted by fresh-context subagents, stuck at `draft`
-because the attestation went through the upsert. If your own tool list lacks
-the field, read the door (`coord-revive.sh tools`) and send over it, per the
-"LANDED is not SERVED" note near the top of this file.
+cannot attest by context at all. Coord finding `05a215f1` is that shape
+measured: two plans vetted by fresh-context subagents, stuck at `draft`,
+because the attestation went through the upsert.
 
-**Confirm the declaration was STORED, not only that the transition landed.**
-`admitted_on: identity` cannot tell the actor-key arm from the declaration arm
-(the Step C table says why), so read `GET
-/coord/agent-work-units/<plan stem>` and find your declaration in
-`metadata.attestations`. Quote both in §6. A `200` with no stored declaration
-is UNKNOWN, not attested by context.
+**The door ladder — take the first rung that applies, and know why each rung is
+where it is.**
 
-**On the self path (`VETTED (self)`), send NO declaration.** This session
-held the context the control exists to exclude, so any declaration it sent
-would be the unearned, false witness statement Step C forbids. Send `vetted`
-without `independence` and expect Step C.
+1. **The native MCP tool `coord_work_unit_transition`, when its LOADED schema
+   lists BOTH `independence` and `vet_evidence`.** It is first because it
+   carries the session's own device identity, and that identity is what the
+   attestation authz evaluates. Check the schema your session actually loaded,
+   not what coord's `origin/main` says: a client caches `tools/list` at
+   connect, so the schema you hold can predate the door.
+2. **Otherwise, the raw door over the same nonce:**
+   `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh call coord_work_unit_transition '<json>'`,
+   with the real workspace root substituted and the path spelled absolutely. It
+   reads no cached schema, so it reaches the fields a stale client schema
+   hides (coord finding `230b8af2`). `coord-revive.sh tools` shows what that
+   door serves. A zero exit is not evidence the write landed: verify by read.
+3. **The HTTP twin, ONLY with a device-scoped JWT whose `exp` you checked:**
 
-`vet_evidence` is the §2a manifest array, verbatim. Send it on **both** Step B
-and Step C — the fallback transition carries it too, so the evidence is stored
-even on the path that does not attest.
+   ```
+   POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
+        {to_status:"vetted", from_status:"<what Step A read>", by_actor:"<this session>",
+         reason:"…", independence:{verified,against,context},
+         vet_evidence:[ <the manifest you built in §2a> ]}
+   ```
+
+   **Never the `/agents/credential` bootstrap token.** It derives no actor key,
+   so coord refuses it `attester_unresolved` on purpose. That refusal is by
+   design, not a transport fault, and no retry on the same token changes it.
+
+**A refusal that NAMES `vet_evidence` or `independence` means change DOOR —
+never drop the field.** The serving coord refuses an unknown body field loudly
+(`400 unknown_body_field`, coord finding `f044e351`), and an MCP client with a
+stale schema refuses it before it leaves the session. Both say the door you
+used does not carry the field. Go down to rung 2, which does. Re-sending
+without the field is not a degraded success: without `independence` the call
+cannot attest, and without `vet_evidence` there is nothing to store.
 
 > ⚠️ **Do not confirm by the `200`. Confirm by the RECEIPT.** When the running
 > coord carries the manifest surface, a write that touched it attaches a
@@ -2695,98 +2742,40 @@ even on the path that does not attest.
 > | `stored` | how many entries coord **kept**. Quote *this* in your §6 report — never the number you sent |
 > | `vet_generation` | the generation your rows landed as |
 > | `retired_prior_rows` | how many rows from the previous vet were retired |
-> | `admitted_on` | **which authz arm let the transition through** — see Step C |
+> | `admitted_on` | **which authz arm let the transition through** — see the table below |
 > | `vet_evidence_error` | present only when the evidence surface was unavailable |
 >
-> The receipt is emitted **only when the write actually touched the evidence
-> surface**, so **its absence is a signal, not a silent zero**: no receipt means
-> the running build has no manifest surface and your manifest was **not stored**.
-> Report it in §6 as *built but not stored*, and do not report the vet as failed.
+> On a coord carrying qontinui-coord's change for plan
+> `2026-09-20-the-vetted-unattested-fallback-is-still-writable-and-vet-plan-sends-the-manifest-down-a-door-that-cannot-authenticate`
+> (its Phase 3), every `→ vetted` returns a receipt, with `stored: 0` when no
+> manifest arrived. On an older coord the receipt appears only when the write
+> touched the evidence surface. Either way **a missing receipt, or `stored: 0`
+> after you sent entries, means your manifest was NOT stored**. Report it in §6
+> as *built but not stored*, with the arm's required detail (§6).
 >
-> **State of the surface.** The manifest door (Phase 3) is on
-> `qontinui-coord`'s `origin/main` as of `qontinui-coord#2207`: both HTTP doors
+> **State of the surface.** The manifest door is on `qontinui-coord`'s
+> `origin/main` as of `qontinui-coord#2207`: both HTTP doors
 > (`POST /coord/work-units/:slug/transition` and the upsert) and both MCP tools
 > (`coord_work_unit_transition`, `coord_work_unit_upsert`) accept
 > `vet_evidence`, store it in the same transaction as the status write, and
 > refuse an unparseable entry naming its index. `GET
 > /coord/agent-work-units/<slug>` echoes the CANONICAL stored form back under
-> `vet_evidence` — read it to verify what coord kept. A coord deployed from an
-> older build may still lack the surface: an older HTTP door **silently drops**
-> the field (no `deny_unknown_fields`), and an older MCP schema rejects it
-> loudly. If the MCP call is rejected on the field, drop `vet_evidence`,
-> re-send, and report *built but not stored*.
+> `vet_evidence` — read it to verify what coord kept.
 >
-> **Key off the receipt, not off a deploy date.** The presence of that object is
-> the only honest test of whether the running coord kept your manifest. **Until a
-> receipt or a read comes back carrying your entries, "submitted" is UNKNOWN, not
-> stored.**
+> **Key off the receipt and the read-back, not off a deploy date.** Until a
+> receipt or a read comes back carrying your entries, "submitted" is UNKNOWN,
+> not stored.
 
-Attempt this — with an `independence` declaration it is expected to LAND, and
-without one it usually fails — because when it does land it is strictly better: `vetted` is the documented lifecycle status, and coord's derive
-worker promotes `vetted` + all-gates-cleared → the derived status `ready`. No
-agent-reachable route produces `ready` any other way (the operator-transition route
-can set it directly, but that is not yours). It lands when the attester is
-genuinely not the owner — a different device, or a peer holding a real agent JWT —
-and it is also the path the graduated-self-attestation relaxation
-(`crates/coord/src/policies/lifecycle_autonomy.rs`) would open if the fleet ever
-arms it.
+**Confirm the declaration was STORED, not only that the transition landed.**
+`admitted_on: identity` cannot tell the actor-key arm from the declaration arm
+(the table below says why), so read `GET /coord/agent-work-units/<plan stem>`
+and find your declaration in `metadata.attestations`. Quote both in §6. A `200`
+with no stored declaration is UNKNOWN, not attested by context.
 
-**Step C — the fallback, and it is NOT the normal path.**
-
-**Step C is the `VETTED (self)` path's — and the subagent path's only after
-one bounded retry.** On the subagent path, branch on the code that refused:
-
-- **`attester_unresolved`** — re-send Step B, declaration and manifest
-  unchanged, ONCE, over a door carrying a device-identified JWT. Refused again,
-  or no device-identified door resolves: TAKE Step C as written below —
-  `vetted_unattested`, the `from_status` CAS guard, the manifest, and the gate
-  keyed on `vetted_unattested`. Report the attestation as **owed**, and say the
-  declaration's facts are kept for a re-send. Nothing is lost by falling back:
-  the declaration arm ignores both the owner and the from-status, so coord
-  admits a later declared `→ vetted` from `vetted_unattested`
-  (`work_unit_registry.rs`, the declaration arm of
-  `authorize_target_transition`).
-- **`self_attestation_forbidden` or `owner_unresolved`** — both mean the
-  declaration never arrived: coord returns them only on the legacy arm, when no
-  declaration was received, and a declaration that does arrive never yields
-  either. See the `self_attestation_forbidden` bullet below. Re-send it over a
-  door that serves the field. If no door does, take Step C and report it owed,
-  as above.
-- **`422 independence_declaration_malformed`** — fix the field and re-send
-  ONCE (bullet below). If it still 422s, report the transition **not made**
-  with the code and stop — no loop. **Never Step C for this**: a malformed
-  declaration is a bug in what you sent, not a refusal of the witness.
-
-"Transition **not made**, gate **not registered**" is reserved for exactly two
-cases: Step A's status is UNKNOWN (the blockquote under Step A), and a 422 that
-survives its one re-send (above). Never key the
-gate on the read status of a REFUSED transition — on a fresh unit that is `""`,
-and a `ready_status: ""` gate clears at once, the false green Step A forbids.
-(Step A's skip arm, and the 409 re-apply of it, key on an already-past status
-they read; that is the exception, not this case.)
-
-Reach for this only when Step B actually refused. **A manifest does not change
-the authorization verdict** — coord has no evidence-admission arm. Plan
-`2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one, but
-`qontinui-coord#2207` deliberately did not carry it: `main`'s
-`IndependenceDeclaration` is the attestation control, and two admission paths on
-one gate is a design nobody has made. So you are standing here for the ordinary
-identity reason — `self_attestation_forbidden` / `owner_unresolved` /
-`attester_unresolved` — whatever your manifest contained. Say which one, and do
-not attribute the fallback to the manifest or to an unarmed flag: there is no
-`COORD_WORKUNIT_EVIDENCE_ATTEST_MODE` to arm.
-
-```
-POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
-     {to_status:"vetted_unattested", from_status:"<what Step A read>",
-      by_actor:"<this session>", vet_evidence:[ <the same §2a manifest> ]}
-```
-
-Carry the manifest here too, under the same receipt rule as Step B. The fallback
-is where a floor-missing vet lands, so it is the path that most needs the
-evidence attached — a `vetted_unattested` unit with a stored manifest is a
-strictly better record than one without, and it is what gives the re-verify
-worker anything to look at.
+When the call lands, the unit is at `vetted`, which is the documented lifecycle
+status: coord's derive worker promotes `vetted` + all-gates-cleared → the
+derived status `ready`. No agent-reachable route produces `ready` any other way
+(the operator-transition route can set it directly, but that is not yours).
 
 **Read `admitted_on` from the receipt; do not infer which arm carried you.** It
 is always present when a receipt is, because "which arm" has no sensible default:
@@ -2795,13 +2784,15 @@ is always present when a receipt is, because "which arm" has no sensible default
 |---|---|
 | `identity` | ⚠️ **Two different things land here and coord does not distinguish them**: the ordinary actor-key comparison passed (you were a different actor from the owner), OR a well-formed `independence` declaration authorized it — both return `Authorized::Normal` (`policies::lifecycle_autonomy`), and there is no declaration tag. So `identity` is **NOT evidence that you were a different actor**. Say which you sent; the declaration itself is the distinguishing record, stored at `metadata.attestations`. **Your manifest did not carry this**, even if you sent one |
 | `graduation` | a graduated actor self-attested; the flywheel's track record carried it, not your evidence |
-| `no_transition` | the write stored a manifest without changing any status, so no authz question was asked at all |
+| `no_transition` | the write stored a manifest without changing any status, so no authz question was asked at all — the REFUSED arm's manifest store below answers this |
 
-There is no `evidence` value: coord has no evidence arm, so a manifest never
-carries a transition. Reporting that your manifest admitted the `→ vetted` is
-exactly the overstatement this plan exists to remove — a self-vet that *would*
-have been refused and a peer vet that was never in doubt are otherwise
-indistinguishable.
+There is no `evidence` value: coord has no evidence-admission arm, so a manifest
+never carries a transition. Plan `2026-09-01-vet-evidence-manifest-and-decay`
+Phase 7 designed one, but `qontinui-coord#2207` deliberately did not carry it:
+`main`'s `IndependenceDeclaration` is the attestation control, and two admission
+paths on one gate is a design nobody has made. Reporting that your manifest
+admitted the `→ vetted` is exactly the overstatement this rule exists to
+remove.
 
 Send `from_status` as a CAS guard so a peer attestation that landed between your
 read and this write cannot be clobbered. Use the value Step A established —
@@ -2809,89 +2800,41 @@ including the literal `""` when this session just created the row.
 
 The CAS is checked BEFORE the attestation authz, so a stale guard answers **`409`**
 `{"error":"from_status does not match current status","current_status":"<actual>","asserted_from_status":"<yours>"}`
-— not one of the three `403`s below. Distinguish them: a `409` means a peer moved
+— not one of the `403`s below. Distinguish them: a `409` means a peer moved
 the unit under you, and **the response body already carries `current_status`**, so
 re-apply Step A's skip rule against that value directly rather than re-reading (the
 re-read would route back through a door that may be exactly what failed). Never
 retry by dropping `from_status`; that converts the guard into the blind write it
 exists to prevent.
 
-Three 403 codes are expected here and NONE is a failure of the vet:
+Three 403 codes can answer the call. None is a failure of the vet:
 
-- **`self_attestation_forbidden`** — `vetted` is an Attested status and coord
-  enforces separation of duties: the attester's actor key must differ from the
-  unit's recorded owner. Step 1's upsert made this session the owner, so this
-  session is the one actor barred from writing it.
-
-  > ⚠️ **You can now satisfy this WITHOUT another session — send an
-  > `independence` declaration.** [policy:
-  > `independence-is-context-not-credential`] (verification-and-evidence v9,
-  > operator-decided 2026-09-03) settles what "independent" means here, and it
-  > is not identity: *"independence means the actor did not hold the AUTHOR'S
-  > CONTEXT. It does not mean a different credential, session id, device or
-  > token shape. A SUBAGENT QUALIFIES … it needs no distinct session id."*
-  >
-  > So `coord_work_unit_transition` takes an optional `independence`
-  > declaration — `{verified, against, context}`. When present and well-formed
-  > it AUTHORIZES the Attested transition and is stored on the unit at
-  > `metadata.attestations`. **Meeting this refusal is too late to earn one.**
-  > The fresh-context vet is Step 1.5's, performed before a single claim was
-  > checked; a subagent spawned here, after this session has already vetted,
-  > edited and stamped the plan, is a spawn whose only purpose is satisfying
-  > an identity check — the kind of spawn the clause refuses to require. If
-  > Step 1.5 spawned, you sent the declaration in Step B and this refusal
-  > means it **never arrived** — a stale tool schema with no `independence`
-  > field, or an older HTTP door that silently drops unknown fields. (A
-  > malformed one is a 422, never this 403 — see the 422 bullet below.) Read the
-  > DOOR, per the "LANDED is not SERVED" note near the top of this file, and
-  > re-send over one whose schema carries the field. If Step 1.5 could not
-  > spawn, you are on the `VETTED (self)` path: send no declaration and take
-  > Step C. The declaration's shape, for reference:
-  >
-  > ```json
-  > {"slug": "<stem>", "to_status": "vetted",
-  >  "independence": {
-  >    "verified": "premises re-derived against origin/main; phase sizing recounted",
-  >    "against":  "plans/<stem>.md at origin/main <sha>",
-  >    "context":  "fresh-context subagent; received the plan body, not the author's rationale"}}
-  > ```
-  >
-  > For a plan not yet on `origin/main`, `against` names it as "working-tree
-  > body (not on origin/main)" instead — the same words the stamp's
-  > `Vetted-by:` uses, so the two cannot disagree.
-  >
-  > **Do not fabricate the declaration to get past the 403.** It is
-  > unfalsifiable by construction — the policy says so in the same breath as
-  > requiring it — which is exactly why it is STORED: the control is
-  > auditability, not prevention. A declaration asserting an independence you
-  > did not have is a false witness statement with your actor key next to it.
-  >
-  > Omitting `independence` entirely keeps the legacy actor-key behaviour
-  > unchanged, so everything below still applies to that path.
+- **`self_attestation_forbidden`** — `vetted` is an Attested status and, absent
+  a declaration, coord enforces separation of duties: the attester's actor key
+  must differ from the unit's recorded owner. Step 1's upsert made this session
+  the owner, so this session is the one actor barred from writing it. **A
+  declaration that ARRIVES never yields this code** — coord returns it only on
+  the legacy arm. So if you sent one, it did not arrive: the door dropped the
+  field, which is a door problem, and you go down the ladder to rung 2. The
+  worked declaration is the Step B call above. If you have no honest
+  declaration to send, take the REFUSED arm.
 - **`owner_unresolved`** — the unit has no recorded owner at all (a row predating
   the ownership widening, or one created by a token carrying no device id). SoD
-  cannot be evaluated, so it is refused rather than passed vacuously. An ordinary
-  Free transition claims ownership and un-strands it. ⚠️ **A well-formed
-  `independence` declaration does NOT meet this refusal**: it evidences the
-  attester's context, and an unresolved owner is deliberately not an obstacle to
-  it (pinned in coord by
-  `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). This is the
-  one refusal a declaration actually removes — so **on the subagent path,
-  `owner_unresolved` means the declaration never arrived**, exactly as
-  `self_attestation_forbidden` does there: route it through that branch of Step
-  C's prologue (re-send over a door that serves the field).
+  cannot be evaluated, so it is refused rather than passed vacuously. ⚠️ **A
+  well-formed `independence` declaration does NOT meet this refusal**: it
+  evidences the attester's context, and an unresolved owner is deliberately not
+  an obstacle to it (pinned in coord by
+  `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). So, as with
+  the code above, meeting it after sending a declaration means the declaration
+  never arrived: change door.
 - **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
   `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
-  service token (transport tier 3 above). **On the self path**, fall back the
-  same way, but say in your report that the attestation was not merely refused —
-  it was **unattemptable from this door**, and would need a device- or
-  agent-identified caller even to be evaluated. **On the subagent path**, follow
-  Step C's prologue: one re-send over a device-identified door, then Step C.
-- **`422 independence_declaration_malformed`** — not one of the three 403s, and
-  not a refusal of the witness: coord could not parse what you sent. Every
-  field must be non-blank — zero-width characters count as blank — and at most
-  `work_unit_registry::INDEPENDENCE_FIELD_MAX` bytes. Fix the field and re-send
-  Step B ONCE, per Step C's prologue. It is **never** a reason for Step C.
+  service token (transport tier 3 above) and on the `/agents/credential`
+  bootstrap token. A declaration waives the owner comparison, not the witness,
+  so it does not help. Re-send over a rung that carries a device identity. When
+  every rung answers this, say in your report that the attestation was not
+  merely refused — it was **unattemptable from every door this session holds**,
+  and would need a device- or agent-identified caller even to be evaluated.
 
 Graduation relaxes exactly ONE of the three: `self_attestation_forbidden`. Both
 `owner_unresolved` and `attester_unresolved` are returned verbatim and are **not**
@@ -2900,15 +2843,11 @@ resolvable actor key there is nothing that could have been earned
 (`crates/coord/src/policies/lifecycle_autonomy.rs`, the
 `OwnerUnresolved | AttesterUnresolved` arm).
 
-**On the self path**, none of the three is a transport problem, a credential
-problem, or a coord bug — do not run `/coord-revive`, do not retry on another
-door, and do not report the vet as failed. **On the subagent path there are two
-exceptions**, both in Step C's prologue: `attester_unresolved` is re-sent once
-over a device-identified door, and `self_attestation_forbidden` /
-`owner_unresolved` are re-sent over a door whose schema serves `independence` —
-there the refusal IS a door problem, because the declaration was dropped. Never
-report the vet as failed on either path. Two facts so you
-do not burn a cycle looking for a way around it:
+None of the three is a coord bug, and none is a reason to run `/coord-revive` or
+to report the vet as failed. The only re-sends are the ones above: a dropped
+declaration goes down the ladder, and `attester_unresolved` goes to a rung with
+a device identity. Two facts so you do not burn a cycle looking for a way
+around it:
 
 - **The check is the six-tier `non_author_allows_identities` ladder**
   (`gates_authority.rs`) over `ActorIdentity { device, agent, session }` — the same
@@ -2945,46 +2884,36 @@ do not burn a cycle looking for a way around it:
   lever, not yours: routing your own vet through it would defeat the control it
   bypasses.
 
-**What the fallback costs, stated plainly — and it is the tier-6 outcome, not the
-expected one.** Attempt `→ vetted` first and expect it to succeed whenever the
-attester is a different device, an agent-JWT peer, or a different session carrying a
-proven binding; fall back only when the ladder actually refuses. A unit left at
-`vetted_unattested`
-never derives `ready`, because that derivation matches the literal `vetted`. You
-keep dispatch (the `unit_ready` gate clears) and lose one derived observation.
-`shipped` is unaffected — it derives from PR citations, independent of the
-from-status. **On the `VETTED (self)` path, and on a subagent-path refusal
-Step C's prologue sent here** (`attester_unresolved` twice, no
-device-identified door, or a declaration no door would carry), treat the attestation as **owed, not blocked** — on the
-subagent path it is owed a RE-SEND of the kept declaration, not a new vet: say
-in your report
-that the unit sits at `vetted_unattested` and a `→ vetted` attestation is
-outstanding. The plan is fully dispatchable meanwhile, and `/implement-plan` gates
-on the plan file's VETTED stamp — it never reads the registry status.
+**The REFUSED arm — the vet ends with the status UNCHANGED.** You are here on
+`self_attestation_forbidden` with no honest declaration to send, or on
+`attester_unresolved` from every rung. There is no fallback status. The old
+Free fallback status is retired (a coord carrying the Phase 1 change of the plan
+named above refuses it `422 status_retired`), and even where it is still
+accepted, writing it parks the unit in a status coord does not recognise and
+stamps this session as its owner. That trap was measured, not theorised. Two
+writes, then stop:
 
-**The fallback's real cost is worse than "one derived observation", and you should
-say so in your report.** `vetted_unattested` is **not a coord status at all**:
-`WorkUnitStatus::from_wire` returns `None` for it, so `classify_target_status`
-files it as **`Free`** — and a Free transition *claims ownership*. The fallback
-therefore stamps **this** session as the unit's owner, which is precisely the
-condition that makes every later `→ vetted` from this session refuse
-`self_attestation_forbidden`, permanently **absent a declaration** — i.e. on the
-self path. A subagent-path fallback escapes it by re-sending the kept
-declaration, which the declaration arm admits regardless of owner. The ordinary
-outcome of the control is a unit parked in a status coord does not recognize,
-owned by the one actor barred from fixing it. That is a trap, not a graceful degradation — do not report it as
-a clean fallback.
+1. **Store the manifest without a transition:**
+   `coord_work_unit_upsert {slug, status:"<the status Step A read>", vet_evidence:[…]}`,
+   over the same ladder. It re-states the current status, so no transition
+   happens. That write stamps no owner and asks no authz question: its receipt
+   answers `admitted_on: no_transition`. Quote `stored` from that receipt. Send
+   the status Step A READ — the literal `""` on a row this session just created
+   — and never invent one: a status you guessed is a transition, and a
+   transition is exactly what this arm must not write. If Step A's status is
+   UNKNOWN, skip this write and say so.
+2. **Report the attestation as OWED**, quoting the refusal code coord returned
+   (and on `attester_unresolved`, every rung you tried). The plan file's VETTED
+   stamp stands: `/implement-plan` gates on that stamp and never reads the
+   registry status, so the plan is fully dispatchable meanwhile. What is owed is
+   the registry's `→ vetted`, and with it the derived `ready`. Step 5's record
+   gate, keyed on `vetted`, stays Open until that attestation lands, and that
+   is the intended record of the debt.
 
-> **No evidence arm keeps you out of that trap.** Plan
-> `2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one — a manifest
-> meeting a floor would admit `→ vetted` regardless of identity — but it is
-> **not on `qontinui-coord`'s `origin/main`**, and `qontinui-coord#2207` left it
-> out on purpose (see Step C). So the fallback fires whenever identity refuses
-> on the self path, and on the subagent path whenever Step C's prologue sends
-> you there.
-> Never tell the operator the manifest changed the verdict; `admitted_on` is the
-> only thing entitled to settle which arm carried you, and it has no `evidence`
-> value.
+A later session that DOES hold an honest declaration discharges the debt with
+Step B unchanged. The declaration arm ignores the recorded owner, so the session
+that was refused is not barred from the re-send once it has a fresh-context
+review to declare.
 
 **Submitting a manifest can never cause a refusal** that would not otherwise
 have happened, so there is no reason to withhold one. What it DOES do once
@@ -3154,11 +3083,10 @@ leave it in the report.
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in → `time_elapsed`; metric →
   `metric_threshold` (explicit `labels` — e.g. `coord_ci_runner_count` MUST filter
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
-  `{work_unit_id, ready_status}` — transition the unit FIRST and set `ready_status`
-  to the status that actually landed (`vetted`, else the Free fallback
-  `vetted_unattested` (self path, or a subagent-path refusal per §5.4 Step C's
-  prologue)); a hardcoded Attested value on a unit you own never clears,
-  since an owner may not attest (§5.4 has the full procedure; canonical:
+  `{work_unit_id, ready_status}` — transition the unit FIRST (one `→ vetted`
+  call carrying an `independence` declaration) and key `ready_status` on
+  `vetted`; never on the status a REFUSED transition left, which on a fresh unit
+  is `""` and clears at once (§5.4 has the full procedure; canonical:
   `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
@@ -3292,17 +3220,11 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
-- **The independence path taken** — `subagent` (Step 1.5 spawned: say whether
-  the `independence` declaration was sent on `coord_work_unit_transition` and
-  whether `metadata.attestations` shows it stored) or `self` (no spawn: name
-  why, and confirm the stamp reads `VETTED (self)` with `Independence: NONE`).
-  Where your edit-time re-check contradicted the subagent's verdict, say so.
-  **Subagent path, transition refused:** name the code, whether you re-sent,
-  what the gate was keyed on (`vetted_unattested` after Step C, or not
-  registered when Step A's status was UNKNOWN or a 422 survived its one
-  re-send), and whether the declaration is
-  owed a re-send
-- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
+- **The difficulty outcome** (§5 "Difficulty stamp"): `stamped <level>` with
+  the computed level it overrode and the one-clause reason, `agreed <level>`
+  (no write), or `UNKNOWN — <why>` (read failed, not captured, or unrated; no
+  write). Never report UNKNOWN as agreement
+- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — no receipt, or `stored` below the count you sent — REQUIRES its evidence:** quote the refusal body coord returned (HTTP status, error code, message) and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without both is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
 

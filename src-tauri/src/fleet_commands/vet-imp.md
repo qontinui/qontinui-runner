@@ -812,8 +812,8 @@ fresh visible session to implement the plan instead of leaving it stranded.
 
 > ⚠️ **Do not "simplify" this back into one gate with a continuation on
 > `unit_ready`. That configuration cannot work, and coord now refuses it at the
-> door.** `/vet-plan` §5.4 mandates transitioning the unit to its vetted status
-> *before* registering the record gate keyed on the status that landed, and
+> door.** `/vet-plan` §5.4 mandates transitioning the unit to `vetted`
+> *before* registering the record gate keyed on `vetted`, and
 > `ready_verdict` is a bare `status != ready_status` compare — so
 > `status == ready_status` **by construction** and a freshly-upserted unit has no
 > open siblings. `Cleared` is the only reachable verdict from the first

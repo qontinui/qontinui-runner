@@ -134,13 +134,16 @@ Do this first, regardless of which transport ends up carrying it.
 
 **`unit_ready` vs `operator_approval` — do not mismodel a work queue as a human
 decision.** Ready, dispatchable, vetted work is `unit_ready`
-(`{"kind":"unit_ready","work_unit_id":"<uuid from upsert>","ready_status":"<what landed>"}`).
+(`{"kind":"unit_ready","work_unit_id":"<uuid from upsert>","ready_status":"vetted"}`).
 `operator_approval` is for genuine human decisions only.
-⚠️ Transition the unit FIRST, then set `ready_status` to the status that actually
-landed. Do not hardcode an **Attested** value (`vetted`/`superseded`/`obsolete`) on
-a unit you own: the upsert that created it made you its owner, an owner may not
-attest, and the gate would pin open forever. `/vet-plan` §5.4 attempts `vetted` and
-falls back to the Free status `vetted_unattested`. (Canonical: `_gate-registration`
+⚠️ Transition the unit FIRST, then key `ready_status` on `vetted`. The upsert that
+created the unit made you its owner, and an owner may not attest an **Attested**
+value (`vetted`/`superseded`/`obsolete`) without an `independence` declaration, so
+a `vetted` key is satisfiable only by a transition that carries one.
+`/vet-plan` §5.4 sends ONE `→ vetted` call carrying that declaration. On a refusal
+it leaves the status unchanged and reports the attestation owed — there is no
+fallback status — and the gate stays Open as the record of that debt.
+(Canonical: `_gate-registration`
 → "`unit_ready` vs `operator_approval`".) **No kind fits?** Either it is a real human
 decision → `operator_approval{prompt}`, or it has **no observable trigger** → it
 is *not a gate*; leave it in your report. Never register prose as a predicate.
