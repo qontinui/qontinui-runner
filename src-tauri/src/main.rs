@@ -3846,6 +3846,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Best-effort and fail-open: with no env override the
                 // candidate set is one path and this is a no-op.
                 let _ = qontinui_runner_lib::pair::converge_binding_store();
+                // After convergence, heal a canonical `paired_user.json` that
+                // is absent or blank while valid per-tenant slots coord still
+                // binds exist (plan 2026-09-29-vanished-paired-user-json-…,
+                // Phase 1). Logs its own outcome; the refresher repeats it
+                // every tick.
+                let _ = qontinui_runner_lib::pair::heal_vanished_paired_user();
 
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
