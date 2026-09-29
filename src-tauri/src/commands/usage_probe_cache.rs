@@ -96,7 +96,7 @@ impl<V: Clone + Send + 'static> CoalescingCache<V> {
         // both become leader. Constructing the future does not poll it, so
         // nothing is awaited while the lock is held (and the non-`Send`
         // guard never crosses an await point).
-        let (leader_generation, future) = {
+        let (slot_generation, future) = {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(Slot::Ready { value, at }) = slots.get(key) {
@@ -107,12 +107,12 @@ impl<V: Clone + Send + 'static> CoalescingCache<V> {
 
             // JOIN: await the leader's request instead of issuing our own.
             let joining = match slots.get(key) {
-                Some(Slot::InFlight { future, .. }) => Some(future.clone()),
+                Some(Slot::InFlight { generation, future }) => Some((*generation, future.clone())),
                 _ => None,
             };
 
             match joining {
-                Some(future) => (None, future),
+                Some(joined) => joined,
                 None => {
                     let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
                     let future = (fetch)().boxed().shared();
@@ -123,23 +123,24 @@ impl<V: Clone + Send + 'static> CoalescingCache<V> {
                             future: future.clone(),
                         },
                     );
-                    (Some(generation), future)
+                    (generation, future)
                 }
             }
         };
 
         let value = future.await;
 
-        // Only the leader publishes, and only over ITS OWN in-flight slot.
-        // If a later leader has already taken the key (we were slow, our
-        // result expired, a new request started), leave its slot alone.
-        let Some(leader_generation) = leader_generation else {
-            return value;
-        };
+        // Every caller of this generation may publish, and only over ITS OWN
+        // in-flight slot. It must not be leader-only: if the leader is
+        // cancelled (its HTTP request dropped) after the shared future has run,
+        // nobody would ever promote the slot, and every later caller would join
+        // the finished `Shared` and be handed its now-arbitrarily-old output
+        // forever. A later leader that has already taken the key (we were slow,
+        // our result expired) is left alone by the generation check.
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let still_ours = matches!(
             slots.get(key),
-            Some(Slot::InFlight { generation, .. }) if *generation == leader_generation
+            Some(Slot::InFlight { generation, .. }) if *generation == slot_generation
         );
         if still_ours {
             slots.insert(
@@ -300,6 +301,55 @@ mod tests {
         cache.get_or_fetch("acct-a", fetch(calls.clone())).await;
         tokio::time::sleep(Duration::from_millis(60)).await;
         cache.get_or_fetch("acct-a", fetch(calls.clone())).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A leader cancelled mid-flight must not strand the slot. A joiner that
+    /// drives the shared future to completion republishes it as `Ready`, so
+    /// once the TTL lapses the next call refetches instead of being handed the
+    /// finished future's output forever (the stale-weekly-utilization bug).
+    #[tokio::test]
+    async fn a_cancelled_leader_does_not_freeze_the_slot() {
+        let cache: Arc<CoalescingCache<u32>> =
+            Arc::new(CoalescingCache::new(Duration::from_millis(30)));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch("acct-a", move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        1u32
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // A joiner attaches, then the leader is cancelled while in flight.
+        let joiner = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.get_or_fetch("acct-a", || async { 99u32 }).await })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        leader.abort();
+        assert_eq!(joiner.await.unwrap(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let calls2 = calls.clone();
+        let v = cache
+            .get_or_fetch("acct-a", move || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                2u32
+            })
+            .await;
+        assert_eq!(
+            v, 2,
+            "past the TTL the slot must refetch, not replay the old result"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
