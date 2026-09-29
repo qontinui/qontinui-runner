@@ -10646,13 +10646,14 @@ Body.
                 .iter()
                 .rev()
                 .find(|b| b.slug == slug)
-                .and_then(|b| b.metadata.clone())
+                .and_then(|b| b.metadata.clone().or_else(|| b.metadata_patch.clone()))
                 .expect("the unit was pushed")
         };
-        assert!(!meta_for("2026-01-01-bad-area")
-            .as_object()
-            .unwrap()
-            .contains_key("area"));
+        // A phase-less plan goes out as a patch, where an undeclared area is
+        // an explicit `null` (RFC 7396 delete) rather than an absent key.
+        assert!(meta_for("2026-01-01-bad-area")
+            .get("area")
+            .is_none_or(|a| a.is_null()));
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
@@ -11842,7 +11843,10 @@ Body.
             let last = upserts.last().expect("at least one upsert");
             assert_eq!(last.title.as_deref(), Some("Renamed twice"));
             assert_eq!(
-                last.metadata.as_ref().expect("metadata")["source_path"],
+                last.metadata
+                    .as_ref()
+                    .or(last.metadata_patch.as_ref())
+                    .expect("metadata")["source_path"],
                 "plans/archive-candidates/a.md",
                 "a moved plan's provenance must follow it"
             );
@@ -14173,7 +14177,10 @@ Body.
         let last = sink.upserts.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.slug, "s");
         assert_eq!(last.status, None, "metadata-only: no status on the wire");
-        assert!(last.metadata.is_some(), "provenance keeps reaching coord");
+        assert!(
+            last.metadata.is_some() || last.metadata_patch.is_some(),
+            "provenance keeps reaching coord"
+        );
         assert_eq!(
             sink.statuses.lock().unwrap().get("s").map(String::as_str),
             Some("superseded")
