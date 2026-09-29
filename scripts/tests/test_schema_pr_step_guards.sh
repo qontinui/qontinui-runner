@@ -217,15 +217,15 @@ gh_calls="$( { grep -oE "(^|[^'\"])gh pr " "$code_only" || true; } | wc -l | tr 
 # ::warning:: + fall back to GITHUB_TOKEN).
 guard_re='^[[:space:]]*if (! )?([a-z_]+=)?"?\$?\(?(GH_TOKEN="\$PAT_TOKEN" )?gh pr '
 guarded="$(grep -cE "$guard_re" "$code_only" || true)"
-assert "gh calls in executable code" 7 "$gh_calls"
-assert "guarded gh calls (all but the bare open lookup)" 6 "$guarded"
+assert "gh calls in executable code" 9 "$gh_calls"
+assert "guarded gh calls (all but the bare open lookup)" 8 "$guarded"
 # The REST reads/writes (`gh api`) the ready-PR guard makes are every one of
 # them inside an `if !`: an unread comment list must never read as "not yet
 # commented".
 gh_api_calls="$( { grep -oE "(^|[^'\"])gh api " "$code_only" || true; } | wc -l | tr -d ' ')"
-gh_api_guarded="$(grep -cE '^[[:space:]]*if ! gh api ' "$code_only" || true)"
-assert "gh api calls in executable code" 2 "$gh_api_calls"
-assert "every gh api call is guarded" 2 "$gh_api_guarded"
+gh_api_guarded="$(grep -cE '^[[:space:]]*if ! ([a-z_]+="\$\()?gh api ' "$code_only" || true)"
+assert "gh api calls in executable code" 3 "$gh_api_calls"
+assert "every gh api call is guarded" 3 "$gh_api_guarded"
 # The one bare call must be the open lookup and nothing else. Without this,
 # swapping which call is bare (guarding `list`, un-guarding `edit`) keeps both
 # counts and passes vacuously.
@@ -244,6 +244,7 @@ assert "PRs are created as drafts" 2 "$(grep -c -- '--draft' "$code_only" || tru
 # register — and a failure there routes through the step's reporter.
 assert "PR step calls the draft->ready script once" 1 "$(grep -c 'bash scripts/ci/ready-bot-draft-pr.sh ' "$code_only" || true)"
 assert "PR step waits for the push's checks to register" 1 "$(grep -c 'ready-bot-draft-pr.sh .*--wait-for-checks-seconds [1-9]' "$code_only" || true)"
+assert "PR step pins the pushed head" 1 "$(grep -c 'ready-bot-draft-pr.sh .*--expect-head "\$pushed_sha"' "$code_only" || true)"
 assert "a ready-script failure goes through pr_op_failed" 1 "$(grep -c 'pr_op_failed "ready-for-review' "$code_only" || true)"
 
 # --- Stub bin -----------------------------------------------------------------
@@ -288,6 +289,7 @@ if [ "$verb" = "view" ]; then key="view:$json"; fi
 case "$json" in *isDraft*) [ "$verb" = "list" ] && key="list:ready" ;; esac
 if [ "${1:-}" = "api" ]; then
   case "$*" in
+    *convertPullRequestToDraft*) key="graphql:convert" ;;
     *" graphql "*)   key="graphql" ;;
     *"/check-runs"*) key="check-runs" ;;
     *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
@@ -319,6 +321,9 @@ case "$key" in
   comments-read) if [ -n "${GH_STUB_COMMENTS:-}" ] && [ -f "$GH_STUB_COMMENTS" ]; then cat "$GH_STUB_COMMENTS"; fi ;;
   pr-body)       printf '%s\n' "${GH_STUB_PR_BODY:-}" ;;
   view:isDraft)  printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
+  view:mergeable,mergeStateStatus) printf '%s\n' "${GH_STUB_MERGE:-MERGEABLE CLEAN}" ;;
+  view:id)       echo "PR_kwDOtest77" ;;
+  graphql:convert) printf '%s\n' "${GH_STUB_CONVERT_ISDRAFT:-true}" ;;
   comment)
     body_file=""; prev=""
     for a in "$@"; do [ "$prev" = "--body-file" ] && body_file="$a"; prev="$a"; done
@@ -347,6 +352,11 @@ echo "$*" >> "${GIT_STUB_LOG:-/dev/null}"
 if [ "${1:-}" = "diff" ]; then
   if [ "${GIT_STUB_STAGED:-1}" = "1" ]; then exit 1; fi
   exit 0
+fi
+# `git rev-parse HEAD` names the commit just pushed; it matches the head the
+# gh stub's ready lookup reports, so the ready script's --expect-head converges.
+if [ "${1:-}" = "rev-parse" ]; then
+  echo "a47f223e3a47f223e3a47f223e3a47f223e3a47f"
 fi
 exit 0
 STUB
@@ -382,12 +392,14 @@ GH_STUB_READY_LINE=""
 GH_STUB_CHECKS=3
 GH_STUB_GRAPHQL_ISDRAFT=false
 GH_STUB_ISDRAFT=true
+GH_STUB_MERGE="MERGEABLE CLEAN"
+GH_STUB_CONVERT_ISDRAFT=true
 GH_STUB_PR_BODY=""
 GH_STUB_COMMENTS="$work/comments.txt"
 : > "$GH_STUB_COMMENTS"
 export GH_STUB_EMPTY_URL GH_STUB_FAIL_FIRST_CREATE GIT_STUB_STAGED PAT_TOKEN_STUB
 export GH_STUB_READY_LINE GH_STUB_CHECKS GH_STUB_GRAPHQL_ISDRAFT
-export GH_STUB_ISDRAFT GH_STUB_PR_BODY GH_STUB_COMMENTS
+export GH_STUB_ISDRAFT GH_STUB_PR_BODY GH_STUB_COMMENTS GH_STUB_MERGE GH_STUB_CONVERT_ISDRAFT
 
 # run_step <fail-keys> <list-open>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log in
@@ -412,6 +424,8 @@ run_step() {
     GH_STUB_CHECKS="${GH_STUB_CHECKS:-3}" \
     GH_STUB_GRAPHQL_ISDRAFT="${GH_STUB_GRAPHQL_ISDRAFT:-false}" \
     GH_STUB_ISDRAFT="${GH_STUB_ISDRAFT:-true}" \
+    GH_STUB_MERGE="${GH_STUB_MERGE:-MERGEABLE CLEAN}" \
+    GH_STUB_CONVERT_ISDRAFT="${GH_STUB_CONVERT_ISDRAFT:-true}" \
     GH_STUB_PR_BODY="${GH_STUB_PR_BODY:-}" \
     GH_STUB_COMMENTS="$GH_STUB_COMMENTS" \
     GH_TOKEN="stub-token" \
@@ -564,6 +578,45 @@ rc="$(run_step "" "77")"
 GH_STUB_PR_BODY=""
 assert "ready PR carrying this dump: exit code" 0 "$rc"
 assert "ready PR carrying this dump: no comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+# A ready PR that CONFLICTS with main can never land: converted back to a
+# draft (from the mutation's own isDraft), then rebuilt and force-pushed like
+# any draft, and re-readied by the ready script once its checks register.
+for shape in "CONFLICTING DIRTY" "CONFLICTING UNKNOWN" "MERGEABLE DIRTY"; do
+  GH_STUB_MERGE="$shape"
+  : > "$GH_STUB_COMMENTS"
+  rc="$(run_step "" "77")"
+  assert "ready+conflicting ($shape): exit code" 0 "$rc"
+  assert "ready+conflicting ($shape): converted to draft" 1 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+  assert "ready+conflicting ($shape): force-pushed" 1 "$(grep -c 'push --force' "$work/git.log" || true)"
+  assert "ready+conflicting ($shape): no drift comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+  assert "ready+conflicting ($shape): re-readied" 1 "$(grep -c '^readied #4242$' "$work/out.txt" || true)"
+done
+GH_STUB_MERGE="CONFLICTING DIRTY"
+GH_STUB_CONVERT_ISDRAFT=false
+rc="$(run_step "" "77")"
+GH_STUB_CONVERT_ISDRAFT=true
+assert "conflict convert returns isDraft=false: exit code" 1 "$rc"
+assert "conflict convert returns isDraft=false: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+rc="$(run_step "graphql:convert" "77")"
+assert "conflict convert refused: exit code" 1 "$rc"
+assert "conflict convert refused: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+# UNKNOWN mergeability is not a conflict: comment only, never a push.
+GH_STUB_MERGE="UNKNOWN UNKNOWN"
+: > "$GH_STUB_COMMENTS"
+rc="$(run_step "" "77")"
+assert "ready+UNKNOWN: exit code" 0 "$rc"
+assert "ready+UNKNOWN: comment only" 1 "$(grep -c '^comment$' "$work/gh.log" || true)"
+assert "ready+UNKNOWN: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+assert "ready+UNKNOWN: not converted" 0 "$(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+GH_STUB_MERGE="MERGEABLE CLEAN"
+: > "$GH_STUB_COMMENTS"
+rc="$(run_step "" "77")"
+assert "ready+mergeable: comment only" "1 0 0" "$(grep -c '^comment$' "$work/gh.log" || true) $(grep -c 'push' "$work/git.log" || true) $(grep -c '^graphql:convert$' "$work/gh.log" || true)"
+rc="$(run_step "view:mergeable,mergeStateStatus" "77")"
+assert "mergeability unreadable: exit code" 1 "$rc"
+assert "mergeability unreadable: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+: > "$GH_STUB_COMMENTS"
+
 # Unreadable state is a red, never a guess — and never a push.
 rc="$(run_step "view:isDraft" "77")"
 assert "isDraft unreadable: exit code" 1 "$rc"
@@ -646,14 +699,20 @@ extract_if() {
 
 # eval_if <expression> <outputs file> — evaluates a step `if:` against the
 # fresh_check outputs, under the implicit success() (every earlier step
-# passed). STRICT: it models `steps.fresh_check.outputs.<name>`, string
-# literals, ==, !=, &&, ||, ! and parentheses — anything else (a function
+# passed and the run was not cancelled). STRICT: it models
+# `steps.fresh_check.outputs.<name>`, `cancelled()` (false), string literals,
+# ==, !=, &&, ||, ! and parentheses — anything else (a function
 # call, another step's outputs) is a loud error, never a guess. Prints
 # true/false.
+#
+# eval_if <expression> <outputs file> failed — the same, on a run where an
+# EARLIER step failed: GitHub then adds an implicit success() (false) to any
+# expression that calls no status function, so only an expression carrying
+# `cancelled()` can still run.
 eval_if() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "${3:-}" <<'PY'
 import re, sys
-expr, outputs_path = sys.argv[1].strip(), sys.argv[2]
+expr, outputs_path, mode = sys.argv[1].strip(), sys.argv[2], sys.argv[3]
 outputs = {}
 for line in open(outputs_path):
     line = line.rstrip("\n")
@@ -664,7 +723,7 @@ if expr.startswith("${{") and expr.endswith("}}"):
     expr = expr[3:-2].strip()
 if not expr:
     sys.exit("eval_if: empty expression")
-tokens = re.findall(r"steps\.fresh_check\.outputs\.[A-Za-z_][A-Za-z0-9_]*|'[^']*'|==|!=|&&|\|\||!|\(|\)|\S+", expr)
+tokens = re.findall(r"steps\.fresh_check\.outputs\.[A-Za-z_][A-Za-z0-9_]*|cancelled\(\)|'[^']*'|==|!=|&&|\|\||!|\(|\)|\S+", expr)
 out = []
 for t in tokens:
     if t.startswith("steps.fresh_check.outputs."):
@@ -679,9 +738,14 @@ for t in tokens:
         out.append("or")
     elif t == "!":
         out.append("not")
+    elif t == "cancelled()":
+        out.append("False")
     else:
         sys.exit("eval_if: unmodelled token %r in %r" % (t, expr))
-print("true" if eval(" ".join(out), {"__builtins__": {}}) else "false")
+result = eval(" ".join(out), {"__builtins__": {}})
+if mode == "failed" and "cancelled()" not in expr:
+    result = False
+print("true" if result else "false")
 PY
 }
 
@@ -814,6 +878,12 @@ assert "drift + self-heal: summary names the drifted table" 1 "$(grep -c 'coord.
 assert "drift + self-heal: PR step runs" "true" "$(eval_if "$pr_if" "$work/fresh.out")"
 assert "drift + self-heal: sweep step runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out")"
 
+# A2. An EARLIER step failed (poetry, alembic, regeneration): that night
+#     delivers nothing, and a parked PR still needs its re-decide and page.
+#     fresh_check writes self_heal first, so the output is set.
+assert "upstream failure: PR step does not run" "false" "$(eval_if "$pr_if" "$work/fresh.out" failed)"
+assert "upstream failure: sweep step still runs" "true" "$(eval_if "$sweep_if" "$work/fresh.out" failed)"
+
 # C. No drift, not a self-heal run (a PR or a non-main dispatch): neither runs.
 rc="$(run_fresh false "$base_dump")"
 assert "no drift, no self-heal: exit code" 0 "$rc"
@@ -883,6 +953,21 @@ if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
   mutate dedup-broken \
     '$0 == "              if grep -qF \"$drift_marker\" \"$seen\"; then" { $0 = "              if false; then" } { print }' \
     "ready PR: exactly one comment across two identical runs"
+  # Remove the conflict check: a conflicting ready PR is commented on forever.
+  mutate conflict-check-removed \
+    '$0 == "              if [ \"$mergeable\" = \"CONFLICTING\" ] || [ \"${merge_status:-}\" = \"DIRTY\" ]; then" { $0 = "              if false; then" } { print }' \
+    "ready+conflicting (CONFLICTING DIRTY): force-pushed"
+  # Back to the default success(): an upstream failure skips the sweep.
+  mutate sweep-success-only \
+    "BEGIN { want = \"      - name: $SWEEP_STEP\" }
+     \$0 == want { in_sweep = 1 }
+     in_sweep && /^        if: / { \$0 = \"        if: steps.fresh_check.outputs.self_heal == 'true'\"; in_sweep = 0 }
+     { print }" \
+    "upstream failure: sweep step still runs"
+  # Drop the head pin at the PR step's call site.
+  mutate expect-head-dropped \
+    '{ sub(/ --expect-head "\$pushed_sha"/, "") } { print }' \
+    "PR step pins the pushed head"
 fi
 echo ""
 if [ "$failures" -ne 0 ]; then
