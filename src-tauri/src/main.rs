@@ -234,6 +234,7 @@ mod safe_lock;
 mod saved_api_requests;
 mod scenarios;
 mod scheduler;
+mod scheduler_probe;
 mod scheduler_remote_agent;
 mod scheduler_service;
 mod schema_registry;
