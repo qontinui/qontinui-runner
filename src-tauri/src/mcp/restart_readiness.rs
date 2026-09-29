@@ -138,6 +138,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -620,6 +621,20 @@ pub fn pane_observations_by_pid(
 /// split, never the verdict's availability.
 pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Set while a Claude Code record read is running. See
+/// [`gather_activity_evidence`].
+pub static RECORD_READ_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears the in-flight flag when dropped — i.e. when the blocking read
+/// finishes or unwinds.
+struct InFlightRead(&'static AtomicBool);
+
+impl Drop for InFlightRead {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The live processes whose activity the pane did NOT decide — the only ones
 /// whose Claude Code record is worth reading — with the census's process age
 /// for the record's identity check.
@@ -644,7 +659,9 @@ fn pids_needing_a_record(
     })
     .map(|p| LivePid {
         pid: p.pid,
-        age_s: p.age_s,
+        // From the census's OWN snapshot time, not a later clock read: the
+        // age was measured at `checked_at_ms`.
+        process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
     })
     .collect()
 }
@@ -655,21 +672,43 @@ fn pids_needing_a_record(
 /// executor and bounded by `read_timeout`. A read that fails or times out
 /// costs the records — those processes read `unknown`, never `idle`.
 /// `proc_start` is [`claude_activity::proc_start_ticks`] in production.
+///
+/// `in_flight` admits ONE read at a time: while a read (even an abandoned,
+/// timed-out one) is still running, a new call skips the read and reports its
+/// undecided processes `unknown`. Production passes
+/// [`RECORD_READ_IN_FLIGHT`].
 pub async fn gather_activity_evidence(
     report: &TrackingHealthReport,
     observed: &ObservedInputs,
     config_dirs: Vec<PathBuf>,
     proc_start: fn(u32) -> Option<String>,
     read_timeout: std::time::Duration,
+    in_flight: &'static AtomicBool,
 ) -> ActivityEvidence {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let pane_by_pid = pane_observations_by_pid(report, observed);
     let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
     let records = if pids.is_empty() {
         HashMap::new()
+    } else if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // An earlier read is still running — it timed out and was abandoned,
+        // but a blocking thread cannot be cancelled. Starting another would
+        // leak one more thread per poll on a hung filesystem.
+        tracing::warn!(
+            "restart-readiness: a previous Claude Code session-record read is still in \
+             flight — skipped; every undecided process reads activity `unknown`"
+        );
+        HashMap::new()
     } else {
+        let guard = InFlightRead(in_flight);
         let read = tokio::task::spawn_blocking(move || {
-            claude_activity::read_records(&config_dirs, &pids, now_ms, &proc_start)
+            // Released when the read ENDS (or unwinds), not when the caller
+            // stops waiting for it.
+            let _guard = guard;
+            claude_activity::read_records(&config_dirs, &pids, &proc_start)
         });
         match tokio::time::timeout(read_timeout, read).await {
             Ok(Ok(records)) => records,
@@ -1132,6 +1171,7 @@ pub async fn restart_readiness_handler(
                 crate::terminal::transcript::find_claude_config_dirs(),
                 claude_activity::proc_start_ticks,
                 RECORD_READ_TIMEOUT,
+                &RECORD_READ_IN_FLIGHT,
             )
             .await
         }
@@ -3285,12 +3325,14 @@ mod tests {
             .into(),
             ..ObservedInputs::default()
         };
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
         let evidence = gather_activity_evidence(
             &report,
             &observed,
             vec![dir],
             kernel_agrees,
             RECORD_READ_TIMEOUT,
+            &IN_FLIGHT,
         )
         .await;
         assert!(
@@ -3313,15 +3355,19 @@ mod tests {
         assert_eq!(totals.by_activity.sum(), totals.total);
     }
 
-    fn slow_kernel(_: u32) -> Option<String> {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        Some("77".to_string())
-    }
-
     /// L2: a record read that overruns its budget costs the records — every
     /// undecided process reads `unknown`, never `idle` — and the sum holds.
+    /// The kernel read sleeps ONCE, so the abandoned thread ends promptly.
     #[tokio::test]
     async fn a_record_read_that_times_out_leaves_every_undecided_process_unknown() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        fn slow_once(_: u32) -> Option<String> {
+            if !SLEPT.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Some("77".to_string())
+        }
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(".claude-x");
         for pid in 1..=9 {
@@ -3332,8 +3378,9 @@ mod tests {
             &report,
             &ObservedInputs::default(),
             vec![dir],
-            slow_kernel,
+            slow_once,
             std::time::Duration::from_millis(20),
+            &IN_FLIGHT,
         )
         .await;
         assert!(evidence.records.is_empty());
@@ -3344,6 +3391,81 @@ mod tests {
                 unknown: 9,
                 ..ActivityCounts::default()
             }
+        );
+    }
+
+    /// N2: while an abandoned read is still running, a new call does NOT
+    /// start another (that would leak a blocking thread per poll on a hung
+    /// filesystem) — it reports `unknown` — and once the read ends, reads
+    /// resume.
+    #[tokio::test]
+    async fn only_one_record_read_is_in_flight_at_a_time() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static SLEPT: AtomicBool = AtomicBool::new(false);
+        fn slow_once(_: u32) -> Option<String> {
+            if !SLEPT.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Some("77".to_string())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in 1..=9 {
+            write_record(&dir, pid, "idle");
+        }
+        let report = activity_report();
+        let observed = ObservedInputs::default();
+        async fn gather(
+            report: &TrackingHealthReport,
+            observed: &ObservedInputs,
+            dir: &std::path::Path,
+            kernel: fn(u32) -> Option<String>,
+            timeout_ms: u64,
+        ) -> ActivityEvidence {
+            gather_activity_evidence(
+                report,
+                observed,
+                vec![dir.to_path_buf()],
+                kernel,
+                std::time::Duration::from_millis(timeout_ms),
+                &IN_FLIGHT,
+            )
+            .await
+        }
+
+        // 1. Times out; its blocking read is still running.
+        assert!(gather(&report, &observed, &dir, slow_once, 20)
+            .await
+            .records
+            .is_empty());
+        assert!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            "the abandoned read holds the slot"
+        );
+
+        // 2. Skipped outright, even with a fast kernel and a generous budget.
+        let skipped = gather(&report, &observed, &dir, kernel_agrees, 3_000).await;
+        assert!(skipped.records.is_empty());
+        assert_eq!(
+            live_claude_totals_observed(&report, &skipped)
+                .by_activity
+                .unknown,
+            9
+        );
+
+        // 3. Once the abandoned read finishes, the slot is free again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while IN_FLIGHT.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the read never ended");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let resumed = gather(&report, &observed, &dir, kernel_agrees, 3_000).await;
+        assert_eq!(resumed.records.len(), 9);
+        assert_eq!(
+            live_claude_totals_observed(&report, &resumed)
+                .by_activity
+                .idle,
+            9
         );
     }
 }
