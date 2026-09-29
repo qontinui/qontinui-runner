@@ -122,7 +122,10 @@
 //! - **Consent.** A batch the watcher DELIVERS while `Settings.cloud_sync_enabled`
 //!   is off moves a tracked session's mark past it (`withhold_batch`), so no
 //!   later gap fill or bind sends it; a gap already open below it is skipped
-//!   too and counted as a `transcript_hole`. Bytes written while sync was off
+//!   too and counted as a `transcript_hole`. The mark is validated first: if
+//!   the JSONL was rewritten while sync was off, the mark is re-anchored past
+//!   the withheld batch on the NEW content (fingerprinted), never reset to 0,
+//!   so the rewritten content delivered while sync was off is not sent either. Bytes written while sync was off
 //!   but never delivered as a batch — the runner was down, or the tail was
 //!   re-started past them — carry no such record and CAN be sent later by a
 //!   gap fill or a bind once sync is on.
@@ -551,6 +554,8 @@ struct Coverage {
     appends_skipped_gate_off: u64,
     /// Reserved ranges found never queued (see `report_hole_if_any`).
     transcript_holes: u64,
+    /// First-seen batches held because their line boundary was unreadable.
+    held_batches: u64,
     /// Gate 1 as observed at the last append. `None` until an append is seen —
     /// which is why the report models it as an option: "no data yet" and
     /// "consent withheld" are different answers and a bare `false` conflates
@@ -581,6 +586,9 @@ pub struct CoverageReport {
     pub appends_skipped_gate_off: u64,
     /// Reserved transcript ranges found never queued (`transcript_hole`).
     pub transcript_holes: u64,
+    /// First-seen batches held (not emitted) because their line boundary
+    /// could not be read; the next batch retries.
+    pub held_batches: u64,
 }
 
 impl SessionTranscriptTailer {
@@ -725,10 +733,30 @@ impl SessionTranscriptTailer {
 
     fn withhold_locked(&self, session_key: &str, path: &Path, file_start: u64, len: usize) {
         let mk = self.mark_key(session_key, path);
-        let Some(mark) = self.marks.get(&mk).map(|m| u64::try_from(m).unwrap_or(0)) else {
+        let Some(recorded) = self.marks.get(&mk).map(|m| u64::try_from(m).unwrap_or(0)) else {
             return;
         };
         let end = file_start + len as u64;
+        // Validate first, exactly as an emit would: a JSONL rewritten while
+        // sync is off must not keep a mark describing the OLD content, or the
+        // reset that the next (sync-on) emit performs would gap-fill the new
+        // content — sync-off bytes included — from 0. Re-anchor on the NEW
+        // content instead: past this withheld batch, fingerprinted, so none of
+        // it is ever sent.
+        let mark = self.validated_mark(&mk, path, false);
+        if recorded > 0 && mark == 0 {
+            if let Some(fp) = first_line_fingerprint(path) {
+                self.marks.set(&fingerprint_key(&mk), fp);
+            }
+            self.marks.set(&mk, end as i64);
+            tracing::info!(
+                session_key,
+                anchored_at = end,
+                "session_transcript_tailer: transcript rewritten while sync was off — mark \
+                 re-anchored past the withheld batch on the new content"
+            );
+            return;
+        }
         if file_start > mark {
             // A gap ABOVE the mark (a failed gap fill, a rolled-back emit, a
             // batch dropped unbound) meets a consent-off batch. Consent wins:
@@ -825,12 +853,17 @@ impl SessionTranscriptTailer {
                     // and create NO mark, so the next batch decides again —
                     // a guessed mark mid-line would later read as a rewrite
                     // and send the whole history.
-                    tracing::debug!(
+                    tracing::warn!(
                         session_key,
                         file_start,
                         "session_transcript_tailer: first-seen batch held — line boundary \
                          unreadable; the next batch retries"
                     );
+                    // `admit` counted it as emitted; it was not.
+                    let mut cov = self.lock_coverage();
+                    cov.appends_emitted = cov.appends_emitted.saturating_sub(1);
+                    cov.bytes_emitted = cov.bytes_emitted.saturating_sub(appended.len() as u64);
+                    cov.held_batches += 1;
                     return;
                 }
             };
@@ -1382,6 +1415,7 @@ impl SessionTranscriptTailer {
             appends_skipped_unbound: cov.appends_skipped_unbound,
             appends_skipped_gate_off: cov.appends_skipped_gate_off,
             transcript_holes: cov.transcript_holes,
+            held_batches: cov.held_batches,
         }
     }
 
@@ -1566,15 +1600,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
-
-        t.on_appended_gated(
+        let path = jsonl(
+            dir.path(),
             &csid,
-            NO_FILE.as_ref(),
-            0,
-            "{\"type\":\"user\"}\n",
-            false,
-            true,
+            "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n",
         );
+
+        t.on_appended_gated(&csid, &path, 0, "{\"type\":\"user\"}\n", false, true);
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 1, "unbound pane is visible");
         assert_eq!(r.unbound_session_ids, vec![csid.clone()]);
@@ -1586,14 +1618,7 @@ mod tests {
         );
 
         sniff_register(&registrar, &csid);
-        t.on_appended_gated(
-            &csid,
-            NO_FILE.as_ref(),
-            16,
-            "{\"type\":\"assistant\"}\n",
-            false,
-            true,
-        );
+        t.on_appended_gated(&csid, &path, 16, "{\"type\":\"assistant\"}\n", false, true);
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 0, "binding clears the coverage hole");
         assert_eq!(r.sessions_tailed, 1);
@@ -2137,6 +2162,39 @@ mod tests {
             t.marks.get(&t.mark_key(&csid, missing)).is_none(),
             "no mark created"
         );
+        let cov = t.coverage();
+        assert_eq!(cov.held_batches, 1);
+        assert_eq!(
+            (cov.appends_emitted, cov.bytes_emitted),
+            (0, 0),
+            "held is not emitted"
+        );
+    }
+
+    /// A JSONL rewritten while sync is off: the withheld (rewritten) content
+    /// is never sent after sync returns — the mark re-anchors on the new
+    /// content instead of resetting to 0.
+    #[test]
+    fn a_rewrite_while_sync_is_off_is_never_sent_after_sync_returns() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let l1 = "{\"v\":\"a1\"}\n";
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        // Sync off: the file is rewritten (new first line, longer), and the
+        // watcher delivers its truncated re-read.
+        let b = "{\"v\":\"b1-rewritten\"}\n{\"v\":\"b2\"}\n";
+        std::fs::write(&path, b).unwrap();
+        t.on_appended_gated(&csid, &path, 0, b, true, false);
+
+        // Sync on again.
+        let b3 = "{\"v\":\"b3\"}\n";
+        append(&path, b3);
+        t.on_appended_gated(&csid, &path, b.len() as u64, b3, false, true);
+
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{b3}"));
     }
 
     /// A sync-off batch arriving above an open gap: consent wins — the mark
