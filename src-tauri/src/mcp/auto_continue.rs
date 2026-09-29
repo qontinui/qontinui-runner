@@ -125,8 +125,15 @@ pub async fn set_workflow_auto_continue(
 /// the configured host resolves to.
 const SUPERVISOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Budget for the identity half (`GET <base>/health`) of an observation.
-const SUPERVISOR_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// ONE deadline for a whole observation: TCP probe (capped at
+/// [`SUPERVISOR_PROBE_TIMEOUT`]) + `/health` send + body read. Kept well under
+/// the settings panels' 4 s client-side abort.
+const SUPERVISOR_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Largest `/health` body the identity check will read. A supervisor's is a
+/// few KiB; anything bigger is not one, and an unbounded read of whatever
+/// happens to listen on the port is a memory hazard.
+const SUPERVISOR_HEALTH_MAX_BYTES: u64 = 64 * 1024;
 
 /// Probe one `host:port` for a TCP listener. BLOCKING, bounded by `budget`.
 ///
@@ -214,22 +221,57 @@ pub fn is_supervisor_health(body: &serde_json::Value) -> bool {
         .is_some_and(|v| v.is_string())
 }
 
+/// The identity client, built once. No redirects (a 3xx from the probed
+/// address must not send the check somewhere else) and no proxy (the probe
+/// is about THIS address, and an `HTTP_PROXY` would answer for it). Timeouts
+/// are per request, from the observation's single deadline.
+fn identity_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .map_err(|e| format!("could not build HTTP client: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 /// `GET <base_url>/health` and check [`is_supervisor_health`]. BLOCKING.
+///
+/// `timeout` covers connect, send AND body read (reqwest's per-request
+/// timeout runs until the body has finished). The body is capped at
+/// [`SUPERVISOR_HEALTH_MAX_BYTES`]: a declared larger length is refused
+/// up front, and an undeclared one is read through `take`, so an oversized
+/// body truncates into a parse failure rather than an allocation.
 fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("could not build HTTP client: {e}"))?;
-    let resp = client
+    use std::io::Read;
+    if timeout.is_zero() {
+        return Err(format!(
+            "no time left in the observation budget to ask {base_url}/health"
+        ));
+    }
+    let resp = identity_client()?
         .get(format!("{base_url}/health"))
+        .timeout(timeout)
         .send()
         .map_err(|e| format!("GET {base_url}/health failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {base_url}/health answered {}", resp.status()));
     }
-    let body: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("GET {base_url}/health is not JSON: {e}"))?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > SUPERVISOR_HEALTH_MAX_BYTES)
+    {
+        return Err(format!(
+            "GET {base_url}/health body is too large to be a supervisor's (> {SUPERVISOR_HEALTH_MAX_BYTES} bytes)"
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_reader(resp.take(SUPERVISOR_HEALTH_MAX_BYTES))
+        .map_err(|e| format!("GET {base_url}/health is not a JSON body within {SUPERVISOR_HEALTH_MAX_BYTES} bytes: {e}"))?;
     if is_supervisor_health(&body) {
         Ok(())
     } else {
@@ -240,12 +282,13 @@ fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> 
 }
 
 /// Build the observation for a configured supervisor URL. BLOCKING, bounded
-/// by `tcp_budget + identity_budget` (plus name resolution).
+/// by ONE `budget` (plus name resolution): the TCP probe gets
+/// `min(budget, 500 ms)`, and the identity check whatever is left.
 pub fn observe_supervisor_at(
     supervisor_url: &str,
-    tcp_budget: std::time::Duration,
-    identity_budget: std::time::Duration,
+    budget: std::time::Duration,
 ) -> SupervisorObservation {
+    let deadline = std::time::Instant::now() + budget;
     let probed_at = chrono::Utc::now().to_rfc3339();
     let unknown = |reason: String| SupervisorObservation {
         observed: None,
@@ -271,30 +314,33 @@ pub fn observe_supervisor_at(
         base_url: Some(base_url.clone()),
         reason,
     };
-    match probe_supervisor_at(&host_port, tcp_budget) {
+    match probe_supervisor_at(&host_port, budget.min(SUPERVISOR_PROBE_TIMEOUT)) {
         None => unknown(format!(
             "{host_port} does not resolve, so nothing was probed"
         )),
         Some(false) => known(false, Some(format!("nothing listens at {host_port}"))),
-        Some(true) => match confirm_supervisor_identity(&base_url, identity_budget) {
-            Ok(()) => known(true, None),
-            Err(reason) => known(false, Some(reason)),
-        },
+        Some(true) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match confirm_supervisor_identity(&base_url, remaining) {
+                Ok(()) => known(true, None),
+                Err(reason) => known(false, Some(reason)),
+            }
+        }
     }
 }
 
 /// [`observe_supervisor_at`] against this runner's configured supervisor.
-/// BLOCKING (TCP ≤ 500 ms, then identity ≤ 1.5 s only if something listens).
+/// BLOCKING, ≤ 2 s in all (TCP ≤ 500 ms; the identity check only if
+/// something listens, within what is left).
 pub fn observe_supervisor() -> SupervisorObservation {
     observe_supervisor_at(
         &crate::api_config::get_supervisor_url(),
-        SUPERVISOR_PROBE_TIMEOUT,
-        SUPERVISOR_IDENTITY_TIMEOUT,
+        SUPERVISOR_OBSERVATION_BUDGET,
     )
 }
 
-/// `GET /supervisor/observation`. The probe is a blocking TCP connect, so it
-/// runs off the async runtime.
+/// `GET /supervisor/observation`. The observation blocks (name lookup, TCP
+/// connect, `/health` read), so it runs off the async runtime.
 async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>> {
     match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(observe_supervisor).await {
         Ok(obs) => Json(ApiResponse::success(obs)),
@@ -335,10 +381,25 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_millis(500);
+    /// A whole-observation budget for the HTTP tests.
+    const B: Duration = Duration::from_millis(2000);
 
-    /// A tiny HTTP server answering every request with `body`. Connections
-    /// that send nothing (the bare TCP probe) are dropped.
+    /// A 200 JSON response carrying `body`.
+    fn ok_json(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
     fn serve(body: &'static str) -> u16 {
+        serve_raw(ok_json(body))
+    }
+
+    /// A tiny HTTP server answering every request with the raw `response`.
+    /// Connections that send nothing (the bare TCP probe) are dropped.
+    fn serve_raw(response: String) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
@@ -349,12 +410,7 @@ mod tests {
                 if !matches!(s.read(&mut buf), Ok(n) if n > 0) {
                     continue;
                 }
-                let _ = write!(
-                    s,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let _ = s.write_all(response.as_bytes());
             }
         });
         port
@@ -400,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_url_with_no_port_is_unknown_and_reports_nothing_probed() {
-        let obs = observe_supervisor_at("http://sup.example", T, T);
+        let obs = observe_supervisor_at("http://sup.example", T);
         assert_eq!(obs.observed, None);
         assert_eq!(obs.port, None);
         assert_eq!(obs.base_url, None);
@@ -411,7 +467,7 @@ mod tests {
     fn a_supervisor_health_body_is_observed_at_the_probed_address() {
         let port = serve(r#"{"status":"ok","supervisor":{"version":"x","project_dir":"/p"}}"#);
         // The configured path is dropped: base_url is exactly what was probed.
-        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}/ignored"), T, T);
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}/ignored"), B);
         assert_eq!(obs.observed, Some(true), "{:?}", obs.reason);
         assert_eq!(obs.port, Some(port));
         assert_eq!(
@@ -427,7 +483,7 @@ mod tests {
     #[test]
     fn a_non_supervisor_listener_is_not_observed_and_says_why() {
         let port = serve(r#"{"status":"ok","uiBridge":{"appId":"runner"}}"#);
-        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), T, T);
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), B);
         assert_eq!(obs.observed, Some(false));
         assert_eq!(obs.port, Some(port));
         assert!(obs
@@ -442,9 +498,66 @@ mod tests {
         // Accepts and never speaks HTTP.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), T, T);
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), B);
         assert_eq!(obs.observed, Some(false));
         assert!(obs.reason.is_some());
+    }
+
+    /// A body over the cap is refused before it is read, even if it would
+    /// otherwise identify as a supervisor.
+    #[test]
+    fn an_oversized_health_body_is_not_observed() {
+        let pad = "x".repeat(70 * 1024);
+        let body = format!(r#"{{"pad":"{pad}","supervisor":{{"project_dir":"/p"}}}}"#);
+        let port = serve_raw(ok_json(&body));
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), B);
+        assert_eq!(obs.observed, Some(false));
+        assert!(
+            obs.reason.as_deref().unwrap_or("").contains("too large"),
+            "{:?}",
+            obs.reason
+        );
+    }
+
+    /// Same, when the length is NOT declared: the capped read truncates the
+    /// body into a parse failure instead of reading it all.
+    #[test]
+    fn an_undeclared_oversized_body_is_capped_not_read() {
+        let pad = "x".repeat(70 * 1024);
+        let body = format!(r#"{{"pad":"{pad}","supervisor":{{"project_dir":"/p"}}}}"#);
+        let port = serve_raw(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        ));
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), B);
+        assert_eq!(obs.observed, Some(false));
+        assert!(obs
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not a JSON body"));
+    }
+
+    /// A redirect is NOT followed — even to a real supervisor-shaped answer.
+    #[test]
+    fn a_redirect_is_not_followed_and_not_observed() {
+        let target = serve(r#"{"supervisor":{"project_dir":"/p"}}"#);
+        let port = serve_raw(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target}/health\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), B);
+        assert_eq!(obs.observed, Some(false));
+        assert!(
+            obs.reason.as_deref().unwrap_or("").contains("302"),
+            "{:?}",
+            obs.reason
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_is_not_observed() {
+        let port = serve(r#"{"supervisor":{"project_dir":"/p"}}"#);
+        let obs = observe_supervisor_at(&format!("http://127.0.0.1:{port}"), Duration::ZERO);
+        assert_ne!(obs.observed, Some(true));
     }
 
     #[test]
@@ -465,7 +578,7 @@ mod tests {
     /// JSON `null` (not an absent key) when unknown.
     #[test]
     fn unknown_serialises_as_explicit_null() {
-        let obs = observe_supervisor_at("http://sup.example", T, T);
+        let obs = observe_supervisor_at("http://sup.example", T);
         let v = serde_json::to_value(&obs).expect("serialise");
         assert!(v.get("observed").expect("observed key present").is_null());
         assert!(v.get("port").expect("port key present").is_null());

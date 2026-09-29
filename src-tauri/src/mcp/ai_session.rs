@@ -2189,8 +2189,16 @@ pub async fn run_prompt(
     // PRIMARY runner's API.
     // An unparseable supervisor address (`None`) probed nothing, so it selects
     // the supervisor-DOWN arm: only an observed listener earns the recipe.
+    // The probe BLOCKS (name lookup + ≤500 ms connect), so it runs off the
+    // async worker, as `session_briefing_handler` does.
+    let supervisor_available =
+        spawn_blocking_tracked(super::auto_continue::check_supervisor_available)
+            .await
+            .ok()
+            .flatten()
+            == Some(true);
     let rules = runner_rules_prefix(
-        super::auto_continue::check_supervisor_available() == Some(true),
+        supervisor_available,
         crate::mcp::types::runner_api_port(&state.app_state),
     );
     // The separator is the RENDERER's job, not a trailing newline the block

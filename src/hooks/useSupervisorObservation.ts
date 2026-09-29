@@ -1,15 +1,19 @@
 /**
- * useSupervisorObservation — the runner's ONE supervisor probe, read.
+ * useSupervisorObservation — the runner's supervisor observation, read.
  *
  * `GET /supervisor/observation` answers `{ observed, probed_at, port,
- * base_url }` from the same TCP probe the session briefing already trusts
- * (`mcp/auto_continue.rs` `check_supervisor_available`). A published runner
+ * base_url, reason }`. It runs the same TCP probe the session briefing trusts
+ * (`mcp/auto_continue.rs` `probe_supervisor_at`) and then CONFIRMS IDENTITY:
+ * `GET <base_url>/health` must carry `supervisor.project_dir`, so another
+ * service on that port is not taken for a supervisor. A published runner
  * has no supervisor, so the dev-only settings panels that talk to one render
  * only when this reports `observed: true`, and take the supervisor's address
  * from here rather than from a port literal.
  *
- * Tri-state on the wire: `observed: null` means the runner's configured
- * supervisor address did not parse, so nothing was probed — UNKNOWN, which
+ * Tri-state on the wire: `true` a supervisor answered and identified itself;
+ * `false` nothing listens, or what listens is not a supervisor; `null` nothing
+ * was probed (the configured supervisor URL names no port, or its host does
+ * not resolve) — UNKNOWN, which
  * the panels treat like "not observed" (they render nothing supervisor
  * related) but which is kept distinct here so it is never reported as absent.
  *
@@ -42,7 +46,10 @@ export type SupervisorObservationState =
   | { kind: "error"; message: string }
   | { kind: "read"; observation: SupervisorObservation };
 
-/** How often the observation is re-read. Each read is a ≤500 ms probe server-side. */
+/**
+ * How often the observation is re-read. Each read costs the runner ≤ 2 s
+ * (TCP ≤ 0.5 s, then the identity check within the rest of that deadline).
+ */
 export const SUPERVISOR_OBSERVATION_POLL_MS = 15_000;
 
 /**
@@ -79,8 +86,9 @@ interface Envelope<T> {
 }
 
 /**
- * Client-side bound on one read. The runner's own budget is ≤ 0.5 s TCP plus
- * ≤ 1.5 s identity check; anything past this is a stuck hop, not an answer.
+ * Client-side bound on one read. The runner holds each observation to ONE
+ * 2 s deadline (TCP probe + `/health` send + body read); anything past this
+ * is a stuck hop, not an answer.
  */
 export const SUPERVISOR_OBSERVATION_FETCH_TIMEOUT_MS = 4_000;
 
