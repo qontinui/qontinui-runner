@@ -8,9 +8,9 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 55 | 56 | 55 | 0 | 0 | 0 |
+| `repo_layout` | 74 | 88 | 74 | 0 | 0 | 0 |
 | `dev_ports` | 26 | 26 | 26 | 0 | 0 | 0 |
-| `supervisor_dependency` | 30 | 30 | 0 | 21 | 3 | 6 |
+| `supervisor_dependency` | 32 | 32 | 0 | 22 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -18,7 +18,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 
-## `repo_layout` (55 rows)
+## `repo_layout` (74 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -27,54 +27,73 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
 | `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_skills/self_path.rs` | `static ROOTED_TOKEN_RE` | `r"^(?:<workspace-root>",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_worktree/census.rs` | `build_and_publish` | `debug!("worktree_census: no qontinui-root dir resolved — skipping");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/agent_skills/self_path.rs` | `static ROOTED_TOKEN_RE` | `r"^(?:<workspace-root>",` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/agent_worktree/census.rs` | `build_and_publish` | `debug!("worktree_census: no qontinui-root dir resolved — skipping");` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_worktree/disk_survey.rs` | `survey` | `"the workspace root could not be resolved (set QONTINUI_ROOT, or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_worktree/fs_backstop.rs` | `tick_once` | `debug!("fs_backstop: no qontinui-root dir resolved — skipping");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/agent_worktree/fs_backstop.rs` | `tick_once` | `debug!("fs_backstop: no qontinui-root dir resolved — skipping");` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/ai_router.rs` | `route_with_learning` | `has_ui_component: context.prompt.to_lowercase().contains("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `IsolatedAmbient::new` | `std::env::set_var("QONTINUI_ROOT", &root);` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_WORKSPACE_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const KEYS_REMOVED` | `"QONTINUI_WORKSPACE_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/capability_manifest.rs` | `Rung::describe` | `"found under '<workspace-root>/qontinui-runner/src-tauri/…' — this \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/capability_manifest.rs` | `Rung::describe` | `'qontinui-claude-config') — answers only where that repo exists"` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `Rung::describe` | `"found under '<workspace-root>/qontinui-runner/src-tauri/…' — this \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `Rung::describe` | `'qontinui-claude-config') — answers only where that repo exists"` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/terminal_analysis.rs` | `get_latest_plan_content` | `let dev_notes = parent.join("qontinui-dev-notes");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/coord_doctor.rs` | `render_onboarding_doc` | `consts, and 'coord-gates-and-access.md' in 'qontinui-claude-config'.\n\n",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `"qontinui-mobile".to_string(),` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `"qontinui-web".to_string(),` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `"ui-bridge".to_string(),` | 7 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `category: Some("ui-bridge".to_string()),` | 4 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-mobile/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-web/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/coord_doctor.rs` | `render_onboarding_doc` | `consts, and 'coord-gates-and-access.md' in 'qontinui-claude-config'.\n\n",` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/coord_mcp.rs` | `probe_stdio_shim` | `"no workspace root resolved, so <root>/qontinui-claude-config/scripts/\` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/coord_mcp.rs` | `resolve_stdio_shim_path` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `bootstrap_dev_apps` | `resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-supervisor",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-web",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/dev_services.rs` | `get_default_dev_services` | `let web_dir = workspace.join("qontinui-web");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/apply_repos.rs` | `apply_section_with` | `"Set $QONTINUI_ROOT, or the runner's 'paths.workspace_root' setting, to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/apply_repos.rs` | `incomparable_scope` | `'qontinui-runner env scope-root' / $QONTINUI_ROOT on one of the two \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/env_agent/collectors.rs` | `claude_md_plain_ok` | `(Some("@qontinui-claude-config/CLAUDE.md"), None)` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/env_agent/collectors.rs` | `claude_md_plain_ok` | `(Some("@qontinui-claude-config/CLAUDE.md"), None)` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const HARNESS_CONFIG_REPO_DIR` | `const HARNESS_CONFIG_REPO_DIR: &str = "qontinui-claude-config";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const HARNESS_PLANS_REPO_DIR` | `const HARNESS_PLANS_REPO_DIR: &str = "qontinui-dev-notes";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/env_agent/collectors.rs` | `const WEB_REPO_DIR` | `const WEB_REPO_DIR: &str = "qontinui-web";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `rest.contains("qontinui-claude-config\\scripts\\dev-start.ps1")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `\|\| rest.contains("qontinui-claude-config/scripts/dev-start.ps1")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/fleet.rs` | `SkillParityViolation::describe` | `qontinui-claude-config has no readable .claude/skills/{rel} — \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/fleet.rs` | `SkillParityViolation::describe` | `qontinui-claude-config/.claude/skills/{rel} — sessions read the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/fleet.rs` | `SkillParityViolation::describe` | `qontinui-claude-config has no readable .claude/skills/{rel} — \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/fleet.rs` | `SkillParityViolation::describe` | `qontinui-claude-config/.claude/skills/{rel} — sessions read the \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `const SKILL_SOURCE_REL` | `const SKILL_SOURCE_REL: &[&str] = &["qontinui-claude-config", ".claude", "skills"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `publish_tree_state` | `"fleet::tree_publisher: no qontinui-root directory found (set \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `publish_tree_state` | `QONTINUI_ROOT to override). Skipping."` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `spawn_skill_parity_pass_if_due` | `located — set QONTINUI_ROOT or the runner's paths.workspace_root"` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/fleet_commands.rs` | `with_provenance` | `"{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/fleet_commands.rs` | `const FLEET_COMMANDS` | `("ui-bridge", UI_BRIDGE),` | 1 | unreviewed | `fleet_commands` |
+| `src/fleet_commands.rs` | `with_provenance` | `"{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/main.rs` | `run_app` | `injected. Set $QONTINUI_ROOT (or 'paths.workspace_root') to \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/api_surface.rs` | `handle_scan` | `"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/plan_library.rs` | `const WRITE_CONTRACT` | `with (a runner scan uses '<repo>/<dir>', e.g. 'qontinui-dev-notes/prompts'). \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/session_recap.rs` | `analyze_handler` | `Json(api_error(format!("Cannot find qontinui-root: {}", e))),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/mcp/plan_library.rs` | `const WRITE_CONTRACT` | `with (a runner scan uses '<repo>/<dir>', e.g. 'qontinui-dev-notes/prompts'). \` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/mcp/session_recap.rs` | `analyze_handler` | `Json(api_error(format!("Cannot find qontinui-root: {}", e))),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/mcp/shared.rs` | `get_workspace_paths_internal` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/task_runs.rs` | `migrate_task_run_logs` | `Set $QONTINUI_ROOT (or the 'paths.workspace_root' setting) to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/online_learning/context.rs` | `normalize_domain` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/orchestrator/learning_recorder.rs` | `infer_domain_tags` | `tags.insert("ui-bridge".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/planning_bridge.rs` | `const HTN_SRC_REPOS` | `const HTN_SRC_REPOS: [&str; 2] = ["qontinui", "multistate"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `$QONTINUI_ROOT to the directory holding the repo checkouts if the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `is already installed for this interpreter. Set $QONTINUI_ROOT to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
+| `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `"this device has no qontinui-claude-config checkout, and this import has \` | 1 | unreviewed | `slash_commands` |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `.join("qontinui-claude-config")` | 1 | unreviewed | `slash_commands` |
+| `src/ui_bridge_plugin.rs` | `init` | `Builder::new("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/workflow_generation/generator.rs` | `generate_workflow` | `\|\| stage_json.contains("ui-bridge");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
 
@@ -82,7 +101,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
-| `src/database/embedding_client.rs` | `const DEFAULT_EMBEDDING_URL` | `const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/compute-text";` | 1 | unreviewed |
+| `src/database/embedding_client.rs` | `const DEFAULT_EMBEDDING_URL` | `const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/compute-text";` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"http://localhost:3001",` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `generate_mcp_tool_context` | `{"tool": "mcp__qontinui__sdk_connect", "url": "http://localhost:3001"}` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `generate_mcp_tool_context` | `{"tool": "mcp__qontinui__sdk_cross_app_compare", "source_url": "http://localhost:1420", "target_url": "http://localhost:3001", "include_c...` | 1 | unreviewed |
@@ -93,7 +112,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/reflection/workflow.rs` | `build_ui_bridge_agentic_prompt` | `- **Web relay health**: 'curl http://localhost:3001/api/ui-bridge/health' — is a browser tab connected? Are there SSE listeners?` | 1 | unreviewed |
 | `src/step_executor/handlers/ui_bridge.rs` | `UiBridgeHandler::execute` | `.unwrap_or("http://localhost:3001");` | 1 | unreviewed |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"State Recv-Q Send-Q Local Address:Port Peer Address:Port\\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\nLISTEN 0 128 *:443 *:*\\...` | 1 | unreviewed |
-| `src/unified_workflow_executor/phase_helpers.rs` | `compute_embedding_sync` | `.post("http://127.0.0.1:8001/api/embeddings/compute-text")` | 1 | unreviewed |
+| `src/unified_workflow_executor/phase_helpers.rs` | `compute_embedding_sync` | `.post("http://127.0.0.1:8001/api/embeddings/compute-text")` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. |
 | `src/workflow_generation/discovery_tools.rs` | `execute_test_api` | `test_urls.push(format!("http://localhost:8000{}", endpoint));` | 1 | unreviewed |
 | `src/workflow_generation/evaluation/mod.rs` | `detect_target_family` | `if json.contains("localhost:1420") \|\| json.contains("localhost:3001") {` | 1 | unreviewed |
 | `src/workflow_generation/generator.rs` | `generate_workflow` | `let targets_web = stage_json.contains("localhost:3001")` | 1 | unreviewed |
@@ -109,7 +128,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
-## `supervisor_dependency` (30 rows)
+## `supervisor_dependency` (32 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -125,11 +144,13 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/config_report_cmd.rs` | `config_report_inputs` | `supervisor_injected_env: Some(supervisor_injected_reading(&env, now)),` | 1 | fallback_correct — Fills the config report's supervisor_injected_env row from supervisor_injected_reading, which reads only this process's own env. |
 | `src/config_report_cmd.rs` | `supervisor_injected_reading` | `pub(crate) fn supervisor_injected_reading(` | 1 | fallback_correct — Reports which supervisor-injected env names are present in THIS process's env; never contacts the supervisor. '0 present' is the correct reading on an operator box. |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"http://localhost:9875",` | 1 | dev_only_surface — Registered only when <workspace-root>/qontinui-supervisor/frontend exists, i.e. only on a developer workspace. |
+| `src/env_agent/collectors.rs` | `const KNOWN_DEV_PORTS` | `("supervisor", 9875),` | 1 | dev_only_surface — Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `**Supervisor API (port 9875):**` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trig...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue...` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_RULES_SUPERVISOR_AVAILABLE` | `Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post` | 1 | fallback_correct — Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise. |
 | `src/mcp/ai_session.rs` | `run_prompt` | `super::auto_continue::check_supervisor_available(),` | 1 | fallback_correct — Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false. |
+| `src/mcp/app_discovery.rs` | `const DESKTOP_APP_PORTS` | `9875,` | 1 | fallback_correct — One port in a discovery scan list; an absent listener is simply not discovered. |
 | `src/mcp/auto_continue.rs` | `check_supervisor_available` | `let addr = crate::api_config::get_supervisor_socket_addr();` | 1 | fallback_correct — A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing. |
 | `src/mcp/auto_continue.rs` | `check_supervisor_available` | `pub fn check_supervisor_available() -> bool {` | 1 | fallback_correct — A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing. |
 | `src/mcp/misc.rs` | `spawn_instance` | `None => format!("{}/runners", crate::api_config::get_supervisor_url()),` | 1 | fallback_correct — Best-effort POST /runners registration after the instance is already launched; failure is logged at debug and the primary runner stays coordinator. |
