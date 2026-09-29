@@ -14180,6 +14180,167 @@ Body.
         );
     }
 
+    // --- Plan 2026-09-28 Phase 3: a hand-set Free status survives a runner start
+
+    /// One cold-start cycle (empty `last_applied`, as after a runner start)
+    /// against a coord row that holds `current` and was last moved by `owner`,
+    /// with the plan file stamped `vetted`. Asserts the adapter DEFERS: no
+    /// status on any upsert, no transition attempted, coord's status intact,
+    /// and nothing remembered as applied.
+    async fn assert_cold_start_defers_to_owner(current: &str, owner: &str) {
+        let sink = FakeSink {
+            last_actor: Some(owner.to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), current.to_string());
+        let mut r = Reconciler::new();
+        assert!(r.mem.is_empty(), "cold start: no last-applied memory");
+
+        let summary = r.cycle(&sink, &[unit("s", "vetted")]).await;
+
+        assert_eq!(summary.transitions, 0);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            0,
+            "zero upserts carry a status (the pre-`8e3a3cf75` UpsertWithStatus overwrite)"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            0,
+            "zero transitions were even attempted"
+        );
+        assert_eq!(summary.seeded, 1, "the cold start seeds `{current}` from coord");
+        assert_eq!(
+            summary.deferred, 1,
+            "`{owner}` owns the unit, so the push is Deferred"
+        );
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the status-less provenance refresh still ran"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("s").map(String::as_str),
+            Some(current),
+            "coord's hand-set status stands"
+        );
+        assert!(
+            !r.mem.contains_key("s"),
+            "a deferral applied nothing, so nothing is remembered as applied"
+        );
+    }
+
+    /// **A hand-set `blocked` survives a runner start.** This is the
+    /// 2026-09-06 arm of plan
+    /// `2026-09-28-a-hand-set-blocked-status-does-not-survive-a-derive-retraction-or-an-old-build-scan`:
+    /// an agent moved the unit to `blocked`, the plan file still reads
+    /// `vetted`, and a runner starts with empty `last_applied`. A build
+    /// predating `8e3a3cf75` answered `decide_push(None)` =
+    /// `UpsertWithStatus`, which bypasses the owner deferral and overwrote
+    /// `blocked` with `vetted`. With the seed block the unit seeds to
+    /// `blocked`, the push is a `Transition`, and the agent's ownership defers
+    /// it.
+    ///
+    /// Neuter check (run 2026-09-29): replace the seed condition
+    /// `prev.is_none() && status_write == StatusWrite::Allowed` with `false`
+    /// and this test (and its derive-owned twin) fails on the first assertion:
+    /// one upsert carries a status, the `UpsertWithStatus` overwrite of
+    /// `blocked` with `vetted`.
+    #[tokio::test]
+    async fn a_hand_set_blocked_survives_a_runner_start() {
+        assert_cold_start_defers_to_owner("blocked", "device:x:agent:y").await;
+    }
+
+    /// The derive-owned twin: coord's derive worker last moved the unit (the
+    /// shipped retraction's `in_progress`). `is_real_agent_actor` counts
+    /// `coord::derive_worker` as an owner, so a cold start defers to it too.
+    #[tokio::test]
+    async fn a_derive_owned_in_progress_survives_a_runner_start() {
+        assert_cold_start_defers_to_owner("in_progress", "coord::derive_worker").await;
+    }
+
+    /// The body coord's Phase-2 scanner-defers-to-owner guard answers with.
+    const SCANNER_DEFERS_TO_OWNER: &str =
+        r#"{"error":"scanner_defers_to_owner","terminality":"permanent"}"#;
+
+    /// **coord's (Phase 2) `scanner_defers_to_owner` denial is consumed with no
+    /// runner change**: a `422` carrying `terminality: "permanent"` for
+    /// `(s, vetted)` retires the pair, and the next cycle takes
+    /// [`StatusWrite::RetiredPermanently`]: no status write, no transition, but
+    /// the metadata-only upsert still goes out.
+    ///
+    /// The runner's own view says the adapter owns the unit (so it does not
+    /// defer); coord, which sees the caller's later `blocked`, refuses.
+    #[tokio::test]
+    async fn a_scanner_defers_to_owner_denial_retires_the_pair_and_keeps_metadata_flowing() {
+        let sink = FakeSink {
+            last_actor: Some(ADAPTER_ACTOR.to_string()),
+            deny_status: Some((
+                "vetted".to_string(),
+                422,
+                SCANNER_DEFERS_TO_OWNER.to_string(),
+            )),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), "blocked".to_string());
+        let mut r = Reconciler::new();
+
+        let first = r.cycle(&sink, &[unit("s", "vetted")]).await;
+        assert_eq!(first.retired_permanent, 1, "the denial retires the pair");
+        assert_eq!(first.errors, 0, "a permanent denial is not a retryable error");
+        assert_eq!(first.forbidden, 0, "...nor a principal-wide verdict");
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            1,
+            "the blocked -> vetted transition reached coord once"
+        );
+        assert_eq!(
+            r.forb.retirement_for("s", "vetted"),
+            Some(RetirementReason::PermanentForStatus)
+        );
+        assert_eq!(
+            r.forb.retirement_for("s", "in_progress"),
+            None,
+            "pair, not slug"
+        );
+
+        let upserts_before = *sink.upsert_calls.lock().unwrap();
+        let second = r.cycle(&sink, &[unit("s", "vetted")]).await;
+        assert_eq!(
+            second.retired_permanent, 1,
+            "cycle 2 takes StatusWrite::RetiredPermanently"
+        );
+        assert_eq!(second.errors, 0);
+        assert_eq!(second.transitions, 0);
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            1,
+            "the refused transition is NOT re-issued"
+        );
+        assert_eq!(*sink.status_upsert_calls.lock().unwrap(), 0);
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            upserts_before + 1,
+            "the metadata-only upsert is still sent"
+        );
+        let last = sink.upserts.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.slug, "s");
+        assert_eq!(last.status, None, "metadata-only: no status on the wire");
+        assert!(last.metadata.is_some(), "provenance keeps reaching coord");
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("s").map(String::as_str),
+            Some("blocked"),
+            "the owner's status stands"
+        );
+    }
+
     /// **A scan must say whether it was COMPLETE — an empty or short vector
     /// cannot.** The partial case is the one a cheap `units.is_empty()` guard
     /// would miss entirely.
