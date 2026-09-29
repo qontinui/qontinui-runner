@@ -90,10 +90,12 @@ name: schema.pg.sql.generated nightly freshness
 # ---------------------------------------------------------------------------
 # Detect -> push the regenerated dump to a long-lived branch -> open/update a
 # PR that is born a DRAFT -> mark it ready for review once its head carries
-# check runs (scripts/ci/ready-bot-draft-pr.sh). The branch is force-pushed
-# ONLY while its PR is a draft (or absent): once the PR is ready it may be a
-# live merge-train candidate, so later drift is delivered as a deduped PR
-# comment instead, and the run after it lands regenerates. The exit code reports
+# Actions check runs (scripts/ci/ready-bot-draft-pr.sh). The branch is
+# force-pushed ONLY while its PR is a draft (or absent): once the PR is ready it
+# may be a live merge-train candidate, so later drift is delivered as a deduped
+# PR comment instead, and the run after it lands regenerates. The one exception
+# is a ready PR that CONFLICTS with main — it can never land, so it is
+# converted back to a draft and rebuilt. The exit code reports
 # DELIVERY, not merely drift:
 #
 #   * no drift                        -> green, `healed=false`
@@ -188,10 +190,14 @@ jobs:
 
     # A job-level block REPLACES the workflow-level one wholesale rather than
     # merging, so `contents` is restated here. `pull-requests: write` carries
-    # every `gh pr` verb except `create` (see pr_op_failed).
+    # every `gh pr` verb except `create` (see pr_op_failed), plus the
+    # ready/convert-to-draft mutations and the page comment. `checks: read` is
+    # what scripts/ci/ready-bot-draft-pr.sh reads the head's check runs with;
+    # without it that read is refused and the PR is never readied.
     permissions:
       contents: write
       pull-requests: write
+      checks: read
 
     services:
       postgres:
@@ -411,7 +417,7 @@ jobs:
               echo ""
               echo "\`healed=true\` — the checked-in dump (${committed_n} lines) differs from a fresh"
               echo "\`alembic upgrade head\` + \`pg_dump\` of qontinui-web@main (${fresh_n} lines)."
-              echo "The regenerated dump is delivered as the refresh PR below."
+              echo "Delivery follows in the PR step (see its summary block below); a red there means it was NOT delivered."
               echo ""
               echo "Tables added: $(wc -l < "$RUNNER_TEMP/tables.added" | tr -d ' '), removed: $(wc -l < "$RUNNER_TEMP/tables.removed" | tr -d ' ') (other changes are column/index/constraint level)."
               echo ""
@@ -503,9 +509,46 @@ jobs:
           # string, so a quoting change in gh's output cannot make every draft
           # read as ready (or the reverse). No `|| true`: an unreadable state
           # is a red, never a guess in either direction.
+          #
+          # EXCEPT a ready PR that CONFLICTS with main: it is not a train
+          # candidate (coord cannot land it), and commenting on it would park
+          # it forever. It is converted back to a draft (asserted from the
+          # mutation's own returned isDraft) and then takes the ordinary draft
+          # path below: rebuilt from the triggering sha, force-pushed, and
+          # re-readied once the new head's checks register. `UNKNOWN`
+          # mergeability is NOT a conflict — GitHub computes it lazily — so an
+          # unknown keeps the comment path: never force-push on an unknown.
           if [ -n "$existing_num" ]; then
             if ! existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"; then
               pr_op_failed "view #$existing_num (isDraft)"; exit 1
+            fi
+            case "$existing_draft" in
+              true|false) : ;;
+              *) echo "::error::Could not read PR #$existing_num's draft state (got '$existing_draft'). Refusing to guess whether it may be force-pushed."; exit 1 ;;
+            esac
+            if [ "$existing_draft" = "false" ]; then
+              if ! merge_state="$(gh pr view "$existing_num" --repo "$REPO" --json mergeable,mergeStateStatus --jq '.mergeable + " " + .mergeStateStatus')"; then
+                pr_op_failed "view #$existing_num (mergeable)"; exit 1
+              fi
+              read -r mergeable merge_status <<< "$merge_state"
+              case "$mergeable" in
+                MERGEABLE|CONFLICTING|UNKNOWN) : ;;
+                *) echo "::error::Could not read PR #$existing_num's mergeability (got '$merge_state')."; exit 1 ;;
+              esac
+              if [ "$mergeable" = "CONFLICTING" ] || [ "${merge_status:-}" = "DIRTY" ]; then
+                echo "::warning::Refresh PR #$existing_num is ready but CONFLICTS with main ($mergeable/${merge_status:-}); it can never land. Converting it back to a draft and rebuilding '$BRANCH' from main."
+                if ! pr_node_id="$(gh pr view "$existing_num" --repo "$REPO" --json id --jq '.id')"; then
+                  pr_op_failed "view #$existing_num (id)"; exit 1
+                fi
+                if ! converted="$(gh api graphql -f query='mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{isDraft}}}' -f id="$pr_node_id" --jq '.data.convertPullRequestToDraft.pullRequest.isDraft')"; then
+                  pr_op_failed "convert #$existing_num to draft"; exit 1
+                fi
+                if [ "$converted" != "true" ]; then
+                  echo "::error::convertPullRequestToDraft on PR #$existing_num returned isDraft=[$converted], not true. Refusing to force-push under a PR that may still be ready."
+                  exit 1
+                fi
+                existing_draft=true
+              fi
             fi
             if [ "$existing_draft" != "true" ]; then
               echo "::warning::Refresh PR #$existing_num is marked ready for review (possible merge-train candidate). Not force-pushing '$BRANCH' under it."
@@ -564,7 +607,10 @@ jobs:
           # above has established that no READY PR sits on it.
           git push --force origin "HEAD:refs/heads/$BRANCH"
           branch_pushed=1
-          echo "Pushed the regenerated dump to '$BRANCH'."
+          # The commit just pushed: the draft->ready call below must decide on
+          # THIS head, not on whatever head GitHub reports a second later.
+          pushed_sha="$(git rev-parse HEAD)"
+          echo "Pushed the regenerated dump to '$BRANCH' ($pushed_sha)."
 
           body="$RUNNER_TEMP/pr-body.md"
           {
@@ -653,13 +699,14 @@ jobs:
           # `tee` keeps the script's ::error:: lines in the log; under
           # pipefail the `if !` sees the script's own exit status.
           ready_log="$RUNNER_TEMP/ready-bot-draft-pr.pr-step.log"
-          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 300 | tee "$ready_log"; then
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 180 --expect-head "$pushed_sha" | tee "$ready_log"; then
             pr_op_failed "ready-for-review (scripts/ci/ready-bot-draft-pr.sh)"; exit 1
           fi
           pr_state="$(tail -n1 "$ready_log")"
           case "$pr_state" in
             "readied #"*|"already-ready #"*) pr_state_word="ready for review ($pr_state)" ;;
-            "draft-no-checks #"*) pr_state_word="still a DRAFT: its head carries no check runs yet ($pr_state); the sweep step re-decides every night" ;;
+            "head-mismatch #"*) pr_state_word="still a DRAFT: GitHub had not yet reported the pushed head $pushed_sha ($pr_state); the sweep step re-decides" ;;
+            "draft-no-checks #"*) pr_state_word="still a DRAFT: its head carries no Actions check runs yet ($pr_state); the sweep step re-decides every night" ;;
             *)
               echo "::warning::The PR was written moments ago but the draft->ready lookup reported '$pr_state'; the sweep step re-decides it."
               pr_state_word="UNKNOWN ($pr_state)"
@@ -678,14 +725,20 @@ jobs:
       # decides at one instant; a PR created on the GITHUB_TOKEN arm, or before
       # its checks registered, would otherwise stay a draft until the next
       # drift. Keyed on `self_heal` (the same selector as the PR step, minus the
-      # drift term), under the default success() semantics: a skipped PR step
-      # does not fail the job, while an earlier FAILED step stops this one.
+      # drift term) under `!cancelled()`, NOT the default success(): a night
+      # whose poetry install, alembic chain or regeneration FAILED is exactly a
+      # night that delivers nothing new, and the parked PR still needs its
+      # re-decide and its page. The sweep's own failure still reds the run.
+      # `self_heal` is written as fresh_check's FIRST line, so it is set on
+      # every run that reached that step; if an EARLIER step failed, the output
+      # is '' and the condition reads false — the sweep is skipped on a run
+      # that never got far enough to know it may self-heal. Accepted.
       # It is the LAST step that touches the PR, after every draft read.
       # --max-age-hours 48 (two nightlies) pages once, on the PR, when a draft
       # with zero check runs has sat past the budget.
       - name: Sweep the refresh PR (ready it once it carries checks; page if parked)
         id: sweep
-        if: steps.fresh_check.outputs.self_heal == 'true'
+        if: ${{ !cancelled() && steps.fresh_check.outputs.self_heal == 'true' }}
         working-directory: qontinui-runner
         shell: bash
         env:

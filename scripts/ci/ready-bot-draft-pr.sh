@@ -17,9 +17,24 @@
 # is marked ready; a draft whose head carries none stays a draft — exactly the
 # case the draft was written for — and, with --max-age-hours, is paged once.
 #
-# The predicate is a count of check runs on the head commit (the observable),
-# never an inference from which token authored the PR, so it stays right if a
-# secret is rotated. Red or pending checks do NOT block the un-draft: coord
+# The predicate is a count of GitHub ACTIONS check runs on the head commit
+# (app slug `github-actions`) — the observable for "this PR's CI workflows
+# fired" — never an inference from which token authored the PR, so it stays
+# right if a secret is rotated. It is deliberately NOT the head's total check
+# count: coord posts its own `Qontinui merge gate` run (app
+# `qontinui-merge-orchestrator`) on every PR it evaluates, INCLUDING a
+# GITHUB_TOKEN-authored PR that fired no workflows, so total_count >= 1 would
+# ready exactly the zero-CI PR the draft exists to hold back. The count is
+# summed over every page (`--paginate` emits one number per page).
+#
+# With --expect-head, the head GitHub reports must equal the commit the caller
+# just pushed before anything is decided: right after a force-push the lookup
+# can still return the OLD head, whose checks say nothing about the new one.
+#
+# Only same-repository PRs are considered (`isCrossRepository` false): a fork
+# PR whose branch happens to share the name is never readied or paged.
+#
+# Red or pending checks do NOT block the un-draft: coord
 # gates on the head's merge state, so a ready PR with a red check simply does
 # not land — the correct outcome, and not this script's concern.
 #
@@ -28,6 +43,7 @@
 # USAGE
 #   ready-bot-draft-pr.sh --repo <owner/name> --branch <head branch>
 #                         [--max-age-hours N] [--wait-for-checks-seconds S]
+#                         [--expect-head <40-hex sha>]
 #
 #   --max-age-hours N         page (one PR comment, idempotent on a hidden
 #                             marker, plus a ::warning::) when the PR is still
@@ -42,13 +58,21 @@
 #                             workflows, but their check runs register seconds
 #                             later, and a push-then-count with no wait would
 #                             read 0 on every night the branch moves. Default 0.
+#                             The same budget also bounds --expect-head's wait.
+#   --expect-head SHA         the commit the caller just pushed. Re-poll the PR
+#                             lookup (within the wait budget) until GitHub
+#                             reports it as the head; if it never does, decide
+#                             NOTHING and report head-mismatch.
 #
 # OUTCOMES (the LAST stdout line is exactly one of these; all exit 0):
 #   no-pr                   no open PR for --branch against main
 #   already-ready #<n>      the PR is not a draft (never touched, never paged)
-#   readied #<n>            it was a draft with >= 1 check run; now ready,
-#                           verified by the mutation's OWN returned isDraft
-#   draft-no-checks #<n>    a draft whose head carries 0 check runs; left alone
+#   readied #<n>            it was a draft with >= 1 Actions check run; now
+#                           ready, verified by the mutation's OWN returned isDraft
+#   draft-no-checks #<n>    a draft whose head carries 0 Actions check runs;
+#                           left alone (and paged past --max-age-hours)
+#   head-mismatch #<n>      --expect-head never became the reported head within
+#                           the budget; left a draft, with a ::warning::
 #
 # When $GITHUB_OUTPUT is set, also writes result=<word>, pr=<n>, url=<url>,
 # checks=<count> and paged=<true|false|already|n/a> to it.
@@ -79,12 +103,14 @@ repo=""
 branch=""
 max_age_hours=""
 wait_seconds="0"
+expect_head=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)                    repo="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --branch)                  branch="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --max-age-hours)           max_age_hours="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --wait-for-checks-seconds) wait_seconds="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --expect-head)             expect_head="${2:-}"; shift 2 || { usage; exit 2; } ;;
     -h|--help)                 usage; exit 0 ;;
     *)
       echo "::error::ready-bot-draft-pr.sh: unknown argument '$1'."
@@ -109,6 +135,10 @@ esac
 case "$wait_seconds" in
   ""|*[!0-9]*) echo "::error::ready-bot-draft-pr.sh: --wait-for-checks-seconds must be a whole number, got '$wait_seconds'."; exit 2 ;;
 esac
+if [ -n "$expect_head" ] && ! [[ "$expect_head" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::ready-bot-draft-pr.sh: --expect-head must be a 40-hex commit sha, got '$expect_head'."
+  exit 2
+fi
 poll_interval="${READY_BOT_POLL_INTERVAL_SECONDS:-15}"
 case "$poll_interval" in
   ""|0|*[!0-9]*) echo "::error::ready-bot-draft-pr.sh: READY_BOT_POLL_INTERVAL_SECONDS must be a positive whole number, got '$poll_interval'."; exit 2 ;;
@@ -138,31 +168,42 @@ emit() {
 # --- 1. The open PR for this branch -------------------------------------------
 # `id` is the GraphQL node id the ready mutation takes. Pre-flattened to one TSV
 # line by gh's own --jq, so no separate jq is needed. `// empty` covers the
-# genuinely-absent case; a gh FAILURE is not "no PR".
-if ! line="$(gh pr list --repo "$repo" --head "$branch" --base main --state open \
-    --json number,isDraft,headRefOid,id,createdAt,url,author \
-    --jq '.[0] // empty | [.number, .isDraft, .headRefOid, .id, .createdAt, .url, (.author.login // "unknown")] | @tsv')"; then
-  gh_failed "gh pr list --head $branch --state open"
-fi
+# genuinely-absent case; a gh FAILURE is not "no PR". Fork PRs
+# (isCrossRepository) are filtered out before `.[0]`.
+#
+# lookup_pr sets pr_num is_draft head_sha node_id created_at pr_url author, or
+# exits no-pr. Called from the MAIN shell so its exits end the script.
+lookup_pr() {
+  if ! line="$(gh pr list --repo "$repo" --head "$branch" --base main --state open \
+      --json number,isDraft,headRefOid,id,createdAt,url,author,isCrossRepository \
+      --jq '[.[] | select(.isCrossRepository == false)] | .[0] // empty | [.number, .isDraft, .headRefOid, .id, .createdAt, .url, (.author.login // "unknown")] | @tsv')"; then
+    gh_failed "gh pr list --head $branch --state open"
+  fi
 
-if [ -z "$line" ]; then
-  echo "No open PR for '$branch' against main on $repo."
-  emit no-pr "" "" "" "n/a"
-  echo "no-pr"
-  exit 0
-fi
+  if [ -z "$line" ]; then
+    echo "No open same-repository PR for '$branch' against main on $repo."
+    emit no-pr "" "" "" "n/a"
+    echo "no-pr"
+    exit 0
+  fi
 
-IFS=$'\t' read -r pr_num is_draft head_sha node_id created_at pr_url author <<< "$line"
+  IFS=$'\t' read -r pr_num is_draft head_sha node_id created_at pr_url author <<< "$line"
 
-# Shape-check before acting on anything: a garbled read must not become a
-# mutation against the wrong node or a page with a nonsense age.
-case "$pr_num" in ""|*[!0-9]*) pr_num="" ;; esac
-case "$is_draft" in true|false) : ;; *) is_draft="" ;; esac
-[[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || head_sha=""
-if [ -z "$pr_num" ] || [ -z "$is_draft" ] || [ -z "$head_sha" ] || [ -z "${node_id:-}" ] || [ -z "${created_at:-}" ]; then
-  echo "::error::ready-bot-draft-pr.sh: could not parse gh's PR lookup for '$branch': [$line]"
-  exit 1
-fi
+  # Shape-check before acting on anything: a garbled read must not become a
+  # mutation against the wrong node or a page with a nonsense age.
+  case "$pr_num" in ""|*[!0-9]*) pr_num="" ;; esac
+  case "$is_draft" in true|false) : ;; *) is_draft="" ;; esac
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || head_sha=""
+  if [ -z "$pr_num" ] || [ -z "$is_draft" ] || [ -z "$head_sha" ] || [ -z "${node_id:-}" ] || [ -z "${created_at:-}" ]; then
+    echo "::error::ready-bot-draft-pr.sh: could not parse gh's PR lookup for '$branch': [$line]"
+    exit 1
+  fi
+}
+
+# One poll budget shared by the head wait and the checks wait.
+extra_polls=$(( wait_seconds / poll_interval ))
+
+lookup_pr
 
 if [ "$is_draft" != "true" ]; then
   echo "PR #$pr_num ($pr_url) is already ready for review; nothing to do."
@@ -171,31 +212,65 @@ if [ "$is_draft" != "true" ]; then
   exit 0
 fi
 
-# --- 2. Measure: how many check runs does the draft's head carry? -------------
+# --- 2. Pin the head: is GitHub reporting the commit the caller pushed? -------
+# Only a draft needs this — a ready PR was already reported above.
+if [ -n "$expect_head" ]; then
+  while [ "$head_sha" != "$expect_head" ] && [ "$extra_polls" -gt 0 ]; do
+    echo "PR #$pr_num still reports head $head_sha, not the pushed $expect_head; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
+    sleep "$poll_interval"
+    extra_polls=$(( extra_polls - 1 ))
+    lookup_pr
+  done
+  if [ "$is_draft" != "true" ]; then
+    echo "PR #$pr_num ($pr_url) became ready for review while waiting for its head; nothing to do."
+    emit already-ready "$pr_num" "$pr_url" "" "n/a"
+    echo "already-ready #$pr_num"
+    exit 0
+  fi
+  if [ "$head_sha" != "$expect_head" ]; then
+    echo "::warning::PR #$pr_num still reports head $head_sha, not the pushed commit $expect_head, after the wait budget. Deciding nothing on a head that is not the one pushed; it stays a draft and the sweep re-decides."
+    emit head-mismatch "$pr_num" "$pr_url" "" "n/a"
+    echo "head-mismatch #$pr_num"
+    exit 0
+  fi
+fi
+
+# --- 3. Measure: how many ACTIONS check runs does the draft's head carry? -----
+# Only app `github-actions` counts: coord's own merge-gate run (and any other
+# app's) is posted whether or not a workflow fired. --paginate prints one count
+# per page; they are summed, and each must be a number.
 count_checks() {
-  if ! checks="$(gh api "repos/$repo/commits/$head_sha/check-runs" --jq '.total_count')"; then
+  if ! per_page="$(gh api --paginate "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.app.slug == "github-actions")] | length')"; then
     gh_failed "gh api repos/$repo/commits/$head_sha/check-runs"
   fi
-  case "$checks" in
-    ""|*[!0-9]*)
-      echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned a non-count total_count: [$checks]"
-      exit 1
-      ;;
-  esac
+  if [ -z "$per_page" ]; then
+    echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned no page at all."
+    exit 1
+  fi
+  checks=0
+  while IFS= read -r n; do
+    case "$n" in
+      ""|*[!0-9]*)
+        echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned a non-count page: [$n]"
+        exit 1
+        ;;
+    esac
+    checks=$(( checks + n ))
+  done <<< "$per_page"
 }
 
-extra_polls=$(( wait_seconds / poll_interval ))
 count_checks
 while [ "$checks" -eq 0 ] && [ "$extra_polls" -gt 0 ]; do
-  echo "Draft PR #$pr_num head $head_sha carries no check runs yet; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
+  echo "Draft PR #$pr_num head $head_sha carries no Actions check runs yet; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
   sleep "$poll_interval"
   extra_polls=$(( extra_polls - 1 ))
   count_checks
 done
 
-echo "PR #$pr_num ($pr_url): draft, head $head_sha, $checks check run(s), author $author, created $created_at."
+echo "PR #$pr_num ($pr_url): draft, head $head_sha, $checks Actions check run(s), author $author, created $created_at."
 
-# --- 3. Decide by measurement -------------------------------------------------
+# --- 4. Decide by measurement -------------------------------------------------
 ready_mutation='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}'
 if [ "$checks" -ge 1 ]; then
   if ! is_draft_after="$(gh api graphql -f query="$ready_mutation" -f id="$node_id" --jq '.data.markPullRequestReadyForReview.pullRequest.isDraft')"; then
@@ -206,13 +281,13 @@ if [ "$checks" -ge 1 ]; then
     echo "::error::ready-bot-draft-pr.sh: markPullRequestReadyForReview on PR #$pr_num returned isDraft=[$is_draft_after], not false. The PR is still a draft; refusing to report it readied."
     exit 1
   fi
-  echo "Marked PR #$pr_num ready for review: its head carries $checks check run(s), so it is gated like any other PR."
+  echo "Marked PR #$pr_num ready for review: its head carries $checks Actions check run(s), so it is gated like any other PR."
   emit readied "$pr_num" "$pr_url" "$checks" "n/a"
   echo "readied #$pr_num"
   exit 0
 fi
 
-# --- 4. Still a draft with zero checks: bound the parked state ----------------
+# --- 5. Still a draft with zero Actions checks: bound the parked state ----------------
 paged="n/a"
 if [ -n "$max_age_hours" ]; then
   now_epoch="${READY_BOT_NOW_EPOCH:-$(date +%s)}"
@@ -225,7 +300,7 @@ if [ -n "$max_age_hours" ]; then
   budget_seconds=$(( max_age_hours * 3600 ))
   paged=false
   if [ "$age_seconds" -gt "$budget_seconds" ]; then
-    echo "::warning::Bot-filed PR #$pr_num ($pr_url) has been a draft for ${age_hours}h (budget ${max_age_hours}h) with 0 check runs on its head. Nothing un-drafts a zero-check PR; it is parked until someone acts."
+    echo "::warning::Bot-filed PR #$pr_num ($pr_url) has been a draft for ${age_hours}h (budget ${max_age_hours}h) with 0 Actions check runs on its head. Nothing un-drafts a PR whose CI never fired; it is parked until someone acts."
 
     # Materialize the comments before grepping, never `gh ... | grep -q`: grep
     # exits on the first hit, SIGPIPEs gh, and under pipefail that turns a
@@ -247,9 +322,9 @@ if [ -n "$max_age_hours" ]; then
       fi
       {
         echo "$PAGE_MARKER"
-        printf '**This bot-filed PR has been a draft for %s hours with %s check runs on its head** (`%s`; budget %s hours). It was opened by `%s`.\n\n' \
+        printf '**This bot-filed PR has been a draft for %s hours with %s Actions check runs on its head** (`%s`; budget %s hours). It was opened by `%s`.\n\n' \
           "$age_hours" "$checks" "$head_sha" "$max_age_hours" "$author"
-        printf 'It was born a draft on purpose, and `scripts/ci/ready-bot-draft-pr.sh` marks it ready for review automatically once its head carries at least one check run. **Nothing un-drafts a zero-check PR**, and coord'"'"'s merge train does not propose drafts, so this fix is parked until someone acts.\n\n'
+        printf 'It was born a draft on purpose, and `scripts/ci/ready-bot-draft-pr.sh` marks it ready for review automatically once its head carries at least one GitHub Actions check run (runs from other apps, such as coord'"'"'s merge gate, do not count). **Nothing un-drafts a PR whose CI never fired**, and coord'"'"'s merge train does not propose drafts, so this fix is parked until someone acts.\n\n'
         printf 'A PR with no checks was usually authored with `GITHUB_TOKEN`, which by design fires no `pull_request` workflows. To unpark it, make its checks run (push to the branch with a token that fires workflows, or close and reopen the PR by hand); the next scheduled run then marks it ready. This comment is posted once per PR.\n'
         if [ -n "$run_line" ]; then
           printf '\n%s\n' "$run_line"
@@ -258,7 +333,7 @@ if [ -n "$max_age_hours" ]; then
       if ! gh api -X POST "repos/$repo/issues/$pr_num/comments" -F "body=@$page_body" --jq '.html_url'; then
         gh_failed "gh api -X POST repos/$repo/issues/$pr_num/comments (page)"
       fi
-      echo "Paged on PR #$pr_num: stale draft, ${age_hours}h old, 0 check runs."
+      echo "Paged on PR #$pr_num: stale draft, ${age_hours}h old, 0 Actions check runs."
       paged=true
     fi
   else
