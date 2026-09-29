@@ -80,6 +80,45 @@ fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
 }
 
+/// The `Skipped` history row for a condition wait that timed out.
+///
+/// It is stamped with the SLOT the wait was for — the task's `next_run`, which
+/// a waiting task does not advance — so the missed-run reconciler
+/// (`find_missed_slots` matches on `scheduled_for`) sees that slot as handled.
+/// Unstamped, a slot the conditions held to timeout read as "missed" and a
+/// `RunOnce` catch-up ran it on the next runner start, conditions unchecked.
+/// A `Condition` schedule has no slots, so it stamps nothing.
+fn condition_timeout_record(task: &ScheduledTask) -> TaskExecutionRecord {
+    let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+    record.status = ScheduledTaskStatus::Skipped;
+    record.ended_at = Some(chrono::Utc::now().to_rfc3339());
+    record.error_message = Some("Condition timeout exceeded".to_string());
+    if !matches!(task.schedule, ScheduleExpression::Condition(_)) {
+        record.scheduled_for = task
+            .next_run
+            .as_deref()
+            .and_then(|next| chrono::DateTime::parse_from_rfc3339(next).ok())
+            .map(|slot| slot.with_timezone(&Utc).to_rfc3339());
+    }
+    record
+}
+
+/// A catch-up for a task with conditions runs only if those conditions admit
+/// it NOW: when they do not (`fire == false`), every `Enqueue` becomes a
+/// `Skip`, i.e. a `MissedRunnerDown` row, instead of an unconditional run.
+fn gate_catch_up_actions(actions: Vec<CatchUpAction>, fire: bool) -> Vec<CatchUpAction> {
+    if fire {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .map(|action| match action {
+            CatchUpAction::Enqueue { scheduled_for } => CatchUpAction::Skip { scheduled_for },
+            skip @ CatchUpAction::Skip { .. } => skip,
+        })
+        .collect()
+}
+
 /// What a due task's conditions say this tick — see
 /// [`SchedulerService::gate_conditions`].
 #[derive(Debug)]
@@ -106,6 +145,11 @@ pub struct SchedulerService {
     check_interval_secs: u64,
     /// Rate-limited `require_probe` state, per task (in memory).
     probe_gate: crate::scheduler_probe::ProbeGate,
+    /// Serializes [`Self::tick`] and [`Self::reconcile_missed_runs`]. Both are
+    /// public entry points (the loop, the wake handler, `/scheduler/reconcile-now`)
+    /// and two concurrent passes would each evaluate — and could each fire —
+    /// the same due task.
+    pass_lock: tokio::sync::Mutex<()>,
 }
 
 impl SchedulerService {
@@ -118,6 +162,7 @@ impl SchedulerService {
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -130,6 +175,7 @@ impl SchedulerService {
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60,
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -270,6 +316,7 @@ impl SchedulerService {
     /// Phase B missed-run reconciler) can fire an immediate cycle without
     /// waiting for the next `check_interval_secs` heartbeat.
     pub async fn tick(self: Arc<Self>) {
+        let _pass = self.pass_lock.lock().await;
         let pg = match self.pg() {
             Ok(pg) => pg,
             Err(e) => {
@@ -309,7 +356,7 @@ impl SchedulerService {
                 .filter(|t| t.enabled)
                 .map(|t| t.id.as_str())
                 .collect();
-            self.probe_gate.retain(&live).await;
+            self.probe_gate.retain(&live);
         }
 
         // Find tasks that are:
@@ -412,10 +459,7 @@ impl SchedulerService {
 
             // Check conditions if task has any
             if task.has_conditions() {
-                match self
-                    .gate_conditions(&task, std::time::Instant::now())
-                    .await
-                {
+                match self.gate_conditions(&task, std::time::Instant::now()).await {
                     ConditionGate::TimedOut => {
                         info!(
                             "Scheduler: Task '{}' timed out waiting for conditions",
@@ -1696,23 +1740,28 @@ fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 
 impl SchedulerService {
     /// Decide what a due task's conditions say at `now`, with the side effects
-    /// on the probe state that decision implies: a MET probe result is spent on
-    /// the run it admits (so a `Cron` slot runs once, and a `Condition` task
+    /// on the probe state that decision implies: a MET probe result is spent by
+    /// the evaluation that returns it, i.e. on the run this Fire admits (so a `Cron` slot runs once, and a `Condition` task
     /// needs a fresh exit 0 after every rearm), and a timed-out wait drops the
     /// task's probe state (killing a probe still running for it).
-    async fn gate_conditions(&self, task: &ScheduledTask, now: std::time::Instant) -> ConditionGate {
+    async fn gate_conditions(
+        &self,
+        task: &ScheduledTask,
+        now: std::time::Instant,
+    ) -> ConditionGate {
         if !task.has_conditions() {
             return ConditionGate::Fire;
         }
         let (met, status) = self.check_conditions_at(task, now).await;
         if status.timed_out {
-            self.probe_gate.forget(&task.id).await;
+            self.probe_gate.forget(&task.id);
             return ConditionGate::TimedOut;
         }
         if !met {
             return ConditionGate::Wait(status);
         }
-        self.probe_gate.consume(&task.id).await;
+        // A met probe was already spent inside `ProbeGate::evaluate`, under
+        // the task's own lock — this Fire is the one run it admits.
         ConditionGate::Fire
     }
 
@@ -1789,8 +1838,7 @@ impl SchedulerService {
         if let Some(probe) = &conditions.require_probe {
             if probe.enabled && !all_met {
                 status.probe_met = None;
-                status.probe_detail =
-                    Some("not run: another condition is not met".to_string());
+                status.probe_detail = Some("not run: another condition is not met".to_string());
             } else if probe.enabled {
                 let verdict = self.probe_gate.evaluate(&task.id, probe, now).await;
                 status.probe_met = Some(verdict.met);
@@ -1868,10 +1916,7 @@ impl SchedulerService {
                 return;
             }
         };
-        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
-        record.status = ScheduledTaskStatus::Skipped;
-        record.ended_at = Some(chrono::Utc::now().to_rfc3339());
-        record.error_message = Some("Condition timeout exceeded".to_string());
+        let record = condition_timeout_record(task);
 
         if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
             error!("Failed to record condition timeout: {}", e);
@@ -2051,6 +2096,7 @@ impl SchedulerService {
     /// Errors per-task are logged and swallowed so one broken task can't
     /// block the entire fleet from reconciling.
     pub async fn reconcile_missed_runs(self: Arc<Self>) -> Result<(), String> {
+        let _pass = self.pass_lock.lock().await;
         let pg = self.pg()?;
 
         let settings = match pg.get_scheduler_settings().await {
@@ -2166,8 +2212,29 @@ impl SchedulerService {
             return Ok(());
         }
 
-        let actions = plan_catch_up_actions(&missed, task.catch_up_policy);
+        let mut actions = plan_catch_up_actions(&missed, task.catch_up_policy);
         let policy = task.catch_up_policy;
+
+        // A catch-up is a run like any other: a task with conditions goes
+        // through the same gate the tick uses (a met probe is spent on it).
+        // Not admitted now -> the slots are recorded MissedRunnerDown.
+        let wants_run = actions
+            .iter()
+            .any(|a| matches!(a, CatchUpAction::Enqueue { .. }));
+        if wants_run && task.has_conditions() {
+            let fire = matches!(
+                self.gate_conditions(task, std::time::Instant::now()).await,
+                ConditionGate::Fire
+            );
+            if !fire {
+                info!(
+                    task_id = %task.id,
+                    "scheduler reconciler: conditions not met — recording missed slots \
+                     instead of a catch-up run"
+                );
+            }
+            actions = gate_catch_up_actions(actions, fire);
+        }
 
         info!(
             task_id = %task.id,
@@ -3373,8 +3440,16 @@ mod tests {
                 ConditionGate::TimedOut => panic!("no timeout inside 8 minutes"),
             }
         }
-        assert_eq!(fired_on, vec![2], "fires on the tick the probe first exits 0, once");
-        assert_eq!(probe_runs(&counter), 3, "no probe runs after the slot fired");
+        assert_eq!(
+            fired_on,
+            vec![2],
+            "fires on the tick the probe first exits 0, once"
+        );
+        assert_eq!(
+            probe_runs(&counter),
+            3,
+            "no probe runs after the slot fired"
+        );
     }
 
     #[cfg(unix)]
@@ -3430,8 +3505,8 @@ mod tests {
         let mut fired_on: Vec<u64> = Vec::new();
         for tick in 0..10u64 {
             let now = Utc::now();
-            task.next_run = compute_next_run(&task.schedule, now, ScheduleZone::Utc)
-                .map(|dt| dt.to_rfc3339());
+            task.next_run =
+                compute_next_run(&task.schedule, now, ScheduleZone::Utc).map(|dt| dt.to_rfc3339());
             // The last run ended `tick - last_fire` simulated minutes ago.
             if let Some(&last) = fired_on.last() {
                 let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
@@ -3449,7 +3524,11 @@ mod tests {
                 other => panic!("an always-met probe must fire when rearmed, got {other:?}"),
             }
         }
-        assert_eq!(fired_on, vec![0, 3, 6, 9], "one run per 3-minute rearm delay");
+        assert_eq!(
+            fired_on,
+            vec![0, 3, 6, 9],
+            "one run per 3-minute rearm delay"
+        );
         assert_eq!(
             probe_runs(&counter),
             4,
@@ -3558,5 +3637,107 @@ mod tests {
             EVALUATED_CONDITIONS.iter().map(|s| s.to_string()).collect();
         evaluated.sort();
         assert_eq!(fields, evaluated);
+    }
+
+    /// Two concurrent passes (the tick loop and the wake handler) gating the
+    /// same task on a met probe: exactly one Fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_gates_on_a_met_probe_fire_exactly_once() {
+        let service = Arc::new(SchedulerService::new(None));
+        let mut task = ScheduledTask::new(
+            "probe-gated".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["sh".into(), "-c".into(), "sleep 1; exit 0".into()],
+                poll_seconds: 60,
+                timeout_seconds: 10,
+            }),
+            ..Default::default()
+        });
+        let at = std::time::Instant::now();
+        let spawn_gate = |service: Arc<SchedulerService>, task: ScheduledTask| {
+            tokio::spawn(async move { service.gate_conditions(&task, at).await })
+        };
+        let (a, b) = tokio::join!(
+            spawn_gate(service.clone(), task.clone()),
+            spawn_gate(service.clone(), task.clone())
+        );
+        let fires = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|g| matches!(g, ConditionGate::Fire))
+            .count();
+        assert_eq!(fires, 1);
+    }
+
+    #[test]
+    fn a_condition_timeout_is_stamped_with_the_slot_it_was_waiting_for() {
+        let slot = "2026-09-29T07:20:00+00:00";
+        let mut cron = fixture_task(60);
+        cron.schedule = ScheduleExpression::Cron("0 20 7 * * *".to_string());
+        cron.next_run = Some(slot.to_string());
+        let record = condition_timeout_record(&cron);
+        assert!(matches!(record.status, ScheduledTaskStatus::Skipped));
+        assert_eq!(
+            record
+                .scheduled_for
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()),
+            chrono::DateTime::parse_from_rfc3339(slot).ok(),
+            "an unstamped timeout reads as a missed slot and is caught up on restart"
+        );
+
+        let mut condition = fixture_task(60);
+        condition.schedule =
+            ScheduleExpression::Condition(crate::scheduler::ConditionScheduleConfig {
+                rearm_delay_minutes: 60,
+            });
+        condition.next_run = Some(slot.to_string());
+        assert_eq!(condition_timeout_record(&condition).scheduled_for, None);
+    }
+
+    #[test]
+    fn a_conditioned_catch_up_the_gate_does_not_admit_is_recorded_missed() {
+        let slots = six_hourly_missed_slots();
+        let actions = plan_catch_up_actions(&slots, CatchUpPolicy::RunOnce);
+        assert!(matches!(actions.as_slice(), [CatchUpAction::Enqueue { .. }]));
+        assert_eq!(gate_catch_up_actions(actions.clone(), true), actions);
+        let held = gate_catch_up_actions(actions, false);
+        assert!(
+            held.iter()
+                .all(|a| matches!(a, CatchUpAction::Skip { .. })),
+            "{held:?}"
+        );
+        assert_eq!(held.len(), 1);
+    }
+
+    /// `reconcile_task` gates a conditioned catch-up through `gate_conditions`
+    /// before acting on it (source-scan: the reconciler needs a database).
+    #[test]
+    fn the_reconciler_gates_catch_up_for_conditioned_tasks() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn reconcile_task(")
+            .expect("reconcile_task exists");
+        let (body, _) = body
+            .split_once("\n    }\n")
+            .expect("reconcile_task closes");
+        let (before_gate, _) = body
+            .split_once("task.has_conditions()")
+            .expect("reconcile_task checks for conditions");
+        let (before_act, _) = body
+            .split_once("for action in actions")
+            .expect("reconcile_task acts on its actions");
+        assert!(
+            before_gate.len() < before_act.len(),
+            "the gate must run before any catch-up is enqueued"
+        );
+        assert!(body.contains("self.gate_conditions(task,"));
+        assert!(body.contains("gate_catch_up_actions(actions, fire)"));
     }
 }
