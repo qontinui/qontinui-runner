@@ -4004,6 +4004,50 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
 /// may call it; this list only forwards.
 ///
+/// `coord_submit_escalate_evidence` is IN, and it is the reason this paragraph
+/// exists: it is the agent door of the operator ruling
+/// `decision_record/escalate-path-clearance-is-agent-work` — an
+/// `escalate-path-matched` block is cleared by an agent submitting a grounded
+/// evidence bundle for one head, and coord (not the agent) checks it, announces
+/// the clearance, and writes the head-pinned marker. The grant carries no scope
+/// and no glob; coord's refusals (`head_moved`, `disclosure_not_grounded`,
+/// `review_not_for_head`, `credential_not_holder_issued`, …) are the control.
+/// Withheld here it answered `METHOD_NOT_ALLOWED` from every runner-proxied
+/// session, so the blocker line coord prints on every such PR — which names this
+/// tool as the remedy — sent the session to a door this list shut (measured
+/// 2026-09-26 on claude-config#1198 and 2026-09-29 on coord#2638, where the
+/// bundle had to be carried over a hand-minted device JWT instead). Its operator
+/// twin `coord_attest_escalate_override` stays in
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], unmoved.
+///
+/// The same diff of coord's `DEVICE_DEFAULT_TOOLS` / `TWIN_READ_TOOLS` against
+/// this list (coord `mcp/agent_tool_access.rs` on origin/main, 2026-09-29) found
+/// ten more names that were neither allowed nor deliberately excluded — the
+/// drift state `coord_mcp_filter_tools_list_response` warns about. Each is
+/// granted on coord's device floor with a recorded rationale. Eight of them
+/// also have a device-admitting HTTP twin (a `DoorAdmits::DeviceAgent` row that
+/// coord's `device_floor_matches_device_admitting_http_doors` pins), so
+/// withholding those here was a transport asymmetry rather than a boundary. The
+/// other two have no such twin and rest on coord's own grant alone:
+/// `coord_fleet_drain_status` is on coord's read-only observer floor, and
+/// `coord_land_provenance_backfill` is a deliberately bounded agent door onto a
+/// repair pass whose HTTP route is operator-only (coord plan
+/// `2026-09-15-two-admin-only-repair-passes-have-no-agent-door`). That is the
+/// same precedent as `coord_citations_reenrich` above: coord's grant is the
+/// authority on who may call it, and this list only forwards.
+///
+/// * reads — `coord_fleet_drain_status` (a session that cannot see a drain
+///   reads a quiesced machine as idle), `coord_next_step_settings_effective`
+///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
+///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
+/// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
+///   fixer takes before acting on a PR it did not author),
+///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
+///   agent-audience queue's only consumers; neither can write `audience` or
+///   erase an operator answer), `coord_operator_touch_classify` (append-only
+///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
+///   default, precedence-aware re-derive, reversible by re-running).
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4020,11 +4064,13 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
+    "coord_adopt_pr",
     "coord_agent_registry_effective",
     "coord_alert_claim",
     "coord_alert_queue",
     "coord_alert_release",
     "coord_am_i_clear",
+    "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
     "coord_bind_self_session",
@@ -4057,6 +4103,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_explain_worktree",
     "coord_find_references",
     "coord_fixer_arm_readiness",
+    "coord_fleet_drain_status",
     "coord_force_clear_gate",
     "coord_gate_doctor",
     "coord_gate_inspect",
@@ -4067,6 +4114,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_inbox",
     "coord_is_commit_live",
     "coord_is_merge_safe",
+    "coord_land_provenance_backfill",
     "coord_layering_triage",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
@@ -4081,8 +4129,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_merge_order",
     "coord_migration_queue",
     "coord_mute_gate",
+    "coord_next_step_settings_effective",
     "coord_notify_sensitive_action",
+    "coord_operator_touch_classify",
     "coord_orient",
+    "coord_pending_agent_questions",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
     // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
@@ -4091,6 +4142,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_label_unset",
     "coord_pr_status",
     "coord_predict_resource_collisions",
+    "coord_primary_tree_branch_status",
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
@@ -4112,15 +4164,18 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_signature",
     "coord_slo_metrics",
     "coord_snooze_gate",
+    "coord_submit_escalate_evidence",
     "coord_symbol_lookup",
     "coord_twin_catalog",
     "coord_typecheck_file",
     "coord_unmute_gate",
     "coord_who_is_working_on",
+    "coord_withdraw_agent_question",
     "coord_withdraw_gate",
     "coord_work_unit_add_citation",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
+    "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
@@ -15325,6 +15380,51 @@ mod coord_mcp_body_gate_tests {
                  only pins that THIS door would not carry it."
             );
         }
+    }
+
+    /// The agent escalate-evidence door and the ten device-floor names found
+    /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
+    /// while the operator escape hatch for the same block stays withheld. A
+    /// literal enumeration, so dropping any one name — or moving the operator
+    /// attest onto the allowlist — reds this test by name.
+    #[test]
+    fn escalate_evidence_door_and_device_floor_drift_are_forwarded() {
+        for tool in [
+            "coord_submit_escalate_evidence",
+            "coord_adopt_pr",
+            "coord_answer_agent_question",
+            "coord_fleet_drain_status",
+            "coord_land_provenance_backfill",
+            "coord_next_step_settings_effective",
+            "coord_operator_touch_classify",
+            "coord_pending_agent_questions",
+            "coord_primary_tree_branch_status",
+            "coord_withdraw_agent_question",
+            "coord_work_unit_overview",
+        ] {
+            assert!(
+                coord_mcp_tool_is_allowed(tool),
+                "{tool} is granted on coord's device floor and must not be withheld here"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be both allowed and listed as a deliberate exclusion"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
+        assert!(
+            !coord_mcp_tool_is_allowed("coord_attest_escalate_override"),
+            "the operator escalate override must stay withheld; agents clear escalate \
+             blocks through coord_submit_escalate_evidence"
+        );
+        assert!(coord_mcp_withholding_is_deliberate("coord_attest_escalate_override"));
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
