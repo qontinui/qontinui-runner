@@ -22,14 +22,6 @@
     {
       "class": "dev_ports",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "dev_ports",
-      "file": "src/mcp/ai_session.rs",
       "symbol": "generate_mcp_tool_context",
       "excerpt": "{\"tool\": \"mcp__qontinui__sdk_connect\", \"url\": \"http://localhost:3001\"}",
       "count": 1,
@@ -2097,15 +2089,6 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
       "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
       "excerpt": "Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo ...",
       "count": 1,
       "disposition": "fallback_correct",
@@ -2115,7 +2098,7 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
       "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
-      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"rebuild\": true, \"trigger_auto_continue\":...",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"rebuild\": true, \"trigger_...",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
@@ -2124,7 +2107,7 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
       "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
-      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"trigger_auto_continue\": true}'",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"trigger_auto_continue\": t...",
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."

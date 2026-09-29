@@ -76,7 +76,7 @@ pub(crate) const AI_SESSION_SUPERVISOR_RESTART_RECIPE: &str = r#"## Development 
 
 (Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervisor_base}} when this session was spawned.)
 
-The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop, optionally rebuild, and restart the runner, then resume this session (`trigger_auto_continue`), instead of the user restarting the application by hand.
+The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop, optionally rebuild, and restart the runner, then resume this session (`trigger_auto_continue`), instead of the user restarting the application by hand. On this machine, carrying out a restart the user explicitly asked for, through this route, is the user's restart, not yours - so it does not break the rules above.
 
 Use it only when ALL of these hold:
 1. The user has explicitly asked, in this session, for the runner to be restarted. Needing to load your own change is not that request: tell the user, quote the readiness verdict, and offer this route.
@@ -85,28 +85,23 @@ Use it only when ALL of these hold:
 
 Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo check` / `cargo test`, or a temporary runner from `POST {{supervisor_base}}/runners/spawn-test`.
 
-**Restarting Runner via Supervisor:**
+**The supervisor will refuse (HTTP 409) without `"force": true`**, because it asks the same restart-readiness question and your own session always counts as live work, and its refusal text will suggest forcing. Send `"force": true` ONLY immediately after a gate-2 readiness read that shows your session as the sole live session. Never force on an UNKNOWN verdict (refused, timed out, error status, unreadable), and never force past any other refusal.
+
+**Restarting Runner via Supervisor** (only when all three conditions above hold, and the force condition just stated holds):
 ```bash
 # Simple restart (no rebuild)
-curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"trigger_auto_continue": true}'
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "trigger_auto_continue": true}'
 
-# Restart with REBUILD (use after modifying runner Rust code)
-curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"rebuild": true, "trigger_auto_continue": true}'
+# Restart with REBUILD (after you modified runner Rust code)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true, "trigger_auto_continue": true}'
 ```
 From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Post` with the same URL and body.
 
 **Supervisor API ({{supervisor_base}}):**
 - GET /health - Check if supervisor is running
-- POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
-- POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
+- POST /runner/restart - Restart runner (options: force, rebuild, trigger_auto_continue, wait_timeout_seconds)
 
-**IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
-
-**Workflow Loop Signal:** If you are running inside a supervisor workflow loop and you modify runner code, call:
-```powershell
-Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post
-```
-This tells the supervisor to restart the runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
+**IMPORTANT:** When the user has asked for the restart and you modified runner Rust code, use `"rebuild": true` to recompile before restart.
 
 ---
 
@@ -184,6 +179,11 @@ const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &["/runner/restart", "USE THE SU
 /// Refuse a served body with the legacy supervisor shape: the builtin renders
 /// instead, named as [`session_briefing::Provenance::BuiltinRejected`] with the
 /// refused version, exactly like a guard failure.
+///
+/// The needles are case-sensitive substrings. That is deliberately broad: a
+/// tenant body that merely MENTIONS `/runner/restart` is rejected too. It errs
+/// safe — the builtin still carries every required rule — and the provenance
+/// line names the refused version, so the rejection is visible, not silent.
 fn reject_legacy_supervisor_body(
     served: crate::mcp::session_briefing::RenderedBlock,
     builtin: &str,
@@ -2985,6 +2985,25 @@ mod tests {
         assert!(up.text.contains("explicitly asked"), "{}", up.text);
         assert!(!up.text.contains("sanctioned exception"), "{}", up.text);
         assert!(!up.text.contains("/runner/stop"), "{}", up.text);
+        // The supervisor refuses without force, and force is gated on a
+        // sole-live-session readiness read.
+        assert!(up.text.contains(r#""force": true"#), "{}", up.text);
+        assert!(up.text.contains("sole live session"), "{}", up.text);
+        assert!(
+            up.text.contains("Never force on an UNKNOWN verdict"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("is the user's restart, not yours"),
+            "{}",
+            up.text
+        );
+        // The workflow-loop signal route does not exist on the supervisor.
+        assert!(!up.text.contains("signal-restart"), "{}", up.text);
+        // No literal port: the rendered text carries only the CONFIGURED
+        // supervisor base, which on a default box does happen to be :9875.
+        assert!(!AI_SESSION_SUPERVISOR_RESTART_RECIPE.contains("9875"));
     }
 
     /// A served body with the LEGACY supervisor shape is refused on the
@@ -3016,7 +3035,8 @@ mod tests {
     }
 
     /// Lockstep pin with coord's seed of `session_briefing/ai-session-rules`:
-    /// the coord side pins the same digest over its `include_str!`'d body.
+    /// coord's seed body must hash to this same value. A coord-side pin of the
+    /// digest does not exist yet; adding one is a follow-up.
     #[test]
     fn the_rules_template_digest_is_pinned() {
         use sha2::{Digest, Sha256};

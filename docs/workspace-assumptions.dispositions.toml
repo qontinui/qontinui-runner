@@ -252,10 +252,9 @@ note = "Dev-box addendum appended by runner_rules_prefix only when check_supervi
 reviewed = [
     "(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...",
     "**Supervisor API ({{supervisor_base}}):**",
-    "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
-    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"rebuild\": true, \"trigger_auto_continue\":...",
-    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"trigger_auto_continue\": true}'",
     "Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo ...",
+    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"rebuild\": true, \"trigger_...",
+    "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"force\": true, \"trigger_auto_continue\": t...",
 ]
 
 [[disposition]]
