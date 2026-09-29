@@ -274,7 +274,7 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
     ) -> Option<Uuid> {
-        self.register_inner(task_run_id, Some(task_run_id), purpose, repo)
+        self.register_inner(task_run_id, Some(task_run_id), purpose, repo, None)
     }
 
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
@@ -321,7 +321,40 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
     ) -> Option<Uuid> {
-        self.register_inner(claude_session_id, None, purpose, repo)
+        self.register_inner(claude_session_id, None, purpose, repo, None)
+    }
+
+    /// Bind an interactive Claude Code session into the R4 index on request —
+    /// the `POST /sessions/transcript-bind` door (plan
+    /// `2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`
+    /// Phase 4.4). The SAME binder as [`Self::register_sniffed_session`] — one
+    /// `register_inner`, one R6 dedupe, one `terminal_claude` kind — for a
+    /// session the resume-sniffer never saw (a session the runner does not
+    /// host, or a pane launched without a sniffable resume line).
+    ///
+    /// `coord_session_id` names a `coord.sessions` row that ALREADY exists
+    /// (typically created by `coord_bind_self_session`): the index then
+    /// adopts that id and no `Started` row is written, so the bind cannot mint
+    /// a duplicate row beside it. `None` mints and registers a fresh row
+    /// exactly as the sniffer does.
+    ///
+    /// Returns the bound coord session id; an R6 hit returns the EXISTING id
+    /// (the supplied `coord_session_id` is then ignored — the first binding
+    /// wins, as for every other registration). `None` when registration is
+    /// gated off (`QONTINUI_SESSION_AUTOMATION_REGISTER`) or the `Started`
+    /// write failed.
+    pub fn bind_transcript_session(
+        &self,
+        claude_session_id: &str,
+        coord_session_id: Option<Uuid>,
+    ) -> Option<Uuid> {
+        self.register_inner(
+            claude_session_id,
+            None,
+            "Claude Code session (transcript bind)",
+            None,
+            coord_session_id,
+        )
     }
 
     /// Shared register core for the pinned (`task_run_id = Some`) and sniffed
@@ -334,6 +367,7 @@ impl AiCoordRegistrar {
         task_run_id: Option<&str>,
         purpose: &str,
         repo: Option<String>,
+        adopt_coord_session: Option<Uuid>,
     ) -> Option<Uuid> {
         if !registration_enabled() {
             debug!(
@@ -343,7 +377,9 @@ impl AiCoordRegistrar {
             return None;
         }
 
-        let session_id = crate::session::uuid_v7();
+        // An adopted id names a coord row that already exists (see
+        // `bind_transcript_session`); otherwise mint one.
+        let session_id = adopt_coord_session.unwrap_or_else(crate::session::uuid_v7);
         let tenant = (self.inner.tenant_resolver)();
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
@@ -485,12 +521,24 @@ impl AiCoordRegistrar {
             payload["claude_code_session_id"] = json!(claude_session_id);
         }
 
-        if let Err(e) = self.inner.outbox.record(
-            self.inner.machine_id,
-            session_id,
-            SessionEventKind::Started,
-            payload,
-        ) {
+        // An ADOPTED row already exists coord-side, so writing `Started` for
+        // it would at best be absorbed by the drain's 409 handling and at
+        // worst overwrite the row's intent — skip it; the index insert below
+        // is the whole binding.
+        let started = if adopt_coord_session.is_some() {
+            Ok(())
+        } else {
+            self.inner
+                .outbox
+                .record(
+                    self.inner.machine_id,
+                    session_id,
+                    SessionEventKind::Started,
+                    payload,
+                )
+                .map(|_| ())
+        };
+        if let Err(e) = started {
             warn!(
                 "ai_coord_register: outbox Started write failed for {} (best-effort): {}",
                 claude_session_id, e

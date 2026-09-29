@@ -1542,8 +1542,14 @@ async fn tail_session(
         // R4 index resolves for the `terminal_claude` plane. Best-effort and
         // synchronous: the tailer's whole write path is a bounded local append
         // that swallows its own errors, so it cannot fail or stall this loop.
+        //
+        // The batch's FILE offset rides along (the reader's cursor has already
+        // advanced past exactly `bytes`), so the tailer can place it against
+        // the session's file mark and never re-emit bytes a
+        // `POST /sessions/transcript-bind` replay already carried.
         if let Some(t) = tailer.as_ref() {
-            t.on_appended(&session_id, &bytes);
+            let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
+            t.on_appended(&session_id, file_start, &bytes, truncated);
         }
     }
 }

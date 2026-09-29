@@ -251,6 +251,10 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // transcript above. Bounded per file / per report, but a bound on volume is
     // not a bound on who may read it.
     "GET /sessions/{id}/file-changes",
+    // Reads a local Claude Code transcript and queues it for coord: it decides
+    // whose conversation leaves the machine. Authorized on the coord-mcp proxy
+    // nonce in the handler; no browser caller has any business here.
+    "POST /sessions/transcript-bind",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",

@@ -51,16 +51,56 @@
 //! verbatim from disk by the Phase 1 scanner, which is the corpus's sole body
 //! writer — so nothing here may bypass `redact_secrets`, and nothing here
 //! computes a `content_sha256`.
+//!
+//! ## Binding on request, and the pre-bind prefix
+//!
+//! Plan `2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`
+//! Phase 4.4. The sniffer binds only panes it sniffed, and appends made before
+//! a bind were dropped for good — Phase 0 of that plan measured transcript
+//! coverage at 0 of 134 author sessions. `POST /sessions/transcript-bind`
+//! (`mcp::sessions`) closes that from the session's side:
+//! [`SessionTranscriptTailer::bind_and_replay`] writes the binding through the
+//! registrar's ONE binder ([`AiCoordRegistrar::bind_transcript_session`]) and
+//! then replays the file's un-emitted prefix through THIS module's emit path —
+//! the same redaction, the same offset lane, the same outbox. There is no
+//! second producer: once bound, later appends arrive from the watcher as
+//! before.
+//!
+//! ### File marks
+//!
+//! Replay and live tailing must never emit the same file bytes twice or out of
+//! order, so every emit goes through [`SessionTranscriptTailer::emit_file_range`]
+//! under a PER-SESSION lock, and advances a durable FILE MARK: the byte offset
+//! in the JSONL through which the file has been handed to the emitter. A
+//! watcher batch that overlaps the mark (a replay read the same lines first)
+//! is trimmed to its unseen suffix; one wholly below it is dropped. The marks
+//! persist in a sidecar beside the outbox (the emitter's own
+//! [`TranscriptOffsetLog`] type, reused as a durable key → i64 map), so a
+//! re-bind after a runner restart replays only the bytes the previous process
+//! never emitted rather than the whole file again.
+//!
+//! The mark is an at-least-once record: it advances AFTER the emitter reports
+//! its chunks durably queued, so a crash between the two re-sends a batch
+//! rather than skipping one.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::claude_session::coord_register::AiCoordRegistrar;
 
-use super::transcript_emitter::TranscriptEmitter;
+use super::transcript_emitter::{TranscriptEmitter, TranscriptOffsetLog};
+
+/// Upper bound on one replay emit. Each emit is one outbox append + fsync and
+/// one offset reservation, so a multi-megabyte prefix is replayed as a handful
+/// of batches rather than one allocation of the whole file. Batches end on a
+/// line boundary; a single line longer than this is emitted alone.
+const REPLAY_BATCH_BYTES: usize = 1024 * 1024;
 
 /// How often the coverage summary is logged. Long enough that an idle fleet
 /// costs one line a minute, short enough that a rebuild's recovery window is
@@ -79,6 +119,139 @@ pub struct SessionTranscriptTailer {
     emitter: Arc<TranscriptEmitter>,
     registrar: Arc<AiCoordRegistrar>,
     coverage: Mutex<Coverage>,
+    /// Per-session emit locks. Every emit — a watcher batch or a replay batch
+    /// — holds its session's lock across the mark read, the emit and the mark
+    /// write, which is what keeps the offset lane in FILE order when a replay
+    /// and a live append race. Grows by one entry per distinct session key.
+    session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Durable file marks — see the module header's "File marks".
+    marks: TranscriptOffsetLog,
+}
+
+/// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BindOutcome {
+    /// The coord session the key is bound to (the existing one on a re-bind).
+    pub coord_session_id: Uuid,
+    /// The key was already bound before this call (by the sniffer, a workflow
+    /// registration, or an earlier bind).
+    pub already_bound: bool,
+    /// File bytes handed to the emitter by this call's replay.
+    pub replayed_bytes: u64,
+    /// Outbox chunks those bytes became.
+    pub replayed_chunks: u64,
+}
+
+/// Why [`SessionTranscriptTailer::bind_and_replay`] refused. Typed so the
+/// route can answer each with its own status and the caller never has to
+/// parse prose to decide whether to retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindRefusal {
+    /// Gate 1 (`Settings.cloud_sync_enabled`) is off. Nothing was written —
+    /// not the binding, not a byte.
+    SyncDisabled,
+    /// The registrar declined to bind (`QONTINUI_SESSION_AUTOMATION_REGISTER`
+    /// off, or its `Started` write failed).
+    RegistrationDisabled,
+    /// The JSONL could not be read for the replay. The binding HAS been
+    /// written; later appends are tailed.
+    Unreadable(String),
+}
+
+/// Why [`locate_session_jsonl`] found no file to bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocateRefusal {
+    /// No Claude config dir was discovered, so the watcher watches nothing.
+    NoConfigDirs,
+    /// No `<config_dir>/projects/*/<id>.jsonl` exists under any of them.
+    NotFound { searched: Vec<String> },
+    /// The file carries the runner's workflow-session marker. The watcher
+    /// never tails those — the executor is their transcript producer — so
+    /// binding it here would be a second producer.
+    WorkflowSession { path: String },
+}
+
+impl LocateRefusal {
+    /// Operator-readable detail for the route's `422` body.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NoConfigDirs => "no Claude config dir was discovered on this machine, so the \
+                 transcript watcher watches no JSONL at all"
+                .to_string(),
+            Self::NotFound { searched } => format!(
+                "no <config_dir>/projects/*/<claude_code_session_id>.jsonl exists under any \
+                 discovered config dir ({}); a transcript outside them is not watched",
+                searched.join(", ")
+            ),
+            Self::WorkflowSession { path } => format!(
+                "{path} is a runner WORKFLOW session: the watcher does not tail it (the \
+                 executor produces its transcript), so binding it here would be a second producer"
+            ),
+        }
+    }
+}
+
+/// Find the Claude Code JSONL for `claude_code_session_id` under the
+/// discovered config dirs — the same `<config_dir>/projects/<project>/` tree
+/// the transcript watcher watches recursively, so a file found here is one the
+/// watcher tails once bound. Newest by mtime when several projects hold the
+/// id. The id must already be validated as a UUID by the caller: it becomes a
+/// file name.
+pub fn locate_session_jsonl(
+    config_dirs: &[PathBuf],
+    claude_code_session_id: &str,
+) -> Result<PathBuf, LocateRefusal> {
+    if config_dirs.is_empty() {
+        return Err(LocateRefusal::NoConfigDirs);
+    }
+    let file_name = format!("{claude_code_session_id}.jsonl");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in config_dirs {
+        let Ok(projects) = std::fs::read_dir(dir.join("projects")) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let candidate = project.path().join(&file_name);
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, candidate));
+            }
+        }
+    }
+    let Some((_, path)) = best else {
+        return Err(LocateRefusal::NotFound {
+            searched: config_dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect(),
+        });
+    };
+    if head_is_workflow_session(&path) {
+        return Err(LocateRefusal::WorkflowSession {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(path)
+}
+
+/// The watcher's own workflow test: the marker within the first five lines.
+fn head_is_workflow_session(path: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let head: String = BufReader::new(f)
+        .lines()
+        .take(5)
+        .map_while(Result::ok)
+        .map(|l| l + "\n")
+        .collect();
+    crate::terminal::transcript::is_workflow_session_marker(&head)
 }
 
 /// Mutable coverage state. Session-id sets rather than counters, because the
@@ -127,10 +300,13 @@ pub struct CoverageReport {
 
 impl SessionTranscriptTailer {
     pub fn new(emitter: Arc<TranscriptEmitter>, registrar: Arc<AiCoordRegistrar>) -> Self {
+        let marks = TranscriptOffsetLog::open(emitter.file_mark_log_path());
         Self {
             emitter,
             registrar,
             coverage: Mutex::new(Coverage::default()),
+            session_locks: Mutex::new(HashMap::new()),
+            marks,
         }
     }
 
@@ -144,7 +320,12 @@ impl SessionTranscriptTailer {
     ///
     /// Never fails and never blocks the watcher — the emitter swallows its own
     /// I/O errors by contract.
-    pub fn on_appended(&self, session_key: &str, appended: &str) {
+    ///
+    /// `file_start` is the JSONL byte offset `appended` begins at, and
+    /// `truncated` says the watcher saw the file shrink and restarted its
+    /// cursor at 0 before this read — together they place the batch against
+    /// the session's file mark (module header, "File marks").
+    pub fn on_appended(&self, session_key: &str, file_start: u64, appended: &str, truncated: bool) {
         // Gate 1 (`Settings.cloud_sync_enabled`) is resolved here rather than
         // inside the emitter because the coverage summary needs its value —
         // "off" and "on but reaching nobody" are different diagnoses. The
@@ -152,7 +333,9 @@ impl SessionTranscriptTailer {
         // re-check it.
         self.on_appended_gated(
             session_key,
+            file_start,
             appended,
+            truncated,
             crate::settings::get_cloud_sync_enabled(),
         );
     }
@@ -163,11 +346,25 @@ impl SessionTranscriptTailer {
     pub(crate) fn on_appended_gated(
         &self,
         session_key: &str,
+        file_start: u64,
         appended: &str,
+        truncated: bool,
         cloud_sync_enabled: bool,
     ) {
         if appended.is_empty() {
             return;
+        }
+
+        if truncated && self.file_mark(session_key).is_some() {
+            // The file was rewritten under the same name: its bytes restart at
+            // 0, so a mark describing the OLD content would swallow the new.
+            // Reset whether or not the session is bound or synced right now —
+            // the mark must describe this file when it next matters.
+            let lock = self.session_lock(session_key);
+            let _held = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.marks.set(session_key, file_start as i64);
         }
 
         if !cloud_sync_enabled {
@@ -204,7 +401,201 @@ impl SessionTranscriptTailer {
         }
 
         // Gate 1 is already satisfied above — see `emit_inner`'s contract.
-        self.emitter.emit_inner(session_key, appended);
+        let lock = self.session_lock(session_key);
+        let _held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.emit_file_range(session_key, file_start, appended);
+    }
+
+    /// The per-session emit lock for `session_key`.
+    fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
+        self.session_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_key.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// The session's file mark, `None` before anything was emitted for it.
+    fn file_mark(&self, session_key: &str) -> Option<u64> {
+        self.marks
+            .get(session_key)
+            .map(|m| u64::try_from(m).unwrap_or(0))
+    }
+
+    /// Hand the file range `[file_start, file_start + text.len())` to the
+    /// emitter, minus whatever the file mark says is already emitted, and
+    /// advance the mark. THE one emit path for both live appends and replay.
+    ///
+    /// **The caller holds `session_key`'s lock** ([`Self::session_lock`]).
+    /// Returns `(file bytes emitted, outbox chunks queued)`.
+    ///
+    /// A range starting ABOVE the mark (a gap: appends dropped while unbound
+    /// in an earlier process, or before an upgrade that introduced marks) is
+    /// emitted as it stands and the gap is left — filling it here would put
+    /// its bytes AFTER the ones just emitted, out of file order.
+    fn emit_file_range(&self, session_key: &str, file_start: u64, text: &str) -> (u64, u64) {
+        let file_end = file_start + text.len() as u64;
+        let from = match self.file_mark(session_key) {
+            Some(mark) if mark > file_start => mark,
+            _ => file_start,
+        };
+        if from >= file_end {
+            return (0, 0); // wholly emitted already (a replay got there first)
+        }
+        let skip = usize::try_from(from - file_start).unwrap_or(usize::MAX);
+        let Some(unseen) = text.get(skip..) else {
+            // Marks sit on the line boundaries the watcher and the replay both
+            // cut at, so this is a mark from DIFFERENT content. Emitting the
+            // whole text would duplicate, trimming mid-character is impossible;
+            // drop the batch loudly rather than guess.
+            tracing::warn!(
+                session_key,
+                file_start,
+                mark = from,
+                "session_transcript_tailer: file mark is not on a character boundary of \
+                 this batch — batch skipped; a re-bind replays from the mark"
+            );
+            return (0, 0);
+        };
+        let chunks = self.emitter.emit_inner(session_key, unseen);
+        if chunks == 0 {
+            // Nothing queued (no binding, or a clean outbox failure): the mark
+            // stays, so a later replay can still carry these bytes.
+            return (0, 0);
+        }
+        self.marks.set(session_key, file_end as i64);
+        (file_end - from, chunks as u64)
+    }
+
+    /// Bind `session_key` (a Claude Code session id, the JSONL stem) into the
+    /// transcript lane and replay the part of `path` not yet emitted. The
+    /// route behind `POST /sessions/transcript-bind`; see the module header.
+    ///
+    /// Order is load-bearing: Gate 1 first (a disabled toggle writes nothing,
+    /// the binding included), then the session lock, then the binding, then
+    /// the replay — all under the one lock a concurrent watcher batch also
+    /// takes, so the lane stays in file order. The replay covers whole lines
+    /// only, exactly as the watcher reads them.
+    ///
+    /// Synchronous file I/O; call it from a blocking context.
+    pub fn bind_and_replay(
+        &self,
+        session_key: &str,
+        path: &Path,
+        coord_session_id: Option<Uuid>,
+        cloud_sync_enabled: bool,
+    ) -> Result<BindOutcome, BindRefusal> {
+        if !cloud_sync_enabled {
+            return Err(BindRefusal::SyncDisabled);
+        }
+        let lock = self.session_lock(session_key);
+        let _held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let existing = self.registrar.session_id_for(session_key);
+        let already_bound = existing.is_some();
+        let coord_session_id = match existing {
+            Some(id) => id,
+            None => self
+                .registrar
+                .bind_transcript_session(session_key, coord_session_id)
+                .ok_or(BindRefusal::RegistrationDisabled)?,
+        };
+        {
+            let mut cov = self.lock_coverage();
+            cov.unbound.remove(session_key);
+            cov.tailed.insert(session_key.to_string());
+        }
+
+        let (replayed_bytes, replayed_chunks) = self.replay_locked(session_key, path)?;
+        tracing::info!(
+            session_key,
+            coord_session = %coord_session_id,
+            already_bound,
+            replayed_bytes,
+            replayed_chunks,
+            path = %path.display(),
+            "session_transcript_tailer: transcript bound on request"
+        );
+        Ok(BindOutcome {
+            coord_session_id,
+            already_bound,
+            replayed_bytes,
+            replayed_chunks,
+        })
+    }
+
+    /// Read `path` from the file mark to its last complete line and feed it
+    /// through [`Self::emit_file_range`] in bounded batches. Caller holds the
+    /// session lock.
+    fn replay_locked(&self, session_key: &str, path: &Path) -> Result<(u64, u64), BindRefusal> {
+        let unreadable =
+            |e: std::io::Error| BindRefusal::Unreadable(format!("{}: {e}", path.display()));
+        let mut file = std::fs::File::open(path).map_err(unreadable)?;
+        let len = file.metadata().map_err(unreadable)?.len();
+        let mut pos = match self.file_mark(session_key) {
+            // A mark past the end: the file was rewritten since. Its content is
+            // new, so it is replayed from the start (the truncation rule the
+            // watcher applies).
+            Some(mark) if mark > len => {
+                self.marks.set(session_key, 0);
+                0
+            }
+            Some(mark) => mark,
+            None => 0,
+        };
+        file.seek(SeekFrom::Start(pos)).map_err(unreadable)?;
+        let mut reader = BufReader::new(file.take(len - pos));
+
+        let (mut bytes, mut chunks) = (0u64, 0u64);
+        let mut batch = String::new();
+        let mut batch_start = pos;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line).map_err(unreadable)?;
+            // EOF, or an unterminated tail the writer has not finished: the
+            // watcher delivers that line once its newline lands.
+            let complete = n > 0 && line.last() == Some(&b'\n');
+            let text = if complete {
+                std::str::from_utf8(&line).ok()
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                batch.push_str(text);
+                pos += n as u64;
+            } else if complete {
+                // The watcher's `read_line` stops at an invalid-UTF-8 line
+                // too, so the lane never gets past it either way.
+                tracing::warn!(
+                    session_key,
+                    offset = pos,
+                    "session_transcript_tailer: replay stopped at a non-UTF-8 line"
+                );
+            }
+            let stop = text.is_none();
+            if !batch.is_empty() && (stop || batch.len() >= REPLAY_BATCH_BYTES) {
+                let (b, c) = self.emit_file_range(session_key, batch_start, &batch);
+                if c == 0 && self.file_mark(session_key).unwrap_or(0) < pos {
+                    // Nothing queued and the mark did not cover it: the outbox
+                    // refused. Stop rather than skip ahead of a hole.
+                    break;
+                }
+                bytes += b;
+                chunks += c;
+                batch.clear();
+                batch_start = pos;
+            }
+            if stop {
+                break;
+            }
+        }
+        Ok((bytes, chunks))
     }
 
     /// Current coverage. Cheap; safe to call from a command handler.
@@ -405,7 +796,7 @@ mod tests {
         let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
 
-        t.on_appended_gated(&csid, "{\"type\":\"user\"}\n", true);
+        t.on_appended_gated(&csid, 0, "{\"type\":\"user\"}\n", false, true);
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 1, "unbound pane is visible");
         assert_eq!(r.unbound_session_ids, vec![csid.clone()]);
@@ -417,7 +808,7 @@ mod tests {
         );
 
         sniff_register(&registrar, &csid);
-        t.on_appended_gated(&csid, "{\"type\":\"assistant\"}\n", true);
+        t.on_appended_gated(&csid, 16, "{\"type\":\"assistant\"}\n", false, true);
         let r = t.coverage();
         assert_eq!(r.sessions_unbound, 0, "binding clears the coverage hole");
         assert_eq!(r.sessions_tailed, 1);
@@ -434,7 +825,7 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         sniff_register(&registrar, &csid);
 
-        t.on_appended_gated(&csid, "should not leave the machine", false);
+        t.on_appended_gated(&csid, 0, "should not leave the machine", false, false);
 
         assert!(transcript_offsets(&outbox).is_empty());
         let r = t.coverage();
@@ -454,8 +845,8 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         sniff_register(&registrar, &csid);
 
-        t.on_appended_gated(&csid, "aaaa", true);
-        t.on_appended_gated(&csid, "bb", true);
+        t.on_appended_gated(&csid, 0, "aaaa", false, true);
+        t.on_appended_gated(&csid, 4, "bb", false, true);
 
         assert_eq!(transcript_offsets(&outbox), vec![0, 4]);
         let r = t.coverage();
@@ -479,7 +870,7 @@ mod tests {
         let first_coord_id = {
             let (t, registrar, outbox) = tailer(dir.path());
             let sid = sniff_register(&registrar, &csid);
-            t.on_appended_gated(&csid, "0123456789", true);
+            t.on_appended_gated(&csid, 0, "0123456789", false, true);
             assert_eq!(transcript_offsets(&outbox), vec![0]);
             sid
         };
@@ -492,7 +883,7 @@ mod tests {
             "the registrar mints a fresh coord session id per process — which is \
              exactly why the lane cannot be keyed on it"
         );
-        t2.on_appended_gated(&csid, "abcde", true);
+        t2.on_appended_gated(&csid, 10, "abcde", false, true);
 
         // The post-restart chunk continues the lane at 10, NOT at 0. At 0 it
         // would collide with the pre-restart chunk under any read that joins
@@ -529,6 +920,305 @@ mod tests {
             "offset lane survives the restart"
         );
         assert_eq!(t2.coverage().appends_emitted, 1);
+    }
+
+    // ── Phase 4.4: POST /sessions/transcript-bind ────────────────────────
+
+    /// A Claude Code JSONL at `<dir>/cfg/projects/proj/<csid>.jsonl`, the
+    /// layout `locate_session_jsonl` searches.
+    fn jsonl(dir: &std::path::Path, csid: &str, body: &str) -> PathBuf {
+        let p = dir.join("cfg").join("projects").join("proj");
+        std::fs::create_dir_all(&p).unwrap();
+        let f = p.join(format!("{csid}.jsonl"));
+        std::fs::write(&f, body).unwrap();
+        f
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// `bind_and_replay` with Gate 1 on, retried across the process-global
+    /// registration kill switch the coord_register suite toggles (the same
+    /// reason `sniff_register` retries).
+    fn bind(t: &SessionTranscriptTailer, csid: &str, path: &Path) -> BindOutcome {
+        for _ in 0..200 {
+            match t.bind_and_replay(csid, path, None, true) {
+                Ok(o) => return o,
+                Err(BindRefusal::RegistrationDisabled) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("bind refused: {e:?}"),
+            }
+        }
+        panic!("registration stayed disabled")
+    }
+
+    /// Every transcript chunk queued for `coord`, in the outbox's own (seq)
+    /// order, as `(chunk_offset, decoded text)`.
+    fn chunks_for(outbox: &OutboxWriter, coord: Uuid) -> Vec<(i64, String)> {
+        use base64::Engine as _;
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.event_kind == SessionEventKind::OutputChunk.as_str() && r.session_id == coord
+            })
+            .map(|r| {
+                let b = base64::engine::general_purpose::STANDARD
+                    .decode(r.payload["payload_b64"].as_str().unwrap())
+                    .unwrap();
+                (
+                    r.payload["chunk_offset"].as_i64().unwrap(),
+                    String::from_utf8(b).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The transcript as the outbox will deliver it: chunks concatenated in
+    /// QUEUE order, with the offset lane asserted contiguous and ascending in
+    /// that same order — so a reordered or duplicated range fails here.
+    fn delivered(outbox: &OutboxWriter, coord: Uuid) -> String {
+        let mut next = None;
+        let mut out = String::new();
+        for (offset, text) in chunks_for(outbox, coord) {
+            if let Some(n) = next {
+                assert_eq!(offset, n, "offset lane out of order or gapped");
+            }
+            next = Some(offset + text.len() as i64);
+            out.push_str(&text);
+        }
+        out
+    }
+
+    /// The replayed prefix goes through the emitter's redaction: a secret in
+    /// the pre-bind part of the JSONL never reaches the outbox file.
+    #[test]
+    fn replayed_prefix_is_redacted() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(
+            dir.path(),
+            &csid,
+            "{\"type\":\"user\",\"text\":\"API_KEY=sk-oops-planted password: hunter2\"}\n",
+        );
+
+        let o = bind(&t, &csid, &path);
+        assert!(!o.already_bound);
+        assert!(o.replayed_chunks >= 1 && o.replayed_bytes > 0);
+
+        let text = delivered(&outbox, o.coord_session_id);
+        assert!(
+            text.contains("\"type\":\"user\""),
+            "the prefix was replayed: {text}"
+        );
+        assert!(!text.contains("sk-oops-planted"), "got: {text}");
+        assert!(!text.contains("hunter2"), "got: {text}");
+        let raw = std::fs::read_to_string(dir.path().join("outbox.jsonl")).unwrap();
+        assert!(
+            !raw.contains("sk-oops-planted"),
+            "secret reached the outbox file"
+        );
+    }
+
+    /// Bind, then the watcher's next batch: each file byte reaches the outbox
+    /// exactly once and in file order. The watcher's batch deliberately
+    /// OVERLAPS the replayed prefix (its cursor sat inside it — it read those
+    /// lines while the session was unbound), which is the race the file mark
+    /// exists for.
+    #[test]
+    fn bind_then_append_yields_each_byte_once_in_order() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let path = jsonl(dir.path(), &csid, &format!("{l1}{l2}"));
+
+        // Pre-bind: the watcher read l1 and dropped it (unbound).
+        t.on_appended_gated(&csid, 0, l1, false, true);
+        assert!(transcript_offsets(&outbox).is_empty());
+
+        let o = bind(&t, &csid, &path);
+        assert_eq!(o.replayed_bytes, (l1.len() + l2.len()) as u64);
+
+        // The writer appends l3; the watcher's cursor was after l1, so its
+        // batch is l2 + l3 starting at l1.len().
+        append(&path, l3);
+        t.on_appended_gated(&csid, l1.len() as u64, &format!("{l2}{l3}"), false, true);
+        // A re-delivery of an old batch is inert.
+        t.on_appended_gated(&csid, 0, l1, false, true);
+
+        assert_eq!(
+            delivered(&outbox, o.coord_session_id),
+            std::fs::read_to_string(&path).unwrap()
+        );
+    }
+
+    /// The same property under a REAL race: a writer thread appends lines and
+    /// plays the watcher (cursor-based batches) while the main thread binds
+    /// mid-stream. Whatever the interleaving, the delivered transcript is the
+    /// file, once, in order — which holds only because the replay and the
+    /// live path share the per-session lock and the mark.
+    #[test]
+    fn concurrent_bind_and_tail_never_duplicate_or_reorder() {
+        for round in 0..25 {
+            let dir = tempdir().unwrap();
+            let (t, _registrar, outbox) = tailer(dir.path());
+            let csid = Uuid::new_v4().to_string();
+            let path = jsonl(dir.path(), &csid, "");
+
+            let writer = {
+                let (t, csid, path) = (t.clone(), csid.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let mut cursor = 0u64;
+                    for i in 0..200 {
+                        let line = format!("{{\"round\":{round},\"i\":{i}}}\n");
+                        append(&path, &line);
+                        t.on_appended_gated(&csid, cursor, &line, false, true);
+                        cursor += line.len() as u64;
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_micros(200 * (round % 5)));
+            let o = bind(&t, &csid, &path);
+            writer.join().unwrap();
+
+            assert_eq!(
+                delivered(&outbox, o.coord_session_id),
+                std::fs::read_to_string(&path).unwrap(),
+                "round {round}"
+            );
+        }
+    }
+
+    /// Re-bind replays nothing: in the same process (already bound) AND after
+    /// a restart (fresh registrar, same durable marks).
+    #[test]
+    fn rebind_replays_nothing() {
+        let dir = tempdir().unwrap();
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(dir.path(), &csid, "{\"n\":1}\n{\"n\":2}\n");
+        {
+            let (t, _registrar, outbox) = tailer(dir.path());
+            let first = bind(&t, &csid, &path);
+            assert!(first.replayed_bytes > 0);
+            let rows = transcript_offsets(&outbox).len();
+
+            let again = bind(&t, &csid, &path);
+            assert!(again.already_bound);
+            assert_eq!(again.coord_session_id, first.coord_session_id);
+            assert_eq!((again.replayed_bytes, again.replayed_chunks), (0, 0));
+            assert_eq!(transcript_offsets(&outbox).len(), rows);
+        }
+        // Restart: the index is empty again, the marks are not.
+        let (t2, _registrar2, outbox2) = tailer(dir.path());
+        let rows = transcript_offsets(&outbox2).len();
+        let after_restart = bind(&t2, &csid, &path);
+        assert!(!after_restart.already_bound, "a fresh process binds anew");
+        assert_eq!(
+            after_restart.replayed_bytes, 0,
+            "but replays nothing already sent"
+        );
+        assert_eq!(transcript_offsets(&outbox2).len(), rows);
+
+        // Bytes appended while no process carried them ARE replayed.
+        append(&path, "{\"n\":3}\n");
+        let (t3, _r3, _o3) = tailer(dir.path());
+        assert_eq!(bind(&t3, &csid, &path).replayed_bytes, 8);
+    }
+
+    /// Gate 1 off: the bind refuses before anything — no binding, no
+    /// `Started` row, no chunk.
+    #[test]
+    fn disabled_toggle_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
+
+        assert_eq!(
+            t.bind_and_replay(&csid, &path, None, false),
+            Err(BindRefusal::SyncDisabled)
+        );
+        assert!(
+            registrar.session_id_for(&csid).is_none(),
+            "no binding written"
+        );
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "no outbox row of any kind"
+        );
+    }
+
+    /// A supplied coord session id is ADOPTED: the index points at it and no
+    /// `Started` row is minted beside the row that already exists.
+    #[test]
+    fn supplied_coord_session_id_is_adopted_without_a_started_row() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let existing = Uuid::new_v4();
+        let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
+
+        let o = (0..200)
+            .find_map(
+                |_| match t.bind_and_replay(&csid, &path, Some(existing), true) {
+                    Ok(o) => Some(o),
+                    Err(BindRefusal::RegistrationDisabled) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        None
+                    }
+                    Err(e) => panic!("{e:?}"),
+                },
+            )
+            .expect("bind");
+        assert_eq!(o.coord_session_id, existing);
+        assert_eq!(registrar.session_id_for(&csid), Some(existing));
+        let started = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+            .count();
+        assert_eq!(started, 0);
+        assert_eq!(delivered(&outbox, existing), "{\"n\":1}\n");
+    }
+
+    /// The locator's three refusals, and its one success.
+    #[test]
+    fn locate_refuses_what_the_watcher_does_not_tail() {
+        let dir = tempdir().unwrap();
+        let csid = Uuid::new_v4().to_string();
+        assert_eq!(
+            locate_session_jsonl(&[], &csid),
+            Err(LocateRefusal::NoConfigDirs)
+        );
+        let cfg = dir.path().join("cfg");
+        assert!(matches!(
+            locate_session_jsonl(std::slice::from_ref(&cfg), &csid),
+            Err(LocateRefusal::NotFound { .. })
+        ));
+        let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
+        assert_eq!(
+            locate_session_jsonl(std::slice::from_ref(&cfg), &csid),
+            Ok(path)
+        );
+
+        let wf = Uuid::new_v4().to_string();
+        jsonl(
+            dir.path(),
+            &wf,
+            "{\"type\":\"queue-operation\",\"operation\":\"enqueue\"}\n",
+        );
+        assert!(matches!(
+            locate_session_jsonl(std::slice::from_ref(&cfg), &wf),
+            Err(LocateRefusal::WorkflowSession { .. })
+        ));
     }
 
     /// `report_coverage_once` must not panic and must be callable with an
