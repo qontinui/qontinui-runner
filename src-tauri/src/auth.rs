@@ -2371,15 +2371,20 @@ pub(crate) fn device_binding_count() -> usize {
 
 /// The tenants this device is currently BOUND to, read from
 /// `paired_user.json` (every `bindings[].tenant_id`, plus `default_tenant_id`
-/// and the legacy v1 `tenant_id`). `None` when the file cannot be read — that
-/// is UNKNOWN, never "bound to nothing", so a caller must not refuse on it.
+/// and the legacy v1 `tenant_id`). `None` is UNKNOWN — the file cannot be
+/// read, OR it states no binding at all (an unpaired or half-written file) —
+/// never "bound to nothing", so a caller must not refuse or age anything out
+/// on it. The same rule [`MeasuredBindingCount`] applies: a file that states
+/// no binding is not a statement that the device holds none.
 ///
 /// A binding is not a credential: see [`device_holds_usable_binding`] for
 /// "can present one". This answers the other question — whether a tenant a
 /// row names is one this device belongs to at all, or a stale/foreign one no
 /// credential will ever be issued for.
 pub(crate) fn device_bound_tenants() -> Option<std::collections::BTreeSet<Uuid>> {
-    read_paired_user_value().map(|v| bound_tenants_from_value(&v))
+    read_paired_user_value()
+        .map(|v| bound_tenants_from_value(&v))
+        .filter(|bound| !bound.is_empty())
 }
 
 /// The parse half of [`device_bound_tenants`].
