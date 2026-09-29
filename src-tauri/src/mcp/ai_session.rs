@@ -76,10 +76,14 @@ pub(crate) const AI_SESSION_SUPERVISOR_RESTART_RECIPE: &str = r#"## Development 
 
 (Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervisor_base}} when this session was spawned.)
 
-The supervisor runs OUTSIDE the runner, so it can stop, optionally rebuild, and restart the runner hosting you, then resume this session (`trigger_auto_continue`). On this machine only, it is the sanctioned exception to the rules above that forbid a tool restarting the runner on your behalf:
+The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop, optionally rebuild, and restart the runner, then resume this session (`trigger_auto_continue`), instead of the user restarting the application by hand.
 
-1. Read `GET {{runner_api_base}}/restart-readiness` first. The counts include your own session; if it reports ANY other live session, or cannot be read, do not restart - finish, commit, and tell the user instead.
-2. Otherwise commit your work, then ask the supervisor to restart the runner.
+Use it only when ALL of these hold:
+1. The user has explicitly asked, in this session, for the runner to be restarted. Needing to load your own change is not that request: tell the user, quote the readiness verdict, and offer this route.
+2. `GET {{runner_api_base}}/restart-readiness` reports no live session other than your own (the counts include you). A refusal, a timeout, an error status or an unreadable body means do not restart.
+3. Your work is committed.
+
+Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo check` / `cargo test`, or a temporary runner from `POST {{supervisor_base}}/runners/spawn-test`.
 
 **Restarting Runner via Supervisor:**
 ```bash
@@ -93,7 +97,6 @@ From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `I
 
 **Supervisor API ({{supervisor_base}}):**
 - GET /health - Check if supervisor is running
-- POST /runner/stop - Stop the runner
 - POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
 - POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
 
@@ -171,6 +174,43 @@ pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -
         .replace("{{runner_api_base}}", api_base)
 }
 
+/// Markers of the LEGACY served `ai-session-rules` shape, which carried its own
+/// supervisor restart recipe. Existing tenants hold that version until the
+/// fleet-neutral one is published to them; rendering it beside
+/// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] would give a session two
+/// conflicting recipes, one of them ungated.
+const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &["/runner/restart", "USE THE SUPERVISOR API"];
+
+/// Refuse a served body with the legacy supervisor shape: the builtin renders
+/// instead, named as [`session_briefing::Provenance::BuiltinRejected`] with the
+/// refused version, exactly like a guard failure.
+fn reject_legacy_supervisor_body(
+    served: crate::mcp::session_briefing::RenderedBlock,
+    builtin: &str,
+) -> crate::mcp::session_briefing::RenderedBlock {
+    use crate::mcp::session_briefing::{Provenance, RenderedBlock};
+    let version = match served.provenance {
+        Provenance::Coord { version, .. } | Provenance::Cached { version } => version,
+        Provenance::Builtin | Provenance::BuiltinRejected { .. } => return served,
+    };
+    let Some(marker) = LEGACY_SUPERVISOR_BODY_MARKERS
+        .iter()
+        .find(|m| served.text.contains(**m))
+    else {
+        return served;
+    };
+    warn!(
+        version,
+        marker = %marker,
+        "ai_session: served ai-session-rules carries the legacy supervisor recipe; rendering the builtin"
+    );
+    RenderedBlock {
+        text: builtin.to_string(),
+        provenance: Provenance::BuiltinRejected { version },
+        fetched_at: None,
+    }
+}
+
 /// Render the runner-triggered rules block from the coord document
 /// `session_briefing/ai-session-rules`, falling back to the compiled-in text.
 ///
@@ -208,13 +248,16 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
     let builtin = builtin_rules_text(&api_base);
 
     let block = if supervisor_available {
-        let served = session_briefing::resolve_requiring(
-            BRIEFING_AI_SESSION_RULES,
+        let served = reject_legacy_supervisor_body(
+            session_briefing::resolve_requiring(
+                BRIEFING_AI_SESSION_RULES,
+                &builtin,
+                &api_base,
+                &coord_url,
+                &web_base,
+                &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
+            ),
             &builtin,
-            &api_base,
-            &coord_url,
-            &web_base,
-            &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
         );
         let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);
         session_briefing::RenderedBlock {
@@ -2828,7 +2871,7 @@ mod tests {
     /// text followed by the dev-box supervisor addendum, under an unchanged
     /// marker line and a provenance line that says where it came from.
     #[test]
-    fn the_builtin_rules_block_is_byte_identical_under_marker_and_provenance() {
+    fn the_builtin_rules_block_renders_under_marker_and_provenance() {
         let _pin = pin_plan_capture_level_for_test("off");
 
         let rules = runner_rules_prefix(true, 9876);
@@ -2930,6 +2973,58 @@ mod tests {
         assert!(recipe.contains("answered at http://10.0.0.5:4242 when"));
         assert!(recipe.contains("GET http://127.0.0.1:9877/restart-readiness"));
         assert!(!recipe.contains("{{"));
+    }
+
+    /// The addendum changes HOW a user-requested restart happens, never
+    /// WHETHER a session may decide one (served policy `production-and-cost`
+    /// `runner-lifecycle`).
+    #[test]
+    fn the_supervisor_recipe_is_gated_on_an_explicit_user_request() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let up = runner_rules_prefix(true, 9876);
+        assert!(up.text.contains("explicitly asked"), "{}", up.text);
+        assert!(!up.text.contains("sanctioned exception"), "{}", up.text);
+        assert!(!up.text.contains("/runner/stop"), "{}", up.text);
+    }
+
+    /// A served body with the LEGACY supervisor shape is refused on the
+    /// supervisor-up arm: the builtin renders, named as rejected, and the
+    /// gated recipe follows it — so a session never sees two recipes.
+    #[test]
+    fn a_legacy_supervisor_body_falls_back_to_the_builtin_on_the_up_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. USE THE SUPERVISOR API",
+                6,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let base = "http://127.0.0.1:9876";
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: builtin-fallback (rejected coord v6)]")
+        );
+        assert!(!up.text.contains("USE THE SUPERVISOR API"), "{}", up.text);
+        assert!(up.text.contains(builtin_rules_text(base).trim_end()));
+        assert!(up.text.ends_with(&supervisor_restart_recipe(
+            &crate::api_config::get_supervisor_url(),
+            base
+        )));
+    }
+
+    /// Lockstep pin with coord's seed of `session_briefing/ai-session-rules`:
+    /// the coord side pins the same digest over its `include_str!`'d body.
+    #[test]
+    fn the_rules_template_digest_is_pinned() {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(AI_SESSION_RULES_TEMPLATE.as_bytes()));
+        assert_eq!(
+            digest,
+            "9a42163a9a4b8212e6ce092a23515cd7bd7bc0b4a2bdd6ced6d207956cb1fd66"
+        );
     }
 
     /// The text every external operator receives (no supervisor on the box)

@@ -10,7 +10,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 |---|---:|---:|---:|---:|---:|---:|
 | `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
-| `supervisor_dependency` | 36 | 36 | 0 | 26 | 4 | 6 |
+| `supervisor_dependency` | 39 | 39 | 0 | 29 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
@@ -108,7 +108,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
-## `supervisor_dependency` (36 rows)
+## `supervisor_dependency` (39 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -128,10 +128,13 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `**Supervisor API ({{supervisor_base}}):**` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer 'cargo ...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"rebuild": true, "trigger_auto_continue":...` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"trigger_auto_continue": true}'` | 1 | fallback_correct — Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor. |
+| `src/mcp/ai_session.rs` | `reject_legacy_supervisor_body` | `fn reject_legacy_supervisor_body(` | 1 | fallback_correct — Refuses a served ai-session-rules body that still carries the legacy supervisor recipe, so the supervisor-available arm renders only the gated compiled-in addendum. |
 | `src/mcp/ai_session.rs` | `run_prompt` | `super::auto_continue::check_supervisor_available(),` | 1 | fallback_correct — Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false. |
 | `src/mcp/ai_session.rs` | `runner_rules_prefix` | `let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);` | 1 | fallback_correct — Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone. |
+| `src/mcp/ai_session.rs` | `runner_rules_prefix` | `let served = reject_legacy_supervisor_body(` | 1 | fallback_correct — Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone. |
 | `src/mcp/ai_session.rs` | `supervisor_restart_recipe` | `.replace("{{supervisor_base}}", supervisor_base.trim_end_matches('/'))` | 1 | fallback_correct — Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm. |
 | `src/mcp/ai_session.rs` | `supervisor_restart_recipe` | `pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {` | 1 | fallback_correct — Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm. |
 | `src/mcp/app_discovery.rs` | `const DESKTOP_APP_PORTS` | `9875,` | 1 | fallback_correct — One port in a discovery scan list; an absent listener is simply not discovered. |

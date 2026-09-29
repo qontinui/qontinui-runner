@@ -255,6 +255,7 @@ reviewed = [
     "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
     "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"rebuild\": true, \"trigger_auto_continue\":...",
     "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"trigger_auto_continue\": true}'",
+    "Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo ...",
 ]
 
 [[disposition]]
@@ -265,6 +266,7 @@ disposition = "fallback_correct"
 note = "Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone."
 reviewed = [
     "let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);",
+    "let served = reject_legacy_supervisor_body(",
 ]
 
 [[disposition]]
@@ -276,6 +278,16 @@ note = "Pure placeholder substitution for the dev-box addendum; called only on t
 reviewed = [
     ".replace(\"{{supervisor_base}}\", supervisor_base.trim_end_matches('/'))",
     "pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "reject_legacy_supervisor_body"
+disposition = "fallback_correct"
+note = "Refuses a served ai-session-rules body that still carries the legacy supervisor recipe, so the supervisor-available arm renders only the gated compiled-in addendum."
+reviewed = [
+    "fn reject_legacy_supervisor_body(",
 ]
 
 [[disposition]]
