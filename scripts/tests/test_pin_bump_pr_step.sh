@@ -142,7 +142,7 @@ case " ${GH_STUB_FAIL:-} " in
 esac
 case "$key" in
   list:open)   printf '%s\n' "${GH_STUB_OPEN:-}" ;;
-  list:closed) : ;;
+  list:closed) printf '%s\n' "${GH_STUB_CLOSED:-}" ;;
   list:ready)
     printf '77\t%s\t%s\tPR_kwDOtest77\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/77\tjspinak\t%s\t%s\n' \
       "${GH_STUB_READY_ISDRAFT:-true}" "${GH_STUB_HEAD:?}" "${GH_STUB_READY_MERGEABLE:-MERGEABLE}" "${GH_STUB_READY_MSS:-CLEAN}" ;;
@@ -157,6 +157,8 @@ case "$key" in
   create)      echo "https://github.com/qontinui/qontinui-runner/pull/77" ;;
   comment)     cat "$body_file" >> "${GH_STUB_COMMENTS:?}" ;;
   comments-read) cat "${GH_STUB_COMMENTS:?}" ;;
+  # (The closed-candidate read shares comments-read; the harness seeds
+  # GH_STUB_COMMENTS with or without the close marker.)
   graphql:convert) printf '%s\n' "${GH_STUB_CONVERT_ISDRAFT:-true}" ;;
   graphql)     printf '%s\n' "${GH_STUB_READY_RESULT_ISDRAFT:-false}" ;;
   check-runs)  echo "${GH_STUB_CHECKS:-3}" ;;
@@ -211,7 +213,7 @@ run_step() {
     GH_STUB_MERGE="$GH_STUB_MERGE" GH_STUB_CONVERT_ISDRAFT="$GH_STUB_CONVERT_ISDRAFT" \
     GH_STUB_READY_RESULT_ISDRAFT="$GH_STUB_READY_RESULT_ISDRAFT" \
     GH_STUB_HEAD="$HEAD_SHA" GH_STUB_COMMENTS="$work/comments.txt" \
-    GH_STUB_TOKEN_LOG="$work/token.log" \
+    GH_STUB_TOKEN_LOG="$work/token.log" GH_STUB_CLOSED="${GH_STUB_CLOSED:-}" \
     REFRESH_SKIPPED_FOR_READY="${REFRESH_SKIPPED_FOR_READY_STUB:-}" \
     GH_TOKEN=pat-token-stub ACTIONS_TOKEN=actions-token-stub PAT_AVAILABLE=true REPO=qontinui/qontinui-runner \
     BRANCH=chore/sibling-pin-bump TITLE="chore(ci): bump sibling pins" \
@@ -241,6 +243,34 @@ assert "no PR: summary names the state" 1 "$(count 'draft/ready state: `readied 
 #     the job's permissions block grants checks: read), never on the PAT.
 assert "ready script's gh calls all ran on ACTIONS_TOKEN" 0 "$(grep -E '^(list:ready|check-runs|graphql) ' "$work/token.log" | grep -vc ' actions-token-stub$' || true)"
 assert "ready script's gh calls were made at all" 1 "$( { grep -E '^graphql actions-token-stub$' "$work/token.log" || true; } | wc -l | tr -d ' ')"
+
+# 1c. No open PR, but a CLOSED unmerged one. If ready-bot-draft-pr.sh closed
+#     it as obsolete (its marker is in the comments), open a FRESH PR — its
+#     branch was force-pushed since, and a genuine move deserves a new PR.
+#     A maintainer-closed one is reopened, as before.
+close_marker="$(bash "$ready_script" --print-close-marker)"
+GH_STUB_OPEN=""; GH_STUB_CLOSED=55
+printf 'Closing: obsolete.\n%s\n' "$close_marker" > "$work/comments.txt"
+rc="$(run_step "")"
+assert "closed-as-obsolete candidate: exit code" 0 "$rc"
+assert "closed-as-obsolete candidate: no reopen" 0 "$(calls reopen)"
+assert "closed-as-obsolete candidate: fresh PR created" 1 "$(calls create)"
+assert "closed-as-obsolete candidate: says why" 1 "$(count 'closed as obsolete by ready-bot-draft-pr.sh' "$work/out.txt")"
+printf 'A maintainer closed this.\n' > "$work/comments.txt"
+rc="$(run_step "")"
+assert "maintainer-closed candidate: exit code" 0 "$rc"
+assert "maintainer-closed candidate: reopened as before" 1 "$(calls reopen)"
+assert "maintainer-closed candidate: no create" 0 "$(calls create)"
+rc="$(run_step "comments-read")"
+assert "closed candidate, comments unreadable: exit code" 1 "$rc"
+assert "closed candidate, comments unreadable: never reopened or created" "0 0" "$(calls reopen) $(calls create)"
+GH_STUB_CLOSED=""
+: > "$work/comments.txt"
+# The marker the workflow matches is the script's own: it is read from the
+# script at run time, never re-typed in the workflow.
+assert "workflow reads the close marker from the script" 1 "$(count 'close_marker="\$\(bash scripts/ci/ready-bot-draft-pr.sh --print-close-marker\)"' "$code_only")"
+assert "workflow does not re-type the marker string" 0 "$(count 'ready-bot-draft-pr:closed-obsolete' "$code_only")"
+assert "script's printed marker equals the one its close comment carries" 1 "$(grep -cxF "CLOSE_MARKER='$close_marker'" "$ready_script" || true)"
 
 # 2. Existing DRAFT PR: force-pushed, edited, readied, as before.
 GH_STUB_OPEN=77; GH_STUB_ISDRAFT=true
@@ -457,6 +487,9 @@ if [ -z "${PIN_BUMP_STEP_MUTANT:-}" ]; then
   mutate close-flag-unconditional \
     '$0 == "          if [ \"$DRIFT\" = \"false\" ]; then" { $0 = "          if true; then" } { print }' \
     "move night + conflicting PR: no flag -> not closed"
+  mutate obsolete-marker-check-skipped \
+    '$0 == "              if grep -qF \"$close_marker\" \"$RUNNER_TEMP/closed-pr-comments.txt\"; then" { $0 = "              if false; then" } { print }' \
+    "closed-as-obsolete candidate: no reopen"
   mutate expect-head-dropped \
     '{ sub(/ --expect-head "\$pushed_sha"/, "") } { print }' \
     "ready call pins the pushed head"
