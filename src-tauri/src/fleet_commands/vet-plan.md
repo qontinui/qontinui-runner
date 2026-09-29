@@ -2522,9 +2522,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
    (MCP twin: `coord_gate_list {work_unit_id, open_only: false}`.) **How many
    rows to assert depends on the caller** — the same split as the table at the
-   top of this section: **standalone `/vet-plan` asserts TWO when the
-   attestation landed; ONE (the net) when §5.4 ended REFUSED, and ONE (the net)
-   under `/vet-imp`.** Report each one's `gate_id` **in full**
+   top of this section: **standalone `/vet-plan` asserts TWO when step 5
+   registered the record gate (the attestation landed, or Step A found the unit
+   already past you); ONE (the net) otherwise — §5.4 ended REFUSED, Step A's
+   status was UNKNOWN, or the vet ran under `/vet-imp`.** Report each one's
+   `gate_id` **in full**
    [policy: `coordination` `record-gate-ids-in-full`]:
 
    | expected row | how to recognise it | if it is MISSING |
