@@ -1259,10 +1259,45 @@ fn tenant_id_from_jwt_claim(token: &str, claim: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Where a pair base URL came from and how to change it, built by the caller
+/// (this lib cannot see the bin-side `ApiBaseUrlArm`). Only rendered into the
+/// error when the request never got an answer, where the URL alone leaves the
+/// operator unable to tell which knob chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairBaseOrigin {
+    /// Short name of the rung/caller that chose the base.
+    pub label: String,
+    /// One-line instruction for pointing the pair at a different base.
+    pub remedy: String,
+}
+
+/// The failure text for a `send()` error: `POST <url> failed: <full source
+/// chain>`, plus `. base chosen by <label>. <remedy>` when the fault is a
+/// connect or timeout (the classes a wrong base explains). reqwest's Display
+/// alone prints only `error sending request`, so the chain is walked.
+fn describe_send_error(url: &str, e: &reqwest::Error, origin: &PairBaseOrigin) -> String {
+    let mut chain = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let mut msg = format!("POST {url} failed: {chain}");
+    if e.is_connect() || e.is_timeout() {
+        msg.push_str(&format!(
+            ". base chosen by {}. {}",
+            origin.label, origin.remedy
+        ));
+    }
+    msg
+}
+
 pub fn pair_with_auth_token(
     base: &str,
     oauth_token: &str,
     tenant_id: uuid::Uuid,
+    origin: &PairBaseOrigin,
 ) -> Result<PairCompleteResponse, String> {
     let device_id = read_device_id()?;
     let user_id = read_paired_user_id().ok_or_else(|| {
@@ -1270,7 +1305,7 @@ pub fn pair_with_auth_token(
          (no paired_user.json on disk)"
             .to_string()
     })?;
-    pair_with_auth_token_with_ids(base, oauth_token, &device_id, &user_id, tenant_id)
+    pair_with_auth_token_with_ids(base, oauth_token, &device_id, &user_id, tenant_id, origin)
 }
 
 /// Build the `POST /api/v1/devices/pair-cli` request body.
@@ -1309,6 +1344,7 @@ pub fn pair_with_auth_token_with_ids(
     device_id: &str,
     user_id: &str,
     tenant_id: uuid::Uuid,
+    origin: &PairBaseOrigin,
 ) -> Result<PairCompleteResponse, String> {
     let url = format!("{}/api/v1/devices/pair-cli", base);
     let body = pair_cli_request_body(device_id, tenant_id);
@@ -1324,7 +1360,7 @@ pub fn pair_with_auth_token_with_ids(
         .header("X-Qontinui-User-Id", user_id)
         .json(&body)
         .send()
-        .map_err(|e| format!("POST {} failed: {}", url, e))?;
+        .map_err(|e| describe_send_error(&url, &e, origin))?;
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp
@@ -3760,6 +3796,66 @@ mod pair_e2e_tests {
         uuid::Uuid::parse_str(TEST_TENANT_ID).unwrap()
     }
 
+    fn test_origin() -> PairBaseOrigin {
+        PairBaseOrigin {
+            label: "test-label".to_string(),
+            remedy: "test-remedy: fix the base.".to_string(),
+        }
+    }
+
+    #[test]
+    fn pair_with_auth_token_connect_refused_names_url_label_and_remedy() {
+        // Bind then drop a loopback listener so the port is known-unbound:
+        // the connect is refused locally, no external network involved.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let base = format!("http://127.0.0.1:{port}");
+        let err = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+            &test_origin(),
+        )
+        .expect_err("connect to an unbound port must fail");
+        assert!(
+            err.contains(&format!("POST {base}/api/v1/devices/pair-cli failed: ")),
+            "must name the URL, got: {err}"
+        );
+        assert!(
+            !err.contains("failed: error sending request.") && err.matches(": ").count() >= 2,
+            "must carry the source chain, not just reqwest's Display, got: {err}"
+        );
+        assert!(
+            err.contains("base chosen by test-label."),
+            "must name the label, got: {err}"
+        );
+        assert!(
+            err.contains("test-remedy: fix the base."),
+            "must carry the remedy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn http_status_errors_carry_no_provenance_suffix() {
+        let (base, _capture, _shutdown) =
+            spawn_mock_web_backend(StatusCode::BAD_GATEWAY, "{}".to_string());
+        let err = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+            &test_origin(),
+        )
+        .expect_err("502 must fail");
+        assert!(err.contains("502"), "got: {err}");
+        assert!(!err.contains("base chosen by"), "got: {err}");
+    }
+
     #[test]
     fn pair_with_auth_token_e2e_200_persists_jwt() {
         // Mock web backend at 127.0.0.1:<port> returns the canonical 200 JSON;
@@ -3774,6 +3870,7 @@ mod pair_e2e_tests {
             TEST_DEVICE_ID,
             TEST_USER_ID,
             test_tenant_uuid(),
+            &test_origin(),
         );
         let resp = result.expect("pair_with_auth_token_with_ids should succeed on 200");
         assert_eq!(resp.token, expected_jwt);
@@ -3799,6 +3896,7 @@ mod pair_e2e_tests {
             TEST_DEVICE_ID,
             TEST_USER_ID,
             test_tenant_uuid(),
+            &test_origin(),
         );
         let err = result.expect_err("401 must return Err");
         assert!(
@@ -3821,6 +3919,7 @@ mod pair_e2e_tests {
             TEST_DEVICE_ID,
             TEST_USER_ID,
             test_tenant_uuid(),
+            &test_origin(),
         );
         let err = result.expect_err("500 must return Err");
         assert!(
@@ -3843,6 +3942,7 @@ mod pair_e2e_tests {
             TEST_DEVICE_ID,
             TEST_USER_ID,
             test_tenant_uuid(),
+            &test_origin(),
         )
         .expect("200 path");
 
