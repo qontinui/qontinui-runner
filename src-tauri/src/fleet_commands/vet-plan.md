@@ -1897,9 +1897,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it — a duplicate, parallel run of the same work (the exact concurrent-WIP clobber
 > the coordination layer exists to prevent). So by default: still upsert the work
 > unit, transition its status (per the registry step below — one `→ vetted`
-> call, or REFUSED with the status unchanged), and register the `unit_ready` gate for
-> registry/dashboard visibility keyed on `vetted` (it
-> auto-clears by predicate), but with NO continuation of any kind.
+> call, or REFUSED with the status unchanged), and — unless it was REFUSED —
+> register the `unit_ready` gate for registry/dashboard visibility keyed on
+> `vetted` (it auto-clears by predicate), but with NO continuation of any kind.
 >
 > ⚠️ **On the `unit_ready` gate this is not a default — it is UNCONDITIONAL
 > WHEREVER that gate is registered at all, i.e. on the standalone arm
@@ -2234,17 +2234,22 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
    ⚠️ **Do NOT skip this because step 5 is skipped.** It reads as "the
    prerequisite for step 5's `ready_status`" and it is — but that is not its only
-   consumer. `/implement-plan` Step 0.5 sends `from_status` as a CAS guard on its
-   `→ in_progress` transition, and `unit_status` gates and the dashboards read
-   this column too. A unit left at the empty-string seed because this step was
-   folded into the one below fails that CAS and reports the plan as never
-   vetted. The transition is unconditional; only step 5's gate is caller-scoped.
+   consumer: `unit_status` gates and the dashboards read this column too.
+   (`/implement-plan` Step 0.5 carries no `from_status` guard on its
+   `→ in_progress` transition, so it is not one of them.) A REFUSED attestation
+   leaves the status unchanged BY DESIGN — that is the arm below, not a skipped
+   step. What this warning forbids is never attempting the transition at all.
+   The attempt is unconditional; only step 5's gate is caller-scoped.
 5. **Register the RECORD gate — STANDALONE VETS ONLY. Under `/vet-imp`, SKIP
    this step entirely** and go straight to step 6; say in your report that the
    record gate was deliberately not registered, per the caller table at the top
    of this section. (Skipping it is the fix for a gate that is unclearable ~24%
    of the time under this caller; it is not a degraded path and needs no
-   fallback.) When you DO register it —
+   fallback.) **Also SKIP it when step 4 ended on the REFUSED arm**: a gate keyed
+   on `vetted` over a unit that stays `""`/`draft`, and that `/implement-plan`
+   later moves to `in_progress`, can never clear — nothing on that path writes
+   `→ vetted` — and it pins open exactly as the warning below describes. Report
+   instead: *record gate not registered — attestation OWED, see coord's auto-registered `attestation:vetted` gate <id> (none for `owner_unresolved` / `attester_unresolved`)*. When you DO register it —
    via the transport cascade in the blockquote above (the work unit
    was already upserted in step 1, so `register-gate` will find it): prefer MCP
    `coord_register_gate`; when a raw device JWT is held, the direct device-authed
@@ -2282,9 +2287,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      >
      > Ordering the transition first makes the outcome observed, not guessed. When
      > the attestation lands, the gate is born cleared. When it is REFUSED, the
-     > status is unchanged and the attestation is OWED. The gate keyed on `vetted`
-     > then stays Open until the owed `→ vetted` lands, and that open row is the
-     > visible record of the debt. Never key it on the unchanged status: on a
+     > status is unchanged and the attestation is OWED — and the record gate is
+     > NOT registered (step 5's REFUSED skip): keyed on `vetted` it would pin open
+     > forever, because the unit moves on to `in_progress` without ever passing
+     > through `vetted`. The owed attestation's record is coord's own
+     > `attestation:vetted` gate. Never key it on the unchanged status: on a
      > fresh unit that is `""`, and a `ready_status: ""` gate clears at once,
      > which is the false green Step A forbids. Never key it on a status coord
      > does not recognise either: the old Free fallback status is retired, and a
@@ -2658,9 +2665,9 @@ fallback transition.
  "from_status": "<what Step A read>",
  "reason": "vetted: <one line>",
  "independence": {
-   "verified": "premises re-derived against origin/main; phase sizing recounted",
-   "against":  "plans/<stem>.md at origin/main <sha>",
-   "context":  "fresh-context subagent; received the plan body, not the author's rationale"},
+   "verified": "<what the reviewer verified>",
+   "against":  "<every repo@sha it read, plus plans/<stem>.md at origin/main <sha>>",
+   "context":  "<how it came by a context free of the author's reasoning>"},
  "vet_evidence": [ <the manifest you built in §2a, verbatim> ]}
 ```
 
@@ -2885,8 +2892,8 @@ around it:
   bypasses.
 
 **The REFUSED arm — the vet ends with the status UNCHANGED.** You are here on
-`self_attestation_forbidden` with no honest declaration to send, or on
-`attester_unresolved` from every rung. There is no fallback status. The old
+`self_attestation_forbidden` or `owner_unresolved` with no honest declaration to
+send, or on `attester_unresolved` from every rung. There is no fallback status. The old
 Free fallback status is retired (a coord carrying the Phase 1 change of the plan
 named above refuses it `422 status_retired`), and even where it is still
 accepted, writing it parks the unit in a status coord does not recognise and
@@ -2895,7 +2902,9 @@ writes, then stop:
 
 1. **Store the manifest without a transition:**
    `coord_work_unit_upsert {slug, status:"<the status Step A read>", vet_evidence:[…]}`,
-   over the same ladder. It re-states the current status, so no transition
+   over the same ladder — with rung 1 now asking whether the LOADED schema of
+   `coord_work_unit_upsert` lists `vet_evidence`, and dropping to rung 2 when it
+   does not. It re-states the current status, so no transition
    happens. That write stamps no owner and asks no authz question: its receipt
    answers `admitted_on: no_transition`. Quote `stored` from that receipt. Send
    the status Step A READ — the literal `""` on a row this session just created
@@ -2906,9 +2915,10 @@ writes, then stop:
    (and on `attester_unresolved`, every rung you tried). The plan file's VETTED
    stamp stands: `/implement-plan` gates on that stamp and never reads the
    registry status, so the plan is fully dispatchable meanwhile. What is owed is
-   the registry's `→ vetted`, and with it the derived `ready`. Step 5's record
-   gate, keyed on `vetted`, stays Open until that attestation lands, and that
-   is the intended record of the debt.
+   the registry's `→ vetted`, and with it the derived `ready`. **Do not register
+   step 5's record gate** on this arm (see step 5); report *record gate not registered — attestation OWED, see coord's auto-registered `attestation:vetted` gate <id> (none for `owner_unresolved` / `attester_unresolved`)*.
+   Read the gate id back from coord's gates for this `work_unit_id`; on
+   `owner_unresolved` and `attester_unresolved` coord registers none, by design.
 
 A later session that DOES hold an honest declaration discharges the debt with
 Step B unchanged. The declaration arm ignores the recorded owner, so the session
@@ -3220,10 +3230,18 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
-- **The difficulty outcome** (§5 "Difficulty stamp"): `stamped <level>` with
-  the computed level it overrode and the one-clause reason, `agreed <level>`
-  (no write), or `UNKNOWN — <why>` (read failed, not captured, or unrated; no
-  write). Never report UNKNOWN as agreement
+- **The independence path taken** — `subagent` (Step 1.5 spawned: say whether
+  the `independence` declaration was sent on `coord_work_unit_transition`, over
+  which §5.4 ladder rung, and whether `metadata.attestations` shows it stored)
+  or `self` (no spawn: name why, and confirm the stamp reads `VETTED (self)` with
+  `Independence: NONE`). Where your edit-time re-check contradicted the
+  subagent's verdict, say so. **Transition refused (either path):** the vet
+  ended on §5.4's REFUSED arm — name the code, the rungs tried, that the status
+  is unchanged and the attestation OWED, and that the record gate was not
+  registered (coord's `attestation:vetted` gate id, or none for
+  `owner_unresolved` / `attester_unresolved`). On the subagent path the kept
+  declaration is owed a re-send; on the self path the attestation needs a
+  fresh-context review first
 - **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — no receipt, or `stored` below the count you sent — REQUIRES its evidence:** quote the refusal body coord returned (HTTP status, error code, message) and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without both is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan

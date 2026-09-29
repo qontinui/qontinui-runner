@@ -142,7 +142,9 @@ value (`vetted`/`superseded`/`obsolete`) without an `independence` declaration, 
 a `vetted` key is satisfiable only by a transition that carries one.
 `/vet-plan` §5.4 sends ONE `→ vetted` call carrying that declaration. On a refusal
 it leaves the status unchanged and reports the attestation owed — there is no
-fallback status — and the gate stays Open as the record of that debt.
+fallback status — and registers NO `unit_ready` record gate: a `vetted` key over a
+unit that never reaches `vetted` pins open forever. The debt's record is coord's
+own auto-registered `attestation:vetted` gate.
 (Canonical: `_gate-registration`
 → "`unit_ready` vs `operator_approval`".) **No kind fits?** Either it is a real human
 decision → `operator_approval{prompt}`, or it has **no observable trigger** → it
