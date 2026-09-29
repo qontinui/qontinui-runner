@@ -1361,6 +1361,7 @@ async fn push_chain(
     abort: Arc<AtomicBool>,
     trip_abort: bool,
     credential_deferred: HashMap<HeldScope, bool>,
+    resolved: HashMap<i64, TenantScope>,
 ) -> ChainOutcome {
     let mut out = ChainOutcome {
         session_id: records.first().map(|r| r.session_id).unwrap_or_default(),
@@ -1391,7 +1392,13 @@ async fn push_chain(
         // tenant said no, and holding it would only wait to be told again.
         let refused = rec.event_kind == SessionEventKind::OutputChunk.as_str()
             && transcript_sync_refused(rec.session_id);
-        let scope_key = gated.then(|| held_scope_key(record_session_tenant(&inner, &rec)));
+        // One scope resolution per row per tick: the drain tick's, when it
+        // already resolved this row, else here — and the push reuses it.
+        let scope = resolved
+            .get(&rec.seq)
+            .copied()
+            .unwrap_or_else(|| record_session_tenant(&inner, &rec));
+        let scope_key = gated.then(|| held_scope_key(scope));
         if let Some(uncurable) = scope_key.and_then(|k| credential_held.get(&k).copied()) {
             if !refused {
                 if uncurable && unresolvable_row_expired(rec.recorded_at, now_utc) {
@@ -1409,7 +1416,7 @@ async fn push_chain(
                  transcript_sync_disabled) — dropped unsent until the next start",
             )
         } else {
-            push_record(&inner, &rec).await
+            push_record_with_scope(&inner, &rec, scope).await
         };
         if let Some(k) = scope_key {
             if matches!(
@@ -1842,26 +1849,30 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     // scope of every owner-only row of a holding session once, forget timers
     // for scopes with no pending row left, and key everything below on rows.
     let holding = state.holding_sessions();
-    let row_scope: HashMap<(Uuid, i64), HeldScope> = pending
+    //
+    // Each row's scope is resolved ONCE per tick here and handed to its chain
+    // (`push_chain`'s `resolved`), which neither re-resolves it nor lets the
+    // push re-resolve it: resolution takes the registry mutex and clones a
+    // `SessionDescription`.
+    let row_scope: HashMap<(Uuid, i64), TenantScope> = pending
         .iter()
         .filter(|r| holding.contains(&r.session_id) && is_credential_gated_kind(&r.event_kind))
-        .map(|r| {
-            (
-                (r.session_id, r.seq),
-                held_scope_key(record_session_tenant(inner, r)),
-            )
-        })
+        .map(|r| ((r.session_id, r.seq), record_session_tenant(inner, r)))
         .collect();
     let live_scopes: HashSet<(Uuid, HeldScope)> = row_scope
         .iter()
-        .map(|((sid, _), scope)| (*sid, *scope))
+        .map(|((sid, _), scope)| (*sid, held_scope_key(*scope)))
         .collect();
     state
         .credential_pending
         .retain(|key, _| live_scopes.contains(key));
     let held_rows: HashSet<(Uuid, i64)> = row_scope
         .iter()
-        .filter(|((sid, _), scope)| state.credential_pending.contains_key(&(*sid, **scope)))
+        .filter(|((sid, _), scope)| {
+            state
+                .credential_pending
+                .contains_key(&(*sid, held_scope_key(**scope)))
+        })
         .map(|(key, _)| *key)
         .collect();
     let (session_drops, global_drops) = credential_pending_over_caps(
@@ -1958,6 +1969,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .filter(|((s, _), t)| *s == sid && t.next_attempt_at > now)
             .map(|((_, scope), t)| (*scope, t.uncurable))
             .collect();
+        let resolved: HashMap<i64, TenantScope> = row_scope
+            .iter()
+            .filter(|((s, _), _)| *s == sid)
+            .map(|((_, seq), scope)| (*seq, *scope))
+            .collect();
         push_chain(
             inner.clone(),
             chain,
@@ -1965,6 +1981,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             abort.clone(),
             trip_abort,
             credential_deferred,
+            resolved,
         )
     }))
     .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
@@ -2227,6 +2244,16 @@ enum PushOutcome {
 }
 
 async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOutcome {
+    push_record_with_scope(inner, rec, record_session_tenant(inner, rec)).await
+}
+
+/// [`push_record`] with the owning scope already resolved by the caller
+/// ([`record_session_tenant`]), so the drain resolves each row once per tick.
+async fn push_record_with_scope(
+    inner: &Arc<CoordSyncInner>,
+    rec: &OutboxRecord,
+    scope: TenantScope,
+) -> PushOutcome {
     let base = inner.coord_url.trim_end_matches('/');
     let kind = rec.event_kind.as_str();
 
@@ -2242,7 +2269,6 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // default slot on a single-bound device, byte-identical to the old
     // behaviour, and degrades to unauthenticated on a multi-bound one instead
     // of filing another tenant's session row.
-    let scope = record_session_tenant(inner, rec);
 
     let result = match kind {
         "started" => {
@@ -5570,6 +5596,7 @@ mod tests {
             abort.clone(),
             true,
             HashMap::new(),
+            HashMap::new(),
         )
         .await;
 
@@ -5621,6 +5648,7 @@ mod tests {
             HashMap::new(),
             abort,
             false,
+            HashMap::new(),
             HashMap::new(),
         )
         .await;
@@ -5708,6 +5736,7 @@ mod tests {
             HashMap::new(),
             abort.clone(),
             false,
+            HashMap::new(),
             HashMap::new(),
         )
         .await;

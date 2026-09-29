@@ -582,6 +582,9 @@ mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // Pin the cwd: portable-pty defaults it to $HOME captured at build
+        // time, and a concurrent `IsolatedAmbient` test deletes its temp HOME.
+        cmd.cwd(std::env::temp_dir());
         // Seed a credential so the seal is exercised on the production path,
         // not only in the unit test above.
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
