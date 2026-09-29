@@ -20,7 +20,7 @@
 # assumption; raising this number instead is a visible choice that needs its
 # reason in the PR. When triage brings the count down, the test asks for this
 # number to come down with it, so the gain is held.
-unreviewed_ceiling = 218
+unreviewed_ceiling = 237
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -328,6 +328,16 @@ reviewed = [
 
 [[disposition]]
 class = "supervisor_dependency"
+file = "src/env_agent/collectors.rs"
+symbol = "const KNOWN_DEV_PORTS"
+disposition = "dev_only_surface"
+note = "Liveness probe of the dev-topology ports for the env report; 'closed' is the correct reading on an operator box."
+reviewed = [
+    "(\"supervisor\", 9875),",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
 file = "src/api_config.rs"
 symbol = "get_supervisor_socket_addr"
 disposition = "fallback_correct"
@@ -387,3 +397,123 @@ note = "Runs check_supervisor_available on a blocking thread and passes == Some(
 reviewed = [
     "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
 ]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/app_discovery.rs"
+symbol = "const DESKTOP_APP_PORTS"
+disposition = "fallback_correct"
+note = "One port in a discovery scan list; an absent listener is simply not discovered."
+reviewed = [
+    "9875,",
+]
+
+# Surfaced by the fleet-nouns.toml vocabulary (plan
+# 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# Phase A6): keys the pre-vocabulary roster did not carry. Acknowledged, NOT
+# triaged — each counts toward unreviewed_ceiling until someone reviews it.
+
+[[disposition]]
+class = "dev_ports"
+file = "src/database/embedding_client.rs"
+symbol = "const DEFAULT_EMBEDDING_URL"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "dev_ports"
+file = "src/unified_workflow_executor/phase_helpers.rs"
+symbol = "compute_embedding_sync"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "self_path_hit"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "static CONFIG_REPO_CLAUDE_RE"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_skills/self_path.rs"
+symbol = "static ROOTED_TOKEN_RE"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_worktree/census.rs"
+symbol = "build_and_publish"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_worktree/fs_backstop.rs"
+symbol = "tick_once"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/capability_manifest.rs"
+symbol = "Rung::describe"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/coord_doctor.rs"
+symbol = "render_onboarding_doc"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/env_agent/collectors.rs"
+symbol = "claude_md_plain_ok"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/fleet.rs"
+symbol = "SkillParityViolation::describe"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/fleet_commands.rs"
+symbol = "with_provenance"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/mcp/plan_library.rs"
+symbol = "const WRITE_CONTRACT"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/mcp/session_recap.rs"
+symbol = "analyze_handler"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/reflection/workflow.rs"
+symbol = "build_ui_bridge_completion_steps"
+disposition = "unreviewed"
+note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
