@@ -139,7 +139,9 @@ impl ProbeOutcome {
     pub fn detail(&self) -> String {
         match self {
             ProbeOutcome::Met => "exit 0".to_string(),
-            ProbeOutcome::Exited { code: Some(code), .. } => format!("exit {code}"),
+            ProbeOutcome::Exited {
+                code: Some(code), ..
+            } => format!("exit {code}"),
             ProbeOutcome::Exited { code: None, .. } => "terminated by a signal".to_string(),
             ProbeOutcome::TimedOut { after, .. } => {
                 format!("timed out after {}s", after.as_secs())
@@ -434,11 +436,19 @@ impl ProbeGate {
     /// has passed since the last launch, waiting up to [`INLINE_GRACE`] for
     /// it, and reports the latest unexpired result (NOT met) or that none is
     /// available (NOT met).
-    pub async fn evaluate(&self, task_id: &str, config: &ProbeCondition, now: Instant) -> ProbeVerdict {
+    pub async fn evaluate(
+        &self,
+        task_id: &str,
+        config: &ProbeCondition,
+        now: Instant,
+    ) -> ProbeVerdict {
         let cell = self.cell(task_id, config);
         let mut state = cell.lock().await;
         if state.config != *config {
-            info!(task_id, "scheduler probe: config changed — resetting probe state");
+            info!(
+                task_id,
+                "scheduler probe: config changed — resetting probe state"
+            );
             state.reset(config.clone());
         }
         let window = result_window(config);
@@ -461,9 +471,9 @@ impl ProbeGate {
 
         // Launch when due, and wait briefly for a quick probe's answer.
         let due = state.in_flight.is_none()
-            && state
-                .last_started
-                .is_none_or(|started| now.saturating_duration_since(started) >= effective_poll(config));
+            && state.last_started.is_none_or(|started| {
+                now.saturating_duration_since(started) >= effective_poll(config)
+            });
         if due {
             let command = config.command.clone();
             let timeout = effective_timeout(config);
@@ -741,8 +751,8 @@ mod tests {
         let v = gate.evaluate("t", &config, t0).await;
         assert_eq!(v.detail, "probe running; awaiting its result");
         tokio::time::sleep(Duration::from_secs(4)).await; // the probe has now exited 0
-        // Collected 300 s after launch (> 60 + 30): expired. The relaunch this
-        // evaluation makes takes 12 s, longer than the inline grace.
+                                                          // Collected 300 s after launch (> 60 + 30): expired. The relaunch this
+                                                          // evaluation makes takes 12 s, longer than the inline grace.
         let v = gate
             .evaluate("t", &config, t0 + Duration::from_secs(300))
             .await;
@@ -769,7 +779,10 @@ mod tests {
         let v = gate
             .evaluate("t", &config, t0 + Duration::from_secs(200))
             .await;
-        assert!(!v.met, "a later evaluation must not reuse the spent result: {v:?}");
+        assert!(
+            !v.met,
+            "a later evaluation must not reuse the spent result: {v:?}"
+        );
     }
 
     /// Two concurrent evaluations of one task on a met probe: exactly one is

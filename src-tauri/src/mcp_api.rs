@@ -1644,15 +1644,17 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
-        // The scheduler `ScheduleConditions` this binary EVALUATES, snake_case
-        // (`crate::scheduler_service::EVALUATED_CONDITIONS`, the same const the
-        // evaluator documents itself against). A capability read, not a
-        // version guess: serde silently drops an unknown condition, so a client
-        // registering a gated schedule must see the condition here first — an
-        // absent field or entry means this build would run the task UNGATED
-        // (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-
-        // wide-so-a-24x7-box-never-gets-one, Phase 5).
-        "schedulerConditions": crate::scheduler_service::EVALUATED_CONDITIONS,
+        // The scheduler `ScheduleConditions` this binary actually ENFORCES,
+        // snake_case: the evaluator's list
+        // (`crate::scheduler_service::EVALUATED_CONDITIONS`) when the task store
+        // round-trips a task's conditions, and EMPTY when it does not — a
+        // condition that is evaluated but never persisted is dropped on create
+        // and the task runs ungated. A capability read, not a version guess:
+        // a client registering a gated schedule must see the condition here
+        // first; an absent field or entry means this build would run the task
+        // UNGATED (plan 2026-09-29-quiet-is-measured-by-session-existence-and-
+        // machine-wide-so-a-24x7-box-never-gets-one, Phase 5).
+        "schedulerConditions": crate::scheduler_service::enforced_conditions(),
         // This runner's DEFAULT tenant — what a session that names no tenant
         // is minted into (`machine.json::active_tenant_id`, read live per
         // request via `resolve_tenant_pin()`, so re-pointing the pin shows
@@ -17903,23 +17905,26 @@ mod coord_provision_session_gate_tests {
             .join("\n");
         assert!(
             region.contains(
-                "\"schedulerConditions\": crate::scheduler_service::EVALUATED_CONDITIONS"
+                "\"schedulerConditions\": crate::scheduler_service::enforced_conditions()"
             ),
             "{region}"
         );
-        // And the const renders as the JSON array a client reads.
+        // And it renders as the JSON array a client reads: the evaluator's
+        // list when the task store persists conditions, otherwise empty.
         let rendered = serde_json::json!({
-            "schedulerConditions": crate::scheduler_service::EVALUATED_CONDITIONS,
+            "schedulerConditions": crate::scheduler_service::enforced_conditions(),
         });
-        assert_eq!(
-            rendered["schedulerConditions"],
+        let expected = if crate::database::pg::scheduler::task_store_persists_conditions() {
             serde_json::json!([
                 "require_idle",
                 "require_repo_inactive",
                 "require_probe",
                 "timeout_minutes"
             ])
-        );
+        } else {
+            serde_json::json!([])
+        };
+        assert_eq!(rendered["schedulerConditions"], expected);
     }
 
     /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-

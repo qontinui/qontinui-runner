@@ -347,8 +347,14 @@ pub async fn update_scheduled_task(
         None
     };
 
+    // Conditional write against the snapshot every check above was made on
+    // (the requireProbe echo exemption included): if the row moved since it
+    // was read, nothing is written and the caller gets 409 — a stale
+    // snapshot can never revert a newer change.
+    let read_modified_at = scheduled_task.modified_at.clone();
     scheduled_task.touch();
-    pg.update_scheduled_task(&scheduled_task)
+    let written = pg
+        .update_scheduled_task(&scheduled_task, &read_modified_at)
         .await
         .map_err(|e| {
             (
@@ -356,6 +362,14 @@ pub async fn update_scheduled_task(
                 Json(api_error(format!("Failed to update task: {}", e))),
             )
         })?;
+    if !written {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(api_error(format!(
+                "task {id} changed while this update was being applied; re-read it and retry"
+            ))),
+        ));
+    }
 
     tracing::info!(
         "Updated scheduled task: {} ({})",
@@ -576,12 +590,26 @@ pub async fn reconcile_now(
             )
         })?;
 
-    service.clone().reconcile_missed_runs().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Reconciler failed: {}", e))),
-        )
-    })?;
+    let ran = service
+        .clone()
+        .try_reconcile_missed_runs()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Reconciler failed: {}", e))),
+            )
+        })?;
+    if !ran {
+        // A tick (which may be running a sync task to completion) or another
+        // reconcile holds the pass lock; answer now rather than hang behind it.
+        return Err((
+            StatusCode::CONFLICT,
+            Json(api_error(
+                "a scheduler pass is in progress; retry shortly".to_string(),
+            )),
+        ));
+    }
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "triggered": true,
@@ -673,9 +701,7 @@ mod tests {
             .unwrap_err()
             .contains("unknown"));
         // No probe in the request: nothing to gate.
-        assert!(
-            refuse_untrusted_probe(Some(&principal(OriginClass::Foreign)), None, None).is_ok()
-        );
+        assert!(refuse_untrusted_probe(Some(&principal(OriginClass::Foreign)), None, None).is_ok());
     }
 
     #[test]
@@ -698,8 +724,14 @@ mod tests {
     fn both_task_write_handlers_gate_the_probe_before_persisting() {
         let src = include_str!("scheduler.rs");
         for (handler, write) in [
-            ("pub async fn create_scheduled_task(", "pg.insert_scheduled_task("),
-            ("pub async fn update_scheduled_task(", "pg.update_scheduled_task("),
+            (
+                "pub async fn create_scheduled_task(",
+                "pg.insert_scheduled_task(",
+            ),
+            (
+                "pub async fn update_scheduled_task(",
+                "pg.update_scheduled_task(",
+            ),
         ] {
             let (_, body) = src.split_once(handler).expect(handler);
             let (before_gate, _) = body
@@ -712,5 +744,47 @@ mod tests {
             );
             assert!(before_gate.contains("Option<axum::Extension<RequesterPrincipal>>"));
         }
+    }
+
+    /// The update is a conditional write keyed on the `modified_at` the
+    /// handler read, and a lost race is a 409 (review round 2: the echo
+    /// exemption was a read-then-write TOCTOU).
+    #[test]
+    fn the_update_is_a_conditional_write_on_the_modified_at_it_read() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn update_scheduled_task(")
+            .expect("update handler");
+        let (body, _) = body
+            .split_once("pub async fn delete_scheduled_task(")
+            .expect("update handler ends");
+        let (before_touch, _) = body
+            .split_once("scheduled_task.touch();")
+            .expect("touch");
+        assert!(before_touch.contains("let read_modified_at = scheduled_task.modified_at.clone();"));
+        assert!(body.contains(".update_scheduled_task(&scheduled_task, &read_modified_at)"));
+        assert!(body.contains("StatusCode::CONFLICT"));
+
+        let pg = include_str!("../database/pg/scheduler.rs");
+        assert!(pg.contains("WHERE id = $17 AND modified_at = $18"));
+        assert!(pg.contains("Ok(updated == 1)"));
+    }
+
+    /// `/scheduler/reconcile-now` does not wait behind a pass in progress; the
+    /// wake handler skips instead of waiting.
+    #[test]
+    fn reconcile_now_and_the_wake_handler_never_wait_behind_a_pass() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn reconcile_now(")
+            .expect("reconcile_now");
+        let (body, _) = body.split_once("\n}\n").expect("reconcile_now ends");
+        assert!(body.contains(".try_reconcile_missed_runs()"));
+        assert!(!body.contains(".reconcile_missed_runs()"));
+        assert!(body.contains("StatusCode::CONFLICT"));
+
+        let wake = include_str!("../wake_handler.rs");
+        assert!(wake.contains("service.try_tick().await"));
+        assert!(!wake.contains("service.tick().await"));
     }
 }

@@ -232,11 +232,22 @@ async fn trigger_scheduler_tick(intent: Option<String>, task_id: Option<String>)
         "Wake deep-link triggering immediate scheduler tick (intent={:?}, task_id={:?})",
         intent, task_id
     );
-    service.tick().await;
-    info!(
-        "Wake-triggered scheduler tick complete (intent={:?}, task_id={:?})",
-        intent, task_id
-    );
+    // try_tick: a pass already in progress (a tick running a sync task, or a
+    // reconcile) would otherwise hold this call for its whole duration. The
+    // regular loop ticks again within a minute, so skipping loses nothing.
+    if service.try_tick().await {
+        info!(
+            "Wake-triggered scheduler tick complete (intent={:?}, task_id={:?})",
+            intent, task_id
+        );
+    } else {
+        info!(
+            "Wake deep-link: a scheduler pass is already in progress; skipping the \
+             immediate tick — the regular loop will pick due tasks up (intent={:?}, \
+             task_id={:?})",
+            intent, task_id
+        );
+    }
 }
 
 /// Helper invoked by the single-instance plugin closure when a *second* runner
