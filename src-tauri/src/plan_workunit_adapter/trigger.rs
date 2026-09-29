@@ -14156,11 +14156,7 @@ Body.
             r.forb.retirement_for("s", file_status),
             Some(RetirementReason::PermanentForStatus)
         );
-        assert_eq!(
-            r.forb.retirement_for("s", current),
-            None,
-            "pair, not slug"
-        );
+        assert_eq!(r.forb.retirement_for("s", current), None, "pair, not slug");
 
         let upserts_before = *sink.upsert_calls.lock().unwrap();
         let second = r.cycle(&sink, &[unit("s", file_status)]).await;
@@ -14225,7 +14221,10 @@ Body.
             0,
             "zero transitions were even attempted"
         );
-        assert_eq!(summary.seeded, 1, "the cold start seeds `{current}` from coord");
+        assert_eq!(
+            summary.seeded, 1,
+            "the cold start seeds `{current}` from coord"
+        );
         assert_eq!(
             summary.deferred, 1,
             "`{owner}` owns the unit, so the push is Deferred"
