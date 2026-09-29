@@ -215,10 +215,17 @@ gh_calls="$( { grep -oE "(^|[^'\"])gh pr " "$code_only" || true; } | wc -l | tr 
 # (fail => remediation + exit 1) and the PAT create's positive
 # `if url="$(GH_TOKEN="$PAT_TOKEN" gh pr create ...)"; then ... else` (fail =>
 # ::warning:: + fall back to GITHUB_TOKEN).
-guard_re='^[[:space:]]*if (! )?(url=)?"?\$?\(?(GH_TOKEN="\$PAT_TOKEN" )?gh pr '
+guard_re='^[[:space:]]*if (! )?([a-z_]+=)?"?\$?\(?(GH_TOKEN="\$PAT_TOKEN" )?gh pr '
 guarded="$(grep -cE "$guard_re" "$code_only" || true)"
-assert "gh calls in executable code" 5 "$gh_calls"
-assert "guarded gh calls (all but the bare open lookup)" 4 "$guarded"
+assert "gh calls in executable code" 7 "$gh_calls"
+assert "guarded gh calls (all but the bare open lookup)" 6 "$guarded"
+# The REST reads/writes (`gh api`) the ready-PR guard makes are every one of
+# them inside an `if !`: an unread comment list must never read as "not yet
+# commented".
+gh_api_calls="$( { grep -oE "(^|[^'\"])gh api " "$code_only" || true; } | wc -l | tr -d ' ')"
+gh_api_guarded="$(grep -cE '^[[:space:]]*if ! gh api ' "$code_only" || true)"
+assert "gh api calls in executable code" 2 "$gh_api_calls"
+assert "every gh api call is guarded" 2 "$gh_api_guarded"
 # The one bare call must be the open lookup and nothing else. Without this,
 # swapping which call is bare (guarding `list`, un-guarding `edit`) keeps both
 # counts and passes vacuously.
@@ -261,6 +268,12 @@ cat > "$bin/gh" <<'STUB'
 # `list:ready`, and its REST/GraphQL calls key as `graphql`, `check-runs`,
 # `comments-read` and `comment-post`. Knobs: GH_STUB_READY_LINE (the lookup's
 # TSV row; "none" = no open PR), GH_STUB_CHECKS, GH_STUB_GRAPHQL_ISDRAFT.
+#
+# And the step's own ready-PR guard: `pr view --json isDraft` answers
+# GH_STUB_ISDRAFT (default true, i.e. the pre-existing force-push path);
+# `api repos/<r>/pulls/<n>` (key `pr-body`) answers GH_STUB_PR_BODY; `pr
+# comment` APPENDS its --body-file to GH_STUB_COMMENTS, which `comments-read`
+# returns — so dedup across runs is exercised against real accumulated state.
 prev=""
 json=""
 method="GET"
@@ -278,6 +291,7 @@ if [ "${1:-}" = "api" ]; then
     *" graphql "*)   key="graphql" ;;
     *"/check-runs"*) key="check-runs" ;;
     *"/comments"*)   if [ "$method" = "POST" ]; then key="comment-post"; else key="comments-read"; fi ;;
+    *"/pulls/"*)     key="pr-body" ;;
     *)               key="api:unhandled" ;;
   esac
 fi
@@ -302,7 +316,16 @@ case "$key" in
     ;;
   check-runs)    printf '%s\n' "${GH_STUB_CHECKS:-3}" ;;
   graphql)       printf '%s\n' "${GH_STUB_GRAPHQL_ISDRAFT:-false}" ;;
-  comments-read) : ;;
+  comments-read) if [ -n "${GH_STUB_COMMENTS:-}" ] && [ -f "$GH_STUB_COMMENTS" ]; then cat "$GH_STUB_COMMENTS"; fi ;;
+  pr-body)       printf '%s\n' "${GH_STUB_PR_BODY:-}" ;;
+  view:isDraft)  printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
+  comment)
+    body_file=""; prev=""
+    for a in "$@"; do [ "$prev" = "--body-file" ] && body_file="$a"; prev="$a"; done
+    [ -f "$body_file" ] || { echo "gh stub: comment without --body-file" >&2; exit 98; }
+    cat "$body_file" >> "${GH_STUB_COMMENTS:?}"
+    echo "https://github.com/qontinui/qontinui-runner/pull/77#issuecomment-1"
+    ;;
   comment-post)  echo "https://github.com/qontinui/qontinui-runner/pull/4242#issuecomment-1" ;;
   # GH_STUB_EMPTY_URL models a gh that exits 0 having printed nothing.
   view:url)  [ -n "${GH_STUB_EMPTY_URL:-}" ] || printf '%s\n' "${GH_STUB_URL:?}" ;;
@@ -358,8 +381,13 @@ PAT_TOKEN_STUB="stub-pat-token"
 GH_STUB_READY_LINE=""
 GH_STUB_CHECKS=3
 GH_STUB_GRAPHQL_ISDRAFT=false
+GH_STUB_ISDRAFT=true
+GH_STUB_PR_BODY=""
+GH_STUB_COMMENTS="$work/comments.txt"
+: > "$GH_STUB_COMMENTS"
 export GH_STUB_EMPTY_URL GH_STUB_FAIL_FIRST_CREATE GIT_STUB_STAGED PAT_TOKEN_STUB
 export GH_STUB_READY_LINE GH_STUB_CHECKS GH_STUB_GRAPHQL_ISDRAFT
+export GH_STUB_ISDRAFT GH_STUB_PR_BODY GH_STUB_COMMENTS
 
 # run_step <fail-keys> <list-open>
 # Echoes the exit code; leaves stdout+stderr in $work/out.txt, the gh call log in
@@ -383,6 +411,9 @@ run_step() {
     GH_STUB_READY_LINE="${GH_STUB_READY_LINE:-}" \
     GH_STUB_CHECKS="${GH_STUB_CHECKS:-3}" \
     GH_STUB_GRAPHQL_ISDRAFT="${GH_STUB_GRAPHQL_ISDRAFT:-false}" \
+    GH_STUB_ISDRAFT="${GH_STUB_ISDRAFT:-true}" \
+    GH_STUB_PR_BODY="${GH_STUB_PR_BODY:-}" \
+    GH_STUB_COMMENTS="$GH_STUB_COMMENTS" \
     GH_TOKEN="stub-token" \
     PAT_TOKEN="${PAT_TOKEN_STUB:-}" \
     REPO="qontinui/qontinui-runner" \
@@ -487,6 +518,68 @@ rc="$(run_step "" "")"
 GH_STUB_EMPTY_URL=""
 assert "empty url on create: hard red" 1 "$rc"
 assert "empty url on create: names the read-back" 1 "$(grep -c 'URL read-back' "$work/out.txt" || true)"
+
+# 9a. An existing DRAFT PR is still force-pushed and edited, exactly as before.
+: > "$GH_STUB_COMMENTS"
+rc="$(run_step "" "77")"
+assert "draft PR: exit code" 0 "$rc"
+assert "draft PR: isDraft was read" 1 "$(grep -c '^view:isDraft$' "$work/gh.log" || true)"
+assert "draft PR: force-pushed" 1 "$(grep -c 'push --force' "$work/git.log" || true)"
+assert "draft PR: edited" 1 "$(grep -c '^edit$' "$work/gh.log" || true)"
+assert "draft PR: no drift comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+
+# 9b. An existing READY PR (possibly a live merge-train candidate) is NEVER
+#     force-pushed. The drift arrives as a comment, deduped across runs.
+GH_STUB_ISDRAFT=false
+: > "$GH_STUB_COMMENTS"
+rc1="$(run_step "" "77")"
+push1="$(grep -c 'push' "$work/git.log" || true)"
+checkout1="$(grep -c 'checkout -B' "$work/git.log" || true)"
+edit_create1="$(grep -cE '^(edit|create|list:ready|graphql)$' "$work/gh.log" || true)"
+warn1="$(grep -c '::warning::Refresh PR #77 is marked ready' "$work/out.txt" || true)"
+rc2="$(run_step "" "77")"
+push2="$(grep -c 'push' "$work/git.log" || true)"
+assert "ready PR: exit code (green)" 0 "$rc1"
+assert "ready PR: no push" 0 "$push1"
+assert "ready PR: branch not even rebuilt" 0 "$checkout1"
+assert "ready PR: no edit/create/ready-script call" 0 "$edit_create1"
+assert "ready PR: warns it did not force-push" 1 "$warn1"
+assert "ready PR, second identical run: exit code" 0 "$rc2"
+assert "ready PR, second identical run: no push" 0 "$push2"
+assert "ready PR: exactly one comment across two identical runs" 1 "$(grep -c 'schema-pg-sql-refresh-dump:' "$GH_STUB_COMMENTS" || true)"
+assert "ready PR: comment says not force-pushed" 1 "$(grep -c 'was \*\*not\*\* force-pushed' "$GH_STUB_COMMENTS" || true)"
+# A DIFFERENT drift is news: a second comment.
+cp "$runner_temp/schema.fresh.sql" "$work/fresh.orig.sql"
+printf 'CREATE TABLE coord.later ();\n' >> "$runner_temp/schema.fresh.sql"
+rc="$(run_step "" "77")"
+assert "ready PR, different drift: exit code" 0 "$rc"
+assert "ready PR, different drift: a second comment" 2 "$(grep -c 'schema-pg-sql-refresh-dump:' "$GH_STUB_COMMENTS" || true)"
+assert "ready PR, different drift: still no push" 0 "$(grep -c 'push' "$work/git.log" || true)"
+cp "$work/fresh.orig.sql" "$runner_temp/schema.fresh.sql"
+# The PR body already carries this dump's marker (it was pushed with it): the
+# first ready night must not announce drift the PR already holds.
+: > "$GH_STUB_COMMENTS"
+GH_STUB_PR_BODY="$(bash -c "awk '!/^-- Dumped by pg_dump version/' '$runner_temp/schema.fresh.sql' | sha256sum | cut -c1-16" | sed 's/^/<!-- schema-pg-sql-refresh-dump:/; s/$/ -->/')"
+rc="$(run_step "" "77")"
+GH_STUB_PR_BODY=""
+assert "ready PR carrying this dump: exit code" 0 "$rc"
+assert "ready PR carrying this dump: no comment" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+# Unreadable state is a red, never a guess — and never a push.
+rc="$(run_step "view:isDraft" "77")"
+assert "isDraft unreadable: exit code" 1 "$rc"
+assert "isDraft unreadable: never pushed" 0 "$(grep -c 'push' "$work/git.log" || true)"
+rc="$(run_step "comments-read" "77")"
+assert "comments unreadable: exit code" 1 "$rc"
+assert "comments unreadable: never comments blind" 0 "$(grep -c '^comment$' "$work/gh.log" || true)"
+rc="$(run_step "comment" "77")"
+assert "comment refused: exit code" 1 "$rc"
+assert "comment refused: reporter names the op" 1 "$(grep -c "'comment on #77' operation failed" "$work/out.txt" || true)"
+GH_STUB_ISDRAFT=true
+: > "$GH_STUB_COMMENTS"
+
+# The body the step writes on the push path carries the marker the guard reads.
+rc="$(run_step "" "")"
+assert "push path: PR body carries the dump marker" 1 "$(grep -c 'schema-pg-sql-refresh-dump:' "$runner_temp/pr-body.md" || true)"
 
 # 10. The draft->ready script fails AFTER the PR was written => a red through
 #     pr_op_failed's ready arm, never a green with the draft undecided.
@@ -782,6 +875,14 @@ if [ -z "${SCHEMA_STEP_MUTANT:-}" ]; then
   mutate healed-hardcoded-false \
     '$0 == "            echo \"healed=$healed\"" { $0 = "            echo \"healed=false\"" } { print }' \
     "drift + self-heal: healed=true"
+  # Remove the ready-PR guard: a ready PR would be force-pushed again.
+  mutate ready-guard-removed \
+    '$0 == "            if [ \"$existing_draft\" != \"true\" ]; then" { $0 = "            if false; then" } { print }' \
+    "ready PR: no push"
+  # Break the dedup: every run comments.
+  mutate dedup-broken \
+    '$0 == "              if grep -qF \"$drift_marker\" \"$seen\"; then" { $0 = "              if false; then" } { print }' \
+    "ready PR: exactly one comment across two identical runs"
 fi
 echo ""
 if [ "$failures" -ne 0 ]; then
