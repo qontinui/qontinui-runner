@@ -724,7 +724,7 @@ struct RootListing {
     /// The `*.md` files the scan will read.
     files: Vec<PathBuf>,
     /// Subdirectories, which are NOT descended into (the roots are flat,
-    /// matching [`super::trigger::read_plan_dir`]) — but they are RECORDED,
+    /// matching [`super::trigger::scan_plan_dir`]) — but they are RECORDED,
     /// because a dry-run that silently omits them reads as "there is nothing
     /// there" when the truth is "this was never looked at". Absence of a
     /// report is not a report of absence.
@@ -770,7 +770,7 @@ enum EntryKind {
 }
 
 /// Whether a path's NAME could carry a plan stem — `extension() == "md"`,
-/// matching [`super::trigger::read_plan_dir`].
+/// matching [`super::trigger::scan_plan_dir`].
 ///
 /// A NAME test, deliberately: `read_dir` hands the name over before any
 /// further syscall, so this answer survives the metadata read failing. That is
@@ -950,7 +950,7 @@ where
 }
 
 /// Read + classify every `*.md` in one root (non-recursive, matching the flat
-/// layout [`super::trigger::read_plan_dir`] already assumes). A dir that will
+/// layout [`super::trigger::scan_plan_dir`] already assumes). A dir that will
 /// not read — a missing one included, since roots come only from explicit
 /// configuration — yields nothing and records `unreadable_dir`, which the
 /// dry-run table renders as UNKNOWN; per-file IO errors are collected, never

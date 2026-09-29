@@ -537,12 +537,15 @@ fn slugify_pathname(pathname: &str) -> String {
 async fn flywheel_dedupes_concurrent_scans() {
     use crate::database::pg::PgDb;
 
-    let db = PgDb::new_blocking_for_test();
+    let _guard = crate::database::pg::spec_proposals::SPEC_PROPOSALS_TEST_LOCK
+        .lock()
+        .await;
+    let db = PgDb::new_for_test().await;
     // Wipe any prior test rows so dedup behaves deterministically. Mirrors
     // the `fresh_db` fixture used in proposals::tests::pg.
     {
         let conn = db.pool().get().await.expect("pg conn");
-        conn.execute("TRUNCATE TABLE spec_proposals", &[])
+        conn.execute("TRUNCATE TABLE atlas_managed.spec_proposals", &[])
             .await
             .expect("truncate spec_proposals");
     }

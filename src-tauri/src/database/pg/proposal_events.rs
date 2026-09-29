@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for `project.proposal_events` — Plan 06 Step 6 (G.6)
+//! PostgreSQL CRUD for `atlas_managed.proposal_events` — Plan 06 Step 6 (G.6)
 //! flywheel observability.
 //!
 //! The table is authored declaratively in `atlas/schema.hcl`; this module
@@ -22,7 +22,7 @@
 use super::PgDb;
 use serde::{Deserialize, Serialize};
 
-/// One row from `project.proposal_events`.
+/// One row from `atlas_managed.proposal_events`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalEventRow {
     pub id: String,
@@ -65,7 +65,7 @@ impl PgDb {
         let id = uuid::Uuid::now_v7().to_string();
         conn.execute(
             r#"
-            INSERT INTO proposal_events
+            INSERT INTO atlas_managed.proposal_events
                 (id, app_id, proposal_id, event_type, snapshot_id, failing_assertion_id)
             VALUES ($1, $2, $3, $4, $5, $6)
             "#,
@@ -112,7 +112,7 @@ impl PgDb {
                     failing_assertion_id,
                     at::TEXT,
                     app_id
-                FROM proposal_events
+                FROM atlas_managed.proposal_events
                 ORDER BY at DESC, id
                 LIMIT $1
                 "#,
@@ -148,7 +148,7 @@ impl PgDb {
                     failing_assertion_id,
                     at::TEXT,
                     app_id
-                FROM proposal_events
+                FROM atlas_managed.proposal_events
                 WHERE app_id = $1
                 ORDER BY at DESC, id
                 LIMIT $2
@@ -187,7 +187,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT count(*)::bigint
-                FROM proposal_events
+                FROM atlas_managed.proposal_events
                 WHERE event_type = $2
                   AND at > now() - make_interval(days => $1)
                 "#,
@@ -221,7 +221,7 @@ impl PgDb {
             .query_one(
                 r#"
                 SELECT count(*)::bigint
-                FROM proposal_events
+                FROM atlas_managed.proposal_events
                 WHERE app_id = $1
                   AND event_type = $2
                   AND at > now() - make_interval(days => $3)

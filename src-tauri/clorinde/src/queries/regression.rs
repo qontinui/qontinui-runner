@@ -382,7 +382,7 @@ where
 pub struct SaveRegressionSuiteStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn save_regression_suite() -> SaveRegressionSuiteStmt {
     SaveRegressionSuiteStmt(
-        "INSERT INTO regression_suites (id, ir_doc_id, suite_json) VALUES ($1::uuid, $2, $3::jsonb) RETURNING id",
+        "INSERT INTO atlas_managed.regression_suites (id, ir_doc_id, suite_json) VALUES ($1::uuid, $2, $3::jsonb) RETURNING id",
         None,
     )
 }
@@ -437,7 +437,7 @@ impl<
 pub struct RecordRegressionRunStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn record_regression_run() -> RecordRegressionRunStmt {
     RecordRegressionRunStmt(
-        "INSERT INTO regression_runs ( id, suite_id, run_id, passed, failed, started_at, completed_at, run_result_json ) VALUES ( $1::uuid, $2::uuid, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::jsonb ) RETURNING id",
+        "INSERT INTO atlas_managed.regression_runs ( id, suite_id, run_id, passed, failed, started_at, completed_at, run_result_json ) VALUES ( $1::uuid, $2::uuid, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::jsonb ) RETURNING id",
         None,
     )
 }
@@ -519,7 +519,7 @@ pub struct RecordRegressionDiagnosisStmt(
 );
 pub fn record_regression_diagnosis() -> RecordRegressionDiagnosisStmt {
     RecordRegressionDiagnosisStmt(
-        "INSERT INTO regression_diagnoses (id, run_id, diagnosis_json) VALUES ($1::uuid, $2::uuid, $3::jsonb) RETURNING id",
+        "INSERT INTO atlas_managed.regression_diagnoses (id, run_id, diagnosis_json) VALUES ($1::uuid, $2::uuid, $3::jsonb) RETURNING id",
         None,
     )
 }
@@ -576,7 +576,7 @@ pub struct RecordAssertionExecutionsBatchStmt(
 );
 pub fn record_assertion_executions_batch() -> RecordAssertionExecutionsBatchStmt {
     RecordAssertionExecutionsBatchStmt(
-        "INSERT INTO regression_assertion_executions ( id, run_id, case_id, assertion_id, assertion_kind, status, started_at, duration_ms, failure_kind, failure_evidence_json, error_message ) SELECT (e->>'id')::uuid, (e->>'run_id')::uuid, e->>'case_id', e->>'assertion_id', e->>'assertion_kind', e->>'status', (e->>'started_at')::timestamptz, (e->>'duration_ms')::int, e->>'failure_kind', e->'failure_evidence_json', e->>'error_message' FROM jsonb_array_elements($1::jsonb) AS e",
+        "INSERT INTO atlas_managed.regression_assertion_executions ( id, run_id, case_id, assertion_id, assertion_kind, status, started_at, duration_ms, failure_kind, failure_evidence_json, error_message ) SELECT (e->>'id')::uuid, (e->>'run_id')::uuid, e->>'case_id', e->>'assertion_id', e->>'assertion_kind', e->>'status', (e->>'started_at')::timestamptz, (e->>'duration_ms')::int, e->>'failure_kind', e->'failure_evidence_json', e->>'error_message' FROM jsonb_array_elements($1::jsonb) AS e",
         None,
     )
 }
@@ -602,7 +602,7 @@ pub struct GetAssertionExecutionsForSuiteStmt(
 );
 pub fn get_assertion_executions_for_suite() -> GetAssertionExecutionsForSuiteStmt {
     GetAssertionExecutionsForSuiteStmt(
-        "SELECT ae.case_id, ae.assertion_id, ae.started_at::TEXT AS started_at, ae.status, ae.assertion_kind, ae.duration_ms, ae.failure_kind, ae.error_message FROM regression_assertion_executions ae JOIN regression_runs r ON r.id = ae.run_id WHERE r.suite_id = $1::uuid ORDER BY ae.started_at ASC",
+        "SELECT ae.case_id, ae.assertion_id, ae.started_at::TEXT AS started_at, ae.status, ae.assertion_kind, ae.duration_ms, ae.failure_kind, ae.error_message FROM atlas_managed.regression_assertion_executions ae JOIN atlas_managed.regression_runs r ON r.id = ae.run_id WHERE r.suite_id = $1::uuid ORDER BY ae.started_at ASC",
         None,
     )
 }
@@ -655,7 +655,7 @@ pub struct GetRecentDiagnosesForSuiteStmt(
 );
 pub fn get_recent_diagnoses_for_suite() -> GetRecentDiagnosesForSuiteStmt {
     GetRecentDiagnosesForSuiteStmt(
-        "SELECT d.id, d.run_id, d.diagnosis_json, d.created_at::TEXT AS created_at FROM regression_diagnoses d JOIN regression_runs r ON r.id = d.run_id WHERE r.suite_id = $1::uuid ORDER BY d.created_at DESC LIMIT $2",
+        "SELECT d.id, d.run_id, d.diagnosis_json, d.created_at::TEXT AS created_at FROM atlas_managed.regression_diagnoses d JOIN atlas_managed.regression_runs r ON r.id = d.run_id WHERE r.suite_id = $1::uuid ORDER BY d.created_at DESC LIMIT $2",
         None,
     )
 }

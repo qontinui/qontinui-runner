@@ -1,4 +1,4 @@
-//! PostgreSQL CRUD for `project.spec_proposals` — Stream E (Flywheel) queue.
+//! PostgreSQL CRUD for `atlas_managed.spec_proposals` — Stream E (Flywheel) queue.
 //!
 //! The table is authored declaratively in `atlas/schema.hcl`; this module
 //! issues the queries directly via `tokio_postgres`, mirroring the
@@ -17,7 +17,15 @@ use super::PgDb;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One row from `project.spec_proposals`.
+/// Serializes the PG tests that TRUNCATE `atlas_managed.spec_proposals` and
+/// then assert on its contents (`spec_api::proposals::tests::pg`,
+/// `flywheel_e2e_tests`): run concurrently, one test's TRUNCATE wipes the row
+/// another just inserted.
+#[cfg(all(test, feature = "pg_integration_tests"))]
+pub(crate) static SPEC_PROPOSALS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// One row from `atlas_managed.spec_proposals`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecProposalRow {
     pub id: String,
@@ -68,7 +76,7 @@ impl PgDb {
         let rows_affected = conn
             .execute(
                 r#"
-                INSERT INTO spec_proposals (id, kind, pathname, spec_id, status, metadata)
+                INSERT INTO atlas_managed.spec_proposals (id, kind, pathname, spec_id, status, metadata)
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
                 ON CONFLICT DO NOTHING
                 "#,
@@ -90,7 +98,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
-            "UPDATE spec_proposals SET status = $2 WHERE id = $1",
+            "UPDATE atlas_managed.spec_proposals SET status = $2 WHERE id = $1",
             &[&id, &status],
         )
         .await
@@ -107,7 +115,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
-            "UPDATE spec_proposals SET last_attempt_at = now() WHERE id = $1",
+            "UPDATE atlas_managed.spec_proposals SET last_attempt_at = now() WHERE id = $1",
             &[&id],
         )
         .await
@@ -129,7 +137,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
-            r#"UPDATE spec_proposals
+            r#"UPDATE atlas_managed.spec_proposals
                SET status = $2,
                    last_error = $3,
                    last_attempt_at = now()
@@ -154,7 +162,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
-            "UPDATE spec_proposals SET consecutive_greens = $2 WHERE id = $1",
+            "UPDATE atlas_managed.spec_proposals SET consecutive_greens = $2 WHERE id = $1",
             &[&id, &consecutive_greens],
         )
         .await
@@ -176,7 +184,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
-            r#"UPDATE spec_proposals
+            r#"UPDATE atlas_managed.spec_proposals
                SET status = $2,
                    candidate_ir = $3::jsonb,
                    last_attempt_at = now(),
@@ -215,7 +223,7 @@ impl PgDb {
                     last_error,
                     candidate_ir,
                     metadata
-                FROM spec_proposals
+                FROM atlas_managed.spec_proposals
                 WHERE id = $1
                 "#,
                 &[&id],
@@ -254,7 +262,7 @@ impl PgDb {
                     last_error,
                     candidate_ir,
                     metadata
-                FROM spec_proposals
+                FROM atlas_managed.spec_proposals
                 ORDER BY created_at DESC, id
                 LIMIT $1 OFFSET $2
                 "#,
@@ -295,7 +303,7 @@ impl PgDb {
                     last_error,
                     candidate_ir,
                     metadata
-                FROM spec_proposals
+                FROM atlas_managed.spec_proposals
                 WHERE status = $1
                 ORDER BY created_at DESC, id
                 LIMIT $2

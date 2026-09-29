@@ -81,8 +81,15 @@ vi.mock("@qontinui/ui-bridge", () => ({
 // `navigator.clipboard` does not exist under `environment: "node"`; the `paste`
 // action (item 5) is defined in terms of it on BOTH paths.
 const clipboardText = { value: "" };
+// Set to make the next `readText()` REJECT (permission denied / not focused).
+const clipboardRejection: { value: Error | null } = { value: null };
 vi.stubGlobal("navigator", {
-  clipboard: { readText: async () => clipboardText.value },
+  clipboard: {
+    readText: async () => {
+      if (clipboardRejection.value) throw clipboardRejection.value;
+      return clipboardText.value;
+    },
+  },
 });
 
 const { attached, invoke } = vi.hoisted(() => ({
@@ -187,6 +194,7 @@ beforeEach(() => {
   attached.length = 0;
   invoke.mockClear();
   clipboardText.value = "";
+  clipboardRejection.value = null;
   // Default the id-addressed bracketed-paste probe (item 6) to "off" so the
   // suites that do not care about it read like the pre-iteration-24 behaviour;
   // the item-6 suite overrides it per test.
@@ -420,6 +428,23 @@ describe("TerminalBridgeProxies paste — exists on this path too (iter 24, item
     clipboardText.value = "";
     const paste = handlerFor(LIVE_TABS, "term-live", "paste");
     await expect(paste()).resolves.toEqual({ success: true, bytes: 0 });
+    expect(ptyWriteCount()).toBe(0);
+  });
+
+  it("throws CLIPBOARD_READ_FAILED on a REJECTED read — never a zero-byte success", async () => {
+    clipboardRejection.value = new Error("Document is not focused.");
+    const paste = handlerFor(LIVE_TABS, "term-live", "paste");
+    let caught: (Error & { code?: string }) | null = null;
+    let resolved: unknown = "<not resolved>";
+    try {
+      resolved = await paste();
+    } catch (err) {
+      caught = err as Error & { code?: string };
+    }
+    expect(resolved).toBe("<not resolved>");
+    expect(caught?.code).toBe("CLIPBOARD_READ_FAILED");
+    expect(caught?.message).toContain("Document is not focused.");
+    // A failed read wrote nothing to someone's live PTY.
     expect(ptyWriteCount()).toBe(0);
   });
 
@@ -947,5 +972,18 @@ describe("pane custom actions refuse a malformed BAG before any write", () => {
     const code = codeOf("TerminalInstance.tsx");
     expect(code.match(/scrollbackTail\(/g) ?? []).toHaveLength(2);
     expect(code).not.toMatch(/Math\.max\(0,\s*totalLines\s*-/);
+  });
+});
+
+// ── paste: a rejected clipboard read is a failure on BOTH paths ─────────────
+// The proxy path is proved behaviorally above; `TerminalInstance` cannot be
+// imported under `environment: "node"`, so its wiring is proved from source —
+// the same technique as every other guard in this block.
+describe("both paste paths share the rejecting clipboard reader", () => {
+  it.each(PATHS.map((f) => [f]))("%s reads the clipboard through readClipboardForPaste", (file) => {
+    const code = codeOf(file);
+    expect(code).toMatch(/const text = await readClipboardForPaste\(\);/);
+    // The swallow that made a rejected read look like an empty clipboard.
+    expect(code).not.toMatch(/readText\(\)\s*\.catch\(\s*\(\)\s*=>\s*""\s*\)/);
   });
 });

@@ -63,6 +63,7 @@ import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
 import { IncomingHandoffToastBridge } from "./components/session/IncomingHandoffToastBridge";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
+import { BindingGapAskBanner } from "./components/BindingGapAskBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -769,6 +770,7 @@ function AppContent() {
           safe pre-auth.
         */}
           <WebIntegrationAuthBanner />
+          <BindingGapAskBanner />
           <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
             <StatusIndicator
               pythonStatus={execution.pythonStatus}

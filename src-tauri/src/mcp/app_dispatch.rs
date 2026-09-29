@@ -70,6 +70,44 @@ pub enum DispatchError {
 
     #[error("app returned non-JSON response: {0}")]
     InvalidJson(String),
+
+    /// The app ANSWERED over HTTP with `{success:false, error, code?}` — an
+    /// app-reported failure, not a transport one. `code` is the app's own
+    /// machine-readable code (`code`, else `errorCode`) when it sent one, so a
+    /// caller can hand it on instead of flattening it into a message. Display
+    /// matches the `HttpStatus` form this case used to be reported as.
+    #[error("http dispatch to '{url}' returned status {status}: {error}")]
+    AppAnswered {
+        url: String,
+        status: u16,
+        error: String,
+        code: Option<String>,
+    },
+}
+
+/// Map an HTTP reply the app ANSWERED with `{success:false, error, code?}` to
+/// [`DispatchError::AppAnswered`], carrying the app's own `code` (else
+/// `errorCode`). `None` for any reply that is not an explicit `success:false`.
+/// Pure, so the mapping is unit-testable without an HTTP round trip.
+fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Option<DispatchError> {
+    if json.get("success").and_then(|v| v.as_bool()) != Some(false) {
+        return None;
+    }
+    let error = json
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error from SDK app")
+        .to_string();
+    let code = ["code", "errorCode"]
+        .into_iter()
+        .find_map(|k| json.get(k).and_then(|v| v.as_str()))
+        .map(String::from);
+    Some(DispatchError::AppAnswered {
+        url: url.to_string(),
+        status,
+        error,
+        code,
+    })
 }
 
 impl DispatchError {
@@ -311,17 +349,8 @@ impl AppDispatcher {
             }
         };
 
-        if let Some(false) = json.get("success").and_then(|v| v.as_bool()) {
-            let msg = json
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error from SDK app")
-                .to_string();
-            return Err(DispatchError::HttpStatus {
-                url,
-                status: status.as_u16(),
-                body: msg,
-            });
+        if let Some(answered) = app_answered_failure(&url, status.as_u16(), &json) {
+            return Err(answered);
         }
         if !status.is_success() && json.get("success").is_none() {
             return Err(DispatchError::HttpStatus {
@@ -344,8 +373,12 @@ impl AppDispatcher {
     /// HTTP transport additionally enforces a 10s responsiveness cache: when
     /// the app's `/health` endpoint recently reported `responsive: false`
     /// (no active browser tab), the call short-circuits with
-    /// `DispatchError::NotResponsive` so handlers can fall back to IPC
-    /// without waiting for a 10s HTTP retry. WebSocket-transport apps skip
+    /// `DispatchError::NotResponsive` instead of waiting for a 10s HTTP retry.
+    /// That is NOT a licence to fall back to the runner's own UI: an app WAS
+    /// the target, so the action handlers refuse the IPC fallback for it —
+    /// only `NotConnected` may fall back (`sdk_client::ipc_fallback_refusal`).
+    /// Read-only handlers without that gate still fall back on any error.
+    /// WebSocket-transport apps skip
     /// the cache entirely — their liveness is already tracked by the relay
     /// heartbeat in `WsConnectionManager`.
     ///
@@ -623,5 +656,55 @@ mod tests {
             err.to_user_message(),
             "SDK app is not responsive (no active browser tab)"
         );
+    }
+
+    // ── app-answered HTTP failures carry the app's own code ────────────────
+
+    fn answered(json: serde_json::Value) -> Option<(String, Option<String>)> {
+        match app_answered_failure("http://127.0.0.1:3000/x", 200, &json)? {
+            DispatchError::AppAnswered { error, code, .. } => Some((error, code)),
+            other => panic!("expected AppAnswered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_answered_failure_carries_code() {
+        let got = answered(
+            json!({"success": false, "error": "no such element", "code": "ELEMENT_NOT_FOUND"}),
+        );
+        assert_eq!(
+            got,
+            Some((
+                "no such element".to_string(),
+                Some("ELEMENT_NOT_FOUND".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn app_answered_failure_falls_back_to_error_code() {
+        let got =
+            answered(json!({"success": false, "error": "boom", "errorCode": "ACTION_FAILED"}));
+        assert_eq!(
+            got,
+            Some(("boom".to_string(), Some("ACTION_FAILED".to_string())))
+        );
+        // `code` wins when both are present.
+        let both = answered(json!({"success": false, "error": "x", "code": "A", "errorCode": "B"}));
+        assert_eq!(both.and_then(|(_, c)| c), Some("A".to_string()));
+    }
+
+    #[test]
+    fn app_answered_failure_without_code_or_error() {
+        assert_eq!(
+            answered(json!({"success": false})),
+            Some(("Unknown error from SDK app".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn app_answered_failure_ignores_non_failures() {
+        assert!(answered(json!({"success": true, "code": "X"})).is_none());
+        assert!(answered(json!({"error": "no success field"})).is_none());
     }
 }

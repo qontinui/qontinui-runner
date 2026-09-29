@@ -18,7 +18,7 @@ name: Flake escalation
 # Trigger posture (deliberately NOT a per-PR check, and NOT in ci.yml):
 #   - schedule (daily): the rate moves per landed run, not per PR, and an
 #     escalation is a repo-level fact rather than a verdict on one branch.
-#     Same reasoning as atlas-exclude-fresh.yml's nightly.
+#     Same reasoning as atlas-schema-check.yml's nightly.
 #   - workflow_dispatch: on-demand read, with `dry_run` to print the plan
 #     without touching a single issue.
 #   - workflow_run (CI on main, completed): the plan's SECOND arm — "any

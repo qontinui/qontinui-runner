@@ -233,15 +233,28 @@ pub(crate) async fn run_dispatch(
         &payload.fetch_url,
         &payload.candidate_ref,
         &payload.head_sha,
+        &cancel,
+        // One line per retry: it tells the operator why the checkout is
+        // waiting, and the progress POST it rides is what renews the lease.
+        &mut |line: &str| sink.push(line),
     )
     .await
     {
         Ok(p) => p,
         Err(e) => {
-            sink.push(&format!("[ci-node] checkout failed: {e}"));
+            // A checkout that never produced a tree says nothing about the
+            // code under test, so it is a non-verdict — `cancelled` — never a
+            // `failure`, which would poison shadow parity with a red the code
+            // did not earn. The reason says which: `head_sha_unavailable`
+            // (the mirror lacks the commit), `fetch_failed` (the fetch failed
+            // otherwise), `checkout_deadline` (the deadline ran out in a local
+            // step), or none (the dispatch was cancelled). Only a genuine
+            // setup fault (`CheckoutError::Failed`) reports `failure`.
+            let (conclusion, reason) = e.result_disposition();
+            sink.push(&format!("{} {e}", e.log_prefix()));
             steps_summary.push(StepSummary {
                 name: "[setup] checkout".to_string(),
-                conclusion: "failure".to_string(),
+                conclusion: conclusion.to_string(),
                 duration_secs: checkout_started.elapsed().as_secs(),
             });
             let tail = sink.finish().await;
@@ -249,9 +262,9 @@ pub(crate) async fn run_dispatch(
             let reported = reporting::post_result(
                 &base,
                 &payload.dispatch_id,
-                "failure",
+                conclusion,
                 &steps_summary,
-                None,
+                reason,
                 &tail,
                 None,
                 // The gate has not run yet — at these two exits the manifest is

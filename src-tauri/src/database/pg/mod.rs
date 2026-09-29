@@ -10,6 +10,7 @@ pub mod ai_sessions;
 pub mod app_deploy_state;
 pub mod approval_gates;
 pub mod apps;
+pub mod atlas_managed_move;
 pub mod breakpoints;
 pub mod cached_specs;
 pub mod canary;
@@ -688,7 +689,7 @@ impl PgDb {
     /// becomes reachable. Idempotent — safe to re-run on every retry.
     pub async fn verify_and_provision(&self) -> Result<(), String> {
         // Verify connectivity and schema
-        let conn = self
+        let mut conn = self
             .pool
             .get()
             .await
@@ -705,10 +706,11 @@ impl PgDb {
         //   2. `CREATE SCHEMA IF NOT EXISTS runner` — back-compat for any
         //      deployment still referencing the legacy runner namespace.
         //
-        // Table-shaped DDL for `project.regression_*` previously lived here as
-        // CREATE TABLE IF NOT EXISTS self-heal. That set is now Atlas-managed
-        // out of `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot,
-        // Wave 1.4). Atlas is invoked out-of-process (CI / migrator container)
+        // Table-shaped DDL for the regression_* tables previously lived here
+        // as CREATE TABLE IF NOT EXISTS self-heal. That set is now
+        // Atlas-managed in `atlas_managed` out of
+        // `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot, Wave
+        // 1.4; schema move per plan `2026-05-14-atlas-wave-6-triage`). Atlas is invoked out-of-process (CI / migrator container)
         // against the canonical PG; this hot path no longer enforces the
         // table shape. The historical alembic migration
         // `f9d3e8a4c1b6_add_regression_tables.py` remains in
@@ -985,39 +987,59 @@ impl PgDb {
         .await
         .map_err(|e| format!("session_prs projection self-heal failed: {}", e))?;
 
+        // Plan `2026-05-14-atlas-wave-6-triage` Phase 3a: the six Atlas-owned
+        // tables live in `atlas_managed`, which Atlas owns wholly, and every
+        // runner query addresses them schema-qualified there. No alembic
+        // revision moves them, so this moves (or merges, verified row by row
+        // and never dropping a row that did not make it across) any
+        // `project.<t>` copy — an alembic-built DB's frozen regression_*
+        // tables, a user's embedded cluster built from an older
+        // `schema.pg.sql.generated`, or a shared DB an older binary touched.
+        // It must run before the app_id backfill below, which addresses
+        // `atlas_managed.proposal_events`.
+        //
+        // Never fatal: the pass logs its own per-table report (ERROR for any
+        // table left behind, or for a pass that could not run) and boot
+        // continues. `atlas_managed` is deliberately NOT on the search_path,
+        // so a query against a table left behind fails loudly on its own
+        // instead of binding the leftover copy.
+        let _moved = atlas_managed_move::migrate_atlas_managed_tables(&mut conn).await;
+
         // spec-multi-app Stream E.1: backfill `app_id` onto
-        // project.proposal_events. The table predates the multi-tenant model,
-        // so existing rows are migrated under the bootstrap app_id
+        // atlas_managed.proposal_events. The table predates the multi-tenant
+        // model, so existing rows are migrated under the bootstrap app_id
         // `qontinui-runner` (matching Stream F's bootstrap registration).
         //
-        // Gated on table existence — on a fresh canonical PG where Atlas
-        // hasn't created project.proposal_events yet, this whole block is a
-        // no-op. Atlas owns the CREATE TABLE; the self-heal owns the
-        // app_id column migration once the table exists. Wrapped in a
-        // PL/pgSQL DO block so the table-existence check + locking + ALTER
-        // run in one round-trip and skip cleanly when the table isn't
-        // present. ACCESS EXCLUSIVE prevents any concurrent writer from
-        // inserting a NULL row between the backfill and the NOT NULL
-        // constraint flip. Idempotent: `ADD COLUMN IF NOT EXISTS` + the
-        // `SET NOT NULL` becomes a no-op on a subsequent boot because the
-        // backfill keeps the column dense.
+        // Gated on table existence — on a database where Atlas hasn't created
+        // atlas_managed.proposal_events (e.g. a fresh alembic-only PG, or an
+        // embedded cluster built from a bundled schema that predates it), this
+        // whole block is a no-op. Embedded clusters built from the current
+        // schema.pg.sql.generated DO have it, already with app_id. Atlas
+        // owns the CREATE TABLE; the self-heal owns the app_id column
+        // migration once the table exists. Wrapped in a PL/pgSQL DO block so
+        // the table-existence check + locking + ALTER run in one round-trip
+        // and skip cleanly when the table isn't present. ACCESS EXCLUSIVE
+        // prevents any concurrent writer from inserting a NULL row between the
+        // backfill and the NOT NULL constraint flip. Idempotent: `ADD COLUMN
+        // IF NOT EXISTS` + the `SET NOT NULL` becomes a no-op on a subsequent
+        // boot because the backfill keeps the column dense.
         conn.batch_execute(
             "DO $$
              BEGIN
                IF EXISTS (
                  SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'project' AND table_name = 'proposal_events'
+                 WHERE table_schema = 'atlas_managed' AND table_name = 'proposal_events'
                ) THEN
-                 LOCK TABLE project.proposal_events IN ACCESS EXCLUSIVE MODE;
-                 ALTER TABLE project.proposal_events
+                 LOCK TABLE atlas_managed.proposal_events IN ACCESS EXCLUSIVE MODE;
+                 ALTER TABLE atlas_managed.proposal_events
                      ADD COLUMN IF NOT EXISTS app_id TEXT;
-                 UPDATE project.proposal_events SET app_id = 'qontinui-runner'
+                 UPDATE atlas_managed.proposal_events SET app_id = 'qontinui-runner'
                      WHERE app_id IS NULL;
-                 ALTER TABLE project.proposal_events ALTER COLUMN app_id SET NOT NULL;
+                 ALTER TABLE atlas_managed.proposal_events ALTER COLUMN app_id SET NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id
-                     ON project.proposal_events(app_id);
+                     ON atlas_managed.proposal_events(app_id);
                  CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id_at_ms
-                     ON project.proposal_events(app_id, at DESC);
+                     ON atlas_managed.proposal_events(app_id, at DESC);
                END IF;
              END $$;",
         )

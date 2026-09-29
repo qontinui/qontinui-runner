@@ -1,0 +1,71 @@
+[package]
+name = "qontinui-pty-holder"
+version = "0.1.0"
+description = "Per-pane PTY holder for the qontinui runner: frame protocol, local IPC transport, lock-before-endpoint liveness"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 1
+# and the D3 decision of 2026-09-28: the holder is a DEDICATED minimal binary,
+# not a re-exec of the runner (the re-exec'd runner cost 24.4 MB private per
+# holder, and D13 multiplies that by the pane count). The library half holds the
+# frame protocol and the transport so the runner (client) and the holder
+# (server) link the SAME code — that is how D3's "the GUI and the holder never
+# drift" survives the split into two executables.
+#
+# The dependency list is deliberately short and must stay that way: every crate
+# added here is paid once per open pane. No tauri, no tokio, no dependency on
+# the src-tauri crate.
+
+[lib]
+name = "qontinui_pty_holder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qontinui-pty-holder"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Target-gated with an EXPLICIT feature list, as crates/runner-win32 does: a
+# plain `windows-sys` dependency takes default features and resolves none of
+# these call sites.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # SECURITY_ATTRIBUTES, TOKEN_USER, GetTokenInformation — the pipe DACL.
+    "Win32_Security",
+    # ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW.
+    "Win32_Security_Authorization",
+    # CreateFileW, ReadFile, WriteFile, LockFileEx, PIPE_ACCESS_DUPLEX, FILE_FLAG_*.
+    "Win32_Storage_FileSystem",
+    # OVERLAPPED, GetOverlappedResult, CancelIoEx.
+    "Win32_System_IO",
+    # CreateNamedPipeW, ConnectNamedPipe, WaitNamedPipeW, GetNamedPipeServerProcessId.
+    "Win32_System_Pipes",
+    # CreateEventW, WaitForSingleObject, OpenProcessToken, GetCurrentProcess.
+    "Win32_System_Threading",
+] }
+
+# The same tiered policy as src-tauri/Cargo.toml [lints] (plan
+# 2026-07-05-lint-tiers-and-diff-scoped-gates): correctness/suspicious DENY,
+# `string_slice` DENY, style/perf warn. The workspace defines no [workspace.lints],
+# so the table is repeated here rather than inherited.
+[lints.rust]
+unfulfilled_lint_expectations = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = 1 }
+suspicious = { level = "deny", priority = 1 }
+string_slice = { level = "deny", priority = 2 }
+disallowed_methods = { level = "deny", priority = 2 }
+perf = { level = "warn", priority = 1 }
+complexity = { level = "warn", priority = 0 }
+style = { level = "warn", priority = 0 }
+pedantic = { level = "allow", priority = 0 }
+nursery = { level = "allow", priority = 0 }
