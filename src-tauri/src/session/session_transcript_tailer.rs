@@ -79,18 +79,37 @@
 //! - **Overlap.** A watcher batch that overlaps the mark (a replay read the
 //!   same lines first) is trimmed to its unseen suffix; one wholly below it is
 //!   dropped.
-//! - **Gap.** A batch that starts ABOVE the mark (a sniffer-bound resumed
-//!   session whose tail started at EOF, appends dropped while unbound, a
-//!   batch deferred under contention) first has `[mark, batch start)` read
-//!   from the file and emitted, under the same lock, so file order holds and
-//!   the prefix is never skipped. If that fill cannot complete, the batch is
-//!   not emitted either and the mark stays: the next batch or bind retries.
+//! - **First seen mid-file.** A session the live path meets with NO mark and
+//!   a batch starting above 0 (a sniffer-bound resumed pane whose tail started
+//!   at EOF) is tracked from that batch, exactly as the pre-mark tailer did,
+//!   and `[0, batch start)` is recorded as its UNSENT PREFIX (below).
+//! - **Gap.** A batch that starts ABOVE an EXISTING mark (a deferred or failed
+//!   batch of a session already tracked) first has `[mark, batch start)` read
+//!   from the file and emitted, under the same lock, so file order holds. If
+//!   that fill cannot complete, the batch is not emitted either and the mark
+//!   stays: the next batch or bind retries.
 //! - **Rewrite.** Beside each mark sits a fingerprint of the file's first line.
 //!   A mark is trusted only while the file is at least that long, the byte
 //!   before the mark is a newline, and the first line still hashes the same;
 //!   otherwise the file was rewritten and the mark resets to 0. The watcher's
 //!   `truncated` flag alone does not reset a mark whose fingerprint still
 //!   matches — a replay may already have reset and re-emitted that content.
+//!
+//! ### Unsent prefix — sent only on an explicit hand-off
+//!
+//! The live path never backfills a first-seen session's history: measured on
+//! one box on 2026-09-28, the JSONLs the watcher tails at startup (24 h) were
+//! 272 files / ~1.19 GiB (median ~2.9 MiB, p90 ~6.3 MiB, max ~229 MiB), and a
+//! pane the pre-mark tailer had already synced would be re-sent from byte 0
+//! under fresh `chunk_offset`s coord cannot dedupe. So the floor
+//! (`unsent_prefix_end`) is recorded durably beside the mark, and ONLY
+//! [`SessionTranscriptTailer::bind_and_replay`] sends `[0, floor)` — first,
+//! under the session lock, with its own write-ahead progress record — then
+//! continues from the mark, then clears the floor so a re-bind sends nothing.
+//! Consequence: for such a session the prefix reaches the lane AFTER the bytes
+//! the live path already sent, so its `chunk_offset` order is emission order,
+//! not file order. A session never tailed has no floor and no mark, and a bind
+//! replays it from 0 in file order.
 //!
 //! **Crash posture — at most once across a crash, never duplicated.** The mark
 //! is reserved (fsynced) BEFORE the emitter queues the bytes, mirroring the
@@ -424,6 +443,16 @@ fn file_identity(path: &Path) -> String {
     }
 }
 
+/// Unsent-prefix keys for mark `mk`: the floor (`unsent_prefix_end`, `-1` =
+/// none) below which the live path never emitted, and how much of `[0, floor)`
+/// a bind has sent so far (write-ahead, like the mark).
+fn prefix_floor_key(mk: &str) -> String {
+    format!("uf\u{1f}{mk}")
+}
+fn prefix_sent_key(mk: &str) -> String {
+    format!("us\u{1f}{mk}")
+}
+
 /// Hole-record keys for mark `mk`: the emitter lane value before the last
 /// reserved emit, and where that emit's range began.
 fn hole_lane_key(mk: &str) -> String {
@@ -635,10 +664,21 @@ impl SessionTranscriptTailer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mk = self.mark_key(session_key, path);
+        if file_start > 0 && self.marks.get(&mk).is_none() {
+            // FIRST SEEN on the live path, mid-file (a resumed pane whose tail
+            // started at EOF): tail from here, as the pre-mark tailer did, and
+            // record `[0, file_start)` as the unsent prefix. Only an explicit
+            // `POST /sessions/transcript-bind` sends that prefix — backfilling
+            // every sniffer-bound pane on upgrade would move ~1.2 GiB/day on
+            // one box and re-send bytes the pre-mark tailer already synced.
+            self.init_mark_at(&mk, path, file_start);
+        }
         let mark = self.validated_mark(&mk, path, truncated);
         if file_start > mark {
-            // Gap: the bytes below this batch were never emitted. Emit them
-            // first, from the file, so the lane stays in file order.
+            // Gap ABOVE an existing mark: bytes of a session already being
+            // tracked that never reached the emitter (a deferred or failed
+            // batch). Emit them first, from the file, so the lane stays in
+            // file order.
             match self.replay_locked(session_key, &mk, path, mark, Some(file_start)) {
                 Ok(pass) if pass.stopped_at.is_none() => {}
                 other => {
@@ -655,6 +695,59 @@ impl SessionTranscriptTailer {
             }
         }
         let _ = self.emit_range(session_key, &mk, path, file_start, appended);
+    }
+
+    /// Start tracking a file mid-way: mark AND unsent-prefix floor at
+    /// `offset`, fingerprint alongside, one fsync with the mark last.
+    fn init_mark_at(&self, mk: &str, path: &Path, offset: u64) {
+        if let Some(fp) = first_line_fingerprint(path) {
+            self.marks.set(&fingerprint_key(mk), fp);
+        }
+        self.marks.set_many(&[
+            (&prefix_floor_key(mk), offset as i64),
+            (&prefix_sent_key(mk), 0),
+            (mk, offset as i64),
+        ]);
+    }
+
+    /// The recorded unsent-prefix floor, if any.
+    fn prefix_floor(&self, mk: &str) -> Option<u64> {
+        self.marks
+            .get(&prefix_floor_key(mk))
+            .filter(|f| *f > 0)
+            .map(|f| f as u64)
+    }
+
+    /// [`Self::emit_range`] for the unsent PREFIX `[0, floor)`: the same
+    /// emitter (same redaction, same lane), but its progress is the
+    /// prefix-sent record rather than the mark, which already sits above the
+    /// floor. Write-ahead and rolled back on a clean failure, like the mark.
+    fn emit_prefix_range(
+        &self,
+        session_key: &str,
+        mk: &str,
+        file_start: u64,
+        text: &str,
+    ) -> Option<(u64, u64)> {
+        let key = prefix_sent_key(mk);
+        let sent = self
+            .marks
+            .get(&key)
+            .map(|v| u64::try_from(v).unwrap_or(0))
+            .unwrap_or(0);
+        let file_end = file_start + text.len() as u64;
+        let from = sent.max(file_start);
+        if from >= file_end {
+            return Some((0, 0));
+        }
+        let unseen = text.get(usize::try_from(from - file_start).unwrap_or(usize::MAX)..)?;
+        self.marks.set(&key, file_end as i64);
+        let chunks = self.emitter.emit_inner(session_key, unseen);
+        if chunks == 0 {
+            self.marks.set(&key, sent as i64);
+            return None;
+        }
+        Some((file_end - from, chunks as u64))
     }
 
     /// The mark key: session AND the file's identity ([`file_identity`]), so a
@@ -730,7 +823,12 @@ impl SessionTranscriptTailer {
                     reason,
                     "session_transcript_tailer: transcript was rewritten — file mark reset to 0"
                 );
-                self.marks.set(mk, 0);
+                // The unsent-prefix record described the OLD content too.
+                self.marks.set_many(&[
+                    (&prefix_floor_key(mk), -1),
+                    (&prefix_sent_key(mk), 0),
+                    (mk, 0),
+                ]);
                 0
             }
             None => mark,
@@ -891,9 +989,52 @@ impl SessionTranscriptTailer {
 
         let mk = self.mark_key(session_key, path);
         let mark = self.validated_mark(&mk, path, false);
-        let pass = self
-            .replay_locked(session_key, &mk, path, mark, None)
-            .map_err(|e| BindRefusal::Unreadable(format!("{}: {e}", path.display())))?;
+        let unreadable =
+            |e: std::io::Error| BindRefusal::Unreadable(format!("{}: {e}", path.display()));
+        self.report_hole_if_any(
+            session_key,
+            &mk,
+            mark,
+            self.emitter.offsets().next_offset(session_key),
+        );
+
+        // 1. The unsent prefix `[0, floor)` the live path deliberately left
+        //    (module header, "Unsent prefix") — only this door sends it. Then
+        //    clear the floor, so a re-bind replays nothing.
+        let mut pass = ReplayPass::default();
+        if let Some(floor) = self.prefix_floor(&mk) {
+            let sent = self
+                .marks
+                .get(&prefix_sent_key(&mk))
+                .map(|v| u64::try_from(v).unwrap_or(0))
+                .unwrap_or(0);
+            pass = self
+                .replay_with(path, sent, Some(floor), session_key, |start, text| {
+                    self.emit_prefix_range(session_key, &mk, start, text)
+                })
+                .map_err(unreadable)?;
+            if pass.stopped_at.is_none() {
+                self.marks
+                    .set_many(&[(&prefix_sent_key(&mk), 0), (&prefix_floor_key(&mk), -1)]);
+            }
+        }
+
+        // 2. Continue from the mark through the last complete line — for a
+        //    never-tailed session that is the whole file from 0.
+        if pass.stopped_at.is_none() {
+            let cont = self
+                .replay_locked(session_key, &mk, path, mark, None)
+                .map_err(unreadable)?;
+            pass.bytes += cont.bytes;
+            pass.chunks += cont.chunks;
+            pass.stopped_at = cont.stopped_at;
+        }
+        if self.marks.get(&mk).is_none() {
+            // Bound but nothing to send yet: record the mark so later live
+            // batches are a tracked session's (gap-filled from 0), never a
+            // first-seen one's.
+            self.marks.set(&mk, 0);
+        }
         tracing::info!(
             session_key,
             coord_session = %coord_session_id,
@@ -929,6 +1070,20 @@ impl SessionTranscriptTailer {
         path: &Path,
         from: u64,
         until: Option<u64>,
+    ) -> std::io::Result<ReplayPass> {
+        self.replay_with(path, from, until, session_key, |start, text| {
+            self.emit_range(session_key, mk, path, start, text)
+        })
+    }
+
+    /// The batching core of [`Self::replay_locked`], over any emit function.
+    fn replay_with(
+        &self,
+        path: &Path,
+        from: u64,
+        until: Option<u64>,
+        session_key: &str,
+        emit: impl Fn(u64, &str) -> Option<(u64, u64)>,
     ) -> std::io::Result<ReplayPass> {
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -973,7 +1128,7 @@ impl SessionTranscriptTailer {
             }
             let stop = text.is_none();
             if !batch.is_empty() && (stop || batch.len() >= REPLAY_BATCH_BYTES) {
-                match self.emit_range(session_key, mk, path, batch_start, &batch) {
+                match emit(batch_start, &batch) {
                     Some((b, c)) => {
                         pass.bytes += b;
                         pass.chunks += c;
@@ -1667,21 +1822,27 @@ mod tests {
     }
 
     /// A session bound by the SNIFFER while its file already held content (a
-    /// resumed session: the watcher's tail started at EOF): the first live
-    /// batch fills the prefix from the file first, so the transcript is the
-    /// whole file, once, in order — and a later route bind replays nothing.
+    /// resumed pane: the watcher's tail started at EOF). The live path emits
+    /// NOTHING below the batch it first meets — no upgrade backfill. The
+    /// explicit bind then sends exactly the unsent prefix, once, before live
+    /// tailing continues; a re-bind sends nothing.
     #[test]
-    fn sniffer_bound_resumed_session_gets_its_prefix_once() {
+    fn first_seen_pane_live_path_sends_no_prefix_and_bind_sends_it_once() {
         let dir = tempdir().unwrap();
         let (t, registrar, outbox) = tailer(dir.path());
         let csid = Uuid::new_v4().to_string();
-        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let (l1, l2, l3, l4) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n", "{\"n\":4}\n");
         let path = jsonl(dir.path(), &csid, &format!("{l1}{l2}"));
         let coord = sniff_register(&registrar, &csid);
+        let floor = (l1.len() + l2.len()) as u64;
 
         append(&path, l3);
-        t.on_appended_gated(&csid, &path, (l1.len() + l2.len()) as u64, l3, false, true);
-        assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}{l3}"));
+        t.on_appended_gated(&csid, &path, floor, l3, false, true);
+        assert_eq!(
+            delivered(&outbox, coord),
+            l3,
+            "the live path sends nothing below the first batch it meets"
+        );
 
         let o = bind(&t, &csid, &path);
         assert!(o.already_bound);
@@ -1689,7 +1850,35 @@ mod tests {
             o.coord_session_id, coord,
             "no second row for a mapped session"
         );
-        assert_eq!((o.replayed_bytes, o.replayed_chunks), (0, 0));
+        assert_eq!(o.replayed_bytes, floor, "exactly the unsent prefix");
+        assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{l2}"));
+
+        // Live continues from the mark: no duplicate of l3, nothing reordered.
+        append(&path, l4);
+        t.on_appended_gated(&csid, &path, floor + l3.len() as u64, l4, false, true);
+        assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{l2}{l4}"));
+
+        let again = bind(&t, &csid, &path);
+        assert_eq!((again.replayed_bytes, again.replayed_chunks), (0, 0));
+        assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{l2}{l4}"));
+    }
+
+    /// A gap ABOVE an existing mark — a batch of an already-tracked session
+    /// that never reached the emitter — is still filled from the file, in
+    /// file order.
+    #[test]
+    fn a_gap_above_an_existing_mark_is_filled_in_order() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        append(&path, l2);
+        append(&path, l3);
+        // Only l3's batch arrives (l2's was deferred and lost to a restart).
+        t.on_appended_gated(&csid, &path, (l1.len() + l2.len()) as u64, l3, false, true);
         assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}{l3}"));
     }
 

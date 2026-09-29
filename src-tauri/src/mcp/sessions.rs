@@ -876,7 +876,10 @@ pub(crate) struct TranscriptBindEnv {
 
 /// `POST /sessions/transcript-bind` — bind the CALLER'S OWN Claude Code session
 /// into the interactive transcript tailer and replay the part of its JSONL not
-/// yet emitted. Plan
+/// yet emitted. This is the ONLY door that sends a session's unsent prefix: the
+/// live tailer tracks a resumed pane from where it first meets it and never
+/// backfills history on its own, so the hand-off is what makes the author's
+/// whole conversation reach coord. Plan
 /// `2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`
 /// Phase 4.4; mechanics in `session::session_transcript_tailer` ("Binding on
 /// request").
