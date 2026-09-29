@@ -388,7 +388,14 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
 ///   2026-09-16 wipe). Send a `metadata_patch` that omits `phases`. `area` is
 ///   sent as `null` when the plan declares none, which RFC 7396 reads as
 ///   "delete the key" — preserving the plan-is-sole-author-of-area rule that
-///   the wholesale replace gave.
+///   the wholesale replace gave. `archive_path` is likewise sent as `null`, so
+///   a phase-less plan restored from the archive dir clears a stale one.
+///
+///   Accepted trade-off: a plan whose phases are removed on purpose (or whose
+///   headings stop parsing) no longer clears the stored phase list from the
+///   adapter push — that now needs a manual coord edit or a wholesale
+///   `metadata` replace. Chosen because a wiped list is unrecoverable data
+///   loss while a stale list is visible and recoverable.
 pub fn metadata_arms(u: &ParsedWorkUnit) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
     if !u.phases.is_empty() {
         return (Some(build_metadata(u)), None);
@@ -397,6 +404,7 @@ pub fn metadata_arms(u: &ParsedWorkUnit) -> (Option<serde_json::Value>, Option<s
     if let Some(obj) = patch.as_object_mut() {
         obj.remove("phases");
         obj.entry("area").or_insert(serde_json::Value::Null);
+        obj.insert("archive_path".to_string(), serde_json::Value::Null);
     }
     (None, Some(patch))
 }
@@ -2229,6 +2237,11 @@ mod tests {
                 assert_eq!(p["source_path"], "plans/s.md");
                 assert_eq!(p["depends_on"][0], "2026-01-01-dep");
                 assert!(p["area"].is_null());
+                assert!(
+                    p.as_object().unwrap().contains_key("archive_path")
+                        && p["archive_path"].is_null(),
+                    "a stale archive_path must be cleared: {p}"
+                );
                 let wire = serde_json::to_value(up).unwrap();
                 assert!(!wire.as_object().unwrap().contains_key("metadata"));
             }
