@@ -1092,16 +1092,16 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
-/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
-/// its status block declares one. coord replaces `metadata` wholesale, so an
-/// archive stamp without the area would erase it from the unit — the same
-/// omit-when-`None` rule as [`build_metadata`].
-fn archive_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
-    let mut m = serde_json::json!({ "archive_path": u.source_path });
-    if let Some(area) = &u.area {
-        m["area"] = serde_json::Value::String(area.clone());
-    }
-    m
+/// The archive stamp as an RFC 7396 `metadata_patch`: `archive_path`, plus the
+/// plan's `area` — `null` (delete) when its status block declares none, so the
+/// plan file stays the sole author of `area`. A patch, never a wholesale
+/// `metadata` replace: a replace would drop the stored `phases`, `source_path`
+/// and `depends_on` of a plan found in the archive directory.
+fn archive_metadata_patch(u: &ParsedWorkUnit) -> serde_json::Value {
+    serde_json::json!({
+        "archive_path": u.source_path,
+        "area": u.area,
+    })
 }
 
 /// Stamp `metadata.archive_path` for a plan found in the archive directory —
@@ -1130,8 +1130,8 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
             title: u.title.clone(),
             // NEVER a status write from the archive scan (D4).
             status: None,
-            metadata: Some(archive_metadata(u)),
-            metadata_patch: None,
+            metadata: None,
+            metadata_patch: Some(archive_metadata_patch(u)),
             by_actor: Some(ADAPTER_ACTOR.to_string()),
             // Harmless under coord's COALESCE, and it means a plan that only ever
             // exists in the archive still gets dated.
@@ -1553,7 +1553,7 @@ mod tests {
         assert_eq!(ups.len(), 1, "exactly one metadata-only upsert");
         assert!(ups[0].status.is_none(), "archive upsert carries NO status");
         assert_eq!(
-            ups[0].metadata.as_ref().unwrap()["archive_path"],
+            ups[0].metadata_patch.as_ref().unwrap()["archive_path"],
             serde_json::json!(u.source_path),
             "archive_path stamped to the archived file path"
         );
@@ -1744,11 +1744,31 @@ mod tests {
             .unwrap();
 
         let ups = sink.upserts.lock().unwrap();
-        let first = ups[0].metadata.as_ref().unwrap();
+        let first = ups[0].metadata_patch.as_ref().unwrap();
         assert_eq!(first["area"], serde_json::json!("ci-runners"));
         assert_eq!(first["archive_path"], serde_json::json!(u.source_path));
-        let second = ups[1].metadata.as_ref().unwrap();
-        assert!(!second.as_object().unwrap().contains_key("area"));
+        // Undeclared area is an explicit null (RFC 7396 delete).
+        let second = ups[1].metadata_patch.as_ref().unwrap();
+        assert!(second["area"].is_null());
+    }
+
+    /// The archive stamp is a PATCH: no wholesale `metadata` on the wire, and
+    /// no `phases`/`source_path`/`depends_on` key for coord to overwrite.
+    #[tokio::test]
+    async fn archive_stamp_is_a_patch_that_cannot_drop_stored_phases() {
+        let sink = FakeSink::default();
+        let u = unit("2026-01-01-archived", "shipped");
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
+        let ups = sink.upserts.lock().unwrap();
+        let wire = serde_json::to_value(&ups[0]).unwrap();
+        assert!(!wire.as_object().unwrap().contains_key("metadata"));
+        let p = wire["metadata_patch"].as_object().unwrap();
+        assert_eq!(p["archive_path"], serde_json::json!(u.source_path));
+        for k in ["phases", "source_path", "depends_on"] {
+            assert!(!p.contains_key(k), "{k} must not be in the archive patch");
+        }
     }
 
     #[tokio::test]

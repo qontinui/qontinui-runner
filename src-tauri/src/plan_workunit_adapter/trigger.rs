@@ -12558,14 +12558,14 @@ Body.
         // [policy: a-test-must-be-able-to-fail, shape 2].
         assert_eq!(
             by_slug["2026-01-01-shipped-plan"]
-                .metadata
+                .metadata_patch
                 .as_ref()
                 .unwrap()["archive_path"],
             serde_json::json!("myrepo/archive/2026-01-01-shipped-plan.md")
         );
         assert_eq!(
             by_slug["2026-01-02-archived-plan"]
-                .metadata
+                .metadata_patch
                 .as_ref()
                 .unwrap()["archive_path"],
             serde_json::json!("myrepo/archive/2026-01-02-archived-plan.md")
