@@ -1271,6 +1271,32 @@ pub struct PairBaseOrigin {
     pub remedy: String,
 }
 
+/// Replace URL userinfo (`scheme://user:pass@host`) with `scheme://***@host`
+/// wherever a URL appears in `text`, so a base carrying credentials is never
+/// echoed into an error message.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c == ')' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(authority_end);
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                out.push_str(authority.get(at..).unwrap_or_default());
+            }
+            None => out.push_str(authority),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The failure text for a `send()` error: `POST <url> failed: <full source
 /// chain>`, plus `. base chosen by <label>. <remedy>` when the fault is a
 /// connect or timeout (the classes a wrong base explains). reqwest's Display
@@ -1283,7 +1309,7 @@ fn describe_send_error(url: &str, e: &reqwest::Error, origin: &PairBaseOrigin) -
         chain.push_str(&cause.to_string());
         source = cause.source();
     }
-    let mut msg = format!("POST {url} failed: {chain}");
+    let mut msg = redact_url_userinfo(&format!("POST {url} failed: {chain}"));
     if e.is_connect() || e.is_timeout() {
         msg.push_str(&format!(
             ". base chosen by {}. {}",
@@ -3825,8 +3851,12 @@ mod pair_e2e_tests {
             err.contains(&format!("POST {base}/api/v1/devices/pair-cli failed: ")),
             "must name the URL, got: {err}"
         );
+        // Only present when the source chain is walked: reqwest's Display alone
+        // stops at `error sending request for url (...)`; the OS error text
+        // ("Connection refused (os error 111)" / Windows "actively refused ...
+        // (os error 10061)") lives in a nested source.
         assert!(
-            !err.contains("failed: error sending request.") && err.matches(": ").count() >= 2,
+            err.contains("os error"),
             "must carry the source chain, not just reqwest's Display, got: {err}"
         );
         assert!(
@@ -3836,6 +3866,23 @@ mod pair_e2e_tests {
         assert!(
             err.contains("test-remedy: fix the base."),
             "must carry the remedy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn redact_url_userinfo_masks_credentials_in_every_url() {
+        assert_eq!(
+            redact_url_userinfo("POST https://user:p%40ss@host:8000/api failed: x"),
+            "POST https://***@host:8000/api failed: x"
+        );
+        assert_eq!(
+            redact_url_userinfo("error for url (http://ops@h.example/a): see http://h2/x"),
+            "error for url (http://***@h.example/a): see http://h2/x"
+        );
+        assert_eq!(redact_url_userinfo("no url here, a@b"), "no url here, a@b");
+        assert_eq!(
+            redact_url_userinfo("http://127.0.0.1:1/p?e=a@b"),
+            "http://127.0.0.1:1/p?e=a@b"
         );
     }
 

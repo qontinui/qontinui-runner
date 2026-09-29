@@ -2325,7 +2325,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             let raw = &settings.web_integration.backend_url;
                             warn!(
                                 rejected_backend_url = %raw,
-                                "plan library: REFUSING persisted                                  web_integration.backend_url '{raw}' as the body-sync                                  target: it is a MACHINE-LOCAL address and this is a                                  RELEASE build (same refusal as                                  api_config::resolve_api_base_url). The body sync (on by                                  default) will NOT run rather than guess a backend. FIX: set                                  web_integration.backend_url in settings.json to the                                  backend this runner actually paired with, then start a                                  new runner."
+                                "plan library: REFUSING persisted \
+                                 web_integration.backend_url '{raw}' as the body-sync \
+                                 target: it is a MACHINE-LOCAL address and this is a \
+                                 RELEASE build (same refusal as \
+                                 api_config::resolve_api_base_url). The body sync (on by \
+                                 default) will NOT run rather than guess a backend. FIX: set \
+                                 web_integration.backend_url in settings.json to the \
+                                 backend this runner actually paired with, then start a \
+                                 new runner."
                             );
                         }
                     }
