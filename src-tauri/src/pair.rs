@@ -1461,6 +1461,58 @@ pub(crate) fn heal_vanished_paired_user_with(
     }
 }
 
+/// The credentials this device HOLDS, by validity — what a default binding
+/// could point at. Plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// Phase 3: when [`heal_vanished_paired_user`] refuses, this is what tells
+/// *"a coord credential is present but no default binding points at it"*
+/// apart from *"this runner holds no coord credential"* — the two shapes the
+/// 2026-09-28 banner rendered identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCredentialCensus {
+    /// Tenants whose `device_jwt:<tenant>` slot holds a USABLE JWT (decodable
+    /// and unexpired — [`crate::auth::read_tenant_slot`] → `Usable`, the
+    /// selector's own predicate). Ascending, distinct.
+    pub usable_tenant_slots: Vec<uuid::Uuid>,
+    /// Does the legacy `access_token` slot — the one an UNPINNED session
+    /// presents — hold a usable JWT?
+    pub legacy_slot_usable: bool,
+}
+
+/// [`held_credential_census_with`] over this process's credential store.
+pub fn held_credential_census() -> Result<HeldCredentialCensus, String> {
+    held_credential_census_with(&crate::auth::AuthManager::new())
+}
+
+/// `Err` when the per-tenant slot store could not be ENUMERATED: an
+/// unreadable store is UNKNOWN, never "no slots". A single slot that cannot
+/// be read is simply not counted as usable.
+pub(crate) fn held_credential_census_with(
+    mgr: &crate::auth::AuthManager,
+) -> Result<HeldCredentialCensus, String> {
+    let mut tenants = mgr
+        .try_list_tenant_device_jwt_tenants()
+        .map_err(|e| format!("the per-tenant credential slots could not be read ({e:#})"))?;
+    tenants.sort();
+    tenants.dedup();
+    let usable_tenant_slots = tenants
+        .into_iter()
+        .filter(|t| {
+            matches!(
+                crate::auth::read_tenant_slot(mgr, t),
+                crate::auth::SlotRead::Usable(_)
+            )
+        })
+        .collect();
+    Ok(HeldCredentialCensus {
+        usable_tenant_slots,
+        legacy_slot_usable: matches!(
+            crate::auth::read_legacy_slot(mgr),
+            crate::auth::SlotRead::Usable(_)
+        ),
+    })
+}
+
 // ============================================================================
 // Host / OS detection
 // ============================================================================
@@ -6486,5 +6538,37 @@ mod vanished_paired_user_heal_tests {
         assert!(report.dropped.is_empty(), "{report:?}");
         assert_eq!(read_paired_binding_tenant_ids_at(&path), vec![ta(), tb()]);
         assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+    }
+
+    /// Phase 3: the census counts VALIDITY, not presence — an expired slot is
+    /// not a credential a default binding could point at — and reports the
+    /// legacy slot separately, because that is what an unpinned session sends.
+    #[test]
+    fn held_credential_census_counts_usable_slots_only() {
+        let (_dir, _path, mgr) = store("census");
+        assert_eq!(
+            held_credential_census_with(&mgr),
+            Ok(HeldCredentialCensus {
+                usable_tenant_slots: vec![],
+                legacy_slot_usable: false,
+            })
+        );
+        mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER))
+            .expect("slot B");
+        mgr.store_tenant_device_jwt(&ta(), &device_jwt(T_A, Some(USER), -60))
+            .expect("expired slot A");
+        assert_eq!(
+            held_credential_census_with(&mgr),
+            Ok(HeldCredentialCensus {
+                usable_tenant_slots: vec![tb()],
+                legacy_slot_usable: false,
+            })
+        );
+        mgr.store_tokens(&live(T_B, USER), "").expect("legacy = B");
+        assert!(
+            held_credential_census_with(&mgr)
+                .expect("census")
+                .legacy_slot_usable
+        );
     }
 }

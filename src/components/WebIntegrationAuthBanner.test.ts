@@ -301,10 +301,36 @@ describe("credentialDarkPresentation", () => {
       titleFor("unrefreshable"),
       titleFor("absent"),
       titleFor("upstream_401"),
+      titleFor("no_default_binding"),
     ];
     expect(new Set(titles).size).toBe(titles.length);
     expect(titleFor("unrefreshable")).toContain("automatic refresh failed");
     expect(titleFor("upstream_401")).toContain("rejecting");
+  });
+
+  // Plan 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3:
+  // "valid slot, no default binding" must never read as "no coord credential".
+  it("tells a held credential with no default binding apart from no credential", () => {
+    const title = credentialDarkPresentation(
+      { ...darkExpired, cause: "no_default_binding", cta: "re_pair" },
+      stubTime,
+    ).title;
+    expect(title).not.toBe(
+      credentialDarkPresentation({ ...darkExpired, cause: "absent" }, stubTime).title,
+    );
+    expect(title).toContain("present");
+    expect(title).toContain("default binding");
+    expect(title).not.toContain("no coord credential");
+  });
+
+  it("an unknown cause still renders, under the generic title", () => {
+    expect(
+      credentialDarkPresentation({ ...darkExpired, cause: "some_future_cause" }, stubTime).title,
+    ).toBe("Coord credential problem");
+    // A prototype key is not a cause.
+    expect(credentialDarkPresentation({ ...darkExpired, cause: "toString" }, stubTime).title).toBe(
+      "Coord credential problem",
+    );
   });
 
   it("routes the HARD Cognito cause to the interactive sign-in", () => {
@@ -331,7 +357,7 @@ describe("credentialDarkPresentation", () => {
       expect(p.ctaLabel).toBe("Sign in");
     });
 
-    it.each(["absent", "unrefreshable", "upstream_401"])(
+    it.each(["absent", "unrefreshable", "upstream_401", "no_default_binding"])(
       "re_pair (%s) → the sign-in that re-pairs, never the exhausted refresher",
       (cause) => {
         const p = credentialDarkPresentation({ ...darkExpired, cause, cta: "re_pair" }, stubTime);
@@ -524,6 +550,28 @@ describe("credentialDarkFromPostureSnapshot", () => {
     // And it is enough on its own: this is the BOOT case, before
     // `get_web_integration_status` has resolved.
     expect(shouldShowAuthBanner(null, false, null, signal)).toBe(true);
+  });
+
+  it("carries the no-default-binding cause, its WHY and the re-pair CTA to the banner", () => {
+    const reason =
+      "a coord credential IS present (a valid per-tenant slot), but no default binding points " +
+      "at it. Why: coord's bound-tenant set is UNKNOWN";
+    const signal = credentialDarkFromPostureSnapshot({
+      posture: "dark",
+      cause: "no_default_binding",
+      canAnswer: false,
+      reason,
+      detail: "coord's bound-tenant set is UNKNOWN",
+      cta: "re_pair",
+      since: 1_757_649_240,
+    });
+    expect(signal?.dark).toBe(true);
+    expect(signal?.cause).toBe("no_default_binding");
+    const p = credentialDarkPresentation(signal!, stubTime);
+    expect(p.title).toBe("Coord credential present, but no default binding points at it");
+    expect(p.body).toContain("Why: coord's bound-tenant set is UNKNOWN");
+    expect(p.ctaAction).toBe("cognito_sign_in");
+    expect(p.ctaLabel).toBe("Sign in to re-pair");
   });
 
   it("reads the deprecated `state` spelling from an older runner build", () => {
