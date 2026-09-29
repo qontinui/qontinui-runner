@@ -891,10 +891,11 @@ pub(crate) struct TranscriptBindEnv {
 /// 2. **Tenant** — the nonce's session tenant from `session_tenant_or_refuse`,
 ///    the resolver the forwarder uses for its bearer; an unresolvable one is
 ///    refused, and the resolved tenant is what a fresh registration stamps.
-/// 3. **Ownership** — the session must be the CALLER's: either an open
-///    lifecycle record hosts it in the nonce's own terminal, or its JSONL's
-///    `cwd` is exactly the nonce's workdir. A nonce cannot bind another
-///    workdir's session.
+/// 3. **Ownership** — the session must be the CALLER's: an open lifecycle
+///    record hosting it in the nonce's own terminal is owned, one hosting it in
+///    any other terminal is refused; an unhosted session's JSONL `cwd` must be
+///    exactly the nonce's workdir, and no `cwd` record yet is refused. A nonce
+///    cannot bind another workdir's session.
 /// 4. **Adoption** — a supplied `coord_session_id` is adopted only after coord
 ///    confirms (over the runner's device credential for that tenant) that the
 ///    row belongs to this Claude session; an unconfirmed id is refused and
@@ -910,6 +911,7 @@ pub(crate) struct TranscriptBindEnv {
 /// - `409 {"error":"sync_disabled"}` — `Settings.cloud_sync_enabled` is off; nothing written
 /// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
 /// - `409 {"error":"coord_session_in_use"}` — the id to adopt is bound to another session
+/// - `409 {"error":"bound_to_other_row","bound":x,"requested":y}` — already bound to another row; nothing written
 /// - `409 {"error":"adoption_unconfirmed"}` — coord could not confirm the supplied id is this session's; nothing written
 /// - `422 {"error":"jsonl_not_watched","detail":…}` — no watched JSONL for the id
 /// - `500 {"error":"replay_failed","detail":…}` — bound, but the JSONL could not be read
@@ -1002,7 +1004,7 @@ pub(crate) async fn transcript_bind_core(
     env: TranscriptBindEnv,
 ) -> (StatusCode, serde_json::Value) {
     use crate::session::session_transcript_tailer::{
-        jsonl_belongs_to_workdir, locate_session_jsonl, BindRefusal, BindRequest,
+        jsonl_ownership, locate_session_jsonl, BindRefusal, BindRequest, Ownership,
     };
 
     // 1. The nonce — before anything else is read.
@@ -1101,28 +1103,46 @@ pub(crate) async fn transcript_bind_core(
         }
     };
 
-    // 6. Ownership: the caller's own session only.
+    // 6. Ownership: the caller's own session only. Hosting decides first —
+    // it is the stronger evidence: hosted in the nonce's own terminal is
+    // owned; hosted in ANY OTHER terminal is refused even when the cwd
+    // matches. Unhosted, the JSONL's own `cwd` must equal the nonce's workdir,
+    // and a file with no `cwd` record yet is refused rather than guessed.
     let nonce_terminal = crate::coord_mcp::terminal_id_for_nonce(&nonce);
     let nonce_workdir = crate::coord_mcp::workdir_for_nonce(&nonce);
-    let by_terminal = nonce_terminal
-        .as_deref()
-        .is_some_and(|t| (env.session_terminal)(&session_key).as_deref() == Some(t));
-    let owned = by_terminal || {
-        let (p, wd) = (path.clone(), nonce_workdir.clone());
-        spawn_blocking_tracked(move || wd.is_some_and(|wd| jsonl_belongs_to_workdir(&p, &wd)))
-            .await
-            .unwrap_or(false)
-    };
-    if !owned {
-        return bind_error(
+    let not_caller = |why: &str| {
+        bind_error(
             StatusCode::FORBIDDEN,
             "not_caller_session",
-            Some(format!(
-                "session {session_key} is not this caller's: it is not hosted in the nonce's \
-                 terminal and its JSONL's cwd is not the nonce's workdir ({})",
-                nonce_workdir.as_deref().unwrap_or("<none>")
-            )),
-        );
+            Some(format!("session {session_key} is not this caller's: {why}")),
+        )
+    };
+    match (env.session_terminal)(&session_key) {
+        Some(host) if nonce_terminal.as_deref() == Some(host.as_str()) => {}
+        Some(_) => {
+            return not_caller("it is hosted in a different runner terminal than this nonce's");
+        }
+        None => {
+            let (p, wd) = (path.clone(), nonce_workdir.clone());
+            let verdict = spawn_blocking_tracked(move || {
+                wd.map(|wd| jsonl_ownership(&p, &wd))
+                    .unwrap_or(Ownership::CwdDiffers)
+            })
+            .await
+            .unwrap_or(Ownership::NoCwdRecord);
+            match verdict {
+                Ownership::Owned => {}
+                Ownership::CwdDiffers => {
+                    return not_caller("its JSONL's cwd is not this nonce's workdir");
+                }
+                Ownership::NoCwdRecord => {
+                    return not_caller(
+                        "no cwd record yet in its JSONL, so ownership cannot be established \
+                         (retry once the session has written a turn)",
+                    );
+                }
+            }
+        }
     }
 
     // 7. Adoption — only a row coord confirms is this session's. An
@@ -1191,6 +1211,16 @@ pub(crate) async fn transcript_bind_core(
                  on this runner"
                     .to_string(),
             ),
+        ),
+        Ok(Err(BindRefusal::BoundToOtherRow { bound, requested })) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "bound_to_other_row",
+                "bound": bound,
+                "requested": requested,
+                "detail": "this session is already bound to a different coord row on this \
+                           runner; nothing was written",
+            }),
         ),
         Ok(Err(BindRefusal::Unreadable(d))) => bind_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1653,6 +1683,44 @@ mod tests {
             assert!(outbox.pending().unwrap().is_empty());
         }
 
+        /// Hosting is stronger evidence than cwd: a session hosted in ANOTHER
+        /// runner terminal is refused even though its cwd is the nonce's
+        /// workdir.
+        #[tokio::test]
+        async fn a_session_hosted_in_another_terminal_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let mut e = env(Some(t), vec![cfg], true);
+            e.session_terminal = Box::new(|_| Some("some-other-terminal".to_string()));
+            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+            assert_eq!(v["error"], "not_caller_session");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        /// No `cwd` record yet: refused, never guessed from the directory name.
+        #[tokio::test]
+        async fn a_session_with_no_cwd_record_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, _wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = dir.path().join("cfg");
+            let p = cfg.join("projects").join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join(format!("{csid}.jsonl")), "{\"type\":\"summary\"}\n").unwrap();
+            let (status, v) =
+                transcript_bind_core(&bearer(&nonce), &body(&csid), env(Some(t), vec![cfg], true))
+                    .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+            assert_eq!(v["error"], "not_caller_session");
+            assert!(v["detail"].as_str().unwrap().contains("no cwd record yet"));
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
         #[tokio::test]
         async fn unresolvable_tenant_is_403() {
             let dir = tempfile::tempdir().unwrap();
@@ -1723,7 +1791,8 @@ mod tests {
                     .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(v["error"], "jsonl_not_watched");
-            assert!(v["detail"].as_str().unwrap().contains("empty-cfg"));
+            // No absolute paths before the ownership check.
+            assert!(!v["detail"].as_str().unwrap().contains("empty-cfg"));
             assert!(outbox.pending().unwrap().is_empty());
         }
 

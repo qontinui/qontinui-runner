@@ -318,6 +318,15 @@ impl TranscriptOffsetLog {
     pub(crate) fn set(&self, session_key: &str, value: i64) {
         self.lock().record(session_key, value);
     }
+
+    /// Durably record several keys in ONE append + fsync, in the given order —
+    /// so the tailer's mark and its hole-detection record cost one fsync. A
+    /// crash mid-append can keep a PREFIX of the entries (a torn trailing line
+    /// is dropped on replay, keeping that key's previous value), so callers put
+    /// the entry that commits the reservation LAST.
+    pub(crate) fn set_many(&self, entries: &[(&str, i64)]) {
+        self.lock().record_many(entries);
+    }
 }
 
 /// Locked view of the lane map. Every mutation is durable before it returns
@@ -330,6 +339,44 @@ struct OffsetLane<'a> {
 impl OffsetLane<'_> {
     fn next_offset(&self, session_key: &str) -> i64 {
         self.state.lanes.get(session_key).copied().unwrap_or(0)
+    }
+
+    /// [`Self::record`] for several keys in one append + fsync.
+    fn record_many(&mut self, entries: &[(&str, i64)]) {
+        for (k, v) in entries {
+            self.state.lanes.insert((*k).to_string(), *v);
+        }
+        if self.state.degraded || entries.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        for (k, v) in entries {
+            buf.push_str(&json!({ "session_key": k, "next_offset": v }).to_string());
+            buf.push('\n');
+        }
+        let write = (|| -> std::io::Result<()> {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.path)?;
+            f.write_all(buf.as_bytes())?;
+            f.sync_data()
+        })();
+        if let Err(e) = write {
+            self.state.degraded = true;
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "transcript_emitter: offset log write failed — falling back to in-memory \
+                 offsets for the rest of this run"
+            );
+            return;
+        }
+        self.state.lines += entries.len();
+        self.maybe_compact();
     }
 
     /// Record `next_offset` for `session_key`, durably. Used both to reserve
@@ -355,6 +402,11 @@ impl OffsetLane<'_> {
             return;
         }
         self.state.lines += 1;
+        self.maybe_compact();
+    }
+
+    /// Rewrite the log in place once it holds enough superseded lines.
+    fn maybe_compact(&mut self) {
         if self.state.lines >= OFFSET_LOG_COMPACT_LINES
             && self.state.lines >= self.state.lanes.len() * 2
         {

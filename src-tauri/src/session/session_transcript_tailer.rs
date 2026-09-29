@@ -150,6 +150,9 @@ pub struct SessionTranscriptTailer {
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Durable file marks and their fingerprints — module header, "File marks".
     marks: TranscriptOffsetLog,
+    /// path as the caller spelled it → [`file_identity`], so the canonicalize
+    /// syscall runs once per spelling rather than once per batch.
+    identities: Mutex<HashMap<PathBuf, String>>,
 }
 
 /// What the caller of [`SessionTranscriptTailer::bind_and_replay`] asks for.
@@ -194,6 +197,9 @@ pub enum BindRefusal {
     RegistrationDisabled,
     /// The coord session to adopt is already bound to a different key.
     CoordSessionInUse,
+    /// This key is already bound to `bound`, not the `requested` row to adopt.
+    /// Nothing was written.
+    BoundToOtherRow { bound: Uuid, requested: Uuid },
     /// The JSONL could not be read for the replay. The binding HAS been
     /// written; later appends are tailed.
     Unreadable(String),
@@ -221,16 +227,19 @@ impl LocateRefusal {
                  this runner (it is not running, or no config dir had a projects/ root when it \
                  started), so no JSONL would be tailed after a bind"
                 .to_string(),
+            // Deliberately no absolute paths: this detail is answered before
+            // the ownership check, so it must not map the machine's config
+            // layout for a caller that may not own the session.
             Self::NotFound { searched } => format!(
-                "no <config_dir>/projects/*/<claude_code_session_id>.jsonl exists under any \
-                 config dir the transcript watcher watches ({}); a transcript outside them is \
-                 not tailed",
-                searched.join(", ")
+                "no <config_dir>/projects/*/<claude_code_session_id>.jsonl exists under any of \
+                 the {} config dir(s) the transcript watcher watches; a transcript outside them \
+                 is not tailed",
+                searched.len()
             ),
-            Self::WorkflowSession { path } => format!(
-                "{path} is a runner WORKFLOW session: the watcher does not tail it (the \
-                 executor produces its transcript), so binding it here would be a second producer"
-            ),
+            Self::WorkflowSession { .. } => "this is a runner WORKFLOW session: the watcher \
+                 does not tail it (the executor produces its transcript), so binding it here \
+                 would be a second producer"
+                .to_string(),
         }
     }
 }
@@ -298,42 +307,57 @@ fn head_is_workflow_session(path: &Path) -> bool {
     crate::terminal::transcript::is_workflow_session_marker(&head)
 }
 
+/// The verdict of [`jsonl_ownership`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ownership {
+    /// The session's `cwd` is the workdir.
+    Owned,
+    /// The session's `cwd` is a different directory.
+    CwdDiffers,
+    /// No `cwd` record in the scanned prefix (yet) — refused, never guessed.
+    NoCwdRecord,
+}
+
 /// Does the Claude Code session in `path` belong to `workdir` — the workdir a
-/// proxy nonce was provisioned into? The ownership half of
-/// `POST /sessions/transcript-bind`'s authorization.
+/// proxy nonce was provisioned into? The cwd half of
+/// `POST /sessions/transcript-bind`'s ownership check.
 ///
-/// The session's own `cwd` record decides when the file carries one (Claude
-/// Code stamps it on every user/assistant record): it must EQUAL the workdir,
-/// not merely sit under it, so a nonce for a workspace root cannot claim every
-/// session in the worktrees below it. A file with no `cwd` record in its first
-/// [`OWNERSHIP_SCAN_LINES`] falls back to the project directory, which Claude
-/// Code names after the launch cwd.
-pub fn jsonl_belongs_to_workdir(path: &Path, workdir: &str) -> bool {
+/// The session's own `cwd` record decides (Claude Code stamps it on every
+/// user/assistant record): it must EQUAL the workdir, not merely sit under it,
+/// so a nonce for a workspace root cannot claim every session in the worktrees
+/// below it. A file with no `cwd` record in its first
+/// [`OWNERSHIP_SCAN_LINES`] is [`Ownership::NoCwdRecord`] — FAIL CLOSED. The
+/// project directory's name is deliberately NOT a fallback: Claude Code's
+/// encoding maps `:` `/` `\` `_` all to `-`, so `/w/a-b` and `/w/a/b` share a
+/// directory name and the fallback would over-match.
+pub fn jsonl_ownership(path: &Path, workdir: &str) -> Ownership {
     let want = normalize_dir(workdir);
     if want.is_empty() {
-        return false;
+        return Ownership::CwdDiffers;
     }
-    if let Ok(f) = std::fs::File::open(path) {
-        for line in BufReader::new(f.take(4 * 1024 * 1024))
-            .lines()
-            .take(OWNERSHIP_SCAN_LINES)
-            .map_while(Result::ok)
+    let Ok(f) = std::fs::File::open(path) else {
+        return Ownership::NoCwdRecord;
+    };
+    for line in BufReader::new(f.take(4 * 1024 * 1024))
+        .lines()
+        .take(OWNERSHIP_SCAN_LINES)
+        .map_while(Result::ok)
+    {
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        if let Some(cwd) = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string))
         {
-            if !line.contains("\"cwd\"") {
-                continue;
-            }
-            if let Some(cwd) = serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string))
-            {
-                return normalize_dir(&cwd) == want;
-            }
+            return if normalize_dir(&cwd) == want {
+                Ownership::Owned
+            } else {
+                Ownership::CwdDiffers
+            };
         }
     }
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .is_some_and(|dir| dir == crate::terminal::transcript_watcher::encode_for_lookup(workdir))
+    Ownership::NoCwdRecord
 }
 
 /// Separator-, trailing-slash- and (on Windows) case-insensitive directory form.
@@ -383,10 +407,30 @@ struct ReplayPass {
     stopped_at: Option<u64>,
 }
 
-/// The mark key: session AND path, so a moved or re-created transcript for the
-/// same session never inherits another file's offset.
-fn mark_key(session_key: &str, path: &Path) -> String {
-    format!("{session_key}\u{1f}{}", path.display())
+/// The file identity marks are keyed on: the canonical path (symlinks,
+/// `.`/`..` and — on macOS — `/private/var` aliases resolved), falling back to
+/// the path as given when it cannot be canonicalized, and lowercased on
+/// Windows like [`normalize_dir`]. The watcher reaches one file by two
+/// spellings (startup discovery builds it from `encode_for_lookup`, a notify
+/// event carries the OS's own path, the route takes the `read_dir` name), and
+/// a second spelling must not read as a fresh file with mark 0.
+fn file_identity(path: &Path) -> String {
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = p.display().to_string();
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Hole-record keys for mark `mk`: the emitter lane value before the last
+/// reserved emit, and where that emit's range began.
+fn hole_lane_key(mk: &str) -> String {
+    format!("hl\u{1f}{mk}")
+}
+fn hole_from_key(mk: &str) -> String {
+    format!("hf\u{1f}{mk}")
 }
 
 /// The key the first-line fingerprint for mark `mk` is stored under.
@@ -408,6 +452,8 @@ struct Coverage {
     bytes_emitted: u64,
     appends_skipped_unbound: u64,
     appends_skipped_gate_off: u64,
+    /// Reserved ranges found never queued (see `report_hole_if_any`).
+    transcript_holes: u64,
     /// Gate 1 as observed at the last append. `None` until an append is seen —
     /// which is why the report models it as an option: "no data yet" and
     /// "consent withheld" are different answers and a bare `false` conflates
@@ -436,6 +482,8 @@ pub struct CoverageReport {
     pub bytes_emitted: u64,
     pub appends_skipped_unbound: u64,
     pub appends_skipped_gate_off: u64,
+    /// Reserved transcript ranges found never queued (`transcript_hole`).
+    pub transcript_holes: u64,
 }
 
 impl SessionTranscriptTailer {
@@ -447,6 +495,7 @@ impl SessionTranscriptTailer {
             coverage: Mutex::new(Coverage::default()),
             session_locks: Mutex::new(HashMap::new()),
             marks,
+            identities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -561,7 +610,7 @@ impl SessionTranscriptTailer {
             Err(TryLockError::Poisoned(p)) => p.into_inner(),
             Err(TryLockError::WouldBlock) => return false,
         };
-        let mk = mark_key(session_key, path);
+        let mk = self.mark_key(session_key, path);
         if self.current_mark(&mk) != file_start {
             return false;
         }
@@ -585,7 +634,7 @@ impl SessionTranscriptTailer {
         let _held = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mk = mark_key(session_key, path);
+        let mk = self.mark_key(session_key, path);
         let mark = self.validated_mark(&mk, path, truncated);
         if file_start > mark {
             // Gap: the bytes below this batch were never emitted. Emit them
@@ -606,6 +655,29 @@ impl SessionTranscriptTailer {
             }
         }
         let _ = self.emit_range(session_key, &mk, path, file_start, appended);
+    }
+
+    /// The mark key: session AND the file's identity ([`file_identity`]), so a
+    /// re-created transcript at another path never inherits an offset and one
+    /// file reached by two spellings shares one mark.
+    fn mark_key(&self, session_key: &str, path: &Path) -> String {
+        let mut ids = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = match ids.get(path) {
+            Some(id) => id.clone(),
+            None => {
+                let id = file_identity(path);
+                // Cache only a resolved identity: a path that does not exist
+                // yet must be re-resolved once it does.
+                if path.exists() {
+                    ids.insert(path.to_path_buf(), id.clone());
+                }
+                id
+            }
+        };
+        format!("{session_key}\u{1f}{id}")
     }
 
     /// The per-session emit lock for `session_key`.
@@ -706,14 +778,52 @@ impl SessionTranscriptTailer {
                 self.marks.set(&fingerprint_key(mk), fp);
             }
         }
-        // Write-ahead reservation.
-        self.marks.set(mk, file_end as i64);
+        let lane_before = self.emitter.offsets().next_offset(session_key);
+        self.report_hole_if_any(session_key, mk, mark, lane_before);
+        // Write-ahead reservation, in one fsync: the hole record first, the
+        // mark LAST, so a torn append never commits a mark without its record.
+        self.marks.set_many(&[
+            (&hole_lane_key(mk), lane_before),
+            (&hole_from_key(mk), from as i64),
+            (mk, file_end as i64),
+        ]);
         let chunks = self.emitter.emit_inner(session_key, unseen);
         if chunks == 0 {
-            self.marks.set(mk, mark as i64);
+            // Clean failure: nothing was queued. Roll the mark back and clear
+            // the hole record — this is a retry, not a hole.
+            self.marks
+                .set_many(&[(&hole_lane_key(mk), -1), (mk, mark as i64)]);
             return None;
         }
         Some((file_end - from, chunks as u64))
+    }
+
+    /// Hole visibility (no delivery change). The last reservation recorded the
+    /// emitter's lane value before its emit; if the lane has NOT advanced past
+    /// it, that emit never queued its bytes — the runner died between the
+    /// mark and the outbox — so `[from, mark)` never reached coord. Logged once
+    /// and counted; the record is overwritten by the reservation that follows.
+    fn report_hole_if_any(&self, session_key: &str, mk: &str, mark: u64, lane_now: i64) {
+        let Some(lane_then) = self.marks.get(&hole_lane_key(mk)).filter(|l| *l >= 0) else {
+            return;
+        };
+        let from = self
+            .marks
+            .get(&hole_from_key(mk))
+            .map(|f| u64::try_from(f).unwrap_or(0))
+            .unwrap_or(mark);
+        if lane_now <= lane_then && from < mark {
+            tracing::warn!(
+                session_key,
+                hole_from = from,
+                hole_to = mark,
+                lane = lane_now,
+                "transcript_hole: a reserved transcript range was never queued (the runner \
+                 stopped between reserving the file mark and the outbox write); bytes \
+                 [hole_from, hole_to) of this JSONL did not reach coord"
+            );
+            self.lock_coverage().transcript_holes += 1;
+        }
     }
 
     /// Bind `session_key` (a Claude Code session id, the JSONL stem) into the
@@ -748,7 +858,18 @@ impl SessionTranscriptTailer {
         let existing = self.registrar.session_id_for(session_key);
         let already_bound = existing.is_some();
         let (coord_session_id, adopted) = match existing {
-            Some(id) => (id, false),
+            // Already mapped: never a second row. A requested adoption of a
+            // DIFFERENT row is refused rather than silently answered with the
+            // mapped one, so the caller never reads back the wrong session.
+            Some(id) => match req.adopt {
+                Some(requested) if requested != id => {
+                    return Err(BindRefusal::BoundToOtherRow {
+                        bound: id,
+                        requested,
+                    })
+                }
+                requested => (id, requested == Some(id)),
+            },
             None => {
                 let id = self
                     .registrar
@@ -768,7 +889,7 @@ impl SessionTranscriptTailer {
             cov.tailed.insert(session_key.to_string());
         }
 
-        let mk = mark_key(session_key, path);
+        let mk = self.mark_key(session_key, path);
         let mark = self.validated_mark(&mk, path, false);
         let pass = self
             .replay_locked(session_key, &mk, path, mark, None)
@@ -894,6 +1015,7 @@ impl SessionTranscriptTailer {
             bytes_emitted: cov.bytes_emitted,
             appends_skipped_unbound: cov.appends_skipped_unbound,
             appends_skipped_gate_off: cov.appends_skipped_gate_off,
+            transcript_holes: cov.transcript_holes,
         }
     }
 
@@ -1634,11 +1756,131 @@ mod tests {
             &csid,
             "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"/work/a\"}\n",
         );
-        assert!(jsonl_belongs_to_workdir(&path, "/work/a"));
-        assert!(jsonl_belongs_to_workdir(&path, "/work/a/"));
-        assert!(!jsonl_belongs_to_workdir(&path, "/work/b"));
-        assert!(!jsonl_belongs_to_workdir(&path, "/work"));
-        assert!(!jsonl_belongs_to_workdir(&path, ""));
+        assert_eq!(jsonl_ownership(&path, "/work/a"), Ownership::Owned);
+        assert_eq!(jsonl_ownership(&path, "/work/a/"), Ownership::Owned);
+        assert_eq!(jsonl_ownership(&path, "/work/b"), Ownership::CwdDiffers);
+        assert_eq!(jsonl_ownership(&path, "/work"), Ownership::CwdDiffers);
+        assert_eq!(jsonl_ownership(&path, ""), Ownership::CwdDiffers);
+
+        // No cwd record: FAIL CLOSED, even when the project directory's
+        // encoded name would match the workdir.
+        let other = Uuid::new_v4().to_string();
+        let p = dir.path().join("cfg").join("projects").join("-work-a");
+        std::fs::create_dir_all(&p).unwrap();
+        let f = p.join(format!("{other}.jsonl"));
+        std::fs::write(&f, "{\"type\":\"summary\"}\n").unwrap();
+        assert_eq!(jsonl_ownership(&f, "/work/a"), Ownership::NoCwdRecord);
+    }
+
+    /// One file reached by two spellings shares one mark: binding through one
+    /// and appending through the other re-sends nothing.
+    #[test]
+    fn a_second_path_spelling_does_not_resend_history() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2) = ("{\"n\":1}\n", "{\"n\":2}\n");
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+
+        let alias = dir
+            .path()
+            .join("cfg")
+            .join("projects")
+            .join("proj")
+            .join("..")
+            .join("proj")
+            .join(format!("{csid}.jsonl"));
+        assert_ne!(alias, path);
+        append(&path, l2);
+        t.on_appended_gated(&csid, &alias, l1.len() as u64, l2, false, true);
+        // And a startup-style re-read from 0 through the alias is inert.
+        t.on_appended_gated(&csid, &alias, 0, &format!("{l1}{l2}"), false, true);
+
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l2}"));
+    }
+
+    /// Re-binding an already-bound session: naming its own row reports
+    /// `adopted`; naming a DIFFERENT row is refused and writes nothing.
+    #[test]
+    fn rebind_naming_a_row_matches_or_is_refused() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let path = jsonl(dir.path(), &csid, "{\"n\":1}\n");
+        let bound = bind(&t, &csid, &path).coord_session_id;
+        let rows = outbox.pending().unwrap().len();
+
+        let same = t
+            .bind_and_replay(
+                &csid,
+                &path,
+                BindRequest {
+                    adopt: Some(bound),
+                    tenant: None,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(same.already_bound && same.adopted);
+        assert_eq!(same.coord_session_id, bound);
+
+        let other = Uuid::new_v4();
+        assert_eq!(
+            t.bind_and_replay(
+                &csid,
+                &path,
+                BindRequest {
+                    adopt: Some(other),
+                    tenant: None,
+                },
+                true,
+            ),
+            Err(BindRefusal::BoundToOtherRow {
+                bound,
+                requested: other
+            })
+        );
+        assert_eq!(registrar.session_id_for(&csid), Some(bound));
+        assert_eq!(outbox.pending().unwrap().len(), rows, "nothing written");
+    }
+
+    /// A reservation whose emit never queued (the runner died between the mark
+    /// and the outbox) is reported as a hole on the next emit — visibility
+    /// only; delivery is unchanged (the range is not re-sent).
+    #[test]
+    fn a_reserved_range_that_never_queued_is_reported_as_a_hole() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n");
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+        assert_eq!(t.coverage().transcript_holes, 0);
+
+        // Simulate the crash: l2 is appended and its range reserved exactly as
+        // `emit_range` does, but the emitter never runs.
+        append(&path, l2);
+        let mk = t.mark_key(&csid, &path);
+        let lane = t.emitter.offsets().next_offset(&csid);
+        let end = (l1.len() + l2.len()) as i64;
+        t.marks.set_many(&[
+            (&hole_lane_key(&mk), lane),
+            (&hole_from_key(&mk), l1.len() as i64),
+            (&mk, end),
+        ]);
+
+        append(&path, l3);
+        t.on_appended_gated(&csid, &path, end as u64, l3, false, true);
+        assert_eq!(t.coverage().transcript_holes, 1);
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l3}"), "no re-send");
+
+        // The next emit after a clean one reports nothing further.
+        let l4 = "{\"n\":4}\n";
+        append(&path, l4);
+        let at = std::fs::metadata(&path).unwrap().len() - l4.len() as u64;
+        t.on_appended_gated(&csid, &path, at, l4, false, true);
+        assert_eq!(t.coverage().transcript_holes, 1);
     }
 
     /// The locator's three refusals, and its one success.
