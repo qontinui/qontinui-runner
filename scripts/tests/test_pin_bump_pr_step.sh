@@ -114,8 +114,9 @@ key=""
 case "${1:-} ${2:-}" in
   "pr list")
     case "$json" in
-      *isDraft*) key="list:ready" ;;
-      *)         key="list:$state" ;;
+      *headRefOid*) key="list:ready" ;;     # the ready script's lookup
+      *isDraft*)    key="list:schemas" ;;   # the schemas step's ready-PR probe
+      *)            key="list:$state" ;;
     esac ;;
   "pr view")   key="view:$json" ;;
   "pr edit")   key="edit" ;;
@@ -127,11 +128,15 @@ case "${1:-} ${2:-}" in
       *convertPullRequestToDraft*) key="graphql:convert" ;;
       *" graphql "*)   key="graphql" ;;
       *"/check-runs"*) key="check-runs" ;;
-      *"/comments"*)   [ "$method" = "GET" ] && key="comments-read" ;;
+      *"/comments"*)   if [ "$method" = "GET" ]; then key="comments-read"; else key="comment-post"; fi ;;
+      *"/pulls/"*)     [ "$method" = "PATCH" ] && key="pr-close" ;;
     esac ;;
 esac
 [ -n "$key" ] || { echo "gh stub: unhandled invocation '$*'" >&2; exit 97; }
 echo "$key" >> "${GH_STUB_LOG:?}"
+# Which token each call ran on — the in-step ready decision must use
+# ACTIONS_TOKEN (GITHUB_TOKEN), never the PAT.
+echo "$key ${GH_TOKEN:-<unset>}" >> "${GH_STUB_TOKEN_LOG:-/dev/null}"
 case " ${GH_STUB_FAIL:-} " in
   *" $key "*) echo "gh: HTTP 403 ($key)" >&2; exit 1 ;;
 esac
@@ -139,8 +144,11 @@ case "$key" in
   list:open)   printf '%s\n' "${GH_STUB_OPEN:-}" ;;
   list:closed) : ;;
   list:ready)
-    printf '77\t%s\t%s\tPR_kwDOtest77\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/77\tjspinak\n' \
-      "${GH_STUB_READY_ISDRAFT:-true}" "${GH_STUB_HEAD:?}" ;;
+    printf '77\t%s\t%s\tPR_kwDOtest77\t2026-09-29T00:00:00Z\thttps://github.com/qontinui/qontinui-runner/pull/77\tjspinak\t%s\t%s\n' \
+      "${GH_STUB_READY_ISDRAFT:-true}" "${GH_STUB_HEAD:?}" "${GH_STUB_READY_MERGEABLE:-MERGEABLE}" "${GH_STUB_READY_MSS:-CLEAN}" ;;
+  list:schemas) printf '%s\n' "${GH_STUB_SCHEMAS_READY:-}" ;;
+  comment-post) echo "https://github.com/qontinui/qontinui-runner/pull/77#issuecomment-2" ;;
+  pr-close)    echo "closed" ;;
   view:isDraft) printf '%s\n' "${GH_STUB_ISDRAFT:-true}" ;;
   view:mergeable,mergeStateStatus) printf '%s\n' "${GH_STUB_MERGE:-MERGEABLE CLEAN}" ;;
   view:id)     echo "PR_kwDOtest77" ;;
@@ -162,6 +170,13 @@ echo "$*" >> "${GIT_STUB_LOG:?}"
 case "${1:-}" in
   diff)      exit 1 ;;                       # staged changes: the normal bump path
   rev-parse) echo "${GH_STUB_HEAD:?}" ;;     # the pushed commit
+  ls-remote)                                 # the sweep's head pin
+    case "${GIT_STUB_REMOTE_HEAD:-}" in
+      fail) echo "fatal: could not read from remote" >&2; exit 128 ;;
+      none) : ;;
+      "")   printf '%s\trefs/heads/chore/sibling-pin-bump\n' "${GH_STUB_HEAD:?}" ;;
+      *)    printf '%s\trefs/heads/chore/sibling-pin-bump\n' "$GIT_STUB_REMOTE_HEAD" ;;
+    esac ;;
 esac
 exit 0
 STUB
@@ -186,7 +201,7 @@ GH_STUB_CONVERT_ISDRAFT=true; GH_STUB_READY_RESULT_ISDRAFT=false
 
 # run_step <fail-keys> — echoes the exit code; out.txt, gh.log, git.log.
 run_step() {
-  : > "$work/gh.log"; : > "$work/git.log"; : > "$work/summary.md"
+  : > "$work/gh.log"; : > "$work/git.log"; : > "$work/summary.md"; : > "$work/token.log"
   local rc=0
   (
     cd "$repo"
@@ -196,7 +211,9 @@ run_step() {
     GH_STUB_MERGE="$GH_STUB_MERGE" GH_STUB_CONVERT_ISDRAFT="$GH_STUB_CONVERT_ISDRAFT" \
     GH_STUB_READY_RESULT_ISDRAFT="$GH_STUB_READY_RESULT_ISDRAFT" \
     GH_STUB_HEAD="$HEAD_SHA" GH_STUB_COMMENTS="$work/comments.txt" \
-    GH_TOKEN=stub ACTIONS_TOKEN=stub PAT_AVAILABLE=true REPO=qontinui/qontinui-runner \
+    GH_STUB_TOKEN_LOG="$work/token.log" \
+    REFRESH_SKIPPED_FOR_READY="${REFRESH_SKIPPED_FOR_READY_STUB:-}" \
+    GH_TOKEN=pat-token-stub ACTIONS_TOKEN=actions-token-stub PAT_AVAILABLE=true REPO=qontinui/qontinui-runner \
     BRANCH=chore/sibling-pin-bump TITLE="chore(ci): bump sibling pins" \
     RUN_URL=https://github.com/qontinui/qontinui-runner/actions/runs/1 \
     MANIFEST=.github/sibling-pins.conf RUNNER_TEMP="$temp" GITHUB_SHA="$HEAD_SHA" \
@@ -219,6 +236,11 @@ assert "no PR: pushed" 1 "$(pushes)"
 assert "no PR: created" 1 "$(calls create)"
 assert "no PR: readied" 1 "$(count '^readied #77$' "$work/out.txt")"
 assert "no PR: summary names the state" 1 "$(count 'draft/ready state: `readied #77`' "$work/summary.md")"
+
+# 1b. The in-step ready decision runs on ACTIONS_TOKEN (GITHUB_TOKEN, which
+#     the job's permissions block grants checks: read), never on the PAT.
+assert "ready script's gh calls all ran on ACTIONS_TOKEN" 0 "$(grep -E '^(list:ready|check-runs|graphql) ' "$work/token.log" | grep -vc ' actions-token-stub$' || true)"
+assert "ready script's gh calls were made at all" 1 "$( { grep -E '^graphql actions-token-stub$' "$work/token.log" || true; } | wc -l | tr -d ' ')"
 
 # 2. Existing DRAFT PR: force-pushed, edited, readied, as before.
 GH_STUB_OPEN=77; GH_STUB_ISDRAFT=true
@@ -253,6 +275,20 @@ for shape in "CONFLICTING DIRTY" "MERGEABLE DIRTY"; do
   assert "ready+conflicting ($shape): re-readied" 1 "$(count '^readied #77$' "$work/out.txt")"
 done
 
+# 4b. N1 — decided ONCE. The schemas step saw a ready PR (mergeability not yet
+#     computed) and skipped the Cargo.lock refresh a moving schemas pin needs;
+#     the PR step then reads CONFLICTING. Converting now would push a
+#     lock-stale bump, so it must comment instead.
+GH_STUB_MERGE="CONFLICTING DIRTY"
+REFRESH_SKIPPED_FOR_READY_STUB=true
+: > "$work/comments.txt"
+rc="$(run_step "")"
+REFRESH_SKIPPED_FOR_READY_STUB=""
+assert "refresh skipped + conflicting: exit code" 0 "$rc"
+assert "refresh skipped + conflicting: not converted" 0 "$(calls graphql:convert)"
+assert "refresh skipped + conflicting: never pushed" 0 "$(pushes)"
+assert "refresh skipped + conflicting: comment instead" 1 "$(calls comment)"
+
 # 5. Ready + UNKNOWN: comment only — never force-push on an unknown.
 GH_STUB_MERGE="UNKNOWN UNKNOWN"
 : > "$work/comments.txt"
@@ -282,6 +318,109 @@ GH_STUB_READY_RESULT_ISDRAFT=false
 assert "ready hand-off fails: exit code" 1 "$rc"
 assert "ready hand-off fails: reporter names it" 1 "$(count 'Marking the bump PR ready for review' "$work/out.txt")"
 
+# =============================================================================
+# The schemas step: it alone decides whether a lock refresh was skipped.
+# =============================================================================
+extract_body() {
+  awk -v name="$1" '
+    state == 0 && $0 == "      - name: " name { state = 1; next }
+    state == 1 && $0 ~ /^      - name: / { exit }
+    state == 1 && $0 == "        run: |" { state = 2; next }
+    state == 2 {
+      if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+      if ($0 !~ /^          /) { exit }
+      print substr($0, 11)
+    }
+  ' "$workflow" > "$2"
+  [ "$(grep -c 'set -euo pipefail' "$2" || true)" -ge 1 ] || { echo "::error::step '$1' did not extract"; exit 1; }
+  bash -n "$2"
+}
+schemas_body="$work/schemas.sh"
+extract_body "Detect a moving qontinui-schemas pin" "$schemas_body"
+sfx="$work/schemas-fx"
+mkdir -p "$sfx/.github"
+OLD_SCHEMAS="3333333333333333333333333333333333333333"
+NEW_SCHEMAS="4444444444444444444444444444444444444444"
+# run_schemas <ready-pr-number-or-empty> <fresh schemas sha>
+run_schemas() {
+  printf 'qontinui/qontinui-schemas %s
+' "$OLD_SCHEMAS" > "$sfx/.github/sibling-pins.conf"
+  printf 'qontinui/qontinui-schemas %s
+' "$2" > "$temp/sibling-pins.fresh.conf"
+  : > "$work/schemas.out"; : > "$work/gh.log"
+  local rc=0
+  (
+    cd "$sfx"
+    PATH="$bin:$PATH" GH_STUB_LOG="$work/gh.log" GH_STUB_SCHEMAS_READY="$1" GH_STUB_HEAD="$HEAD_SHA" \
+    MANIFEST=.github/sibling-pins.conf GH_TOKEN=stub REPO=qontinui/qontinui-runner \
+    BRANCH=chore/sibling-pin-bump RUNNER_TEMP="$temp" GITHUB_OUTPUT="$work/schemas.out" \
+    bash "$schemas_body"
+  ) > "$work/schemas.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+sout() { sed -n "s/^$1=//p" "$work/schemas.out"; }
+echo ""
+echo "Schemas step cases:"
+rc="$(run_schemas 77 "$NEW_SCHEMAS")"
+assert "ready PR + schemas moves: exit code" 0 "$rc"
+assert "ready PR + schemas moves: refresh skipped" "false" "$(sout moved)"
+assert "ready PR + schemas moves: refresh_skipped_for_ready=true" "true" "$(sout refresh_skipped_for_ready)"
+rc="$(run_schemas 77 "$OLD_SCHEMAS")"
+assert "ready PR + schemas unchanged: refresh_skipped_for_ready=false" "false" "$(sout refresh_skipped_for_ready)"
+rc="$(run_schemas "" "$NEW_SCHEMAS")"
+assert "no ready PR + schemas moves: moved=true" "true" "$(sout moved)"
+assert "no ready PR + schemas moves: refresh_skipped_for_ready=false" "false" "$(sout refresh_skipped_for_ready)"
+schemas_code="$work/schemas.code.sh"
+{ grep -vE '^[[:space:]]*#' "$schemas_body" || true; } > "$schemas_code"
+assert "schemas probe: a conflicting ready PR is NOT skipped" 1 "$(count 'select\(.isDraft == false and .isCrossRepository == false and .mergeable != "CONFLICTING" and .mergeStateStatus != "DIRTY"\)' "$schemas_code")"
+printf 'qontinui/ui-bridge 2222222222222222222222222222222222222222\n' > "$temp/sibling-pins.fresh.conf"
+
+# =============================================================================
+# The sweep step: pinned head, and --close-if-obsolete only on an explicit
+# no-move night.
+# =============================================================================
+sweep_body="$work/sweep.sh"
+extract_body "Sweep the bump PR (ready it once it carries checks; page if parked)" "$sweep_body"
+# run_sweep <DRIFT value> — echoes the exit code; the ready lookup reports a
+# READY PR that conflicts with main unless the caller overrides.
+run_sweep() {
+  : > "$work/gh.log"; : > "$work/summary.md"
+  local rc=0
+  (
+    cd "$repo"
+    PATH="$bin:$PATH" GH_STUB_LOG="$work/gh.log" GIT_STUB_LOG="$work/git.log" \
+    GH_STUB_HEAD="$HEAD_SHA" GH_STUB_COMMENTS="$work/comments.txt" \
+    GH_STUB_READY_ISDRAFT="${SW_ISDRAFT:-false}" GH_STUB_READY_MERGEABLE="${SW_MERGEABLE:-CONFLICTING}" \
+    GH_STUB_READY_MSS="${SW_MSS:-DIRTY}" GIT_STUB_REMOTE_HEAD="${SW_REMOTE_HEAD:-}" \
+    GH_TOKEN=stub REPO=qontinui/qontinui-runner BRANCH=chore/sibling-pin-bump DRIFT="$1" \
+    RUNNER_TEMP="$temp" GITHUB_STEP_SUMMARY="$work/summary.md" \
+    bash "$sweep_body"
+  ) > "$work/sweep.log" 2>&1 || rc=$?
+  echo "$rc"
+}
+echo ""
+echo "Sweep step cases:"
+: > "$work/comments.txt"
+rc="$(run_sweep false)"
+assert "no-move night + conflicting PR: exit code" 0 "$rc"
+assert "no-move night + conflicting PR: sweep passes the flag -> closed" "closed-obsolete #77" "$(tail -n1 "$work/sweep.log")"
+rc="$(run_sweep true)"
+assert "move night + conflicting PR: no flag -> not closed" "0 already-ready #77" "$(calls pr-close) $(tail -n1 "$work/sweep.log")"
+rc="$(run_sweep "")"
+assert "empty drift output + conflicting PR: no flag -> not closed" "0 already-ready #77" "$(calls pr-close) $(tail -n1 "$work/sweep.log")"
+SW_ISDRAFT=true; SW_MERGEABLE=MERGEABLE; SW_MSS=CLEAN
+SW_REMOTE_HEAD="c69f445a5c69f445a5c69f445a5c69f445a5c69f"
+rc="$(run_sweep false)"
+assert "sweep, stale head: head-mismatch, not readied" "head-mismatch #77 0" "$(tail -n1 "$work/sweep.log") $(calls graphql)"
+SW_REMOTE_HEAD=""
+rc="$(run_sweep false)"
+assert "sweep, pinned head matches: readied" "readied #77" "$(tail -n1 "$work/sweep.log")"
+SW_REMOTE_HEAD="fail"
+rc="$(run_sweep false)"
+SW_REMOTE_HEAD=""
+assert "sweep, ls-remote refused: red, undecided" "1 0" "$rc $(calls graphql)"
+SW_ISDRAFT=""; SW_MERGEABLE=""; SW_MSS=""
+
 # --- Mutation proofs ----------------------------------------------------------
 if [ -z "${PIN_BUMP_STEP_MUTANT:-}" ]; then
   echo ""
@@ -309,6 +448,15 @@ if [ -z "${PIN_BUMP_STEP_MUTANT:-}" ]; then
   mutate sweep-success-only \
     '/^        if: \$\{\{ !cancelled\(\) && steps\.scan\.outputs\.sweep == / { sub(/\$\{\{ !cancelled\(\) && /, ""); sub(/ \}\}$/, "") } { print }' \
     "sweep if: runs under !cancelled()"
+  mutate refresh-skip-ignored \
+    '$0 == "                if [ \"${REFRESH_SKIPPED_FOR_READY:-}\" = \"true\" ]; then" { $0 = "                if false; then" } { print }' \
+    "refresh skipped + conflicting: never pushed"
+  mutate actions-token-dropped \
+    '{ sub(/if ! GH_TOKEN="\$ACTIONS_TOKEN" bash /, "if ! bash ") } { print }' \
+    "ready script's gh calls all ran on ACTIONS_TOKEN"
+  mutate close-flag-unconditional \
+    '$0 == "          if [ \"$DRIFT\" = \"false\" ]; then" { $0 = "          if true; then" } { print }' \
+    "move night + conflicting PR: no flag -> not closed"
   mutate expect-head-dropped \
     '{ sub(/ --expect-head "\$pushed_sha"/, "") } { print }' \
     "ready call pins the pushed head"

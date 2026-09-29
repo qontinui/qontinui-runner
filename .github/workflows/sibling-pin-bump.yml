@@ -133,13 +133,13 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
-    # Was 15. The bump PR step now waits up to 180 s for the pushed head to be
-    # reported and its check runs to register (scripts/ci/ready-bot-draft-pr.sh
-    # --wait-for-checks-seconds 180), and the sweep adds a few gh calls. Worst
-    # case: checkout + scan (~1 min) + schemas lock refresh (toolchain install
-    # + two `cargo metadata`, measured ~3-6 min) + PR step (~1 min of git/gh,
-    # plus the 3 min wait) + sweep (<1 min) = ~12 min, which left 15 about 3
-    # min of headroom. 20 restores ~8.
+    # Was 15. The bump PR step can now wait up to 180 s for the pushed head to
+    # be reported and its check runs to register (scripts/ci/ready-bot-draft-pr.sh
+    # --wait-for-checks-seconds 180), and the sweep adds a few gh calls.
+    # Measured whole-job runs before that wait were 35-44 s, so the new bound
+    # is ~3 min of wait on top of well under a minute of work. 20 is generous
+    # HEADROOM for a slow toolchain install or a congested API, not a measured
+    # worst case.
     timeout-minutes: 20
 
     # Two runs on main (the nightly plus a dispatch, or two dispatches) would
@@ -592,22 +592,44 @@ jobs:
           BRANCH: chore/sibling-pin-bump
         run: |
           set -euo pipefail
-          # A READY bump PR is never force-pushed (the PR step comments instead),
-          # so a lock refresh here would be discarded work that can still fail
-          # the run and cost the ui-bridge/web bumps their comment. Skip it —
-          # UNLESS it conflicts with main: the PR step converts that one back to
-          # a draft and rebuilds it, so it needs the refresh like any draft.
-          # No `|| true`: an unreadable PR list must not read as "no PR".
-          ready_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number,isDraft,mergeable,mergeStateStatus --jq '[.[] | select(.isDraft == false and .mergeable != "CONFLICTING" and .mergeStateStatus != "DIRTY")][0].number // empty')"
-          if [ -n "$ready_num" ]; then
-            echo "moved=false" >> "$GITHUB_OUTPUT"
-            echo "Bump PR #$ready_num is ready for review; the PR step will not force-push, so the lock refresh is skipped."
-            exit 0
-          fi
           read_pin() { tr -d '\r' < "$1" | awk '{ sub(/#.*/, "") } $1 == "qontinui/qontinui-schemas" && NF == 2 { print $2 }'; }
           old="$(read_pin "$MANIFEST")"
           new="$(read_pin "$RUNNER_TEMP/sibling-pins.fresh.conf")"
+          schemas_moves=false
           if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+            schemas_moves=true
+          fi
+
+          # A READY bump PR is never force-pushed (the PR step comments instead),
+          # so a lock refresh here would be discarded work that can still fail
+          # the run and cost the ui-bridge/web bumps their comment. Skip it.
+          #
+          # A ready PR that already reads CONFLICTING/DIRTY here is NOT
+          # skipped: the PR step converts it back to a draft and rebuilds it,
+          # so it needs the refresh like any draft.
+          #
+          # DECIDED ONCE. GitHub computes mergeability lazily, so this read can
+          # say UNKNOWN (or MERGEABLE) and the PR step's read a minute later
+          # CONFLICTING — and the PR step would then convert and force-push a
+          # schemas move WITHOUT the Cargo.lock refresh skipped here, a PR
+          # ci.yml's `cargo metadata --locked` reds. So this step publishes
+          # `refresh_skipped_for_ready=true` exactly when it skipped a refresh
+          # the bump NEEDED (a non-conflicting ready PR AND a moving schemas
+          # pin), and the PR step then takes the comment path even on a
+          # conflict. The next night reads the (by then computed) conflict
+          # here, refreshes, and the PR step converts.
+          # No `|| true`: an unreadable PR list must not read as "no PR".
+          ready_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number,isDraft,isCrossRepository,mergeable,mergeStateStatus --jq '[.[] | select(.isDraft == false and .isCrossRepository == false and .mergeable != "CONFLICTING" and .mergeStateStatus != "DIRTY")][0].number // empty')"
+          if [ -n "$ready_num" ]; then
+            {
+              echo "moved=false"
+              echo "refresh_skipped_for_ready=$schemas_moves"
+            } >> "$GITHUB_OUTPUT"
+            echo "Bump PR #$ready_num is ready for review; the PR step will not force-push, so the lock refresh is skipped (schemas pin moves: $schemas_moves)."
+            exit 0
+          fi
+          echo "refresh_skipped_for_ready=false" >> "$GITHUB_OUTPUT"
+          if [ "$schemas_moves" = "true" ]; then
             # checkout-sibling reads the manifest from the workspace, so stage
             # the fresh one there first. The PR step copies it again (a no-op).
             cp "$RUNNER_TEMP/sibling-pins.fresh.conf" "$MANIFEST"
@@ -665,6 +687,11 @@ jobs:
           # include Checks — a PAT lacking it would red a nightly that is
           # otherwise delivering.
           ACTIONS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # "true" when the schemas step skipped a Cargo.lock refresh the bump
+          # needed because a ready PR existed: this step must then NOT convert
+          # and force-push, even on a conflict (see that step). '' / "false"
+          # otherwise.
+          REFRESH_SKIPPED_FOR_READY: ${{ steps.schemas.outputs.refresh_skipped_for_ready }}
           REPO: ${{ github.repository }}
           BRANCH: chore/sibling-pin-bump
           TITLE: "chore(ci): bump sibling pins to current sibling heads"
@@ -713,8 +740,10 @@ jobs:
           # a transient gh 403 force-push under a live candidate — the exact
           # wedge the guard exists to prevent. `// empty` already covers the
           # genuinely-absent case.
+          # Same-repository PRs only: a fork PR sharing the branch name is never
+          # this workflow's to edit, comment on or force-push under.
           existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open \
-            --json number --jq '.[0].number // empty')"
+            --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
 
           if [ -n "$existing_num" ]; then
             # Queried separately rather than parsed out of one "<num> <bool>"
@@ -747,20 +776,29 @@ jobs:
                 *) echo "::error::Could not read bump PR #$existing_num's mergeability (got '$merge_state'). Nothing was pushed."; exit 1 ;;
               esac
               if [ "$mergeable" = "CONFLICTING" ] || [ "${merge_status:-}" = "DIRTY" ]; then
-                echo "::warning::Bump PR #$existing_num is ready but CONFLICTS with main ($mergeable/${merge_status:-}); it can never land. Converting it back to a draft and rebuilding '$BRANCH' from main."
-                if ! pr_node_id="$(gh pr view "$existing_num" --repo "$REPO" --json id --jq '.id')"; then
-                  echo "::error::Could not read bump PR #$existing_num's node id (gh's error above). Nothing was pushed."
-                  exit 1
+                # Decided ONCE, by the schemas step: when it saw a ready PR and
+                # skipped the Cargo.lock refresh this schemas move needs, a rebuild
+                # now would push a lock-stale bump that ci.yml's
+                # `cargo metadata --locked` reds. Comment instead; the next night
+                # re-reads everything and converts then.
+                if [ "${REFRESH_SKIPPED_FOR_READY:-}" = "true" ]; then
+                  echo "::warning::Bump PR #$existing_num conflicts with main, but the schemas step already skipped the Cargo.lock refresh for a ready PR this run. Not converting or force-pushing; the next run decides again."
+                else
+                  echo "::warning::Bump PR #$existing_num is ready but CONFLICTS with main ($mergeable/${merge_status:-}); it can never land. Converting it back to a draft and rebuilding '$BRANCH' from main."
+                  if ! pr_node_id="$(gh pr view "$existing_num" --repo "$REPO" --json id --jq '.id')"; then
+                    echo "::error::Could not read bump PR #$existing_num's node id (gh's error above). Nothing was pushed."
+                    exit 1
+                  fi
+                  if ! converted="$(gh api graphql -f query='mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{isDraft}}}' -f id="$pr_node_id" --jq '.data.convertPullRequestToDraft.pullRequest.isDraft')"; then
+                    echo "::error::Converting bump PR #$existing_num back to a draft failed (gh's error above). Nothing was pushed; it still conflicts with main."
+                    exit 1
+                  fi
+                  if [ "$converted" != "true" ]; then
+                    echo "::error::convertPullRequestToDraft on bump PR #$existing_num returned isDraft=[$converted], not true. Refusing to force-push under a PR that may still be ready."
+                    exit 1
+                  fi
+                  existing_draft=true
                 fi
-                if ! converted="$(gh api graphql -f query='mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{isDraft}}}' -f id="$pr_node_id" --jq '.data.convertPullRequestToDraft.pullRequest.isDraft')"; then
-                  echo "::error::Converting bump PR #$existing_num back to a draft failed (gh's error above). Nothing was pushed; it still conflicts with main."
-                  exit 1
-                fi
-                if [ "$converted" != "true" ]; then
-                  echo "::error::convertPullRequestToDraft on bump PR #$existing_num returned isDraft=[$converted], not true. Refusing to force-push under a PR that may still be ready."
-                  exit 1
-                fi
-                existing_draft=true
               fi
             fi
             if [ "$existing_draft" != "true" ]; then
@@ -902,7 +940,7 @@ jobs:
             # merged one must never be reopened. `first`, not `last`: gh returns
             # newest-first. No `|| true`, same reason as the open lookup above.
             existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
-              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
+              --json number,mergedAt,isCrossRepository --jq 'map(select(.mergedAt == null and .isCrossRepository == false)) | first | .number // empty')"
             if [ -n "$existing_num" ]; then
               echo "Reopening previously closed bump PR #$existing_num."
               gh pr reopen "$existing_num" --repo "$REPO" \
@@ -974,10 +1012,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: chore/sibling-pin-bump
+          # The scan's `drift`: "false" means the fresh manifest equals the
+          # committed one — no pin moves, main is already current.
+          DRIFT: ${{ steps.scan.outputs.drift }}
         run: |
           set -euo pipefail
           sweep_log="$RUNNER_TEMP/ready-bot-draft-pr.sweep.log"
-          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 | tee "$sweep_log"; then
+          extra_args=()
+          # Pin the decision to the branch's current head. No `|| true`: an
+          # unanswered ls-remote is not "no branch". An absent branch pins
+          # nothing.
+          if ! remote_line="$(git ls-remote origin "refs/heads/$BRANCH")"; then
+            echo "::error::git ls-remote for '$BRANCH' failed (see above); refusing to decide on an unpinned head."
+            exit 1
+          fi
+          remote_head="${remote_line%%$'\t'*}"
+          if [ -n "$remote_head" ]; then
+            extra_args+=(--expect-head "$remote_head")
+          fi
+          # Close a CONFLICTING bump PR as obsolete ONLY on an explicit
+          # no-move night: main is already current, so its change is not
+          # needed. An empty `drift` (the scan failed before deciding) is
+          # UNKNOWN and never closes anything.
+          if [ "$DRIFT" = "false" ]; then
+            extra_args+=(--close-if-obsolete)
+          fi
+          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --max-age-hours 48 "${extra_args[@]}" | tee "$sweep_log"; then
             echo "::error::The bump-PR sweep could not decide the draft/ready state of '$BRANCH''s PR on $REPO (see the ::error:: above)."
             echo "::error::It runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal means that permissions block has drifted."
             exit 1
@@ -986,5 +1046,5 @@ jobs:
             echo ""
             echo "### bump-PR sweep"
             echo ""
-            echo "Outcome: \`$(tail -n1 "$sweep_log")\`"
+            echo "drift=${DRIFT:-unknown}; outcome: \`$(tail -n1 "$sweep_log")\`"
           } >> "$GITHUB_STEP_SUMMARY"

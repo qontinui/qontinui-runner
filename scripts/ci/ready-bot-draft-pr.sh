@@ -22,10 +22,16 @@
 # fired" — never an inference from which token authored the PR, so it stays
 # right if a secret is rotated. It is deliberately NOT the head's total check
 # count: coord posts its own `Qontinui merge gate` run (app
-# `qontinui-merge-orchestrator`) on every PR it evaluates, INCLUDING a
-# GITHUB_TOKEN-authored PR that fired no workflows, so total_count >= 1 would
-# ready exactly the zero-CI PR the draft exists to hold back. The count is
-# summed over every page (`--paginate` emits one number per page).
+# `qontinui-merge-orchestrator`) on the PRs it evaluates, and GitHub does not
+# suppress APP webhooks for events a GITHUB_TOKEN causes (only workflow
+# triggers are suppressed) — so coord can post that run on a PR whose own CI
+# never fired, and a total_count >= 1 predicate would then ready exactly the
+# zero-CI PR the draft exists to hold back. The count is summed over every
+# page (`--paginate` emits one number per page).
+#
+# A draft that CONFLICTS with main (mergeable CONFLICTING, or mergeStateStatus
+# DIRTY) is never readied — coord cannot land it — and with
+# --close-if-obsolete a conflicting PR is closed instead (see OUTCOMES).
 #
 # With --expect-head, the head GitHub reports must equal the commit the caller
 # just pushed before anything is decided: right after a force-push the lookup
@@ -43,7 +49,7 @@
 # USAGE
 #   ready-bot-draft-pr.sh --repo <owner/name> --branch <head branch>
 #                         [--max-age-hours N] [--wait-for-checks-seconds S]
-#                         [--expect-head <40-hex sha>]
+#                         [--expect-head <40-hex sha>] [--close-if-obsolete]
 #
 #   --max-age-hours N         page (one PR comment, idempotent on a hidden
 #                             marker, plus a ::warning::) when the PR is still
@@ -63,6 +69,11 @@
 #                             lookup (within the wait budget) until GitHub
 #                             reports it as the head; if it never does, decide
 #                             NOTHING and report head-mismatch.
+#   --close-if-obsolete       the caller found main already current (no drift,
+#                             no pin move). A PR (draft or ready) that
+#                             conflicts with main then carries an obsolete
+#                             change: comment (once, hidden marker) and close
+#                             it. Nothing else is deleted — the branch stays.
 #
 # OUTCOMES (the LAST stdout line is exactly one of these; all exit 0):
 #   no-pr                   no open PR for --branch against main
@@ -71,8 +82,13 @@
 #                           ready, verified by the mutation's OWN returned isDraft
 #   draft-no-checks #<n>    a draft whose head carries 0 Actions check runs;
 #                           left alone (and paged past --max-age-hours)
+#   draft-conflicting #<n>  a draft that conflicts with main; never readied,
+#                           ::warning::, paged past --max-age-hours like
+#                           draft-no-checks (the page names the cause)
 #   head-mismatch #<n>      --expect-head never became the reported head within
-#                           the budget; left a draft, with a ::warning::
+#                           the budget; nothing decided, with a ::warning::
+#   closed-obsolete #<n>    --close-if-obsolete and the PR conflicts with main:
+#                           commented on and closed
 #
 # When $GITHUB_OUTPUT is set, also writes result=<word>, pr=<n>, url=<url>,
 # checks=<count> and paged=<true|false|already|n/a> to it.
@@ -94,6 +110,7 @@
 set -euo pipefail
 
 PAGE_MARKER='<!-- ready-bot-draft-pr:stale-draft -->'
+CLOSE_MARKER='<!-- ready-bot-draft-pr:closed-obsolete -->'
 
 usage() {
   awk '/^# OUTCOMES/ { exit } /^# USAGE/ { p = 1 } p { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
@@ -104,6 +121,7 @@ branch=""
 max_age_hours=""
 wait_seconds="0"
 expect_head=""
+close_if_obsolete="false"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)                    repo="${2:-}"; shift 2 || { usage; exit 2; } ;;
@@ -111,6 +129,7 @@ while [ $# -gt 0 ]; do
     --max-age-hours)           max_age_hours="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --wait-for-checks-seconds) wait_seconds="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --expect-head)             expect_head="${2:-}"; shift 2 || { usage; exit 2; } ;;
+    --close-if-obsolete)       close_if_obsolete="true"; shift ;;
     -h|--help)                 usage; exit 0 ;;
     *)
       echo "::error::ready-bot-draft-pr.sh: unknown argument '$1'."
@@ -166,17 +185,18 @@ emit() {
 }
 
 # --- 1. The open PR for this branch -------------------------------------------
-# `id` is the GraphQL node id the ready mutation takes. Pre-flattened to one TSV
-# line by gh's own --jq, so no separate jq is needed. `// empty` covers the
+# `id` is the GraphQL node id the mutations take. Pre-flattened to one TSV line
+# by gh's own --jq, so no separate jq is needed. `// empty` covers the
 # genuinely-absent case; a gh FAILURE is not "no PR". Fork PRs
 # (isCrossRepository) are filtered out before `.[0]`.
 #
-# lookup_pr sets pr_num is_draft head_sha node_id created_at pr_url author, or
-# exits no-pr. Called from the MAIN shell so its exits end the script.
+# lookup_pr sets pr_num is_draft head_sha node_id created_at pr_url author
+# mergeable merge_status, or exits no-pr. Called from the MAIN shell so its
+# exits end the script.
 lookup_pr() {
   if ! line="$(gh pr list --repo "$repo" --head "$branch" --base main --state open \
-      --json number,isDraft,headRefOid,id,createdAt,url,author,isCrossRepository \
-      --jq '[.[] | select(.isCrossRepository == false)] | .[0] // empty | [.number, .isDraft, .headRefOid, .id, .createdAt, .url, (.author.login // "unknown")] | @tsv')"; then
+      --json number,isDraft,headRefOid,id,createdAt,url,author,isCrossRepository,mergeable,mergeStateStatus \
+      --jq '[.[] | select(.isCrossRepository == false)] | .[0] // empty | [.number, .isDraft, .headRefOid, .id, .createdAt, .url, (.author.login // "unknown"), .mergeable, .mergeStateStatus] | @tsv')"; then
     gh_failed "gh pr list --head $branch --state open"
   fi
 
@@ -187,23 +207,89 @@ lookup_pr() {
     exit 0
   fi
 
-  IFS=$'\t' read -r pr_num is_draft head_sha node_id created_at pr_url author <<< "$line"
+  IFS=$'\t' read -r pr_num is_draft head_sha node_id created_at pr_url author mergeable merge_status <<< "$line"
 
   # Shape-check before acting on anything: a garbled read must not become a
   # mutation against the wrong node or a page with a nonsense age.
   case "$pr_num" in ""|*[!0-9]*) pr_num="" ;; esac
   case "$is_draft" in true|false) : ;; *) is_draft="" ;; esac
+  case "${mergeable:-}" in MERGEABLE|CONFLICTING|UNKNOWN) : ;; *) mergeable="" ;; esac
+  [[ "${merge_status:-}" =~ ^[A-Z_]+$ ]] || merge_status=""
   [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || head_sha=""
-  if [ -z "$pr_num" ] || [ -z "$is_draft" ] || [ -z "$head_sha" ] || [ -z "${node_id:-}" ] || [ -z "${created_at:-}" ]; then
+  if [ -z "$pr_num" ] || [ -z "$is_draft" ] || [ -z "$head_sha" ] || [ -z "${node_id:-}" ] \
+     || [ -z "${created_at:-}" ] || [ -z "$mergeable" ] || [ -z "$merge_status" ]; then
     echo "::error::ready-bot-draft-pr.sh: could not parse gh's PR lookup for '$branch': [$line]"
     exit 1
   fi
+}
+
+# A PR that conflicts with main can never land: coord will not propose it, and
+# readying it only parks it in a slot it cannot use. UNKNOWN mergeability is
+# NOT a conflict — GitHub computes it lazily after a push, so UNKNOWN is the
+# normal first answer — and it does not block readying: if the PR does turn
+# out to conflict, coord still refuses to land it, and the next run sees it.
+is_conflicting() {
+  [ "$mergeable" = "CONFLICTING" ] || [ "$merge_status" = "DIRTY" ]
 }
 
 # One poll budget shared by the head wait and the checks wait.
 extra_polls=$(( wait_seconds / poll_interval ))
 
 lookup_pr
+
+# --- 2. Pin the head: is GitHub reporting the commit the caller pushed? -------
+# Nothing below — close, ready, page — is decided on a head that is not the one
+# the caller named.
+if [ -n "$expect_head" ]; then
+  while [ "$head_sha" != "$expect_head" ] && [ "$extra_polls" -gt 0 ]; do
+    echo "PR #$pr_num still reports head $head_sha, not the expected $expect_head; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
+    sleep "$poll_interval"
+    extra_polls=$(( extra_polls - 1 ))
+    lookup_pr
+  done
+  if [ "$head_sha" != "$expect_head" ]; then
+    echo "::warning::PR #$pr_num still reports head $head_sha, not the expected commit $expect_head, after the wait budget. Deciding nothing on a head that is not the branch's; the next run re-decides."
+    emit head-mismatch "$pr_num" "$pr_url" "" "n/a"
+    echo "head-mismatch #$pr_num"
+    exit 0
+  fi
+fi
+
+# --- 3. An obsolete conflicting PR is closed (only when the caller says so) ---
+# The caller passes --close-if-obsolete only on a run that found main already
+# current (no drift / no pin move): a conflicting PR then carries a change main
+# no longer needs, and nothing else will ever clear it. Draft or ready alike.
+if [ "$close_if_obsolete" = "true" ] && is_conflicting; then
+  echo "::warning::PR #$pr_num ($pr_url) conflicts with main ($mergeable/$merge_status) and this run found main already current, so its change is obsolete. Closing it; the next drift run opens a fresh one."
+  close_comments="$(mktemp)"
+  close_body="$(mktemp)"
+  trap 'rm -f "$close_comments" "$close_body"' EXIT
+  if ! gh api --paginate "repos/$repo/issues/$pr_num/comments" --jq '.[].body' > "$close_comments"; then
+    gh_failed "gh api repos/$repo/issues/$pr_num/comments (read, before close)"
+  fi
+  if grep -qF "$CLOSE_MARKER" "$close_comments"; then
+    echo "PR #$pr_num already carries the obsolete-close comment; not commenting again."
+  else
+    {
+      echo "$CLOSE_MARKER"
+      printf '**Closing: this bot-filed PR is obsolete.** It conflicts with `main` (`%s` / `%s`), and the scheduled run that swept it found `main` already current — no drift, no pin to move — so the change this PR carries is no longer needed.\n\n' "$mergeable" "$merge_status"
+      printf 'Nothing is lost: the next run that finds drift rebuilds the branch from `main` and opens a fresh PR. The branch itself is left in place.\n'
+    } > "$close_body"
+    if ! gh api -X POST "repos/$repo/issues/$pr_num/comments" -F "body=@$close_body" --jq '.html_url'; then
+      gh_failed "gh api -X POST repos/$repo/issues/$pr_num/comments (close)"
+    fi
+  fi
+  if ! closed_state="$(gh api -X PATCH "repos/$repo/pulls/$pr_num" -f state=closed --jq '.state')"; then
+    gh_failed "gh api -X PATCH repos/$repo/pulls/$pr_num state=closed"
+  fi
+  if [ "$closed_state" != "closed" ]; then
+    echo "::error::ready-bot-draft-pr.sh: closing PR #$pr_num returned state=[$closed_state], not closed."
+    exit 1
+  fi
+  emit closed-obsolete "$pr_num" "$pr_url" "" "n/a"
+  echo "closed-obsolete #$pr_num"
+  exit 0
+fi
 
 if [ "$is_draft" != "true" ]; then
   echo "PR #$pr_num ($pr_url) is already ready for review; nothing to do."
@@ -212,82 +298,66 @@ if [ "$is_draft" != "true" ]; then
   exit 0
 fi
 
-# --- 2. Pin the head: is GitHub reporting the commit the caller pushed? -------
-# Only a draft needs this — a ready PR was already reported above.
-if [ -n "$expect_head" ]; then
-  while [ "$head_sha" != "$expect_head" ] && [ "$extra_polls" -gt 0 ]; do
-    echo "PR #$pr_num still reports head $head_sha, not the pushed $expect_head; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
+# --- 4. Decide: conflicting drafts are never readied; else measure CI --------
+checks=""
+park_reason=""
+if is_conflicting; then
+  echo "::warning::Draft PR #$pr_num ($pr_url) conflicts with main ($mergeable/$merge_status). Not readying it: coord cannot land a conflicting PR. It stays a draft until its branch is rebuilt."
+  park_reason="conflicting"
+else
+  # Only app `github-actions` counts: another app's run (coord's merge gate
+  # among them) says nothing about whether a workflow fired. --paginate
+  # prints one count per page; they are summed, and each must be a number.
+  count_checks() {
+    if ! per_page="$(gh api --paginate "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
+        --jq '[.check_runs[] | select(.app.slug == "github-actions")] | length')"; then
+      gh_failed "gh api repos/$repo/commits/$head_sha/check-runs"
+    fi
+    if [ -z "$per_page" ]; then
+      echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned no page at all."
+      exit 1
+    fi
+    checks=0
+    while IFS= read -r n; do
+      case "$n" in
+        ""|*[!0-9]*)
+          echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned a non-count page: [$n]"
+          exit 1
+          ;;
+      esac
+      checks=$(( checks + n ))
+    done <<< "$per_page"
+  }
+
+  count_checks
+  while [ "$checks" -eq 0 ] && [ "$extra_polls" -gt 0 ]; do
+    echo "Draft PR #$pr_num head $head_sha carries no Actions check runs yet; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
     sleep "$poll_interval"
     extra_polls=$(( extra_polls - 1 ))
-    lookup_pr
+    count_checks
   done
-  if [ "$is_draft" != "true" ]; then
-    echo "PR #$pr_num ($pr_url) became ready for review while waiting for its head; nothing to do."
-    emit already-ready "$pr_num" "$pr_url" "" "n/a"
-    echo "already-ready #$pr_num"
+
+  echo "PR #$pr_num ($pr_url): draft, head $head_sha, $checks Actions check run(s), mergeable $mergeable/$merge_status, author $author, created $created_at."
+
+  ready_mutation='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}'
+  if [ "$checks" -ge 1 ]; then
+    if ! is_draft_after="$(gh api graphql -f query="$ready_mutation" -f id="$node_id" --jq '.data.markPullRequestReadyForReview.pullRequest.isDraft')"; then
+      gh_failed "gh api graphql markPullRequestReadyForReview (PR #$pr_num)"
+    fi
+    # Assert on the mutation's OWN returned post-state, not on a later re-read.
+    if [ "$is_draft_after" != "false" ]; then
+      echo "::error::ready-bot-draft-pr.sh: markPullRequestReadyForReview on PR #$pr_num returned isDraft=[$is_draft_after], not false. The PR is still a draft; refusing to report it readied."
+      exit 1
+    fi
+    echo "Marked PR #$pr_num ready for review: its head carries $checks Actions check run(s), so it is gated like any other PR."
+    emit readied "$pr_num" "$pr_url" "$checks" "n/a"
+    echo "readied #$pr_num"
     exit 0
   fi
-  if [ "$head_sha" != "$expect_head" ]; then
-    echo "::warning::PR #$pr_num still reports head $head_sha, not the pushed commit $expect_head, after the wait budget. Deciding nothing on a head that is not the one pushed; it stays a draft and the sweep re-decides."
-    emit head-mismatch "$pr_num" "$pr_url" "" "n/a"
-    echo "head-mismatch #$pr_num"
-    exit 0
-  fi
+  park_reason="no-checks"
 fi
 
-# --- 3. Measure: how many ACTIONS check runs does the draft's head carry? -----
-# Only app `github-actions` counts: coord's own merge-gate run (and any other
-# app's) is posted whether or not a workflow fired. --paginate prints one count
-# per page; they are summed, and each must be a number.
-count_checks() {
-  if ! per_page="$(gh api --paginate "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
-      --jq '[.check_runs[] | select(.app.slug == "github-actions")] | length')"; then
-    gh_failed "gh api repos/$repo/commits/$head_sha/check-runs"
-  fi
-  if [ -z "$per_page" ]; then
-    echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned no page at all."
-    exit 1
-  fi
-  checks=0
-  while IFS= read -r n; do
-    case "$n" in
-      ""|*[!0-9]*)
-        echo "::error::ready-bot-draft-pr.sh: check-runs for $head_sha returned a non-count page: [$n]"
-        exit 1
-        ;;
-    esac
-    checks=$(( checks + n ))
-  done <<< "$per_page"
-}
-
-count_checks
-while [ "$checks" -eq 0 ] && [ "$extra_polls" -gt 0 ]; do
-  echo "Draft PR #$pr_num head $head_sha carries no Actions check runs yet; re-polling in ${poll_interval}s ($extra_polls poll(s) left)."
-  sleep "$poll_interval"
-  extra_polls=$(( extra_polls - 1 ))
-  count_checks
-done
-
-echo "PR #$pr_num ($pr_url): draft, head $head_sha, $checks Actions check run(s), author $author, created $created_at."
-
-# --- 4. Decide by measurement -------------------------------------------------
-ready_mutation='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}'
-if [ "$checks" -ge 1 ]; then
-  if ! is_draft_after="$(gh api graphql -f query="$ready_mutation" -f id="$node_id" --jq '.data.markPullRequestReadyForReview.pullRequest.isDraft')"; then
-    gh_failed "gh api graphql markPullRequestReadyForReview (PR #$pr_num)"
-  fi
-  # Assert on the mutation's OWN returned post-state, not on a later re-read.
-  if [ "$is_draft_after" != "false" ]; then
-    echo "::error::ready-bot-draft-pr.sh: markPullRequestReadyForReview on PR #$pr_num returned isDraft=[$is_draft_after], not false. The PR is still a draft; refusing to report it readied."
-    exit 1
-  fi
-  echo "Marked PR #$pr_num ready for review: its head carries $checks Actions check run(s), so it is gated like any other PR."
-  emit readied "$pr_num" "$pr_url" "$checks" "n/a"
-  echo "readied #$pr_num"
-  exit 0
-fi
-
-# --- 5. Still a draft with zero Actions checks: bound the parked state ----------------
+# --- 5. Still a draft (no Actions checks, or conflicting): bound the park -----
 paged="n/a"
 if [ -n "$max_age_hours" ]; then
   now_epoch="${READY_BOT_NOW_EPOCH:-$(date +%s)}"
@@ -299,8 +369,13 @@ if [ -n "$max_age_hours" ]; then
   age_hours=$(( age_seconds / 3600 ))
   budget_seconds=$(( max_age_hours * 3600 ))
   paged=false
+  if [ "$park_reason" = "conflicting" ]; then
+    why="it conflicts with main ($mergeable/$merge_status)"
+  else
+    why="its head carries 0 Actions check runs"
+  fi
   if [ "$age_seconds" -gt "$budget_seconds" ]; then
-    echo "::warning::Bot-filed PR #$pr_num ($pr_url) has been a draft for ${age_hours}h (budget ${max_age_hours}h) with 0 Actions check runs on its head. Nothing un-drafts a PR whose CI never fired; it is parked until someone acts."
+    echo "::warning::Bot-filed PR #$pr_num ($pr_url) has been a draft for ${age_hours}h (budget ${max_age_hours}h) and $why. Nothing un-drafts it; it is parked until someone acts."
 
     # Materialize the comments before grepping, never `gh ... | grep -q`: grep
     # exits on the first hit, SIGPIPEs gh, and under pipefail that turns a
@@ -322,10 +397,16 @@ if [ -n "$max_age_hours" ]; then
       fi
       {
         echo "$PAGE_MARKER"
-        printf '**This bot-filed PR has been a draft for %s hours with %s Actions check runs on its head** (`%s`; budget %s hours). It was opened by `%s`.\n\n' \
-          "$age_hours" "$checks" "$head_sha" "$max_age_hours" "$author"
-        printf 'It was born a draft on purpose, and `scripts/ci/ready-bot-draft-pr.sh` marks it ready for review automatically once its head carries at least one GitHub Actions check run (runs from other apps, such as coord'"'"'s merge gate, do not count). **Nothing un-drafts a PR whose CI never fired**, and coord'"'"'s merge train does not propose drafts, so this fix is parked until someone acts.\n\n'
-        printf 'A PR with no checks was usually authored with `GITHUB_TOKEN`, which by design fires no `pull_request` workflows. To unpark it, make its checks run (push to the branch with a token that fires workflows, or close and reopen the PR by hand); the next scheduled run then marks it ready. This comment is posted once per PR.\n'
+        if [ "$park_reason" = "conflicting" ]; then
+          printf '**This bot-filed PR has been a draft for %s hours and CONFLICTS with `main`** (`%s` / `%s`; head `%s`; budget %s hours). It was opened by `%s`.\n\n' \
+            "$age_hours" "$mergeable" "$merge_status" "$head_sha" "$max_age_hours" "$author"
+          printf '`scripts/ci/ready-bot-draft-pr.sh` never readies a conflicting PR — coord cannot land one. The branch is rebuilt from `main` on the next night that still finds drift; a night that finds `main` already current closes this PR as obsolete. If neither happens, it is parked until someone acts. This comment is posted once per PR.\n'
+        else
+          printf '**This bot-filed PR has been a draft for %s hours with %s Actions check runs on its head** (`%s`; budget %s hours). It was opened by `%s`.\n\n' \
+            "$age_hours" "$checks" "$head_sha" "$max_age_hours" "$author"
+          printf 'It was born a draft on purpose, and `scripts/ci/ready-bot-draft-pr.sh` marks it ready for review automatically once its head carries at least one GitHub Actions check run (runs from other apps, such as coord'"'"'s merge gate, do not count). **Nothing un-drafts a PR whose CI never fired**, and coord'"'"'s merge train does not propose drafts, so this fix is parked until someone acts.\n\n'
+          printf 'A PR with no checks was usually authored with `GITHUB_TOKEN`, which by design fires no `pull_request` workflows. To unpark it, make its checks run (push to the branch with a token that fires workflows, or close and reopen the PR by hand); the next scheduled run then marks it ready. This comment is posted once per PR.\n'
+        fi
         if [ -n "$run_line" ]; then
           printf '\n%s\n' "$run_line"
         fi
@@ -333,7 +414,7 @@ if [ -n "$max_age_hours" ]; then
       if ! gh api -X POST "repos/$repo/issues/$pr_num/comments" -F "body=@$page_body" --jq '.html_url'; then
         gh_failed "gh api -X POST repos/$repo/issues/$pr_num/comments (page)"
       fi
-      echo "Paged on PR #$pr_num: stale draft, ${age_hours}h old, 0 Actions check runs."
+      echo "Paged on PR #$pr_num: stale draft, ${age_hours}h old, $why."
       paged=true
     fi
   else
@@ -341,6 +422,6 @@ if [ -n "$max_age_hours" ]; then
   fi
 fi
 
-emit draft-no-checks "$pr_num" "$pr_url" "$checks" "$paged"
-echo "draft-no-checks #$pr_num"
+emit "draft-$park_reason" "$pr_num" "$pr_url" "$checks" "$paged"
+echo "draft-$park_reason #$pr_num"
 exit 0

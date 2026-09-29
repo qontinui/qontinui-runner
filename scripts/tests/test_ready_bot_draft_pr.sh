@@ -22,6 +22,10 @@
 #   5. A zero-check draft older than the budget is paged exactly ONCE (the
 #      marker makes it idempotent across nights); within budget, or ready, it
 #      is never paged. Fork PRs are never considered.
+#   6. A draft that CONFLICTS with main is never readied (draft-conflicting,
+#      paged like a zero-check draft); UNKNOWN mergeability does not block.
+#      With --close-if-obsolete a conflicting PR — draft or ready — is
+#      commented on once and closed; without it, nothing is closed.
 #
 # HOW THE STUB ANSWERS. For the PR lookup, the check-runs pages and the
 # GraphQL mutation, the stub holds realistic JSON fixtures and applies the
@@ -99,6 +103,7 @@ case "${1:-}" in
   pr) [ "${2:-}" = "list" ] && key="list" ;;
   api)
     case "$*" in
+      *"/pulls/"*)     [ "$method" = "PATCH" ] && key="pr-close" ;;
       *" graphql "*)   key="graphql" ;;
       *"/check-runs"*) key="check-runs" ;;
       *"/comments"*)
@@ -144,6 +149,9 @@ case "$key" in
   comments-read)
     [ -f "${GH_STUB_COMMENTS:?}" ] && cat "$GH_STUB_COMMENTS"
     ;;
+  pr-close)
+    printf '{"state":"%s"}' "${GH_STUB_CLOSE_STATE:-closed}" | jq -r "$jq_expr"
+    ;;
   comment-post)
     body_file=""
     for a in "$@"; do
@@ -172,13 +180,16 @@ CREATED_STALE="2026-09-27T00:00:00Z"   # 72h before NOW: over a 48h budget
 CREATED_FRESH="2026-09-29T00:00:00Z"   # 24h before NOW: within it
 PR_URL="https://github.com/qontinui/qontinui-runner/pull/4242"
 
-# pr <isDraft> <createdAt> [head] [isCrossRepository] [number] — one PR object
-# in the shape `gh pr list --json ...` returns.
+# pr <isDraft> <createdAt> [head] [isCrossRepository] [number] [mergeable]
+#    [mergeStateStatus] — one PR object in the shape `gh pr list --json ...`
+#    returns.
 pr() {
   jq -nc --argjson d "$1" --arg c "$2" --arg h "${3:-$HEAD_SHA}" \
     --argjson x "${4:-false}" --argjson n "${5:-4242}" --arg u "$PR_URL" \
+    --arg m "${6:-MERGEABLE}" --arg ms "${7:-CLEAN}" \
     '{number: $n, isDraft: $d, headRefOid: $h, id: ("PR_kwDOtest" + ($n|tostring)),
-      createdAt: $c, url: $u, author: {login: "jspinak"}, isCrossRepository: $x}'
+      createdAt: $c, url: $u, author: {login: "jspinak"}, isCrossRepository: $x,
+      mergeable: $m, mergeStateStatus: $ms}'
 }
 # set_prs <array-json>... — the 1st, 2nd, ... lookup's answer.
 set_prs() {
@@ -222,6 +233,7 @@ run_script() {
     GH_STUB_COMMENTS="$work/comments.txt" \
     GH_STUB_FAIL="$S_FAIL" \
     GH_STUB_GRAPHQL_ISDRAFT="$S_GRAPHQL" \
+    GH_STUB_CLOSE_STATE="${S_CLOSE_STATE:-closed}" \
     GITHUB_OUTPUT="$work/output.txt" \
     READY_BOT_NOW_EPOCH="$NOW_EPOCH" \
     READY_BOT_POLL_INTERVAL_SECONDS=15 \
@@ -423,6 +435,66 @@ rc="$(run_script --expect-head "$HEAD_SHA")"
 assert "head already pushed one: readied" "readied #4242" "$(last_line)"
 assert "head already pushed one: one lookup" 1 "$(count list "$work/gh.log")"
 
+# 14. Conflicting PRs. A draft that conflicts with main is never readied —
+#     coord cannot land it — even with green CI; UNKNOWN does not block.
+CONFLICT_DRAFT="[$(pr true "$CREATED_FRESH" "$HEAD_SHA" false 4242 CONFLICTING DIRTY)]"
+reset "$CONFLICT_DRAFT" "23"
+rc="$(run_script)"
+assert "conflicting draft w/ checks: exit code" 0 "$rc"
+assert "conflicting draft w/ checks: not readied" "draft-conflicting #4242" "$(last_line)"
+assert "conflicting draft w/ checks: mutation never called" 0 "$(count graphql "$work/gh.log")"
+assert "conflicting draft w/ checks: ::warning::" 1 "$(count '::warning::Draft PR #4242' "$work/out.txt")"
+assert "conflicting draft w/ checks: result=draft-conflicting" 1 "$(count 'result=draft-conflicting' "$work/output.txt")"
+reset "[$(pr true "$CREATED_FRESH" "$HEAD_SHA" false 4242 MERGEABLE DIRTY)]" "23"
+rc="$(run_script)"
+assert "DIRTY draft w/ checks: not readied" "draft-conflicting #4242" "$(last_line)"
+reset "[$(pr true "$CREATED_FRESH" "$HEAD_SHA" false 4242 UNKNOWN UNKNOWN)]" "23"
+rc="$(run_script)"
+assert "UNKNOWN-mergeable draft w/ checks: readied" "readied #4242" "$(last_line)"
+# ...and a conflicting draft parked past the budget is paged, naming the cause.
+reset "[$(pr true "$CREATED_STALE" "$HEAD_SHA" false 4242 CONFLICTING DIRTY)]" "23"
+run_script --max-age-hours 48 > /dev/null
+run_script --max-age-hours 48 > /dev/null
+assert "stale conflicting draft: exactly one page across two runs" 1 "$(count "$MARKER" "$work/comments.txt")"
+assert "stale conflicting draft: page names the conflict" 1 "$(count 'CONFLICTS with `main`' "$work/comments.txt")"
+assert "stale conflicting draft: page is not the no-checks text" 0 "$(count 'Nothing un-drafts a PR whose CI never fired' "$work/comments.txt")"
+
+# 15. --close-if-obsolete: a conflicting PR (ready or draft) is closed, with
+#     one comment across runs; without the flag nothing is closed; a
+#     mergeable PR is never closed by it.
+CLOSE_MARKER='<!-- ready-bot-draft-pr:closed-obsolete -->'
+CONFLICT_READY="[$(pr false "$CREATED_STALE" "$HEAD_SHA" false 4242 CONFLICTING DIRTY)]"
+reset "$CONFLICT_READY" "23"
+rc="$(run_script --close-if-obsolete)"
+assert "conflicting ready + flag: exit code" 0 "$rc"
+assert "conflicting ready + flag: closed" "closed-obsolete #4242" "$(last_line)"
+assert "conflicting ready + flag: close call made once" 1 "$(count pr-close "$work/gh.log")"
+run_script --close-if-obsolete > /dev/null
+assert "conflicting ready + flag: one close comment across two runs" 1 "$(count "$CLOSE_MARKER" "$work/comments.txt")"
+assert "conflicting ready + flag: comment says main is already current" 1 "$(count 'found `main` already current' "$work/comments.txt")"
+reset "$CONFLICT_READY" "23"
+rc="$(run_script)"
+assert "conflicting ready, no flag: already-ready" "already-ready #4242" "$(last_line)"
+assert "conflicting ready, no flag: never closed" 0 "$(count pr-close "$work/gh.log")"
+assert "conflicting ready, no flag: no comment" 0 "$(count comment "$work/gh.log")"
+reset "$CONFLICT_DRAFT" "23"
+rc="$(run_script --close-if-obsolete)"
+assert "conflicting draft + flag: closed" "closed-obsolete #4242" "$(last_line)"
+reset "$DRAFT_FRESH" "23"
+rc="$(run_script --close-if-obsolete)"
+assert "mergeable draft + flag: readied, not closed" "readied #4242 0" "$(last_line) $(count pr-close "$work/gh.log")"
+reset "$CONFLICT_READY" "23"
+S_FAIL="pr-close"
+rc="$(run_script --close-if-obsolete)"
+assert "close refused: exit code" 1 "$rc"
+assert "close refused: ::error:: names the call" 1 "$(count "state=closed' failed" "$work/out.txt")"
+reset "$CONFLICT_READY" "23"
+S_CLOSE_STATE="open"
+rc="$(run_script --close-if-obsolete)"
+S_CLOSE_STATE="closed"
+assert "close returns state=open: exit code" 1 "$rc"
+assert "close returns state=open: never reports closed" 0 "$(count 'closed-obsolete' "$work/out.txt")"
+
 # 13. Garbled lookup / usage errors are reds, not guesses.
 reset '[{"number": 4242, "isDraft": "maybe", "headRefOid": "nothex", "isCrossRepository": false}]' "5"
 rc="$(run_script)"
@@ -489,7 +561,7 @@ if [ -z "${READY_BOT_MUTANT:-}" ]; then
     "graphql fails: ::error:: names the failed call"
   # (b') the page post's failure exit replaced by a no-op
   mutate page-failure-swallowed \
-    's/  gh_failed "gh api -X POST/  : "gh api -X POST/' \
+    's/gh_failed \("gh api -X POST [^"]*(page)"\)/: \1/' \
     "comment post fails: exit code"
   # (c) the age comparison inverted
   mutate age-inverted \
@@ -500,6 +572,14 @@ if [ -z "${READY_BOT_MUTANT:-}" ]; then
   mutate head-check-skipped \
     's/  if \[ "\$head_sha" != "\$expect_head" \]; then/  if false; then/' \
     "stale head never converges: mutation never called"
+  # (f) the conflicting check dropped from the ready branch
+  mutate conflict-check-dropped \
+    's/^if is_conflicting; then/if false; then/' \
+    "conflicting draft w/ checks: not readied"
+  # (g) the close branch never taken
+  mutate close-branch-dropped \
+    's/^if \[ "\$close_if_obsolete" = "true" \] \&\& is_conflicting; then/if false; then/' \
+    "conflicting ready + flag: closed"
   # (e) the fork filter dropped
   mutate fork-filter-dropped \
     's/\[\.\[\] | select(\.isCrossRepository == false)\] | \.\[0\]/.[0]/' \
