@@ -1644,6 +1644,15 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
+        // The scheduler `ScheduleConditions` this binary EVALUATES, snake_case
+        // (`crate::scheduler_service::EVALUATED_CONDITIONS`, the same const the
+        // evaluator documents itself against). A capability read, not a
+        // version guess: serde silently drops an unknown condition, so a client
+        // registering a gated schedule must see the condition here first — an
+        // absent field or entry means this build would run the task UNGATED
+        // (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-
+        // wide-so-a-24x7-box-never-gets-one, Phase 5).
+        "schedulerConditions": crate::scheduler_service::EVALUATED_CONDITIONS,
         // This runner's DEFAULT tenant — what a session that names no tenant
         // is minted into (`machine.json::active_tenant_id`, read live per
         // request via `resolve_tenant_pin()`, so re-pointing the pin shows
@@ -17866,6 +17875,51 @@ mod coord_provision_session_gate_tests {
             "the fields must be rendered from that live pin"
         );
         assert!(src.contains(".route(\"/health\", get(health))"));
+    }
+
+    /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-
+    /// so-a-24x7-box-never-gets-one` Phase 4b: `/health` carries the scheduler
+    /// condition capability list, rendered from the evaluator's own const —
+    /// the field a schedule installer reads before registering a probe-gated
+    /// `Condition` task (same source-scan technique as the tests around it).
+    #[test]
+    fn the_health_handler_emits_the_scheduler_conditions_capability() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains(
+                "\"schedulerConditions\": crate::scheduler_service::EVALUATED_CONDITIONS"
+            ),
+            "{region}"
+        );
+        // And the const renders as the JSON array a client reads.
+        let rendered = serde_json::json!({
+            "schedulerConditions": crate::scheduler_service::EVALUATED_CONDITIONS,
+        });
+        assert_eq!(
+            rendered["schedulerConditions"],
+            serde_json::json!([
+                "require_idle",
+                "require_repo_inactive",
+                "require_probe",
+                "timeout_minutes"
+            ])
+        );
     }
 
     /// Plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-transcript-

@@ -47,6 +47,51 @@ impl CatchUpContext {
 // Scheduler Service
 // ============================================================================
 
+/// The [`ScheduleConditions`](crate::scheduler::ScheduleConditions) fields this
+/// build's [`SchedulerService::check_conditions_at`] evaluates, by their
+/// snake_case names — the single list both the evaluator's contract and the
+/// `GET /health` `schedulerConditions` capability field are read from.
+///
+/// It is a CAPABILITY statement a client reads before relying on a condition:
+/// serde does not refuse unknown fields, so a schedule posted to a build that
+/// predates a condition silently loses that gate (plan
+/// `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
+/// Phase 5). A test pins it against the serialized `ScheduleConditions` shape,
+/// so a field added to the schema without an evaluator entry here fails CI.
+pub const EVALUATED_CONDITIONS: &[&str] = &[
+    "require_idle",
+    "require_repo_inactive",
+    "require_probe",
+    "timeout_minutes",
+];
+
+/// Whether `task` belongs in this tick's candidate set: enabled, and either
+/// already parked waiting for conditions or at/past its `next_run`.
+fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    if !task.enabled {
+        return false;
+    }
+    if task.is_waiting_for_conditions() {
+        return true;
+    }
+    task.next_run
+        .as_deref()
+        .and_then(|next_run| chrono::DateTime::parse_from_rfc3339(next_run).ok())
+        .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
+}
+
+/// What a due task's conditions say this tick — see
+/// [`SchedulerService::gate_conditions`].
+#[derive(Debug)]
+enum ConditionGate {
+    /// No conditions, or all met: run it now.
+    Fire,
+    /// Not met yet: persist this status and re-check next tick.
+    Wait(ConditionStatus),
+    /// `timeout_minutes` elapsed while waiting: record a `Skipped` run.
+    TimedOut,
+}
+
 /// Background scheduler service that executes tasks at their scheduled times
 pub struct SchedulerService {
     /// PostgreSQL database for activity timeline and watchers (optional)
@@ -59,6 +104,8 @@ pub struct SchedulerService {
     running_tasks: Arc<RwLock<Vec<String>>>,
     /// Check interval in seconds
     check_interval_secs: u64,
+    /// Rate-limited `require_probe` state, per task (in memory).
+    probe_gate: crate::scheduler_probe::ProbeGate,
 }
 
 impl SchedulerService {
@@ -70,6 +117,7 @@ impl SchedulerService {
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
+            probe_gate: crate::scheduler_probe::ProbeGate::new(),
         }
     }
 
@@ -81,6 +129,7 @@ impl SchedulerService {
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60,
+            probe_gate: crate::scheduler_probe::ProbeGate::new(),
         }
     }
 
@@ -252,31 +301,23 @@ impl SchedulerService {
 
         let now = chrono::Utc::now();
 
+        // Probe state for a deleted or disabled task is dropped (which kills a
+        // probe still running for it).
+        {
+            let live: Vec<&str> = tasks
+                .iter()
+                .filter(|t| t.enabled)
+                .map(|t| t.id.as_str())
+                .collect();
+            self.probe_gate.retain(&live).await;
+        }
+
         // Find tasks that are:
         // 1. Due for execution (next_run <= now), OR
         // 2. Already waiting for conditions (have condition_status set)
         let mut due_tasks: Vec<ScheduledTask> = tasks
             .into_iter()
-            .filter(|task| {
-                // Must be enabled
-                if !task.enabled {
-                    return false;
-                }
-
-                // Include if already waiting for conditions
-                if task.is_waiting_for_conditions() {
-                    return true;
-                }
-
-                // Include if due for execution
-                if let Some(ref next_run) = task.next_run {
-                    if let Ok(next_dt) = chrono::DateTime::parse_from_rfc3339(next_run) {
-                        return next_dt.with_timezone(&chrono::Utc) <= now;
-                    }
-                }
-
-                false
-            })
+            .filter(|task| task_is_due(task, now))
             .collect();
 
         // Sort by: waiting tasks first (by waiting_since), then by next_run time
@@ -371,37 +412,45 @@ impl SchedulerService {
 
             // Check conditions if task has any
             if task.has_conditions() {
-                let (conditions_met, status) = self.check_conditions(&task).await;
-
-                if status.timed_out {
-                    info!(
-                        "Scheduler: Task '{}' timed out waiting for conditions",
-                        task.name
-                    );
-                    self.record_condition_timeout(&task).await;
-                    continue;
-                }
-
-                if !conditions_met {
-                    info!(
-                        "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?})",
-                        task.name, status.idle_met, status.repo_inactive_met
-                    );
-                    let status_json = serde_json::to_string(&status).ok();
-                    if let Err(e) = pg
-                        .update_task_condition_status(&task.id, status_json.as_deref())
-                        .await
-                    {
-                        error!("Failed to update condition status: {}", e);
+                match self
+                    .gate_conditions(&task, std::time::Instant::now())
+                    .await
+                {
+                    ConditionGate::TimedOut => {
+                        info!(
+                            "Scheduler: Task '{}' timed out waiting for conditions",
+                            task.name
+                        );
+                        self.record_condition_timeout(&task).await;
+                        continue;
                     }
-                    continue;
+                    ConditionGate::Wait(status) => {
+                        info!(
+                            "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?}, \
+                             probe: {:?} {:?})",
+                            task.name,
+                            status.idle_met,
+                            status.repo_inactive_met,
+                            status.probe_met,
+                            status.probe_detail
+                        );
+                        let status_json = serde_json::to_string(&status).ok();
+                        if let Err(e) = pg
+                            .update_task_condition_status(&task.id, status_json.as_deref())
+                            .await
+                        {
+                            error!("Failed to update condition status: {}", e);
+                        }
+                        continue;
+                    }
+                    ConditionGate::Fire => {
+                        // Conditions met - clear status before execution
+                        if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
+                            error!("Failed to clear condition status: {}", e);
+                        }
+                        info!("Scheduler: Task '{}' conditions met, executing", task.name);
+                    }
                 }
-
-                // Conditions met - clear status before execution
-                if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
-                    error!("Failed to clear condition status: {}", e);
-                }
-                info!("Scheduler: Task '{}' conditions met, executing", task.name);
             }
 
             info!("Scheduler: Executing task '{}'", task.name);
@@ -1646,9 +1695,41 @@ fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 }
 
 impl SchedulerService {
-    /// Check if a task's conditions are met
-    /// Returns (all_conditions_met, updated_status)
-    async fn check_conditions(&self, task: &ScheduledTask) -> (bool, ConditionStatus) {
+    /// Decide what a due task's conditions say at `now`, with the side effects
+    /// on the probe state that decision implies: a MET probe result is spent on
+    /// the run it admits (so a `Cron` slot runs once, and a `Condition` task
+    /// needs a fresh exit 0 after every rearm), and a timed-out wait drops the
+    /// task's probe state (killing a probe still running for it).
+    async fn gate_conditions(&self, task: &ScheduledTask, now: std::time::Instant) -> ConditionGate {
+        if !task.has_conditions() {
+            return ConditionGate::Fire;
+        }
+        let (met, status) = self.check_conditions_at(task, now).await;
+        if status.timed_out {
+            self.probe_gate.forget(&task.id).await;
+            return ConditionGate::TimedOut;
+        }
+        if !met {
+            return ConditionGate::Wait(status);
+        }
+        self.probe_gate.consume(&task.id).await;
+        ConditionGate::Fire
+    }
+
+    /// Check if a task's conditions are met at `now`.
+    /// Returns (all_conditions_met, updated_status).
+    ///
+    /// Evaluates exactly the conditions named in [`EVALUATED_CONDITIONS`]:
+    /// `timeout_minutes` first (a timed-out wait is reported without running
+    /// anything else), then `require_idle`, `require_repo_inactive` and
+    /// `require_probe` — ALL enabled ones must be met. `require_probe` is
+    /// rate-limited by [`crate::scheduler_probe::ProbeGate`]; its result and a
+    /// one-line outcome land in `probe_met` / `probe_detail`.
+    async fn check_conditions_at(
+        &self,
+        task: &ScheduledTask,
+        now: std::time::Instant,
+    ) -> (bool, ConditionStatus) {
         let conditions = match &task.conditions {
             Some(c) => c,
             None => return (true, condition_status_default()),
@@ -1663,12 +1744,7 @@ impl SchedulerService {
         let mut status = task
             .condition_status
             .clone()
-            .unwrap_or_else(|| ConditionStatus {
-                waiting_since: chrono::Utc::now().to_rfc3339(),
-                idle_met: None,
-                repo_inactive_met: None,
-                timed_out: false,
-            });
+            .unwrap_or_else(condition_status_default);
 
         // Check timeout first
         if let Some(timeout_mins) = conditions.timeout_minutes {
@@ -1701,6 +1777,25 @@ impl SchedulerService {
                 let all_repos_inactive = repo_status.iter().all(|(_, inactive)| *inactive);
                 status.repo_inactive_met = Some(repo_status);
                 if !all_repos_inactive {
+                    all_met = false;
+                }
+            }
+        }
+
+        // Check probe condition — last, and only when everything else is met:
+        // the probe is the one condition that costs a process spawn, and its
+        // answer cannot change the verdict when another condition already
+        // says no.
+        if let Some(probe) = &conditions.require_probe {
+            if probe.enabled && !all_met {
+                status.probe_met = None;
+                status.probe_detail =
+                    Some("not run: another condition is not met".to_string());
+            } else if probe.enabled {
+                let verdict = self.probe_gate.evaluate(&task.id, probe, now).await;
+                status.probe_met = Some(verdict.met);
+                status.probe_detail = Some(verdict.detail);
+                if !verdict.met {
                     all_met = false;
                 }
             }
@@ -3194,5 +3289,274 @@ mod tests {
         let mut runtime_record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
         runtime_record.complete(false, Some("runtime error".to_string()));
         assert!(matches!(runtime_record.status, ScheduledTaskStatus::Failed));
+    }
+
+    // ========================================================================
+    // `require_probe` (plan 2026-09-29-quiet-is-measured-by-session-existence-
+    // and-machine-wide-so-a-24x7-box-never-gets-one, Phase 4b). Each "tick"
+    // below walks the same path `tick()` does for one task — `task_is_due`,
+    // the Condition rearm check, `gate_conditions` — minus the database, with
+    // the probe's rate-limit clock driven one 60 s tick per iteration.
+    // ========================================================================
+
+    use crate::scheduler::{ProbeCondition, ScheduleConditions, ScheduleZone};
+
+    /// A probe that exits 0 only from its `flip_at`-th run on, counting runs
+    /// in `counter`.
+    #[cfg(unix)]
+    fn counting_probe(counter: &std::path::Path, flip_at: u32) -> ProbeCondition {
+        let c = counter.display();
+        ProbeCondition {
+            enabled: true,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "n=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'; \
+                     [ \"$n\" -ge {flip_at} ]"
+                ),
+            ],
+            poll_seconds: 60,
+            timeout_seconds: 10,
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_runs(counter: &std::path::Path) -> u32 {
+        std::fs::read_to_string(counter)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cron_task_waits_for_its_probe_and_runs_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated cron".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(counting_probe(&counter, 3)),
+            timeout_minutes: Some(180),
+            ..Default::default()
+        });
+        assert!(task.has_conditions());
+        // The cron slot has just passed.
+        task.next_run = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+
+        let t0 = std::time::Instant::now();
+        let mut fired_on = Vec::new();
+        for tick in 0..8u64 {
+            let now = Utc::now();
+            if !task_is_due(&task, now) {
+                continue;
+            }
+            let at = t0 + std::time::Duration::from_secs(60 * tick);
+            match service.gate_conditions(&task, at).await {
+                ConditionGate::Fire => {
+                    fired_on.push(tick);
+                    task.condition_status = None;
+                    task.next_run = compute_next_run(&task.schedule, now, ScheduleZone::Utc)
+                        .map(|dt| dt.to_rfc3339());
+                }
+                ConditionGate::Wait(status) => {
+                    assert_eq!(status.probe_met, Some(false));
+                    assert_eq!(status.probe_detail.as_deref(), Some("exit 1"));
+                    task.condition_status = Some(status);
+                }
+                ConditionGate::TimedOut => panic!("no timeout inside 8 minutes"),
+            }
+        }
+        assert_eq!(fired_on, vec![2], "fires on the tick the probe first exits 0, once");
+        assert_eq!(probe_runs(&counter), 3, "no probe runs after the slot fired");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cron_wait_times_out_and_forgets_the_probe() {
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated cron".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["false".into()],
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            timeout_minutes: Some(30),
+            ..Default::default()
+        });
+        let mut status = condition_status_default();
+        status.waiting_since = (Utc::now() - chrono::Duration::minutes(31)).to_rfc3339();
+        task.condition_status = Some(status);
+        let gate = service
+            .gate_conditions(&task, std::time::Instant::now())
+            .await;
+        assert!(matches!(gate, ConditionGate::TimedOut), "{gate:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_condition_task_fires_when_its_probe_is_met_and_honours_rearm_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "probe-gated condition".to_string(),
+            None,
+            ScheduleExpression::Condition(crate::scheduler::ConditionScheduleConfig {
+                rearm_delay_minutes: 3,
+            }),
+            scheduled_task_type_default(),
+        );
+        // Always met from the first run.
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(counting_probe(&counter, 1)),
+            ..Default::default()
+        });
+
+        let t0 = std::time::Instant::now();
+        let mut fired_on: Vec<u64> = Vec::new();
+        for tick in 0..10u64 {
+            let now = Utc::now();
+            task.next_run = compute_next_run(&task.schedule, now, ScheduleZone::Utc)
+                .map(|dt| dt.to_rfc3339());
+            // The last run ended `tick - last_fire` simulated minutes ago.
+            if let Some(&last) = fired_on.last() {
+                let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+                record.complete(true, None);
+                record.ended_at =
+                    Some((now - chrono::Duration::minutes((tick - last) as i64)).to_rfc3339());
+                task.last_run = Some(record);
+            }
+            if !task_is_due(&task, now) || !task.is_rearm_ready() {
+                continue;
+            }
+            let at = t0 + std::time::Duration::from_secs(60 * tick);
+            match service.gate_conditions(&task, at).await {
+                ConditionGate::Fire => fired_on.push(tick),
+                other => panic!("an always-met probe must fire when rearmed, got {other:?}"),
+            }
+        }
+        assert_eq!(fired_on, vec![0, 3, 6, 9], "one run per 3-minute rearm delay");
+        assert_eq!(
+            probe_runs(&counter),
+            4,
+            "the probe runs only when the rearm delay lets the task be evaluated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_is_not_run_while_another_condition_is_unmet() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let watched = dir.path().join("repo");
+        std::fs::create_dir(&watched).unwrap();
+        std::fs::write(watched.join("fresh"), "just now").unwrap();
+        let service = SchedulerService::new(None);
+        let mut task = ScheduledTask::new(
+            "two conditions".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 7 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.conditions = Some(ScheduleConditions {
+            require_repo_inactive: Some(crate::scheduler::RepositoryInactiveCondition {
+                enabled: true,
+                repositories: vec![RepositoryWatch {
+                    path: watched.display().to_string(),
+                    inactive_minutes: 60,
+                }],
+            }),
+            require_probe: Some(counting_probe(&counter, 1)),
+            ..Default::default()
+        });
+        match service
+            .gate_conditions(&task, std::time::Instant::now())
+            .await
+        {
+            ConditionGate::Wait(status) => {
+                assert_eq!(status.probe_met, None);
+                assert_eq!(
+                    status.probe_detail.as_deref(),
+                    Some("not run: another condition is not met")
+                );
+            }
+            other => panic!("a freshly modified repo must hold the task, got {other:?}"),
+        }
+        assert_eq!(probe_runs(&counter), 0);
+    }
+
+    #[test]
+    fn an_enabled_probe_with_no_command_still_gates_the_task() {
+        let mut task = fixture_task(60);
+        task.conditions = Some(ScheduleConditions {
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: Vec::new(),
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            ..Default::default()
+        });
+        assert!(
+            task.has_conditions(),
+            "dropping a broken probe would run the task ungated"
+        );
+    }
+
+    /// `EVALUATED_CONDITIONS` is the capability list `/health` serves; it must
+    /// name exactly the fields `ScheduleConditions` carries, so a schema field
+    /// added without an evaluator (or the reverse) fails here.
+    #[test]
+    fn evaluated_conditions_match_the_schedule_conditions_shape() {
+        let full = ScheduleConditions {
+            require_idle: Some(crate::scheduler::IdleCondition { enabled: true }),
+            require_repo_inactive: Some(crate::scheduler::RepositoryInactiveCondition {
+                enabled: true,
+                repositories: Vec::new(),
+            }),
+            require_probe: Some(ProbeCondition {
+                enabled: true,
+                command: vec!["true".into()],
+                poll_seconds: 60,
+                timeout_seconds: 5,
+            }),
+            timeout_minutes: Some(1),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        let mut fields: Vec<String> = value
+            .as_object()
+            .expect("ScheduleConditions serializes as an object")
+            .keys()
+            .map(|camel| {
+                camel.chars().fold(String::new(), |mut acc, ch| {
+                    if ch.is_ascii_uppercase() {
+                        acc.push('_');
+                        acc.push(ch.to_ascii_lowercase());
+                    } else {
+                        acc.push(ch);
+                    }
+                    acc
+                })
+            })
+            .collect();
+        fields.sort();
+        let mut evaluated: Vec<String> =
+            EVALUATED_CONDITIONS.iter().map(|s| s.to_string()).collect();
+        evaluated.sort();
+        assert_eq!(fields, evaluated);
     }
 }

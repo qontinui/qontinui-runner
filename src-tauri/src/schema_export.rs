@@ -132,6 +132,7 @@ pub fn export_all_schemas() -> Value {
         "RepositoryInactiveCondition",
         qs::RepositoryInactiveCondition
     );
+    add!("ProbeCondition", qs::ProbeCondition);
     add!("ScheduleConditions", qs::ScheduleConditions);
     add!("ConditionStatus", qs::ConditionStatus);
     add!("ScheduledTaskType", qs::ScheduledTaskType);

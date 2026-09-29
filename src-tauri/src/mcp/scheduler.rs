@@ -129,6 +129,11 @@ pub async fn create_scheduled_task(
 > {
     let pg = &state.app_state.pg_db;
 
+    if let Some(conditions) = &request.conditions {
+        crate::scheduler_probe::validate_conditions(conditions)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    }
+
     let mut scheduled_task = crate::scheduler::ScheduledTask::new(
         request.name,
         request.description,
@@ -252,6 +257,10 @@ pub async fn update_scheduled_task(
         scheduled_task.success_criteria = success_criteria;
     }
     if let Some(conditions) = request.conditions {
+        if let Some(conditions) = &conditions {
+            crate::scheduler_probe::validate_conditions(conditions)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+        }
         scheduled_task.conditions = conditions;
         scheduled_task.condition_status = None;
     }
