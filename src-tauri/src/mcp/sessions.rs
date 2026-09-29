@@ -815,6 +815,243 @@ async fn finish_session(
 }
 
 // =============================================================================
+// /sessions/transcript-bind
+// =============================================================================
+
+/// Body for `POST /sessions/transcript-bind`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptBindRequest {
+    /// The Claude Code session UUID — the JSONL stem.
+    pub claude_code_session_id: String,
+    /// An EXISTING `coord.sessions` id to bind to (typically from
+    /// `coord_bind_self_session`). Absent: the runner registers a fresh
+    /// `terminal_claude` row, exactly as the resume-sniffer does.
+    #[serde(default)]
+    pub coord_session_id: Option<String>,
+}
+
+/// A typed JSON answer: `{"error": code}` plus an optional `detail`.
+fn bind_error(
+    status: StatusCode,
+    code: &str,
+    detail: Option<String>,
+) -> (StatusCode, serde_json::Value) {
+    let mut body = serde_json::json!({ "error": code });
+    if let Some(d) = detail {
+        body["detail"] = serde_json::Value::String(d);
+    }
+    (status, body)
+}
+
+/// `POST /sessions/transcript-bind` — bind a Claude Code session into the
+/// interactive transcript tailer and replay the part of its JSONL not yet
+/// emitted. Plan
+/// `2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`
+/// Phase 4.4; mechanics in `session::session_transcript_tailer` ("Binding on
+/// request").
+///
+/// **Authorization (security-surface content trigger 5).** This door decides
+/// who may send a session's conversation off the machine, so it authorizes on
+/// the coord-mcp PROXY NONCE exactly as the forwarder and the plan-library
+/// write door do — `proxy_nonce_from_request` (either
+/// `Authorization: Bearer <nonce>` or `X-Coord-Mcp-Proxy-Key`) resolved by
+/// `proxy_principal_for_nonce` — and never on "the request came from
+/// loopback". The nonce is checked before the body is parsed, so an
+/// unauthenticated call answers 401 whatever it sends.
+///
+/// Answers:
+/// - `200 {"bound":true,"already_bound":b,"replayed_bytes":n,"replayed_chunks":n,"coord_session_id":id}`
+/// - `401 {"error":"nonce_required"}` — no registered proxy nonce
+/// - `400 {"error":"malformed_request"|"malformed_id"}`
+/// - `409 {"error":"sync_disabled"}` — `Settings.cloud_sync_enabled` is off; nothing written
+/// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
+/// - `422 {"error":"jsonl_not_watched","detail":…}` — no watched JSONL for the id
+/// - `500 {"error":"replay_failed","detail":…}` — bound, but the JSONL could not be read
+/// - `503 {"error":"tailer_unavailable"}` — this runner booted without the session outbox
+///
+/// Tenant consent and coord's quotas are enforced coord-side on ingest, as for
+/// every transcript chunk; nothing here bypasses them.
+async fn transcript_bind(
+    State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tailer = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>()
+        .map(|s| s.inner().clone());
+    let (status, body) = transcript_bind_core(
+        &headers,
+        &body,
+        crate::settings::get_cloud_sync_enabled,
+        tailer,
+        crate::terminal::transcript::find_claude_config_dirs,
+    )
+    .await;
+    (status, Json(body))
+}
+
+/// The route's logic with its three environment reads injected (Gate 1, the
+/// tailer, the config-dir discovery), so the tests drive every arm without the
+/// machine's settings or a Tauri app.
+pub(crate) async fn transcript_bind_core(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    cloud_sync_enabled: impl FnOnce() -> bool,
+    tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
+    config_dirs: impl FnOnce() -> Vec<std::path::PathBuf> + Send + 'static,
+) -> (StatusCode, serde_json::Value) {
+    use crate::session::session_transcript_tailer::{locate_session_jsonl, BindRefusal};
+
+    // 1. The nonce — before anything else is read.
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(headers);
+    if nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+        .is_none()
+    {
+        crate::coord_mcp::spawn_log_proxy_nonce_rejected(
+            nonce.as_deref(),
+            "missing, unregistered, or expired proxy key on POST /sessions/transcript-bind (401)",
+        );
+        let detail = match nonce {
+            None => crate::coord_mcp::missing_proxy_key_error(),
+            Some(_) => {
+                crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE)
+            }
+        };
+        return bind_error(StatusCode::UNAUTHORIZED, "nonce_required", Some(detail));
+    }
+
+    // 2. The body and its ids.
+    let req: TranscriptBindRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return bind_error(
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let Ok(csid) = uuid::Uuid::parse_str(req.claude_code_session_id.trim()) else {
+        return bind_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_id",
+            Some("claude_code_session_id is not a UUID".to_string()),
+        );
+    };
+    let coord_session_id = match req.coord_session_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match uuid::Uuid::parse_str(raw) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return bind_error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed_id",
+                    Some("coord_session_id is not a UUID".to_string()),
+                );
+            }
+        },
+    };
+
+    // 3. Gate 1 — the runner's transcript-sync toggle. Off writes nothing.
+    let sync_enabled = cloud_sync_enabled();
+    if !sync_enabled {
+        return bind_error(
+            StatusCode::CONFLICT,
+            "sync_disabled",
+            Some(
+                "transcript sync is off on this runner (Settings.cloud_sync_enabled = false); \
+                 nothing was bound or written"
+                    .to_string(),
+            ),
+        );
+    }
+
+    let Some(tailer) = tailer else {
+        return bind_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tailer_unavailable",
+            Some(
+                "this runner booted without its session outbox, so it has no transcript tailer"
+                    .to_string(),
+            ),
+        );
+    };
+
+    // 4. Locate, bind, replay — file I/O and fsyncs, off the async runtime.
+    let session_key = csid.to_string();
+    let joined = spawn_blocking_tracked(move || -> Result<_, LocateOrBind> {
+        let path = locate_session_jsonl(&config_dirs(), &session_key)?;
+        Ok(tailer.bind_and_replay(&session_key, &path, coord_session_id, sync_enabled)?)
+    })
+    .await;
+
+    match joined {
+        Ok(Ok(outcome)) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "bound": true,
+                "already_bound": outcome.already_bound,
+                "replayed_bytes": outcome.replayed_bytes,
+                "replayed_chunks": outcome.replayed_chunks,
+                "coord_session_id": outcome.coord_session_id,
+            }),
+        ),
+        Ok(Err(LocateOrBind::Locate(r))) => bind_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "jsonl_not_watched",
+            Some(r.detail()),
+        ),
+        Ok(Err(LocateOrBind::Bind(BindRefusal::SyncDisabled))) => {
+            bind_error(StatusCode::CONFLICT, "sync_disabled", None)
+        }
+        Ok(Err(LocateOrBind::Bind(BindRefusal::RegistrationDisabled))) => bind_error(
+            StatusCode::CONFLICT,
+            "registration_disabled",
+            Some(
+                "the runner's coord session registration declined the binding \
+                 (QONTINUI_SESSION_AUTOMATION_REGISTER is off, or its outbox write failed)"
+                    .to_string(),
+            ),
+        ),
+        Ok(Err(LocateOrBind::Bind(BindRefusal::Unreadable(d)))) => bind_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replay_failed",
+            Some(format!(
+                "the session IS bound and later appends are tailed, but its JSONL could not be \
+                 read for the replay: {d}"
+            )),
+        ),
+        Err(e) => bind_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "replay_failed",
+            Some(format!("bind task failed: {e}")),
+        ),
+    }
+}
+
+/// The two refusal families the blocking half can return.
+enum LocateOrBind {
+    Locate(crate::session::session_transcript_tailer::LocateRefusal),
+    Bind(crate::session::session_transcript_tailer::BindRefusal),
+}
+
+impl From<crate::session::session_transcript_tailer::LocateRefusal> for LocateOrBind {
+    fn from(r: crate::session::session_transcript_tailer::LocateRefusal) -> Self {
+        Self::Locate(r)
+    }
+}
+
+impl From<crate::session::session_transcript_tailer::BindRefusal> for LocateOrBind {
+    fn from(r: crate::session::session_transcript_tailer::BindRefusal) -> Self {
+        Self::Bind(r)
+    }
+}
+
+// =============================================================================
 // /sessions/tree-resets
 // =============================================================================
 
@@ -1127,6 +1364,222 @@ mod tests {
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
 
     // =========================================================================
+    // POST /sessions/transcript-bind — the route contract (plan 2026-09-28
+    // author-session slot, Phase 4.4). The bind/replay mechanics are tested in
+    // `session::session_transcript_tailer`; these pin the door.
+    // =========================================================================
+
+    mod transcript_bind {
+        use super::*;
+        use crate::session::local_store::OutboxWriter;
+        use crate::session::session_transcript_tailer::SessionTranscriptTailer;
+        use crate::session::transcript_emitter::TranscriptEmitter;
+        use axum::http::HeaderMap;
+        use std::path::PathBuf;
+
+        fn tailer(dir: &std::path::Path) -> (Arc<SessionTranscriptTailer>, Arc<OutboxWriter>) {
+            let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
+            let machine_id = uuid::Uuid::new_v4();
+            let registrar = Arc::new(
+                crate::claude_session::coord_register::AiCoordRegistrar::with_tenant_resolver(
+                    outbox.clone(),
+                    machine_id,
+                    || None,
+                ),
+            );
+            let emitter = Arc::new(TranscriptEmitter::new(
+                outbox.clone(),
+                machine_id,
+                registrar.clone(),
+            ));
+            (
+                Arc::new(SessionTranscriptTailer::new(emitter, registrar)),
+                outbox,
+            )
+        }
+
+        /// A registered nonce, via the one `pub(crate)` registration helper
+        /// the plan-library door tests use too.
+        fn registered_nonce() -> String {
+            let wd = format!("/tmp/transcript-bind-door-test-{}", uuid::Uuid::now_v7());
+            crate::coord_mcp::register_agent_proxy_nonce(&wd, uuid::Uuid::new_v4())
+        }
+
+        fn bearer(nonce: &str) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {nonce}").parse().unwrap(),
+            );
+            h
+        }
+
+        fn body(csid: &str) -> Vec<u8> {
+            serde_json::json!({ "claude_code_session_id": csid })
+                .to_string()
+                .into_bytes()
+        }
+
+        /// `<dir>/cfg/projects/p/<csid>.jsonl`; returns the config dir.
+        fn config_with(dir: &std::path::Path, csid: &str, text: &str) -> PathBuf {
+            let cfg = dir.join("cfg");
+            let p = cfg.join("projects").join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join(format!("{csid}.jsonl")), text).unwrap();
+            cfg
+        }
+
+        /// No nonce, or one this runner never minted, under EITHER header:
+        /// 401 `nonce_required`, and nothing reaches the outbox — even with a
+        /// valid body and a watched JSONL behind it.
+        #[tokio::test]
+        async fn refuses_a_call_without_a_registered_nonce() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n");
+
+            let stranger = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut legacy = HeaderMap::new();
+            legacy.insert("x-coord-mcp-proxy-key", stranger.parse().unwrap());
+            for headers in [HeaderMap::new(), bearer(&stranger), legacy] {
+                let cfg = cfg.clone();
+                let (status, v) = transcript_bind_core(
+                    &headers,
+                    &body(&csid),
+                    || true,
+                    Some(t.clone()),
+                    move || vec![cfg],
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(v["error"], "nonce_required");
+            }
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        /// The toggle off answers 409 `sync_disabled` and writes nothing.
+        #[tokio::test]
+        async fn disabled_toggle_is_sync_disabled_and_writes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n");
+
+            let (status, v) = transcript_bind_core(
+                &bearer(&registered_nonce()),
+                &body(&csid),
+                || false,
+                Some(t),
+                move || vec![cfg],
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(v["error"], "sync_disabled");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn malformed_ids_are_400() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let nonce = registered_nonce();
+            for raw in [
+                serde_json::json!({ "claude_code_session_id": "../../etc/passwd" }),
+                serde_json::json!({
+                    "claude_code_session_id": uuid::Uuid::new_v4().to_string(),
+                    "coord_session_id": "nope",
+                }),
+            ] {
+                let (status, v) = transcript_bind_core(
+                    &bearer(&nonce),
+                    raw.to_string().as_bytes(),
+                    || true,
+                    Some(t.clone()),
+                    Vec::new,
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(v["error"], "malformed_id");
+            }
+            let (status, v) =
+                transcript_bind_core(&bearer(&nonce), b"{", || true, Some(t), Vec::new).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(v["error"], "malformed_request");
+        }
+
+        #[tokio::test]
+        async fn unwatched_jsonl_is_422() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = dir.path().join("empty-cfg");
+            let (status, v) = transcript_bind_core(
+                &bearer(&registered_nonce()),
+                &body(&csid),
+                || true,
+                Some(t),
+                move || vec![cfg],
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(v["error"], "jsonl_not_watched");
+            assert!(v["detail"].as_str().unwrap().contains("empty-cfg"));
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        /// The happy path end to end through the door, then a re-bind.
+        #[tokio::test]
+        async fn binds_and_replays_then_rebind_replays_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n{\"n\":2}\n");
+            let nonce = registered_nonce();
+
+            // The registration kill switch is process-global and toggled by
+            // the coord_register suite; retry across it like the tailer tests.
+            let mut first = None;
+            for _ in 0..200 {
+                let cfg = cfg.clone();
+                let (status, v) = transcript_bind_core(
+                    &bearer(&nonce),
+                    &body(&csid),
+                    || true,
+                    Some(t.clone()),
+                    move || vec![cfg],
+                )
+                .await;
+                if status == StatusCode::CONFLICT && v["error"] == "registration_disabled" {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                first = Some((status, v));
+                break;
+            }
+            let (status, v) = first.expect("bound");
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["bound"], true);
+            assert_eq!(v["already_bound"], false);
+            assert_eq!(v["replayed_bytes"], 16);
+            assert_eq!(v["replayed_chunks"], 1);
+
+            let (status, v) = transcript_bind_core(
+                &bearer(&nonce),
+                &body(&csid),
+                || true,
+                Some(t),
+                move || vec![cfg],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["already_bound"], true);
+            assert_eq!(v["replayed_bytes"], 0);
+            assert_eq!(v["replayed_chunks"], 0);
+        }
+    }
+
+    // =========================================================================
     // GET /sessions/history — the scope key
     //
     // Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
@@ -1333,4 +1786,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // and gets no drift guard from one; its contract is covered by the
         // handler tests below instead.
         .route("/sessions/{id}/finish", post(finish_session))
+        // Phase 4.4 (plan 2026-09-28 author-session slot): bind a Claude Code
+        // session into the transcript tailer and replay its prefix. A
+        // credential door (`origin_guard::CREDENTIAL_DOORS`) that authorizes
+        // on the coord-mcp proxy nonce — see `transcript_bind`.
+        .route("/sessions/transcript-bind", post(transcript_bind))
 }

@@ -305,6 +305,19 @@ impl TranscriptOffsetLog {
     pub fn next_offset(&self, session_key: &str) -> i64 {
         self.lock().next_offset(session_key)
     }
+
+    /// The recorded value for `session_key`, `None` when never written — the
+    /// generic read the tailer's file-mark log uses (it reuses this type as a
+    /// durable key → i64 map rather than growing a second one).
+    pub(crate) fn get(&self, session_key: &str) -> Option<i64> {
+        self.lock().state.lanes.get(session_key).copied()
+    }
+
+    /// Durably record `value` for `session_key` (append + fsync, compacted in
+    /// place). The generic write behind [`Self::get`].
+    pub(crate) fn set(&self, session_key: &str, value: i64) {
+        self.lock().record(session_key, value);
+    }
 }
 
 /// Locked view of the lane map. Every mutation is durable before it returns
@@ -454,6 +467,22 @@ impl TranscriptEmitter {
         self.emit_inner(session_key, text);
     }
 
+    /// Path of the tailer's durable FILE-mark sidecar for this emitter's
+    /// outbox — beside the offset sidecar, for the same reasons (instance
+    /// scoping and the unwritable-home fallback come with the outbox path).
+    /// See `session_transcript_tailer`'s "File marks" section.
+    pub(crate) fn file_mark_log_path(&self) -> PathBuf {
+        let stem = self
+            .outbox
+            .path()
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session-outbox".to_string());
+        self.outbox
+            .path()
+            .with_file_name(format!("{stem}-transcript-file-marks.jsonl"))
+    }
+
     /// Gate-2/3 + append path, split from [`Self::emit`] so tests can drive
     /// it without touching the machine's real `settings.json`.
     ///
@@ -464,9 +493,15 @@ impl TranscriptEmitter {
     /// gate's value anyway to report coverage and so checks it itself rather
     /// than paying the settings read twice per append. Every other caller
     /// goes through [`Self::emit`].
-    pub(crate) fn emit_inner(&self, session_key: &str, text: &str) {
+    ///
+    /// Returns how many chunks were durably queued: `0` means nothing reached
+    /// the outbox (empty text, no coord binding, or a clean outbox failure).
+    /// The tailer's file mark advances only on a non-zero return, so a
+    /// block this call dropped stays inside the range a later
+    /// `POST /sessions/transcript-bind` replay can re-read.
+    pub(crate) fn emit_inner(&self, session_key: &str, text: &str) -> usize {
         if text.is_empty() {
-            return;
+            return 0;
         }
 
         // Linkage: claude_session_id → coord session UUID via the registrar's
@@ -485,7 +520,7 @@ impl TranscriptEmitter {
                     "transcript_emitter: no coord session for session key — skipping cloud sync"
                 );
             }
-            return;
+            return 0;
         };
 
         // Gate 3 — redact unconditionally. Workflow runs carry no
@@ -493,7 +528,7 @@ impl TranscriptEmitter {
         // ever reaches the durable outbox file.
         let bytes = redact_secrets(text.as_bytes());
         if bytes.is_empty() {
-            return;
+            return 0;
         }
 
         // Allocate the per-(session-key, transcript-stream) offsets and
@@ -539,8 +574,9 @@ impl TranscriptEmitter {
         // clean failure means NOTHING was written, so durably rewind the
         // reservation and the same chunks re-send next time (idempotent
         // coord-side) rather than leaving a permanent hole.
+        let queued = events.len();
         match self.outbox.record_batch(events) {
-            Ok(_) => {}
+            Ok(_) => queued,
             Err(e) => {
                 lane.record(session_key, start_offset);
                 tracing::warn!(
@@ -550,6 +586,7 @@ impl TranscriptEmitter {
                     "transcript_emitter: outbox append failed (best-effort) — block dropped \
                      locally, offset lane rewound to {start_offset}"
                 );
+                0
             }
         }
     }
