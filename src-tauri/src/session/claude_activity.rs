@@ -273,14 +273,13 @@ pub fn read_records(config_dirs: &[PathBuf], pids: &[u32]) -> HashMap<u32, Recor
 fn read_one(pid: u32, candidates: &[(PathBuf, PathBuf)]) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
     for (dir, path) in candidates {
-        match std::fs::read_to_string(path)
+        // A body that does not parse is only decisive when nothing else names
+        // this pid — see the `let Some(..) else` below.
+        if let Ok((raw, ev)) = std::fs::read_to_string(path)
             .map_err(|_| ())
             .and_then(|b| parse_record(&b, pid))
         {
-            Ok((raw, ev)) => parsed.push((dir.as_path(), raw, ev)),
-            // A body that does not parse is only decisive when nothing else
-            // names this pid — see the `let Some(..) else` below.
-            Err(()) => {}
+            parsed.push((dir.as_path(), raw, ev));
         }
     }
     let first_session = parsed
