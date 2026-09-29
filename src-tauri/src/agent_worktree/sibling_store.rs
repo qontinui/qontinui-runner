@@ -35,6 +35,12 @@ use crate::worktree::run_git_command;
 /// The store's directory name under the agent-worktree root.
 pub(crate) const SIBLING_STORE_DIRNAME: &str = ".siblings";
 
+/// The completeness marker, written at an entry's root after a fully successful
+/// extraction and BEFORE the atomic rename, so it lands with the entry or not at
+/// all. Shared contract with `allocate-worktree.sh`: an entry without it is
+/// never adopted and never backs a cargo config.
+pub(crate) const COMPLETE_MARKER: &str = ".qontinui-sibling-complete";
+
 /// `git archive` of a sibling repo is tens of MB; bounded like every other
 /// worktree git call so a wedged git cannot hang an allocation.
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -87,8 +93,12 @@ pub(crate) fn materialize(
         .prefix(&format!(".tmp-{name}-{}-", std::process::id()))
         .tempdir_in(store_root)
         .map_err(|e| format!("temp dir under {}: {e}", store_root.display()))?;
-    extract_archive(canonical, sha, tmp.path())?;
+    extract_archive(store_root, &name, canonical, sha, tmp.path())?;
     set_files_readonly(tmp.path())?;
+    // Last, and only after everything above succeeded: the marker is what says
+    // "this tree is whole".
+    std::fs::write(tmp.path().join(COMPLETE_MARKER), b"")
+        .map_err(|e| format!("write completeness marker in {}: {e}", tmp.path().display()))?;
 
     // `keep()` hands the directory over so a successful rename is not undone by
     // the TempDir drop; on any failure below we remove it ourselves.
@@ -125,18 +135,39 @@ pub(crate) fn materialize(
     }
 }
 
-/// Adopt the entry at `target` if it is a real directory: stamp its mtime FIRST,
-/// then re-test it, so an entry a reaper takes in between reads as absent rather
-/// than adopted. Never creates anything. A non-directory squatting on the entry
-/// path (a stray file or symlink) is removed so a real entry can be published
-/// there; `Ok(false)` means "absent, materialise it".
+/// Adopt the entry at `target` if it is a real, COMPLETE directory: stamp its
+/// mtime FIRST, then re-test it, so an entry a reaper takes in between reads as
+/// absent rather than adopted. Never creates anything. `Ok(false)` means
+/// "absent, materialise it"; to make that true, whatever else sits at the path
+/// is moved or removed first:
+/// - a directory without [`COMPLETE_MARKER`] is corrupt (a partial tree). It is
+///   never deleted in place — it is renamed to `.trash-<name>-<pid>-<n>` for a
+///   reaper, and a failed rename is an error (the caller then skips the config);
+/// - a non-directory (a stray file or symlink) is removed.
 fn adopt_existing(target: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(target) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!("stat {}: {e}", target.display())),
+        Ok(meta) if meta.is_dir() && !target.join(COMPLETE_MARKER).is_file() => {
+            let trash = trash_path(target);
+            warn!(
+                "sibling store: {} has no {COMPLETE_MARKER} (partial tree) — moving it to {}",
+                target.display(),
+                trash.display()
+            );
+            match std::fs::rename(target, &trash) {
+                Ok(()) => Ok(false),
+                Err(_) if !target.exists() => Ok(false),
+                Err(e) => Err(format!(
+                    "incomplete entry {} could not be set aside: {e}",
+                    target.display()
+                )),
+            }
+        }
         Ok(meta) if meta.is_dir() => {
             touch_entry(target);
-            Ok(std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()))
+            Ok(std::fs::symlink_metadata(target).is_ok_and(|m| m.is_dir())
+                && target.join(COMPLETE_MARKER).is_file())
         }
         Ok(meta) => {
             warn!(
@@ -151,6 +182,20 @@ fn adopt_existing(target: &Path) -> Result<bool, String> {
                 .map_err(|e| format!("remove non-directory {}: {e}", target.display()))
         }
     }
+}
+
+/// A `.trash-<name>-<pid>-<n>` sibling of `target` that does not exist yet.
+fn trash_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent = target.parent().unwrap_or(target);
+    let pid = std::process::id();
+    (0u32..)
+        .map(|n| parent.join(format!(".trash-{name}-{pid}-{n}")))
+        .find(|p| !p.exists())
+        .unwrap_or_else(|| parent.join(format!(".trash-{name}-{pid}")))
 }
 
 /// Set the entry directory's mtime to now, so a store reaper's quiet window
@@ -198,10 +243,31 @@ fn ensure_commit(canonical: &Path, sha: &str) -> Result<(), String> {
         .map_err(|e| format!("commit {sha} absent from {}: {e}", canonical.display()))
 }
 
-/// `git archive --format=tar <sha>` unpacked into `dest`.
-fn extract_archive(canonical: &Path, sha: &str, dest: &Path) -> Result<(), String> {
+/// `git archive --format=tar -o <file> <sha>`, then unpacked from that file into
+/// `dest`.
+///
+/// The archive goes to a FILE, never through captured stdout:
+/// `output_with_timeout` caps captured output at `MAX_CAPTURED_BYTES` (4 MiB)
+/// and still reports success, which truncated a 7 MB schemas archive — usually
+/// into an unpack error, but when the cut fell on a tar header boundary into a
+/// silently PARTIAL tree. git's exit status is checked, the timeout watchdog is
+/// kept, and the tar file sits beside the extraction dir (not inside it) under a
+/// `.tmp-` name a reaper never takes as an entry.
+fn extract_archive(
+    store_root: &Path,
+    name: &str,
+    canonical: &Path,
+    sha: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    let tar_file = tempfile::Builder::new()
+        .prefix(&format!(".tmp-{name}-{}-", std::process::id()))
+        .suffix(".tar")
+        .tempfile_in(store_root)
+        .map_err(|e| format!("temp archive under {}: {e}", store_root.display()))?;
+    let tar_path = tar_file.path().to_string_lossy().to_string();
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["archive", "--format=tar", sha])
+    cmd.args(["archive", "--format=tar", "-o", &tar_path, sha])
         .current_dir(canonical);
     let out = crate::process_helpers::output_with_timeout(cmd, ARCHIVE_TIMEOUT)
         .map_err(|e| format!("git archive {sha}: {e}"))?;
@@ -211,7 +277,9 @@ fn extract_archive(canonical: &Path, sha: &str, dest: &Path) -> Result<(), Strin
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    tar::Archive::new(out.stdout.as_slice())
+    let file = std::fs::File::open(tar_file.path())
+        .map_err(|e| format!("open archive {tar_path}: {e}"))?;
+    tar::Archive::new(std::io::BufReader::new(file))
         .unpack(dest)
         .map_err(|e| format!("unpack archive of {sha} into {}: {e}", dest.display()))
 }
@@ -309,8 +377,26 @@ pub(crate) fn missing_override_entries(
     Ok(entries
         .iter()
         .map(|e| agent_root.join(e))
-        .filter(|p| !p.join("Cargo.toml").is_file())
+        .filter(|p| !p.join("Cargo.toml").is_file() || !store_entry_is_complete(p))
         .collect())
+}
+
+/// For a path inside the store (`…/.siblings/<entry>/…`), whether `<entry>`
+/// carries [`COMPLETE_MARKER`]. A path outside the store has no entry to check
+/// and passes.
+fn store_entry_is_complete(path: &Path) -> bool {
+    let mut root = PathBuf::new();
+    let mut comps = path.components();
+    while let Some(c) = comps.next() {
+        root.push(c);
+        if c.as_os_str() == SIBLING_STORE_DIRNAME {
+            return match comps.next() {
+                Some(entry) => root.join(entry).join(COMPLETE_MARKER).is_file(),
+                None => false,
+            };
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -364,6 +450,7 @@ mod tests {
             .path()
             .join(format!(".siblings/qontinui-schemas@{SHA_A}"));
         std::fs::create_dir_all(entry.join("rust")).unwrap();
+        std::fs::write(entry.join(COMPLETE_MARKER), "").unwrap();
         let body = format!(
             "paths = [\"../.siblings/qontinui-schemas@{SHA_A}/rust\", \
              \"../.siblings/qontinui-schemas@{SHA_A}/code-graph\"]\n"
@@ -440,11 +527,12 @@ mod tests {
         assert_eq!(first, store.join(format!("qontinui-schemas@{sha}")));
         let manifest = first.join("rust/Cargo.toml");
         assert!(manifest.is_file());
+        assert!(first.join(COMPLETE_MARKER).is_file());
         assert!(std::fs::metadata(&manifest)
             .unwrap()
             .permissions()
             .readonly());
-        // No temp extraction left behind.
+        // No temp extraction or temp archive left behind.
         let leftovers: Vec<_> = std::fs::read_dir(&store)
             .unwrap()
             .flatten()
@@ -469,9 +557,100 @@ mod tests {
         let store = ws.path().join(".siblings");
         let pre = store.join(format!("qontinui-schemas@{SHA_A}"));
         std::fs::create_dir_all(&pre).unwrap();
+        std::fs::write(pre.join(COMPLETE_MARKER), "").unwrap();
         let got =
             materialize(&store, &ws.path().join("absent"), "qontinui-schemas", SHA_A).unwrap();
         assert_eq!(got, pre);
+    }
+
+    /// B1 regression: an archive larger than `MAX_CAPTURED_BYTES` (4 MiB) must
+    /// round-trip completely — the captured-stdout path truncated it, sometimes
+    /// into a silently partial tree.
+    #[test]
+    fn an_archive_over_four_mib_round_trips_completely() {
+        let ws = tempfile::tempdir().unwrap();
+        let repo = ws.path().join("qontinui-schemas");
+        std::fs::create_dir_all(repo.join("rust")).unwrap();
+        git(&repo, &["init", "-q"]);
+        // Pseudo-random bytes so nothing along the way can shrink them.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let big: Vec<u8> = (0..6 * 1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        std::fs::write(repo.join("a_big.bin"), &big).unwrap();
+        std::fs::write(repo.join("rust/Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        std::fs::write(repo.join("zz_last.txt"), "tail").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "--no-verify", "-m", "big"]);
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+
+        let store = ws.path().join(".siblings");
+        let got = materialize(&store, &repo, "qontinui-schemas", &sha).unwrap();
+        assert_eq!(std::fs::read(got.join("a_big.bin")).unwrap(), big);
+        assert_eq!(
+            std::fs::read_to_string(got.join("zz_last.txt")).unwrap(),
+            "tail"
+        );
+        assert!(got.join("rust/Cargo.toml").is_file());
+        assert!(got.join(COMPLETE_MARKER).is_file());
+    }
+
+    /// B2: a directory at the entry path without the completeness marker is a
+    /// partial tree. It is not adopted, not deleted in place (set aside as
+    /// `.trash-*`), and a complete entry is published in its place.
+    #[test]
+    fn a_partial_entry_is_set_aside_and_rematerialised() {
+        let ws = tempfile::tempdir().unwrap();
+        let (repo, sha) = fixture_repo(ws.path());
+        let store = ws.path().join(".siblings");
+        let entry = store.join(format!("qontinui-schemas@{sha}"));
+        std::fs::create_dir_all(entry.join("rust")).unwrap();
+        std::fs::write(entry.join("rust/half.rs"), "partial").unwrap();
+
+        assert!(!adopt_existing(&entry).unwrap());
+        assert!(
+            !entry.exists(),
+            "the partial tree was moved aside, not adopted"
+        );
+        let trash: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".trash-"))
+            .collect();
+        assert_eq!(trash.len(), 1);
+        assert!(trash[0].path().join("rust/half.rs").is_file());
+
+        std::fs::create_dir_all(entry.join("rust")).unwrap();
+        let got = materialize(&store, &repo, "qontinui-schemas", &sha).unwrap();
+        assert!(got.join(COMPLETE_MARKER).is_file());
+        assert!(got.join("rust/Cargo.toml").is_file());
+        assert!(!got.join("rust/half.rs").exists());
+    }
+
+    #[test]
+    fn the_gate_refuses_an_entry_without_the_marker() {
+        let ws = tempfile::tempdir().unwrap();
+        let agent_root = ws.path().join("agent-a");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        let entry = ws
+            .path()
+            .join(format!(".siblings/qontinui-schemas@{SHA_A}"));
+        std::fs::create_dir_all(entry.join("rust")).unwrap();
+        std::fs::write(entry.join("rust/Cargo.toml"), "").unwrap();
+        let body = format!("paths = [\"../.siblings/qontinui-schemas@{SHA_A}/rust\"]\n");
+        assert_eq!(
+            missing_override_entries(&agent_root, &body).unwrap().len(),
+            1
+        );
+        std::fs::write(entry.join(COMPLETE_MARKER), "").unwrap();
+        assert!(missing_override_entries(&agent_root, &body)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
