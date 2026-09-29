@@ -339,7 +339,9 @@ impl SchedulerService {
             } else {
                 None
             };
-            pg.update_task_next_run(&task.id, next.as_deref()).await?;
+            // Conditional on this snapshot; a concurrent edit recomputed it.
+            pg.update_task_next_run(&task.id, next.as_deref(), &task.modified_at)
+                .await?;
         }
 
         Ok(())
@@ -532,18 +534,45 @@ impl SchedulerService {
                             status.probe_detail
                         );
                         let status_json = serde_json::to_string(&status).ok();
-                        if let Err(e) = pg
-                            .update_task_condition_status(&task.id, status_json.as_deref())
+                        match pg
+                            .update_task_condition_status(
+                                &task.id,
+                                status_json.as_deref(),
+                                &task.modified_at,
+                            )
                             .await
                         {
-                            error!("Failed to update condition status: {}", e);
+                            Ok(true) => {}
+                            Ok(false) => info!(
+                                "Scheduler: task '{}' was edited since this tick read it; \
+                                 its wait state is re-evaluated next tick",
+                                task.name
+                            ),
+                            Err(e) => error!("Failed to update condition status: {}", e),
                         }
                         continue;
                     }
                     ConditionGate::Fire => {
-                        // Conditions met - clear status before execution
-                        if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
-                            error!("Failed to clear condition status: {}", e);
+                        // Conditions met - clear status before execution. The
+                        // clear is conditional on the snapshot the conditions
+                        // were evaluated against: if the task was edited since,
+                        // this tick's verdict is about a task that no longer
+                        // exists in that form, so it does not run; the next
+                        // tick re-reads and re-evaluates.
+                        match pg
+                            .update_task_condition_status(&task.id, None, &task.modified_at)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                info!(
+                                    "Scheduler: task '{}' was edited since this tick read it; \
+                                     not running on the stale verdict — re-evaluating next tick",
+                                    task.name
+                                );
+                                continue;
+                            }
+                            Err(e) => error!("Failed to clear condition status: {}", e),
                         }
                         info!("Scheduler: Task '{}' conditions met, executing", task.name);
                     }
@@ -622,9 +651,15 @@ impl SchedulerService {
 
         // Mark as running (stays marked until the spawned poller completes
         // for async workflows; until the sync execute_* returns otherwise).
-        {
-            let mut running = self.running_tasks.write().await;
-            running.push(task_id.clone());
+        // Check-and-insert is one step under one write lock: the tick, a
+        // catch-up and "Run now" can all reach here, and a separate
+        // read-then-push lets two of them both start the task.
+        if !self.try_mark_running(&task_id).await {
+            warn!(
+                "Scheduler: task '{}' is already running; not starting a second run",
+                task_name
+            );
+            return;
         }
 
         // === Async launch-and-poll paths ===
@@ -910,6 +945,7 @@ impl SchedulerService {
             }
         };
 
+        let read_modified_at = task.modified_at.clone();
         task.record_launch_failure();
         let failures = task.consecutive_launch_failures;
         let backoff = task.launch_failure_backoff();
@@ -939,11 +975,13 @@ impl SchedulerService {
         }
 
         let next_run_str = next_run.map(|dt| dt.to_rfc3339());
-        if let Err(e) = pg
-            .update_task_next_run(task_id, next_run_str.as_deref())
+        match pg
+            .update_task_next_run(task_id, next_run_str.as_deref(), &read_modified_at)
             .await
         {
-            error!("Failed to update next_run after launch failure: {}", e);
+            Ok(true) => {}
+            Ok(false) => debug!("backoff next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update next_run after launch failure: {}", e),
         }
     }
 
@@ -1376,8 +1414,15 @@ impl SchedulerService {
         let zone = self.schedule_zone().await;
         let next = compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339());
 
-        if let Err(e) = pg.update_task_next_run(task_id, next.as_deref()).await {
-            error!("Failed to update task next_run: {}", e);
+        match pg
+            .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
+            .await
+        {
+            Ok(true) => {}
+            // An edit landed between this read and the write; it recomputed
+            // next_run itself, so the edit's value stands.
+            Ok(false) => debug!("next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update task next_run: {}", e),
         }
     }
 
@@ -1595,6 +1640,17 @@ After making fixes, run tests if applicable to verify the fixes work."#
     }
 
     /// Check if a specific task is currently running
+    /// Atomically mark `task_id` running: `false` (and no change) when it
+    /// already is.
+    async fn try_mark_running(&self, task_id: &str) -> bool {
+        let mut running = self.running_tasks.write().await;
+        if running.iter().any(|id| id == task_id) {
+            return false;
+        }
+        running.push(task_id.to_string());
+        true
+    }
+
     pub async fn is_task_running(&self, task_id: &str) -> bool {
         let running = self.running_tasks.read().await;
         running.contains(&task_id.to_string())
@@ -1981,9 +2037,14 @@ impl SchedulerService {
             error!("Failed to update task last_run: {}", e);
         }
 
-        // Clear condition status
-        if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
-            error!("Failed to clear condition status: {}", e);
+        // Clear condition status (conditional on the snapshot: an edit since
+        // then already reset it, see `update_scheduled_task`).
+        match pg
+            .update_task_condition_status(&task.id, None, &task.modified_at)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => error!("Failed to clear condition status: {}", e),
         }
 
         // Update next_run
@@ -3877,5 +3938,43 @@ mod tests {
                 "timeout_minutes"
             ]
         );
+    }
+
+    /// Marking a task running is one atomic check-and-insert: concurrent
+    /// starters of the same task get exactly one `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_starter_marks_a_task_running() {
+        let service = Arc::new(SchedulerService::new(None));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                service.try_mark_running("t").await
+            }));
+        }
+        let mut marked = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                marked += 1;
+            }
+        }
+        assert_eq!(marked, 1);
+        assert_eq!(service.get_running_tasks().await, vec!["t".to_string()]);
+        assert!(!service.try_mark_running("t").await);
+        assert!(service.try_mark_running("other").await);
+    }
+
+    /// `execute_task_with_context` starts only through the atomic mark.
+    #[test]
+    fn execute_task_starts_only_through_the_atomic_mark() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn execute_task_with_context(")
+            .expect("execute_task_with_context");
+        let (head, _) = body
+            .split_once("// === Async launch-and-poll paths ===")
+            .expect("launch section");
+        assert!(head.contains("if !self.try_mark_running(&task_id).await {"));
+        assert!(!head.contains("running.push("));
     }
 }
