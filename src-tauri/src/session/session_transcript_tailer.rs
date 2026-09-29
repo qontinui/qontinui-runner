@@ -119,9 +119,13 @@
 //! - **Aligned.** A tail that starts inside a line (a file that ended in an
 //!   unterminated fragment when the tail began) is first tracked from the next
 //!   line boundary; the floor covers the straddling line, sent whole by a bind.
-//! - **Consent.** Batches appended while `Settings.cloud_sync_enabled` is off
-//!   move a tracked session's mark past them (`withhold_batch`), so no later
-//!   gap fill sends bytes written while sync was off.
+//! - **Consent.** A batch the watcher DELIVERS while `Settings.cloud_sync_enabled`
+//!   is off moves a tracked session's mark past it (`withhold_batch`), so no
+//!   later gap fill or bind sends it; a gap already open below it is skipped
+//!   too and counted as a `transcript_hole`. Bytes written while sync was off
+//!   but never delivered as a batch — the runner was down, or the tail was
+//!   re-started past them — carry no such record and CAN be sent later by a
+//!   gap fill or a bind once sync is on.
 //!
 //! A session never tailed BY THIS BUILD has no floor and no mark, and a bind
 //! replays it from 0 in file order — which, for a session a pre-mark build
@@ -725,6 +729,20 @@ impl SessionTranscriptTailer {
             return;
         };
         let end = file_start + len as u64;
+        if file_start > mark {
+            // A gap ABOVE the mark (a failed gap fill, a rolled-back emit, a
+            // batch dropped unbound) meets a consent-off batch. Consent wins:
+            // the mark still moves past both, so `[mark, file_start)` will
+            // never be sent. Say so, as a hole.
+            tracing::warn!(
+                session_key,
+                hole_from = mark,
+                hole_to = file_start,
+                "transcript_hole: bytes below a batch written while sync was off are skipped \
+                 with it — [hole_from, hole_to) of this JSONL will not reach coord"
+            );
+            self.lock_coverage().transcript_holes += 1;
+        }
         if end > mark {
             self.marks.set(&mk, end as i64);
         }
@@ -795,12 +813,26 @@ impl SessionTranscriptTailer {
             // floor then covers the straddling line, so a later bind sends it
             // whole, and its tail fragment in this batch is dropped.
             let aligned = match newline_precedes(path, file_start) {
+                Some(true) => file_start,
                 Some(false) => appended
                     .find('\n')
                     .map_or(file_start + appended.len() as u64, |i| {
                         file_start + i as u64 + 1
                     }),
-                _ => file_start,
+                None => {
+                    // Cannot tell whether the tail starts mid-line (the file
+                    // is unreadable right now). Fail closed: hold the batch
+                    // and create NO mark, so the next batch decides again —
+                    // a guessed mark mid-line would later read as a rewrite
+                    // and send the whole history.
+                    tracing::debug!(
+                        session_key,
+                        file_start,
+                        "session_transcript_tailer: first-seen batch held — line boundary \
+                         unreadable; the next batch retries"
+                    );
+                    return;
+                }
             };
             self.init_mark_at(&mk, path, aligned);
         }
@@ -875,15 +907,15 @@ impl SessionTranscriptTailer {
         let lane_before = self.emitter.offsets().next_offset(session_key);
         self.report_hole_if_any(session_key, mk, lane_before);
         self.marks.set_many(&[
-            (&hole_lane_key(mk), lane_before),
             (&hole_from_key(mk), from as i64),
             (&hole_end_key(mk), file_end as i64),
+            (&hole_lane_key(mk), lane_before),
             (&key, file_end as i64),
         ]);
         let chunks = self.emitter.emit_inner(session_key, unseen);
         if chunks == 0 {
             self.marks
-                .set_many(&[(&hole_lane_key(mk), -1), (&key, sent as i64)]);
+                .set_many(&[(&key, sent as i64), (&hole_lane_key(mk), -1)]);
             return None;
         }
         Some((file_end - from, chunks as u64))
@@ -1017,12 +1049,14 @@ impl SessionTranscriptTailer {
         }
         let lane_before = self.emitter.offsets().next_offset(session_key);
         self.report_hole_if_any(session_key, mk, lane_before);
-        // Write-ahead reservation, in one fsync: the hole record first, the
-        // mark LAST, so a torn append never commits a mark without its record.
+        // Write-ahead reservation, in one fsync, ordered range -> lane -> mark:
+        // the range is written before the lane value that arms it, and the
+        // mark last, so a torn append either arms nothing or arms a record
+        // naming exactly the range being reserved.
         self.marks.set_many(&[
-            (&hole_lane_key(mk), lane_before),
             (&hole_from_key(mk), from as i64),
             (&hole_end_key(mk), file_end as i64),
+            (&hole_lane_key(mk), lane_before),
             (mk, file_end as i64),
         ]);
         let chunks = self.emitter.emit_inner(session_key, unseen);
@@ -1030,7 +1064,7 @@ impl SessionTranscriptTailer {
             // Clean failure: nothing was queued. Roll the mark back and clear
             // the hole record — this is a retry, not a hole.
             self.marks
-                .set_many(&[(&hole_lane_key(mk), -1), (mk, mark as i64)]);
+                .set_many(&[(mk, mark as i64), (&hole_lane_key(mk), -1)]);
             return None;
         }
         Some((file_end - from, chunks as u64))
@@ -1042,8 +1076,11 @@ impl SessionTranscriptTailer {
     /// next reservation, that emit never queued its bytes (the runner died
     /// between the reservation and the outbox), so the range never reached
     /// coord. Logged once and counted; the record is overwritten by the
-    /// reservation that follows. A crash in the middle of the reservation's
-    /// own append can over-report one range that was in fact retried.
+    /// reservation that follows. Records are written range, then lane, then
+    /// mark (rollback: mark, then lane), so a torn reservation arms either
+    /// nothing or a record naming the torn range itself; in the second case
+    /// the range may in fact be retried (its mark never committed), so a crash
+    /// mid-append can over-report that one range.
     fn report_hole_if_any(&self, session_key: &str, mk: &str, lane_now: i64) {
         let Some(lane_then) = self.marks.get(&hole_lane_key(mk)).filter(|l| *l >= 0) else {
             return;
@@ -1171,12 +1208,15 @@ impl SessionTranscriptTailer {
             if prefix_truncated_bytes > 0 {
                 self.marks.set(&prefix_sent_key(&mk), start as i64);
             }
-            prefix_after_chunk_offset = Some(self.emitter.offsets().next_offset(session_key));
+            let lane_before_prefix = self.emitter.offsets().next_offset(session_key);
             pass = self
                 .replay_with(path, start, Some(floor), session_key, |start, text| {
                     self.emit_prefix_range(session_key, &mk, start, text)
                 })
                 .map_err(unreadable)?;
+            if pass.bytes > 0 {
+                prefix_after_chunk_offset = Some(lane_before_prefix);
+            }
             if pass.stopped_at.is_none() {
                 // Clear the floor ALONE — one entry cannot tear. Writing the
                 // progress reset beside it could keep `sent = 0` with the floor
@@ -2077,6 +2117,49 @@ mod tests {
         );
         assert_eq!(delivered(&outbox, coord), format!("{l3}{l1}{head}{rest}"));
         assert_eq!(bind(&t, &csid, &path).replayed_bytes, 0);
+    }
+
+    /// Fail closed: a first-seen mid-file batch whose line boundary cannot be
+    /// read (the file is unreadable — here, absent) is held, and NO mark is
+    /// created, so the next batch decides again.
+    #[test]
+    fn a_first_seen_batch_with_an_unreadable_boundary_is_held_without_a_mark() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &csid);
+        let missing: &Path = NO_FILE.as_ref();
+
+        t.on_appended_gated(&csid, missing, 16, "{\"n\":3}\n", false, true);
+
+        assert!(transcript_offsets(&outbox).is_empty(), "batch held");
+        assert!(
+            t.marks.get(&t.mark_key(&csid, missing)).is_none(),
+            "no mark created"
+        );
+    }
+
+    /// A sync-off batch arriving above an open gap: consent wins — the mark
+    /// moves past both, the gap is counted as a hole, and neither is sent.
+    #[test]
+    fn a_sync_off_batch_above_a_gap_skips_the_gap_as_a_hole() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (l1, l2, l3, l4) = ("{\"n\":1}\n", "{\"n\":2}\n", "{\"n\":3}\n", "{\"n\":4}\n");
+        let path = jsonl(dir.path(), &csid, l1);
+        let coord = bind(&t, &csid, &path).coord_session_id;
+        assert_eq!(t.coverage().transcript_holes, 0);
+
+        append(&path, &format!("{l2}{l3}"));
+        // l2's batch never arrived (the gap); l3 arrives while sync is off.
+        t.on_appended_gated(&csid, &path, (l1.len() + l2.len()) as u64, l3, false, false);
+        assert_eq!(t.coverage().transcript_holes, 1);
+
+        append(&path, l4);
+        let at = (l1.len() + l2.len() + l3.len()) as u64;
+        t.on_appended_gated(&csid, &path, at, l4, false, true);
+        assert_eq!(delivered(&outbox, coord), format!("{l1}{l4}"));
     }
 
     /// M-b: a batch appended while Gate 1 is OFF never reaches the outbox,
