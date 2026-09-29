@@ -74,6 +74,8 @@
 #                             conflicts with main then carries an obsolete
 #                             change: comment (once, hidden marker) and close
 #                             it. Nothing else is deleted — the branch stays.
+#   --print-close-marker      print that comment's hidden marker and exit 0
+#                             (callers match on it; takes no other argument).
 #
 # OUTCOMES (the LAST stdout line is exactly one of these; all exit 0):
 #   no-pr                   no open PR for --branch against main
@@ -130,6 +132,10 @@ while [ $# -gt 0 ]; do
     --wait-for-checks-seconds) wait_seconds="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --expect-head)             expect_head="${2:-}"; shift 2 || { usage; exit 2; } ;;
     --close-if-obsolete)       close_if_obsolete="true"; shift ;;
+    # Prints the hidden marker an obsolete-close comment carries, and exits.
+    # sibling-pin-bump.yml reads it from here (one definition, not two) to
+    # tell a PR this script closed from one a maintainer closed.
+    --print-close-marker)      printf '%s\n' "$CLOSE_MARKER"; exit 0 ;;
     -h|--help)                 usage; exit 0 ;;
     *)
       echo "::error::ready-bot-draft-pr.sh: unknown argument '$1'."

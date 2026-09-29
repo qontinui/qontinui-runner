@@ -941,6 +941,26 @@ jobs:
             # newest-first. No `|| true`, same reason as the open lookup above.
             existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
               --json number,mergedAt,isCrossRepository --jq 'map(select(.mergedAt == null and .isCrossRepository == false)) | first | .number // empty')"
+            # A PR that scripts/ci/ready-bot-draft-pr.sh closed as OBSOLETE
+            # (the sweep found main already current and the PR conflicting)
+            # is NOT the maintainer-closed case above: this genuine move
+            # deserves a fresh PR, and the old one's branch has been
+            # force-pushed since it was closed, which GitHub refuses to
+            # reopen. Recognised by the hidden marker that script's close
+            # comment carries — read from the script itself, so there is one
+            # definition. Comments are read via REST --paginate into a file
+            # (no page cap; no `gh | grep -q` SIGPIPE), with no `|| true`.
+            if [ -n "$existing_num" ]; then
+              close_marker="$(bash scripts/ci/ready-bot-draft-pr.sh --print-close-marker)"
+              if ! gh api --paginate "repos/$REPO/issues/$existing_num/comments" \
+                  --jq '.[].body' > "$RUNNER_TEMP/closed-pr-comments.txt"; then
+                pr_write_failed "reading the comments of closed bump PR #$existing_num"
+              fi
+              if grep -qF "$close_marker" "$RUNNER_TEMP/closed-pr-comments.txt"; then
+                echo "Closed bump PR #$existing_num was closed as obsolete by ready-bot-draft-pr.sh; opening a fresh PR instead of reopening it."
+                existing_num=""
+              fi
+            fi
             if [ -n "$existing_num" ]; then
               echo "Reopening previously closed bump PR #$existing_num."
               gh pr reopen "$existing_num" --repo "$REPO" \
