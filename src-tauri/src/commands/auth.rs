@@ -1265,6 +1265,10 @@ async fn finalize_signed_in(
     let cognito_access = login.access_token.clone();
     let device_b = device_id.clone();
     let sub_b = login.sub.clone();
+    let origin_b = qontinui_runner_lib::pair::PairBaseOrigin {
+        label: "explicit (caller-supplied backendUrl)".to_string(),
+        remedy: "Correct the backendUrl passed to sign-in.".to_string(),
+    };
     let pair_resp = spawn_blocking_tracked(move || {
         pair_with_auth_token_with_ids(
             &base_b,
@@ -1272,6 +1276,7 @@ async fn finalize_signed_in(
             &device_b,
             &sub_b,
             uuid::Uuid::nil(),
+            &origin_b,
         )
     })
     .await
