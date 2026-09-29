@@ -55,6 +55,10 @@ unset QONTINUI_PREPUSH_SKIP QONTINUI_PREPUSH_SKIP_ALL QONTINUI_PREPUSH_STRICT
 # guard override or workspace root would decide the linked-worktree cases below
 # instead of the fixture.
 unset CARGO_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
+# The pushed-range resolution reads these. A developer running the tests from
+# inside a real pre-commit pre-push invocation would otherwise have the RANGE
+# under test decided by their own push.
+unset PRE_COMMIT_FROM_REF PRE_COMMIT_TO_REF
 
 PASS=0
 FAIL=0
@@ -123,13 +127,36 @@ fixture() {
     # pre-commit install, and a hook failing on a two-line fixture would read
     # as a cascade bug.
     git -C "$UPSTREAM" config core.hooksPath "$UPSTREAM/.git/no-hooks"
-    mkdir -p "$UPSTREAM/src-tauri/src" "$UPSTREAM/src"
+    mkdir -p "$UPSTREAM/src-tauri/src" "$UPSTREAM/src" \
+        "$UPSTREAM/crates/thing/src" "$UPSTREAM/src/components/app"
+    # An in-repo path dependency and a build-script input: `cd src-tauri &&
+    # cargo clippy` compiles the first and build.rs fatally reads the second,
+    # so both are gate inputs that live OUTSIDE src-tauri/.
+    printf '// dep\n' > "$UPSTREAM/crates/thing/src/lib.rs"
+    printf 'export const VALID_TAB_IDS = [];\n' > "$UPSTREAM/src/components/app/tab-types.ts"
+    cat > "$UPSTREAM/src-tauri/build.rs" <<'BUILDRS'
+fn main() {
+    const TAB_TYPES_TS: &str = "../src/components/app/tab-types.ts";
+    println!("cargo:rerun-if-changed={TAB_TYPES_TS}");
+}
+BUILDRS
     printf '// base\n'   > "$UPSTREAM/src-tauri/src/lib.rs"
     # An include_str!-style markdown body, so a content-only edit is expressible.
     printf '# body\n'    > "$UPSTREAM/src-tauri/src/body.md"
     printf '// ui\n'     > "$UPSTREAM/src/app.ts"
     printf '[workspace]\n' > "$UPSTREAM/Cargo.toml"
     printf '# lock\n'      > "$UPSTREAM/Cargo.lock"
+    # NOT `clippy.toml` / `rust-toolchain.toml` in the BASE fixture. Two arms
+    # below run a REAL `cargo metadata`, and a `rust-toolchain.toml` carrying an
+    # empty `[toolchain]` table makes RUSTUP refuse before cargo starts — which
+    # turns the workspace-preflight arms' typed decline into an unclassified
+    # failure. The arms that test those two files create them themselves.
+    cat > "$UPSTREAM/src-tauri/Cargo.toml" <<'TOML'
+[package]
+name = "app"
+[dependencies]
+thing = { path = "../crates/thing" }
+TOML
     git -C "$UPSTREAM" add -A >/dev/null
     git -C "$UPSTREAM" commit --quiet -m base
 
@@ -182,9 +209,24 @@ commit_change() {
 
 # Run the real hook in the fixture, with the recording shim ahead of any real
 # cargo on PATH. Captures combined output; sets HOOK_RC and HOOK_OUT.
+#
+# `</dev/null` is load-bearing, not tidiness. The hook now reads git's pre-push
+# ref list from stdin (`push_pushed_refs`), so whatever stdin the test runner
+# happens to hand this script would otherwise decide the range under test —
+# a terminal, an idle pipe, or a CI harness's own input. Pinning it to an empty
+# stdin is what makes these cases assert the HEAD fallback specifically; the
+# stdin arms below feed it deliberately instead.
 run_prepush() {
     HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
-        bash "$PREPUSH" 2>&1)"
+        bash "$PREPUSH" 2>&1 </dev/null)"
+    HOOK_RC=$?
+}
+
+# The same, but feeding the hook a pre-push ref list on stdin, the way git does.
+# $1 is the whole stdin text.
+run_prepush_with_stdin() {
+    HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+        bash "$PREPUSH" 2>&1 <<<"$1")"
     HOOK_RC=$?
 }
 
@@ -389,7 +431,7 @@ STUB
 
 run_prepush_in_wt() {
     HOOK_OUT="$(cd "$WT" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" "$@" \
-        bash "$PREPUSH" 2>&1)"
+        bash "$PREPUSH" 2>&1 </dev/null)"
     HOOK_RC=$?
 }
 
@@ -584,6 +626,395 @@ else
         *) fail_note "strict mode must say why it blocked" ;;
     esac
 fi
+
+echo "  -- the pushed range is what git says it is, not whatever HEAD points at --"
+
+# THE regression this section exists for. `main` is checked out; a DIFFERENT
+# branch carrying a Rust change is pushed. Scoped against HEAD the range is
+# empty, so the gate reports a clean skip and an unlinted commit goes out —
+# reproduced end-to-end on 2026-09-17 before the fix.
+#
+# `commit_change` commits on the current branch, so these build the feature
+# branch and then return to main.
+feature_branch_fixture() {
+    fixture
+    git -C "$WORK" checkout --quiet -b feature
+    commit_change "$1" "$2"
+    FEATURE_SHA="$(git -C "$WORK" rev-parse feature)"
+    git -C "$WORK" checkout --quiet main
+    # Guard against a vacuous pass: main really must carry none of it.
+    MAIN_RANGE="$(git -C "$WORK" diff --name-only origin/main..main -- src-tauri/)"
+}
+
+# git's own protocol line: <local ref> <local sha> <remote ref> <remote sha>.
+pushed_line() { printf '%s %s %s %s\n' "refs/heads/$1" "$2" "refs/heads/$1" "${3:-$ZERO_SHA}"; }
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+feature_branch_fixture "src-tauri/src/lib.rs" "// rust on the branch being pushed"
+check "fixture is honest -> HEAD (main) carries no src-tauri/ change" "" "$MAIN_RANGE"
+run_prepush_with_stdin "$(pushed_line feature "$FEATURE_SHA")"
+check "stdin names a non-checked-out branch with Rust -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# The inverse, which is what proves the range came from stdin rather than from
+# HEAD: the PUSHED branch is TS-only while HEAD carries Rust. A fix that merely
+# widened the scope would run the gate here.
+fixture
+git -C "$WORK" checkout --quiet -b ts-only
+commit_change "src/app.ts" "// ui only"
+TS_SHA="$(git -C "$WORK" rev-parse ts-only)"
+git -C "$WORK" checkout --quiet main
+commit_change "src-tauri/src/lib.rs" "// rust that is NOT being pushed"
+run_prepush_with_stdin "$(pushed_line ts-only "$TS_SHA")"
+check "stdin names a TS-only branch while HEAD carries Rust -> gate SKIPPED" "no" "$(cargo_ran)"
+check "and the hook exits 0" "0" "$HOOK_RC"
+
+# pre-commit consumes git's stdin and re-exposes it as these two. Same answer.
+feature_branch_fixture "src-tauri/src/lib.rs" "// rust on the branch being pushed"
+HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+    PRE_COMMIT_TO_REF="$FEATURE_SHA" PRE_COMMIT_FROM_REF="$(git -C "$WORK" rev-parse origin/main)" \
+    bash "$PREPUSH" 2>&1 </dev/null)"
+check "PRE_COMMIT_TO_REF names the pushed branch -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# The remote already has the ref: its sha is exactly the base, so only the new
+# commits count. Here the Rust change is ALREADY on the remote and the pushed
+# commit is TS-only — a HEAD-and-merge-base scope would re-gate the old commit.
+fixture
+commit_change "src-tauri/src/lib.rs" "// rust already pushed"
+git -C "$WORK" push --quiet origin main >/dev/null 2>&1
+REMOTE_SHA="$(git -C "$WORK" rev-parse HEAD)"
+commit_change "src/app.ts" "// new ui commit"
+run_prepush_with_stdin "$(pushed_line main "$(git -C "$WORK" rev-parse HEAD)" "$REMOTE_SHA")"
+check "a non-zero remote sha is the base -> already-pushed Rust does not re-gate" "no" "$(cargo_ran)"
+
+# A multi-ref push (`git push --all`): the verdict is over the UNION, so one
+# Rust-bearing ref gates the whole push.
+fixture
+git -C "$WORK" checkout --quiet -b ts-branch
+commit_change "src/app.ts" "// ui"
+TS_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet -b rust-branch
+commit_change "src-tauri/src/lib.rs" "// rust"
+RUST_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet main
+run_prepush_with_stdin "$(pushed_line ts-branch "$TS_SHA")
+$(pushed_line rust-branch "$RUST_SHA")"
+check "multi-ref push, one ref carries Rust -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# A deletion carries no commits, so it must be DISCARDED — leaving no pushed
+# ref information at all, which sends the hook to the HEAD fallback.
+#
+# HEAD here is deliberately TS-only, which is what makes this case tell the two
+# behaviours apart. Keeping the all-zero line instead would put an unresolvable
+# sha into the range list, the whole resolution would report incomplete, and
+# the hook would fail OPEN and run the gate. Both readings are safe, so an
+# arm whose HEAD carried Rust would pass either way and assert nothing.
+fixture
+commit_change "src/app.ts" "// ui only"
+run_prepush_with_stdin "$(printf 'refs/heads/gone %s refs/heads/gone %s\n' "$ZERO_SHA" "$ZERO_SHA")"
+check "a deletion-only push is discarded and falls back to HEAD -> gate SKIPPED" \
+    "no" "$(cargo_ran)"
+
+# ...and a deletion riding ALONGSIDE a real ref must not suppress that ref.
+fixture
+git -C "$WORK" checkout --quiet -b rust-branch
+commit_change "src-tauri/src/lib.rs" "// rust"
+RUST_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet main
+run_prepush_with_stdin "$(printf 'refs/heads/gone %s refs/heads/gone %s\n' "$ZERO_SHA" "$ZERO_SHA")
+$(pushed_line rust-branch "$RUST_SHA")"
+check "a deletion beside a real ref -> the real ref still decides -> gate ATTEMPTED" \
+    "yes" "$(cargo_ran)"
+
+# Anything that is not a ref list is not GUESSED at — but neither is it
+# silently discarded. HEAD here is TS-only, so a hook that fell back to HEAD
+# would skip; the gate running is what proves the unreadable input was treated
+# as "I cannot see the whole push" rather than as "there is no push info".
+fixture
+commit_change "src/app.ts" "// ui"
+run_prepush_with_stdin "this is not a ref list
+neither is this one"
+check "wholly unreadable stdin -> gate RUNS (fail open), not a HEAD fallback" \
+    "yes" "$(cargo_ran)"
+
+# THE case the round-2 review reproduced. One well-formed ref beside one
+# malformed one: the surviving line is a strict SUBSET of the push, so scoping
+# on it is a false skip. Here the dropped line is the Rust-bearing ref and the
+# survivor is TS-only — the shape that made the old code print a clean skip.
+fixture
+git -C "$WORK" checkout --quiet -b rusty
+commit_change "src-tauri/src/lib.rs" "// rust on the dropped ref"
+RUSTY_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet main
+commit_change "src/app.ts" "// ui on the surviving ref"
+run_prepush_with_stdin "refs/heads/rusty $RUSTY_SHA refs/heads/rusty
+$(pushed_line main "$(git -C "$WORK" rev-parse HEAD)")"
+check "a malformed ref beside a good one -> gate RUNS, never scoped to the survivor" \
+    "yes" "$(cargo_ran)"
+
+# End to end through git itself, pushing by SHA to a ref name that is not the
+# checked-out branch — the `git push origin <sha>:refs/heads/x` spelling the
+# plan named. git supplies stdin; nothing here fabricates it.
+feature_branch_fixture "src-tauri/src/lib.rs" "// rust pushed by sha"
+HOOKS="$(dirname "$WORK")/sha-push-hooks"
+mkdir -p "$HOOKS"
+cat > "$HOOKS/pre-push" <<HOOK
+#!/usr/bin/env bash
+exec bash "$PREPUSH"
+HOOK
+chmod +x "$HOOKS/pre-push"
+git -C "$WORK" config core.hooksPath "$HOOKS"
+HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+    git push origin "$FEATURE_SHA":refs/heads/topic 2>&1)"
+HOOK_RC=$?
+check "real 'git push origin <sha>:refs/heads/topic' -> the push succeeds" "0" "$HOOK_RC"
+check "real 'git push origin <sha>:refs/heads/topic' -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# The UTF-8 probe has to read the blob at the PUSHED TIP. Here the pushed branch
+# MODIFIES a markdown body that HEAD (main) has deleted, so `HEAD:<path>` does
+# not resolve at all — and a `cat-file` that fails reads as "not valid UTF-8"
+# and gates for a reason that has nothing to do with the push.
+fixture
+git -C "$WORK" checkout --quiet -b mdbranch
+commit_change "src-tauri/src/body.md" "more prose"
+MD_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet main
+git -C "$WORK" rm --quiet src-tauri/src/body.md
+git -C "$WORK" commit --quiet -m "delete body.md on main"
+check "fixture is honest -> HEAD does not carry the path" \
+    "" "$(git -C "$WORK" cat-file blob HEAD:src-tauri/src/body.md 2>/dev/null; echo -n '')"
+run_prepush_with_stdin "$(pushed_line mdbranch "$MD_SHA")"
+check "a modified .md is read at the pushed tip, not at HEAD -> gate SKIPPED" "no" "$(cargo_ran)"
+
+# A ref list that STALLS mid-stream must read as incomplete, not as the whole
+# push. If the dropped ref is the Rust-bearing one and a surviving ref is
+# TS-only, a "complete" verdict over the union is a false skip.
+#
+# Two bugs hid here in a row, both of which LOOKED fixed: `$?` after `done` is
+# the loop BODY's status, and `$?` inside `if ! read` is the NEGATION's. This
+# arm is what distinguishes a real fix from either.
+fixture
+STALL_OUT="$(cd "$WORK" && bash -c '
+    . "'"$SCRIPT_DIR"'/lib/push-range.sh"
+    out="$(push_pushed_refs)"; rc=$?
+    printf "rc=%s lines=%s" "$rc" "$(printf "%s\n" "$out" | grep -c .)"
+  ' < <(printf "refs/heads/a %s refs/heads/a %s\n" "$(printf '1%.0s' $(seq 40))" "$ZERO_SHA"
+        sleep 4
+        printf "refs/heads/b %s refs/heads/b %s\n" "$(printf '2%.0s' $(seq 40))" "$ZERO_SHA"))"
+check "a ref list that stalls mid-stream reads as INCOMPLETE" "rc=2 lines=1" "$STALL_OUT"
+
+# ...and it has to reach the HOOK. The library returning a typed 2 is worth
+# nothing if the caller maps it onto the same fallback as "no ref info at all":
+# that converts "I could not read the whole push" into "measure HEAD instead",
+# which is the exact false skip this file exists to abolish. HEAD is TS-only
+# here, so a hook that fell back to HEAD would skip.
+fixture
+git -C "$WORK" checkout --quiet -b stalled-rust
+commit_change "src-tauri/src/lib.rs" "// rust on the stalled ref"
+STALLED_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" checkout --quiet main
+commit_change "src/app.ts" "// ui on HEAD"
+HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+    bash "$PREPUSH" 2>&1 < <(pushed_line stalled-rust "$STALLED_SHA"; sleep 4))"
+check "a stalled ref list makes the HOOK run the gate, not fall back to HEAD" \
+    "yes" "$(cargo_ran)"
+
+# ...while a complete multi-ref list on the same code path is complete.
+WHOLE_OUT="$(cd "$WORK" && bash -c '
+    . "'"$SCRIPT_DIR"'/lib/push-range.sh"
+    out="$(push_pushed_refs)"; rc=$?
+    printf "rc=%s lines=%s" "$rc" "$(printf "%s\n" "$out" | grep -c .)"
+  ' <<REFS
+refs/heads/a $(printf '1%.0s' $(seq 40)) refs/heads/a $ZERO_SHA
+refs/heads/b $(printf '2%.0s' $(seq 40)) refs/heads/b $ZERO_SHA
+REFS
+)"
+check "a complete multi-ref list reads as COMPLETE" "rc=0 lines=2" "$WHOLE_OUT"
+
+echo "  -- everything the gate COMPILES is in scope, not just src-tauri/ --"
+
+# THE live false skip this section exists for. `cd src-tauri && cargo clippy`
+# compiles the in-repo path dependencies, so a push touching only one of them
+# breaks the gate's own build — and the old `-- src-tauri/` pathspec skipped it
+# with "no src-tauri/ changes". `git log` holds a real instance:
+# `2372b5de5 style(spec-check): apply cargo fmt to the crate`.
+fixture
+commit_change "crates/thing/src/lib.rs" "// changed the path dep"
+run_prepush
+check "a change to an in-repo path DEPENDENCY -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# build.rs reads this file and is, in its own words, "deliberately FATAL on
+# failure": a rename or a reshape is a hard build failure, not a lint.
+fixture
+git -C "$WORK" mv src/components/app/tab-types.ts src/components/app/tabs.ts
+git -C "$WORK" commit --quiet -m "rename the build-script input"
+run_prepush
+check "renaming a build.rs input -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# The build configuration decides what the gate's verdict even is: which
+# clippy, which lint levels, which profile, which dependency versions.
+for f in Cargo.toml Cargo.lock clippy.toml rust-toolchain.toml; do
+    fixture
+    commit_change "$f" "# touched"
+    run_prepush
+    check "a change to $f -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+done
+
+# ...and the scope must still be the crate's INPUTS, not the whole repo: a
+# TS-only push that touches none of them still skips. Without this the section
+# above would be satisfied by simply gating everything.
+fixture
+commit_change "src/app.ts" "// ui only"
+run_prepush
+check "a TS change touching no gate input -> gate SKIPPED" "no" "$(cargo_ran)"
+
+# A `.md` that is in scope because it sits inside a path-dep CRATE is not an
+# embed, so the content excuse must not reach it. The excuse is keyed on the
+# embed set; `*.md` alone would excuse any markdown the widened scope pulls in.
+fixture
+printf '# readme\n' > "$WORK/crates/thing/README.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "add a readme in the path dep"
+git -C "$WORK" push --quiet origin HEAD:refs/heads/mdbase >/dev/null 2>&1
+git -C "$WORK" update-ref refs/remotes/origin/main HEAD
+commit_change "crates/thing/README.md" "more prose"
+run_prepush
+check "a MODIFIED .md inside a path-dep crate is not excused -> gate ATTEMPTED" \
+    "yes" "$(cargo_ran)"
+
+# ...while the same edit to a markdown body under src-tauri/ still is.
+fixture
+commit_change "src-tauri/src/body.md" "more prose"
+run_prepush
+check "a MODIFIED .md under src-tauri/ is still excused -> gate SKIPPED" \
+    "no" "$(cargo_ran)"
+
+# A path-dep .rs is a first-class Rust input, so a MODIFICATION gates even
+# though a modified embed of the same status would be excused. The excuse is
+# keyed on the embed set, not on "outside src-tauri/".
+fixture
+printf '// still valid utf-8\n' >> "$WORK/crates/thing/src/lib.rs"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "edit the path dep"
+run_prepush
+check "a MODIFIED path-dep source is not excused as content -> gate ATTEMPTED" \
+    "yes" "$(cargo_ran)"
+
+echo "  -- the skip switches still short-circuit everything above --"
+
+# Both halves of each switch, because an opt-in tested only in its ON state
+# says nothing about the arm that actually runs on every push.
+fixture
+commit_change "src-tauri/src/lib.rs" "// rust"
+HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+    QONTINUI_PREPUSH_SKIP_ALL=1 bash "$PREPUSH" 2>&1 </dev/null)"
+HOOK_RC=$?
+check "QONTINUI_PREPUSH_SKIP_ALL=1 -> exit 0" "0" "$HOOK_RC"
+check "QONTINUI_PREPUSH_SKIP_ALL=1 -> cargo never invoked" "no" "$(cargo_ran)"
+
+fixture
+commit_change "src-tauri/src/lib.rs" "// rust"
+run_prepush
+check "QONTINUI_PREPUSH_SKIP_ALL unset -> the same diff DOES run cargo" "yes" "$(cargo_ran)"
+
+fixture
+commit_change "src-tauri/src/lib.rs" "// rust"
+HOOK_OUT="$(cd "$WORK" && CARGO_SHIM_LOG="$SHIM_LOG" PATH="$SHIM_BIN:$PATH" \
+    QONTINUI_PREPUSH_SKIP=1 bash "$PREPUSH" 2>&1 </dev/null)"
+HOOK_RC=$?
+check "QONTINUI_PREPUSH_SKIP=1 -> exit 0" "0" "$HOOK_RC"
+# The shim records each invocation's argv, so the two halves are separable.
+# Spelled as ONE comparison of the actual subcommand list: an `&& echo x ||
+# echo x` pair reads like an assertion and cannot fail.
+check "QONTINUI_PREPUSH_SKIP=1 -> fmt ran and clippy did not" \
+    "fmt" \
+    "$(sed 's/ |.*//' "$SHIM_LOG" | grep -E '^(fmt|clippy)$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+case "$HOOK_OUT" in
+    *"skipping clippy (fmt above still ran)"*) pass_note "and it says clippy was the half skipped" ;;
+    *) fail_note "expected the clippy-only skip note, got: $HOOK_OUT" ;;
+esac
+
+echo "  -- embedded files OUTSIDE src-tauri/ are in scope --"
+
+# `include_str!` resolves relative to the .rs file that names it, so the crate
+# compiles in files the `src-tauri/` pathspec cannot see. Give the fixture one.
+embed_fixture() {
+    fixture
+    mkdir -p "$WORK/examples" "$WORK/specs/pages" "$WORK/docs"
+    printf 'print("hi")\n' > "$WORK/examples/setup.py"
+    printf '# page\n'       > "$WORK/specs/pages/home.md"
+    printf '# unrelated\n'  > "$WORK/docs/not-embedded.md"
+    cat > "$WORK/src-tauri/src/embed.rs" <<'RS'
+const SETUP: &str = include_str!("../../examples/setup.py");
+static PAGES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../specs/pages");
+RS
+    git -C "$WORK" add -A >/dev/null
+    git -C "$WORK" commit --quiet -m "add outside-tree embeds"
+    git -C "$WORK" push --quiet origin HEAD:refs/heads/embedbase >/dev/null 2>&1
+    git -C "$WORK" update-ref refs/remotes/origin/main HEAD
+}
+
+embed_fixture
+git -C "$WORK" rm --quiet examples/setup.py
+git -C "$WORK" commit --quiet -m "delete an embedded file"
+run_prepush
+check "deleting an embedded file outside src-tauri/ -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+embed_fixture
+git -C "$WORK" mv examples/setup.py examples/renamed.py
+git -C "$WORK" commit --quiet -m "rename an embedded file"
+run_prepush
+check "renaming an embedded file outside src-tauri/ -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# A content edit that stays valid UTF-8 cannot change what compiles, so it is
+# excused for the same reason a modified .md under src-tauri/ is.
+embed_fixture
+commit_change "examples/setup.py" "print('more')"
+run_prepush
+check "editing an embedded file (valid UTF-8) -> gate SKIPPED" "no" "$(cargo_ran)"
+
+# ...but re-encoding it is a compile error for include_str!, exactly as under
+# src-tauri/.
+embed_fixture
+printf '\xe9t\xe9\n' >> "$WORK/examples/setup.py"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "re-encode the embedded file as latin-1"
+run_prepush
+check "re-encoding an embedded file to invalid UTF-8 -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# The scope must widen to the EMBEDDED files, not to the whole repo. A deleted
+# file nothing embeds still skips.
+embed_fixture
+git -C "$WORK" rm --quiet docs/not-embedded.md
+git -C "$WORK" commit --quiet -m "delete a file nothing embeds"
+run_prepush
+check "deleting a NON-embedded file outside src-tauri/ -> gate SKIPPED" "no" "$(cargo_ran)"
+
+# include_dir! embeds a TREE, so a new file appearing under it changes what
+# compiles even though the directory path itself did not change.
+embed_fixture
+printf '# about\n' > "$WORK/specs/pages/about.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "add a page under the embedded directory"
+run_prepush
+check "adding a file under an include_dir! tree -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+
+# An embed spelling the deriver cannot read (a raw string) makes the input set
+# UNKNOWN. UNKNOWN must run the gate, never skip it: deleting the file that
+# raw-string embed names is a compile error the scoped diff cannot see.
+embed_fixture
+printf 'const RAW: &str = include_str!(r"../../docs/raw.md");\n' >> "$WORK/src-tauri/src/embed.rs"
+printf '# raw\n' > "$WORK/docs/raw.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "add an embed spelling the deriver cannot read"
+git -C "$WORK" update-ref refs/remotes/origin/main HEAD
+git -C "$WORK" rm --quiet docs/raw.md
+git -C "$WORK" commit --quiet -m "delete the raw-string embed target"
+run_prepush
+check "unreadable embed spelling (UNKNOWN input set) -> gate ATTEMPTED" "yes" "$(cargo_ran)"
+case "$HOOK_OUT" in
+    *"could not tell which files outside src-tauri/"*) pass_note "and it names the UNKNOWN as the reason" ;;
+    *) fail_note "expected the UNKNOWN-input-set note, got: $HOOK_OUT" ;;
+esac
 
 echo
 if [ "$SKIP" -gt 0 ]; then

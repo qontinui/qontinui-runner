@@ -387,8 +387,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 #   code that always has a filesystem; these two scripts are about to stop having one.
 #
 # CALLER CONTRACT — set these BEFORE this block:
-#   PROBE_TIMEOUT     seconds; interpolated into the TIMEOUT verdict string.
 #   DOOR_SCRIPT_NAME  this script's name, for LOCAL-fault preflight errors.
+# The curl budgets are NOT a global: every classify() call passes the connect and
+# total budgets ITS OWN curl was given, so the TIMEOUT verdict names the bound that
+# was actually applied (plan 2026-09-26-coord-revive-timeout-verdict-names-the-wrong-budget
+# — a global PROBE_TIMEOUT made a 60 s `call` report "within 15s").
 #
 # VERDICT STRINGS ARE AN INTERFACE. coord-revive.sh's probe_door() branches on
 # `CREDENTIAL_REFRESHING*` as a PREFIX match to decide whether to retry (it appends a
@@ -414,7 +417,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 #                                It is NOT a live-class verdict: no call can be
 #                                carried over it.
 # ========================================================================================
-: "${PROBE_TIMEOUT:?must be set before the shared coord-door classifier}"
 : "${DOOR_SCRIPT_NAME:?must be set before the shared coord-door classifier}"
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -648,13 +650,18 @@ runner_credential_code_textual() {
     | sed 's/.*"\([^"]*\)"$/\1/'
 }
 
-# classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
+# classify <curl_exit> <http_code> <body> <connect_budget> <total_budget> <curl_err> [unauth-wording]
+#   -> typed verdict.
+# <connect_budget> / <total_budget> are the seconds THIS call's curl was given
+# (`--connect-timeout` / `-m`), and <curl_err> is that curl's own stderr text. All
+# three are positional and REQUIRED so no caller can forget them: the budget used
+# to be a global, and the one global was wrong for every non-probe caller.
 # 401 wording is parameterized because on a loopback proxy it means "stale
 # proxy key" while on the direct bearer door it means "rejected bearer".
 #
 # INVARIANT: every path returns a NAMED cause. A verdict that names nothing is
 classify() {
-  local ce="$1" code="$2" body="$3" unauth="${4:-COORD_MCP_PROXY_UNAUTHORIZED (stale/evicted proxy key)}"
+  local ce="$1" code="$2" body="$3" connect_budget="$4" total_budget="$5" curl_err="$6" unauth="${7:-COORD_MCP_PROXY_UNAUTHORIZED (stale/evicted proxy key)}"
   # curl can fail BEFORE the transfer starts (unopenable `--header @file`, bad
   # URL). It then never writes its `-w` output, so $code arrives EMPTY — not
   # "000", which is what curl reports for a failure during the transfer. An
@@ -670,7 +677,32 @@ classify() {
   # that its own upstream hung. Collapsing the two loses the one bit that decides
   # what to do next: a door that never answered may still be alive and loaded,
   # while a door that answered 504 is provably alive and its coord hop is not.
-  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response reached this box within ${PROBE_TIMEOUT}s - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
+  # WHICH bound fired is read from curl's own stderr, which names the PHASE it was
+  # in when time ran out, not the timer: `Operation timed out` is the transfer
+  # phase, so the -m total bound; `Connection timed out` is the connect phase
+  # (TCP AND, in curl 8, the TLS handshake), which is cut short by whichever of
+  # --connect-timeout and -m is SMALLER -- `--connect-timeout 5 -m 1` prints
+  # "Connection timed out after 1001 milliseconds". So that arm names the
+  # smaller budget. Anything else (a resolve timeout, an empty stderr, a budget
+  # that is not a number) names BOTH rather than guessing -- elapsed time is not
+  # used, local load blurs it.
+  if [ "$ce" = "28" ]; then
+    local bound connect_limit
+    connect_limit="$(awk -v c="$connect_budget" -v t="$total_budget" 'BEGIN {
+      if (c !~ /^[0-9]+(\.[0-9]+)?$/ || t !~ /^[0-9]+(\.[0-9]+)?$/) { print "unknown"; exit }
+      if (c + 0 == 0) { print (t + 0 > 0 && t + 0 < 300 ? "total" : "unknown"); exit }  # curl: 0 = its ~300 s default
+      if (t + 0 > 0 && t + 0 <= c + 0) print "total"; else print "connect" }')"
+    case "$curl_err:$connect_limit" in
+      *"Connection timed out"*:connect)
+        bound="the connect bound (${connect_budget}s) fired: the connect phase (TCP or TLS handshake) did not complete" ;;
+      *"Connection timed out"*:total)
+        bound="the total bound (${total_budget}s) fired during the connect phase (TCP or TLS handshake) - the connect phase is cut short by whichever bound is smaller, and this one was (connect bound ${connect_budget}s; 0 means curl's own ~300 s default)" ;;
+      *"Operation timed out"*:*)
+        bound="the total bound (${total_budget}s) fired: connected, but no complete response reached this box" ;;
+      *) bound="a curl bound fired - the connect bound (${connect_budget}s) or the total bound (${total_budget}s); curl did not say which" ;;
+    esac
+    echo "TIMEOUT ($bound - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return
+  fi
   # 26 = "couldn't open/read the local data file", i.e. the auth-header file.
   # This is a LOCAL fault and must never read as a coord verdict — the same
   # rule coord-acting-bearer.sh states for its mint ("a 'Failed to open' here
@@ -1436,7 +1468,7 @@ probe_door() {
       -X POST "$url" -H "Content-Type: application/json" \
       -H "@$hdrpath" -d "$RPC_LIST" 2>"$errfile")
     ce=$?
-    verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+    verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" "$PROBE_CONNECT_TIMEOUT" "$PROBE_TIMEOUT" "$(cat "$errfile" 2>/dev/null)" ${unauth:+"$unauth"})"
     record_plane "$url" "$verdict"
     note_runner_credential "$verdict"
 
@@ -1463,7 +1495,7 @@ probe_door() {
             -X POST "$url" -H "Content-Type: application/json" \
             -H "@$hdrpath" -d "$RPC_E2E" 2>"$errfile")
           ce=$?
-          verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+          verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" "$PROBE_CONNECT_TIMEOUT" "$PROBE_TIMEOUT" "$(cat "$errfile" 2>/dev/null)" ${unauth:+"$unauth"})"
           record_plane "$url" "$verdict"
           note_runner_credential "$verdict"
           if [ "$e2e_attempt" = "1" ]; then
@@ -2350,7 +2382,7 @@ if [ $# -gt 0 ]; then
       echo "  Recovery for THIS caller: the file was re-read just now, so the key on disk is itself stale - run 'bash coord-revive.sh' (no verb) for the full cascade, which finds a sibling key or a bearer. Recovery for the NATIVE MCP client: it cannot re-read .mcp.json, so start a NEW SESSION. NEVER restart the runner over this, and this verb never mints (a /coord-mcp/provision-session mint evicts the live peer holding this workdir's slot)." >&2
       exit 1 ;;
     *)
-      VV="$(classify "$VCE" "$VCODE" "$VBODY")"
+      VV="$(classify "$VCE" "$VCODE" "$VBODY" "$PROBE_CONNECT_TIMEOUT" "$CALL_TIMEOUT" "$VCURLERR")"
       [ -n "$VCURLERR" ] && VV="$VV [curl: $VCURLERR]"
       echo "coord-revive: $VERB -> $VV (door $CFG_URL from $OWN_CFG_PATH; the call was NOT carried - a write here is presumed LOST, re-issue and verify by read)" >&2
       exit 1 ;;

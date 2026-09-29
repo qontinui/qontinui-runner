@@ -223,6 +223,7 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
         &[occluded_element("btn-save", "modal-1", 40.0, "Save")],
         0.02,
         false,
+        None,
     );
     let entry = &report["occlusions"][0];
 
@@ -246,8 +247,8 @@ fn occlusion_entry_pins_the_sdk_entry_field_names() {
     assert_eq!(
         entry["isExpectedOverlay"], false,
         "`isExpectedOverlay` is the SDK's key for 'the occluder is a tracked \
-         modal, not a bug'; see the KNOWN DIVERGENCE test below for why the \
-         Rust twin always says false"
+         modal, not a bug'. `false` here because no modal stack was supplied; \
+         the cross-implementation agreement test below pins the `true` arm"
     );
     assert_eq!(
         entry["hidesText"], true,
@@ -297,6 +298,7 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         &[occluded_element("btn-save", "modal-1", 40.0, "Save")],
         0.02,
         true,
+        None,
     );
 
     assert!(
@@ -315,8 +317,8 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
     );
     assert_eq!(
         report["includeExpected"], true,
-        "`includeExpected` is echoed; see the KNOWN DIVERGENCE test for what \
-         the echo does and does not promise"
+        "`includeExpected` is echoed; the cross-implementation agreement \
+         test below pins what it does to the list"
     );
     assert_eq!(
         report["verdict"], "occlusions_found",
@@ -332,20 +334,32 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
          all is 'nothing OBSERVED', not 'nothing covered'"
     );
 
-    // DIVERGENCE, recorded: the SDK 0.26.0 report carries two more keys that
-    // the Rust twin does not emit, because both are outputs of the modal-stack
-    // classifier the Rust side has no equivalent of. A consumer written
-    // against the SDK interface will find them `undefined` here. Pinned as an
-    // explicit absence so the day someone implements the classifier, this test
-    // reddens and the pin is updated on purpose rather than by accident.
-    for sdk_only in ["expectedOverlayDetection", "expectedOverlaysFiltered"] {
-        assert!(
-            report.get(sdk_only).is_none(),
-            "`{sdk_only}` is an SDK-0.26.0 report key with no Rust twin. If \
-             this is now red, the modal-stack classifier landed here — update \
-             this pin and the divergence note deliberately"
-        );
-    }
+    // The SDK's two classifier outputs (`types.ts` `VisibilityReport`,
+    // ui-bridge `fc6838e`). Until plan
+    // `2026-09-10-the-runners-rust-visibility-twin-diverges-from-the-sdk-it-mirrors`
+    // the Rust twin emitted neither and this block pinned their ABSENCE; it is
+    // now a presence-and-type pin. `expectedOverlayDetection` is the closed
+    // two-variant union that separates "no expected overlays" from "could not
+    // classify"; `expectedOverlaysFiltered` is a COUNT (`number` in the SDK),
+    // not a list — `[]` here would be a new type divergence.
+    let detection = report["expectedOverlayDetection"]
+        .as_str()
+        .expect("`expectedOverlayDetection` must be present and a string");
+    assert!(
+        ["modal-stack", "unavailable"].contains(&detection),
+        "`expectedOverlayDetection` is the SDK union 'modal-stack' | \
+         'unavailable'; got {detection:?}"
+    );
+    assert_eq!(
+        detection, "unavailable",
+        "no modal stack was supplied to this build, so classification did not run"
+    );
+    assert!(
+        report["expectedOverlaysFiltered"].is_u64(),
+        "`expectedOverlaysFiltered` is an unsigned integer count, got {:?}",
+        report["expectedOverlaysFiltered"]
+    );
+    assert_eq!(report["expectedOverlaysFiltered"], 0);
 
     for absent in [
         "element_count",
@@ -368,7 +382,7 @@ fn visibility_verdict_union_is_exactly_the_sdk_three() {
     // Empty registry: UNKNOWN, never "clear". This is the absence-is-not-zero
     // distinction, and collapsing it into `clear` is the exact misreading the
     // variant exists to prevent.
-    let empty = build_visibility_report(&[], 0.02, false);
+    let empty = build_visibility_report(&[], 0.02, false, None);
     assert_eq!(
         empty["verdict"], "unknown_empty_registry",
         "an empty element list is UNKNOWN — nothing was swept, so nothing can \
@@ -381,6 +395,7 @@ fn visibility_verdict_union_is_exactly_the_sdk_three() {
         &[serde_json::json!({ "id": "btn-save", "state": {} })],
         0.02,
         false,
+        None,
     );
     assert_eq!(
         clear["verdict"], "clear",
@@ -397,6 +412,7 @@ fn visibility_verdict_union_is_exactly_the_sdk_three() {
         &[occluded_element("btn-save", "modal-1", 40.0, "Save")],
         0.02,
         false,
+        None,
     );
     assert_eq!(found["verdict"], "occlusions_found");
 }
@@ -410,7 +426,7 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
     // ratio == minRatio: KEPT.
-    let at = build_visibility_report(&elements, 0.4, false);
+    let at = build_visibility_report(&elements, 0.4, false, None);
     assert_eq!(
         at["occlusions"].as_array().map(Vec::len),
         Some(1),
@@ -422,7 +438,7 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
     // element is now just BELOW threshold: DROPPED. (The second parameter is
     // minRatio, not ratio — the element's ratio is pinned at 40.0/100.0 by the
     // fixture and never moves.)
-    let below_threshold = build_visibility_report(&elements, 0.400_001, false);
+    let below_threshold = build_visibility_report(&elements, 0.400_001, false, None);
     assert_eq!(
         below_threshold["occlusions"].as_array().map(Vec::len),
         Some(0),
@@ -435,39 +451,101 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
     );
 }
 
-/// KNOWN CROSS-IMPLEMENTATION DIVERGENCE, pinned so it is a recorded fact.
+/// CROSS-IMPLEMENTATION AGREEMENT on `includeExpected`, pinned so it stays a
+/// recorded fact.
 ///
-/// The Rust twin hardcodes `isExpectedOverlay: false` and ECHOES
-/// `includeExpected` without ever acting on it. The SDK fixed exactly this in
-/// `fc6838e` (`packages/ui-bridge/src/server/visibility-report.ts`): it
-/// classifies each occluder against the snapshot's modal stack and, when
-/// `includeExpected` is false, DROPS the expected ones and counts them in
-/// `expectedOverlaysFiltered`.
-///
-/// So on identical input the two implementations can return different lists.
-/// That is not a bug this phase fixes; it is a divergence this phase makes
-/// visible. **If this test goes red because the Rust side now filters, the fix
-/// landed — update the pin, and drop the SDK-only-keys assertion above with it.**
+/// History: this test used to be `include_expected_is_parsed_and_echoed_but_never_applied`,
+/// which pinned a DIVERGENCE — the Rust twin hardcoded `isExpectedOverlay:
+/// false` and echoed `includeExpected` without acting on it, while the SDK's
+/// `fc6838e` (`packages/ui-bridge/src/server/visibility-report.ts`) classified
+/// each occluder against the modal stack and dropped the expected ones. Plan
+/// `2026-09-10-the-runners-rust-visibility-twin-diverges-from-the-sdk-it-mirrors`
+/// ported that classifier; this test now pins the AGREEMENT, rule for rule, so
+/// a drift on either side has one place to go red. It is the only record that
+/// the two implementations are meant to answer identically — do not delete it
+/// to make a divergence go green.
 #[test]
-fn include_expected_is_parsed_and_echoed_but_never_applied() {
+fn include_expected_filters_tracked_modal_overlays_as_the_sdk_does() {
+    use std::collections::HashSet;
+    let modal_ids: HashSet<String> = ["modal-1".to_string()].into_iter().collect();
     let elements = [occluded_element("btn-save", "modal-1", 40.0, "Save")];
 
-    let excluded = build_visibility_report(&elements, 0.02, false);
-    let included = build_visibility_report(&elements, 0.02, true);
-
+    // Default (`includeExpected: false`): the modal overlay is DROPPED and COUNTED.
+    let excluded = build_visibility_report(&elements, 0.02, false, Some(&modal_ids));
     assert_eq!(
-        excluded["occlusions"], included["occlusions"],
-        "includeExpected changes NOTHING in the Rust twin — the two lists are \
-         identical. The SDK's fc6838e filters here; that divergence is the \
-         point of this pin"
+        excluded["occlusions"].as_array().map(Vec::len),
+        Some(0),
+        "an occlusion by a tracked modal is the UI working, not a regression — \
+         dropped from the default response, as fc6838e does"
+    );
+    assert_eq!(excluded["expectedOverlaysFiltered"], 1, "…and counted");
+    assert_eq!(excluded["expectedOverlayDetection"], "modal-stack");
+    assert_eq!(
+        excluded["verdict"], "clear",
+        "a list emptied by the expected-overlay filter is `clear` — the SDK \
+         computes the verdict from the filtered list too"
     );
     assert_eq!(excluded["includeExpected"], false, "echoed verbatim");
-    assert_eq!(included["includeExpected"], true, "echoed verbatim");
+
+    // `includeExpected: true`: KEPT, flagged, not counted.
+    let included = build_visibility_report(&elements, 0.02, true, Some(&modal_ids));
+    assert_eq!(included["occlusions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(included["occlusions"][0]["isExpectedOverlay"], true);
     assert_eq!(
-        included["occlusions"][0]["isExpectedOverlay"], false,
-        "always false on this side: classifying a tracked modal needs an \
-         overlay registry the Rust twin has no access to, so it reports \
-         honestly rather than guessing"
+        included["expectedOverlaysFiltered"], 0,
+        "always 0 when includeExpected is true (SDK `types.ts`)"
+    );
+    assert_eq!(included["expectedOverlayDetection"], "modal-stack");
+    assert_eq!(included["includeExpected"], true, "echoed verbatim");
+
+    // The unregistered-occluder DOM-id form `<tag>#<modal.id>` matches too.
+    let dom_id = build_visibility_report(
+        &[occluded_element("btn-save", "div#modal-1", 40.0, "Save")],
+        0.02,
+        false,
+        Some(&modal_ids),
+    );
+    assert_eq!(dom_id["occlusions"].as_array().map(Vec::len), Some(0));
+    assert_eq!(dom_id["expectedOverlaysFiltered"], 1);
+
+    // Class and bare-tag descriptors are NOT identities and are NOT matched:
+    // a loose rule would hide the regressions this route exists to surface.
+    for loose in ["div.modal-1", "div"] {
+        let report = build_visibility_report(
+            &[occluded_element("btn-save", loose, 40.0, "Save")],
+            0.02,
+            false,
+            Some(&modal_ids),
+        );
+        assert_eq!(
+            report["occlusions"].as_array().map(Vec::len),
+            Some(1),
+            "`{loose}` must not be classified as the modal"
+        );
+        assert_eq!(report["occlusions"][0]["isExpectedOverlay"], false);
+        assert_eq!(report["expectedOverlaysFiltered"], 0);
+    }
+
+    // No modal stack (`None`): nothing can be classified, so nothing is
+    // filtered, and the report SAYS so rather than looking clean.
+    let unavailable = build_visibility_report(&elements, 0.02, false, None);
+    assert_eq!(unavailable["expectedOverlayDetection"], "unavailable");
+    assert_eq!(unavailable["expectedOverlaysFiltered"], 0);
+    assert_eq!(unavailable["occlusions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(unavailable["occlusions"][0]["isExpectedOverlay"], false);
+
+    // minRatio runs FIRST: a below-threshold modal overlap is neither reported
+    // nor counted (SDK: the `ratio < minRatio` continue precedes classification).
+    let hairline = build_visibility_report(
+        &[occluded_element("btn-save", "modal-1", 1.0, "Save")],
+        0.02,
+        false,
+        Some(&modal_ids),
+    );
+    assert_eq!(hairline["occlusions"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        hairline["expectedOverlaysFiltered"], 0,
+        "a sub-threshold modal overlap is filtered by minRatio, not counted as expected"
     );
 }
 
@@ -544,6 +622,40 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
     let discover_at = body
         .find("\"discover\"")
         .expect("the handler must issue a discover request");
+    let modal_at = body
+        .find("\"get_modal_context\"")
+        .expect("the handler must ask the webview for its modal stack");
+    assert!(
+        validate_at < modal_at,
+        "minRatio is validated BEFORE the modal-context IPC too"
+    );
+    // A modal-context failure degrades classification to `unavailable`; it
+    // must never fail the sweep. Pinned by shape: the result is matched (not
+    // `?`-propagated), and its `Err` arm yields `None`, not an early return.
+    // The `.await?` spelling below cannot occur inside `tokio::join!` (the calls
+    // carry no `.await` there); it guards a refactor back to sequential calls.
+    // The load-bearing check is the match-arm scrape that follows.
+    assert!(
+        !body.contains("\"get_modal_context\", serde_json::json!({})).await?")
+            && !body.contains("\"get_modal_context\", serde_json::json!({}))?"),
+        "the modal-context IPC result must not be `?`-propagated"
+    );
+    let modal_match_at = body
+        .find("let modal_ids = match modal_result")
+        .expect("the modal-context result must be matched explicitly");
+    let modal_arm = body
+        .get(modal_match_at..)
+        .and_then(|rest| {
+            rest.find("let discover_data")
+                .and_then(|end| rest.get(..end))
+        })
+        .expect("the modal match precedes the discover match");
+    assert!(
+        !modal_arm.contains("return") && modal_arm.contains("None"),
+        "a get_modal_context failure must yield `None` (detection unavailable), \
+         never an early return — a misbehaving tracker degrades the field, never \
+         the caller (SDK registry.ts). Arm was:\n{modal_arm}"
+    );
     assert_eq!(
         body.matches("StatusCode::UNPROCESSABLE_ENTITY").count(),
         1,

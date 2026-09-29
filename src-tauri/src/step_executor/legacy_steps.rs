@@ -144,55 +144,6 @@ impl StepExecutor {
         }
     }
 
-    /// Execute a verification test by ID and return simplified (success, error) tuple
-    ///
-    /// This is the legacy interface used by execute_single_step.
-    pub(crate) async fn execute_verification_test(
-        &self,
-        test_id: &str,
-        is_critical: bool,
-    ) -> Result<(bool, Option<String>), String> {
-        use crate::test_executor::TestStatus;
-
-        let result = self.execute_verification_test_with_details(test_id).await?;
-
-        // Log the result
-        if result.status == TestStatus::Passed {
-            info!(
-                "Test '{}' passed in {}ms ({}/{} assertions)",
-                result.test_name,
-                result.duration_ms,
-                result.assertions_passed,
-                result.assertions_passed + result.assertions_failed
-            );
-            Ok((true, None))
-        } else {
-            let error_msg = format!(
-                "Test '{}' {}: {} ({}/{} assertions passed)",
-                result.test_name,
-                match result.status {
-                    TestStatus::Failed => "failed",
-                    TestStatus::Error => "errored",
-                    TestStatus::Timeout => "timed out",
-                    _ => "did not pass",
-                },
-                result.error.as_deref().unwrap_or("Unknown error"),
-                result.assertions_passed,
-                result.assertions_passed + result.assertions_failed
-            );
-
-            warn!("{}", error_msg);
-
-            // If critical, report as step failure; otherwise, log but succeed
-            if is_critical {
-                Ok((false, Some(error_msg)))
-            } else {
-                info!("Non-critical test failure - step continues");
-                Ok((true, Some(format!("(Non-critical) {}", error_msg))))
-            }
-        }
-    }
-
     /// Execute a verification test by ID and return the full TestExecutionResult
     ///
     /// This provides rich details for verification phase context building.

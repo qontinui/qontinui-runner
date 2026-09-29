@@ -20,7 +20,7 @@
 //! `tokio::task::spawn_blocking` since COM calls are blocking.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -113,6 +113,115 @@ pub struct UiaAdapter {
     state: Option<Arc<UiaState>>,
     connected: Arc<AtomicBool>,
     backend: Box<dyn UiaBackend>,
+    /// The focus-changed handler registered by `subscribe_events`, with the
+    /// exact `IUIAutomation` it was registered on (every connect builds a
+    /// fresh one, so the handler must be removed from the instance that owns
+    /// it). At most one exists: it is removed before every re-subscribe, on
+    /// `disconnect`/`connect`, and on drop. A `std` mutex because
+    /// `subscribe_events` takes `&self`; it is never held across an `.await`.
+    focus_subscription: Mutex<Option<FocusSubscription>>,
+}
+
+/// A live `AddFocusChangedEventHandler` registration, removed exactly once:
+/// by [`FocusSubscription::remove`], or else when it is dropped.
+///
+/// The drop arm is what makes a cancelled `subscribe_events` safe: the
+/// registration is made inside a blocking task, and if the future awaiting it
+/// is dropped the task still completes and drops its `FocusSubscription`, which
+/// then unregisters the handler instead of leaking it in UIA.
+struct FocusSubscription {
+    /// `None` once removed, which disarms the drop.
+    registration: Option<FocusRegistration>,
+}
+
+/// The handler plus the exact `IUIAutomation` it was registered on.
+struct FocusRegistration {
+    automation: IUIAutomation,
+    handler: IUIAutomationFocusChangedEventHandler,
+}
+
+// SAFETY: `automation` is an interface pointer created in the MTA (`uia3`
+// initializes COM with COINIT_MULTITHREADED), so it may be used from any
+// thread that is itself in the MTA — and the only use after the move,
+// `FocusRegistration::remove`, joins the MTA before calling it. `handler` is
+// our own `FocusChangedHandler`, whose only state is an `mpsc::Sender`
+// (`Send`). The same argument as `UiaState`'s `unsafe impl Send`.
+unsafe impl Send for FocusRegistration {}
+
+impl FocusSubscription {
+    fn new(automation: IUIAutomation, handler: IUIAutomationFocusChangedEventHandler) -> Self {
+        Self {
+            registration: Some(FocusRegistration {
+                automation,
+                handler,
+            }),
+        }
+    }
+
+    /// Unregister the handler now, on this thread. Blocking COM call — run it
+    /// off the async runtime. Once removed, UIA drops its reference to the
+    /// handler, which drops the channel sender and ends the receiver's stream.
+    fn remove(mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.remove();
+        }
+    }
+}
+
+impl Drop for FocusSubscription {
+    /// Remove a registration that was never explicitly removed, on a plain OS
+    /// thread: `drop` may run on an async worker (or inside a blocking task
+    /// whose awaiting future was cancelled), where it must neither block on
+    /// COM nor wait for anything.
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            std::thread::spawn(move || registration.remove());
+        }
+    }
+}
+
+impl FocusRegistration {
+    fn remove(self) {
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+        // The calling thread may never have touched COM (a fresh thread from
+        // `Drop`, or a pooled blocking thread). Join the MTA first. S_OK and
+        // S_FALSE ("already initialized in the MTA") each take a reference
+        // that must be paired with CoUninitialize. RPC_E_CHANGED_MODE means
+        // the thread is already in an STA (not expected: only our own threads
+        // and tokio's blocking pool run this). COM is initialized there and
+        // the removal is still attempted — its HRESULT is logged if it fails —
+        // but that call took no reference, so none is released.
+        //
+        // SAFETY: plain COM initialization of the current thread.
+        let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let paired = init.is_ok(); // S_OK or S_FALSE
+        if !paired && init != RPC_E_CHANGED_MODE {
+            warn!(
+                "CoInitializeEx before removing the UIA focus handler failed: {:?}",
+                init
+            );
+        }
+
+        // SAFETY: `handler` was registered on this `automation` instance, and
+        // COM is initialized on this thread (see above) — or, when
+        // initialization failed outright, the call reports that as an error
+        // instead of touching uninitialized COM state.
+        if let Err(e) = unsafe {
+            self.automation
+                .RemoveFocusChangedEventHandler(&self.handler)
+        } {
+            warn!("Failed to remove UIA focus event handler: {}", e);
+        }
+        // Release the COM pointers before the apartment reference.
+        drop(self);
+
+        if paired {
+            // SAFETY: pairs the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    }
 }
 
 impl Default for UiaAdapter {
@@ -137,6 +246,25 @@ impl UiaAdapter {
             state: None,
             connected: Arc::new(AtomicBool::new(false)),
             backend: select_backend(choice),
+            focus_subscription: Mutex::new(None),
+        }
+    }
+
+    /// Take the current focus subscription out of its slot, if any.
+    fn take_focus_subscription(&self) -> Option<FocusSubscription> {
+        self.focus_subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Remove the registered focus handler (if any) and wait for UIA to
+    /// confirm, so no second registration can coexist with it.
+    async fn release_focus_subscription(&self) {
+        if let Some(sub) = self.take_focus_subscription() {
+            if let Err(e) = spawn_blocking_tracked(move || sub.remove()).await {
+                warn!("UIA focus handler removal task failed: {}", e);
+            }
         }
     }
 
@@ -174,6 +302,8 @@ impl PlatformAdapter for UiaAdapter {
         if self.connected.load(Ordering::Relaxed) {
             self.disconnect().await?;
         }
+        // A subscription can outlive a failed connect; never carry one over.
+        self.release_focus_subscription().await;
 
         let state = self.init_uia().await?;
 
@@ -193,6 +323,7 @@ impl PlatformAdapter for UiaAdapter {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.release_focus_subscription().await;
         if let Some(state) = self.state.take() {
             state.handles.clear();
         }
@@ -219,21 +350,38 @@ impl PlatformAdapter for UiaAdapter {
         spawn_blocking_tracked(move || state.capture_tree(max_depth, include_hidden)).await?
     }
 
+    /// Idempotent per connection: any handler a previous call registered is
+    /// removed first, and the registration is awaited — a failure is returned
+    /// as `Err`, never a receiver for a stream that will stay silent.
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
         let state = match self.state.as_ref() {
             Some(s) => s.clone(),
             None => return Ok(None),
         };
 
+        self.release_focus_subscription().await;
+
         let (tx, rx) = mpsc::channel::<A11yEvent>(256);
 
-        spawn_blocking_tracked(move || unsafe {
-            let handler = FocusChangedHandler { tx };
-            let handler: IUIAutomationFocusChangedEventHandler = handler.into();
-            if let Err(e) = state.automation.AddFocusChangedEventHandler(None, &handler) {
-                warn!("Failed to register UIA focus event handler: {}", e);
-            }
-        });
+        let subscription = spawn_blocking_tracked(move || -> anyhow::Result<FocusSubscription> {
+            let handler: IUIAutomationFocusChangedEventHandler = FocusChangedHandler { tx }.into();
+            // SAFETY: COM call on an MTA-initialized `IUIAutomation`.
+            unsafe { state.automation.AddFocusChangedEventHandler(None, &handler) }
+                .map_err(|e| anyhow!("Failed to register UIA focus event handler: {}", e))?;
+            Ok(FocusSubscription::new(state.automation.clone(), handler))
+        })
+        .await??;
+
+        // Should a concurrent subscribe have filled the slot meanwhile, keep
+        // the newest registration and remove the one it displaced.
+        let displaced = self
+            .focus_subscription
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(subscription);
+        if let Some(old) = displaced {
+            let _ = spawn_blocking_tracked(move || old.remove()).await;
+        }
 
         Ok(Some(rx))
     }
@@ -273,5 +421,15 @@ impl PlatformAdapter for UiaAdapter {
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+impl Drop for UiaAdapter {
+    /// Backstop for an adapter dropped without `disconnect` (e.g. when the
+    /// manager swaps in the JAB adapter): dropping the subscription removes
+    /// the handler on a plain OS thread (see `FocusSubscription`'s `Drop`),
+    /// since `drop` cannot await and must not block the runtime.
+    fn drop(&mut self) {
+        drop(self.take_focus_subscription());
     }
 }

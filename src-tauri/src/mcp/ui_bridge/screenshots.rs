@@ -23,6 +23,7 @@
 //!     `vision_routes.rs` can resolve element-id → pixel-space rect through
 //!     the same `discover` IPC.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -31,9 +32,7 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
-#[cfg(windows)]
-use tracing::debug;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::screen;
@@ -1122,9 +1121,14 @@ pub struct VisibilityRequest {
     /// sibling route already shipped.
     #[serde(default, alias = "min_ratio")]
     pub min_ratio: Option<f64>,
-    /// Echoed through; a tracked modal/dropdown overlay is not yet
-    /// distinguishable from an accidental one on either side (see
-    /// `isExpectedOverlay` below).
+    /// Keep occlusions whose occluder is a TRACKED MODAL (default `false`:
+    /// drop them and count them in `expectedOverlaysFiltered`). Classification
+    /// reads the webview's modal stack through the `get_modal_context` IPC —
+    /// the same `registry.getModalContext()` the SDK's handler uses since
+    /// ui-bridge `fc6838e` — and the rule is the SDK's, ported in
+    /// [`is_tracked_overlay`]. When no modal stack answered, nothing can be
+    /// classified: nothing is filtered, and the report says
+    /// `expectedOverlayDetection: "unavailable"` rather than looking clean.
     ///
     /// Aliased for the same reason as `min_ratio` above — it had the identical
     /// silent-drop defect, and fixing one spelling while leaving its neighbour
@@ -1190,15 +1194,17 @@ fn occlusion_entry(
     text: &str,
     occluded_by: &str,
     ratio: f64,
+    is_expected_overlay: bool,
 ) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "element": element_id,
         "occludedBy": occluded_by,
         "ratio": ratio,
-        // The SDK sets this `false` too: telling a tracked modal/dropdown
-        // apart from an accidental overlay needs an overlay registry neither
-        // side has. Reported honestly rather than guessed.
-        "isExpectedOverlay": false,
+        // `true` only when a modal stack answered AND the occluder is one of
+        // its modals by identity (see `is_tracked_overlay`). With no modal
+        // stack it is `false`, and the report-level `expectedOverlayDetection`
+        // says `unavailable` so the `false` is not read as a classification.
+        "isExpectedOverlay": is_expected_overlay,
         "hidesText": !text.is_empty(),
         // Always `hit-test`: the numbers come from the registry's
         // `elementFromPoint` sampling. The geometric arm lives in
@@ -1215,16 +1221,82 @@ fn occlusion_entry(
     entry
 }
 
+/// Extract the modal identity set from a `get_modal_context` IPC answer.
+///
+/// The value is the SDK's `SnapshotModalContext` (`{ modals: [{ id, … }], … }`)
+/// or `null`. Returns `None` — detection UNAVAILABLE — for `null`, a non-object,
+/// or an object with no `modals` array: that is "no modal detector answered",
+/// which must never collapse into "no modals are open". A `modals` array that is
+/// present but empty is `Some(empty)`: detection ran and found nothing.
+///
+/// Entries whose `id` is absent, non-string or empty are skipped, mirroring the
+/// SDK's `if (modal?.id) ids.add(modal.id)` (`visibility-report.ts`
+/// `modalIdentities`).
+///
+/// **One deliberate divergence from the SDK — do not "fix" it toward parity.**
+/// The SDK's `modalIdentities` reads `modalContext.modals ?? []`, so ANY defined
+/// context (even `{}`) classifies as `modal-stack`. Here an object with no
+/// `modals` array is `None`. The reason is the transport: `extract_response_data`
+/// (`request.rs`) turns a frontend `{success: false}` answer — "UI Bridge is not
+/// available", "Unknown request type" from a frontend predating this IPC — into
+/// an `Ok` object with no `modals` key, and reading that as `modal-stack` would
+/// label a failed IPC as a successful classification.
+pub(crate) fn modal_ids_from_context(context: &serde_json::Value) -> Option<HashSet<String>> {
+    let modals = context.as_object()?.get("modals")?.as_array()?;
+    Some(
+        modals
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Is `occluded_by` one of the tracked modals, BY IDENTITY?
+///
+/// A port of the SDK's `isTrackedOverlay` (`visibility-report.ts`), rule for
+/// rule. Exactly two forms match:
+///
+/// - `occluded_by == modal.id` — the occluder is registered under the modal's id;
+/// - `"<tag>#<modal.id>"` — an unregistered occluder whose DOM id is the
+///   modal's. The split is at the FIRST `#` (the SDK's `indexOf('#')` +
+///   `slice(hash + 1)`), so everything after it is compared whole.
+///
+/// Class (`div.modal-1`) and bare-tag (`div`) descriptors are deliberately NOT
+/// matched: they are not identities. An entry marked expected is DROPPED from
+/// the default response, so a loose rule would hide exactly the occlusion
+/// regressions this route exists to surface (`fc6838e`'s own rationale).
+fn is_tracked_overlay(occluded_by: &str, modal_ids: &HashSet<String>) -> bool {
+    if modal_ids.contains(occluded_by) {
+        return true;
+    }
+    match occluded_by.split_once('#') {
+        Some((_, after_hash)) => modal_ids.contains(after_hash),
+        None => false,
+    }
+}
+
 /// Build the `VisibilityReport` from a `discover` element array.
 ///
 /// Split out from the handler so the whole contract is unit-testable without a
-/// webview: the handler is a thin shell over one IPC call plus this.
+/// webview: the handler is a thin shell over two IPC calls plus this.
+///
+/// `modal_ids` is the webview's modal identity set (see
+/// [`modal_ids_from_context`]); `None` means detection is UNAVAILABLE. The SDK's
+/// `buildVisibilityReport` order is kept exactly: the `minRatio` filter runs
+/// FIRST, so a below-threshold modal overlap is neither reported nor counted;
+/// then an occluder that is a tracked modal is dropped and counted in
+/// `expectedOverlaysFiltered` unless `include_expected`, in which case it is
+/// kept with `isExpectedOverlay: true`.
 pub(crate) fn build_visibility_report(
     elements: &[serde_json::Value],
     min_ratio: f64,
     include_expected: bool,
+    modal_ids: Option<&HashSet<String>>,
 ) -> serde_json::Value {
     let mut occlusions: Vec<(bool, f64, serde_json::Value)> = Vec::new();
+    let mut expected_overlays_filtered: u64 = 0;
     // Did ANY element carry occlusion data at all? See `occlusionDataObserved`
     // below - this is what separates "nothing is covered" from "this webview's
     // bridge cannot tell us".
@@ -1258,6 +1330,12 @@ pub(crate) fn build_visibility_report(
         if ratio < min_ratio {
             continue;
         }
+        // Classified AFTER the minRatio filter, as the SDK does.
+        let is_expected_overlay = modal_ids.is_some_and(|ids| is_tracked_overlay(occluded_by, ids));
+        if is_expected_overlay && !include_expected {
+            expected_overlays_filtered += 1;
+            continue;
+        }
         let text = state
             .get("textContent")
             .and_then(|v| v.as_str())
@@ -1267,7 +1345,7 @@ pub(crate) fn build_visibility_report(
         occlusions.push((
             !text.is_empty(),
             ratio,
-            occlusion_entry(id, label, text, occluded_by, ratio),
+            occlusion_entry(id, label, text, occluded_by, ratio, is_expected_overlay),
         ));
     }
 
@@ -1293,6 +1371,12 @@ pub(crate) fn build_visibility_report(
         "elementCount": elements.len(),
         "minRatio": min_ratio,
         "includeExpected": include_expected,
+        // The SDK's two classifier outputs. `unavailable` is what separates
+        // "no expected overlays" from "could not classify" — without it a
+        // `0` below would read as a finding. The count is always `0` when
+        // detection is unavailable or `includeExpected` is true.
+        "expectedOverlayDetection": if modal_ids.is_some() { "modal-stack" } else { "unavailable" },
+        "expectedOverlaysFiltered": expected_overlays_filtered,
         "verdict": verdict,
         // -- Runner-only advisory field, deliberately OUTSIDE the verdict --
         //
@@ -1343,7 +1427,13 @@ pub(crate) fn build_visibility_report(
 ///
 /// Shaped like `ui_bridge_page_health_handler`: one `discover` IPC for the FULL
 /// element set (`includeHidden: true` AND `interactiveOnly: false`), then pure
-/// analysis in Rust. Going the other way -
+/// analysis in Rust. Alongside it, concurrently, one `get_modal_context` IPC
+/// for the webview's modal stack, which is what lets `includeExpected` be
+/// APPLIED here as it is in the SDK (`fc6838e`) rather than merely echoed. A
+/// modal IPC that fails or answers `null` degrades only the classification
+/// (`expectedOverlayDetection: "unavailable"`, nothing filtered) — never the
+/// sweep, matching the SDK's "a misbehaving tracker degrades the field, never
+/// the caller". Going the other way -
 /// forwarding a `visibility` request type to the webview - would answer
 /// "unknown request type": the frontend dispatches UI Bridge requests through
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
@@ -1389,7 +1479,39 @@ pub async fn ui_bridge_visibility_handler(
     let discover_payload = serde_json::json!({
         "options": { "includeHidden": true, "interactiveOnly": false }
     });
-    let discover_data = match ui_bridge_request_sync(&state, "discover", discover_payload).await {
+    // Concurrent, as `state-summary` does: the wall time is the slower of the
+    // two, not their sum.
+    let (discover_result, modal_result) = tokio::join!(
+        ui_bridge_request_sync(&state, "discover", discover_payload),
+        ui_bridge_request_sync(&state, "get_modal_context", serde_json::json!({})),
+    );
+    // A modal-context failure is NOT a sweep failure: log it, classify nothing,
+    // and let the report say `unavailable`. Never `?`-propagated.
+    let modal_ids = match modal_result {
+        Ok(ctx) => {
+            let ids = modal_ids_from_context(&ctx);
+            if ids.is_none() && !ctx.is_null() {
+                // A frontend `{success: false}` arrives here as an `Ok` object
+                // with no `modals` (see `modal_ids_from_context`); log it so
+                // this path is as diagnosable as the `Err` one below.
+                debug!(
+                    "UI Bridge API: visibility get_modal_context answered without a \
+                     modal stack ({}); expectedOverlayDetection=unavailable",
+                    ctx
+                );
+            }
+            ids
+        }
+        Err(e) => {
+            warn!(
+                "UI Bridge API: visibility get_modal_context failed ({}); \
+                 expectedOverlayDetection=unavailable",
+                e
+            );
+            None
+        }
+    };
+    let discover_data = match discover_result {
         Ok(d) => d,
         Err(e) => {
             error!("UI Bridge API: visibility discover failed: {}", e);
@@ -1406,6 +1528,7 @@ pub async fn ui_bridge_visibility_handler(
         &elements,
         min_ratio,
         include_expected,
+        modal_ids.as_ref(),
     ))))
 }
 
@@ -1574,7 +1697,7 @@ mod visibility_tests {
                 "textContent": "  Zone 8: qontinui-web  ",
             }),
         )];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         assert_eq!(report["verdict"], json!("occlusions_found"));
         assert_eq!(report["elementCount"], json!(1));
         assert_eq!(report["occlusionDataObserved"], json!(true));
@@ -1606,7 +1729,7 @@ mod visibility_tests {
             ),
             el("btn-2", "Cancel", json!({ "textContent": "Cancel" })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         assert_eq!(report["verdict"], json!("clear"));
         assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(report["elementCount"], json!(2));
@@ -1623,7 +1746,7 @@ mod visibility_tests {
             ),
             el("real", "b", json!({ "occludedBy": "y", "occludedPct": 60 })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         let ids: Vec<&str> = report["occlusions"]
             .as_array()
             .unwrap()
@@ -1633,7 +1756,7 @@ mod visibility_tests {
         assert_eq!(ids, vec!["real"]);
         // Raising the floor above the real one drops it too - proving the
         // parameter is read rather than ignored.
-        let strict = build_visibility_report(&elements, 0.9, false);
+        let strict = build_visibility_report(&elements, 0.9, false, None);
         assert_eq!(strict["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(strict["verdict"], json!("clear"));
         assert_eq!(strict["minRatio"], json!(0.9));
@@ -1659,7 +1782,7 @@ mod visibility_tests {
                 json!({ "occludedBy": "x", "occludedPct": 70, "textContent": "yo" }),
             ),
         ];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         let ids: Vec<&str> = report["occlusions"]
             .as_array()
             .unwrap()
@@ -1672,7 +1795,7 @@ mod visibility_tests {
     /// An empty registry is UNKNOWN, never "nothing is covered".
     #[test]
     fn an_empty_registry_is_unknown_not_clear() {
-        let report = build_visibility_report(&[], 0.02, false);
+        let report = build_visibility_report(&[], 0.02, false, None);
         assert_eq!(report["verdict"], json!("unknown_empty_registry"));
         assert_eq!(report["elementCount"], json!(0));
         assert_eq!(report["occlusionDataObserved"], json!(false));
@@ -1694,7 +1817,7 @@ mod visibility_tests {
             "Save",
             json!({ "visible": true, "textContent": "Save" }),
         )];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         assert_eq!(report["verdict"], json!("clear"));
         assert_eq!(report["occlusionDataObserved"], json!(false));
     }
@@ -1702,7 +1825,7 @@ mod visibility_tests {
     /// Params are echoed back so a caller can audit what the sweep actually ran with.
     #[test]
     fn the_report_echoes_the_parameters_it_ran_with() {
-        let report = build_visibility_report(&[el("a", "a", json!({}))], 0.25, true);
+        let report = build_visibility_report(&[el("a", "a", json!({}))], 0.25, true, None);
         assert_eq!(report["minRatio"], json!(0.25));
         assert_eq!(report["includeExpected"], json!(true));
     }
@@ -1716,10 +1839,90 @@ mod visibility_tests {
             el("empty-occluder", "x", json!({ "occludedBy": "" })),
             el("no-pct", "x", json!({ "occludedBy": "y" })),
         ];
-        let report = build_visibility_report(&elements, 0.02, false);
+        let report = build_visibility_report(&elements, 0.02, false, None);
         // `no-pct` has an occluder but a 0 ratio, which is below the floor.
         assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
         assert_eq!(report["elementCount"], json!(4));
+    }
+
+    /// `get_modal_context` answers → modal identity set. Absence of a modal
+    /// stack is `None` (detection UNAVAILABLE), never an empty set: the two
+    /// are the "could not classify" / "classified, none open" distinction the
+    /// report's `expectedOverlayDetection` exists to carry.
+    #[test]
+    fn modal_ids_from_context_distinguishes_unavailable_from_empty() {
+        use super::modal_ids_from_context;
+
+        assert_eq!(
+            modal_ids_from_context(&json!(null)),
+            None,
+            "null = no detector"
+        );
+        assert_eq!(
+            modal_ids_from_context(&json!({})),
+            None,
+            "an object with no `modals` array is malformed, not 'no modals'"
+        );
+        assert_eq!(
+            modal_ids_from_context(&json!({ "modals": "modal-1" })),
+            None,
+            "`modals` must be an array"
+        );
+        assert_eq!(modal_ids_from_context(&json!([{ "id": "modal-1" }])), None);
+
+        let empty = modal_ids_from_context(&json!({ "modals": [], "topModal": null }))
+            .expect("an empty stack is a real answer");
+        assert!(empty.is_empty());
+
+        let ids = modal_ids_from_context(&json!({
+            "modals": [
+                { "id": "modal-1", "type": "dialog" },
+                { "id": 7 },
+                { "id": "" },
+                { "type": "no-id" },
+                null,
+                { "id": "dropdown-2" },
+            ]
+        }))
+        .expect("modals array present");
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["dropdown-2".to_string(), "modal-1".to_string()],
+            "non-string, empty and absent ids are skipped (SDK: `if (modal?.id)`)"
+        );
+    }
+
+    /// The identity rule, ported from the SDK's `isTrackedOverlay`: the bare
+    /// id and the `<tag>#<id>` DOM-id form match; class and bare-tag
+    /// descriptors never do; the split is at the FIRST `#`.
+    #[test]
+    fn is_tracked_overlay_matches_identities_only() {
+        use super::is_tracked_overlay;
+        let ids: std::collections::HashSet<String> = ["modal-1".to_string()].into_iter().collect();
+
+        assert!(is_tracked_overlay("modal-1", &ids));
+        assert!(is_tracked_overlay("div#modal-1", &ids));
+        assert!(is_tracked_overlay("#modal-1", &ids));
+        assert!(
+            !is_tracked_overlay("div.modal-1", &ids),
+            "a class is not an identity"
+        );
+        assert!(
+            !is_tracked_overlay("div", &ids),
+            "a bare tag is not an identity"
+        );
+        assert!(!is_tracked_overlay("modal-10", &ids));
+        assert!(
+            !is_tracked_overlay("div#x#modal-1", &ids),
+            "split at the FIRST `#`, as `indexOf('#')` does: the remainder is \
+             `x#modal-1`, which is not a modal id"
+        );
+        assert!(!is_tracked_overlay(
+            "modal-1",
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// The route must be BOTH mounted and declared - `route_entries()` is what
@@ -1783,7 +1986,7 @@ mod visibility_min_ratio_contract_tests {
             "label": "covered",
             "state": { "occludedBy": "overlay", "occludedPct": 100 },
         })];
-        let report = build_visibility_report(&elements, 1.0, false);
+        let report = build_visibility_report(&elements, 1.0, false, None);
         assert_eq!(
             report["occlusions"].as_array().unwrap().len(),
             1,

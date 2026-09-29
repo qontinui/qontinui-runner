@@ -38,7 +38,7 @@ function getStateMachine(): StateMachineAPI | undefined {
 }
 
 /**
- * Handles: discover, find, get_snapshot, get_component_state,
+ * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
  *          activate_state_group, deactivate_state_group, get_transitions,
@@ -183,6 +183,39 @@ export function useDiscoveryEvents(
             timestamp: Date.now(),
           });
           logger.debug(`get_snapshot: response sent (${snapshot.elements.length} elements)`);
+          return true;
+        }
+
+        case "get_modal_context": {
+          // The modal stack ALONE, for the Rust `/control/visibility` twin
+          // (`screenshots.rs::ui_bridge_visibility_handler`), which classifies
+          // occluders against `modals[].id` to honour `includeExpected`. This is
+          // the same accessor the SDK's own visibility handler reads
+          // (`registry.getModalContext()`), and it exists so the sweep need not
+          // rebuild a full `get_snapshot` a second time.
+          //
+          // `null` means "no modal detector answered" — NEVER "no modals": the
+          // Rust side reports `expectedOverlayDetection: "unavailable"` for it.
+          // A throwing tracker degrades to the same `null` rather than failing
+          // the request, per the SDK's rule that a misbehaving tracker degrades
+          // the field, never the caller (ui-bridge `core/registry.ts`).
+          let modalContext: unknown;
+          try {
+            const registry = (
+              currentBridge as { registry?: { getModalContext?: () => unknown } }
+            ).registry;
+            modalContext = registry?.getModalContext?.() ?? null;
+          } catch (err) {
+            logger.warn("get_modal_context: modal tracker threw; reporting null", err);
+            modalContext = null;
+          }
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: modalContext,
+            timestamp: Date.now(),
+          });
           return true;
         }
 

@@ -101,6 +101,18 @@ pub trait PlatformAdapter: Send + Sync {
     ///
     /// Returns a channel receiver for events, or `None` if the platform does
     /// not support event streaming.
+    ///
+    /// # Contract
+    ///
+    /// * **Idempotent per connection.** `AccessibilityManager` calls this on
+    ///   every `connect`, so a second call must release whatever the first one
+    ///   registered (native handler, listener task, bus match rules) before
+    ///   registering anew — at most one live registration per adapter.
+    /// * **`disconnect` releases it**, as does a subsequent `connect`; the
+    ///   receiver previously handed out then ends.
+    /// * **Registration is awaited.** If the native registration fails, return
+    ///   `Err` rather than a receiver that will never yield, so callers never
+    ///   believe a dead stream is live.
     async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>>;
 
     /// Perform a native interaction on an element.

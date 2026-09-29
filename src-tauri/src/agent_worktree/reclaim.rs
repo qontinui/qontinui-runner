@@ -81,6 +81,8 @@
 //! unexpected IO error is treated AS building (skip, retry next tick).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::process_helpers::{run_probe, ProbeOutcome};
@@ -413,9 +415,14 @@ pub fn plan_reclaim(
         ReclaimAction::Remove => {
             let mut steps: Vec<ReclaimStep> = Vec::new();
             // INV-W4: unlink EVERY junction first, in the order coord
-            // listed them, BEFORE the recursive worktree removal.
+            // listed them, BEFORE the recursive worktree removal. Each sink
+            // kind expands to every path it may live at (see
+            // [`remove_unlink_paths`]), so the unlink cannot miss the junction
+            // the census measured.
             for rel in &instr.junctioned_paths {
-                steps.push(ReclaimStep::UnlinkJunction(worktree.join(rel)));
+                for p in remove_unlink_paths(&worktree, rel) {
+                    steps.push(ReclaimStep::UnlinkJunction(p));
+                }
             }
             // Only now the worktree removal.
             steps.push(ReclaimStep::RemoveWorktree(worktree));
@@ -434,12 +441,27 @@ pub fn plan_reclaim(
                     instr.worktree_path
                 ))];
             }
+            // `rel` is a sink KIND, resolved per checkout — both ends (see
+            // [`sink_path`]). The two resolutions must land at the same
+            // relative location; a worktree and canonical that disagree on
+            // layout are skipped rather than cross-joined.
             instr
                 .junctioned_paths
                 .iter()
-                .map(|rel| ReclaimStep::CreateJunction {
-                    link: worktree.join(rel),
-                    target: canonical.join(rel),
+                .map(|rel| {
+                    let link = sink_path(&worktree, rel);
+                    let target = sink_path(canonical, rel);
+                    let link_suffix = link.strip_prefix(&worktree).unwrap_or(&link);
+                    let target_suffix = target.strip_prefix(canonical).unwrap_or(&target);
+                    if link_suffix != target_suffix {
+                        return ReclaimStep::Skip(format!(
+                            "rejunction {} — layout mismatch: link {} vs canonical {}",
+                            instr.worktree_path,
+                            link_suffix.display(),
+                            target_suffix.display()
+                        ));
+                    }
+                    ReclaimStep::CreateJunction { link, target }
                 })
                 .collect()
         }
@@ -447,6 +469,48 @@ pub fn plan_reclaim(
             "unknown reclaim action {a:?} for {} — ignoring",
             instr.worktree_path
         ))],
+    }
+}
+
+/// Resolve a coord-issued sink name against a checkout root.
+///
+/// Coord's vocabulary is a sink KIND (`"target"`, `"node_modules"`), not a
+/// layout-aware relative path: for the Tauri runner the cargo sink is
+/// `src-tauri/target`, and `<root>/target` does not exist on either end. So
+/// `"target"` resolves through [`super::census::target_dir_for`] — the same
+/// resolver the census MEASURES with, so the instruction acts on the dir
+/// whose bytes coord was shown — and every other kind is a literal join,
+/// exactly as before. Applied to BOTH the worktree (link) and the canonical
+/// checkout (target): a link-only fix would trade the `mklink` failure for
+/// `create_junction`'s "target does not exist" refusal. Plan
+/// `2026-08-26-disk-reclaim-is-disabled-three-independent-ways` §4 L1.
+///
+/// Reads the filesystem (`is_dir` / `exists`) but never mutates it, so
+/// [`plan_reclaim`] stays side-effect free.
+fn sink_path(root: &Path, rel: &str) -> PathBuf {
+    if rel == "target" {
+        super::census::target_dir_for(root)
+    } else {
+        root.join(rel)
+    }
+}
+
+/// Every path a Remove must unlink for sink kind `rel`, BEFORE the removal.
+///
+/// `"target"` yields BOTH `src-tauri/target` and `target`, as the backstop
+/// sweep does, instead of the one [`sink_path`] picks: that choice rests on
+/// `exists()` at execution time, and a dangling junction can flip it away
+/// from the path the census saw. The extra step is free —
+/// [`unlink_junction`] is a no-op on an absent path or a real directory —
+/// and cannot widen what is deleted. Other kinds are a literal join.
+fn remove_unlink_paths(worktree: &Path, rel: &str) -> Vec<PathBuf> {
+    if rel == "target" {
+        vec![
+            worktree.join("src-tauri").join("target"),
+            worktree.join("target"),
+        ]
+    } else {
+        vec![worktree.join(rel)]
     }
 }
 
@@ -666,6 +730,23 @@ fn is_session_uuid_dir(path: &Path) -> bool {
         .is_some_and(|n| Uuid::parse_str(n).is_ok())
 }
 
+/// Render a path as a `cmd.exe` argument: every `/` becomes `\`.
+///
+/// Worktree paths arrive from coord with forward slashes and get sink names
+/// joined on with the platform separator, so `mklink` was handed
+/// `D:/qontinui-root/…/qontinui-runner\target` — and `cmd` parses a
+/// `/`-led token as a switch (`Invalid switch`; pre-state counts in the
+/// plan's §5).
+/// Normalised HERE, at the `cmd` boundary only: `on_demand::norm_path` keys
+/// comparisons on forward slashes, so rewriting paths on ingest would
+/// silently re-key the cleared-set map. Pure and compiled on every platform
+/// so its test runs on Linux too; only the Windows `create_junction` calls
+/// it. Same plan as [`sink_path`], §4 L3.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_path_arg(p: &Path) -> String {
+    p.to_string_lossy().replace('/', "\\")
+}
+
 /// Create (or recreate) a junction at `link` pointing at `target`
 /// (`mklink /J` semantics). Idempotent: if `link` is already a junction
 /// we leave it; if it's a stale dir we remove the link first.
@@ -706,14 +787,16 @@ fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
             ));
         }
     }
-    // `cmd /C mklink /J <link> <target>` — /J = directory junction.
+    // `cmd /C mklink /J <link> <target>` — /J = directory junction. Both
+    // paths go through [`cmd_path_arg`]: a forward slash reaches `cmd` as a
+    // switch (`Invalid switch`).
     let mut cmd = crate::process_helpers::no_window("cmd");
     cmd.args([
         "/C",
         "mklink",
         "/J",
-        &link.to_string_lossy(),
-        &target.to_string_lossy(),
+        &cmd_path_arg(link),
+        &cmd_path_arg(target),
     ]);
     // `output_with_timeout`, not `run_probe`: the failure arm below needs the
     // child's stderr verbatim, and a timeout surfaces here as an io error whose
@@ -1017,6 +1100,131 @@ fn execute_pull(pull: &ReclaimPull) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step-failure reporting — aggregate throttle for the high-volume classes
+// (same plan as [`sink_path`], Phase 2b).
+//
+// Coord re-sends every refused Rejunction each tick, so the per-step `warn!`
+// wrote "refusing to clobber" and `mklink` lines in a volume that buried the
+// rate it was meant to show (2026-08-26 pre-state counts: plan
+// `2026-08-26-disk-reclaim-is-disabled-three-independent-ways` §5). The two known classes are counted
+// every time and surfaced as ONE aggregate WARN per class per window — count
+// since the last emit plus one example. Anything else keeps its per-instance
+// WARN: an unknown failure is exactly what must not be hidden. A log line,
+// not a coord finding, because the clobber refusal is the designed steady
+// state of a real-copy Rejunction (§4 L2) — a finding would page for it.
+// ---------------------------------------------------------------------------
+
+/// Aggregate window per failure class — 10 minutes, two poll ticks.
+const STEP_FAILURE_AGGREGATE_SECS: u64 = 600;
+
+/// Failure class of one step error, keyed on the messages
+/// [`create_junction`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepFailureClass {
+    RefusingToClobber,
+    MklinkFailed,
+    Other,
+}
+
+impl StepFailureClass {
+    fn classify(err: &str) -> Self {
+        if err.contains("refusing to clobber") {
+            Self::RefusingToClobber
+        } else if err.contains("mklink /J") && err.contains("failed") {
+            Self::MklinkFailed
+        } else {
+            Self::Other
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RefusingToClobber => "refusing_to_clobber",
+            Self::MklinkFailed => "mklink_failed",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Count + last-emit stamp + one example for one aggregated class.
+/// Process-global via the statics below; tests drive a local instance.
+struct StepFailureAggregate {
+    last_emit: AtomicU64,
+    count: AtomicU64,
+    example: Mutex<Option<String>>,
+}
+
+impl StepFailureAggregate {
+    const fn new() -> Self {
+        Self {
+            last_emit: AtomicU64::new(super::census::THROTTLE_NEVER),
+            count: AtomicU64::new(0),
+            example: Mutex::new(None),
+        }
+    }
+
+    /// Record one occurrence at `now`. Returns `Some((count, example))` when
+    /// the window lets an aggregate through — `count` is every occurrence
+    /// since the previous emit, this one included — and resets the tally.
+    fn note(&self, now: u64, window_secs: u64, example: &str) -> Option<(u64, String)> {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut slot) = self.example.lock() {
+            if slot.is_none() {
+                *slot = Some(example.to_string());
+            }
+        }
+        let mut out = None;
+        super::census::emit_throttled(&self.last_emit, now, window_secs, || {
+            let n = self.count.swap(0, Ordering::AcqRel);
+            let ex = self
+                .example
+                .lock()
+                .ok()
+                .and_then(|mut s| s.take())
+                .unwrap_or_else(|| example.to_string());
+            out = Some((n, ex));
+            true
+        });
+        out
+    }
+}
+
+static CLOBBER_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
+static MKLINK_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
+
+/// The aggregate a class reports through, or `None` for a class that must
+/// keep its per-instance WARN.
+fn aggregate_for(class: StepFailureClass) -> Option<&'static StepFailureAggregate> {
+    match class {
+        StepFailureClass::RefusingToClobber => Some(&CLOBBER_FAILURES),
+        StepFailureClass::MklinkFailed => Some(&MKLINK_FAILURES),
+        StepFailureClass::Other => None,
+    }
+}
+
+/// Log one failed step: per-instance for [`StepFailureClass::Other`],
+/// aggregated per window for the two high-volume classes.
+fn report_step_failure(step: &ReclaimStep, err: &str) {
+    let class = StepFailureClass::classify(err);
+    let Some(agg) = aggregate_for(class) else {
+        warn!("worktree_reclaim: step {step:?} failed: {err}");
+        return;
+    };
+    let example = format!("step {step:?} failed: {err}");
+    if let Some((count, example)) = agg.note(
+        super::census::now_epoch_secs(),
+        STEP_FAILURE_AGGREGATE_SECS,
+        &example,
+    ) {
+        warn!(
+            "worktree_reclaim: {count} step failure(s) of class {} since the last report \
+             (aggregated per {STEP_FAILURE_AGGREGATE_SECS}s); example: {example}",
+            class.label()
+        );
+    }
+}
+
 /// Execute an ordered [`ReclaimStep`] plan, honoring the INV-W4 abort rule:
 /// a FAILED `UnlinkJunction` stops the plan immediately, because the
 /// remaining `RemoveWorktree` would then recurse through a still-live
@@ -1034,7 +1242,7 @@ pub(super) fn execute_steps(worktree_path: &str, steps: &[ReclaimStep]) -> Resul
     let mut first_err: Option<String> = None;
     for step in steps {
         if let Err(e) = execute_step(step) {
-            warn!("worktree_reclaim: step {step:?} failed: {e}");
+            report_step_failure(step, &e);
             if first_err.is_none() {
                 first_err = Some(e);
             }
@@ -2132,11 +2340,16 @@ mod tests {
         // remove_armed=true.
         let steps = plan_reclaim(&i, false, true, None, true);
 
-        // Exactly: UnlinkJunction(target), UnlinkJunction(node_modules),
-        // RemoveWorktree(path) — junctions first, in order.
+        // Exactly: both `target` candidates, then node_modules, then
+        // RemoveWorktree(path) — junctions first, in coord's order.
         assert_eq!(
             steps,
             vec![
+                ReclaimStep::UnlinkJunction(
+                    PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo")
+                        .join("src-tauri")
+                        .join("target")
+                ),
                 ReclaimStep::UnlinkJunction(PathBuf::from(
                     "D:/qontinui-root/qontinui-runner-wt-foo/target"
                 )),
@@ -2821,5 +3034,262 @@ mod tests {
         assert!(DirtyVerdict::Clean.permits_removal());
         assert!(!DirtyVerdict::Dirty.permits_removal());
         assert!(!DirtyVerdict::Unknown.permits_removal());
+    }
+
+    // --- §4 L1: a sink KIND resolves per checkout, on both ends -----------
+
+    fn rejunction_steps_for(
+        worktree: &Path,
+        canonical: &Path,
+        junctioned: &[&str],
+    ) -> Vec<ReclaimStep> {
+        let mut i = instr(ReclaimAction::Rejunction, junctioned, false);
+        i.worktree_path = worktree.to_string_lossy().into_owned();
+        plan_reclaim(&i, true, false, Some(canonical), true)
+    }
+
+    /// The Tauri layout: `<root>/target` is absent on BOTH ends and the real
+    /// cargo sink is `src-tauri/target`. Link and target must both land
+    /// there — a link-only fix would point a junction at a missing target.
+    #[test]
+    fn rejunction_resolves_tauri_target_on_both_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let canonical = dir.path().join("canonical");
+        for root in [&wt, &canonical] {
+            std::fs::create_dir_all(root.join("src-tauri/target")).unwrap();
+        }
+        let steps = rejunction_steps_for(&wt, &canonical, &["target"]);
+        assert_eq!(
+            steps,
+            vec![ReclaimStep::CreateJunction {
+                link: wt.join("src-tauri").join("target"),
+                target: canonical.join("src-tauri").join("target"),
+            }]
+        );
+    }
+
+    /// Worktree side of the Tauri layout has no build yet (`src-tauri/`
+    /// without a `target`): `target_dir_for` still picks `src-tauri/target`,
+    /// which is where the junction belongs.
+    #[test]
+    fn rejunction_tauri_link_resolves_before_first_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let canonical = dir.path().join("canonical");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("src-tauri/target")).unwrap();
+        let steps = rejunction_steps_for(&wt, &canonical, &["target"]);
+        assert_eq!(
+            steps,
+            vec![ReclaimStep::CreateJunction {
+                link: wt.join("src-tauri").join("target"),
+                target: canonical.join("src-tauri").join("target"),
+            }]
+        );
+    }
+
+    /// A plain repo (no `src-tauri/`) keeps the literal `target`, and a
+    /// non-`target` kind is a literal join in every layout.
+    #[test]
+    fn rejunction_plain_repo_and_node_modules_are_literal_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let canonical = dir.path().join("canonical");
+        for root in [&wt, &canonical] {
+            std::fs::create_dir_all(root.join("target")).unwrap();
+        }
+        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
+        assert_eq!(
+            steps,
+            vec![
+                ReclaimStep::CreateJunction {
+                    link: wt.join("target"),
+                    target: canonical.join("target"),
+                },
+                ReclaimStep::CreateJunction {
+                    link: wt.join("node_modules"),
+                    target: canonical.join("node_modules"),
+                },
+            ]
+        );
+
+        // node_modules stays a literal join in a Tauri layout too.
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
+        assert_eq!(sink_path(&wt, "node_modules"), wt.join("node_modules"));
+        assert_eq!(
+            sink_path(&canonical, "node_modules"),
+            canonical.join("node_modules")
+        );
+    }
+
+    /// INV-W4 on a Tauri worktree: `"target"` unlinks BOTH candidate paths
+    /// (so an `exists()` flip between census and execution cannot miss the
+    /// junction), all before the removal.
+    #[test]
+    fn remove_unlinks_tauri_target_junction_before_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(wt.join("src-tauri/target")).unwrap();
+        let mut i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
+        i.worktree_path = wt.to_string_lossy().into_owned();
+        let expected = vec![
+            ReclaimStep::UnlinkJunction(wt.join("src-tauri").join("target")),
+            ReclaimStep::UnlinkJunction(wt.join("target")),
+            ReclaimStep::UnlinkJunction(wt.join("node_modules")),
+            ReclaimStep::RemoveWorktree(wt.clone()),
+        ];
+        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
+
+        // Both paths present: the plan is identical — it does not depend on
+        // which one `target_dir_for` would pick.
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
+    }
+
+    /// The worktree resolves `src-tauri/target` (Tauri, no build yet) while
+    /// the canonical, holding a top-level `target` and no `src-tauri/target`,
+    /// resolves `target`. Joining them would cross layouts: skip instead.
+    #[test]
+    fn rejunction_layout_mismatch_is_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let canonical = dir.path().join("canonical");
+        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(canonical.join("target")).unwrap();
+        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            ReclaimStep::Skip(msg) => assert!(
+                msg.contains("layout mismatch"),
+                "unexpected skip reason: {msg}"
+            ),
+            other => panic!("expected a layout-mismatch Skip, got {other:?}"),
+        }
+        // The other sink is unaffected.
+        assert_eq!(
+            steps[1],
+            ReclaimStep::CreateJunction {
+                link: wt.join("node_modules"),
+                target: canonical.join("node_modules"),
+            }
+        );
+    }
+
+    // --- §4 L3: the `cmd` boundary gets backslashes only -------------------
+
+    #[test]
+    fn cmd_path_arg_normalises_mixed_separators() {
+        let p = Path::new("D:/qontinui-root/x/qontinui-runner\\target");
+        assert_eq!(
+            cmd_path_arg(p),
+            "D:\\qontinui-root\\x\\qontinui-runner\\target"
+        );
+        assert!(!cmd_path_arg(p).contains('/'));
+        // Already-native input is unchanged.
+        assert_eq!(cmd_path_arg(Path::new("C:\\a\\b")), "C:\\a\\b");
+    }
+
+    // --- Phase 2b: step-failure classification and aggregate throttle -----
+
+    #[test]
+    fn step_failure_classes() {
+        assert_eq!(
+            StepFailureClass::classify(
+                "rejunction: D:/wt/target exists and is not a junction — refusing to clobber"
+            ),
+            StepFailureClass::RefusingToClobber
+        );
+        assert_eq!(
+            StepFailureClass::classify(
+                "rejunction: mklink /J D:/wt\\target D:/c\\target failed: Invalid switch - \"wt\""
+            ),
+            StepFailureClass::MklinkFailed
+        );
+        // A spawn error mentions mklink but is not an `mklink /J … failed`.
+        assert_eq!(
+            StepFailureClass::classify("rejunction: spawn mklink: timed out"),
+            StepFailureClass::Other
+        );
+        assert_eq!(
+            StepFailureClass::classify("remove worktree dir D:/wt: access denied"),
+            StepFailureClass::Other
+        );
+    }
+
+    /// Classification against the exact messages `create_junction` builds
+    /// (its `format!` literals, copied — that fn compiles only on Windows).
+    #[test]
+    fn step_failure_classes_match_create_junction_messages() {
+        let link = Path::new("D:/wt/src-tauri/target");
+        let target = Path::new("D:/canonical/src-tauri/target");
+        let clobber = format!(
+            "rejunction: {} exists and is not a junction — refusing to clobber",
+            link.display()
+        );
+        let mklink = format!(
+            "rejunction: mklink /J {} {} failed: {}",
+            link.display(),
+            target.display(),
+            "Invalid switch - \"wt\"."
+        );
+        assert_eq!(
+            StepFailureClass::classify(&clobber),
+            StepFailureClass::RefusingToClobber
+        );
+        assert_eq!(
+            StepFailureClass::classify(&mklink),
+            StepFailureClass::MklinkFailed
+        );
+    }
+
+    /// Routing: each high-volume class has its OWN aggregate, and `Other`
+    /// is never aggregated (an unknown failure keeps its per-instance WARN).
+    #[test]
+    fn step_failure_routing_picks_the_class_aggregate() {
+        assert!(std::ptr::eq(
+            aggregate_for(StepFailureClass::RefusingToClobber).unwrap(),
+            &CLOBBER_FAILURES
+        ));
+        assert!(std::ptr::eq(
+            aggregate_for(StepFailureClass::MklinkFailed).unwrap(),
+            &MKLINK_FAILURES
+        ));
+        assert!(aggregate_for(StepFailureClass::Other).is_none());
+    }
+
+    /// 1 000 refusals at one logical instant emit exactly one aggregate; once
+    /// the window has passed, the next occurrence reports everything that
+    /// accumulated in between. Driven on a local instance with an injected
+    /// clock, never the process-global statics.
+    #[test]
+    fn step_failure_aggregate_emits_once_per_window_with_the_count() {
+        let agg = StepFailureAggregate::new();
+        let window = STEP_FAILURE_AGGREGATE_SECS;
+        let mut emits = Vec::new();
+        for i in 0..1000 {
+            if let Some(e) = agg.note(0, window, &format!("refusal #{i}")) {
+                emits.push(e);
+            }
+        }
+        assert_eq!(emits.len(), 1, "one aggregate per window");
+        assert_eq!(emits[0], (1, "refusal #0".to_string()));
+
+        // Inside the window: counted, not emitted.
+        assert!(agg.note(window - 1, window, "late").is_none());
+
+        // Window elapsed: the 999 suppressed at t=0, the one at window-1, and
+        // this one — with the first suppressed occurrence as the example.
+        let (count, example) = agg
+            .note(window, window, "after")
+            .expect("the window has elapsed");
+        assert_eq!(count, 1001);
+        assert_eq!(example, "refusal #1");
+
+        // The tally reset on emit.
+        let (count, _) = agg.note(2 * window, window, "next").unwrap();
+        assert_eq!(count, 1);
     }
 }

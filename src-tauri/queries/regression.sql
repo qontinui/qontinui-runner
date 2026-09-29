@@ -15,12 +15,12 @@
 --- runs before the migration; that is expected.
 
 --! save_regression_suite
-INSERT INTO regression_suites (id, ir_doc_id, suite_json)
+INSERT INTO atlas_managed.regression_suites (id, ir_doc_id, suite_json)
 VALUES (:id::uuid, :ir_doc_id, :suite_json::jsonb)
 RETURNING id;
 
 --! record_regression_run
-INSERT INTO regression_runs (
+INSERT INTO atlas_managed.regression_runs (
     id, suite_id, run_id, passed, failed, started_at, completed_at, run_result_json
 ) VALUES (
     :id::uuid, :suite_id::uuid, :run_id, :passed, :failed,
@@ -29,7 +29,7 @@ INSERT INTO regression_runs (
 RETURNING id;
 
 --! record_regression_diagnosis
-INSERT INTO regression_diagnoses (id, run_id, diagnosis_json)
+INSERT INTO atlas_managed.regression_diagnoses (id, run_id, diagnosis_json)
 VALUES (:id::uuid, :run_id::uuid, :diagnosis_json::jsonb)
 RETURNING id;
 
@@ -39,7 +39,7 @@ RETURNING id;
 -- have the keys: id, run_id, case_id, assertion_id, assertion_kind, status,
 -- started_at, duration_ms, and the optional failure_kind / failure_evidence_json /
 -- error_message.
-INSERT INTO regression_assertion_executions (
+INSERT INTO atlas_managed.regression_assertion_executions (
     id, run_id, case_id, assertion_id, assertion_kind, status,
     started_at, duration_ms, failure_kind, failure_evidence_json, error_message
 )
@@ -70,8 +70,8 @@ SELECT
     ae.duration_ms,
     ae.failure_kind,
     ae.error_message
-FROM regression_assertion_executions ae
-JOIN regression_runs r ON r.id = ae.run_id
+FROM atlas_managed.regression_assertion_executions ae
+JOIN atlas_managed.regression_runs r ON r.id = ae.run_id
 WHERE r.suite_id = :suite_id::uuid
 ORDER BY ae.started_at ASC;
 
@@ -83,8 +83,8 @@ SELECT
     d.run_id,
     d.diagnosis_json,
     d.created_at::TEXT AS created_at
-FROM regression_diagnoses d
-JOIN regression_runs r ON r.id = d.run_id
+FROM atlas_managed.regression_diagnoses d
+JOIN atlas_managed.regression_runs r ON r.id = d.run_id
 WHERE r.suite_id = :suite_id::uuid
 ORDER BY d.created_at DESC
 LIMIT :limit;

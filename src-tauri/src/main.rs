@@ -2775,6 +2775,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::get_runner_tier,
             commands::auth::kick_device_jwt_refresher_cmd,
             commands::auth::get_coord_credential_posture,
+            commands::auth::get_binding_gap_asks,
             commands::auth::logout,
             commands::auth::qontinui_sign_out,
             commands::auth::reset_credential_store,
@@ -4975,6 +4976,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.
                 looping_agent_supervisor::start(app.handle());
+
+                // Wind-down executor (plan
+                // `2026-09-13-drained-runner-never-reaches-idle`, Phase 4):
+                // while coord holds this device DRAINED, close the sessions
+                // that are finished and idle past their grace period with a
+                // graceful `/exit`, so a drained runner actually reaches idle;
+                // on undrain, restart exactly the stewards the drain stopped.
+                // Started after the looping supervisor so the two agree about
+                // which tabs exist, and after the lifecycle store is managed
+                // (it records each outcome there).
+                session::wind_down_executor::start();
 
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every

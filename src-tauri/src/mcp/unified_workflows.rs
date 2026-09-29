@@ -59,6 +59,93 @@ pub struct GenerateWorkflowAsyncResponse {
     pub meta_workflow_id: String,
 }
 
+/// One step of `refetch_unified_workflow_steps`: normalize and parse; on a
+/// parse failure a `ui_bridge` step becomes a step that FAILS at execution
+/// naming it (`failing_step`), and other types keep the manual extraction.
+fn convert_refetched_step(
+    step: &serde_json::Value,
+) -> Option<crate::step_executor::ExecutionStepConfig> {
+    use crate::step_executor::ExecutionStepConfig;
+    debug!(
+        "refetch_unified_workflow_steps: converting step: {}",
+        serde_json::to_string(step).unwrap_or_else(|_| "ERROR".to_string())
+    );
+
+    // Normalize canonical keys, then deserialize.
+    use crate::unified_workflow_executor::step_conversion::{
+        failing_step, fallback_refused, parse_step_value, StepConversionError,
+    };
+    let err = match parse_step_value(step) {
+        Ok(config) => {
+            debug!(
+                "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
+                config.check_type
+            );
+            return Some(config);
+        }
+        Err(e) => e,
+    };
+    if fallback_refused(step) {
+        // No faithful fallback: persist a step that FAILS at
+        // execution naming this one, never a dropped step.
+        let err = StepConversionError::new(step, &err);
+        error!("refetch_unified_workflow_steps: {err}; the step will fail at execution");
+        return Some(failing_step(step, &err));
+    }
+
+    debug!("refetch_unified_workflow_steps: serde failed, using manual extraction");
+
+    // Fall back to manual extraction
+    let step_type = step.get("type").and_then(|t| t.as_str())?;
+    let name = step
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string());
+
+    // Helper to get string from either snake_case or camelCase
+    let get_str = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| step.get(*k).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+    };
+    let get_bool = |keys: &[&str]| -> Option<bool> {
+        keys.iter()
+            .find_map(|k| step.get(*k).and_then(|v| v.as_bool()))
+    };
+
+    Some(ExecutionStepConfig {
+        step_type: step_type.to_string(),
+        name,
+        check_type: get_str(&["check_type", "checkType"]),
+        check_command: get_str(&["command", "check_command", "checkCommand"]),
+        check_working_directory: get_str(&[
+            "working_directory",
+            "workingDirectory",
+            "check_working_directory",
+            "checkWorkingDirectory",
+        ]),
+        check_auto_fix: get_bool(&["auto_fix", "autoFix", "check_auto_fix", "checkAutoFix"]),
+        test_id: get_str(&["test_id", "testId"]),
+        test_type: get_str(&["test_type", "testType"]),
+        test_is_critical: get_bool(&["is_critical", "isCritical"]),
+        shell_command: get_str(&["command", "shell_command", "shellCommand"]),
+        shell_command_working_directory: get_str(&[
+            "working_directory",
+            "workingDirectory",
+            "shell_command_working_directory",
+            "shellCommandWorkingDirectory",
+        ]),
+        shell_command_fail_on_error: get_bool(&[
+            "fail_on_error",
+            "failOnError",
+            "shell_command_fail_on_error",
+            "shellCommandFailOnError",
+        ]),
+        prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
+        ..Default::default()
+    })
+}
+
 pub fn refetch_unified_workflow_steps(
     task_id: &str,
     cached_steps_json: Option<String>,
@@ -94,136 +181,29 @@ pub fn refetch_unified_workflow_steps(
             use crate::step_executor::ExecutionStepConfig;
             let mut all_steps: Vec<ExecutionStepConfig> = Vec::new();
 
-            // Helper closure to convert step
-            let convert_step = |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
-                debug!(
-                    "refetch_unified_workflow_steps: converting step: {}",
-                    serde_json::to_string(step).unwrap_or_else(|_| "ERROR".to_string())
-                );
-
-                // Try direct deserialization first
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    debug!(
-                        "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
-                        config.check_type
-                    );
-                    return Some(config);
-                }
-
-                debug!("refetch_unified_workflow_steps: serde failed, using manual extraction");
-
-                // Fall back to manual extraction
-                let step_type = step.get("type").and_then(|t| t.as_str())?;
-                let name = step
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|s| s.to_string());
-
-                // Helper to get string from either snake_case or camelCase
-                let get_str = |keys: &[&str]| -> Option<String> {
-                    keys.iter()
-                        .find_map(|k| step.get(*k).and_then(|v| v.as_str()))
-                        .map(|s| s.to_string())
-                };
-                let get_bool = |keys: &[&str]| -> Option<bool> {
-                    keys.iter()
-                        .find_map(|k| step.get(*k).and_then(|v| v.as_bool()))
-                };
-
-                Some(ExecutionStepConfig {
-                    step_type: step_type.to_string(),
-                    name,
-                    check_type: get_str(&["check_type", "checkType"]),
-                    check_command: get_str(&["command", "check_command", "checkCommand"]),
-                    check_working_directory: get_str(&[
-                        "working_directory",
-                        "workingDirectory",
-                        "check_working_directory",
-                        "checkWorkingDirectory",
-                    ]),
-                    check_auto_fix: get_bool(&[
-                        "auto_fix",
-                        "autoFix",
-                        "check_auto_fix",
-                        "checkAutoFix",
-                    ]),
-                    test_id: get_str(&["test_id", "testId"]),
-                    test_type: get_str(&["test_type", "testType"]),
-                    test_is_critical: get_bool(&["is_critical", "isCritical"]),
-                    shell_command: get_str(&["command", "shell_command", "shellCommand"]),
-                    shell_command_working_directory: get_str(&[
-                        "working_directory",
-                        "workingDirectory",
-                        "shell_command_working_directory",
-                        "shellCommandWorkingDirectory",
-                    ]),
-                    shell_command_fail_on_error: get_bool(&[
-                        "fail_on_error",
-                        "failOnError",
-                        "shell_command_fail_on_error",
-                        "shellCommandFailOnError",
-                    ]),
-                    prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
-                    // UI Bridge fields
-                    ui_bridge_action: get_str(&["ui_bridge_action", "uiBridgeAction"]),
-                    ui_bridge_url: get_str(&["ui_bridge_url", "uiBridgeUrl"]),
-                    ui_bridge_instruction: get_str(&[
-                        "ui_bridge_instruction",
-                        "uiBridgeInstruction",
-                    ]),
-                    ui_bridge_target: get_str(&["ui_bridge_target", "uiBridgeTarget"]),
-                    ui_bridge_assert_type: get_str(&[
-                        "ui_bridge_assert_type",
-                        "uiBridgeAssertType",
-                    ]),
-                    ui_bridge_expected: get_str(&["ui_bridge_expected", "uiBridgeExpected"]),
-                    ui_bridge_timeout_ms: step
-                        .get("ui_bridge_timeout_ms")
-                        .or_else(|| step.get("uiBridgeTimeoutMs"))
-                        .and_then(|v| v.as_u64()),
-                    ui_bridge_compare_mode: get_str(&[
-                        "ui_bridge_compare_mode",
-                        "uiBridgeCompareMode",
-                    ]),
-                    ui_bridge_reference_snapshot: step
-                        .get("ui_bridge_reference_snapshot")
-                        .or_else(|| step.get("uiBridgeReferenceSnapshot"))
-                        .cloned(),
-                    ui_bridge_reference_snapshot_id: get_str(&[
-                        "ui_bridge_reference_snapshot_id",
-                        "uiBridgeReferenceSnapshotId",
-                    ]),
-                    ui_bridge_severity_threshold: get_str(&[
-                        "ui_bridge_severity_threshold",
-                        "uiBridgeSeverityThreshold",
-                    ]),
-                    ..Default::default()
-                })
-            };
-
             // Normalize to stages to handle both flat and multi-stage workflows
             let normalized_stages = workflow.normalize_to_stages();
             for stage in &normalized_stages {
                 for step in &stage.setup_steps {
-                    if let Some(mut config) = convert_step(step) {
+                    if let Some(mut config) = convert_refetched_step(step) {
                         config.phase = Some("setup".to_string());
                         all_steps.push(config);
                     }
                 }
                 for step in &stage.verification_steps {
-                    if let Some(mut config) = convert_step(step) {
+                    if let Some(mut config) = convert_refetched_step(step) {
                         config.phase = Some("verification".to_string());
                         all_steps.push(config);
                     }
                 }
                 for step in &stage.agentic_steps {
-                    if let Some(mut config) = convert_step(step) {
+                    if let Some(mut config) = convert_refetched_step(step) {
                         config.phase = Some("agentic".to_string());
                         all_steps.push(config);
                     }
                 }
                 for step in &stage.completion_steps {
-                    if let Some(mut config) = convert_step(step) {
+                    if let Some(mut config) = convert_refetched_step(step) {
                         config.phase = Some("completion".to_string());
                         all_steps.push(config);
                     }
@@ -3100,7 +3080,33 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
 
 #[cfg(test)]
 mod tests {
+
     use super::RUNTIME_OVERRIDE_KEYS;
+
+    /// An unparseable ui_bridge step in a refetched workflow is persisted as a
+    /// step that FAILS at execution naming it — never dropped, never a snapshot.
+    #[test]
+    fn refetched_unparseable_ui_bridge_step_fails_visibly() {
+        let step = serde_json::json!({"type": "ui_bridge", "id": "r1", "name": "go",
+            "phase": "setup", "action": "navigate", "url": "http://x", "timeoutMs": "soon"});
+        let esc = super::convert_refetched_step(&step).expect("never dropped");
+        assert_eq!(esc.step_type, "ui_bridge");
+        assert_eq!(esc.id.as_deref(), Some("r1"));
+        let msg = esc
+            .conversion_error
+            .as_deref()
+            .expect("carries the failure");
+        assert!(
+            msg.starts_with("ui_bridge step 'go' (id r1) could not be parsed"),
+            "{msg}"
+        );
+        assert!(msg.contains("invalid type: string \"soon\""), "{msg}");
+        // It survives the execution_steps_json round-trip the refetch writes.
+        let json = serde_json::to_string(&vec![esc.clone()]).unwrap();
+        let back =
+            crate::unified_workflow_executor::step_conversion::parse_steps_json(&json).unwrap();
+        assert_eq!(back[0].conversion_error.as_deref(), Some(msg));
+    }
 
     /// This module's own source, so the roster can be checked against the code
     /// that consumes it without a database, a server, or a hand-kept list.

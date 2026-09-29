@@ -317,7 +317,7 @@ Edit files 1–3 with Edit. For `Cargo.lock`, prefer `cargo update -p qontinui-r
 
 ## Phase 3: Land the bump, then tag a green commit
 
-1. Open a PR with the four version bumps (plus any release-note edits) and let coord's merge train land it once green. **Do not run `gh pr merge` or `--admin`** — coord is the sole merge authority for `qontinui/*` repos (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). The tag in Phase 3 must point at a commit that is already on `main` and green, so waiting for coord is a real dependency here, not a formality. **Gotcha:** if you re-point a PR's base, `pull_request` CI does NOT re-fire — `gh pr close <n> && gh pr reopen <n>` to force a `reopened` event.
+1. Open a PR with the four version bumps (plus any release-note edits), in `/implement-plan` Step 4.5b's served door order, then READ it back — `gh pr list --repo qontinui/qontinui-runner --head <branch> --state all --json number,url,state,headRefOid` must return a row whose `headRefOid` is the head you pushed, because a create call's exit status and output are never evidence a PR exists — and let coord's merge train land it once green. **Do not run `gh pr merge` or `--admin`** — coord is the sole merge authority for `qontinui/*` repos (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). The tag in Phase 3 must point at a commit that is already on `main` and green, so waiting for coord is a real dependency here, not a formality. **Gotcha:** if you re-point a PR's base, `pull_request` CI does NOT re-fire — `gh pr close <n> && gh pr reopen <n>` to force a `reopened` event.
 2. Confirm the merge commit is green on main, then tag **that exact SHA**:
 
 ```bash

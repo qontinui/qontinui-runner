@@ -21,7 +21,7 @@ Review a just-completed implementation plan. Find unfinished features, check for
      partial mirror of disk by construction — so fall through to the sources
      below rather than concluding the plan does not exist.
    - `$QONTINUI_PLANS_DIR/*.md`, or PLAN*.md / TODO*.md files in the working
-     directory or qontinui-dev-notes
+     directory or in the repository where the workspace keeps its notes
 
 2. **Determine scope** — identify which repos/directories were touched:
    ```bash

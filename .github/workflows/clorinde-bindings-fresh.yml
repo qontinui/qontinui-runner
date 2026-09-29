@@ -87,6 +87,8 @@ jobs:
           #   - queries/**          (new or modified SQL queries)
           #   - clorinde.toml       (codegen config)
           #   - clorinde/**         (manual edits — forbidden but caught)
+          #   - atlas/**            (schema.hcl shapes the Atlas-owned tables
+          #                          the queries read)
           # Cross-repo qontinui-web alembic changes also affect bindings
           # (a column type change upstream re-shapes the generated row
           # types), but we can't reliably detect that from runner-side
@@ -129,7 +131,8 @@ jobs:
                   'src-tauri/queries/' \
                   'src-tauri/clorinde.toml' \
                   'src-tauri/clorinde/' \
-                  'src-tauri/schema.pg.sql.generated')"; then
+                  'src-tauri/schema.pg.sql.generated' \
+                  'atlas/')"; then
                 echo "::error::git diff against merge base $merge_base failed; cannot determine path-change scope."
                 exit 1
               fi
@@ -252,6 +255,16 @@ jobs:
         env:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: poetry run alembic upgrade head
+
+      # Atlas, not alembic, owns `atlas_managed` and `orchestration`
+      # (atlas/schema.hcl), and no alembic revision creates or moves their
+      # tables. Apply the HCL after the alembic chain so the database this job
+      # generates from carries them. The script provisions its own throwaway
+      # dev database and runs Atlas and psql from pinned docker images.
+      - name: Apply Atlas-owned schema (atlas/schema.hcl)
+        working-directory: qontinui-runner
+        timeout-minutes: 10
+        run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -214,6 +214,47 @@ pub fn drain_gate_for_work(origin: SpawnOrigin, work_key: &str) -> DrainGate {
     gate
 }
 
+/// Longest caller-supplied component a deferral key may carry verbatim.
+/// Anything longer is digested by [`bounded_work_key`].
+pub const MAX_WORK_KEY_TAIL: usize = 48;
+
+/// Hard cap on distinct deferral keys held at once (see [`record_deferral`]).
+pub const MAX_DEFERRED_KEYS: usize = 512;
+
+/// Build a deferral key whose caller-supplied half is BOUNDED.
+///
+/// Several doors key their deferral on a string the CALLER chose — a terminal
+/// title, a relay `request_id`. Left verbatim, a caller could grow the banner's
+/// `deferred` set (and each key's length) without limit simply by varying that
+/// string, which is a remote-influenced allocation in a process an operator is
+/// watching. The caller-supplied tail is therefore passed through only while it
+/// is short and made of key-safe characters; anything else is replaced by a
+/// fixed-width digest of it, so the key stays stable per distinct caller value,
+/// stays readable for the ordinary case, and can never exceed
+/// `prefix.len() + 1 + MAX_WORK_KEY_TAIL`.
+///
+/// CARDINALITY is bounded separately, by [`MAX_DEFERRED_KEYS`] — a digest keeps
+/// each key small but a caller varying its input still produces distinct keys.
+pub fn bounded_work_key(prefix: &str, raw: &str) -> String {
+    let plain = raw.len() <= MAX_WORK_KEY_TAIL
+        && !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'));
+    if plain {
+        return format!("{prefix}:{raw}");
+    }
+    // FNV-1a — a stable, dependency-free digest. This is a bounding device, not
+    // a security boundary: a collision merges two callers' deferrals into one
+    // banner row, which costs a count, not a decision.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in raw.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{prefix}:#{hash:016x}")
+}
+
 /// PURE: the gate for `origin` against `state`.
 pub fn gate_for(state: &CoordDrainState, origin: SpawnOrigin) -> DrainGate {
     gate_for_at(state, origin, Utc::now())
@@ -538,6 +579,9 @@ struct Inner {
     last_fold_at: DateTime<Utc>,
     /// Distinct deferred work items since the drain began, `(origin, key)`.
     deferred: BTreeSet<(SpawnOrigin, String)>,
+    /// Whether `deferred` has hit [`MAX_DEFERRED_KEYS`], so its length is a
+    /// floor rather than a total. Reported, never hidden.
+    deferred_capped: bool,
     /// The state the last event carried, so staleness transitions that happen
     /// between folds are still emitted by the next getter-driven check.
     last_emitted: Option<CoordDrainState>,
@@ -564,6 +608,7 @@ fn global() -> &'static Global {
                 last_fold: Instant::now(),
                 last_fold_at: now,
                 deferred: BTreeSet::new(),
+                deferred_capped: false,
                 last_emitted: None,
                 folded_once: false,
             }),
@@ -618,6 +663,7 @@ pub fn current() -> CoordDrainState {
             inner.last_emitted = Some(state.clone());
             if state.allows_autonomous_spawns() {
                 inner.deferred.clear();
+                inner.deferred_capped = false;
             }
         }
         (state, emit)
@@ -646,6 +692,10 @@ pub struct CoordDrainSnapshot {
     pub cause: Option<String>,
     /// Distinct autonomous work items deferred since the drain began.
     pub deferred_count: usize,
+    /// `true` once the [`MAX_DEFERRED_KEYS`] cap was hit, which makes
+    /// `deferred_count` a FLOOR rather than a total. `false` in every ordinary
+    /// drain.
+    pub deferred_capped: bool,
     /// The same count split by `SpawnOrigin` wire value.
     pub deferred_by_origin: BTreeMap<String, usize>,
     /// When the state was last folded from a coord read (or a failed one).
@@ -677,6 +727,7 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
         since,
         cause,
         deferred_count: inner.deferred.len(),
+        deferred_capped: inner.deferred_capped,
         deferred_by_origin: by_origin,
         last_read_at: inner.last_fold_at,
         boot_read_pending: !inner.folded_once
@@ -695,6 +746,7 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         last_fold: Instant::now(),
         last_fold_at: DateTime::<Utc>::UNIX_EPOCH,
         deferred: BTreeSet::new(),
+        deferred_capped: false,
         last_emitted: None,
         folded_once: true,
     };
@@ -737,6 +789,7 @@ fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Trans
         let changed = transition.changed || before != after;
         if after.allows_autonomous_spawns() {
             inner.deferred.clear();
+            inner.deferred_capped = false;
         }
         if changed || inner.last_emitted.is_none() {
             inner.last_emitted = Some(after.clone());
@@ -777,16 +830,37 @@ fn log_transition(state: &CoordDrainState) {
 
 /// Record that the autonomous `origin` work `key` was deferred by the drain.
 /// Idempotent per `(origin, key)`; cleared when autonomous spawns resume.
+///
+/// BOUNDED at [`MAX_DEFERRED_KEYS`] distinct keys. Some doors key their
+/// deferral on a caller-supplied string (see [`bounded_work_key`]), so an
+/// unbounded set is a remote-influenced allocation during a long drain. At the
+/// cap nothing further is stored and `deferred_capped` goes true, which makes
+/// `deferred_count` a FLOOR — the banner reads "512+ deferred work items"
+/// rather than a total it cannot support.
+///
+/// The cap deliberately records a FLAG and not a count of what it refused. A
+/// counter would have to be incremented on every refused call, and a call at
+/// the cap is exactly the repeated one a bounded set cannot deduplicate — so it
+/// would emit a Tauri snapshot per call for the drain's duration (an emit storm
+/// on the remote-reachable doors this cap exists to defend), and the number
+/// would count CALLS beside a distinct-KEY count, which is not comparable to
+/// the figure it qualifies.
 pub fn record_deferral(origin: SpawnOrigin, key: &str) {
-    let grew = {
+    let emit = {
         let mut inner = lock_inner();
         if current_locked(&inner).allows_autonomous_spawns() {
             false
+        } else if inner.deferred.len() >= MAX_DEFERRED_KEYS {
+            // At the cap. Flip the flag ONCE (that transition is worth an
+            // emit); every later refused call is silent.
+            let first = !inner.deferred_capped;
+            inner.deferred_capped = true;
+            first
         } else {
             inner.deferred.insert((origin, key.to_string()))
         }
     };
-    if grew {
+    if emit {
         emit_snapshot();
     }
 }
@@ -808,12 +882,96 @@ pub async fn wait_until_allowed(origin: SpawnOrigin) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Staggered release (the thundering-herd bound)
+// ---------------------------------------------------------------------------
+
+/// Minimum spacing between two HELD work items starting after a drain lifts.
+///
+/// The wave is paced, not capped, so the LAST of N held tasks waits about
+/// `N * RELEASE_SPACING`: a drain that accumulated 1000 of them releases over
+/// roughly 25 minutes. That is the intended behaviour and not a hang — every
+/// task is queued, none is dropped, and each one logs its own release.
+pub const RELEASE_SPACING: Duration = Duration::from_millis(1_500);
+
+/// Upper bound on the random jitter added to each release slot, so a release
+/// wave does not land on a fixed grid either.
+pub const RELEASE_JITTER: Duration = Duration::from_millis(750);
+
+/// The next release slot, as a monotonic instant. `None` until the first
+/// staggered release; reset is unnecessary because a slot in the past is
+/// simply overtaken by `now`.
+fn release_slot() -> &'static Mutex<Option<tokio::time::Instant>> {
+    static SLOT: OnceLock<Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// PURE: the slot a release claims, given the previously claimed one.
+///
+/// `now` when nothing is queued ahead; otherwise `spacing + jitter` past the
+/// last claimed slot. Monotone by construction: a caller that claims LATER
+/// never gets an earlier slot.
+///
+/// That orders releases by CLAIM order, which is mutex-acquisition order after
+/// `tx.send_replace` wakes every waiter at once — scheduler order, not the
+/// order the tasks arrived at the hold, which can be hours apart. Pacing is the
+/// property this buys; fairness is not, and nothing downstream needs it.
+pub fn next_release_slot(
+    now: tokio::time::Instant,
+    last: Option<tokio::time::Instant>,
+    spacing: Duration,
+    jitter: Duration,
+) -> tokio::time::Instant {
+    match last {
+        Some(last) if last >= now => last + spacing + jitter,
+        _ => now,
+    }
+}
+
+/// Claim this task's release slot and wait for it.
+///
+/// **Why this exists (independent review S5).** `held_until_allowed` is applied
+/// INSIDE already-spawned workflow tasks, so over a long drain N of them pile
+/// up — each holding a `WorkflowDropGuard` and a task-run row that reads
+/// *running* with no progress. `tx.send_replace` then wakes ALL N in the same
+/// instant. The machine-load backstop (`agent_runtime::admit_launch` /
+/// `evaluate_load_guard`) sits on the COORD-LAUNCH path and does not see this
+/// one, so nothing downstream bounds the wave.
+///
+/// **What bounds it here, exactly:** the release RATE, to one task per
+/// [`RELEASE_SPACING`] plus up to [`RELEASE_JITTER`] — a single global slot
+/// cursor that each releasing task advances before sleeping until its own slot.
+/// N tasks therefore start spread over roughly `N * RELEASE_SPACING`, in
+/// arrival order, instead of simultaneously. It is a PACER, not a cap: nothing
+/// is dropped and no permit is held across the work itself, so a long-running
+/// workflow never blocks the next release.
+async fn stagger_release() {
+    let jitter = {
+        use rand::Rng;
+        let millis = u64::try_from(RELEASE_JITTER.as_millis()).unwrap_or(0);
+        Duration::from_millis(rand::rng().random_range(0..=millis))
+    };
+    let slot = {
+        let mut guard = match release_slot().lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let slot = next_release_slot(tokio::time::Instant::now(), *guard, RELEASE_SPACING, jitter);
+        *guard = Some(slot);
+        slot
+    };
+    tokio::time::sleep_until(slot).await;
+}
+
 /// Run `fut` once autonomous spawns of `origin` may run: a HOLD, never a
 /// refusal. For fire-once autonomous launches that have nowhere to leave the
 /// work pending (workflow triggers): while the device is drained or its drain
 /// state is unknown the future waits, counted on the banner under `work_key`,
 /// and starts the moment the drain lifts. Nothing inside `fut` runs — no
 /// `claude` process exists — until then.
+///
+/// A hold that actually waited is released through [`stagger_release`], which
+/// paces the wave — read its doc comment for what bounds it.
 pub async fn held_until_allowed<F: std::future::Future>(
     origin: SpawnOrigin,
     work_key: String,
@@ -822,6 +980,7 @@ pub async fn held_until_allowed<F: std::future::Future>(
     if let DrainGate::Defer { reason, .. } = drain_gate_for_work(origin, &work_key) {
         info!("coord_drain_state: holding {work_key} — {reason}");
         wait_until_allowed(origin).await;
+        stagger_release().await;
         info!("coord_drain_state: releasing {work_key} — autonomous spawns allowed again");
     }
     fut.await
@@ -1445,6 +1604,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            deferred_capped: false,
             last_emitted: None,
             folded_once: true,
         };
@@ -1517,5 +1677,51 @@ mod tests {
         // A non-autonomous origin never defers, whatever the global state is.
         let out = held_until_allowed(SpawnOrigin::OperatorChat, "k".into(), async { 7 }).await;
         assert_eq!(out, 7);
+    }
+
+    /// Review N4: a caller-supplied key component is passed through only while
+    /// it is short and key-safe; anything else becomes a fixed-width digest, so
+    /// the key length is bounded whatever the caller sends.
+    #[test]
+    fn a_work_key_is_bounded_however_long_the_callers_half_is() {
+        assert_eq!(
+            bounded_work_key("http_terminal", "merge-train"),
+            "http_terminal:merge-train"
+        );
+        let long = "x".repeat(10_000);
+        let key = bounded_work_key("relay_terminal", &long);
+        assert!(
+            key.len() <= "relay_terminal".len() + 1 + MAX_WORK_KEY_TAIL,
+            "unbounded key: {} bytes",
+            key.len()
+        );
+        // Stable per distinct value, and distinct values stay distinct.
+        assert_eq!(key, bounded_work_key("relay_terminal", &long));
+        assert_ne!(key, bounded_work_key("relay_terminal", &"y".repeat(10_000)));
+        // A newline or a control character is digested rather than embedded in
+        // a key that is logged and rendered.
+        assert!(bounded_work_key("proxy_terminal", "a\nb").contains(":#"));
+        assert!(bounded_work_key("proxy_terminal", "").contains(":#"));
+    }
+
+    /// Review S5: the release pacer is monotone and spaces successive claims,
+    /// so N held tasks start spread out instead of all at once.
+    #[test]
+    fn the_release_pacer_spaces_successive_claims_and_never_moves_backwards() {
+        let spacing = Duration::from_millis(1_500);
+        let jitter = Duration::from_millis(100);
+        let t0 = tokio::time::Instant::now();
+
+        // Nothing queued: start now.
+        assert_eq!(next_release_slot(t0, None, spacing, jitter), t0);
+        // A slot already claimed for now: the next one is spacing + jitter later.
+        let second = next_release_slot(t0, Some(t0), spacing, jitter);
+        assert_eq!(second, t0 + spacing + jitter);
+        // ...and a third stacks on the second, so ten tasks take ~10 * spacing.
+        let third = next_release_slot(t0, Some(second), spacing, jitter);
+        assert_eq!(third, second + spacing + jitter);
+        // A stale slot (already past) does not hold anything back.
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(next_release_slot(later, Some(t0), spacing, jitter), later);
     }
 }

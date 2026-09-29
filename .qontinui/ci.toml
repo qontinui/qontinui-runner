@@ -4,8 +4,11 @@
 # PARITY IS A REVIEW-TIME INVARIANT: these steps mirror the gate commands of
 # .github/workflows/ci.yml's `test` job. When ci.yml's gates change, update
 # this file in the same PR. Step order matches ci.yml: the frontend build
-# must precede every cargo step (tauri::generate_context! reads ../dist at
-# compile time), and lint/typecheck fail fast before paying for the build.
+# must precede every COMPILING cargo step (tauri::generate_context! reads
+# ../dist at compile time), and lint/typecheck fail fast before paying for
+# the build. What this lane runs differently from `test (windows-latest)`,
+# and why, is enumerated in the STEP PARITY block above [[steps]] — a gap
+# not listed there is drift, not a decision.
 #
 # Commands are argv arrays (never shell strings); env is limited to the
 # runner's allowlist; cargo runs single-job (this workspace OOMs otherwise)
@@ -140,6 +143,132 @@ cargo_build_jobs = 1
 # result as RUST_TEST_THREADS and NEXTEST_TEST_THREADS, so `cargo test` no
 # longer defaults to nproc on a 32-vCPU box.
 
+# ===========================================================================
+# STEP PARITY WITH ci.yml's `test` JOB — every gate step of that job is
+# either mirrored below, in ci.yml's order, or listed here as a DECLARED
+# DIVERGENCE with its reason. A shadow verdict from this lane is meant to be
+# a like-for-like of `test (windows-latest)` (plan
+# 2026-09-27-arm-ci-node-dispatch-for-runner-windows-leg §1a row 7, Phase A
+# item 2), so a step added to that job without a line here is drift.
+#
+# MIRRORED WITH A DECLARED ADAPTATION
+#
+# - "Clippy check" is UBUNTU-ONLY in the `test` job; Windows clippy is the
+#   separate `clippy-windows` job. `rust-clippy` below runs on every host
+#   anyway — extra coverage (it is the only cfg(windows) lint pass a Windows
+#   CI node gets), not a parity break, but it is a third full compile that
+#   `test (windows-latest)` does not pay, so wall-clock comparisons against
+#   that leg must subtract it.
+#
+# - The separate `holder-crates` job (ci.yml, matrix ubuntu + windows) runs
+#   `cargo test -p qontinui-pty-holder -p qontinui-runner-win32` and
+#   `cargo clippy -p qontinui-pty-holder --all-targets` from the repo root,
+#   because every src-tauri step selects the src-tauri package only and never
+#   reaches those crates' own tests or [lints]. Mirrored below as
+#   `holder-crates-test` / `holder-crates-clippy` on the same reasoning as
+#   `rust-clippy`: extra coverage over `test (windows-latest)`, not a parity
+#   break — and on a Windows CI node it is where the pty-holder's named-pipe /
+#   DACL / LockFileEx code executes. Both are small crates, seconds to build.
+#
+# - "Build Rust tests" + "Run Rust tests" (the `cargo test --no-run` / run-
+#   the-recovered-binaries split) are ONE `cargo test` below. Same pass/fail
+#   meaning (fail-fast on the first failing binary), without the per-phase
+#   bounds; and `cargo test` also runs the doctests the split drops. The
+#   split exists to attribute an Actions-timeout expiry, which this lane's
+#   own per-step timeout does not need. ci.yml runs it at CARGO_BUILD_JOBS=2
+#   on windows; this lane is capped at 1 by [limits] above — a declared
+#   difference (compile is slower here), not an equivalence. And because
+#   `cargo test` also runs the doctests the Actions split drops, a broken
+#   doctest reds THIS lane alone: that red is a real doctest defect, not drift.
+#
+# DECLARED DIVERGENCES — ci.yml runs these in the `test` job, this lane does
+# not. The manifest has NO per-OS step selector (CiManifest is a flat
+# `steps` list with deny_unknown_fields) and no shell strings, so an
+# OS-conditional step cannot be expressed without either failing on the
+# other OS or inventing a wrapper. Adding a selector is a runner-first
+# schema change (older runners refuse an unknown key); until then:
+#
+# - "Cargo.lock is in sync with the pinned qontinui-schemas" (`cargo metadata
+#   --locked`): NOT mirrored while qontinui-schemas floats in this lane (the
+#   sibling DECLARED DIVERGENCE above). Measured 2026-09-27: schemas
+#   origin/main declares qontinui-types 3.1.0 while Cargo.lock (and the
+#   sibling-pins.conf pin) record 3.0.0, so a `--locked` resolve here would red
+#   EVERY dispatch while the pinned Actions lane stays green — a guaranteed
+#   false red, which poisons the verdict-parity this manifest exists for. Add
+#   it back (as `cargo tree --locked --workspace --depth 0`: argv has no
+#   redirect, and `cargo metadata` prints one multi-megabyte line that this
+#   lane would push to coord as a single progress line) in the SAME PR that
+#   flips the schemas sibling to `pin = "pin-file"`.
+#
+# - "Build Tauri app (development)" (`pnpm run tauri build --debug
+#   --no-bundle`): NOT mirrored for the first shadow soak. Its
+#   beforeBuildCommand also runs `bundle:profile-sidecar`, i.e. a full
+#   `cargo build --release` of the graph (scripts/bundle-profile-sidecar.mjs),
+#   on top of the debug build — and this lane compiles at CARGO_BUILD_JOBS=1.
+#   Unmeasured on a CI node, it is a likely timeout (false red) and the
+#   largest wall-clock and memory cost on a host that also serves interactive
+#   sessions. Add it once a soak has measured the rest of the lane's
+#   wall-clock on a real node.
+#
+# - Hosted-infra setup ("Configure pagefile (Windows)", the Node 20 /
+#   pnpm / Rust toolchain setup actions, the Rust cache): not mirrored — a CI
+#   node uses the host's own toolchain and pagefile. Toolchain versions can
+#   therefore differ from the hosted runner's; a red that reproduces only on
+#   one toolchain is that difference.
+#
+# - "Contract-smoke effect-probe verdict (PS 5.1)" (windows only),
+#   `powershell -File scripts/tests/test-effect-probe.ps1`, and
+# - "Contract-smoke summary invariants (PS 5.1)" (windows only),
+#   `powershell -File scripts/tests/test-smoke-summary.ps1`: both must run
+#   under Windows PowerShell 5.1 specifically (the defects they pin are 5.1-
+#   only), and `powershell` does not exist on a non-Windows CI node, where
+#   the step would fail to spawn rather than skip. Pure-logic, ~1s each,
+#   runnable on any Windows box by hand.
+#
+# - "SDK↔runner contract smoke (direct-exe)" (windows only): BOOTS the
+#   just-built runner exe on the host and walks its HTTP routes. On a CI node
+#   that is a second runner process on a user's machine, beside the live one
+#   serving the dispatch — outside what this lane may do to a host — and its
+#   `-DirectExe target/debug/...` path does not exist here anyway: the
+#   executor supplies CARGO_TARGET_DIR outside the worktree.
+#
+# - "Poison ambient state" / "Unpoison ambient state": multi-line bash that
+#   writes machine.json, profiles.json and coord-device-jwt into the REAL
+#   `~/.qontinui/` (and %USERPROFILE%) and exports COORD_HTTP_URL,
+#   QONTINUI_ROOT, QONTINUI_SERVER_MODE, QONTINUI_RUNNER_TIER through
+#   $GITHUB_ENV. On a CI node that home is the operator's live runner
+#   identity; overwriting it is destructive, not a test fixture. Those four
+#   env keys are also outside the step env allowlist (ci_node/manifest.rs
+#   ENV_ALLOWLIST), deliberately. Consequence: this lane does NOT catch a new
+#   test that reads ambient machine state — and on a configured operator box
+#   such a test can fail HERE while passing on the clean Actions runner. A
+#   red of that shape is the ambient-state defect, not lane drift.
+#
+# - "CI-integrity guard policy" (ubuntu only in ci.yml) and "Live AI
+#   extractor smoke" (ubuntu only, continue-on-error, needs a secret): not
+#   part of `test (windows-latest)`, so a Windows shadow correctly omits them.
+#
+# - Non-gate diagnostics and reporting ("Explain which Rust test phase the
+#   bound expired in", "Windows memory peak after the Rust test steps",
+#   "Report test results to coord"): they read Actions-only state and decide
+#   nothing, so they have nothing to mirror. The workflow-level
+#   GITHUB_TOKEN env (rate-limit headroom for the postgresql_embedded build
+#   script) is not available to this lane either; a 403 from that build
+#   script here is that gap.
+# ===========================================================================
+
+[[steps]]
+# ci.yml "Run CI-tooling unit tests" — first, before any install: all
+# three files import only Node built-ins, and a break is cheap to see early.
+name = "ci-tooling-node-tests"
+command = [
+  "node",
+  "--test",
+  "scripts/__tests__/ci-flake-analyze.test.mjs",
+  "scripts/__tests__/ci-test-results-ingest.test.mjs",
+  "scripts/__tests__/ci-expiry-phase-summary.test.mjs",
+]
+
 [[steps]]
 name = "frontend-install"
 command = ["pnpm", "install", "--frozen-lockfile"]
@@ -147,6 +276,12 @@ command = ["pnpm", "install", "--frozen-lockfile"]
 [[steps]]
 name = "frontend-lint"
 command = ["pnpm", "run", "lint"]
+
+[[steps]]
+# ci.yml "Verify component-action effect fixture" — node-only, sub-second,
+# placed before typecheck exactly as ci.yml places it.
+name = "effect-fixture-check"
+command = ["pnpm", "run", "effect:fixture:check"]
 
 [[steps]]
 name = "frontend-typecheck"
@@ -184,3 +319,17 @@ working_dir = "src-tauri"
 # hang headless environments).
 env = { QONTINUI_DISABLE_KEYCHAIN = "1" }
 timeout_secs = 7200
+
+[[steps]]
+# ci.yml `holder-crates` job, "Test holder crates" — see STEP PARITY above.
+# From the repo root: `-p` selects workspace members src-tauri never tests.
+name = "holder-crates-test"
+command = ["cargo", "test", "-p", "qontinui-pty-holder", "-p", "qontinui-runner-win32"]
+timeout_secs = 1800
+
+[[steps]]
+# ci.yml `holder-crates` job, "Clippy holder crates" — PLAIN clippy, levels
+# from the crate's own [lints] table, exactly like `rust-clippy`.
+name = "holder-crates-clippy"
+command = ["cargo", "clippy", "-p", "qontinui-pty-holder", "--all-targets"]
+timeout_secs = 1800

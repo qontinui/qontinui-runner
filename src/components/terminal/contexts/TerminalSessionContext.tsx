@@ -752,6 +752,7 @@ const PageSessionScope = memo(function PageSessionScope({
             zoneLayout.layout.zones.length,
             zoneLayout.focusedZone,
             tabId,
+            zoneLayout.getReservedZones(),
           )
         : null;
       if (!plan) {

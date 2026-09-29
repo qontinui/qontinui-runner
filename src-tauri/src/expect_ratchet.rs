@@ -78,7 +78,9 @@ mod tests {
         Ratchet {
             lint: "clippy::disallowed_methods",
             expect_needle: "#[expect(clippy::disallowed_methods",
-            baseline: 537,
+            // 537 -> 536: qontinui_specs.rs `table_exists` migrated to
+            // try_get (plan 2026-05-14-atlas-wave-6-triage).
+            baseline: 536,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),

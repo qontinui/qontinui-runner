@@ -24,6 +24,26 @@
 #   guarantees the dump reflects the ALEMBIC-AUTHORITATIVE state,
 #   independent of any drift in the long-lived dev DB.
 #
+# Atlas-owned schemas (both modes)
+# --------------------------------
+# alembic does NOT create the Atlas-owned tables: `atlas_managed` (and
+# `orchestration`) are declared in atlas/schema.hcl and applied by Atlas, and
+# no alembic revision creates or moves them. So after the alembic chain this
+# script applies atlas/schema.hcl to the database it dumps
+# (atlas/scripts/apply_to.sh), then dumps `atlas_managed` alongside the
+# alembic schemas. The four `project.regression_*` tables alembic still
+# creates (frozen revision f9d3e8a4c1b6) are legacy copies superseded by
+# `atlas_managed` and are EXCLUDED from the dump, so the output carries all
+# six Atlas-owned tables in `atlas_managed` and none in `project`.
+#
+# PREREQUISITE: docker (apply_to.sh runs Atlas and psql from pinned images),
+# unless ATLAS_BIN names a native atlas binary and `psql` is on PATH.
+# REGEN_SKIP_ATLAS=1 skips the apply, for a caller that has just applied it
+# itself (the CI workflows do, as their own step). In DEFAULT mode (a
+# long-lived database) the apply is opt-in via REGEN_APPLY_ATLAS=1, because it
+# writes to shared state; without it the script only checks that all six
+# atlas_managed tables are already there and refuses otherwise.
+#
 # Output: src-tauri/schema.pg.sql.generated.
 #
 # Determinism: pg_dump headers that contain timestamps, runtime info,
@@ -45,6 +65,10 @@
 #   PGPASSWORD            (read by native pg_dump; ignored in docker-exec mode)
 #   QONTINUI_WEB_DIR      (default: ../../../qontinui-web/backend)
 #                         Used by --fresh-temp-db to find alembic.
+#   REGEN_SKIP_ATLAS      (default: unset) 1 = do not apply atlas/schema.hcl
+#                         (the DB already has it applied).
+#   REGEN_APPLY_ATLAS     (default: unset) 1 = in default mode, apply
+#                         atlas/schema.hcl to the long-lived DB before dumping.
 #
 # Container vs native pg_dump:
 # By default the script uses `docker exec <container> pg_dump` so a host
@@ -59,12 +83,28 @@ HOST="${CLORINDE_PG_HOST:-localhost}"
 PORT="${CLORINDE_PG_PORT:-5433}"
 DB="${CLORINDE_PG_DB:-qontinui_db}"
 PG_USER="${CLORINDE_PG_USER:-qontinui_user}"
-SCHEMAS=(project coord agent auth cloud public)
+SCHEMAS=(project coord agent auth cloud public atlas_managed)
 
 # Default to relative path; can be overridden by env.
 QONTINUI_WEB_DIR="${QONTINUI_WEB_DIR:-../../../qontinui-web/backend}"
 
 cd "$(dirname "$0")/.."  # src-tauri/
+
+# Shared Atlas helpers (side-effect free to source): the declared table list
+# and the container networking apply_to.sh uses.
+# shellcheck source=atlas/scripts/lib.sh
+. ../atlas/scripts/lib.sh
+
+# One source for credentials. PGPASSWORD is exported for pg_dump/psql and the
+# helper containers; URLs carry the password percent-encoded, so a character
+# like @ : / # ? in it cannot break them.
+PG_PASSWORD="${PGPASSWORD:-qontinui_dev_password}"
+export PGPASSWORD="$PG_PASSWORD"
+pg_url() {
+    local enc
+    enc="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PG_PASSWORD")"
+    printf 'postgresql://%s:%s@%s:%s/%s\n' "$PG_USER" "$enc" "$HOST" "$PORT" "$1"
+}
 
 OUTPUT="schema.pg.sql.generated"
 TMP="${OUTPUT}.tmp"
@@ -80,6 +120,12 @@ fi
 PG_DUMP_ARGS=(--schema-only --no-owner --no-privileges)
 for s in "${SCHEMAS[@]}"; do
     PG_DUMP_ARGS+=(--schema="$s")
+done
+# Legacy copies from frozen alembic history (revision f9d3e8a4c1b6),
+# superseded by atlas_managed.<t>; their indexes and constraints go with them.
+LEGACY_ATLAS_TABLES=(regression_suites regression_runs regression_diagnoses regression_assertion_executions)
+for t in "${LEGACY_ATLAS_TABLES[@]}"; do
+    PG_DUMP_ARGS+=(--exclude-table="project.$t")
 done
 
 # ---------------------------------------------------------------------
@@ -108,14 +154,49 @@ if [[ "$mode" == "fresh-temp-db" ]]; then
     fi
     (
         cd "$QONTINUI_WEB_DIR"
-        # Container is on host network port 5433; assume that.
-        DATABASE_URL="postgresql://${PG_USER}:qontinui_dev_password@localhost:5433/${TEMP_DB}" \
-            python -m alembic upgrade head
+        # The container publishes Postgres on $HOST:$PORT (default localhost:5433).
+        DATABASE_URL="$(pg_url "$TEMP_DB")" python -m alembic upgrade head
     )
     DUMP_DB="$TEMP_DB"
 else
     echo "[regen] Mode: default. Dumping $DB from $CONTAINER." >&2
     DUMP_DB="$DB"
+fi
+
+# ---------------------------------------------------------------------
+# Atlas-owned schemas: apply atlas/schema.hcl to the DB being dumped.
+# ---------------------------------------------------------------------
+if [[ "${REGEN_SKIP_ATLAS:-}" == "1" ]]; then
+    echo "[regen] REGEN_SKIP_ATLAS=1: assuming atlas/schema.hcl is already applied to $DUMP_DB." >&2
+elif [[ "$mode" != "fresh-temp-db" && "${REGEN_APPLY_ATLAS:-}" != "1" ]]; then
+    # Default mode dumps a LONG-LIVED database (the shared dev DB). Applying
+    # Atlas there is a write to shared state, so it is opt-in: a runner that
+    # booted against that DB has already moved the Atlas-owned tables into
+    # atlas_managed via its self-heal. Refuse rather than dump a file that
+    # silently lacks them.
+    echo "[regen] Default mode: NOT applying atlas/schema.hcl to the long-lived $DUMP_DB (set REGEN_APPLY_ATLAS=1 to allow that write)." >&2
+    # The expected set is whatever atlas/schema.hcl declares in atlas_managed.
+    expected="$(atlas_declared_tables atlas_managed | sed 's/^atlas_managed\.//' | sort)"
+    list_sql="SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'atlas_managed' AND c.relkind IN ('r','p') ORDER BY 1"
+    if [[ -n "$CONTAINER" ]]; then
+        present="$(docker exec "$CONTAINER" psql -U "$PG_USER" -d "$DUMP_DB" -tAc "$list_sql")" \
+            || { echo "[regen] ERROR: could not read atlas_managed from $DUMP_DB." >&2; exit 1; }
+    else
+        present="$(psql -h "$HOST" -p "$PORT" -U "$PG_USER" -d "$DUMP_DB" -tAc "$list_sql")" \
+            || { echo "[regen] ERROR: could not read atlas_managed from $DUMP_DB." >&2; exit 1; }
+    fi
+    missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$present" | sort) | tr '\n' ' ')"
+    missing="${missing% }"
+    if [[ -z "$expected" || -n "$missing" ]]; then
+        echo "[regen] ERROR: $DUMP_DB lacks atlas_managed table(s) schema.hcl declares: ${missing:-<none parsed from schema.hcl>}. Boot a current runner against it, re-run with REGEN_APPLY_ATLAS=1, or use --fresh-temp-db." >&2
+        exit 1
+    fi
+else
+    echo "[regen] Applying atlas/schema.hcl to $DUMP_DB (Atlas owns atlas_managed)." >&2
+    # With a named container, the helper containers join its network and reach
+    # Postgres on its own port (works on Docker Desktop, which has no host
+    # networking); without one they use the host network.
+    ATLAS_PG_CONTAINER="$CONTAINER" bash ../atlas/scripts/apply_to.sh "$(pg_url "$DUMP_DB")"
 fi
 
 # ---------------------------------------------------------------------
@@ -125,9 +206,11 @@ cat > "$TMP" <<'EOF'
 -- GENERATED FILE — do not hand-edit.
 -- Regenerate via: src-tauri/scripts/regenerate_schema_pg_sql.sh
 --
--- Source: alembic-managed schema, dumped via pg_dump with
+-- Source: alembic head plus atlas/schema.hcl (Atlas owns atlas_managed),
+-- dumped via pg_dump with
 --   --schema=project --schema=coord --schema=agent --schema=auth
---   --schema=cloud --schema=public --no-owner --no-privileges.
+--   --schema=cloud --schema=public --schema=atlas_managed --no-owner
+--   --no-privileges, excluding the legacy project.regression_* copies.
 --
 -- Consumers: Clorinde (validates queries/*.sql against this file).
 --

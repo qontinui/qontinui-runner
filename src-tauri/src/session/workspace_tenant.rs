@@ -85,6 +85,37 @@ pub(crate) enum TenantDeclarationSource {
     },
 }
 
+impl TenantDeclarationSource {
+    /// The stable machine-readable tier token, for a reader that has to branch
+    /// rather than read prose. Deliberately NOT derived from [`fmt::Display`]:
+    /// the Display form names the *path it matched on*, which is what a human
+    /// needs, and a machine consumer keying on that string would break the
+    /// moment a path changed.
+    ///
+    /// Plan `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`
+    /// D5 / Phase 5 — `/coord-mcp/doctor` prints both halves side by side,
+    /// because "which rule matched" and "what it matched on" are two different
+    /// questions and a refused agent needs both.
+    pub(crate) fn tier(&self) -> &'static str {
+        match self {
+            TenantDeclarationSource::Env => "env",
+            TenantDeclarationSource::ConfigYml { .. } => "config-yml",
+            TenantDeclarationSource::TenantMap { .. } => "tenant-map",
+        }
+    }
+
+    /// The file this tier read, when it read one. Tier 1 is the process
+    /// environment and has no path — `None` here is "this tier is not a file",
+    /// never "the path is unknown".
+    pub(crate) fn path(&self) -> Option<&Path> {
+        match self {
+            TenantDeclarationSource::Env => None,
+            TenantDeclarationSource::ConfigYml { path }
+            | TenantDeclarationSource::TenantMap { path, .. } => Some(path.as_path()),
+        }
+    }
+}
+
 impl fmt::Display for TenantDeclarationSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -31,6 +31,25 @@ pub enum WorkflowEventType {
     /// the serialized `PhaseResult`. Ingested by the web backend's
     /// `POST /api/v1/events/phase-completed` endpoint.
     PhaseCompleted,
+    // ---- New-project create funnel (plan 2026-09-22 PR-F) -----------------
+    // Telemetry, not user-facing: the web backend suppresses push + feed for
+    // these. All rows of one create attempt share one `run_id` (the flow id).
+    /// `create_new_project` was entered (the user committed to creating).
+    NewProjectStarted,
+    /// The `validate` step passed (local template/name/location rules).
+    NewProjectNameOk,
+    /// The `create_remote` step created (or re-verified) the GitHub repo.
+    NewProjectRepoCreated,
+    /// The `push` step pushed `main` to GitHub.
+    NewProjectPushed,
+    /// The `enroll` step enrolled the repo with the Qontinui GitHub Apps.
+    NewProjectEnrolled,
+    /// Terminal event of every attempt, success or failure: carries `ok`,
+    /// `failed_step`, the typed error code and `skipped_stages[]`.
+    NewProjectFinished,
+    /// The onboarding doctor reported `ready_to_land` (emitted by the UI in
+    /// Phase 3 through [`emit_workflow_event`]; no runner-side emitter).
+    NewProjectLive,
 }
 
 /// Payload sent to `POST /api/v1/events/workflow`.
@@ -257,6 +276,40 @@ pub fn emit_terminal_exited(terminal_id: &str, title: &str, exit_code: Option<i3
     tauri::async_runtime::spawn(post_workflow_event(event));
 }
 
+/// Emit one new-project create-funnel event (plan 2026-09-22 PR-F).
+///
+/// `flow_id` is minted once per `create_new_project` invocation and stamped
+/// as `run_id` so every stage of one attempt joins. Fire-and-forget: a missing
+/// device id, a missing token or a failed post is logged (or silently dropped)
+/// and never reaches the caller — telemetry must never fail a project creation.
+///
+/// Uses `tauri::async_runtime::spawn` (as [`emit_terminal_exited`] does) so it
+/// is safe from any calling context.
+pub fn emit_new_project_stage(
+    flow_id: &str,
+    event_type: WorkflowEventType,
+    summary: String,
+    payload: serde_json::Value,
+) {
+    let auth_manager = AuthManager::new();
+    let device_id = match auth_manager.get_device_id() {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    let event = WorkflowEventPayload {
+        event_type,
+        device_id,
+        runner_name: get_runner_name(),
+        run_id: Some(flow_id.to_string()),
+        summary,
+        payload: Some(payload),
+        timestamp: now_iso(),
+    };
+
+    tauri::async_runtime::spawn(post_workflow_event(event));
+}
+
 /// Emit a generic workflow event via Tauri command.
 ///
 /// This allows the frontend to trigger events for lifecycle points it manages
@@ -288,6 +341,13 @@ pub async fn emit_workflow_event(
         "build_failed" => WorkflowEventType::BuildFailed,
         "verification_failed" => WorkflowEventType::VerificationFailed,
         "phase_completed" => WorkflowEventType::PhaseCompleted,
+        "new_project_started" => WorkflowEventType::NewProjectStarted,
+        "new_project_name_ok" => WorkflowEventType::NewProjectNameOk,
+        "new_project_repo_created" => WorkflowEventType::NewProjectRepoCreated,
+        "new_project_pushed" => WorkflowEventType::NewProjectPushed,
+        "new_project_enrolled" => WorkflowEventType::NewProjectEnrolled,
+        "new_project_finished" => WorkflowEventType::NewProjectFinished,
+        "new_project_live" => WorkflowEventType::NewProjectLive,
         _ => return Err(format!("Invalid event_type: {}", event_type)),
     };
 
@@ -329,4 +389,39 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_workflow_events")
         .invoke_handler(tauri::generate_handler![emit_workflow_event,])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire name of every funnel variant must be exactly the string the
+    /// web backend's `WorkflowEventType` accepts (an unknown type 400s).
+    #[test]
+    fn new_project_variants_serialize_to_backend_names() {
+        let cases = [
+            (WorkflowEventType::NewProjectStarted, "new_project_started"),
+            (WorkflowEventType::NewProjectNameOk, "new_project_name_ok"),
+            (
+                WorkflowEventType::NewProjectRepoCreated,
+                "new_project_repo_created",
+            ),
+            (WorkflowEventType::NewProjectPushed, "new_project_pushed"),
+            (
+                WorkflowEventType::NewProjectEnrolled,
+                "new_project_enrolled",
+            ),
+            (
+                WorkflowEventType::NewProjectFinished,
+                "new_project_finished",
+            ),
+            (WorkflowEventType::NewProjectLive, "new_project_live"),
+        ];
+        for (variant, name) in cases {
+            assert_eq!(
+                serde_json::to_value(&variant).expect("serialize"),
+                serde_json::Value::String(name.to_string())
+            );
+        }
+    }
 }

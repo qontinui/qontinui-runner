@@ -23,6 +23,14 @@ use super::types::{DurableStepResult, WorkflowInput, WorkflowOutput};
 /// `super::durable_executor::PhaseResult`.
 pub use crate::unified_workflow_executor::types::PhaseResult;
 
+/// Parse a durable batch's steps, or the `failure_context` the batch fails
+/// with. An unparseable `ui_bridge` step fails the batch naming the step
+/// (`StepsJsonError::UnparseableStep`) — it is never dropped.
+fn parse_batch_steps(steps_json: &str) -> Result<Vec<ExecutionStepConfig>, String> {
+    crate::unified_workflow_executor::step_conversion::parse_steps_json(steps_json)
+        .map_err(|e| format!("Step deserialization failed: {e}"))
+}
+
 /// Executes a batch of steps, returning a serializable `PhaseResult`.
 ///
 /// This function is designed to be called inside a Restate `ctx.run()` side effect.
@@ -46,12 +54,12 @@ pub async fn execute_steps_batch(
     let mut variables_set = Vec::new();
 
     // Deserialize steps
-    let steps: Vec<ExecutionStepConfig> = match serde_json::from_str(steps_json) {
+    let steps: Vec<ExecutionStepConfig> = match parse_batch_steps(steps_json) {
         Ok(s) => s,
-        Err(e) => {
+        Err(failure_context) => {
             error!(
                 "Failed to deserialize {} steps for {}: {}",
-                phase_name, execution_id, e
+                phase_name, execution_id, failure_context
             );
             return PhaseResult {
                 phase: phase_name.to_string(),
@@ -60,7 +68,7 @@ pub async fn execute_steps_batch(
                 success: false,
                 all_passed: false,
                 step_results: vec![],
-                failure_context: Some(format!("Step deserialization failed: {}", e)),
+                failure_context: Some(failure_context),
                 duration_ms: start.elapsed().as_millis() as u64,
                 variables_set: Some(vec![]),
                 commit_hash: None,
@@ -589,5 +597,29 @@ pub fn worktree_remove_compensation(
         },
         recorded_at: chrono::Utc::now().to_rfc3339(),
         description: format!("Remove worktree at {}", worktree_path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_batch_steps;
+
+    #[test]
+    fn unparseable_ui_bridge_step_fails_the_batch_naming_it() {
+        let json = r#"[{"type":"ui_bridge","id":"s1","name":"open runs","action":"navigate",
+                        "url":"http://localhost:3001","timeoutMs":"soon"}]"#;
+        let failure = parse_batch_steps(json).unwrap_err();
+        assert!(
+            failure.starts_with("Step deserialization failed: ui_bridge step 'open runs' (id s1)"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("invalid type: string \"soon\""),
+            "{failure}"
+        );
+        let ok =
+            parse_batch_steps(r#"[{"type":"ui_bridge","action":"navigate","url":"http://x"}]"#)
+                .unwrap();
+        assert_eq!(ok[0].ui_bridge_url.as_deref(), Some("http://x"));
     }
 }

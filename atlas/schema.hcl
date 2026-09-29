@@ -1,57 +1,61 @@
 // Atlas-managed schema for runner-Rust-owned PG objects.
 //
-// Source of truth for the table/index/FK definitions the runner's
-// Rust code used to create imperatively via `database/pg/mod.rs::PgDb::new`
-// (regression_* tables). `project.coordinator_shadow_decisions` was declared
-// here until Phase 4 of `2026-09-12-consolidate-local-orchestration-onto-
-// conductor` deleted the scheduler that wrote it; the table is no longer
-// created anywhere and is EXCLUDED (never dropped) on databases that have it.
+// OWNERSHIP MODEL (plan `2026-05-14-atlas-wave-6-triage`, Phases 1-3):
+// Atlas owns exactly two schemas, WHOLLY:
 //
-// Row 3 schema-half pilot per
-// `plans/2026-05-14-branch-per-agent-bottlenecks-tracker.md` Row 3 schema-half.
-// Atlas Community edition is the target; PG extensions (vector, pgcrypto)
-// stay imperatively bootstrapped in mod.rs::PgDb::new — that's the
-// idiomatic bootstrap-vs-schema split.
+//   atlas_managed  -- the UI Bridge regression substrate (regression_*) and
+//                     the flywheel queue (spec_proposals, proposal_events).
+//   orchestration  -- the Approach-D conductor ledger (runs, subtasks).
 //
-// Tables ALSO covered by historical alembic migrations
-// (project.regression_* by f9d3e8a4c1b6). The alembic files stay in
-// `qontinui-web/backend/alembic/versions/` as frozen history; new alembic
-// autogenerate runs exclude these tables via the env.py include_object
-// filter so the two systems can't drift.
+// Every object in those two schemas must be declared in this file, and
+// nothing else in them may exist. There is no exclude list: `coord`,
+// `project` and every other schema are simply absent from `schemas` in
+// atlas.hcl, and a schema outside `schemas` is invisible to both
+// `schema diff` and `schema apply` (spike Q1-1, 2026-09-05), so no object in
+// it can ever become a DROP candidate. alembic (qontinui-web) is the sole DDL
+// author of `coord.*` and `project.*`, including `project.apps`; its env.py
+// skips `atlas_managed` and `orchestration` at schema level so the two
+// systems cannot drift into each other.
 //
-// ALWAYS go through `--env runner_pilot` (defined in atlas.hcl). That env is
-// what binds the `exclude.txt` list; a bare `--schema project --schema coord
-// --schema orchestration` invocation carries NO exclusions, so Atlas compares
-// every alembic- and coord-owned table in those schemas against this file and
-// proposes to DROP each one. That is the data-loss footgun the exclude list
-// exists to prevent -- an earlier version of this header spelled out exactly
-// such a command, which is why it is called out here.
+// Invariant, enforced by .github/workflows/atlas-schema-check.yml against a
+// Postgres with the alembic chain applied: `schema apply --env runner_pilot`
+// plans no DROP, a second `schema diff` plans nothing, and every table
+// declared here exists afterwards. A planned DROP means a foreign object
+// landed in an Atlas-owned schema; a planned CREATE on the second pass means
+// a declaration Atlas cannot converge.
 //
-// Run the freshness guard first (see atlas/README.md):
-//   pwsh atlas/scripts/regen_exclude.ps1 -Check    # 0 fresh / 2 drift / 1 failed
+// PG extensions (vector, pgcrypto) stay imperatively bootstrapped in
+// `database/pg/mod.rs` -- the idiomatic bootstrap-vs-schema split. The six
+// atlas_managed tables used to live in `project`; the runner's
+// `verify_and_provision` moves (or merges) any leftover `project.<t>` copy
+// into `atlas_managed` on boot. No alembic revision moves them: an
+// alembic-only database still carries the four legacy project.regression_*
+// tables (frozen revision f9d3e8a4c1b6), so every codegen pipeline runs
+// atlas/scripts/apply_to.sh after `alembic upgrade head`.
 //
-// To preview the diff, then apply, against live PG (ATLAS_LIVE_URL and
-// ATLAS_DEV_URL supply the two urls -- see atlas.hcl):
-//   docker run --rm --network host -v "${PWD}/atlas:/atlas" -w /atlas \
+// Use `--env runner_pilot` (atlas.hcl) so the two schemas stay the scope.
+// The dev database must have NO `public` schema, or `schema apply` aborts
+// its post-apply verification after a clean diff.
+//   docker run --rm --network host -v "${PWD}/atlas:/work" -w /work \
 //     -e ATLAS_LIVE_URL -e ATLAS_DEV_URL \
-//     arigaio/atlas:latest schema diff --env runner_pilot
-//   docker run --rm --network host -v "${PWD}/atlas:/atlas" -w /atlas \
+//     arigaio/atlas:1.3.3-community schema apply --env runner_pilot --dry-run
+//   docker run --rm --network host -v "${PWD}/atlas:/work" -w /work \
 //     -e ATLAS_LIVE_URL -e ATLAS_DEV_URL \
-//     arigaio/atlas:latest schema apply --env runner_pilot
+//     arigaio/atlas:1.3.3-community schema apply --env runner_pilot
 
-schema "project" {}
-schema "coord" {}
+// UI Bridge regression substrate + flywheel queue, owned wholly by Atlas.
+schema "atlas_managed" {}
 // Runner-owned orchestration ledger (Approach-D Conductor/Engine, Phase 1).
 // Self-healed imperatively in `database/pg/mod.rs::verify_and_provision` as
 // well, so a fresh PG without Atlas applied still boots the conductor loop.
 schema "orchestration" {}
 
 // ---------------------------------------------------------------
-// project.regression_* — UI Bridge regression substrate (Section 11 / Phase A2)
+// atlas_managed.regression_* — UI Bridge regression substrate (Section 11 / Phase A2)
 // ---------------------------------------------------------------
 
 table "regression_suites" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = uuid
@@ -78,7 +82,7 @@ table "regression_suites" {
 }
 
 table "regression_runs" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = uuid
@@ -132,7 +136,7 @@ table "regression_runs" {
 }
 
 table "regression_diagnoses" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = uuid
@@ -164,7 +168,7 @@ table "regression_diagnoses" {
 }
 
 table "regression_assertion_executions" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = uuid
@@ -242,14 +246,14 @@ table "regression_assertion_executions" {
 }
 
 // ---------------------------------------------------------------
-// project.spec_proposals — Stream E (Flywheel) coverage-growth queue.
+// atlas_managed.spec_proposals — Stream E (Flywheel) coverage-growth queue.
 // Stores `fullPage` and `patch` proposals discovered by
 // `/spec/proposals/scan`; lifecycle is driven by the supervisor cron + the
 // `/spec/proposals/{id}/execute` handler.
 // ---------------------------------------------------------------
 
 table "spec_proposals" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = text
@@ -322,7 +326,7 @@ table "spec_proposals" {
 }
 
 // ---------------------------------------------------------------
-// project.proposal_events — Plan 06 Step 6 (G.6) flywheel observability.
+// atlas_managed.proposal_events — Plan 06 Step 6 (G.6) flywheel observability.
 // Append-only log of state transitions on spec_proposals rows. Written
 // alongside the corresponding SpecApiEvent broadcast (Plan 06 Step 2).
 // Decouples durable history from broadcast; a subscriber that drops events
@@ -330,7 +334,7 @@ table "spec_proposals" {
 // ---------------------------------------------------------------
 
 table "proposal_events" {
-  schema = schema.project
+  schema = schema.atlas_managed
   column "id" {
     null = false
     type = text
@@ -384,89 +388,6 @@ table "proposal_events" {
     }
     on {
       column = column.at
-      desc   = true
-    }
-  }
-}
-
-// ---------------------------------------------------------------
-// project.apps — multi-tenant app registry (spec-multi-app Stream B).
-//
-// One row per registered Qontinui application. The runner serves each app's
-// specs out of `<repo_root>/specs/pages/`. `app_id` is a slug (lowercase
-// ASCII letters, digits, hyphens; 1–64 chars; validated by
-// `qontinui_types::apps::validate_app_id` before insert).
-//
-// `repo_root` is an absolute path on disk owned by the runner; this is a
-// runner-local registry and is NOT synced via coord in v1.
-//
-// `last_seen_at_ms` is bumped on every `/apps/<app_id>/spec/*` hit so the
-// CLI / dashboard can show recently-touched apps. Updates are best-effort —
-// `touch_app` failures are logged at `warn!` but never fail the calling
-// storage operation.
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │ NOT CURRENTLY ATLAS-MANAGED — this declaration is INCOMPLETE.           │
-// └─────────────────────────────────────────────────────────────────────────┘
-//
-// `project.apps` is listed in `exclude.txt`, so `atlas schema apply` ignores
-// it and the block below is inert. That is deliberate, and it must stay that
-// way until the block is completed, because the table really has SIX more
-// columns than are declared here — added by the runner's own self-heal in
-// `database/pg/mod.rs` and mirrored by qontinui-web's alembic revision
-// `project_apps_p1a_auto_fresh_fields`:
-//
-//   auth_required, red_threshold, yellow_threshold,
-//   update_strategy, build_command, start_command
-//
-// Un-excluding it against THIS block would make Atlas drop all six — live
-// fleet-fresh configuration. Completing it is not a mechanical edit either:
-// the table's two creators disagree on nullability (the `CREATE TABLE`
-// declares `auth_required BOOLEAN DEFAULT false`, the follow-up
-// `ADD COLUMN IF NOT EXISTS` declares it `NOT NULL`), so the live shape
-// depends on which ran first and there is no single correct desired state to
-// write down yet.
-//
-// Resolving it properly means (1) reconciling that nullability split, and
-// (2) a matching `ATLAS_OWNED_TABLES` entry in qontinui-web's alembic
-// `env.py` — a cross-repo change. Until then the exception is recorded by
-// name in `$ExcludedDeclarations` in `scripts/regen_exclude.ps1`, and
-// `scripts/check_pilot_consistency.ps1` fails CI if the table ever leaves
-// `exclude.txt` while this block is still the desired state.
-// ---------------------------------------------------------------
-
-table "apps" {
-  schema = schema.project
-  column "app_id" {
-    null = false
-    type = text
-  }
-  column "repo_root" {
-    null = false
-    type = text
-  }
-  column "ui_bridge_url" {
-    null = false
-    type = text
-  }
-  column "display_name" {
-    null = false
-    type = text
-  }
-  column "created_at_ms" {
-    null = false
-    type = bigint
-  }
-  column "last_seen_at_ms" {
-    null = false
-    type = bigint
-  }
-  primary_key {
-    columns = [column.app_id]
-  }
-  index "idx_apps_last_seen" {
-    on {
-      column = column.last_seen_at_ms
       desc   = true
     }
   }

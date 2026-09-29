@@ -24,14 +24,33 @@ export interface DrainBannerModel {
   detail: string | null;
   /** "3 deferred work items", or null when nothing has been deferred yet. */
   deferredLabel: string | null;
+  /**
+   * The restore note (review N3), or null when the state does not withhold
+   * anything. Rendered verbatim.
+   */
+  restoreNote: string | null;
 }
 
 /** The copy the UNKNOWN state must carry, verbatim (plan Phase 3). */
 export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused";
 
-export function deferredLabel(count: number): string | null {
+/**
+ * Review N3. While the drain holds, `terminal_session_list_open` withholds the
+ * RESTORABLE set, so a page whose only tabs are unrestored sessions shows no
+ * tab at all for the drain's duration — a blank grid that reads as lost work
+ * rather than as deferred work. The restore re-runs by itself when the drain
+ * lifts (`autonomousResumeDetector` → `drainResumeEpoch`); this line is what
+ * says so while the operator is looking at the gap.
+ */
+export const RESTORE_NOTE =
+  "saved session tabs are not restored while this holds — they come back when it lifts, nothing is lost";
+
+export function deferredLabel(count: number, capped = false): string | null {
   if (count <= 0) return null;
-  return `${count} deferred work item${count === 1 ? "" : "s"}`;
+  // At the backend's cap the count is a FLOOR, not a total — say so with a `+`
+  // rather than presenting it as the whole number.
+  const n = capped ? `${count}+` : `${count}`;
+  return `${n} deferred work item${count === 1 && !capped ? "" : "s"}`;
 }
 
 function formatUntil(until: string): string {
@@ -50,7 +69,8 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       status: "warning",
       heading: "Runner drained by coord — autonomous spawns deferred",
       detail: parts.length > 0 ? parts.join(" · ") : null,
-      deferredLabel: deferredLabel(s.deferredCount),
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: RESTORE_NOTE,
     };
   }
   // At boot the state is "not read yet" until the first drain read lands; that
@@ -61,7 +81,8 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       status: "error",
       heading: UNKNOWN_HEADING,
       detail: s.cause,
-      deferredLabel: deferredLabel(s.deferredCount),
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: RESTORE_NOTE,
     };
   }
   return null;
@@ -84,6 +105,14 @@ export function RunnerDrainBanner() {
           {model.deferredLabel ? `${model.deferredLabel} · ` : ""}
           your own new terminals, chats and steward starts still run
         </div>
+        {model.restoreNote && (
+          <div
+            className="text-[11px] leading-snug mt-0.5 opacity-80"
+            data-ui-bridge-id="terminal.runner-drain-banner.restore-note"
+          >
+            {model.restoreNote}
+          </div>
+        )}
       </StatusBanner>
     </div>
   );

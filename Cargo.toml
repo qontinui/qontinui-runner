@@ -13,6 +13,11 @@ members = [
     # [profile.*] overrides below.
     "crates/runner-stats",
     "crates/runner-win32",
+    # The per-pane PTY holder (plan
+    # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, D3 as
+    # decided 2026-09-28): a dedicated minimal binary plus the frame protocol
+    # and transport library both it and the runner link.
+    "crates/pty-holder",
 ]
 resolver = "2"
 

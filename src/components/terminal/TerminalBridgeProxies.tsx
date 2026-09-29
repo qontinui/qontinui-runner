@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { attachSubordinateBridgeInput } from "./subordinateBridgeRegistration";
-import { throwIfWriteFailed } from "./terminalWriteResult";
+import { readClipboardForPaste, throwIfWriteFailed } from "./terminalWriteResult";
 import { preparePasteData } from "./preparePaste";
 import { readBracketedPasteMode } from "./bracketedPasteById";
 import { hasMountedTerminalView } from "./mountedTerminalViews";
@@ -400,7 +400,9 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               // A capability that flickers with the viewport is worse than one
               // that is absent: automation written against it fails
               // intermittently and looks like a flake.
-              const text = await navigator.clipboard.readText().catch(() => "");
+              // A REJECTED read throws CLIPBOARD_READ_FAILED; only a genuinely
+              // empty clipboard is the zero-byte success below.
+              const text = await readClipboardForPaste();
               if (!text) return { success: true, bytes: 0 };
               const prepared = preparePasteData(
                 text,

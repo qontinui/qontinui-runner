@@ -1481,14 +1481,74 @@ fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bo
     caps
 }
 
+/// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
+/// `ci_node.repo_allowlist` entry, so coord's device selection can filter on
+/// the same allowlist the runner's admission enforces instead of electing a
+/// device that will only answer `cancelled: repo … not in … repo_allowlist`.
+///
+/// A NEW token rather than a reuse of `repo:<basename>`: that one is a WARMTH
+/// label ("a checkout is present", `ci_node_labels`), and it rides
+/// `ci_runner_labels`, which is omitted-when-empty and COALESCE'd coord-side —
+/// monotonic, so a removed allowlist entry could never be withdrawn. This token
+/// rides the AUTHORITATIVE `capabilities` vector, which is always sent.
+///
+/// Entries are emitted VERBATIM (an entry is either an `owner/name` slug or a
+/// bare basename, exactly as `ci_node::admission::repo_allowed` compares them),
+/// and coord matches `ci_repo:<slug>` OR `ci_repo:<basename>` — so a repo is
+/// electable exactly when admission would accept it. Normalising here (case,
+/// whitespace) would make coord elect a device admission then refuses.
+pub(crate) const CI_REPO_CAPABILITY_PREFIX: &str = "ci_repo:";
+
+/// Upper bound on `ci_repo:` tokens per heartbeat. The allowlist is
+/// operator-edited and rides every 30 s heartbeat into a JSONB column that
+/// coord's selection SQL `@>`-scans, so its size must not be whatever a
+/// settings file happens to hold. Entries past the cap are not advertised —
+/// coord cannot elect this device for them (admission would still accept), and
+/// the heartbeat logs that it truncated.
+pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
+
+/// Set once the truncation above has been logged, so it is logged once.
+static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
-/// `ci_node` leads (it is the coarse fleet-role flag the CI filters read);
-/// the probed host facts follow. Unit-tested without disk or subprocesses.
-fn build_device_capabilities(ci_node: bool, host: &[String]) -> Vec<String> {
-    let mut caps = Vec::with_capacity(host.len() + 1);
+/// `ci_node` leads (it is the coarse fleet-role flag the CI filters read),
+/// followed by one [`CI_REPO_CAPABILITY_PREFIX`] token per allowlist entry —
+/// both ONLY when CI-node mode is on, so turning it off retracts them together
+/// — and then the probed host facts. Empty and duplicate allowlist entries are
+/// dropped (an empty entry matches no repo, so it could elect nothing), and at
+/// most [`MAX_CI_REPO_CAPABILITIES`] tokens are emitted, in allowlist order.
+/// Unit-tested without disk or subprocesses.
+fn build_device_capabilities(
+    ci_node: bool,
+    repo_allowlist: &[String],
+    host: &[String],
+) -> Vec<String> {
+    let mut caps = Vec::with_capacity(host.len() + 1 + repo_allowlist.len());
     if ci_node {
         caps.push("ci_node".to_string());
+        let mut repo_tokens = 0usize;
+        for entry in repo_allowlist.iter().filter(|e| !e.is_empty()) {
+            let token = format!("{CI_REPO_CAPABILITY_PREFIX}{entry}");
+            if caps.contains(&token) {
+                continue;
+            }
+            if repo_tokens == MAX_CI_REPO_CAPABILITIES {
+                // Once per process: the heartbeat re-assembles this every 30 s,
+                // and the truncation is a standing property of the settings,
+                // not a new event each tick.
+                if !CI_REPO_CAP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "fleet: ci_node.repo_allowlist has more than {MAX_CI_REPO_CAPABILITIES} \
+                         distinct entries; advertising the first {MAX_CI_REPO_CAPABILITIES} only"
+                    );
+                }
+                break;
+            }
+            caps.push(token);
+            repo_tokens += 1;
+        }
     }
     caps.extend(host.iter().cloned());
     caps
@@ -1846,7 +1906,8 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     itself retractable, so a stale label set left behind by a device that
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let capabilities = build_device_capabilities(ci.enabled, &host_capabilities());
+    let capabilities =
+        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &host_capabilities());
     let ci_runner_labels = if ci.enabled {
         ci_node_labels()
     } else {
@@ -4510,12 +4571,32 @@ async fn request_and_apply_pull(
         "surface": "infra",
         "context": context,
     });
-    if let Some(t) = payload.tenant_id {
+    // ONE scope drives BOTH halves, so the body and the bearer cannot disagree.
+    //
+    // Caught by `a_body_that_declares_a_tenant_never_asserts_device_scope`
+    // (Phase 7(b)) on its first run: this statement used to declare
+    // `tenant_id` on the wire while asserting `TenantScope::Device`, i.e. "this
+    // row has no tenant dimension" and "here is its tenant" in the same breath.
+    // The old annotation excused it as "coord resolves per-publisher and reads
+    // no bearer" — true today, and exactly the reasoning D1 rejects: a fix to
+    // one half is a fix to one class, and coord's data-plane routes are stated
+    // to be moving to `require`. When that lands, a `Device` bearer beside a
+    // tenant-declaring body becomes a live mismatch rather than a quiet one.
+    //
+    // `for_bound_device_default`, not a fallback: a publisher that declares no
+    // tenant genuinely has no tenant dimension, so `Device` is the truth in
+    // that arm rather than a guess. A declared tenant becomes `Owned` only when
+    // this device can present its credential; otherwise the body would claim a
+    // tenant the bearer cannot back, so it is `Unresolved` and declares nothing.
+    let scope = crate::auth::TenantScope::for_bound_device_default(
+        payload.tenant_id,
+        &crate::auth::device_holds_usable_binding,
+    );
+    if let Some(t) = scope.declared_tenant() {
         body["tenant_id"] = serde_json::json!(t);
     }
     let url = format!("{base}/coord/trees/pull-decision");
-    // coord-tenant-scope(device): body already carries device_id and, when present, the publisher's own tenant_id (:2725-2727); coord resolves per-publisher and reads no bearer.
-    let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let resp = match crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope)
         .send()
         .await
     {
@@ -7062,7 +7143,11 @@ mod tests {",
     /// so a stale label set cannot be reached by any CI filter.
     #[test]
     fn heartbeat_always_sends_capabilities_but_omits_empty_ci_labels() {
-        let body = serde_json::to_value(heartbeat_payload_with_ci(Vec::new(), Vec::new())).unwrap();
+        // Assembled, not hand-built: CI-node mode OFF with a populated
+        // allowlist must still put `[]` on the wire — no `ci_node`, and no
+        // `ci_repo:` token either.
+        let caps = build_device_capabilities(false, &["qontinui/qontinui-runner".to_string()], &[]);
+        let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
             body.get("capabilities"),
             Some(&serde_json::json!([])),
@@ -7082,8 +7167,11 @@ mod tests {",
     /// matching.
     #[test]
     fn heartbeat_sends_host_capability_tokens_verbatim() {
-        let caps =
-            build_device_capabilities(true, &build_host_capabilities("windows", true, true, true));
+        let caps = build_device_capabilities(
+            true,
+            &[],
+            &build_host_capabilities("windows", true, true, true),
+        );
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
             body.get("capabilities"),
@@ -7280,17 +7368,109 @@ mod tests {",
     #[test]
     fn device_capabilities_advertise_host_facts_without_ci_node() {
         let host = build_host_capabilities("linux", true, false, false);
+        let allow = vec![
+            "qontinui/qontinui-runner".to_string(),
+            "qontinui-coord".to_string(),
+        ];
         assert_eq!(
-            build_device_capabilities(false, &host),
+            build_device_capabilities(false, &allow, &host),
             vec!["os:linux", "shell:powershell"],
-            "host facts must be advertised with CI-node mode DISABLED"
+            "host facts must be advertised with CI-node mode DISABLED — and \
+             an allowlist must advertise NO ci_repo: token while it is off, \
+             or coord would keep electing a device that has left the lane"
         );
         assert_eq!(
-            build_device_capabilities(true, &host),
+            build_device_capabilities(true, &[], &host),
             vec!["ci_node", "os:linux", "shell:powershell"],
             "CI-node mode adds the bare ci_node token, it does not replace \
              the host facts"
         );
+        assert_eq!(
+            build_device_capabilities(true, &allow, &host),
+            vec![
+                "ci_node",
+                "ci_repo:qontinui/qontinui-runner",
+                "ci_repo:qontinui-coord",
+                "os:linux",
+                "shell:powershell"
+            ],
+            "CI-node mode advertises one verbatim ci_repo: token per allowlist \
+             entry, between ci_node and the host facts"
+        );
+    }
+
+    /// Empty and duplicate allowlist entries advertise nothing extra, and
+    /// entries ride VERBATIM — coord matches the slug or the basename exactly
+    /// as `admission::repo_allowed` does, so no normalisation here.
+    #[test]
+    fn ci_repo_tokens_skip_empty_and_duplicate_entries_and_stay_verbatim() {
+        let allow = vec![
+            "qontinui-runner".to_string(),
+            String::new(),
+            "qontinui-runner".to_string(),
+            "Qontinui/Qontinui-Web".to_string(),
+        ];
+        assert_eq!(
+            build_device_capabilities(true, &allow, &[]),
+            vec![
+                "ci_node",
+                "ci_repo:qontinui-runner",
+                "ci_repo:Qontinui/Qontinui-Web"
+            ]
+        );
+    }
+
+    /// The token set and admission agree: every repo admission accepts is
+    /// named by a token coord can match (slug or basename), and one it
+    /// rejects is named by none.
+    ///
+    /// The `electable` predicate below is the RUNNER-side restatement of
+    /// coord's selection filter (plan
+    /// `2026-09-27-ci-node-shadow-dispatch-never-passes-checkout-race-lost-leases-unfiltered-selection`
+    /// Phase 4c: `capabilities @> ['ci_repo:' || slug] OR
+    /// capabilities @> ['ci_repo:' || basename]` in `select_ci_node_device`).
+    /// Changing the token shape here without changing that SQL, or the reverse,
+    /// makes devices unelectable for repos they accept.
+    #[test]
+    fn ci_repo_tokens_match_exactly_what_admission_accepts() {
+        let allow = vec![
+            "qontinui/qontinui-runner".to_string(),
+            "qontinui-coord".to_string(),
+        ];
+        let caps = build_device_capabilities(true, &allow, &[]);
+        for repo in [
+            "qontinui/qontinui-runner",
+            "qontinui/qontinui-coord",
+            "qontinui/qontinui-web",
+        ] {
+            let basename = crate::agent_runtime::local_repo_name(repo);
+            let electable = caps.iter().any(|c| {
+                c == &format!("{CI_REPO_CAPABILITY_PREFIX}{repo}")
+                    || c == &format!("{CI_REPO_CAPABILITY_PREFIX}{basename}")
+            });
+            assert_eq!(
+                electable,
+                crate::ci_node::admission::repo_allowed(&allow, repo),
+                "coord's electability of {repo} must equal admission's verdict"
+            );
+        }
+    }
+
+    /// A huge allowlist is capped, in order, and duplicates do not consume the
+    /// budget.
+    #[test]
+    fn ci_repo_tokens_are_capped() {
+        let mut allow: Vec<String> = vec!["dup".to_string(), "dup".to_string()];
+        allow.extend((0..100).map(|i| format!("repo-{i}")));
+        let caps = build_device_capabilities(true, &allow, &["os:linux".to_string()]);
+        let repo_caps: Vec<&String> = caps
+            .iter()
+            .filter(|c| c.starts_with(CI_REPO_CAPABILITY_PREFIX))
+            .collect();
+        assert_eq!(repo_caps.len(), MAX_CI_REPO_CAPABILITIES);
+        assert_eq!(repo_caps[0], "ci_repo:dup");
+        assert_eq!(repo_caps[1], "ci_repo:repo-0");
+        assert_eq!(caps.last().map(String::as_str), Some("os:linux"));
     }
 
     /// With nothing probed and CI-node mode off the set is empty — and an
@@ -7299,7 +7479,11 @@ mod tests {",
     /// which is what lets coord's write-through retract a capability.
     #[test]
     fn device_capabilities_can_be_empty() {
-        assert!(build_device_capabilities(false, &[]).is_empty());
+        assert!(build_device_capabilities(false, &[], &[]).is_empty());
+        assert!(
+            build_device_capabilities(false, &["qontinui-runner".to_string()], &[]).is_empty(),
+            "an allowlist alone, with CI-node mode off, advertises nothing"
+        );
     }
 
     /// Cache invariant: two back-to-back calls agree, and the OS fact is

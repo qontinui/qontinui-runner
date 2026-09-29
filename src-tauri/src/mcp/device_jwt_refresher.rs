@@ -2155,8 +2155,9 @@ pub enum BindingGapReport {
 /// served by the legacy `access_token` slot, so it is not a gap even with no
 /// `device_jwt:<t>` entry (see [`crate::auth::select_device_bearer`]).
 ///
-/// **No mint.** This function reports; it does not act. Seeding a gap is
-/// Phase 4 and a separate PR.
+/// **No mint.** This function reports; it does not act. Phase 4 ASKS the
+/// operator about a gap ([`ask_bound_tenant_gaps`]); a headless seed is the
+/// plan's Phase 6/7 and does not exist yet.
 pub(crate) fn resolve_binding_gaps(
     tenant_slots: Option<&[uuid::Uuid]>,
     default_binding: crate::auth::BindingTenantRead,
@@ -2230,6 +2231,540 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
         .lock()
         .expect("binding gaps poisoned")
         .clone()
+}
+
+// ===========================================================================
+// ASKING FOR A BOUND TENANT'S SLOT — D3 (plan
+// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+// Phase 4, as revised by its "Review findings from the route-around"
+// section). Consumes Phase 3's [`BindingGapReport`] above.
+//
+// ## Why this module never seeds a slot itself
+//
+// Phase 4 as first written had an "Arm A": when a stored Cognito refresh
+// token was in window, run `pair-cli` headlessly with the GAP's tenant id.
+// It was removed before it shipped, because coord's pairing write
+// (`record_pairing`, shared by `pair-cli` and `pair-complete`) does two
+// things no refresher may do on its own:
+//
+// 1. it rewrites `coord.devices.tenant_id` to the requested tenant — the
+//    device's HOME pointer, which `machine-credential/exchange` mints for —
+//    so seeding non-default tenant B would make the default tenant's own
+//    recovery mint B and be refused as `TenantMismatch`;
+// 2. it UPSERTS `coord.tenant_devices`, so a coord-side unbind would be
+//    silently reversed by the next pass that still believed the binding.
+//
+// The safe headless seed is a coord door that mints for an EXISTING binding
+// without touching either (the plan's Phase 6), consumed here by Phase 7.
+// Until then a measured gap is answered by ONE durable ask per tenant per
+// lapse. Coord finding `f2dce2cb-b7a8-473b-b1bf-f5631954427b` records the
+// decision and how to reverse it — do not reverse it by calling `pair-cli`.
+//
+// ## The ask is the RECORD, not the event
+//
+// Tauri `emit` has no replay and nothing guarantees a listener at emit time,
+// so an ask that exists only as an event is spent on nobody. The persisted
+// lapse record (`binding_gap_asks.json`) IS the ask: it carries the reason,
+// [`open_binding_gap_asks`] serves it to the UI by pull
+// (`get_binding_gap_asks`), and [`AUTONOMY_BINDING_GAP_EVENT`] is only a
+// nudge to re-read.
+//
+// ## And never on UNKNOWN, nor on a sidecar too stale to act on
+//
+// Only a MEASURED `Gaps(..)` built from a sidecar inside
+// [`qontinui_runner_lib::pair::BINDING_GAP_ASK_MAX_AGE_SECS`] may open an
+// ask. Anything else asks nobody and does not touch the lapse record: a
+// silence must not close a lapse any more than it may open one.
+// ===========================================================================
+
+/// Frontend NUDGE: the set of open binding-gap asks changed, re-read it with
+/// the `get_binding_gap_asks` command. Carries `{tenant_id, open}` for
+/// logging only — the UI must not build state from the event, because an
+/// event emitted before its listener registered is lost.
+///
+/// Its own event, not [`AUTONOMY_CREDENTIAL_DARK_EVENT`]: that one holds ONE
+/// signal per *authority*, while this is one ask per *tenant*.
+pub const AUTONOMY_BINDING_GAP_EVENT: &str = "autonomy-binding-gap";
+
+/// Why the operator is asked rather than the runner seeding the slot itself.
+/// Stored on the record and shown verbatim.
+pub(crate) const BINDING_GAP_ASK_REASON: &str = "no headless path can seed this tenant's \
+     credential safely: coord's pairing door (pair-cli) also re-points this device's home \
+     tenant and re-creates the binding, so the runner will not run it unattended";
+
+/// What the heal command also does, stated on every ask. Pairing goes
+/// through coord's `record_pairing`, which makes the paired tenant this
+/// device's home (`coord.devices.tenant_id`), and qontinui-web rotates the
+/// device's single machine key to it.
+pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
+     device's home tenant in coord and rotates its machine key to it — that is how \
+     pairing works until coord offers a per-binding seed door";
+
+/// One tenant's state within the CURRENT lapse — the record that makes
+/// "exactly once" survive a restart, and the ask the UI reads back.
+///
+/// A *lapse* is one contiguous episode of a tenant being reported as a gap. It
+/// opens when a MEASURED, act-grade report first names the tenant and closes
+/// when a MEASURED report stops naming it. An `Unknown` report closes nothing.
+///
+/// Unknown fields are ignored on read, so a record written by the pre-review
+/// build (which also carried `mint_attempted`) still loads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GapAskRecord {
+    /// True once the ask for this tenant in this lapse has been RECORDED —
+    /// which, since the record is what the UI reads, is the same as asked.
+    #[serde(default)]
+    pub notified: bool,
+    /// Unix seconds when this lapse was first observed.
+    #[serde(default)]
+    pub first_seen: i64,
+    /// The operator-facing reason, stored so the pull path can render the
+    /// ask without re-deriving it.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// The on-disk lapse record, keyed by stringified tenant UUID.
+///
+/// A SIDECAR beside `paired_user.json` and `coord_bound_tenants.json`: it is
+/// neither a binding nor a credential, nothing selects a slot from it, and a
+/// corrupt or absent one degrades to "nobody has been asked yet".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GapAskState {
+    /// The paired account (`paired_user.json` `user_id`) the asks were
+    /// recorded for. Asks are never served to, or carried over into, another
+    /// account: a record whose owner differs from the current account is
+    /// discarded whole before a pass and served as nothing.
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub tenants: std::collections::BTreeMap<String, GapAskRecord>,
+}
+
+impl GapAskState {
+    fn record(&self, tenant: &uuid::Uuid) -> Option<&GapAskRecord> {
+        self.tenants.get(&tenant.to_string())
+    }
+
+    fn entry(&mut self, tenant: &uuid::Uuid, now: i64) -> &mut GapAskRecord {
+        self.tenants
+            .entry(tenant.to_string())
+            .or_insert(GapAskRecord {
+                notified: false,
+                first_seen: now,
+                reason: String::new(),
+            })
+    }
+
+    /// Close every lapse the MEASURED report no longer names, and report which
+    /// tenants were closed. Called only on a measured report.
+    fn close_lapses_not_in(&mut self, gaps: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+        let live: std::collections::HashSet<String> = gaps.iter().map(|t| t.to_string()).collect();
+        let closed: Vec<String> = self
+            .tenants
+            .keys()
+            .filter(|k| !live.contains(*k))
+            .cloned()
+            .collect();
+        for k in &closed {
+            self.tenants.remove(k);
+        }
+        closed
+            .iter()
+            .filter_map(|k| uuid::Uuid::parse_str(k).ok())
+            .collect()
+    }
+}
+
+/// Where the lapse record lives: beside `paired_user.json` and
+/// `coord_bound_tenants.json`, in whichever storage dir THIS process resolves.
+pub(crate) fn binding_gap_ask_path() -> Option<std::path::PathBuf> {
+    qontinui_runner_lib::pair::coord_bound_tenants_path()
+        .map(|p| p.with_file_name("binding_gap_asks.json"))
+}
+
+/// Read the lapse record. FAIL-SOFT in exactly one direction: an absent,
+/// unreadable or malformed file reads as "nobody has been asked yet", so the
+/// worst a corrupt record can do is ask the operator one extra time.
+pub(crate) fn load_gap_ask_state(path: &std::path::Path) -> GapAskState {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            warn!(
+                "device_jwt_refresher: {} is unreadable ({e}) — treating every lapse as \
+                 not-yet-asked",
+                path.display()
+            );
+            GapAskState::default()
+        }),
+        Err(_) => GapAskState::default(),
+    }
+}
+
+/// Persist the lapse record. Best-effort: a write failure only costs a repeat
+/// ask after a restart, and must never fail the pass.
+pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) {
+    let body = match serde_json::to_vec_pretty(state) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("device_jwt_refresher: serialize binding_gap_asks.json failed: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(
+                "device_jwt_refresher: mkdir {} failed: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    // Its own tmp name — never the one `write_paired_user_file` or
+    // `record_coord_bound_tenants_at` use.
+    // Per-process, so two runner processes sharing a storage dir cannot
+    // interleave writes through one temp file.
+    let tmp = path.with_extension(format!("json.gap-ask.{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        warn!("device_jwt_refresher: write {} failed: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        warn!(
+            "device_jwt_refresher: rename {} failed: {e}",
+            path.display()
+        );
+    }
+}
+
+/// The MEASURED gap set, or `None` when the report established nothing.
+pub(crate) fn measured_gaps(report: &BindingGapReport) -> Option<Vec<uuid::Uuid>> {
+    match report {
+        BindingGapReport::Unknown(_) => None,
+        BindingGapReport::Gaps(ids) => Some(
+            ids.iter()
+                .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                .collect(),
+        ),
+    }
+}
+
+/// The ask's payload. Pure, so the gate can assert what the operator is shown.
+///
+/// It names WHICH tenant, WHICH detector fired, WHY a human is needed, and the
+/// ONE door that heals it — the same command `SPAWN_TENANT_PAIRING_HINT`
+/// already points refused sessions at.
+pub(crate) fn binding_gap_ask_payload(
+    tenant: &uuid::Uuid,
+    reason: &str,
+    first_seen: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tenant_id": tenant.to_string(),
+        "detector": "binding_gaps",
+        "reason": reason,
+        "message": format!(
+            "This device is bound to tenant {tenant} but holds no credential for it. \
+             Pair it once to restore autonomous sessions for this tenant."
+        ),
+        "cta": "device_pair_tenant",
+        "command": format!("qontinui_profile device pair --tenant-id {tenant}"),
+        // Said, not hidden: the heal is the SAME coord pairing write the
+        // runner refuses to run unattended, so a human running it should know
+        // what it moves. The plan's Phase 6 door removes this caveat.
+        "caveat": BINDING_GAP_PAIR_CAVEAT,
+        "first_seen": first_seen,
+    })
+}
+
+/// Every OPEN ask on disk that is STILL TRUE, as the payloads the UI renders —
+/// the PULL half of the ask. Sorted by tenant id.
+///
+/// `bound` is coord's bound set read under the ask window
+/// ([`qontinui_runner_lib::pair::coord_bound_tenants_for_ask`]). An ask
+/// outlives the pass that recorded it, so without this re-check an ask opened
+/// on a fresh sidecar would keep telling the operator to re-pair a tenant coord
+/// has since UNBOUND while the heartbeat was down — re-creating the binding the
+/// unbind removed. So: an `Unknown` bound set returns `None` (UNKNOWN, the UI
+/// shows nothing), and a known one keeps only tenants still in it.
+///
+/// `tenant_slots` is this box's slot enumeration: a tenant that now HOLDS a
+/// slot (a human paired it) is no longer asked about, even before the next
+/// refresher pass closes its lapse. An unreadable store (`None`) is UNKNOWN.
+///
+/// `account` is [`binding_gap_ask_account`]: a signed-out box serves no asks
+/// (`None`), and a record written for ANOTHER account serves nothing
+/// (`Some([])`) — asks never cross an account switch.
+pub(crate) fn open_binding_gap_asks(
+    path: &std::path::Path,
+    bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    account: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    let account = account?;
+    let qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(bound) = bound else {
+        return None;
+    };
+    let slots = tenant_slots?;
+    let state = load_gap_ask_state(path);
+    if state.account.as_deref() != Some(account) {
+        return Some(Vec::new());
+    }
+    Some(
+        state
+            .tenants
+            .iter()
+            .filter(|(_, r)| r.notified)
+            .filter_map(|(k, r)| {
+                let tenant = uuid::Uuid::parse_str(k).ok()?;
+                let reason = if r.reason.is_empty() {
+                    BINDING_GAP_ASK_REASON
+                } else {
+                    r.reason.as_str()
+                };
+                (bound.contains(&tenant) && !slots.contains(&tenant))
+                    .then(|| binding_gap_ask_payload(&tenant, reason, r.first_seen))
+            })
+            .collect(),
+    )
+}
+
+/// Forget the evidence behind every ask — for a full sign-out or a
+/// credential-store reset, after which the recorded tenants may belong to
+/// another account.
+///
+/// BOTH files go: the ask record, and the heartbeat's
+/// `coord_bound_tenants.json`. Deleting only the asks is not enough — with the
+/// slots cleared, the next pass would read every non-default bound tenant of
+/// the departed account as a gap and re-open its ask for whoever signs in
+/// next. With the sidecar gone the bound set is UNKNOWN (never "no gaps") — but
+/// only until the next heartbeat, which rewrites it WITHOUT a credential
+/// (coord's register echo lists the device's bindings). The lasting guard is
+/// [`binding_gap_ask_account`]: a signed-out box asks nobody, and a record is
+/// only ever served to the account that owns it. Deleting the files here only
+/// keeps the window before that clean. What is NOT solved in the runner: the
+/// device-level bound set can still name a tenant a PREVIOUS account left bound
+/// to this device, and the next account may be asked about it — that is a
+/// coord-side binding cleanup, recorded in the plan.
+/// Best-effort; an absent file is already forgotten.
+pub(crate) fn forget_binding_gap_evidence() {
+    if let (Some(asks), Some(sidecar)) = (
+        binding_gap_ask_path(),
+        qontinui_runner_lib::pair::coord_bound_tenants_path(),
+    ) {
+        forget_binding_gap_evidence_at(&asks, &sidecar);
+    }
+}
+
+pub(crate) fn forget_binding_gap_evidence_at(asks: &std::path::Path, sidecar: &std::path::Path) {
+    for path in [asks, sidecar] {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "device_jwt_refresher: could not remove {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// What one ask pass did, per tenant. Returned rather than applied so the gate
+/// can drive several passes — and simulated restarts — and count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GapAction {
+    /// The ask for this tenant was RECORDED — once in this lapse.
+    Notified {
+        tenant: uuid::Uuid,
+        payload: serde_json::Value,
+    },
+    /// Already asked in this lapse.
+    Silent(uuid::Uuid),
+    /// A MEASURED report stopped naming this tenant: the lapse closed and its
+    /// record was cleared. `slot_now_held` says whether the reason is that a
+    /// credential for it now exists (a human paired it) — in which case the
+    /// tenant's upstream-rejection streak, earned by the credential it
+    /// REPLACED, is spent evidence and must be reset.
+    LapseClosed {
+        tenant: uuid::Uuid,
+        slot_now_held: bool,
+    },
+}
+
+/// Run one ask pass over an act-grade binding-gap report.
+///
+/// `tenant_slots` is the slot enumeration the report was built from; it only
+/// decides `slot_now_held` on a closing lapse. Path-parameterised so the gate
+/// can drive it hermetically; the production wrapper is
+/// [`ask_bound_tenant_gaps`].
+///
+/// This function makes NO network call and writes NO credential — see the
+/// module note on why the runner never seeds a slot itself.
+pub(crate) fn ask_bound_tenant_gaps_at(
+    state_path: &std::path::Path,
+    ask_report: &BindingGapReport,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    account: Option<&str>,
+    now: i64,
+) -> Vec<GapAction> {
+    // No signed-in, paired account (see [`binding_gap_ask_account`]): there is
+    // nobody to ask on behalf of, and the record is left exactly as it is.
+    let Some(account) = account.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Vec::new();
+    };
+    // THE UNKNOWN GATE. A report that established nothing — or one built from
+    // a sidecar too stale to act on — asks nobody and changes no record.
+    let Some(gaps) = measured_gaps(ask_report) else {
+        return Vec::new();
+    };
+
+    let mut state = load_gap_ask_state(state_path);
+    // A record written for ANOTHER account is discarded whole — its lapses are
+    // that account's, and must neither be served to this one nor suppress this
+    // account's own first ask.
+    if state.account.as_deref() != Some(account) {
+        state = GapAskState {
+            account: Some(account.to_string()),
+            tenants: Default::default(),
+        };
+    }
+    let mut actions: Vec<GapAction> = state
+        .close_lapses_not_in(&gaps)
+        .into_iter()
+        .map(|tenant| GapAction::LapseClosed {
+            tenant,
+            slot_now_held: tenant_slots.is_some_and(|s| s.contains(&tenant)),
+        })
+        .collect();
+
+    for tenant in gaps {
+        if state.record(&tenant).is_some_and(|r| r.notified) {
+            actions.push(GapAction::Silent(tenant));
+            continue;
+        }
+        let first_seen = {
+            let rec = state.entry(&tenant, now);
+            rec.notified = true;
+            rec.reason = BINDING_GAP_ASK_REASON.to_string();
+            rec.first_seen
+        };
+        warn!(
+            "device_jwt_refresher: asking the operator ONCE to pair bound tenant {tenant} \
+             (detector: binding_gaps) — {BINDING_GAP_ASK_REASON}"
+        );
+        actions.push(GapAction::Notified {
+            tenant,
+            payload: binding_gap_ask_payload(&tenant, BINDING_GAP_ASK_REASON, first_seen),
+        });
+    }
+
+    save_gap_ask_state(state_path, &state);
+    actions
+}
+
+/// Is anyone signed in on this box, as far as asking goes? True iff the box
+/// holds ANY device credential — the legacy default slot or a per-tenant slot.
+///
+/// A full sign-out (`sign_out_full`, `reset_credential_store`) clears every
+/// slot, but the heartbeat keeps rewriting `coord_bound_tenants.json` without a
+/// credential (coord's register echo lists the DEVICE's bindings), so the bound
+/// set comes straight back. Without this gate the next pass — slots now empty —
+/// would read every non-default bound tenant as a gap and ask, on a signed-out
+/// box, about the departed account's tenants.
+pub(crate) fn binding_gap_asks_permitted(
+    legacy_slot_present: bool,
+    tenant_slots: Option<&[uuid::Uuid]>,
+) -> bool {
+    legacy_slot_present || tenant_slots.is_some_and(|s| !s.is_empty())
+}
+
+/// The account asks are recorded for and served to: the paired user
+/// (`paired_user.json` `user_id`) — but only while the box is signed in (see
+/// [`binding_gap_asks_permitted`]). `None` means nobody to ask on behalf of.
+pub(crate) fn binding_gap_ask_account(
+    legacy_slot_present: bool,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    paired_user: Option<String>,
+) -> Option<String> {
+    if !binding_gap_asks_permitted(legacy_slot_present, tenant_slots) {
+        return None;
+    }
+    paired_user
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Production wrapper: resolve the lapse-record path and run one ask pass.
+pub(crate) fn ask_bound_tenant_gaps(
+    ask_report: &BindingGapReport,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    account: Option<&str>,
+    now: i64,
+) -> Vec<GapAction> {
+    if account.is_none() {
+        return Vec::new();
+    }
+    let Some(gaps) = measured_gaps(ask_report) else {
+        return Vec::new();
+    };
+    let Some(state_path) = binding_gap_ask_path() else {
+        warn!(
+            "device_jwt_refresher: could not resolve the binding-gap lapse record path — \
+             no ask recorded this pass"
+        );
+        return Vec::new();
+    };
+    // Nothing at all to do: no gap, and no stale lapse record to close.
+    if gaps.is_empty() && load_gap_ask_state(&state_path).tenants.is_empty() {
+        return Vec::new();
+    }
+    ask_bound_tenant_gaps_at(&state_path, ask_report, tenant_slots, account, now)
+}
+
+/// Apply a pass's side effects: reset the rejection streak of every tenant
+/// whose lapse closed because it now holds a slot (review MAJOR 3 — without
+/// this a pinned tenant's stale 401 streak survives the new credential and
+/// publishes `dark` over it), then nudge the UI to re-read the open asks.
+///
+/// Returns the tenants whose streak was reset, so the gate can assert it.
+///
+/// Bounded, not total: a gap that opened and healed while the sidecar was too
+/// stale to act on never had a lapse record, so no reset fires here — the
+/// first accepted request on the new credential still resets the streak
+/// through `note_coord_upstream_verdict`.
+fn settle_binding_gap_actions(
+    app: Option<&tauri::AppHandle>,
+    actions: &[GapAction],
+) -> Vec<uuid::Uuid> {
+    let mut reset = Vec::new();
+    for action in actions {
+        if let GapAction::LapseClosed {
+            tenant,
+            slot_now_held: true,
+        } = action
+        {
+            reset_upstream_rejections_for(Some(*tenant));
+            reset.push(*tenant);
+        }
+    }
+    if let Some(app) = app {
+        for action in actions {
+            let nudge = match action {
+                GapAction::Notified { tenant, .. } => Some((tenant, true)),
+                GapAction::LapseClosed { tenant, .. } => Some((tenant, false)),
+                GapAction::Silent(_) => None,
+            };
+            if let Some((tenant, open)) = nudge {
+                let payload = serde_json::json!({"tenant_id": tenant.to_string(), "open": open});
+                if let Err(e) = app.emit(AUTONOMY_BINDING_GAP_EVENT, payload) {
+                    warn!(
+                        "device_jwt_refresher: failed to emit {AUTONOMY_BINDING_GAP_EVENT} \
+                         for tenant {tenant}: {e} (the ask stays readable by pull)"
+                    );
+                }
+            }
+        }
+    }
+    reset
 }
 
 /// Compose the two reads into a writable-key set, ABORTING on any UNKNOWN.
@@ -2362,6 +2897,17 @@ struct SweepInputs {
     /// already gathered here so none of it runs on the async executor. Feeds
     /// [`resolve_binding_gaps`] only — nothing destructive reads it.
     coord_bound_tenants: qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    /// The SAME sidecar read under the tighter
+    /// [`qontinui_runner_lib::pair::BINDING_GAP_ASK_MAX_AGE_SECS`] window. The
+    /// report above may be up to 24 h old and says so; an ASK may only be
+    /// driven by a record a live heartbeat would have refreshed, or a
+    /// coord-side unbind since then would be read as "bound" and the operator
+    /// asked to re-create it.
+    coord_bound_tenants_for_ask: qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    /// Whether the legacy `access_token` slot holds anything — half of the
+    /// signed-in gate [`binding_gap_asks_permitted`]. Read in this blocking
+    /// hop with the rest.
+    legacy_slot_present: bool,
 }
 
 /// Blocking: reads the slot store, `paired_user.json`, `machine.json` and the
@@ -2372,6 +2918,11 @@ fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
         default_binding: crate::auth::default_binding_tenant_probe(),
         machine_pin: crate::session::tenant_pin::resolve_tenant_pin(),
         coord_bound_tenants: qontinui_runner_lib::pair::coord_bound_tenants(),
+        coord_bound_tenants_for_ask: qontinui_runner_lib::pair::coord_bound_tenants_for_ask(),
+        legacy_slot_present: auth_manager
+            .get_access_token()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false),
     }
 }
 
@@ -2471,6 +3022,17 @@ fn binding_gaps_from(inputs: &SweepInputs) -> BindingGapReport {
         inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
         inputs.default_binding,
         &inputs.coord_bound_tenants,
+    )
+}
+
+/// Pure: the act-grade twin of [`binding_gaps_from`] — the same composition
+/// over the sidecar read under the ask window. Feeds
+/// [`ask_bound_tenant_gaps`] only; the published report is unchanged.
+fn ask_gaps_from(inputs: &SweepInputs) -> BindingGapReport {
+    resolve_binding_gaps(
+        inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
+        inputs.default_binding,
+        &inputs.coord_bound_tenants_for_ask,
     )
 }
 
@@ -4081,9 +4643,33 @@ async fn refresher_loop(
         // so a tenant bound with NO slot is structurally invisible to it.
         // Composed here, from the SAME blocking-pool read, and published
         // BEFORE the pass so the health snapshot it publishes carries this
-        // pass's answer. Report only — no mint is attempted for a gap; that
-        // is Phase 4 (`seed_a_bound_tenants_slot`), a separate change.
-        publish_binding_gaps(binding_gaps_from(&sweep_inputs));
+        // pass's answer.
+        let gap_report = binding_gaps_from(&sweep_inputs);
+        publish_binding_gaps(gap_report.clone());
+        // D3 (Phase 4, as revised by the route-around review): act on that
+        // report by ASKING the operator once per tenant per lapse — never by
+        // minting. The ask is driven by the act-grade twin of the report (a
+        // sidecar inside BINDING_GAP_ASK_MAX_AGE_SECS), is persisted, and is
+        // read back by the UI through `get_binding_gap_asks`; the event below
+        // is only a nudge. A lapse that closes because a slot now exists
+        // resets that tenant's stale rejection streak.
+        let slots_now = sweep_inputs
+            .tenant_slots
+            .as_ref()
+            .ok()
+            .map(|v| v.as_slice());
+        let gap_actions = ask_bound_tenant_gaps(
+            &ask_gaps_from(&sweep_inputs),
+            slots_now,
+            binding_gap_ask_account(
+                sweep_inputs.legacy_slot_present,
+                slots_now,
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+            )
+            .as_deref(),
+            chrono::Utc::now().timestamp(),
+        );
+        settle_binding_gap_actions(Some(&api_state.app_handle), &gap_actions);
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
@@ -8132,6 +8718,8 @@ mod tenant_slot_refresh_tests {
             default_binding: crate::auth::BindingTenantRead::Bound(bound),
             machine_pin: TenantPin::Pinned(pinned),
             coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
         };
         let pins = inputs.posture_pin_inputs();
         assert_eq!(
@@ -8177,6 +8765,8 @@ mod tenant_slot_refresh_tests {
             default_binding: crate::auth::BindingTenantRead::Bound(bound),
             machine_pin: TenantPin::Pinned(pinned),
             coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8496,6 +9086,8 @@ mod tenant_slot_refresh_tests {
             default_binding: crate::auth::BindingTenantRead::Bound(a),
             machine_pin: crate::session::tenant_pin::TenantPin::Pinned(a),
             coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
         };
         assert!(matches!(
             writable_slot_keys_from(&unreadable),
@@ -8506,6 +9098,8 @@ mod tenant_slot_refresh_tests {
             default_binding: crate::auth::BindingTenantRead::Unbound,
             machine_pin: crate::session::tenant_pin::TenantPin::Unresolvable,
             coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
         };
         assert_eq!(
             writable_slot_keys_from(&readable),
@@ -9312,6 +9906,8 @@ mod tenant_slot_refresh_tests {
             default_binding: crate::auth::BindingTenantRead::Unbound,
             machine_pin: crate::session::tenant_pin::TenantPin::Pinned(held),
             coord_bound_tenants: CoordBoundTenantsRead::Known(vec![held, bound_only]),
+            coord_bound_tenants_for_ask: CoordBoundTenantsRead::Known(vec![held, bound_only]),
+            legacy_slot_present: false,
         };
         assert_eq!(
             binding_gaps_from(&inputs),
@@ -9377,6 +9973,667 @@ mod tenant_slot_refresh_tests {
             "UNKNOWN must reach the doctor as UNKNOWN, never as an empty gap list"
         );
         assert!(cap.mint_attempts.lock().unwrap().is_empty());
+    }
+
+    // =======================================================================
+    // Phase 4 — asking for a bound tenant's slot (D3), as revised by the
+    // route-around review (plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
+    // "Review findings from the route-around"). Every test here is hermetic:
+    // a per-test lapse-record path, no network, no `~/.qontinui`.
+    // =======================================================================
+
+    /// A fresh, per-test lapse-record path. Never the real
+    /// `binding_gap_ask_path()` — these tests must not touch the operator's
+    /// box.
+    fn gap_state_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("qontinui_test_gap_asks")
+            .join(format!("{name}_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join("binding_gap_asks.json")
+    }
+
+    fn gaps(ids: &[uuid::Uuid]) -> BindingGapReport {
+        BindingGapReport::Gaps(ids.iter().map(|t| t.to_string()).collect())
+    }
+
+    /// The paired account every ask test records under.
+    const ACCT: &str = "acct-a";
+
+    fn known(ids: &[uuid::Uuid]) -> qontinui_runner_lib::pair::CoordBoundTenantsRead {
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(ids.to_vec())
+    }
+
+    fn notified(actions: &[GapAction]) -> Vec<&serde_json::Value> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                GapAction::Notified { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Write a `coord_bound_tenants.json` sidecar observed `age_secs` ago.
+    fn write_sidecar(
+        dir: &std::path::Path,
+        ids: &[uuid::Uuid],
+        observed_at: i64,
+    ) -> std::path::PathBuf {
+        let path = dir.join("coord_bound_tenants.json");
+        let body = serde_json::json!({
+            "tenant_ids": ids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "observed_at": observed_at,
+        });
+        std::fs::write(&path, body.to_string()).expect("write sidecar");
+        path
+    }
+
+    /// REVIEW MAJOR 1 (and the headless half of MAJOR 2) — the runner never
+    /// runs `pair-cli` to seed a bound tenant's slot. Coord's pairing write
+    /// re-points `coord.devices.tenant_id` and upserts `coord.tenant_devices`,
+    /// so a headless per-tenant pair would move this device's home tenant and
+    /// silently undo a coord-side unbind. The only `pair-cli` call in this
+    /// module is the pre-existing default-tenant refresh in
+    /// [`try_refresh_once`]; a second one is the removed Arm A coming back.
+    /// Reverse only through the coord door the plan's Phase 6 specifies —
+    /// coord finding `f2dce2cb-b7a8-473b-b1bf-f5631954427b`.
+    #[test]
+    fn no_headless_pair_cli_seeds_a_bound_tenants_slot() {
+        let src = include_str!("device_jwt_refresher.rs");
+        // Every CODE line naming the pairing entry points — a qualified call,
+        // an import, or the `pair_with_auth_token` wrapper — not one spelling.
+        // Comment lines and string literals are skipped; the needle is split
+        // so this test does not count itself.
+        let needle = concat!("pair_with_auth", "_token");
+        let calls: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('"'))
+            .filter(|l| l.contains(needle))
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{calls:?}: exactly one pair-cli call site (try_refresh_once, the default \
+             tenant) — a second one re-introduces the headless per-tenant seed the \
+             route-around review removed (it re-points coord.devices.tenant_id and \
+             re-creates bindings)"
+        );
+        assert!(
+            calls[0].starts_with(concat!(
+                "qontinui_runner_lib::pair::",
+                "pair_with_auth",
+                "_token_with_ids("
+            )),
+            "the one call is try_refresh_once's: {calls:?}"
+        );
+        // Nor the other pairing entry points, which also end in coord's
+        // `record_pairing` (pair-code and browser pairing).
+        for other in [
+            concat!("pair_with_pair", "_code"),
+            concat!("pair_via", "_browser"),
+        ] {
+            assert!(
+                !src.lines()
+                    .map(str::trim_start)
+                    .any(|l| !l.starts_with("//") && l.contains(other)),
+                "the refresher must not call {other} — it re-points coord.devices.tenant_id"
+            );
+        }
+        // Nor a hand-rolled request to the route: production code (everything
+        // before the first test module) never names it.
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split");
+        let route = concat!("/pair", "-cli");
+        assert!(
+            !production
+                .lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with("//") && l.contains(route)),
+            "production code must not build a {route} request — pair.rs owns that door"
+        );
+        // And the ask pass itself is structurally incapable of minting: it takes
+        // no AuthManager, no bearer and no base URL, and a measured gap produces
+        // an ask, not a credential.
+        let path = gap_state_path("no_headless_seed");
+        let actions = ask_bound_tenant_gaps_at(
+            &path,
+            &gaps(&[tenant(2)]),
+            Some(&[]),
+            Some(ACCT),
+            1_800_000_000,
+        );
+        assert_eq!(notified(&actions).len(), 1, "{actions:?}");
+        assert!(
+            notified(&actions)[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("re-points this device's home tenant"),
+            "the ask says WHY a human is needed"
+        );
+    }
+
+    /// REVIEW MAJOR 2 — a sidecar still inside the 24 h REPORT window but past
+    /// the ACT window drives no ask and touches no lapse record: a coord-side
+    /// unbind while the heartbeat was down must not become a request to
+    /// re-create the binding.
+    #[test]
+    fn a_sidecar_too_stale_to_act_on_reports_the_gap_but_asks_nobody() {
+        use qontinui_runner_lib::pair::{
+            coord_bound_tenants_at, coord_bound_tenants_at_within, BINDING_GAP_ASK_MAX_AGE_SECS,
+        };
+        let (held, bound_only) = (tenant(0), tenant(2));
+        let now = 1_800_000_000;
+        let dir = gap_state_path("stale_for_ask")
+            .parent()
+            .expect("dir")
+            .to_path_buf();
+        const THREE_HOURS: i64 = 3 * 60 * 60;
+        const _: () = assert!(THREE_HOURS > BINDING_GAP_ASK_MAX_AGE_SECS);
+        let three_hours_ago = now - THREE_HOURS;
+        let sidecar = write_sidecar(&dir, &[held, bound_only], three_hours_ago);
+
+        let report_read = coord_bound_tenants_at(&sidecar, now);
+        let ask_read = coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &report_read,
+        );
+        let ask_report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &ask_read,
+        );
+        assert_eq!(
+            report,
+            gaps(&[bound_only]),
+            "the REPORT still shows the gap — it may be up to 24 h old and says so"
+        );
+        assert!(
+            matches!(ask_report, BindingGapReport::Unknown(_)),
+            "…but it is UNKNOWN for an ACTOR: {ask_report:?}"
+        );
+
+        let path = dir.join("binding_gap_asks.json");
+        for _ in 0..3 {
+            let actions =
+                ask_bound_tenant_gaps_at(&path, &ask_report, Some(&[held]), Some(ACCT), now);
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+        assert!(
+            !path.exists(),
+            "no lapse record is opened on a stale sidecar"
+        );
+
+        // A sidecar a live heartbeat would have restamped IS act-grade.
+        write_sidecar(&dir, &[held, bound_only], now - 30 * 60);
+        let fresh = coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let fresh_report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &fresh,
+        );
+        let actions =
+            ask_bound_tenant_gaps_at(&path, &fresh_report, Some(&[held]), Some(ACCT), now);
+        assert_eq!(notified(&actions).len(), 1, "{actions:?}");
+    }
+
+    /// REVIEW MAJOR 3 — a lapse that closes because the tenant now HOLDS a slot
+    /// resets that tenant's upstream-rejection streak, which was earned by the
+    /// credential the new one replaced. Without it a pinned tenant publishes
+    /// `dark` over a fresh credential (the M1 latch). A lapse that closes
+    /// WITHOUT a slot (coord unbound the tenant) leaves the streak alone.
+    #[test]
+    fn a_lapse_healed_by_a_new_slot_resets_that_tenants_rejection_streak() {
+        let _serialised = health_lock();
+        reset_posture();
+        let (healed, unbound) = (tenant(4), tenant(5));
+        for t in [healed, unbound] {
+            for _ in 0..3 {
+                note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_revoked"}"#);
+            }
+            assert_eq!(
+                upstream_signal_for(Some(&t.to_string())).consecutive_rejections,
+                3
+            );
+        }
+        let path = gap_state_path("healed_resets_streak");
+        let now = 1_800_000_000;
+        let opened =
+            ask_bound_tenant_gaps_at(&path, &gaps(&[healed, unbound]), Some(&[]), Some(ACCT), now);
+        assert_eq!(notified(&opened).len(), 2);
+
+        // A human paired `healed`: it now has a slot and leaves the gap set.
+        // `unbound` left the bound set without ever getting a slot.
+        let closed =
+            ask_bound_tenant_gaps_at(&path, &gaps(&[]), Some(&[healed]), Some(ACCT), now + 60);
+        assert!(closed.contains(&GapAction::LapseClosed {
+            tenant: healed,
+            slot_now_held: true
+        }));
+        assert!(closed.contains(&GapAction::LapseClosed {
+            tenant: unbound,
+            slot_now_held: false
+        }));
+
+        let reset = settle_binding_gap_actions(None, &closed);
+        assert_eq!(reset, vec![healed]);
+        assert_eq!(
+            upstream_signal_for(Some(&healed.to_string())).consecutive_rejections,
+            0,
+            "the new credential does not inherit the old one's 401 streak"
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&unbound.to_string())).consecutive_rejections,
+            3,
+            "no slot appeared, so there is no new credential to exonerate"
+        );
+        reset_posture();
+    }
+
+    /// REVIEW MAJOR 4 — the ask is the persisted RECORD, readable by pull, so an
+    /// ask made when no UI was listening (no app handle at all here) is still
+    /// delivered. The event is only a nudge.
+    #[test]
+    fn an_ask_made_with_no_listener_is_readable_by_pull_until_its_lapse_closes() {
+        let path = gap_state_path("pull_readable");
+        let t = tenant(2);
+        let now = 1_800_000_000;
+        let actions = ask_bound_tenant_gaps_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now);
+        assert_eq!(
+            settle_binding_gap_actions(None, &actions),
+            Vec::<uuid::Uuid>::new()
+        );
+
+        let open = open_binding_gap_asks(&path, &known(&[t]), Some(&[]), Some(ACCT))
+            .expect("known bound set");
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0]["tenant_id"], serde_json::json!(t.to_string()));
+        assert_eq!(open[0]["detector"], serde_json::json!("binding_gaps"));
+        assert_eq!(open[0]["first_seen"], serde_json::json!(now));
+        assert_eq!(
+            open[0]["command"],
+            serde_json::json!(format!("qontinui_profile device pair --tenant-id {t}"))
+        );
+        assert_eq!(
+            open[0],
+            notified(&actions)[0].clone(),
+            "pull == what was recorded"
+        );
+
+        // Still there after a "restart" (a fresh read), gone once the lapse closes.
+        assert_eq!(
+            open_binding_gap_asks(&path, &known(&[t]), Some(&[]), Some(ACCT)).map(|v| v.len()),
+            Some(1)
+        );
+        ask_bound_tenant_gaps_at(&path, &gaps(&[]), Some(&[t]), Some(ACCT), now + 60);
+        assert_eq!(
+            open_binding_gap_asks(&path, &known(&[t]), Some(&[]), Some(ACCT)),
+            Some(vec![])
+        );
+    }
+
+    /// REVIEW (round 2) of MAJOR 2 — an ask already OPEN is re-checked on every
+    /// pull. When the bound set goes stale (heartbeat down) the pull is UNKNOWN
+    /// and shows nothing; when coord has unbound the tenant the ask is dropped.
+    /// Otherwise the operator would keep being told to re-create a binding
+    /// coord removed.
+    #[test]
+    fn an_open_ask_is_withdrawn_once_its_evidence_is_stale_or_contradicted() {
+        use qontinui_runner_lib::pair::{
+            coord_bound_tenants_at_within, BINDING_GAP_ASK_MAX_AGE_SECS,
+        };
+        let path = gap_state_path("open_ask_rechecked");
+        let dir = path.parent().expect("dir").to_path_buf();
+        let (held, t) = (tenant(0), tenant(2));
+        let now = 1_800_000_000;
+        let sidecar = write_sidecar(&dir, &[held, t], now - 60);
+        let fresh = coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &fresh,
+        );
+        assert_eq!(
+            notified(&ask_bound_tenant_gaps_at(
+                &path,
+                &report,
+                Some(&[held]),
+                Some(ACCT),
+                now
+            ))
+            .len(),
+            1
+        );
+        assert_eq!(
+            open_binding_gap_asks(&path, &fresh, Some(&[held]), Some(ACCT)).map(|v| v.len()),
+            Some(1)
+        );
+
+        // Three hours later the heartbeat has not restamped: UNKNOWN, not "ask".
+        let later = now + 3 * 60 * 60;
+        let stale = coord_bound_tenants_at_within(&sidecar, later, BINDING_GAP_ASK_MAX_AGE_SECS);
+        assert_eq!(
+            open_binding_gap_asks(&path, &stale, Some(&[held]), Some(ACCT)),
+            None
+        );
+
+        // Coord unbound `t` (a fresh sidecar no longer names it): withdrawn,
+        // even before a pass closes the lapse record.
+        assert_eq!(
+            open_binding_gap_asks(&path, &known(&[held]), Some(&[held]), Some(ACCT)),
+            Some(vec![])
+        );
+
+        // A human paired `t` (it now holds a slot): no longer asked, even
+        // before the next pass closes the lapse; an unreadable store is UNKNOWN.
+        assert_eq!(
+            open_binding_gap_asks(&path, &fresh, Some(&[held, t]), Some(ACCT)),
+            Some(vec![])
+        );
+        assert_eq!(open_binding_gap_asks(&path, &fresh, None, Some(ACCT)), None);
+    }
+
+    /// Round-2 review — a full sign-out forgets the ask record AND the bound
+    /// set it was built from, so the next pass (slots now empty) cannot re-open
+    /// asks naming the departed account's tenants for whoever signs in next.
+    #[test]
+    fn sign_out_forgets_the_asks_and_the_bound_set_they_came_from() {
+        use qontinui_runner_lib::pair::{
+            coord_bound_tenants_at_within, BINDING_GAP_ASK_MAX_AGE_SECS,
+        };
+        let path = gap_state_path("sign_out_forgets");
+        let dir = path.parent().expect("dir").to_path_buf();
+        let (held, t) = (tenant(0), tenant(2));
+        let now = 1_800_000_000;
+        let sidecar = write_sidecar(&dir, &[held, t], now - 60);
+        let read = coord_bound_tenants_at_within(&sidecar, now, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let report = resolve_binding_gaps(
+            Some(&[held]),
+            crate::auth::BindingTenantRead::Unbound,
+            &read,
+        );
+        assert_eq!(
+            notified(&ask_bound_tenant_gaps_at(
+                &path,
+                &report,
+                Some(&[held]),
+                Some(ACCT),
+                now
+            ))
+            .len(),
+            1
+        );
+
+        forget_binding_gap_evidence_at(&path, &sidecar);
+        assert!(!path.exists() && !sidecar.exists());
+
+        // The heartbeat rewrites the sidecar WITHOUT a credential (coord echoes
+        // the DEVICE's bindings), so the bound set comes straight back — and
+        // with every slot cleared, `t` AND `held` would read as gaps. The
+        // signed-in gate is what keeps the departed account's tenants unasked.
+        write_sidecar(&dir, &[held, t], now + 30);
+        let echoed =
+            coord_bound_tenants_at_within(&sidecar, now + 60, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let report =
+            resolve_binding_gaps(Some(&[]), crate::auth::BindingTenantRead::Unbound, &echoed);
+        let account = binding_gap_ask_account(false, Some(&[]), Some(ACCT.to_string()));
+        assert_eq!(account, None, "no credential at all: signed out");
+        assert!(
+            ask_bound_tenant_gaps_at(&path, &report, Some(&[]), account.as_deref(), now + 60)
+                .is_empty()
+        );
+        assert!(!path.exists(), "a signed-out pass opens no lapse record");
+        assert_eq!(
+            open_binding_gap_asks(&path, &echoed, Some(&[]), account.as_deref()),
+            None
+        );
+        assert!(
+            binding_gap_asks_permitted(true, Some(&[])),
+            "a legacy slot is signed in"
+        );
+        assert!(
+            binding_gap_asks_permitted(false, Some(&[held])),
+            "so is a tenant slot"
+        );
+        std::fs::remove_file(&sidecar).expect("drop the echoed sidecar");
+
+        // With no heartbeat yet the bound set is UNKNOWN, so nothing is asked
+        // and nothing is served either.
+        let after = coord_bound_tenants_at_within(&sidecar, now + 60, BINDING_GAP_ASK_MAX_AGE_SECS);
+        let report =
+            resolve_binding_gaps(Some(&[]), crate::auth::BindingTenantRead::Unbound, &after);
+        assert!(
+            ask_bound_tenant_gaps_at(&path, &report, Some(&[]), Some(ACCT), now + 60).is_empty()
+        );
+        assert_eq!(
+            open_binding_gap_asks(&path, &after, Some(&[]), Some(ACCT)),
+            None
+        );
+    }
+
+    /// Round-4 review — asks never cross an account switch. Account A's
+    /// recorded asks are not served to account B, and B's first pass starts
+    /// from an empty record rather than inheriting (or being suppressed by)
+    /// A's lapses.
+    #[test]
+    fn asks_never_cross_an_account_switch() {
+        let path = gap_state_path("account_switch");
+        let t = tenant(2);
+        let now = 1_800_000_000;
+        assert_eq!(
+            notified(&ask_bound_tenant_gaps_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some("acct-a"),
+                now
+            ))
+            .len(),
+            1
+        );
+        assert_eq!(
+            open_binding_gap_asks(&path, &known(&[t]), Some(&[]), Some("acct-a")).map(|v| v.len()),
+            Some(1)
+        );
+        // B signs in: A's record serves B nothing.
+        assert_eq!(
+            open_binding_gap_asks(&path, &known(&[t]), Some(&[]), Some("acct-b")),
+            Some(vec![])
+        );
+        // B's pass discards A's record whole and owns the new one.
+        let b = ask_bound_tenant_gaps_at(&path, &gaps(&[]), Some(&[]), Some("acct-b"), now + 60);
+        assert!(b.is_empty(), "A's lapses are not B's to close: {b:?}");
+        let on_disk = load_gap_ask_state(&path);
+        assert_eq!(on_disk.account.as_deref(), Some("acct-b"));
+        assert!(on_disk.tenants.is_empty());
+        // No paired account at all: nobody to ask for.
+        assert!(ask_bound_tenant_gaps_at(&path, &gaps(&[t]), Some(&[]), None, now).is_empty());
+        assert_eq!(binding_gap_ask_account(true, Some(&[]), None), None);
+        assert_eq!(
+            binding_gap_ask_account(true, Some(&[]), Some("acct-b".into())).as_deref(),
+            Some("acct-b")
+        );
+    }
+
+    /// Exactly ONE ask per tenant per lapse, over several passes and across a
+    /// simulated restart (the state is re-read from disk every pass), with two
+    /// tenants so "one per tenant" is distinguishable from "one".
+    #[test]
+    fn exactly_one_ask_per_tenant_per_lapse_across_passes_and_restarts() {
+        let (a, b) = (tenant(2), tenant(3));
+        let now = 1_800_000_000;
+        let path = gap_state_path("one_ask");
+
+        let mut all: Vec<GapAction> = Vec::new();
+        for _ in 0..6 {
+            all.extend(ask_bound_tenant_gaps_at(
+                &path,
+                &gaps(&[a, b]),
+                Some(&[]),
+                Some(ACCT),
+                now,
+            ));
+        }
+        let asks: Vec<uuid::Uuid> = all
+            .iter()
+            .filter_map(|x| match x {
+                GapAction::Notified { tenant, .. } => Some(*tenant),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            vec![a, b],
+            "ONE ask per tenant across six passes: {all:?}"
+        );
+
+        let on_disk = load_gap_ask_state(&path);
+        for t in [a, b] {
+            let rec = on_disk.tenants.get(&t.to_string()).expect("record on disk");
+            assert!(
+                rec.notified && rec.first_seen > 0 && !rec.reason.is_empty(),
+                "{rec:?}"
+            );
+        }
+        assert_eq!(
+            notified(&all)[0]["cta"],
+            serde_json::json!("device_pair_tenant")
+        );
+
+        // A LATER lapse may ask again.
+        let closed = ask_bound_tenant_gaps_at(&path, &gaps(&[]), Some(&[]), Some(ACCT), now);
+        assert_eq!(
+            closed
+                .iter()
+                .filter(|x| matches!(x, GapAction::LapseClosed { .. }))
+                .count(),
+            2
+        );
+        let reopened = ask_bound_tenant_gaps_at(&path, &gaps(&[a]), Some(&[]), Some(ACCT), now);
+        assert_eq!(
+            notified(&reopened).len(),
+            1,
+            "a NEW lapse gets its own single ask"
+        );
+    }
+
+    /// An `unknown` reading asks nobody and touches no record — and an UNKNOWN
+    /// arriving mid-lapse does not CLOSE the lapse either.
+    #[test]
+    fn an_unknown_binding_gap_reading_asks_nobody_and_closes_nothing() {
+        let t = tenant(2);
+        let now = 1_800_000_000;
+        let path = gap_state_path("unknown");
+        for why in [
+            "coord_bound_tenants.json is ABSENT",
+            "older than the ask window",
+            "the tenant device-JWT slot store could not be enumerated",
+            "paired_user.json is unreadable or malformed",
+        ] {
+            let actions = ask_bound_tenant_gaps_at(
+                &path,
+                &BindingGapReport::Unknown(why.into()),
+                None,
+                Some(ACCT),
+                now,
+            );
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+        assert!(
+            !path.exists(),
+            "an UNKNOWN does not even open a lapse record"
+        );
+
+        assert_eq!(
+            notified(&ask_bound_tenant_gaps_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some(ACCT),
+                now
+            ))
+            .len(),
+            1
+        );
+        assert!(ask_bound_tenant_gaps_at(
+            &path,
+            &BindingGapReport::Unknown("sidecar went absent".into()),
+            None,
+            Some(ACCT),
+            now
+        )
+        .is_empty());
+        assert!(
+            notified(&ask_bound_tenant_gaps_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some(ACCT),
+                now
+            ))
+            .is_empty(),
+            "an UNKNOWN in the middle of a lapse must not re-open the ask"
+        );
+    }
+
+    /// The lapse record round-trips, a corrupt one fails SOFT toward "nobody
+    /// asked yet", and a record written by the pre-review build (which also
+    /// carried `mint_attempted` and no `reason`) still loads and still serves.
+    #[test]
+    fn a_corrupt_or_legacy_lapse_record_fails_soft() {
+        let path = gap_state_path("corrupt");
+        assert_eq!(load_gap_ask_state(&path), GapAskState::default());
+
+        let mut state = GapAskState::default();
+        state.tenants.insert(
+            tenant(2).to_string(),
+            GapAskRecord {
+                notified: true,
+                first_seen: 1_800_000_000,
+                reason: "r".into(),
+            },
+        );
+        save_gap_ask_state(&path, &state);
+        assert_eq!(load_gap_ask_state(&path), state, "it round-trips on disk");
+
+        std::fs::write(&path, b"{not json").expect("corrupt it");
+        assert_eq!(load_gap_ask_state(&path), GapAskState::default());
+
+        let legacy = format!(
+            r#"{{"account":"acct-a","tenants":{{"{}":{{"mint_attempted":true,"notified":true,"first_seen":7}}}}}}"#,
+            tenant(3)
+        );
+        std::fs::write(&path, legacy).expect("legacy");
+        let open = open_binding_gap_asks(&path, &known(&[tenant(3)]), Some(&[]), Some(ACCT))
+            .expect("known");
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0]["reason"], serde_json::json!(BINDING_GAP_ASK_REASON));
+    }
+
+    /// [`measured_gaps`] is the single UNKNOWN gate for the whole phase.
+    #[test]
+    fn measured_gaps_is_the_one_gate_on_unknown() {
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Unknown("absent".into())),
+            None
+        );
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Gaps(vec![])),
+            Some(vec![]),
+            "a MEASURED zero is a Some, and it CLOSES lapses"
+        );
+        assert_eq!(measured_gaps(&gaps(&[tenant(2)])), Some(vec![tenant(2)]));
+        assert_eq!(
+            measured_gaps(&BindingGapReport::Gaps(vec!["not-a-uuid".into()])),
+            Some(vec![]),
+            "an unparseable entry is dropped, never guessed at"
+        );
     }
 }
 

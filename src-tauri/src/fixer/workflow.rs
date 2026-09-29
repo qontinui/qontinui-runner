@@ -299,7 +299,7 @@ End with:
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.
-fn build_api_step(
+pub(crate) fn build_api_step(
     name: &str,
     method: &str,
     url: &str,

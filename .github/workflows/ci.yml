@@ -41,10 +41,13 @@ on:
     #      23:33:13Z. Every runner PR gets `coord:landed` on land. Over PRs
     #      1132–1161 there were 19 label events, 8 of them post-merge
     #      `coord:landed`. This workflow is the expensive one (a GREEN main
-    #      rebuild measured at 136–155 job-min, mean ~144), and it has no
-    #      `concurrency:` group, so those runs are additive and uncancelled:
-    #      ~1,150 job-min of pure post-merge waste in a 36 h window, to save the
-    #      ~330 job-min the race actually costs.
+    #      rebuild measured at 136–155 job-min, mean ~144), and at the time it
+    #      had no `concurrency:` group, so those runs were additive and
+    #      uncancelled: ~1,150 job-min of pure post-merge waste in a 36 h window,
+    #      to save the ~330 job-min the race actually costs. The per-PR group
+    #      added below (2026-09-25) does NOT remove this cost: a `labeled` run
+    #      on an already-merged PR is the newest run in its group, so nothing
+    #      supersedes it and it runs to completion.
     #
     #   2. CORRECTNESS — and this is the disqualifying one. The natural
     #      narrowing (a job-level `if:` on `github.event.label.name`) is WORSE
@@ -105,6 +108,39 @@ on:
 permissions:
   contents: read
   pull-requests: read
+
+# Cancel ONLY superseded `pull_request` runs, one group per PR number. A PR
+# amended mid-run otherwise pays the full ~144 job-min matrix for a head sha
+# nobody will ever land. Plan: 2026-09-25-fleet-bundle-sync-residual-gaps
+# (Phase 3 / Gap 3).
+#
+# `push` (main, develop, merge-candidate*/**) and `workflow_dispatch` runs are
+# NEVER grouped or cancelled: each keys on its own `github.run_id`, so it is
+# the sole member of its group, and `cancel-in-progress` is false for them
+# anyway. coord lands on those push refs and redispatches this file on the
+# default branch, so a cancelled run there would be a missing verdict.
+#
+# Why cancelling a PR run is safe for coord: coord reads check rows PER HEAD
+# SHA (`ci_rows_for` over `coord.pr_check_runs_latest WHERE repo=$1 AND
+# head_sha=$2`), so a run cancelled on a superseded sha cannot attach to the
+# new head. `classify_check_rows` would treat `cancelled` as a failure, but the
+# view ranks `cancelled` last per (repo, head_sha, name), so a cancelled row
+# only counts when it is the sole row for that check on that sha.
+#
+# ⚠️ The group is keyed on the PR, NOT the sha: the NEWEST entrant cancels
+# whatever else is in the group, whichever sha it is for. A re-run of an OLDER
+# sha's run (the UI "Re-run" button, or ci-rerun-on-declaration.yml) therefore
+# cancels the CURRENT head's run and leaves a lone `cancelled` on it — red, with
+# nothing re-firing CI. ci-rerun-on-declaration.yml re-checks the PR head before
+# re-running for exactly this reason; do not re-run a superseded run by hand.
+#
+# `github.workflow` is in the key so the group cannot collide with another
+# workflow's group (concurrency groups are repo-wide). Do NOT add a `paths:`
+# filter as a cheaper alternative: the fleet bundle is compiled into the binary
+# via `include_dir!` (fleet_skills.rs), and coord counts `skipped` as passing.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -1189,11 +1225,18 @@ jobs:
           # and independent of where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
-          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
-          # (`DEFAULT_COORD_URL` in that script), so "" falls back to its
+          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL` (in `main()` of
+          # scripts/ci-test-results-ingest.mjs), so "" falls back to its
           # documented default — the same "empty means unset" contract
           # `Unpoison` itself relies on.
           COORD_HTTP_URL: ""
+          # Whole-invocation budget for the POSTs (see the script's
+          # DEFAULT_BUDGET_MS for the measurement behind it). Spelled here at
+          # its default so the bound is visible where the step is, and so an
+          # operator changes it in ONE place. This step's wall time is the
+          # merge train's wait: coord's predicate waits for every check run on
+          # the head, so the job is held until this step ends.
+          COORD_INGEST_BUDGET_MS: "180000"
         run: |
           node scripts/ci-test-results-ingest.mjs \
             --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
@@ -1433,6 +1476,76 @@ jobs:
         run: |
           cd src-tauri
           cargo clippy
+
+  # Tests + clippy for the standalone workspace crates that the `test` job
+  # never reaches.
+  #
+  # WHY: every Rust step above runs `cd src-tauri && cargo …`, and cargo run
+  # from a member directory selects THAT package only — so `crates/pty-holder`
+  # (plan 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+  # Phase 1) and `crates/runner-win32` are compiled only as src-tauri's
+  # dependencies (runner-win32) or not at all (pty-holder), so neither
+  # crate's own tests run in CI, and pty-holder's [lints] table is never
+  # applied (runner-win32 has no [lints] table and is not clippy'd here —
+  # its tests are). pty-holder's frozen-envelope wire-shape
+  # pin and its byte-fidelity source guard protect nothing unless something
+  # executes them, and the windows leg is the only place its named-pipe /
+  # DACL / LockFileEx code executes at all.
+  #
+  # Setup mirrors `clippy-windows` for everything that is not the cargo
+  # command, minus what these crates do not need: no qontinui-web / ui-bridge
+  # siblings and no pnpm / node / frontend build (only src-tauri's
+  # tauri::generate_context! reads ../dist, and neither crate compiles
+  # src-tauri), and no pagefile (two small crates, no link-time OOM risk).
+  # qontinui-schemas IS still checked out: cargo resolves the whole workspace
+  # even for `-p`, and src-tauri path-depends on ../../qontinui-schemas/*.
+  #
+  # Clippy is PLAIN (no `-D warnings`), the repo convention: levels come from
+  # each crate's own [lints] table, where correctness/suspicious are `deny`.
+  #
+  # Not a required check (not registered in the ruleset by this change).
+  holder-crates:
+    name: Holder crates (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    # UNMEASURED at introduction: no run of this job exists yet. Both crates
+    # are small with few dependencies, so the budget should be dominated by
+    # checkout + toolchain + cache restore. 20
+    # min is a generous first bound, well under GitHub's 360-minute default;
+    # tighten it once there are runs to measure.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
+      # load the workspace; same action (and declared-adaptation resolution)
+      # as the `test` and `clippy-windows` jobs.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          # Save from main only, as `clippy-windows` does: a separate cache
+          # scope that candidate/PR runs must not grow against the 10 GB cap.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test holder crates
+        run: cargo test -p qontinui-pty-holder -p qontinui-runner-win32
+
+      - name: Clippy holder crates
+        run: cargo clippy -p qontinui-pty-holder --all-targets
 
   # Gating frontend unit-test lane (vitest).
   #

@@ -188,6 +188,37 @@ pub struct OrchestrationRunConfig {
     /// is the ONLY thing left in the run, and the guard stops one ending a run
     /// with live workers in it before the window is even reached.
     pub coord_block_stall_after_secs: i64,
+    /// Seconds a row whose ONLY stuck reason is a TRANSIENT dispatch refusal
+    /// (`T:` — the fleet's fan-out bound was full, or coord has drained this
+    /// device) must stay continuously stuck before it alone may write the run
+    /// `stalled`.
+    ///
+    /// The third window, and it exists for the same reason the coord one does.
+    /// A transient refusal used to be EXCLUDED outright — [`tick_exit`] dropped
+    /// the row's fingerprint key — on the reading that a row waiting for a slot
+    /// is waiting, not stuck. That reading is right for as long as the
+    /// condition clears, and there is nothing that makes it clear: a transient
+    /// condition that never lifts left the run unbounded, invisible to the only
+    /// mechanism that could end it (measured 2026-09-26, run `68809b35`: 123
+    /// ticks of re-decided dispatch, no stall, no failure, no terminal state).
+    /// So the arm gets a WINDOW rather than an exemption, exactly like the two
+    /// arms beside it.
+    ///
+    /// The number matches [`Self::coord_block_stall_after_secs`] and
+    /// [`Self::working_silence_secs`], not the row-sized
+    /// [`Self::stall_after_secs`], and for the coord window's argument: a
+    /// fleet-wide fan-out bound held by peers is an ordinary condition on a busy
+    /// box that no row can influence, so the window is sized well above normal
+    /// contention. Erring long delays a stall verdict; erring short ends healthy
+    /// runs, which is the worse of the two.
+    ///
+    /// See also the in-flight guard in [`tick_exit`], which holds on a `T:` row
+    /// exactly as it holds on a `C:` one: a stall exit RETURNS from the
+    /// reconciler, so ending a run with live workers orphans their sessions.
+    /// That, and not "their finishing frees the bound" — the bound is
+    /// fleet-wide and peers can hold it indefinitely
+    /// ([`TickPlan::in_flight_workers`] states the residual).
+    pub transient_stall_after_secs: i64,
     /// The agent registry's declared `parallel_fanout` bound, refreshed from
     /// coord once per tick by the live loop (see
     /// [`crate::agent_authorization::current_fanout_bound`]).
@@ -234,6 +265,10 @@ impl Default for OrchestrationRunConfig {
             // it, an outage is indistinguishable from a blip this fleet sees
             // routinely.
             coord_block_stall_after_secs: 1800,
+            // 30 minutes of a dispatch being refused transiently. Same budget
+            // as the coord window and for the same reason: below it, a busy
+            // fleet is indistinguishable from a bound that will never free.
+            transient_stall_after_secs: 1800,
             fanout_bound: None,
         }
     }
@@ -601,12 +636,14 @@ impl SignalSource for ManagerSignalSource {
 ///
 /// The other two variants are TRANSIENT — they resolve without anything in this
 /// run changing, so [`transient`](Self::transient) reads `true` and `tick_exit`
-/// DROPS the row's fingerprint key instead of accruing stall time against it:
+/// REPLACES the row's fingerprint entries with a single `T:` one, putting it on
+/// the long transient window instead of the row-sized default:
 ///
 /// * [`DeferredByDrain`](Self::DeferredByDrain) — coord has drained this device
 ///   (or its drain state is unknown). Expected for as long as the drain holds,
-///   so `apply_tick` logs it at `debug!` rather than warning once per queued
-///   subtask every tick.
+///   so `apply_tick` announces it at `info!` once per deferral EPISODE — see
+///   [`DrainDeferLog`] — rather than warning once per queued subtask every
+///   tick.
 /// * [`Transient`](Self::Transient) — today, exactly the fleet-wide
 ///   `parallel_fanout` bound being fully occupied. The served clause the
 ///   admission implements says a bound breach "must never become a task failure
@@ -622,7 +659,17 @@ pub enum DispatchError {
     /// `2026-09-13-drained-runner-never-reaches-idle`). TRANSIENT and expected
     /// for as long as the drain holds: the subtask stays `Submitted` and a later
     /// tick retries, so it is logged quietly rather than as a failure.
-    DeferredByDrain(String),
+    ///
+    /// `class` is the STABLE identity of the deferring condition and `message`
+    /// is not: two of the three producers of an `Unknown` drain reason embed a
+    /// miss counter or a heartbeat age, so the text differs on every tick of
+    /// one unchanged deferral ([`crate::coord_drain_state::DrainTracker::miss`],
+    /// [`crate::coord_drain_state::effective_state`]). Anything asking "is this
+    /// the same deferral as last tick?" must read `class`.
+    DeferredByDrain {
+        message: String,
+        class: crate::coord_drain_state::DeferClass,
+    },
     /// A failure that resolves on its own — the row is queued, not stuck. The
     /// subtask stays `Submitted` and a later tick retries once the bound frees.
     Transient(String),
@@ -635,11 +682,20 @@ pub enum DispatchError {
 impl DispatchError {
     /// `true` for the two variants that resolve without anything in this run
     /// changing ([`Self::DeferredByDrain`] and [`Self::Transient`]). Such a row
-    /// is waiting, not stuck, so `tick_exit` removes its fingerprint key.
+    /// is waiting rather than stuck, so `tick_exit` REPLACES its fingerprint
+    /// entries with a single `T:` one — which is what puts it on the long
+    /// [`OrchestrationRunConfig::transient_stall_after_secs`] window instead of
+    /// the row-sized default.
+    ///
+    /// It is a window, not an exemption: "waiting, not stuck" holds only while
+    /// the condition clears, and nothing guarantees it will. Dropping the row
+    /// from the fingerprint outright — which this used to do — left a run whose
+    /// transient condition never lifted invisible to the stall detector
+    /// forever.
     pub fn transient(&self) -> bool {
         matches!(
             self,
-            DispatchError::DeferredByDrain(_) | DispatchError::Transient(_)
+            DispatchError::DeferredByDrain { .. } | DispatchError::Transient(_)
         )
     }
 }
@@ -647,7 +703,7 @@ impl DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DispatchError::DeferredByDrain(m)
+            DispatchError::DeferredByDrain { message: m, .. }
             | DispatchError::Transient(m)
             | DispatchError::Failed(m) => f.write_str(m),
         }
@@ -775,9 +831,24 @@ pub struct TickPlan {
     /// bound `task_run_id`, not decided `to_complete`/`to_fail`, and not itself
     /// blocked on coord. This is the run's "something is genuinely happening"
     /// term, and [`tick_exit`] uses it for one job only — refusing to end a run
-    /// on a coord block alone while healthy work is in flight (a stall exit
-    /// RETURNS from the reconciler and orphans those workers; `finish_run`
-    /// touches no session).
+    /// on a coord block or a transient dispatch refusal alone while healthy
+    /// work is in flight (a stall exit RETURNS from the reconciler and orphans
+    /// those workers; `finish_run` touches no session).
+    ///
+    /// The justification is the ORPHANING, and that alone. It used to add that
+    /// the transient condition "will in fact lift when these workers finish and
+    /// release the fan-out bound", which does not follow: the bound is
+    /// FLEET-WIDE, so peers on other runs and other devices can hold it
+    /// indefinitely and this run's workers finishing may free nothing. The
+    /// residual, stated plainly: while any worker is live, a run queued behind
+    /// a bound held entirely by peers is held open past its window, for as long
+    /// as those workers last. That is bounded by the workers' own
+    /// `working_silence_secs` WHERE IT APPLIES, and by nothing at all for a
+    /// worker that wedges while still emitting — the chatty-wedged case this
+    /// file names at the `working_silence_secs` field and again in
+    /// [`tick_exit`]'s doc, which is precisely where this residual bites. The
+    /// transient window keeps accumulating underneath the guard — so the stall
+    /// fires on the first tick the run has nothing live, with no extra wait.
     ///
     /// Rows blocked on coord are excluded deliberately: a `Working` verify
     /// subtask whose verdict read keeps failing is BOTH in flight and the stuck
@@ -848,15 +919,24 @@ pub struct TickOutcome {
     /// ([`DispatchError::Transient`]), and coord having drained this device
     /// ([`DispatchError::DeferredByDrain`]).
     ///
-    /// [`tick_exit`] drops the row's stall-fingerprint KEY entirely — not just
-    /// the `E:` entry, because the row also carries an `R:` from the dispatch
-    /// this tick decided. A row waiting for a slot is waiting, not stuck: the
-    /// served clause the admission implements says "a bound breach must never
-    /// become a task failure while sequential progress is still possible", and
-    /// the conductor already treats ready work beyond THIS RUN's cap as
-    /// legitimate waiting. Calling the same condition stuck because the bound
-    /// is fleet-wide rather than run-wide was the same condition with the
-    /// opposite verdict.
+    /// [`tick_exit`] REPLACES the row's stall-fingerprint entries with a single
+    /// `T:<task_id>`: it removes the key first — dropping the `R:` the same
+    /// tick pushed for the dispatch it decided — and pushes the `T:` back. The
+    /// row therefore stays in the stuck set, carrying ONLY `T:` entries, which
+    /// is what [`StallFingerprint::transient_only_keys`] reads to put it on the
+    /// long [`OrchestrationRunConfig::transient_stall_after_secs`] window.
+    ///
+    /// A row waiting for a slot IS waiting rather than stuck, and the window is
+    /// how that reading is honoured without being unconditional: the served
+    /// clause the admission implements says "a bound breach must never become a
+    /// task failure while sequential progress is still possible", and the
+    /// conductor already treats ready work beyond THIS RUN's cap as legitimate
+    /// waiting. But "sequential progress is still possible" is a claim about
+    /// the future, and a transient condition that never clears falsifies it.
+    /// Removing the key outright — which this used to do — meant the one row
+    /// that was not moving was the one row the detector could never see, and
+    /// the run ticked at `running` forever. The generous window forgives
+    /// ordinary contention and bounds the rest.
     pub transient_failures: Vec<String>,
     /// `true` when the run is finished (mirrors [`TickPlan::done`], which reads
     /// committed rows).
@@ -1291,13 +1371,14 @@ pub fn compute_tick<S: SignalSource>(
 pub struct StallFingerprint {
     /// Sorted, deduped `(key, entry)` pairs: the key is a `task_id` (or
     /// [`NOTHING_ACTIONABLE_KEY`]) and the entry is that row's reason sentence
-    /// (`C:`/`R:`/`B:`/`W!:`/`E:`/`Z:`). One row may carry several entries.
+    /// (`C:`/`R:`/`B:`/`W!:`/`E:`/`T:`/`Z:`). One row may carry several
+    /// entries.
     ///
     /// They are stored PAIRED rather than as two independent lists because a
     /// key can leave the set for a reason its entries must follow
     /// ([`Self::remove_key`]), and because the reasons decide how a key is
-    /// TIMED ([`Self::coord_only_keys`]). Two parallel lists can answer
-    /// neither question.
+    /// TIMED ([`Self::coord_only_keys`], [`Self::transient_only_keys`]). Two
+    /// parallel lists can answer neither question.
     rows: Vec<(String, String)>,
 }
 
@@ -1315,11 +1396,18 @@ impl StallFingerprint {
     }
 
     /// Drop a row from the stuck set entirely — its key AND every reason it
-    /// carries. This is what "not stuck after all" means: leaving the key while
-    /// dropping one entry would keep [`StallWatch`]'s window running on a row
-    /// nothing can name a reason for, and leaving an entry while dropping the
-    /// key would put a sentence in the operator's stall reason about a row the
-    /// watch is not watching. See [`TickOutcome::transient_failures`].
+    /// carries. Both halves go together: leaving the key while dropping one
+    /// entry would keep [`StallWatch`]'s window running on a row nothing can
+    /// name a reason for, and leaving an entry while dropping the key would put
+    /// a sentence in the operator's stall reason about a row the watch is not
+    /// watching.
+    ///
+    /// Its one caller today is [`tick_exit`]'s transient arm, which does NOT
+    /// use it to forget a row: it removes and then pushes a single `T:` entry
+    /// back, so the row keeps a window but is RE-CLASSIFIED — the whole-row
+    /// removal is what discards the `R:` the same tick pushed, which is the
+    /// only way the row can end up carrying `T:` alone. See
+    /// [`TickOutcome::transient_failures`] and [`Self::transient_only_keys`].
     pub fn remove_key(&mut self, key: &str) {
         self.rows.retain(|(k, _)| k != key);
     }
@@ -1356,6 +1444,36 @@ impl StallFingerprint {
                 .iter()
                 .filter(|(k, _)| *k == key)
                 .all(|(_, e)| e.starts_with("C:"))
+            {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// The stuck rows whose EVERY reason is a transient dispatch refusal (`T:`
+    /// — the fleet fan-out bound was full, or coord drained this device). Those
+    /// are timed on [`OrchestrationRunConfig::transient_stall_after_secs`]
+    /// instead of the row-sized window, for the same reason a coord block is:
+    /// the condition is fleet-wide, every queued row observes it at once, and
+    /// no row can influence it.
+    ///
+    /// "EVERY reason" is load-bearing here exactly as it is in
+    /// [`Self::coord_only_keys`]. A row that transient-failed its dispatch AND
+    /// carries an `E:` for a durable write that will not land is stuck for a
+    /// reason of its own and gets the short window.
+    ///
+    /// The only writer of a `T:` entry is [`tick_exit`], and it writes one by
+    /// [`Self::remove_key`]-then-push so the `R:` from the dispatch it decided
+    /// this tick does not survive to make this predicate false.
+    pub fn transient_only_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for key in self.keys() {
+            if self
+                .rows
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .all(|(_, e)| e.starts_with("T:"))
             {
                 keys.push(key);
             }
@@ -1420,6 +1538,13 @@ impl StallFingerprint {
 ///   row would be unreconcilable if anything ever did.
 /// - `E:<op>:<task_id>` — a side effect that was attempted and did not land
 ///   (added by [`tick_exit`] from the [`TickOutcome`], not here).
+/// - `T:<task_id>` — a dispatch refused TRANSIENTLY (the fleet fan-out bound
+///   was full, or coord drained this device). Added by [`tick_exit`] from the
+///   [`TickOutcome`], not here, and it REPLACES the row's other entries: the
+///   row is waiting rather than stuck, so it is timed on the long
+///   [`OrchestrationRunConfig::transient_stall_after_secs`] window
+///   ([`StallFingerprint::transient_only_keys`]) rather than excluded, which
+///   left a never-clearing transient condition unbounded.
 /// - `Z:nothing-actionable:<rows>` — the catch-all, added by [`compute_tick`].
 fn stall_fingerprint(
     subtasks: &[Subtask],
@@ -1538,6 +1663,157 @@ pub async fn harvest_elaboration(
 // ============================================================================
 // Apply a tick (side effects) + the live background loop
 // ============================================================================
+
+/// The identity of one drain-deferral EPISODE, as [`DrainDeferLog`] compares
+/// them tick to tick.
+///
+/// Deliberately not the reason string. Two of the three producers of an
+/// `Unknown` drain reason embed a monotonically increasing number —
+/// [`crate::coord_drain_state::DrainTracker::miss`] interpolates the
+/// consecutive-miss count, and [`crate::coord_drain_state::effective_state`]
+/// interpolates the heartbeat's age in seconds, recomputed on every read — so
+/// with the heartbeat dead the text is different on every single tick. A memo
+/// keyed on it suppresses nothing, which is the state the rate limiter was in
+/// when it was written: `info!` once per queued subtask per tick, at the
+/// DEFAULT filter level, i.e. exactly the noise the `debug!` it replaced
+/// existed to avoid.
+///
+/// The drain module already draws this distinction for its own event stream —
+/// `miss` marks a cause-only rewrite of an existing `Unknown` as
+/// `changed = false`, "not a change worth an event per tick" — and this is the
+/// same rule applied to the same data one layer up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferEpisode {
+    /// The stable class of the deferring condition, from the DECISION that
+    /// deferred (never a later re-read).
+    class: crate::coord_drain_state::DeferClass,
+    /// The reason text — but ONLY for [`DeferClass::Drained`](crate::coord_drain_state::DeferClass::Drained),
+    /// where it is stable across ticks because it is built from the drain's
+    /// `until` and the operator's reason, both fixed for the life of one
+    /// drain. Including it is what makes a SECOND, different drain re-announce
+    /// itself. `None` for `Unknown`, whose text is the per-tick-varying kind
+    /// described above.
+    ///
+    /// This is why the memo does not need the drain's `until` plumbed through
+    /// as its own field: for the one class whose identity `until` refines, the
+    /// reason string already carries it.
+    stable_reason: Option<String>,
+}
+
+impl DeferEpisode {
+    fn new(class: crate::coord_drain_state::DeferClass, reason: &str) -> Self {
+        use crate::coord_drain_state::DeferClass;
+        Self {
+            class,
+            stable_reason: match class {
+                DeferClass::Drained => Some(reason.to_string()),
+                DeferClass::Unknown => None,
+            },
+        }
+    }
+}
+
+/// Per-`(run_id, task_id)` memory of the drain-deferral episode already
+/// announced at `info!`, so [`apply_tick`]'s [`DispatchError::DeferredByDrain`]
+/// arm logs once per deferral episode rather than once per 5 s tick.
+///
+/// Cross-tick state with no home on `apply_tick` — a module static in the style
+/// of [`ai_session_executor`]'s isolation backoff, deliberately, rather than a
+/// new map threaded through `apply_tick` and its call sites and tests for a
+/// log-rate concern. Process-local: a restart simply re-announces, which is the
+/// safe direction for a visibility mechanism.
+#[derive(Default)]
+struct DrainDeferLog {
+    /// The episode last announced for a row.
+    last: HashMap<(Uuid, String), DeferEpisode>,
+}
+
+impl DrainDeferLog {
+    /// `true` when this deferral should be announced: the FIRST tick a row is
+    /// deferred, and again whenever the EPISODE changes (a drain replacing an
+    /// unreadable state or the reverse, or a different drain with a different
+    /// expiry — each is new information). A re-worded reason for the same
+    /// episode is not. Records the episode either way.
+    fn should_log(
+        &mut self,
+        run_id: Uuid,
+        task_id: &str,
+        class: crate::coord_drain_state::DeferClass,
+        reason: &str,
+    ) -> bool {
+        let episode = DeferEpisode::new(class, reason);
+        match self.last.get_mut(&(run_id, task_id.to_string())) {
+            Some(prev) if *prev == episode => false,
+            Some(prev) => {
+                *prev = episode;
+                true
+            }
+            None => {
+                self.last.insert((run_id, task_id.to_string()), episode);
+                true
+            }
+        }
+    }
+
+    /// Forget a row once its dispatch stopped being drain-deferred, so a LATER
+    /// deferral of the same row is a new episode and announces itself.
+    fn clear(&mut self, run_id: Uuid, task_id: &str) {
+        self.last.remove(&(run_id, task_id.to_string()));
+    }
+
+    /// Forget every row of a run. What actually BOUNDS the map.
+    ///
+    /// [`clear`](Self::clear) does not: it fires only from `apply_tick`'s
+    /// dispatch arms, so a row still deferred when its run ENDS — which is the
+    /// ordinary way a drained run ends, and was the whole subject of the
+    /// change this memo shipped with — is never reached by it and its entry
+    /// survives for the life of the process. A runner here lives for days.
+    /// [`DrainDeferRunGuard`] calls this from `Drop`, so it runs on every exit
+    /// of `run_orchestration` — the stop channel, `done`, `tick_exit` and an
+    /// unwind alike — rather than on the subset anyone remembered to annotate,
+    /// and a fourth exit added later is covered without being noticed.
+    fn clear_run(&mut self, run_id: Uuid) {
+        self.last.retain(|(run, _), _| *run != run_id);
+    }
+
+    /// How many rows are memoized (tests only — the leak is a property of the
+    /// map's SIZE, so a test has to be able to read it).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.last.len()
+    }
+}
+
+/// Drops every [`DrainDeferLog`] entry belonging to one run when the run's loop
+/// leaves, whatever exit it takes. See [`DrainDeferLog::clear_run`].
+struct DrainDeferRunGuard(Uuid);
+
+impl Drop for DrainDeferRunGuard {
+    fn drop(&mut self) {
+        drain_defer_log().clear_run(self.0);
+    }
+}
+
+/// Whether a dispatch result ENDS a drain-deferral episode for the row, i.e.
+/// whether `apply_tick` should forget the row's memo.
+///
+/// Every outcome except another drain deferral does — a dispatch that landed,
+/// a full fan-out bound, a hard failure. Written as one predicate over the
+/// whole result, rather than a `clear` call repeated in each of the three
+/// non-deferral arms, so that the rule is in one testable place and a fourth
+/// arm added later cannot forget it.
+fn ends_drain_defer_episode(result: &Result<Uuid, DispatchError>) -> bool {
+    !matches!(result, Err(DispatchError::DeferredByDrain { .. }))
+}
+
+static DRAIN_DEFER_LOG: std::sync::LazyLock<std::sync::Mutex<DrainDeferLog>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn drain_defer_log() -> std::sync::MutexGuard<'static, DrainDeferLog> {
+    DRAIN_DEFER_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Apply a computed [`TickPlan`] against the DB + dispatcher (side effects).
 /// Returns what actually LANDED — see [`TickOutcome`], which is what stall
@@ -1666,28 +1942,64 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     // Dispatches (step 3).
     for tid in &plan.to_dispatch {
         if let Some(st) = by_id.get(tid.as_str()) {
-            match dispatcher.dispatch(run_id, st).await {
+            let result = dispatcher.dispatch(run_id, st).await;
+            // One rule, one place: any outcome other than another drain
+            // deferral ends the row's deferral episode, so the NEXT deferral of
+            // this row announces itself instead of being swallowed by a stale
+            // memo. See `ends_drain_defer_episode`.
+            if ends_drain_defer_episode(&result) {
+                drain_defer_log().clear(run_id, tid);
+            }
+            match result {
                 Ok(trid) => {
                     info!("conductor: dispatched {tid} → worker {trid} (run {run_id})");
                     outcome.dispatched.push(tid.clone());
                 }
-                // Expected for as long as coord's device drain holds; every
-                // tick would otherwise WARN once per queued subtask. Recorded
-                // as a transient failure all the same: the row is waiting on a
-                // drain that will lift, not stuck, so `tick_exit` drops its
-                // fingerprint KEY and a held drain can never write a healthy
-                // run `stalled`.
-                Err(DispatchError::DeferredByDrain(reason)) => {
-                    debug!("apply_tick: dispatch {tid} deferred by the device drain: {reason}");
+                // Expected for as long as coord's device drain holds, and
+                // recorded as a transient failure: the row is waiting on a
+                // drain that will lift, so `tick_exit` re-classifies it onto
+                // the long `transient_stall_after_secs` window and a drain of
+                // ordinary length can never write a healthy run `stalled`.
+                //
+                // Logged at `info!` — the DEFAULT filter level — but ONCE per
+                // row and again only when the deferral EPISODE changes, not
+                // once per tick and NOT on every rewording of one unchanged
+                // condition (`DeferEpisode` says why that distinction is the
+                // whole mechanism). It used to be `debug!`, on the reading that a line
+                // per queued subtask per tick is noise. The reading was right
+                // about the frequency and wrong about the level: below the
+                // default filter this arm produced no line AT ALL, so a
+                // drain-deferred subtask sat `Submitted` tick after tick with
+                // nothing in the log to say why, indistinguishable from a hung
+                // dispatcher. Its sibling arm below has always been visible at
+                // the default level; the rate limiter is how this one joins it
+                // without the noise.
+                Err(DispatchError::DeferredByDrain { message, class }) => {
+                    if drain_defer_log().should_log(run_id, tid, class, &message) {
+                        info!("conductor: {tid} deferred by the device drain — {message}");
+                    } else {
+                        debug!(
+                            "apply_tick: dispatch {tid} deferred by the device drain: {message}"
+                        );
+                    }
                     outcome.transient_failures.push(tid.clone());
                 }
                 Err(e) if e.transient() => {
                     // The fleet's declared fan-out bound was full. The subtask
                     // stays `Submitted` and a later tick dispatches it once a
                     // slot frees — waiting, not stuck, exactly as ready work
-                    // beyond THIS RUN's own cap is. `tick_exit` drops the row's
-                    // fingerprint KEY (the `R:` this tick put there), so a busy
-                    // gate can never write a healthy run `stalled`.
+                    // beyond THIS RUN's own cap is. `tick_exit` replaces the
+                    // row's fingerprint entries (the `R:` this tick put there)
+                    // with a `T:`, so the row takes the long
+                    // `transient_stall_after_secs` window and a busy gate can
+                    // never write a healthy run `stalled` — while a bound that
+                    // never frees is eventually named instead of leaving the
+                    // run unbounded.
+                    //
+                    // Logged every tick, deliberately unlike the drain arm
+                    // above: the message interpolates the bound and the
+                    // accumulated wait, so the repetition IS the signal an
+                    // operator reads the queue depth from.
                     info!("conductor: {tid} queued — {e}");
                     outcome.transient_failures.push(tid.clone());
                 }
@@ -2188,26 +2500,97 @@ pub struct StallWatch {
     /// A key absent from a tick's fingerprint is dropped, so re-appearing
     /// restarts its window.
     seen_since: HashMap<String, i64>,
+    /// The stuck-key set [`tick_exit`]'s in-flight-worker guard last ANNOUNCED
+    /// it was holding the run open on, or `None` when the guard is not
+    /// currently holding it open.
+    ///
+    /// The guard's condition is an ordinary one — one long-running worker plus
+    /// one row behind a fleet bound held by peers is a normal busy box — and
+    /// it is re-evaluated every 5 s tick, so an unconditional `warn!` there is
+    /// hours of identical lines. This is what makes it edge-triggered: it
+    /// announces the TRANSITION into holding open, and any later change of
+    /// WHICH rows it is holding open for, and says nothing in between.
+    held_open_for: Option<Vec<String>>,
+    /// How many times the guard has ANNOUNCED, i.e. how many `warn!` lines it
+    /// has emitted. Test-only, because "it warns once rather than every tick"
+    /// is a claim about a count and nothing else in the struct records one —
+    /// `held_open_for` cannot distinguish "not re-announced" from
+    /// "re-announced with the same value".
+    #[cfg(test)]
+    held_open_announcements: u32,
+}
+
+/// The three stall windows [`StallWatch::observe`] selects between, NAMED.
+///
+/// They used to be three adjacent positional `i64` parameters. Swapping two of
+/// them compiles silently; [`OrchestrationRunConfig::default`] gives the coord
+/// and transient windows the same 1800 s value, so production could not detect
+/// the swap either; and the only asymmetric pair is `row` against the other
+/// two, which a caller reaching for "the window" gets wrong in exactly the
+/// direction that ends healthy runs. Named fields make the class unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallWindows {
+    /// The row-sized default: a row stuck for a reason of its own.
+    pub row: i64,
+    /// A row whose ONLY reasons are coord blocks.
+    pub coord: i64,
+    /// A row whose ONLY reasons are transient dispatch refusals.
+    pub transient: i64,
+}
+
+impl StallWindows {
+    /// The windows a run is configured with.
+    pub fn from_config(config: &OrchestrationRunConfig) -> Self {
+        Self {
+            row: config.stall_after_secs,
+            coord: config.coord_block_stall_after_secs,
+            transient: config.transient_stall_after_secs,
+        }
+    }
 }
 
 impl StallWatch {
     /// Observe one tick. Returns evidence once ANY single key has been stuck for
-    /// its own window without interruption: `coord_window_secs` for a key whose
-    /// ONLY reasons are coord blocks ([`StallFingerprint::coord_only_keys`]),
-    /// `window_secs` for every other key.
+    /// its own window without interruption. Three windows, selected per key by
+    /// the reasons that key carries:
     ///
-    /// Both windows run off the SAME continuity memory, so a row that is coord
-    /// blocked for a while and then stuck for a reason of its own does not get
-    /// a fresh window — only its deadline shortens.
+    /// - [`StallWindows::coord`] for a key whose ONLY reasons are coord blocks
+    ///   ([`StallFingerprint::coord_only_keys`]);
+    /// - [`StallWindows::transient`] for a key whose ONLY reasons are transient
+    ///   dispatch refusals ([`StallFingerprint::transient_only_keys`]);
+    /// - [`StallWindows::row`] for every other key.
+    ///
+    /// The two long windows are for conditions that are FLEET-WIDE rather than
+    /// properties of the row — coord not answering, the fan-out bound being
+    /// occupied by peers — which every affected row observes at once and none
+    /// can influence. The two classes are mutually exclusive by construction
+    /// (a key's entries all share one prefix or it takes the default), so the
+    /// order of the first two arms is immaterial.
+    ///
+    /// All three run off the SAME continuity memory: a key's `seen_since` is
+    /// set on the tick it ENTERS the stuck set and survives every later tick
+    /// it is present for, whichever class it carries then. So a row that is
+    /// coord blocked for a while and then stuck for a reason of its own does
+    /// not get a fresh window.
+    ///
+    /// The deadline that continuity is measured against, though, moves in
+    /// EITHER direction, because the class is re-read every tick. Shortening
+    /// is the case above. It also lengthens, and `tick_exit` produces that
+    /// routinely: a row carrying `E:dispatch:A` plus `R:A` on one tick (the
+    /// 300 s row window) that transient-fails on the next has its entries
+    /// REPLACED by `T:A` alone, so the same unbroken `seen_since` is suddenly
+    /// measured against 1800 s. Benign, and in the conservative direction — a
+    /// longer deadline can only delay ending a run, never end a healthy one —
+    /// but it is not "only shortens", which is what this said before.
     pub fn observe(
         &mut self,
         fingerprint: &StallFingerprint,
         now: i64,
-        window_secs: i64,
-        coord_window_secs: i64,
+        windows: StallWindows,
     ) -> Option<StallEvidence> {
         let keys = fingerprint.keys();
         let coord_only = fingerprint.coord_only_keys();
+        let transient_only = fingerprint.transient_only_keys();
         // Drop anything no longer stuck — that row moved, so its window is over.
         self.seen_since.retain(|k, _| keys.contains(k));
         let mut fired: Vec<(String, i64)> = Vec::new();
@@ -2215,9 +2598,11 @@ impl StallWatch {
             let since = *self.seen_since.entry(key.clone()).or_insert(now);
             let stuck_for = now - since;
             let window = if coord_only.contains(key) {
-                coord_window_secs
+                windows.coord
+            } else if transient_only.contains(key) {
+                windows.transient
             } else {
-                window_secs
+                windows.row
             };
             if stuck_for >= window {
                 fired.push((key.clone(), stuck_for));
@@ -2234,6 +2619,28 @@ impl StallWatch {
             stuck_keys,
             unchanged_for_secs,
         })
+    }
+
+    /// Record that the in-flight-worker guard is holding the run open on
+    /// `stuck_keys`, returning `true` when that is news — the first tick of a
+    /// hold, or a change to the set being held open for. See
+    /// [`Self::held_open_for`].
+    fn announce_held_open(&mut self, stuck_keys: &[String]) -> bool {
+        if self.held_open_for.as_deref() == Some(stuck_keys) {
+            return false;
+        }
+        self.held_open_for = Some(stuck_keys.to_vec());
+        #[cfg(test)]
+        {
+            self.held_open_announcements += 1;
+        }
+        true
+    }
+
+    /// The guard is not holding the run open this tick, so the next hold is a
+    /// fresh episode and announces itself.
+    fn clear_held_open(&mut self) {
+        self.held_open_for = None;
     }
 
     /// The keys currently under watch, sorted (diagnostics + tests).
@@ -2259,21 +2666,42 @@ impl StallWatch {
 /// per-row marker cannot record (when the row write is what is failing, so is
 /// the marker), so it is carried in memory instead, and because the same failure
 /// recurs every tick the entry is stable and accumulates exactly like any other.
-/// It also REMOVES rows: a side effect that failed transiently
-/// ([`TickOutcome::transient_failures`]) takes the whole row out of the stuck
-/// set, `R:` entry included.
+/// It also RE-CLASSIFIES rows: a side effect that failed transiently
+/// ([`TickOutcome::transient_failures`]) has its whole row replaced by a single
+/// `T:<task_id>` — `remove_key` first, so the `R:` this tick pushed goes, then
+/// the `T:` — which puts the row on the long
+/// [`OrchestrationRunConfig::transient_stall_after_secs`] window instead of the
+/// row-sized default. It is no longer REMOVED: an exemption is only sound while
+/// the transient condition clears, and one that never did left the run
+/// unbounded and invisible to this function entirely.
 ///
 /// A tick whose only "no progress" is legitimate waiting — a working worker, an
 /// open gate, a dependency that can still be satisfied, a saturated concurrency
-/// cap, a fleet fan-out bound that is momentarily full — contributes NO
-/// fingerprint entry at all, so a healthy run can never be written `stalled`.
+/// cap — contributes NO fingerprint entry at all, so a healthy run can never be
+/// written `stalled`. A fleet fan-out bound that is momentarily full is the one
+/// case that contributes an entry and is still forgiven: it is forgiven by the
+/// SIZE of its window (30 minutes, far above ordinary contention) rather than
+/// by exclusion, so that a bound which never frees is eventually named.
 ///
 /// One further refusal, the in-flight guard: a run is NOT ended on coord blocks
-/// ALONE while it still has live workers. A stall exit is terminal and the
-/// reconciler RETURNS, so it orphans every session the run spawned
-/// (`finish_run` touches no session); doing that to three healthy workers
-/// because a fourth row's gate poll cannot reach coord trades the whole run for
-/// a diagnosis.
+/// or transient dispatch refusals ALONE while it still has live workers. A
+/// stall exit is terminal and the reconciler RETURNS, so it orphans every
+/// session the run spawned (`finish_run` touches no session); doing that to
+/// three healthy workers because a fourth row's gate poll cannot reach coord
+/// trades the whole run for a diagnosis. The transient arm is in the guard on
+/// the ORPHANING argument and nothing else — see
+/// [`TickPlan::in_flight_workers`] for why "the bound will free when these
+/// workers finish" is not available as a second reason, the bound being
+/// fleet-wide. The defect the transient window exists to catch is a run with
+/// NOTHING live and a row that never clears, and in that state the guard does
+/// not hold.
+///
+/// The guard's `warn!` is EDGE-TRIGGERED ([`StallWatch::announce_held_open`]):
+/// it speaks on the transition into holding open and on any change of the
+/// held-open set, and `debug!`s in between. Since the transient arm joined it
+/// the guard's condition is an ordinary one — one live worker beside one row
+/// queued behind a peer-held bound — re-evaluated every tick, so an
+/// unconditional line here is hours of identical output.
 ///
 /// The guard does not wedge in any case the reconciler can observe, but the
 /// bound is weaker than "every `Working` row times out". A `Working` row is
@@ -2287,7 +2715,12 @@ impl StallWatch {
 ///
 /// That is deliberately the safer of the two failure modes — a stall exit is
 /// terminal and orphans the sessions, while holding open leaves them reachable
-/// — it warns every tick, and `stop_orchestration_run` still ends the run. In
+/// — and `stop_orchestration_run` still ends the run. Note the warning is
+/// EDGE-TRIGGERED (see `announce_held_open`): it fires when the hold starts and
+/// when the held-open set changes, NOT every tick, so the absence of a fresh
+/// line is not evidence the run stopped being held open. `apply_tick`'s
+/// per-tick summary carries `waiting-for-a-slot=<rows>` if you need the live
+/// view. In
 /// every case where a `Working` row DOES reach a deadline, the in-flight set
 /// drains on its own, and because the window keeps accumulating underneath the
 /// guard, the stall fires the moment it does.
@@ -2309,33 +2742,57 @@ pub fn tick_exit(
         let task_id = failure.split_once(':').map(|(_, t)| t).unwrap_or(failure);
         fingerprint.push(task_id.to_string(), format!("E:{failure}"));
     }
-    // ...and a row whose only failure was transient is not stuck at all. The
-    // KEY goes, not just the `E:` entry: the row is `R:`-fingerprinted too (this
-    // tick decided to dispatch it), and leaving that behind would stall the run
-    // on exactly the condition the removal exists to forgive.
+    // ...and a row whose only failure was transient is waiting rather than
+    // stuck, so it is RE-CLASSIFIED rather than dropped. Remove-then-push, and
+    // the order is load-bearing: the row is `R:`-fingerprinted too (this tick
+    // decided to dispatch it) and the removal is the only thing that clears it,
+    // which is what leaves the row carrying `T:` alone so
+    // `transient_only_keys` puts it on the long window. Leaving the `R:` behind
+    // would time the row on the 300 s default and stall the run on exactly the
+    // condition the long window exists to forgive; dropping the key outright —
+    // what this used to do — took the row out of the stuck set forever, so a
+    // transient condition that never cleared could never end the run.
     for tid in &outcome.transient_failures {
         fingerprint.remove_key(tid);
+        fingerprint.push(tid.clone(), format!("T:{tid}"));
     }
-    let evidence = watch.observe(
-        &fingerprint,
-        now,
-        config.stall_after_secs,
-        config.coord_block_stall_after_secs,
-    )?;
+    let Some(evidence) = watch.observe(&fingerprint, now, StallWindows::from_config(config)) else {
+        watch.clear_held_open();
+        return None;
+    };
     if !plan.in_flight_workers.is_empty() {
         let coord_only = fingerprint.coord_only_keys();
-        if evidence.stuck_keys.iter().all(|k| coord_only.contains(k)) {
-            warn!(
-                "conductor: holding the run OPEN despite {} — every stuck row is blocked on \
-                 coord and {} worker(s) are still live ({}). A coord block alone does not end a \
-                 run with work in flight; the window keeps running underneath.",
+        let transient_only = fingerprint.transient_only_keys();
+        if evidence
+            .stuck_keys
+            .iter()
+            .all(|k| coord_only.contains(k) || transient_only.contains(k))
+        {
+            // EDGE-TRIGGERED. The guard now holds on `coord_only OR
+            // transient_only`, and the transient arm makes its condition an
+            // ordinary one: one long-running worker beside one row queued
+            // behind a fleet bound held by peers satisfies it, for as long as
+            // the worker lasts. Unconditional, that is this `warn!` every 5 s
+            // for hours. The transition and any change of the held-open set
+            // are the information; the repetition is not.
+            let message = format!(
+                "holding the run OPEN despite {} — every stuck row is blocked on coord or \
+                 queued behind the fleet fan-out bound, and {} worker(s) are still live \
+                 ({}). Neither alone ends a run with work in flight; the window keeps \
+                 running underneath.",
                 evidence,
                 plan.in_flight_workers.len(),
                 plan.in_flight_workers.join(",")
             );
+            if watch.announce_held_open(&evidence.stuck_keys) {
+                warn!("conductor: {message}");
+            } else {
+                debug!("tick_exit: {message}");
+            }
             return None;
         }
     }
+    watch.clear_held_open();
     Some(RunExit::stalled(evidence, &plan.blocked_on_coord))
 }
 
@@ -2539,6 +2996,14 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         config.concurrency_cap, config.tick_interval_secs
     );
 
+    // Bounds the process-global `DRAIN_DEFER_LOG` to LIVE runs. RAII rather
+    // than a call before each `return`, because this function leaves by three
+    // of them — the stop channel, `done`, `tick_exit` — plus an unwind, and
+    // the ordinary way a DRAINED run ends is with rows still deferred, so the
+    // `apply_tick` arms that call `clear` are exactly the ones that do not
+    // fire on the run that leaks.
+    let _drain_defer_guard = DrainDeferRunGuard(run_id);
+
     // Stall watch — fires only on the conductor's OWN stuck-state fingerprint,
     // and only after it has held unchanged for `stall_after_secs` of wall
     // clock. Never on legitimate waiting (a working worker, an open gate, an
@@ -2680,6 +3145,7 @@ async fn sleep_or_stop(config: &OrchestrationRunConfig, stop_rx: &mut watch::Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord_drain_state::DeferClass;
     use crate::database::pg::completion_reports::CompletionReport;
     use std::collections::HashMap as Map;
     use std::sync::Mutex as StdMutex;
@@ -4786,34 +5252,35 @@ mod tests {
     /// stays fires on its own clock.
     #[test]
     fn stall_watch_measures_each_row_continuously() {
+        // The row under test carries `C:` entries, so it is timed on
+        // `StallWindows::coord` — and the three windows are DISTINCT here on
+        // purpose. Every window test used to set all three to one value, which
+        // meant no test could tell the three apart and a swapped pair was
+        // invisible to production (`Default` gives coord and transient the
+        // same 1800 s) and to the suite alike. Here the assertions below only
+        // hold if `coord` is the field that is read.
         let window = 300;
-        // Both windows are set to the same value here on purpose: this test is
-        // about CONTINUITY, not about which class of reason gets which window
-        // (that is `a_coord_block_is_timed_on_the_coord_window`).
-        let coord = window;
+        let windows = StallWindows {
+            row: 11,
+            coord: window,
+            transient: 9_999,
+        };
         let mut w = StallWatch::default();
-        assert_eq!(
-            w.observe(&fp(&[("x", "C:x")]), 0, window, coord),
-            None,
-            "first"
-        );
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 0, windows), None, "first");
         assert_eq!(w.watching(), vec!["x".to_string()]);
         assert_eq!(
-            w.observe(&fp(&[("x", "C:x")]), 299, window, coord),
+            w.observe(&fp(&[("x", "C:x")]), 299, windows),
             None,
-            "1 s short"
+            "1 s short — and NOT fired at t=11, which is what `row` would give"
         );
         // x leaves the stuck set — it moved, so its window is over.
-        assert_eq!(
-            w.observe(&StallFingerprint::default(), 300, window, coord),
-            None
-        );
+        assert_eq!(w.observe(&StallFingerprint::default(), 300, windows), None);
         assert!(w.watching().is_empty());
         // ...and re-entering starts a fresh window rather than inheriting one.
-        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 301, window, coord), None);
-        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 599, window, coord), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 301, windows), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 599, windows), None);
         let ev = w
-            .observe(&fp(&[("x", "C:x")]), 601, window, coord)
+            .observe(&fp(&[("x", "C:x")]), 601, windows)
             .expect("300 s continuous");
         assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
         assert_eq!(ev.unchanged_for_secs, 300);
@@ -4829,9 +5296,14 @@ mod tests {
     #[test]
     fn an_oscillating_reason_does_not_defeat_the_window() {
         let window = 300;
-        // One window for both classes — the claim under test is that the KEY,
-        // not the reason string, is what continuity is measured on.
-        let coord = window;
+        // One window for every class — the claim under test is that the KEY,
+        // not the reason string, is what continuity is measured on, and the
+        // oscillating tokens are both `C:`, so the selection is not in play.
+        let windows = StallWindows {
+            row: window,
+            coord: window,
+            transient: window,
+        };
         let mut w = StallWatch::default();
         let mut fired = None;
         for tick in 1..=200i64 {
@@ -4842,7 +5314,7 @@ mod tests {
             } else {
                 "C:coord_error:x"
             };
-            if let Some(ev) = w.observe(&fp(&[("x", token)]), now, window, coord) {
+            if let Some(ev) = w.observe(&fp(&[("x", token)]), now, windows) {
                 assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
                 assert_eq!(ev.fingerprint, token, "the evidence carries WHICH failure");
                 fired = Some(now);
@@ -4861,7 +5333,11 @@ mod tests {
     #[test]
     fn one_rows_churn_does_not_reset_another_rows_window() {
         let window = 300;
-        let coord = window;
+        let windows = StallWindows {
+            row: window,
+            coord: window,
+            transient: window,
+        };
         let mut w = StallWatch::default();
         let mut fired = None;
         for tick in 1..=200i64 {
@@ -4874,8 +5350,7 @@ mod tests {
             if let Some(ev) = w.observe(
                 &fp(&[("stuck", "C:x:stuck"), (&churn, &entry)]),
                 now,
-                window,
-                coord,
+                windows,
             ) {
                 assert_eq!(ev.stuck_keys, vec!["stuck".to_string()]);
                 fired = Some(now);
@@ -4883,6 +5358,565 @@ mod tests {
             }
         }
         assert_eq!(fired, Some(305), "first seen at t=5");
+    }
+
+    // --- the transient window (plan
+    // `2026-09-27-a-transient-dispatch-failure-that-never-clears-leaves-a-conductor-run-unbounded`)
+
+    /// A [`TickOutcome`] carrying nothing but one transient dispatch failure,
+    /// which is the shape every test below drives `tick_exit` with.
+    fn transient_outcome(task_id: &str) -> TickOutcome {
+        TickOutcome {
+            transient_failures: vec![task_id.to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// **The defect.** A transient dispatch failure that never clears used to
+    /// take the row OUT of the stall fingerprint entirely, so the one row that
+    /// was not moving was the one row the detector could never see and the run
+    /// ticked at `running` forever (measured: run `68809b35`, 123 ticks, 96
+    /// minted `task_run_id`s, no terminal state). It now takes a window.
+    #[test]
+    fn a_transient_failure_that_never_clears_eventually_ends_the_run() {
+        let c = cfg();
+        let plan = TickPlan::default();
+        let outcome = transient_outcome("A");
+        let mut watch = StallWatch::default();
+
+        // Every tick inside the window: still waiting, exactly as before.
+        let mut now = 0;
+        while now < c.transient_stall_after_secs {
+            assert!(
+                tick_exit(&plan, &outcome, &mut watch, now, &c).is_none(),
+                "t={now}: inside the window a queued row is still waiting"
+            );
+            now += c.tick_interval_secs as i64;
+        }
+        // ...and past it, the run is ENDED and the reason names the row.
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("a transient condition that never clears is bounded");
+        assert_eq!(exit.status(), RunExit::STATUS_STALLED);
+        let reason = exit.reason().unwrap();
+        assert!(reason.contains("T:A"), "{reason}");
+        assert!(
+            reason.starts_with("Stall detected: A stuck for"),
+            "{reason}"
+        );
+    }
+
+    /// The other half of the same claim, stated on its own so a regression that
+    /// shortened the window would fail HERE rather than only in a slow loop:
+    /// ordinary fleet contention — anything short of the window — never ends a
+    /// run. The 300 s row-sized window is the wrong one and this pins it.
+    ///
+    /// **A FORWARD regression only, not a pin on this change.** It passes
+    /// against the pre-change code too, where the row was dropped from the
+    /// fingerprint outright and so also never ended the run. What the change
+    /// is pinned by is
+    /// `a_transient_failure_that_never_clears_eventually_ends_the_run` (the
+    /// other end of the window) and
+    /// `a_transient_row_carries_only_a_t_entry_and_takes_the_long_window` (the
+    /// mechanism). This one guards the direction those two could break.
+    #[test]
+    fn a_transient_failure_inside_the_window_does_not_end_the_run() {
+        let c = cfg();
+        assert!(
+            c.transient_stall_after_secs > c.stall_after_secs,
+            "the transient window must be the LONG one, or this test proves nothing"
+        );
+        let plan = TickPlan::default();
+        let outcome = transient_outcome("A");
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &outcome, &mut watch, 0, &c).is_none());
+        for now in [
+            c.stall_after_secs,
+            c.stall_after_secs * 2,
+            c.transient_stall_after_secs - 1,
+        ] {
+            assert!(
+                tick_exit(&plan, &outcome, &mut watch, now, &c).is_none(),
+                "t={now}: a busy fleet is not a stalled run"
+            );
+        }
+    }
+
+    /// A row that dispatches on one tick and is refused on the next never
+    /// accrues a window: leaving the fingerprint is what resets continuity, and
+    /// that is unchanged by the `T:` entry. A fleet that is intermittently full
+    /// — the normal case — therefore cannot stall a run however long the run
+    /// lasts.
+    ///
+    /// **A FORWARD regression only**, on the same reading as the test above:
+    /// the pre-change code passes it as well, because a dropped row also never
+    /// accrues a window. Its job is to stop a future change buying boundedness
+    /// at the cost of stalling every intermittently-contended run.
+    #[test]
+    fn alternating_transient_failure_and_progress_never_accrues_a_window() {
+        let c = cfg();
+        let plan = TickPlan::default();
+        let refused = transient_outcome("A");
+        let moved = TickOutcome::default();
+        let mut watch = StallWatch::default();
+        // 4x the window in wall clock, alternating every tick.
+        let mut now = 0;
+        let mut tick = 0;
+        while now < c.transient_stall_after_secs * 4 {
+            let outcome = if tick % 2 == 0 { &refused } else { &moved };
+            assert!(
+                tick_exit(&plan, outcome, &mut watch, now, &c).is_none(),
+                "t={now}: the row moved every other tick — it is not stuck"
+            );
+            now += c.tick_interval_secs as i64;
+            tick += 1;
+        }
+    }
+
+    /// **Pins the remove-then-push ORDER.** The plan's fingerprint already
+    /// carries `R:A` for the dispatch this tick decided; `tick_exit` must drop
+    /// the whole row before pushing `T:A`, or the row carries both entries,
+    /// [`StallFingerprint::transient_only_keys`] does not return it, and it
+    /// silently takes the 300 s default window instead of the long one — ending
+    /// healthy runs, which is the failure mode this plan exists to prevent.
+    #[test]
+    fn a_transient_row_carries_only_a_t_entry_and_takes_the_long_window() {
+        let c = cfg();
+        let plan = TickPlan {
+            stall_fingerprint: fp(&[("A", "R:A")]),
+            ..Default::default()
+        };
+        let outcome = transient_outcome("A");
+        let mut watch = StallWatch::default();
+
+        // The row is watched from the first tick...
+        assert!(tick_exit(&plan, &outcome, &mut watch, 0, &c).is_none());
+        assert_eq!(watch.watching(), vec!["A".to_string()]);
+        // ...and it is NOT on the row-sized window, which only holds if the
+        // `R:` the plan pushed was removed.
+        assert!(
+            tick_exit(&plan, &outcome, &mut watch, c.stall_after_secs, &c).is_none(),
+            "a `T:`-only row is NOT on the row-sized window"
+        );
+        // Past the long window it fires, and the EVIDENCE is read back out of
+        // the exit `tick_exit` actually produced — never out of a fingerprint
+        // the test rebuilt for itself. This block used to clone the plan's
+        // fingerprint and re-run `remove_key` + `push` inline before asserting
+        // on the result, which asserts on two lines of the test rather than on
+        // the two lines under review: delete the production change and it
+        // still passed.
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("it is on the long one");
+        let reason = exit.reason().unwrap();
+        assert!(reason.contains("T:A"), "{reason}");
+        assert!(
+            !reason.contains("R:A"),
+            "the `R:` the plan pushed must be GONE — with it the row is not \
+             transient-only and would have fired 1500 s earlier: {reason}"
+        );
+    }
+
+    /// The "EVERY reason" rule, stated on the predicate itself: a row carrying
+    /// a `T:` AND an `E:` is stuck for a reason of its own and is NOT
+    /// transient-only, so it takes the short window — exactly as
+    /// [`StallFingerprint::coord_only_keys`] treats the same shape.
+    ///
+    /// Note what this does and does not say about [`tick_exit`]. There, the
+    /// `E:` loop runs BEFORE the transient loop, and the transient loop's
+    /// `remove_key` discards it — so a row that transient-failed a dispatch and
+    /// failed another op the same tick reaches the watch carrying `T:` alone
+    /// and takes the LONG window. That is the plan's disclosed residual,
+    /// accepted knowingly: today such a row gets no window at all, so it is
+    /// strictly better. This test pins the predicate, which is what would have
+    /// to change to close the residual.
+    #[test]
+    fn a_row_with_a_non_transient_reason_beside_it_is_not_transient_only() {
+        let mut f = fp(&[("A", "T:A")]);
+        assert_eq!(f.transient_only_keys(), vec!["A".to_string()]);
+        f.push("A".to_string(), "E:complete:A".to_string());
+        assert!(
+            f.transient_only_keys().is_empty(),
+            "a row stuck for a reason of its own gets the short window"
+        );
+    }
+
+    /// **D1a.** A fired transient window does NOT end a run that still has live
+    /// workers: a stall exit returns from the reconciler and orphans their
+    /// sessions. NOT because the condition "was about to lift" — the fan-out
+    /// bound is fleet-wide, so this run's workers finishing may free nothing
+    /// ([`TickPlan::in_flight_workers`]). The window keeps accumulating
+    /// underneath the guard, so the stall fires the moment the run has nothing
+    /// live — which is the state the defect actually occurred in, and which is
+    /// what keeps the guard from being an exemption in disguise.
+    #[test]
+    fn a_fired_transient_window_does_not_end_a_run_with_a_live_worker() {
+        let c = cfg();
+        let busy = TickPlan {
+            in_flight_workers: vec!["W".to_string()],
+            ..Default::default()
+        };
+        let outcome = transient_outcome("A");
+        let mut watch = StallWatch::default();
+        for now in [
+            0,
+            c.transient_stall_after_secs,
+            c.transient_stall_after_secs * 4,
+        ] {
+            assert!(
+                tick_exit(&busy, &outcome, &mut watch, now, &c).is_none(),
+                "t={now}: a queued row must not kill a run with a healthy worker in it"
+            );
+        }
+        // The worker finishes. Nothing is live, and the window that has been
+        // running underneath the guard fires immediately — no extra wait.
+        let idle = TickPlan::default();
+        assert!(
+            tick_exit(
+                &idle,
+                &outcome,
+                &mut watch,
+                c.transient_stall_after_secs * 4,
+                &c
+            )
+            .is_some(),
+            "and the moment the run has nothing live, the accumulated window fires"
+        );
+    }
+
+    /// **The in-flight guard's `warn!` is EDGE-TRIGGERED.** Before the
+    /// transient arm existed the guard needed the whole fired set to be
+    /// coord-blocked, which is a rare condition; a `T:` row now qualifies, so
+    /// one long-running worker beside one row queued behind a fleet bound held
+    /// by peers satisfies it — and that is an ordinary busy box, re-evaluated
+    /// every 5 s for as long as the worker lasts. The transition and any
+    /// change of the held-open set are the information; the repetition is not.
+    ///
+    /// Asserted on the memo rather than on the log line, which is what a test
+    /// can actually see: [`StallWatch::announce_held_open`] returns `true`
+    /// exactly when the guard warns.
+    #[test]
+    fn the_in_flight_guard_warns_on_the_edge_not_every_tick() {
+        let c = cfg();
+        let busy = TickPlan {
+            in_flight_workers: vec!["W".to_string()],
+            ..Default::default()
+        };
+        let outcome = transient_outcome("A");
+        let mut watch = StallWatch::default();
+
+        // Inside the window nothing fires, so the guard is not reached and has
+        // announced nothing.
+        assert!(tick_exit(&busy, &outcome, &mut watch, 0, &c).is_none());
+        assert_eq!(watch.held_open_for, None, "the window has not fired yet");
+
+        assert_eq!(watch.held_open_announcements, 0);
+
+        // The window fires: the guard holds the run open and SAYS so — ONCE,
+        // across 200 further ticks of the identical condition. Unconditional,
+        // that is 201 `warn!` lines.
+        let mut now = c.transient_stall_after_secs;
+        assert!(tick_exit(&busy, &outcome, &mut watch, now, &c).is_none());
+        assert_eq!(watch.held_open_for.as_deref(), Some(&["A".to_string()][..]));
+        assert_eq!(watch.held_open_announcements, 1);
+        for _ in 0..200 {
+            now += c.tick_interval_secs as i64;
+            assert!(tick_exit(&busy, &outcome, &mut watch, now, &c).is_none());
+        }
+        assert_eq!(
+            watch.held_open_announcements, 1,
+            "200 ticks of the same hold are one line, not 201"
+        );
+
+        // A SECOND row appears. On the tick it joins it has served none of its
+        // own window, so the guard is still holding open for `A` alone and
+        // says nothing new...
+        let both = TickOutcome {
+            transient_failures: vec!["A".to_string(), "B".to_string()],
+            ..Default::default()
+        };
+        now += c.tick_interval_secs as i64;
+        assert!(tick_exit(&busy, &both, &mut watch, now, &c).is_none());
+        assert_eq!(watch.held_open_for.as_deref(), Some(&["A".to_string()][..]));
+        assert_eq!(watch.held_open_announcements, 1);
+
+        // ...and once `B` has served ITS window the held-open set changes,
+        // which IS news and speaks again.
+        now += c.transient_stall_after_secs;
+        assert!(tick_exit(&busy, &both, &mut watch, now, &c).is_none());
+        assert_eq!(
+            watch.held_open_for.as_deref(),
+            Some(&["A".to_string(), "B".to_string()][..]),
+            "a changed held-open set re-announces"
+        );
+        assert_eq!(watch.held_open_announcements, 2);
+
+        // The worker finishes: the guard no longer applies, the run ends, and
+        // the memo is cleared so a LATER hold is a fresh episode.
+        let idle = TickPlan::default();
+        assert!(tick_exit(&idle, &both, &mut watch, now, &c).is_some());
+        assert_eq!(watch.held_open_for, None);
+    }
+
+    /// A mixed run is not held open by the guard: the guard covers `C:`/`T:`
+    /// rows only, so a row stuck for a reason of its OWN still ends the run
+    /// while workers are live — otherwise a single queued subtask would make
+    /// any run with a worker in it unstallable.
+    #[test]
+    fn a_row_stuck_on_its_own_account_still_ends_a_run_with_a_live_worker() {
+        let c = cfg();
+        let busy = TickPlan {
+            in_flight_workers: vec!["W".to_string()],
+            ..Default::default()
+        };
+        let outcome = TickOutcome {
+            transient_failures: vec!["A".to_string()],
+            apply_failures: vec!["complete:B".to_string()],
+            ..Default::default()
+        };
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&busy, &outcome, &mut watch, 0, &c).is_none());
+        let exit = tick_exit(&busy, &outcome, &mut watch, c.stall_after_secs, &c)
+            .expect("B is stuck on its own account and the guard does not cover it");
+        assert!(exit.reason().unwrap().contains("E:complete:B"));
+    }
+
+    /// `transient_stall_after_secs` deserializes from a stored `runs.config`
+    /// row written before the knob existed — `#[serde(default)]` on the struct,
+    /// so the boot sweep relaunches an old run rather than refusing it.
+    #[test]
+    fn a_stored_config_without_the_transient_knob_still_deserializes() {
+        let stored = r#"{"tick_interval_secs":5,"concurrency_cap":3,
+            "report_timeout_secs":90,"report_reprompt_grace_secs":90,
+            "gone_grace_secs":60,"working_silence_secs":1800,
+            "stall_after_secs":300,"coord_block_stall_after_secs":1800}"#;
+        let c: OrchestrationRunConfig = serde_json::from_str(stored).expect("stored config");
+        assert_eq!(
+            c.transient_stall_after_secs,
+            OrchestrationRunConfig::default().transient_stall_after_secs,
+            "a knob added after the row was written comes from Default"
+        );
+    }
+
+    // --- the drain-deferral log rate limiter (Phase 3) ---------------------
+
+    /// The `DeferredByDrain` arm is logged at `info!` — the DEFAULT filter
+    /// level, where it used to emit nothing at all — but ONCE per deferral
+    /// episode rather than once per 5 s tick, which is what the `debug!` it
+    /// replaced was avoiding. First deferral logs; the same episode on every
+    /// later tick does not; a CHANGED episode logs again, because a different
+    /// drain (or a drain state that became unreadable) is new information.
+    #[test]
+    fn a_drain_deferral_logs_once_per_episode_not_once_per_tick() {
+        let mut log = DrainDeferLog::default();
+        let run = Uuid::new_v4();
+        let reason = "device drained until 2026-09-27T12:00:00Z";
+
+        assert!(
+            log.should_log(run, "A", DeferClass::Drained, reason),
+            "the first deferral speaks"
+        );
+        for tick in 0..100 {
+            assert!(
+                !log.should_log(run, "A", DeferClass::Drained, reason),
+                "tick {tick}: the same episode is not re-announced"
+            );
+        }
+        assert!(
+            log.should_log(run, "A", DeferClass::Unknown, "drain state unreadable"),
+            "a drain that became unreadable is a different episode"
+        );
+        assert!(!log.should_log(run, "A", DeferClass::Unknown, "drain state unreadable"));
+    }
+
+    /// **The defect the reviewer found in the rate limiter: it was inert in
+    /// the most likely drain state.** The memo keyed on the reason STRING, and
+    /// two of the three producers of an `Unknown` reason interpolate a number
+    /// that moves every tick — `DrainTracker::miss` the consecutive-miss
+    /// count, `effective_state` the heartbeat's age in seconds. With the
+    /// heartbeat dead the text was therefore never twice the same and the
+    /// limiter suppressed nothing: `info!` per queued subtask per tick, at the
+    /// default filter level, which is the noise the `debug!` existed to avoid.
+    ///
+    /// The episode, not the text, is the key. This test drives the two real
+    /// generators' shapes.
+    #[test]
+    fn a_reason_that_moves_every_tick_is_still_one_episode() {
+        let mut log = DrainDeferLog::default();
+        let run = Uuid::new_v4();
+
+        // `effective_state`: the age is recomputed on every read.
+        assert!(log.should_log(
+            run,
+            "A",
+            DeferClass::Unknown,
+            "no drain read for 5s (the heartbeat is not ticking)"
+        ));
+        for age in (10..600).step_by(5) {
+            let reason = format!("no drain read for {age}s (the heartbeat is not ticking)");
+            assert!(
+                !log.should_log(run, "A", DeferClass::Unknown, &reason),
+                "age={age}: a re-worded Unknown is not a new episode"
+            );
+        }
+        // `DrainTracker::miss`: the miss count only ever increases.
+        for misses in 3..200 {
+            let reason = format!("{misses} consecutive failed drain read(s); last: timeout");
+            assert!(
+                !log.should_log(run, "A", DeferClass::Unknown, &reason),
+                "misses={misses}: still the same unreadable-drain episode"
+            );
+        }
+        // ...and coord answering again with a real drain IS a new episode.
+        assert!(log.should_log(
+            run,
+            "A",
+            DeferClass::Drained,
+            "coord has drained this device until 2026-09-27T12:00:00Z"
+        ));
+    }
+
+    /// The other side of the same coin: for a `Drained` deferral the reason IS
+    /// stable — built from the drain's `until` and the operator's text, both
+    /// fixed for the life of one drain — so it is kept in the episode key, and
+    /// a SECOND drain with a different expiry announces itself. This is what
+    /// the memo would otherwise need the `until` plumbed through for.
+    #[test]
+    fn a_different_drain_is_a_different_episode() {
+        let mut log = DrainDeferLog::default();
+        let run = Uuid::new_v4();
+        let first = "coord has drained this device until 2026-09-27T12:00:00Z (rebuild)";
+        let second = "coord has drained this device until 2026-09-27T18:00:00Z (rebuild)";
+
+        assert!(log.should_log(run, "A", DeferClass::Drained, first));
+        assert!(!log.should_log(run, "A", DeferClass::Drained, first));
+        assert!(
+            log.should_log(run, "A", DeferClass::Drained, second),
+            "a drain with a different expiry is new information"
+        );
+    }
+
+    /// The memo is per ROW and per RUN, and [`DrainDeferLog::clear`] starts a
+    /// new episode for a row.
+    ///
+    /// **Scope, stated because the name used to overreach.** This exercises
+    /// `DrainDeferLog` in isolation — it calls `clear` itself, so it says
+    /// nothing about `apply_tick` calling it. That wiring is one line now, not
+    /// three: `apply_tick` asks [`ends_drain_defer_episode`] once per dispatch
+    /// result and clears on `true`, and the predicate is pinned exhaustively
+    /// by `every_dispatch_outcome_but_another_deferral_ends_the_episode`.
+    #[test]
+    fn the_drain_deferral_memo_is_keyed_per_row_and_per_run() {
+        let mut log = DrainDeferLog::default();
+        let run = Uuid::new_v4();
+        let other_run = Uuid::new_v4();
+        let reason = "device drained";
+
+        assert!(log.should_log(run, "A", DeferClass::Drained, reason));
+        assert!(
+            log.should_log(run, "B", DeferClass::Drained, reason),
+            "a different row speaks"
+        );
+        assert!(
+            log.should_log(other_run, "A", DeferClass::Drained, reason),
+            "the same row in a different run speaks"
+        );
+        assert!(!log.should_log(run, "A", DeferClass::Drained, reason));
+
+        // The row dispatched (or failed for another reason) — the episode is
+        // over, so the next deferral is announced rather than swallowed.
+        log.clear(run, "A");
+        assert!(
+            log.should_log(run, "A", DeferClass::Drained, reason),
+            "a new episode speaks"
+        );
+        assert!(
+            !log.should_log(run, "B", DeferClass::Drained, reason),
+            "and B is unaffected"
+        );
+    }
+
+    /// The rule `apply_tick` applies to every dispatch result, exhaustively
+    /// over the four shapes. Only another drain deferral KEEPS the memo.
+    #[test]
+    fn every_dispatch_outcome_but_another_deferral_ends_the_episode() {
+        assert!(ends_drain_defer_episode(&Ok(Uuid::new_v4())), "dispatched");
+        assert!(
+            ends_drain_defer_episode(&Err(DispatchError::Transient("bound full".into()))),
+            "a full fan-out bound is a different condition — the drain episode is over"
+        );
+        assert!(
+            ends_drain_defer_episode(&Err(DispatchError::Failed("no worktree".into()))),
+            "a hard failure ends it too"
+        );
+        assert!(
+            !ends_drain_defer_episode(&Err(DispatchError::DeferredByDrain {
+                message: "drained".into(),
+                class: DeferClass::Drained,
+            })),
+            "still deferred — the episode continues and must stay quiet"
+        );
+    }
+
+    /// **The memo is bounded by the RUN, not by the dispatch arms.** `clear`
+    /// fires only from `apply_tick`, so a row still deferred when its run ends
+    /// — the ordinary way a drained run ends — was never reached by it, and
+    /// its entry survived for the life of a process that lives for days. The
+    /// doc comment claimed the opposite ("only rows currently deferred are
+    /// held"). `clear_run` is what actually bounds it, and
+    /// [`DrainDeferRunGuard`] calls it from `Drop` so every exit path of
+    /// `run_orchestration` is covered rather than the subset that was
+    /// annotated.
+    #[test]
+    fn a_runs_deferral_memos_do_not_outlive_the_run() {
+        let mut log = DrainDeferLog::default();
+        let ending = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+        for row in ["A", "B", "C"] {
+            assert!(log.should_log(ending, row, DeferClass::Drained, "drained"));
+            assert!(log.should_log(peer, row, DeferClass::Drained, "drained"));
+        }
+        assert_eq!(log.len(), 6);
+
+        log.clear_run(ending);
+        assert_eq!(log.len(), 3, "only the ending run's rows go");
+        assert!(
+            log.should_log(ending, "A", DeferClass::Drained, "drained"),
+            "the ended run left nothing behind"
+        );
+        assert!(
+            !log.should_log(peer, "A", DeferClass::Drained, "drained"),
+            "a LIVE peer run's memo is untouched — this reaps by run, not globally"
+        );
+    }
+
+    /// The guard is dropped on every exit of `run_orchestration`, including
+    /// the ones that `return` without touching the memo. Driven here over the
+    /// process-global map the real guard uses, with run ids unique to this
+    /// test so it cannot collide with a peer test.
+    #[test]
+    fn the_run_guard_reaps_the_memo_on_any_exit() {
+        let run = Uuid::new_v4();
+        {
+            let _guard = DrainDeferRunGuard(run);
+            assert!(drain_defer_log().should_log(run, "A", DeferClass::Drained, "drained"));
+            assert!(!drain_defer_log().should_log(run, "A", DeferClass::Drained, "drained"));
+        }
+        assert!(
+            drain_defer_log().should_log(run, "A", DeferClass::Drained, "drained"),
+            "the guard's Drop reaped the run's rows"
+        );
+        drain_defer_log().clear_run(run);
     }
 
     /// A DESIGN failure is a `failed` run carrying the design error — never a
@@ -5048,14 +6082,19 @@ mod tests {
     /// The two designs this type merged disagree only on WHICH failures are
     /// transient, and every caller reads that through one accessor: `apply_tick`
     /// to decide `transient_failures` vs `apply_failures`, and `tick_exit` to
-    /// decide whether the row keeps its stall-fingerprint key. A drain deferral
-    /// is as transient as a full fan-out bound — in both the row is queued and
-    /// will dispatch once a condition OUTSIDE this run clears — so counting
-    /// either as stuck stalls a healthy run.
+    /// decide WHICH WINDOW the row's stall-fingerprint key is timed on. A drain
+    /// deferral is as transient as a full fan-out bound — in both the row is
+    /// queued and will dispatch once a condition OUTSIDE this run clears — so
+    /// both take the long `transient_stall_after_secs` window, and counting
+    /// either on the row-sized one would stall a healthy run.
     #[test]
     fn a_drain_deferral_is_as_transient_as_a_full_fanout_bound() {
         assert!(
-            DispatchError::DeferredByDrain("drained".to_string()).transient(),
+            DispatchError::DeferredByDrain {
+                message: "drained".to_string(),
+                class: DeferClass::Drained,
+            }
+            .transient(),
             "a device drain lifts on its own; the subtask stays Submitted"
         );
         assert!(
@@ -5098,10 +6137,15 @@ mod tests {
         let plan = TickPlan::default();
         let c = cfg();
         assert_eq!(tick_exit(&plan, &o, &mut watch, 0, &c), None);
+        // BOTH rows are watched. `d` used to be dropped from the fingerprint
+        // outright — the exemption that left a never-clearing transient
+        // condition invisible to the detector forever. It is now kept, on its
+        // own long window: `c` fires at `stall_after_secs` and `d` not until
+        // `transient_stall_after_secs`, which the asserts below pin.
         assert_eq!(
             watch.watching(),
-            vec!["c".to_string()],
-            "only the did-not-land row is watched — `d` is waiting for a slot"
+            vec!["c".to_string(), "d".to_string()],
+            "the did-not-land row AND the transient row are both watched"
         );
         let other = TickOutcome {
             apply_failures: vec!["complete:c".to_string()],
@@ -5109,7 +6153,25 @@ mod tests {
         };
         let exit = tick_exit(&plan, &other, &mut watch, c.stall_after_secs, &c)
             .expect("the row was stuck across both attempts");
-        assert!(exit.reason().unwrap().contains("E:complete:c"));
+        let reason = exit.reason().unwrap();
+        assert!(reason.contains("E:complete:c"));
+        assert!(
+            reason.starts_with("Stall detected: c stuck for"),
+            "`c` alone ended the run: {reason}"
+        );
+        // Why `d` is absent, stated exactly. NOT "it is on the long transient
+        // window and nowhere near it" — that was the reason this assert used
+        // to give and it is the wrong one. `other` carries no
+        // `transient_failures`, so the second tick's fingerprint has no `d`
+        // key at all, `seen_since.retain` dropped it, and it left the watch
+        // entirely. The long window is why `d` did not fire on the FIRST
+        // tick's 300 s; it is not why `d` is missing from this evidence.
+        assert_eq!(
+            watch.watching(),
+            vec!["c".to_string()],
+            "`d` stopped failing, so it left the stuck set — the transient \
+             window never came into it"
+        );
     }
 
     /// `finish_run` writes the exit to the run ROW (status + reason) before it
@@ -5703,16 +6765,22 @@ mod tests {
     }
 
     /// A dispatch refused because the FLEET's fan-out bound is full is
-    /// TRANSIENT: no `apply_failures`, and `tick_exit` drops the row's KEY — the
-    /// `R:` this tick put there included — so the run never stalls on it however
-    /// long the gate stays busy. The opposite verdict is what
+    /// TRANSIENT: no `apply_failures`, and `tick_exit` REPLACES the row's
+    /// entries — the `R:` this tick put there included — with a single `T:`,
+    /// so the run does not stall on it however long ordinary contention lasts.
+    /// The opposite verdict is what
     /// `ready_work_beyond_a_partially_admitting_cap_is_not_stuck` already gives
     /// the run-wide cap; this pins that the fleet-wide bound reads the same.
+    ///
+    /// The name says "inside its window" because the forgiveness is now a
+    /// 30-minute window rather than an exemption. This used to assert the row
+    /// was not watched at all, which is exactly how a bound that never freed
+    /// left a run ticking at `running` forever with nothing able to see it.
     ///
     /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
-    async fn a_full_fanout_bound_is_transient_and_never_stalls_the_run() {
+    async fn a_full_fanout_bound_is_transient_and_never_stalls_a_run_inside_its_window() {
         let (pg, run_id, rows) = one_row_run(mk("A", 0, &[], SubtaskState::Submitted)).await;
         let c = cfg();
         let mut timers = ReadyIdleTimers::default();
@@ -5755,10 +6823,38 @@ mod tests {
                 "tick {tick}: a row waiting for a fleet slot is waiting, not stuck"
             );
         }
+        // 200 ticks reaches t=995 s, well inside the 1800 s transient window,
+        // so no stall — the claim in this test's name still holds for every
+        // realistic period of fleet contention.
+        //
+        // But the row IS watched now, which is the point of the change: the
+        // emptiness this used to assert was the exemption that left a bound
+        // which never frees invisible to the detector forever. It is watched
+        // on the LONG window, carrying only a `T:` entry, and the two asserts
+        // below pin both halves.
+        assert_eq!(
+            watch.watching(),
+            vec!["A".to_string()],
+            "the row stays under watch — on its own window, not exempt"
+        );
+        // Past the window, with nothing in flight, the run finally ends —
+        // named, instead of ticking at `running` forever. The fingerprint is
+        // read out of the exit `tick_exit` produced; this block used to
+        // re-run `remove_key` + `push` on a clone here and assert on THAT,
+        // which passes with the production change reverted.
+        let exit = tick_exit(
+            &plan,
+            &outcome,
+            &mut watch,
+            c.transient_stall_after_secs,
+            &c,
+        )
+        .expect("a fan-out bound that never frees is eventually a stall");
+        let reason = exit.reason().unwrap();
+        assert!(reason.contains("T:A"), "{exit:?}");
         assert!(
-            watch.watching().is_empty(),
-            "and the watch is not even tracking it: {:?}",
-            watch.watching()
+            !reason.contains("R:A"),
+            "the `R:` the plan pushed is gone, so the row took the long window: {reason}"
         );
         drop_run(&pg, run_id).await;
     }

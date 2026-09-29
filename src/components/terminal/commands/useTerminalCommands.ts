@@ -1025,9 +1025,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // the id: it clears the maximized zone, re-flows unassigned tabs into
       // empty zones (`applyLayoutAssignments`), and clamps the focused zone.
       // So re-applying the CURRENT preset is a real operation — it is how an
-      // operator un-maximizes and places unassigned tabs (an assigned tab never
-      // moves, since zone metadata is keyed by index) — and short-circuiting it
-      // on `layoutId` equality would have silently deleted that, including
+      // operator un-maximizes and places unassigned tabs (a tab in one of the
+      // layout's zones never moves: zone metadata is keyed by index) — so
+      // short-circuiting it on `layoutId` equality would have deleted that, including
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
@@ -1036,7 +1036,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         grown !== null
           ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
           : wasAlready
-            ? `already ${normalized}; grid re-packed`
+            ? `already ${normalized}; re-applied`
             : normalized;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
     },

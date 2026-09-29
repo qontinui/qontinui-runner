@@ -152,7 +152,7 @@ For each repository:
    **For each hit, annotate with its merge status before recording it** — the operator needs that to decide between safe-delete (`git branch -d`) and force-delete (`git branch -D`). Without the annotation, the operator has to run `gh pr list --head <name> --state merged` once per stale branch by hand; with it, the report is directly actionable.
 
    **ONE `gh` call per repo, not one per branch.** The per-branch form was already
-   mis-sized before this widening — measured on `qontinui-claude-config` 2026-09-20 the
+   mis-sized before this widening — measured on one config repository 2026-09-20 the
    scan yields **355** hits (251 `gone` + 104 never-tracked), so the old shape meant 355
    sequential API calls for ONE repo, well into GitHub's secondary rate limit, times ~14
    repos. Build the head→PR map once and look each branch up locally:
@@ -276,7 +276,7 @@ For each repository:
 
    Exclude the currently-checked-out branch from this scan; that's Case D's territory, and the report should not double-count.
 
-   Cost: **one** `gh pr list` per REPO (not per branch — see the map above), plus one local `awk` lookup and, for never-tracked hits, one local `git show-ref` per hit. No network inside the loop. ⚠️ **N is not 0–5 on this fleet and has not been for a long time** — measured on `qontinui-claude-config` alone on 2026-09-20: **355** hits (251 `gone` + 104 never-tracked) out of 387 local branches. The old "typical N is 0–5" was already wrong for the `gone` class before this widening; the never-tracked class simply makes the true size visible, because it was never being counted at all. A four-figure fleet total is the signal to run `/cleanup-steward`, not to run `/pull-all` more often.
+   Cost: **one** `gh pr list` per REPO (not per branch — see the map above), plus one local `awk` lookup and, for never-tracked hits, one local `git show-ref` per hit. No network inside the loop. ⚠️ **N is not 0–5 on this fleet and has not been for a long time** — measured on one config repository alone on 2026-09-20: **355** hits (251 `gone` + 104 never-tracked) out of 387 local branches. The old "typical N is 0–5" was already wrong for the `gone` class before this widening; the never-tracked class simply makes the true size visible, because it was never being counted at all. A four-figure fleet total is the signal to run `/cleanup-steward`, not to run `/pull-all` more often.
 
 6. **If `gh` is unavailable or unauthenticated** (`gh auth status` fails): fall back to treating ALL non-default branches as "drifted feature branch" rather than "PR-protected." Less protective (a real open PR might get downgraded to feature-branch handling) but still correct: the answer is the same — don't pull it.
 

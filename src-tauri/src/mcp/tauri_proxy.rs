@@ -234,9 +234,11 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
                 crate::coord_drain_state::drain_gate_for_work(
                     crate::coord_drain_state::SpawnOrigin::Unknown,
-                    &format!(
-                        "proxy_terminal:{}",
-                        a.title.as_deref().unwrap_or("untitled")
+                    // Caller-supplied title — BOUNDED (review N4): a caller
+                    // must not be able to grow the banner's deferred set.
+                    &crate::coord_drain_state::bounded_work_key(
+                        "proxy_terminal",
+                        a.title.as_deref().unwrap_or("untitled"),
                     ),
                 )
             {
