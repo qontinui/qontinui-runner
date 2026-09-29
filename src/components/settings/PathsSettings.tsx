@@ -127,15 +127,16 @@ interface PathFieldCopy {
 const FIELD_COPY: Record<PathField, PathFieldCopy> = {
   plans_dir: {
     label: "Plans directory",
-    does: "The directory of markdown plans the plan adapter scans: each plan becomes a coord work unit, and every session launched by this runner receives it as QONTINUI_PLANS_DIR.",
+    does: "The directory of markdown plans the plan adapter scans: each plan becomes a coord work unit.",
     whenUnset:
-      "Unset means plan scanning is off. No work units are pushed to coord and sessions get no QONTINUI_PLANS_DIR.",
+      "Unset means plan scanning is off and no work units are pushed to coord. Either way, a session receives QONTINUI_PLANS_DIR from this directory only when its tenant has no override below.",
     placeholder: "e.g. /home/you/qontinui-dev-notes/plans",
   },
   prompts_dir: {
     label: "Prompts directory",
-    does: "The directory of prompt documents the adapter scans alongside the plans, exported to every session as QONTINUI_PROMPTS_DIR.",
-    whenUnset: "Unset means the prompt scan is off and sessions get no QONTINUI_PROMPTS_DIR.",
+    does: "The directory of prompt documents the adapter scans alongside the plans.",
+    whenUnset:
+      "Unset means the prompt scan is off. Either way, a session receives QONTINUI_PROMPTS_DIR from this directory only when its tenant has no override below.",
     placeholder: "e.g. /home/you/qontinui-dev-notes/plans/prompts",
   },
   workspace_root: {
@@ -424,6 +425,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
             showSwitcher={showSwitcher}
             candidates={candidates}
             defaultTenantId={defaultTenantIdForNewSessions}
+            planTierActive={view.resolved.plan_tier_active}
             configured={view.configured}
             drafts={tenantDrafts}
             onChange={setTenantDraft}
@@ -695,6 +697,12 @@ interface PerTenantPathsProps {
   candidates: readonly string[];
   /** The device's default tenant for new sessions, annotated on its row. */
   defaultTenantId: string | null;
+  /**
+   * `resolved.plan_tier_active` — whether a device-wide plans directory resolves.
+   * It gates the capture note below: with the tier OFF nothing is scanned at all,
+   * which is a different (and louder) statement than "scanned device-wide only".
+   */
+  planTierActive: boolean;
   configured: PathSettings;
   drafts: TenantPathDrafts;
   onChange: (field: TenantPathField, tenantId: string, value: string) => void;
@@ -715,6 +723,7 @@ function PerTenantPaths({
   showSwitcher,
   candidates,
   defaultTenantId,
+  planTierActive,
   configured,
   drafts,
   onChange,
@@ -747,6 +756,21 @@ function PerTenantPaths({
           means that tenant uses the device-wide directory above. A session&rsquo;s tenant is
           stamped when it is spawned and never changes, so a change here applies to future sessions.
         </p>
+        {planTierActive ? (
+          <p className="text-[10px] text-muted-foreground">
+            <strong>Sessions write per tenant; the scanner reads device-wide.</strong> The adapter
+            scans the device-wide directories above, so a plan, archive or prompt file written into
+            a per-tenant directory is not scanned unless that directory is also the device-wide one.
+            An agent can still push one explicitly. Per-tenant scanning waits on the plan corpus
+            gaining a tenant axis.
+          </p>
+        ) : (
+          <p className="text-[10px] text-muted-foreground">
+            <strong>Per-tenant paths do not turn scanning on.</strong> They still decide what a
+            session writes into, but nothing written to them — or to the device-wide directories —
+            reaches coord until a device-wide plans directory is set above.
+          </p>
+        )}
         {hasUnbound && (
           <p className="text-[10px] text-muted-foreground">
             A row marked <strong>not currently bound</strong> is a path stored for a tenant this
