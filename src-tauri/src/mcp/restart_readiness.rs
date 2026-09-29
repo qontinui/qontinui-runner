@@ -99,10 +99,11 @@
 //!
 //! `blocking` still counts every non-`finished` process, because a restart
 //! kills an idle session as surely as a working one. But "245 blocking" hides
-//! what an operator needs to decide what to finish first: measured on
-//! `merytshost` 2026-09-29, 245 live sessions of which Claude Code's own
-//! records called 220 `idle` and only 8 had exchanged a message in the last
-//! hour. `live_claude.by_activity {working, idle, stale, unknown}` splits the
+//! what an operator needs to decide what to finish first. Coord finding
+//! `0675c4e4` (merytshost, 2026-09-29) counted 245 live sessions of which
+//! Claude Code's own records called 220 `idle` and only 8 had exchanged a
+//! message in the last hour — a hand measurement cited here, not something
+//! this code measured. `live_claude.by_activity {working, idle, stale, unknown}` splits the
 //! same `total` on the ACTIVITY axis ([`crate::session::claude_activity`]):
 //! the runner's own pane observation (already taken by the wind-down
 //! observer) where it is decisive, else Claude Code's `sessions/<pid>.json`.
@@ -136,6 +137,7 @@
 //! consulted precisely when someone is about to do something destructive.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -144,7 +146,7 @@ use serde::Serialize;
 
 use crate::mcp::session_work_status::{self, SessionStatusSource};
 use crate::mcp::types::ApiState;
-use crate::session::claude_activity::{self, ActivityCounts, RecordReading};
+use crate::session::claude_activity::{self, ActivityCounts, LivePid, RecordReading};
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
 use crate::session::wind_down_observer::{self, ObservedInputs, TerminalObservation};
@@ -299,8 +301,8 @@ pub struct LiveClaudeTotals {
     /// a process that cannot be classified is `unknown`, never `idle`.
     ///
     /// ⚠ **REPORT-ONLY — the verdict never reads it.** An idle session still
-    /// dies on a restart. This exists so an operator can see "245 open, 7
-    /// working" and decide what to finish first; see
+    /// dies on a restart. This exists so an operator can see how many of the
+    /// open sessions are actually working and decide what to finish first; see
     /// [`crate::session::claude_activity`] for the evidence and its precedence.
     pub by_activity: ActivityCounts,
 }
@@ -612,8 +614,20 @@ pub fn pane_observations_by_pid(
         .collect()
 }
 
-/// Every live `claude` pid in the pass, across all four classes.
-fn all_live_pids(report: &TrackingHealthReport) -> Vec<u32> {
+/// How long the Claude Code record read may take before every undecided
+/// process is reported `unknown`. `/restart-readiness` is polled on every Stop
+/// turn under a short client timeout; a slow disk must cost the activity
+/// split, never the verdict's availability.
+pub const RECORD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The live processes whose activity the pane did NOT decide — the only ones
+/// whose Claude Code record is worth reading — with the census's process age
+/// for the record's identity check.
+fn pids_needing_a_record(
+    report: &TrackingHealthReport,
+    pane_by_pid: &HashMap<u32, TerminalObservation>,
+    now_ms: i64,
+) -> Vec<LivePid> {
     [
         &report.terminal_hosted,
         &report.ai_plane,
@@ -621,8 +635,65 @@ fn all_live_pids(report: &TrackingHealthReport) -> Vec<u32> {
         &report.live_untracked,
     ]
     .iter()
-    .flat_map(|l| l.iter().map(|p| p.pid))
+    .flat_map(|l| l.iter())
+    .filter(|p| {
+        pane_by_pid
+            .get(&p.pid)
+            .and_then(|obs| claude_activity::classify_from_pane(obs, p.has_live_children, now_ms))
+            .is_none()
+    })
+    .map(|p| LivePid {
+        pid: p.pid,
+        age_s: p.age_s,
+    })
     .collect()
+}
+
+/// Assemble the activity evidence for one pass: the pane observations the
+/// wind-down observer already took, plus Claude Code's records for every
+/// process the pane could not decide, read from `config_dirs` off the
+/// executor and bounded by `read_timeout`. A read that fails or times out
+/// costs the records — those processes read `unknown`, never `idle`.
+/// `proc_start` is [`claude_activity::proc_start_ticks`] in production.
+pub async fn gather_activity_evidence(
+    report: &TrackingHealthReport,
+    observed: &ObservedInputs,
+    config_dirs: Vec<PathBuf>,
+    proc_start: fn(u32) -> Option<String>,
+    read_timeout: std::time::Duration,
+) -> ActivityEvidence {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let pane_by_pid = pane_observations_by_pid(report, observed);
+    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
+    let records = if pids.is_empty() {
+        HashMap::new()
+    } else {
+        let read = tokio::task::spawn_blocking(move || {
+            claude_activity::read_records(&config_dirs, &pids, now_ms, &proc_start)
+        });
+        match tokio::time::timeout(read_timeout, read).await {
+            Ok(Ok(records)) => records,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "restart-readiness: Claude Code session-record read failed ({e}) — \
+                     every undecided process reads activity `unknown`"
+                );
+                HashMap::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "restart-readiness: Claude Code session-record read exceeded {read_timeout:?} — \
+                     every undecided process reads activity `unknown`"
+                );
+                HashMap::new()
+            }
+        }
+    };
+    ActivityEvidence {
+        pane_by_pid,
+        records,
+        now_ms,
+    }
 }
 
 /// One AI-plane session as collected from `SessionManager` + the `task_runs`
@@ -1051,33 +1122,18 @@ pub async fn restart_readiness_handler(
     //
     // The pane half is the observation `fresh_pass` already took for the
     // wind-down verdicts — no second look at any pane. The record half reads
-    // Claude Code's `sessions/<pid>.json` for every live pid: blocking file
-    // I/O (one directory listing per config dir, one small file per pid, and
-    // a transcript tail for `busy`/`shell` records only), so it runs off the
-    // executor. A failed blocking task costs every record — `unknown`, never
-    // `idle`.
+    // Claude Code's `sessions/<pid>.json` only for processes the pane did not
+    // decide, off the executor and under `RECORD_READ_TIMEOUT`.
     let activity_evidence = match pass.as_ref() {
         Some(p) => {
-            let pids = all_live_pids(&p.report);
-            let records = tokio::task::spawn_blocking(move || {
-                claude_activity::read_records(
-                    &crate::terminal::transcript::find_claude_config_dirs(),
-                    &pids,
-                )
-            })
+            gather_activity_evidence(
+                &p.report,
+                &observed,
+                crate::terminal::transcript::find_claude_config_dirs(),
+                claude_activity::proc_start_ticks,
+                RECORD_READ_TIMEOUT,
+            )
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "restart-readiness: Claude Code session-record read failed ({e}) — \
-                     every process falls back to activity `unknown`"
-                );
-                HashMap::new()
-            });
-            ActivityEvidence {
-                pane_by_pid: pane_observations_by_pid(&p.report, &observed),
-                records,
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            }
         }
         None => ActivityEvidence::default(),
     };
@@ -2980,7 +3036,9 @@ mod tests {
                 wind_down_proc(1, Some("s1"), Some("working"), false, false), // pane: working
                 wind_down_proc(2, Some("s2"), Some("finished"), false, false), // pane: idle
                 wind_down_proc(3, Some("s1"), None, true, false),             // nested: record
-                wind_down_proc(4, Some("s4"), Some("working"), false, false), // pane undecided: record
+                // An idle pane, but a live child (a days-old MCP shim) vetoes
+                // pane-idle WITHOUT counting as work: the record decides.
+                wind_down_proc(4, Some("s4"), Some("working"), false, true),
             ],
             ai_plane: vec![wind_down_proc(5, None, None, false, false)],
             headless_exempt: vec![
@@ -3015,7 +3073,16 @@ mod tests {
                         grid: GridIdle::Idle { since_ms: 1 },
                     },
                 ),
-                (4, TerminalObservation::UNOBSERVABLE),
+                (
+                    4,
+                    TerminalObservation {
+                        sideband: Sideband::Reported {
+                            state: qontinui_runner_lib::wind_down::SidebandState::NotWorking,
+                            set_at_ms: 1,
+                        },
+                        grid: GridIdle::Idle { since_ms: 1 },
+                    },
+                ),
             ]
             .into(),
             records: [
@@ -3043,8 +3110,8 @@ mod tests {
             totals.by_activity,
             ActivityCounts {
                 working: 2, // pid 1 (pane grid busy), pid 3 (busy + recent message)
-                idle: 2,    // pid 2 (pane idle beats a busy record), pid 4 (waiting)
-                stale: 1,   // pid 5 (shell, silent 10 h)
+                idle: 2, // pid 2 (pane idle beats a busy record), pid 4 (child-vetoed pane, waiting record)
+                stale: 1, // pid 5 (shell, silent 10 h)
                 unknown: 4, // pids 6-9: unparseable, unknown status, ambiguous, missing
             }
         );
@@ -3157,6 +3224,126 @@ mod tests {
             by_pid,
             [(1, IDLE_LONG_AGO), (2, TerminalObservation::UNOBSERVABLE)].into()
         );
-        assert_eq!(all_live_pids(&report), (1..=9).collect::<Vec<u32>>());
+    }
+
+    /// Only processes the pane did NOT decide get a record read (L2): pid 1
+    /// (busy grid) and pid 2 (idle pane) are decided; pid 4's idle pane is
+    /// vetoed by its child, so it still needs one.
+    #[test]
+    fn records_are_read_only_for_processes_the_pane_did_not_decide() {
+        let report = activity_report();
+        let evidence = activity_evidence();
+        let pids: Vec<u32> = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, vec![3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    fn write_record(dir: &std::path::Path, pid: u32, status: &str) {
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(
+            dir.join(format!("sessions/{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"s{pid}","status":"{status}","procStart":"77"}}"#),
+        )
+        .unwrap();
+    }
+
+    fn kernel_agrees(_: u32) -> Option<String> {
+        Some("77".to_string())
+    }
+
+    /// L1: the handler's evidence assembly, end to end against a temp config
+    /// dir — pane-decided processes, record-decided ones, and a missing
+    /// record, summing to `total`.
+    #[tokio::test]
+    async fn gather_activity_evidence_reads_records_from_the_given_config_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in [3, 4, 6, 7, 8] {
+            write_record(&dir, pid, "idle");
+        }
+        write_record(&dir, 5, "waiting");
+        // pid 9: no record at all.
+        let report = activity_report();
+        let observed = ObservedInputs {
+            terminal_by_session: [
+                ("s1".to_string(), "t1".to_string()),
+                ("s2".to_string(), "t2".to_string()),
+            ]
+            .into(),
+            by_terminal: [
+                (
+                    "t1".to_string(),
+                    TerminalObservation {
+                        sideband: Sideband::NeverReported,
+                        grid: GridIdle::Busy,
+                    },
+                ),
+                ("t2".to_string(), IDLE_LONG_AGO),
+            ]
+            .into(),
+            ..ObservedInputs::default()
+        };
+        let evidence = gather_activity_evidence(
+            &report,
+            &observed,
+            vec![dir],
+            kernel_agrees,
+            RECORD_READ_TIMEOUT,
+        )
+        .await;
+        assert!(
+            !evidence.records.contains_key(&1),
+            "a pane-decided process is never read"
+        );
+        let totals = live_claude_totals_observed(&report, &evidence);
+        // pid 1 working (busy grid); pid 2's pane never reported a sideband so
+        // it falls to the record — none written for it, so unknown; 3-8 idle
+        // from their records; 9 missing → unknown.
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                working: 1,
+                idle: 6,
+                stale: 0,
+                unknown: 2,
+            }
+        );
+        assert_eq!(totals.by_activity.sum(), totals.total);
+    }
+
+    fn slow_kernel(_: u32) -> Option<String> {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Some("77".to_string())
+    }
+
+    /// L2: a record read that overruns its budget costs the records — every
+    /// undecided process reads `unknown`, never `idle` — and the sum holds.
+    #[tokio::test]
+    async fn a_record_read_that_times_out_leaves_every_undecided_process_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude-x");
+        for pid in 1..=9 {
+            write_record(&dir, pid, "idle");
+        }
+        let report = activity_report();
+        let evidence = gather_activity_evidence(
+            &report,
+            &ObservedInputs::default(),
+            vec![dir],
+            slow_kernel,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(evidence.records.is_empty());
+        let totals = live_claude_totals_observed(&report, &evidence);
+        assert_eq!(
+            totals.by_activity,
+            ActivityCounts {
+                unknown: 9,
+                ..ActivityCounts::default()
+            }
+        );
     }
 }
