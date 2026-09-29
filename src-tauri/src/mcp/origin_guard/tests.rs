@@ -1726,21 +1726,25 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
     let without_probe = json!({ "conditions": { "timeoutMinutes": 30 } }).to_string();
     let host = host(&h);
 
-    let status = |method: &'static str, uri: &'static str, origin: Option<&'static str>, body: String| {
-        let router = router.clone();
-        let host = host.clone();
-        async move {
-            let mut headers = vec![("host", host.as_str()), ("content-type", "application/json")];
-            if let Some(o) = origin {
-                headers.push(("origin", o));
+    let status =
+        |method: &'static str, uri: &'static str, origin: Option<&'static str>, body: String| {
+            let router = router.clone();
+            let host = host.clone();
+            async move {
+                let mut headers = vec![
+                    ("host", host.as_str()),
+                    ("content-type", "application/json"),
+                ];
+                if let Some(o) = origin {
+                    headers.push(("origin", o));
+                }
+                router
+                    .oneshot(req(method, uri, &headers, &body))
+                    .await
+                    .unwrap()
+                    .status()
             }
-            router
-                .oneshot(req(method, uri, &headers, &body))
-                .await
-                .unwrap()
-                .status()
-        }
-    };
+        };
 
     // Foreign: admitted by the shadowed route policy, refused by the handler.
     assert_eq!(

@@ -65,6 +65,28 @@ pub const EVALUATED_CONDITIONS: &[&str] = &[
     "timeout_minutes",
 ];
 
+/// The conditions this build ENFORCES end to end: [`EVALUATED_CONDITIONS`]
+/// when the task store round-trips a task's `conditions`, and none when it
+/// does not. Served as `GET /health` `schedulerConditions`.
+///
+/// The distinction is not academic. `project.scheduled_tasks` (owned by
+/// qontinui-web's alembic chain) has NO `conditions` column today: the PG
+/// store drops a task's conditions on insert/update and reads every task
+/// back with `conditions: None`, so `has_conditions()` is false and every
+/// condition — `require_probe` included — is inert. Advertising the evaluator's
+/// list anyway would tell the Phase 5 installer that a probe-gated
+/// `Condition` schedule is safe on a build where it fires ungated every
+/// rearm. This derives from the store's own column list
+/// ([`crate::database::pg::scheduler::task_store_persists_conditions`]), so it
+/// flips to the full list in the same change that adds the column.
+pub fn enforced_conditions() -> &'static [&'static str] {
+    if crate::database::pg::scheduler::task_store_persists_conditions() {
+        EVALUATED_CONDITIONS
+    } else {
+        &[]
+    }
+}
+
 /// Whether `task` belongs in this tick's candidate set: enabled, and either
 /// already parked waiting for conditions or at/past its `next_run`.
 fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
@@ -103,18 +125,31 @@ fn condition_timeout_record(task: &ScheduledTask) -> TaskExecutionRecord {
     record
 }
 
-/// A catch-up for a task with conditions runs only if those conditions admit
-/// it NOW: when they do not (`fire == false`), every `Enqueue` becomes a
-/// `Skip`, i.e. a `MissedRunnerDown` row, instead of an unconditional run.
+/// Catch-up actions for a task with conditions, given whether the gate
+/// admitted a run NOW (`fire`).
+///
+/// One admission is one run: a met gate (a spent probe result included) keeps
+/// only the LATEST `Enqueue` — actions are chronological, so the last one — and
+/// every earlier `Enqueue` becomes a `Skip` (a `MissedRunnerDown` row). So
+/// `CatchUpPolicy::Run` with N missed slots runs once, not N times on one
+/// admission. Not admitted (`fire == false`, or the task is already running):
+/// every `Enqueue` becomes a `Skip`.
 fn gate_catch_up_actions(actions: Vec<CatchUpAction>, fire: bool) -> Vec<CatchUpAction> {
-    if fire {
-        return actions;
-    }
+    let keep = if fire {
+        actions
+            .iter()
+            .rposition(|a| matches!(a, CatchUpAction::Enqueue { .. }))
+    } else {
+        None
+    };
     actions
         .into_iter()
-        .map(|action| match action {
-            CatchUpAction::Enqueue { scheduled_for } => CatchUpAction::Skip { scheduled_for },
-            skip @ CatchUpAction::Skip { .. } => skip,
+        .enumerate()
+        .map(|(i, action)| match action {
+            CatchUpAction::Enqueue { scheduled_for } if Some(i) != keep => {
+                CatchUpAction::Skip { scheduled_for }
+            }
+            other => other,
         })
         .collect()
 }
@@ -317,6 +352,24 @@ impl SchedulerService {
     /// waiting for the next `check_interval_secs` heartbeat.
     pub async fn tick(self: Arc<Self>) {
         let _pass = self.pass_lock.lock().await;
+        self.clone().tick_pass().await;
+    }
+
+    /// [`Self::tick`] unless a pass (a tick — which runs sync task types to
+    /// completion — or a reconcile) is already in progress, in which case it
+    /// returns `false` at once instead of waiting behind it. For callers that
+    /// must not hang for a whole sync run: the wake handler (the loop ticks
+    /// again within a minute anyway).
+    pub async fn try_tick(self: Arc<Self>) -> bool {
+        let Ok(_pass) = self.pass_lock.try_lock() else {
+            return false;
+        };
+        self.clone().tick_pass().await;
+        true
+    }
+
+    /// One tick's body; the caller holds [`Self::pass_lock`].
+    async fn tick_pass(self: Arc<Self>) {
         let pg = match self.pg() {
             Ok(pg) => pg,
             Err(e) => {
@@ -2097,6 +2150,21 @@ impl SchedulerService {
     /// block the entire fleet from reconciling.
     pub async fn reconcile_missed_runs(self: Arc<Self>) -> Result<(), String> {
         let _pass = self.pass_lock.lock().await;
+        self.clone().reconcile_pass().await
+    }
+
+    /// [`Self::reconcile_missed_runs`] unless a pass is already in progress:
+    /// `Ok(false)` at once instead of waiting behind it. `/scheduler/reconcile-now`
+    /// answers that with 409 rather than hanging for a whole sync run.
+    pub async fn try_reconcile_missed_runs(self: Arc<Self>) -> Result<bool, String> {
+        let Ok(_pass) = self.pass_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.clone().reconcile_pass().await.map(|()| true)
+    }
+
+    /// The reconciler's body; the caller holds [`Self::pass_lock`].
+    async fn reconcile_pass(self: Arc<Self>) -> Result<(), String> {
         let pg = self.pg()?;
 
         let settings = match pg.get_scheduler_settings().await {
@@ -2218,10 +2286,19 @@ impl SchedulerService {
         // A catch-up is a run like any other: a task with conditions goes
         // through the same gate the tick uses (a met probe is spent on it).
         // Not admitted now -> the slots are recorded MissedRunnerDown.
+        // A task that is running right now gets no concurrent catch-up either
+        // way (the tick skips a running task for the same reason).
         let wants_run = actions
             .iter()
             .any(|a| matches!(a, CatchUpAction::Enqueue { .. }));
-        if wants_run && task.has_conditions() {
+        if wants_run && self.is_task_running(&task.id).await {
+            info!(
+                task_id = %task.id,
+                "scheduler reconciler: task is running — recording missed slots instead \
+                 of a concurrent catch-up run"
+            );
+            actions = gate_catch_up_actions(actions, false);
+        } else if wants_run && task.has_conditions() {
             let fire = matches!(
                 self.gate_conditions(task, std::time::Instant::now()).await,
                 ConditionGate::Fire
@@ -3705,12 +3782,14 @@ mod tests {
     fn a_conditioned_catch_up_the_gate_does_not_admit_is_recorded_missed() {
         let slots = six_hourly_missed_slots();
         let actions = plan_catch_up_actions(&slots, CatchUpPolicy::RunOnce);
-        assert!(matches!(actions.as_slice(), [CatchUpAction::Enqueue { .. }]));
+        assert!(matches!(
+            actions.as_slice(),
+            [CatchUpAction::Enqueue { .. }]
+        ));
         assert_eq!(gate_catch_up_actions(actions.clone(), true), actions);
         let held = gate_catch_up_actions(actions, false);
         assert!(
-            held.iter()
-                .all(|a| matches!(a, CatchUpAction::Skip { .. })),
+            held.iter().all(|a| matches!(a, CatchUpAction::Skip { .. })),
             "{held:?}"
         );
         assert_eq!(held.len(), 1);
@@ -3724,9 +3803,7 @@ mod tests {
         let (_, body) = src
             .split_once("async fn reconcile_task(")
             .expect("reconcile_task exists");
-        let (body, _) = body
-            .split_once("\n    }\n")
-            .expect("reconcile_task closes");
+        let (body, _) = body.split_once("\n    }\n").expect("reconcile_task closes");
         let (before_gate, _) = body
             .split_once("task.has_conditions()")
             .expect("reconcile_task checks for conditions");
@@ -3739,5 +3816,66 @@ mod tests {
         );
         assert!(body.contains("self.gate_conditions(task,"));
         assert!(body.contains("gate_catch_up_actions(actions, fire)"));
+    }
+
+    /// `CatchUpPolicy::Run` with 3 missed slots and one gate admission: exactly
+    /// one run (the latest slot); the other two are recorded missed.
+    #[test]
+    fn one_admission_runs_one_catch_up_under_the_run_policy() {
+        let slots: Vec<DateTime<Utc>> = six_hourly_missed_slots().into_iter().take(3).collect();
+        assert_eq!(slots.len(), 3);
+        let actions = plan_catch_up_actions(&slots, CatchUpPolicy::Run);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, CatchUpAction::Enqueue { .. }))
+                .count(),
+            3
+        );
+        let gated = gate_catch_up_actions(actions, true);
+        let runs: Vec<_> = gated
+            .iter()
+            .filter_map(|a| match a {
+                CatchUpAction::Enqueue { scheduled_for } => Some(*scheduled_for),
+                CatchUpAction::Skip { .. } => None,
+            })
+            .collect();
+        assert_eq!(runs, vec![slots[2]], "only the latest slot runs");
+        assert_eq!(gated.len(), 3);
+    }
+
+    /// A pass in progress makes the try-variants return at once instead of
+    /// waiting (the wake handler skips; `/scheduler/reconcile-now` answers 409).
+    #[tokio::test]
+    async fn try_variants_do_not_wait_behind_a_pass_in_progress() {
+        let service = Arc::new(SchedulerService::new(None));
+        let held = service.pass_lock.lock().await;
+        let started = std::time::Instant::now();
+        assert!(!service.clone().try_tick().await);
+        assert_eq!(service.clone().try_reconcile_missed_runs().await, Ok(false));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
+        // Free: the pass runs (and, with no database, reports that).
+        assert!(service.clone().try_tick().await);
+        assert!(service.clone().try_reconcile_missed_runs().await.is_err());
+    }
+
+    /// `/health` `schedulerConditions` advertises a condition only when the
+    /// task store round-trips it. Today `project.scheduled_tasks` has no
+    /// `conditions` column, so the honest answer is empty — a client that
+    /// trusted the evaluator's list would install a probe-gated schedule that
+    /// runs ungated.
+    #[test]
+    fn enforced_conditions_are_empty_while_the_store_drops_conditions() {
+        let persists = crate::database::pg::scheduler::task_store_persists_conditions();
+        assert_eq!(
+            enforced_conditions(),
+            if persists { EVALUATED_CONDITIONS } else { &[] as &[&str] }
+        );
+        assert!(
+            !persists,
+            "the store now names a `conditions` column: confirm insert/update write it and \
+             the row reader parses it, then drop this assertion"
+        );
     }
 }

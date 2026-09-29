@@ -32,6 +32,19 @@ const SELECT_TASK_COLS: &str = r#"
     consecutive_launch_failures, launch_failure_backoff_seconds
 "#;
 
+/// Whether this store round-trips a task's `ScheduleConditions`: true iff the
+/// column list it reads names a `conditions` column. Today it does not —
+/// `project.scheduled_tasks` has no such column, so conditions are dropped on
+/// write and read back as `None` (see
+/// `crate::scheduler_service::enforced_conditions`). Derived from
+/// [`SELECT_TASK_COLS`] rather than declared, so it cannot disagree with the
+/// query that decides it.
+pub fn task_store_persists_conditions() -> bool {
+    SELECT_TASK_COLS
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .any(|column| column == "conditions")
+}
+
 /// Parse a `catch_up_policy` text value from the DB into the typed enum.
 /// Falls back to [`CatchUpPolicy::default`] for unknown / null values so
 /// rows written before this column existed still load.
@@ -346,8 +359,21 @@ impl PgDb {
         Ok(())
     }
 
-    /// Update an existing scheduled task (full replacement of mutable fields).
-    pub async fn update_scheduled_task(&self, task: &ScheduledTask) -> Result<(), String> {
+    /// Update an existing scheduled task (full replacement of mutable fields)
+    /// as a CONDITIONAL write: it lands only if the row's `modified_at` still
+    /// equals `expected_modified_at`, the value the caller read before
+    /// building `task`. Returns `Ok(false)` when it did not (another writer —
+    /// an operator edit, or the scheduler's own status/next-run writes — moved
+    /// the row since), so a caller holding a stale snapshot cannot overwrite a
+    /// newer change; the HTTP handler answers that with 409.
+    pub async fn update_scheduled_task(
+        &self,
+        task: &ScheduledTask,
+        expected_modified_at: &str,
+    ) -> Result<bool, String> {
+        let expected: DateTime<Utc> = expected_modified_at
+            .parse()
+            .map_err(|e| format!("expected modified_at '{expected_modified_at}': {e}"))?;
         let conn = self
             .pool
             .get()
@@ -365,7 +391,7 @@ impl PgDb {
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
 
-        conn.execute(
+        let updated = conn.execute(
             r#"
             UPDATE scheduled_tasks SET
                 name = $1,
@@ -384,7 +410,7 @@ impl PgDb {
                 catch_up_grace_seconds = $14,
                 consecutive_launch_failures = $15,
                 launch_failure_backoff_seconds = $16
-            WHERE id = $17
+            WHERE id = $17 AND modified_at = $18
             "#,
             &[
                 &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -410,12 +436,13 @@ impl PgDb {
                 &consecutive_launch_failures_i32,
                 &launch_failure_backoff_seconds_i32,
                 &task.id,
+                &expected,
             ],
         )
         .await
         .map_err(|e| format!("PG update_scheduled_task {}: {}", task.id, e))?;
 
-        Ok(())
+        Ok(updated == 1)
     }
 
     /// Delete a scheduled task by ID. History is cascade-deleted by FK.
