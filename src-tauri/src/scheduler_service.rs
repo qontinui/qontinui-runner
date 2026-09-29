@@ -69,16 +69,16 @@ pub const EVALUATED_CONDITIONS: &[&str] = &[
 /// when the task store round-trips a task's `conditions`, and none when it
 /// does not. Served as `GET /health` `schedulerConditions`.
 ///
-/// The distinction is not academic. `project.scheduled_tasks` (owned by
-/// qontinui-web's alembic chain) has NO `conditions` column today: the PG
-/// store drops a task's conditions on insert/update and reads every task
-/// back with `conditions: None`, so `has_conditions()` is false and every
-/// condition — `require_probe` included — is inert. Advertising the evaluator's
-/// list anyway would tell the Phase 5 installer that a probe-gated
-/// `Condition` schedule is safe on a build where it fires ungated every
-/// rearm. This derives from the store's own column list
-/// ([`crate::database::pg::scheduler::task_store_persists_conditions`]), so it
-/// flips to the full list in the same change that adds the column.
+/// The distinction is not academic. Until Phase 4c `project.scheduled_tasks`
+/// (owned by qontinui-web's alembic chain) had NO `conditions` column: the PG
+/// store dropped a task's conditions on insert/update and read every task
+/// back with `conditions: None`, so every condition — `require_probe`
+/// included — was inert, and advertising the evaluator's list would have
+/// told the Phase 5 installer that a probe-gated `Condition` schedule was
+/// safe on a build where it fires ungated every rearm. This derives from the
+/// store's own column list
+/// ([`crate::database::pg::scheduler::task_store_persists_conditions`]), so a
+/// store that stops persisting conditions stops advertising them.
 pub fn enforced_conditions() -> &'static [&'static str] {
     if crate::database::pg::scheduler::task_store_persists_conditions() {
         EVALUATED_CONDITIONS
@@ -3861,25 +3861,21 @@ mod tests {
     }
 
     /// `/health` `schedulerConditions` advertises a condition only when the
-    /// task store round-trips it. Today `project.scheduled_tasks` has no
-    /// `conditions` column, so the honest answer is empty — a client that
-    /// trusted the evaluator's list would install a probe-gated schedule that
-    /// runs ungated.
+    /// task store round-trips it — derived from the store's own column list.
+    /// Since Phase 4c the store persists `conditions`, so the capability is
+    /// the evaluator's full list.
     #[test]
-    fn enforced_conditions_are_empty_while_the_store_drops_conditions() {
-        let persists = crate::database::pg::scheduler::task_store_persists_conditions();
+    fn enforced_conditions_are_the_full_list_now_the_store_persists_them() {
+        assert!(crate::database::pg::scheduler::task_store_persists_conditions());
+        assert_eq!(enforced_conditions(), EVALUATED_CONDITIONS);
         assert_eq!(
             enforced_conditions(),
-            if persists {
-                EVALUATED_CONDITIONS
-            } else {
-                &[] as &[&str]
-            }
-        );
-        assert!(
-            !persists,
-            "the store now names a `conditions` column: confirm insert/update write it and \
-             the row reader parses it, then drop this assertion"
+            &[
+                "require_idle",
+                "require_repo_inactive",
+                "require_probe",
+                "timeout_minutes"
+            ]
         );
     }
 }
