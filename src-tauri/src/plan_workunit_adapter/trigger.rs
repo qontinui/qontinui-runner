@@ -10237,6 +10237,7 @@ Body.
             depends_on,
             area: None,
             area_rejected: None,
+            pr_refs: vec![],
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
