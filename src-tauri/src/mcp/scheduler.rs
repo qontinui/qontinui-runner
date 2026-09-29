@@ -758,9 +758,7 @@ mod tests {
         let (body, _) = body
             .split_once("pub async fn delete_scheduled_task(")
             .expect("update handler ends");
-        let (before_touch, _) = body
-            .split_once("scheduled_task.touch();")
-            .expect("touch");
+        let (before_touch, _) = body.split_once("scheduled_task.touch();").expect("touch");
         assert!(before_touch.contains("let read_modified_at = scheduled_task.modified_at.clone();"));
         assert!(body.contains(".update_scheduled_task(&scheduled_task, &read_modified_at)"));
         assert!(body.contains("StatusCode::CONFLICT"));

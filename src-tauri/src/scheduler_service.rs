@@ -3870,7 +3870,11 @@ mod tests {
         let persists = crate::database::pg::scheduler::task_store_persists_conditions();
         assert_eq!(
             enforced_conditions(),
-            if persists { EVALUATED_CONDITIONS } else { &[] as &[&str] }
+            if persists {
+                EVALUATED_CONDITIONS
+            } else {
+                &[] as &[&str]
+            }
         );
         assert!(
             !persists,
