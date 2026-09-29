@@ -1140,8 +1140,10 @@ mod tests {
     /// helper answers exactly for the four configured arms; a persisted value
     /// the readers must treat as REFUSED (non-blank, not honoured, not the
     /// build default) is exactly the loopback-rejected arm, whose URL is the
-    /// release default they defer to; and a blank or default-equal persisted
-    /// value is plainly unconfigured (helper `None`, not refused).
+    /// release default they defer to; and a blank persisted value is plainly
+    /// unconfigured (helper `None`, not refused). The table feeds the resolver
+    /// raw values, so the debug-only default-equal filter
+    /// (`persisted_input`) is covered by its own tests, not here.
     #[test]
     fn configured_helper_and_reader_mappings_agree_over_one_table() {
         let persisted_values = [
@@ -1549,9 +1551,10 @@ mod tests {
         }
     }
 
-    /// The read-side filter: a persisted value byte-equal to the build default
-    /// is dropped, so the arm becomes the build-default arm; a different value
-    /// stays `PersistedBackendUrl`. Drives `api_base_url_inputs_from` with env
+    /// The read-side filter (DEBUG builds only): a persisted value equal to
+    /// the build default is dropped, so the arm becomes the build-default arm;
+    /// in a release build it is kept as `PersistedBackendUrl`. A different
+    /// value stays `PersistedBackendUrl` in both. Drives `api_base_url_inputs_from` with env
     /// locked and cleared; the profile input it reads from disk is overwritten
     /// before resolving so the developer's real profiles.json cannot leak in.
     #[test]
@@ -1563,9 +1566,24 @@ mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.web_integration.enabled = true;
 
+        // The filter is DEBUG-only (`persisted_input`): in a release build the
+        // default is the prod URL, identical whether attributed to the
+        // persisted or the build-default rung, and dropping it would
+        // un-configure the readers. So the expectation follows the build.
         settings.web_integration.backend_url = default.clone();
         let mut i = api_base_url_inputs_from(&settings);
-        assert_eq!(i.persisted, None, "default-equal persisted must be dropped");
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                i.persisted, None,
+                "debug: default-equal persisted is dropped"
+            );
+        } else {
+            assert_eq!(
+                i.persisted,
+                Some(default.clone()),
+                "release: default-equal persisted is kept"
+            );
+        }
         i.profile_api_url = None;
         let (url, arm) = resolve_api_base_url(&i);
         assert_eq!(url, default);
@@ -1574,13 +1592,18 @@ mod tests {
             if cfg!(debug_assertions) {
                 ApiBaseUrlArm::BuildDefaultDebug
             } else {
-                ApiBaseUrlArm::BuildDefaultRelease
+                ApiBaseUrlArm::PersistedBackendUrl
             }
         );
 
         // Whitespace around the default is still the default.
         settings.web_integration.backend_url = format!("  {default} ");
-        assert_eq!(api_base_url_inputs_from(&settings).persisted, None);
+        let padded = api_base_url_inputs_from(&settings).persisted;
+        if cfg!(debug_assertions) {
+            assert_eq!(padded, None);
+        } else {
+            assert!(padded.is_some(), "release keeps a padded default too");
+        }
 
         // A differing value is still a choice.
         settings.web_integration.backend_url = "https://elsewhere.example".to_string();
