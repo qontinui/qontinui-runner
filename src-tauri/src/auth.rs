@@ -2369,6 +2369,39 @@ pub(crate) fn device_binding_count() -> usize {
     }
 }
 
+/// The tenants this device is currently BOUND to, read from
+/// `paired_user.json` (every `bindings[].tenant_id`, plus `default_tenant_id`
+/// and the legacy v1 `tenant_id`). `None` when the file cannot be read — that
+/// is UNKNOWN, never "bound to nothing", so a caller must not refuse on it.
+///
+/// A binding is not a credential: see [`device_holds_usable_binding`] for
+/// "can present one". This answers the other question — whether a tenant a
+/// row names is one this device belongs to at all, or a stale/foreign one no
+/// credential will ever be issued for.
+pub(crate) fn device_bound_tenants() -> Option<std::collections::BTreeSet<Uuid>> {
+    read_paired_user_value().map(|v| bound_tenants_from_value(&v))
+}
+
+/// The parse half of [`device_bound_tenants`].
+pub(crate) fn bound_tenants_from_value(
+    value: &serde_json::Value,
+) -> std::collections::BTreeSet<Uuid> {
+    let parse = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s.trim()).ok())
+    };
+    let mut out: std::collections::BTreeSet<Uuid> = value
+        .get("bindings")
+        .and_then(|b| b.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| parse(e.get("tenant_id")))
+        .collect();
+    out.extend(parse(value.get("default_tenant_id")));
+    out.extend(parse(value.get("tenant_id")));
+    out
+}
+
 /// `paired_user.json` as JSON, or `None` when there is no storage dir, no file,
 /// or the file does not parse. The one file read both binding-count parsers
 /// share; each classifies the absence its own way.

@@ -313,9 +313,12 @@ async fn flush(
                 );
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
-                if detail.contains("transcript_sync_disabled") {
+                if super::coord_sync::is_tenant_transcript_refusal(&detail) {
                     // Tenant consent is off for every stream: stop asking for
                     // this session until the next start, like the outbox lane.
+                    // (A `column_missing: true` refusal is coord's
+                    // deploy-ordering fallback, not the tenant's — it drops
+                    // this chunk below and asks again on the next flush.)
                     if super::coord_sync::note_transcript_sync_refused(session_id) {
                         tracing::info!(
                             session = %session_id,
@@ -326,7 +329,8 @@ async fn flush(
                 } else {
                     tracing::info!(
                         session = %session_id,
-                        "session output_pipe: coord warm quota exceeded — dropping chunk"
+                        "session output_pipe: coord paced this chunk (429: warm quota, or a \
+                         transcript-consent fallback while coord's migration lands) — dropping it"
                     );
                 }
                 // Drop the chunk (don't advance offset — but also don't
