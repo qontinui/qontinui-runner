@@ -196,7 +196,7 @@ run_step() {
     GH_STUB_MERGE="$GH_STUB_MERGE" GH_STUB_CONVERT_ISDRAFT="$GH_STUB_CONVERT_ISDRAFT" \
     GH_STUB_READY_RESULT_ISDRAFT="$GH_STUB_READY_RESULT_ISDRAFT" \
     GH_STUB_HEAD="$HEAD_SHA" GH_STUB_COMMENTS="$work/comments.txt" \
-    GH_TOKEN=stub PAT_AVAILABLE=true REPO=qontinui/qontinui-runner \
+    GH_TOKEN=stub ACTIONS_TOKEN=stub PAT_AVAILABLE=true REPO=qontinui/qontinui-runner \
     BRANCH=chore/sibling-pin-bump TITLE="chore(ci): bump sibling pins" \
     RUN_URL=https://github.com/qontinui/qontinui-runner/actions/runs/1 \
     MANIFEST=.github/sibling-pins.conf RUNNER_TEMP="$temp" GITHUB_SHA="$HEAD_SHA" \

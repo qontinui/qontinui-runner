@@ -156,12 +156,10 @@ jobs:
     # draft, and lets the sweep mark it ready and page on it. `checks: read` is
     # what scripts/ci/ready-bot-draft-pr.sh reads the head's check runs with.
     #
-    # WHICH TOKEN each ready decision runs on — these blocks bind only
-    # GITHUB_TOKEN: the ready call INSIDE the PR step runs on that step's
-    # GH_TOKEN, which is the CLORINDE_AUTOCOMMIT_TOKEN PAT when it is set (so
-    # it needs the PAT's own `Pull requests: write` / `Checks: read`) and
-    # GITHUB_TOKEN otherwise; the SWEEP step always runs on GITHUB_TOKEN under
-    # this block. A job-level block REPLACES the
+    # WHICH TOKEN each ready decision runs on: both the ready call INSIDE the
+    # PR step (via its ACTIONS_TOKEN env) and the SWEEP step run on
+    # GITHUB_TOKEN under this block, never on the PAT, so the decision does
+    # not depend on the PAT's scopes. A job-level block REPLACES the
     # workflow-level one wholesale rather than merging with it, so everything
     # this job needs is stated here. Permissions are not event-conditional — a
     # same-repo `pull_request` run carries this token too — so the gating is in
@@ -661,6 +659,12 @@ jobs:
           # surfaced in the body.
           GH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || secrets.GITHUB_TOKEN }}
           PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
+          # The in-step ready decision runs on GITHUB_TOKEN, not the PAT: the
+          # job's permissions block grants it `pull-requests: write` +
+          # `checks: read`, while the PAT's scopes are not guaranteed to
+          # include Checks — a PAT lacking it would red a nightly that is
+          # otherwise delivering.
+          ACTIONS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: chore/sibling-pin-bump
           TITLE: "chore(ci): bump sibling pins to current sibling heads"
@@ -930,7 +934,7 @@ jobs:
           # registering. `tee` keeps the script's ::error:: lines in the log;
           # under pipefail the `if !` sees the script's own exit status.
           ready_log="$RUNNER_TEMP/ready-bot-draft-pr.pr-step.log"
-          if ! bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 180 --expect-head "$pushed_sha" | tee "$ready_log"; then
+          if ! GH_TOKEN="$ACTIONS_TOKEN" bash scripts/ci/ready-bot-draft-pr.sh --repo "$REPO" --branch "$BRANCH" --wait-for-checks-seconds 180 --expect-head "$pushed_sha" | tee "$ready_log"; then
             pr_write_failed "Marking the bump PR ready for review (scripts/ci/ready-bot-draft-pr.sh; its ::error:: above names the gh call)"
           fi
           {
