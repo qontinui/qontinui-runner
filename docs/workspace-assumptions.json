@@ -22,8 +22,8 @@
     {
       "class": "dev_ports",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"trigger_auto_continue...",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -820,8 +820,8 @@
     {
       "class": "os_bound_tooling",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "```powershell",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Pos...",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -2078,38 +2078,47 @@
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "**Supervisor API (port 9875):**",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervi...",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"rebuild\": true, \"trig...",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "**Supervisor API ({{supervisor_base}}):**",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
-      "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/runner/restart\" -Method Post -ContentType \"application/json\" -Body '{\"trigger_auto_continue...",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/mcp/ai_session.rs",
-      "symbol": "const AI_SESSION_RULES_SUPERVISOR_AVAILABLE",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
       "excerpt": "Invoke-RestMethod -Uri \"http://localhost:9875/workflow-loop/signal-restart\" -Method Post",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Chosen by runner_rules_prefix only when check_supervisor_available() is true; the supervisor-DOWN arm is used otherwise."
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"rebuild\": true, \"trigger_auto_continue\":...",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "const AI_SESSION_SUPERVISOR_RESTART_RECIPE",
+      "excerpt": "curl -fsS -X POST \"{{supervisor_base}}/runner/restart\" -H \"Content-Type: application/json\" -d '{\"trigger_auto_continue\": true}'",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Dev-box addendum appended by runner_rules_prefix only when check_supervisor_available() answered; addresses the configured get_supervisor_url(), never rendered on a box with no supervisor. The served ai-session-rules document names no supervisor."
     },
     {
       "class": "supervisor_dependency",
@@ -2119,6 +2128,33 @@
       "count": 1,
       "disposition": "fallback_correct",
       "note": "Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "runner_rules_prefix",
+      "excerpt": "let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Resolves the supervisor URL only inside the supervisor-available arm, to fill the dev-box addendum; the supervisor-down arm renders the fleet-neutral rules alone."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "supervisor_restart_recipe",
+      "excerpt": ".replace(\"{{supervisor_base}}\", supervisor_base.trim_end_matches('/'))",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/ai_session.rs",
+      "symbol": "supervisor_restart_recipe",
+      "excerpt": "pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Pure placeholder substitution for the dev-box addendum; called only on the supervisor-available arm."
     },
     {
       "class": "supervisor_dependency",
