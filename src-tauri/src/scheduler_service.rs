@@ -3948,9 +3948,9 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let service = service.clone();
-            handles.push(tokio::spawn(async move {
-                service.try_mark_running("t").await
-            }));
+            handles.push(tokio::spawn(
+                async move { service.try_mark_running("t").await },
+            ));
         }
         let mut marked = 0;
         for handle in handles {
