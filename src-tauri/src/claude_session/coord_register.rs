@@ -101,6 +101,27 @@ pub fn agent_logs_from_sessions_enabled() -> bool {
     )
 }
 
+/// Per-call overrides for [`AiCoordRegistrar::register_inner`]; both `None`
+/// for the pinned and sniffed planes.
+#[derive(Debug, Clone, Copy, Default)]
+struct RegisterOverrides {
+    /// Adopt this existing coord session id instead of minting one; no
+    /// `Started` row is written for it.
+    adopt: Option<Uuid>,
+    /// Stamp this tenant instead of the resolver's answer.
+    tenant: Option<Uuid>,
+}
+
+/// Why [`AiCoordRegistrar::bind_transcript_session`] declined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptBindRefusal {
+    /// Registration is gated off (`QONTINUI_SESSION_AUTOMATION_REGISTER`),
+    /// the index lock is poisoned, or the `Started` write failed.
+    RegistrationDisabled,
+    /// The coord session id to adopt is already bound to a different key.
+    CoordSessionInUse,
+}
+
 /// Registers authenticated `ClaudeSession`s into `coord.sessions` and owns the
 /// runner-local `coord session_id (UUIDv7) ↔ task_run_id (UUIDv4)` index (R4).
 ///
@@ -274,7 +295,14 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
     ) -> Option<Uuid> {
-        self.register_inner(task_run_id, Some(task_run_id), purpose, repo, None)
+        self.register_inner(
+            task_run_id,
+            Some(task_run_id),
+            purpose,
+            repo,
+            RegisterOverrides::default(),
+        )
+        .ok()
     }
 
     /// Session-identity fabric Phase 3 — register a SNIFFED interactive
@@ -321,7 +349,14 @@ impl AiCoordRegistrar {
         purpose: &str,
         repo: Option<String>,
     ) -> Option<Uuid> {
-        self.register_inner(claude_session_id, None, purpose, repo, None)
+        self.register_inner(
+            claude_session_id,
+            None,
+            purpose,
+            repo,
+            RegisterOverrides::default(),
+        )
+        .ok()
     }
 
     /// Bind an interactive Claude Code session into the R4 index on request —
@@ -332,28 +367,32 @@ impl AiCoordRegistrar {
     /// session the resume-sniffer never saw (a session the runner does not
     /// host, or a pane launched without a sniffable resume line).
     ///
-    /// `coord_session_id` names a `coord.sessions` row that ALREADY exists
-    /// (typically created by `coord_bind_self_session`): the index then
-    /// adopts that id and no `Started` row is written, so the bind cannot mint
-    /// a duplicate row beside it. `None` mints and registers a fresh row
-    /// exactly as the sniffer does.
+    /// `adopt` names a `coord.sessions` row that ALREADY exists and that the
+    /// CALLER has confirmed with coord belongs to this Claude session in this
+    /// tenant (the route does that read; this function cannot). The index then
+    /// adopts it and no `Started` row is written. An id already bound to a
+    /// DIFFERENT key in this process is refused
+    /// ([`TranscriptBindRefusal::CoordSessionInUse`]) — adopting it would
+    /// overwrite that key's `forward` mapping and route its chunks, closes and
+    /// finishes to the wrong row. `None` mints a fresh row as the sniffer does.
     ///
-    /// Returns the bound coord session id; an R6 hit returns the EXISTING id
-    /// (the supplied `coord_session_id` is then ignored — the first binding
-    /// wins, as for every other registration). `None` when registration is
-    /// gated off (`QONTINUI_SESSION_AUTOMATION_REGISTER`) or the `Started`
-    /// write failed.
+    /// `tenant` is the CALLER's resolved tenant (the proxy nonce's session
+    /// tenant), stamped instead of the machine default; `None` falls back to
+    /// the registrar's resolver exactly as every other registration does.
+    ///
+    /// An R6 hit returns the EXISTING id (first binding wins).
     pub fn bind_transcript_session(
         &self,
         claude_session_id: &str,
-        coord_session_id: Option<Uuid>,
-    ) -> Option<Uuid> {
+        adopt: Option<Uuid>,
+        tenant: Option<Uuid>,
+    ) -> Result<Uuid, TranscriptBindRefusal> {
         self.register_inner(
             claude_session_id,
             None,
             "Claude Code session (transcript bind)",
             None,
-            coord_session_id,
+            RegisterOverrides { adopt, tenant },
         )
     }
 
@@ -367,20 +406,21 @@ impl AiCoordRegistrar {
         task_run_id: Option<&str>,
         purpose: &str,
         repo: Option<String>,
-        adopt_coord_session: Option<Uuid>,
-    ) -> Option<Uuid> {
+        overrides: RegisterOverrides,
+    ) -> Result<Uuid, TranscriptBindRefusal> {
+        let adopt_coord_session = overrides.adopt;
         if !registration_enabled() {
             debug!(
                 "ai_coord_register: disabled via QONTINUI_SESSION_AUTOMATION_REGISTER — skipping {}",
                 claude_session_id
             );
-            return None;
+            return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
 
         // An adopted id names a coord row that already exists (see
         // `bind_transcript_session`); otherwise mint one.
         let session_id = adopt_coord_session.unwrap_or_else(crate::session::uuid_v7);
-        let tenant = (self.inner.tenant_resolver)();
+        let tenant = overrides.tenant.or_else(|| (self.inner.tenant_resolver)());
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -399,10 +439,19 @@ impl AiCoordRegistrar {
                     "ai_coord_register: reverse-index lock poisoned — skipping {}",
                     claude_session_id
                 );
-                return None;
+                return Err(TranscriptBindRefusal::RegistrationDisabled);
             };
             match rev.get(claude_session_id) {
                 Some(existing) => Some(*existing),
+                // Adoption of an id another key already holds: refused in the
+                // SAME critical section as the reservation, so two adopters
+                // cannot both win.
+                None if adopt_coord_session.is_some_and(|a| {
+                    rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
+                }) =>
+                {
+                    return Err(TranscriptBindRefusal::CoordSessionInUse);
+                }
                 None => {
                     rev.insert(claude_session_id.to_string(), session_id);
                     // Record the tenant in the SAME critical section: the id
@@ -446,7 +495,7 @@ impl AiCoordRegistrar {
                     claude_session_id, existing
                 );
             }
-            return Some(existing);
+            return Ok(existing);
         }
 
         let now = chrono::Utc::now();
@@ -554,7 +603,7 @@ impl AiCoordRegistrar {
             if let Ok(mut tenants) = self.inner.tenants.lock() {
                 tenants.remove(&session_id);
             }
-            return None;
+            return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
 
         // Finalize the R4 index: the reverse entry was reserved atomically
@@ -599,7 +648,7 @@ impl AiCoordRegistrar {
             }
         }
 
-        Some(session_id)
+        Ok(session_id)
     }
 
     /// Fire the Phase-1 `fsh_` handle mint/rebind for `claude_session_id`,

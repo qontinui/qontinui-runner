@@ -824,9 +824,12 @@ async fn finish_session(
 pub struct TranscriptBindRequest {
     /// The Claude Code session UUID — the JSONL stem.
     pub claude_code_session_id: String,
-    /// An EXISTING `coord.sessions` id to bind to (typically from
-    /// `coord_bind_self_session`). Absent: the runner registers a fresh
-    /// `terminal_claude` row, exactly as the resume-sniffer does.
+    /// An EXISTING `coord.sessions` id to adopt (typically from
+    /// `coord_bind_self_session`). Adopted only when coord confirms that row
+    /// belongs to this Claude session in the caller's tenant; otherwise the
+    /// call is refused `409 adoption_unconfirmed` and nothing is bound. Absent: a
+    /// session the registrar already maps keeps its row; an unmapped one gets
+    /// a fresh `terminal_claude` row, exactly as the resume-sniffer registers.
     #[serde(default)]
     pub coord_session_id: Option<String>,
 }
@@ -844,28 +847,70 @@ fn bind_error(
     (status, body)
 }
 
-/// `POST /sessions/transcript-bind` — bind a Claude Code session into the
-/// interactive transcript tailer and replay the part of its JSONL not yet
-/// emitted. Plan
+/// Future type of [`TranscriptBindEnv::confirm_adoption`].
+type AdoptionCheck =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+/// Everything `transcript_bind_core` reads from the machine, injected so the
+/// tests drive every arm without the machine's settings, credential store,
+/// lifecycle store, coord, or a Tauri app.
+pub(crate) struct TranscriptBindEnv {
+    /// Gate 1, `Settings.cloud_sync_enabled`.
+    pub cloud_sync_enabled: bool,
+    pub tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
+    /// The config dirs the transcript watcher actually watches.
+    pub watched_config_dirs: Vec<std::path::PathBuf>,
+    /// nonce → the tenant its session writes under (`session_tenant_or_refuse`),
+    /// or the refusal body.
+    pub session_tenant:
+        Box<dyn Fn(&str) -> Result<Option<uuid::Uuid>, serde_json::Value> + Send + Sync>,
+    /// claude session id → the runner terminal an OPEN lifecycle record hosts
+    /// it in, if any (the deterministic ownership leg).
+    pub session_terminal: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// `(tenant, claude session, coord session)` → does coord say that coord
+    /// row belongs to that Claude session in that tenant? `Err` carries why it
+    /// could not be confirmed.
+    pub confirm_adoption:
+        Box<dyn Fn(Option<uuid::Uuid>, uuid::Uuid, uuid::Uuid) -> AdoptionCheck + Send + Sync>,
+}
+
+/// `POST /sessions/transcript-bind` — bind the CALLER'S OWN Claude Code session
+/// into the interactive transcript tailer and replay the part of its JSONL not
+/// yet emitted. Plan
 /// `2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`
 /// Phase 4.4; mechanics in `session::session_transcript_tailer` ("Binding on
 /// request").
 ///
 /// **Authorization (security-surface content trigger 5).** This door decides
-/// who may send a session's conversation off the machine, so it authorizes on
-/// the coord-mcp PROXY NONCE exactly as the forwarder and the plan-library
-/// write door do — `proxy_nonce_from_request` (either
-/// `Authorization: Bearer <nonce>` or `X-Coord-Mcp-Proxy-Key`) resolved by
-/// `proxy_principal_for_nonce` — and never on "the request came from
-/// loopback". The nonce is checked before the body is parsed, so an
-/// unauthenticated call answers 401 whatever it sends.
+/// whose conversation leaves the machine, so it authorizes in four steps, none
+/// of them "the request came from loopback":
+/// 1. **Nonce** — a registered coord-mcp proxy nonce, found by the same
+///    `proxy_nonce_from_request` → `proxy_principal_for_nonce` resolution the
+///    coord-mcp forwarder and the plan-library write door use, checked before
+///    the body is parsed.
+/// 2. **Tenant** — the nonce's session tenant from `session_tenant_or_refuse`,
+///    the resolver the forwarder uses for its bearer; an unresolvable one is
+///    refused, and the resolved tenant is what a fresh registration stamps.
+/// 3. **Ownership** — the session must be the CALLER's: either an open
+///    lifecycle record hosts it in the nonce's own terminal, or its JSONL's
+///    `cwd` is exactly the nonce's workdir. A nonce cannot bind another
+///    workdir's session.
+/// 4. **Adoption** — a supplied `coord_session_id` is adopted only after coord
+///    confirms (over the runner's device credential for that tenant) that the
+///    row belongs to this Claude session; an unconfirmed id is refused and
+///    nothing is bound, and an id another key holds here is refused.
 ///
-/// Answers:
-/// - `200 {"bound":true,"already_bound":b,"replayed_bytes":n,"replayed_chunks":n,"coord_session_id":id}`
+/// Answers (the client contract; later fields are additive):
+/// - `200 {"bound":true,"already_bound":b,"adopted":b,"replayed_bytes":n,"replayed_chunks":n,"coord_session_id":id,"replay_stopped_at":n|null}`
+///   — `adopted` is true iff a supplied `coord_session_id` was adopted
 /// - `401 {"error":"nonce_required"}` — no registered proxy nonce
 /// - `400 {"error":"malformed_request"|"malformed_id"}`
+/// - `403 {"error":"tenant_unresolvable"}` — the nonce's tenant is not knowable
+/// - `403 {"error":"not_caller_session"}` — the session is not the caller's
 /// - `409 {"error":"sync_disabled"}` — `Settings.cloud_sync_enabled` is off; nothing written
 /// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
+/// - `409 {"error":"coord_session_in_use"}` — the id to adopt is bound to another session
+/// - `409 {"error":"adoption_unconfirmed"}` — coord could not confirm the supplied id is this session's; nothing written
 /// - `422 {"error":"jsonl_not_watched","detail":…}` — no watched JSONL for the id
 /// - `500 {"error":"replay_failed","detail":…}` — bound, but the JSONL could not be read
 /// - `503 {"error":"tailer_unavailable"}` — this runner booted without the session outbox
@@ -881,48 +926,102 @@ async fn transcript_bind(
         .app_handle
         .try_state::<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>()
         .map(|s| s.inner().clone());
-    let (status, body) = transcript_bind_core(
-        &headers,
-        &body,
-        crate::settings::get_cloud_sync_enabled,
+    let lifecycle = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let env = TranscriptBindEnv {
+        cloud_sync_enabled: crate::settings::get_cloud_sync_enabled(),
         tailer,
-        crate::terminal::transcript::find_claude_config_dirs,
-    )
-    .await;
+        watched_config_dirs: crate::terminal::transcript_watcher::watched_config_dirs(),
+        session_tenant: Box::new(|nonce| {
+            crate::coord_mcp::session_tenant_or_refuse(Some(nonce)).map_err(|r| r.json_body())
+        }),
+        session_terminal: Box::new(move |csid| {
+            lifecycle
+                .as_ref()
+                .and_then(|store| store.get(csid))
+                .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
+                .map(|rec| rec.terminal_id)
+        }),
+        confirm_adoption: Box::new(|tenant, csid, coord| {
+            Box::pin(confirm_adoption_with_coord(tenant, csid, coord))
+        }),
+    };
+    let (status, body) = transcript_bind_core(&headers, &body, env).await;
     (status, Json(body))
 }
 
-/// The route's logic with its three environment reads injected (Gate 1, the
-/// tailer, the config-dir discovery), so the tests drive every arm without the
-/// machine's settings or a Tauri app.
+/// Ask coord which row it resolves this Claude session to, in this tenant,
+/// over the runner's device credential for that tenant. `GET
+/// /sessions/:id/output` accepts a Claude Code session id as `:id`
+/// (`load_session_scoped_or_claude`, tenant-filtered) and answers the matched
+/// row's coord `session_id`; the adoption is confirmed only when that is the
+/// requested row. Any failure to ask is "not confirmed", never "confirmed".
+async fn confirm_adoption_with_coord(
+    tenant: Option<uuid::Uuid>,
+    claude_session: uuid::Uuid,
+    coord_session: uuid::Uuid,
+) -> Result<(), String> {
+    let jwt = crate::coord_mcp::read_usable_device_jwt_for(tenant)
+        .await
+        .ok_or_else(|| "no usable device credential for the session's tenant".to_string())?;
+    let (base, _) = crate::coord_mcp::coord_base_url_with_source();
+    let url = format!("{base}/sessions/{claude_session}/output?stream=transcript&limit=1");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .map_err(|e| format!("coord unreachable: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("coord answered {status} for this claude session"));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("coord answer unparseable: {e}"))?;
+    match v.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if id == coord_session.to_string() => Ok(()),
+        Some(id) => Err(format!(
+            "coord resolves this claude session to row {id}, not {coord_session}"
+        )),
+        None => Err("coord's answer names no session_id".to_string()),
+    }
+}
+
+/// The route's logic over an injected [`TranscriptBindEnv`].
 pub(crate) async fn transcript_bind_core(
     headers: &axum::http::HeaderMap,
     body: &[u8],
-    cloud_sync_enabled: impl FnOnce() -> bool,
-    tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
-    config_dirs: impl FnOnce() -> Vec<std::path::PathBuf> + Send + 'static,
+    env: TranscriptBindEnv,
 ) -> (StatusCode, serde_json::Value) {
-    use crate::session::session_transcript_tailer::{locate_session_jsonl, BindRefusal};
+    use crate::session::session_transcript_tailer::{
+        jsonl_belongs_to_workdir, locate_session_jsonl, BindRefusal, BindRequest,
+    };
 
     // 1. The nonce — before anything else is read.
     let nonce = crate::coord_mcp::proxy_nonce_from_request(headers);
-    if nonce
-        .as_deref()
-        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
-        .is_none()
-    {
+    let Some(nonce) = nonce.filter(|n| crate::coord_mcp::proxy_principal_for_nonce(n).is_some())
+    else {
+        let presented = crate::coord_mcp::proxy_nonce_from_request(headers);
         crate::coord_mcp::spawn_log_proxy_nonce_rejected(
-            nonce.as_deref(),
+            presented.as_deref(),
             "missing, unregistered, or expired proxy key on POST /sessions/transcript-bind (401)",
         );
-        let detail = match nonce {
+        let detail = match presented {
             None => crate::coord_mcp::missing_proxy_key_error(),
             Some(_) => {
                 crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE)
             }
         };
         return bind_error(StatusCode::UNAUTHORIZED, "nonce_required", Some(detail));
-    }
+    };
 
     // 2. The body and its ids.
     let req: TranscriptBindRequest = match serde_json::from_slice(body) {
@@ -942,7 +1041,7 @@ pub(crate) async fn transcript_bind_core(
             Some("claude_code_session_id is not a UUID".to_string()),
         );
     };
-    let coord_session_id = match req.coord_session_id.as_deref().map(str::trim) {
+    let requested_adopt = match req.coord_session_id.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => match uuid::Uuid::parse_str(raw) {
             Ok(id) => Some(id),
@@ -957,8 +1056,7 @@ pub(crate) async fn transcript_bind_core(
     };
 
     // 3. Gate 1 — the runner's transcript-sync toggle. Off writes nothing.
-    let sync_enabled = cloud_sync_enabled();
-    if !sync_enabled {
+    if !env.cloud_sync_enabled {
         return bind_error(
             StatusCode::CONFLICT,
             "sync_disabled",
@@ -969,8 +1067,7 @@ pub(crate) async fn transcript_bind_core(
             ),
         );
     }
-
-    let Some(tailer) = tailer else {
+    let Some(tailer) = env.tailer else {
         return bind_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "tailer_unavailable",
@@ -981,34 +1078,103 @@ pub(crate) async fn transcript_bind_core(
         );
     };
 
-    // 4. Locate, bind, replay — file I/O and fsyncs, off the async runtime.
+    // 4. The caller's tenant.
+    let tenant = match (env.session_tenant)(&nonce) {
+        Ok(t) => t,
+        Err(refusal) => {
+            let mut body = serde_json::json!({ "error": "tenant_unresolvable" });
+            body["detail"] = refusal;
+            return (StatusCode::FORBIDDEN, body);
+        }
+    };
+
+    // 5. The file — only under a root the watcher actually watches.
     let session_key = csid.to_string();
-    let joined = spawn_blocking_tracked(move || -> Result<_, LocateOrBind> {
-        let path = locate_session_jsonl(&config_dirs(), &session_key)?;
-        Ok(tailer.bind_and_replay(&session_key, &path, coord_session_id, sync_enabled)?)
+    let path = match locate_session_jsonl(&env.watched_config_dirs, &session_key) {
+        Ok(p) => p,
+        Err(r) => {
+            return bind_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "jsonl_not_watched",
+                Some(r.detail()),
+            )
+        }
+    };
+
+    // 6. Ownership: the caller's own session only.
+    let nonce_terminal = crate::coord_mcp::terminal_id_for_nonce(&nonce);
+    let nonce_workdir = crate::coord_mcp::workdir_for_nonce(&nonce);
+    let by_terminal = nonce_terminal
+        .as_deref()
+        .is_some_and(|t| (env.session_terminal)(&session_key).as_deref() == Some(t));
+    let owned = by_terminal || {
+        let (p, wd) = (path.clone(), nonce_workdir.clone());
+        spawn_blocking_tracked(move || wd.is_some_and(|wd| jsonl_belongs_to_workdir(&p, &wd)))
+            .await
+            .unwrap_or(false)
+    };
+    if !owned {
+        return bind_error(
+            StatusCode::FORBIDDEN,
+            "not_caller_session",
+            Some(format!(
+                "session {session_key} is not this caller's: it is not hosted in the nonce's \
+                 terminal and its JSONL's cwd is not the nonce's workdir ({})",
+                nonce_workdir.as_deref().unwrap_or("<none>")
+            )),
+        );
+    }
+
+    // 7. Adoption — only a row coord confirms is this session's. An
+    // unconfirmed id is refused outright: binding anyway would mint a second
+    // row beside the one the caller named, the duplicate-row defect the client
+    // exists to avoid.
+    let adopt = match requested_adopt {
+        None => None,
+        Some(id) => match (env.confirm_adoption)(tenant, csid, id).await {
+            Ok(()) => Some(id),
+            Err(why) => {
+                return bind_error(
+                    StatusCode::CONFLICT,
+                    "adoption_unconfirmed",
+                    Some(format!(
+                        "coord could not confirm coord session {id} belongs to Claude session \
+                         {csid} in this tenant ({why}); nothing was bound or written"
+                    )),
+                );
+            }
+        },
+    };
+
+    // 8. Bind + replay — file I/O and fsyncs, off the async runtime.
+    let sync_enabled = env.cloud_sync_enabled;
+    let joined = spawn_blocking_tracked(move || {
+        tailer.bind_and_replay(
+            &session_key,
+            &path,
+            BindRequest { adopt, tenant },
+            sync_enabled,
+        )
     })
     .await;
 
     match joined {
-        Ok(Ok(outcome)) => (
-            StatusCode::OK,
-            serde_json::json!({
+        Ok(Ok(o)) => {
+            let body = serde_json::json!({
                 "bound": true,
-                "already_bound": outcome.already_bound,
-                "replayed_bytes": outcome.replayed_bytes,
-                "replayed_chunks": outcome.replayed_chunks,
-                "coord_session_id": outcome.coord_session_id,
-            }),
-        ),
-        Ok(Err(LocateOrBind::Locate(r))) => bind_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "jsonl_not_watched",
-            Some(r.detail()),
-        ),
-        Ok(Err(LocateOrBind::Bind(BindRefusal::SyncDisabled))) => {
+                "already_bound": o.already_bound,
+                "adopted": o.adopted,
+                "replayed_bytes": o.replayed_bytes,
+                "replayed_chunks": o.replayed_chunks,
+                "coord_session_id": o.coord_session_id,
+                "replay_stopped_at": o.replay_stopped_at,
+            });
+            (StatusCode::OK, body)
+        }
+        Ok(Err(BindRefusal::SyncDisabled)) => {
             bind_error(StatusCode::CONFLICT, "sync_disabled", None)
         }
-        Ok(Err(LocateOrBind::Bind(BindRefusal::RegistrationDisabled))) => bind_error(
+        Ok(Err(BindRefusal::RegistrationDisabled)) => bind_error(
             StatusCode::CONFLICT,
             "registration_disabled",
             Some(
@@ -1017,7 +1183,16 @@ pub(crate) async fn transcript_bind_core(
                     .to_string(),
             ),
         ),
-        Ok(Err(LocateOrBind::Bind(BindRefusal::Unreadable(d)))) => bind_error(
+        Ok(Err(BindRefusal::CoordSessionInUse)) => bind_error(
+            StatusCode::CONFLICT,
+            "coord_session_in_use",
+            Some(
+                "the coord_session_id to adopt is already bound to a different Claude session \
+                 on this runner"
+                    .to_string(),
+            ),
+        ),
+        Ok(Err(BindRefusal::Unreadable(d))) => bind_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "replay_failed",
             Some(format!(
@@ -1030,24 +1205,6 @@ pub(crate) async fn transcript_bind_core(
             "replay_failed",
             Some(format!("bind task failed: {e}")),
         ),
-    }
-}
-
-/// The two refusal families the blocking half can return.
-enum LocateOrBind {
-    Locate(crate::session::session_transcript_tailer::LocateRefusal),
-    Bind(crate::session::session_transcript_tailer::BindRefusal),
-}
-
-impl From<crate::session::session_transcript_tailer::LocateRefusal> for LocateOrBind {
-    fn from(r: crate::session::session_transcript_tailer::LocateRefusal) -> Self {
-        Self::Locate(r)
-    }
-}
-
-impl From<crate::session::session_transcript_tailer::BindRefusal> for LocateOrBind {
-    fn from(r: crate::session::session_transcript_tailer::BindRefusal) -> Self {
-        Self::Bind(r)
     }
 }
 
@@ -1398,11 +1555,13 @@ mod tests {
             )
         }
 
-        /// A registered nonce, via the one `pub(crate)` registration helper
-        /// the plan-library door tests use too.
-        fn registered_nonce() -> String {
+        /// A registered nonce and the workdir it is bound to, via the one
+        /// `pub(crate)` registration helper the plan-library door tests use.
+        fn registered_nonce() -> (String, String) {
             let wd = format!("/tmp/transcript-bind-door-test-{}", uuid::Uuid::now_v7());
-            crate::coord_mcp::register_agent_proxy_nonce(&wd, uuid::Uuid::new_v4())
+            let nonce = crate::coord_mcp::register_agent_proxy_nonce(&wd, uuid::Uuid::new_v4());
+            let bound = crate::coord_mcp::workdir_for_nonce(&nonce).expect("workdir");
+            (nonce, bound)
         }
 
         fn bearer(nonce: &str) -> HeaderMap {
@@ -1420,13 +1579,68 @@ mod tests {
                 .into_bytes()
         }
 
-        /// `<dir>/cfg/projects/p/<csid>.jsonl`; returns the config dir.
-        fn config_with(dir: &std::path::Path, csid: &str, text: &str) -> PathBuf {
+        fn body_adopting(csid: &str, coord: uuid::Uuid) -> Vec<u8> {
+            serde_json::json!({ "claude_code_session_id": csid, "coord_session_id": coord })
+                .to_string()
+                .into_bytes()
+        }
+
+        /// `<dir>/cfg/projects/p/<csid>.jsonl` whose records carry `cwd`;
+        /// returns the config dir.
+        fn config_with(dir: &std::path::Path, csid: &str, cwd: &str) -> PathBuf {
             let cfg = dir.join("cfg");
             let p = cfg.join("projects").join("p");
             std::fs::create_dir_all(&p).unwrap();
+            let text = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "user", "cwd": cwd, "n": 1}),
+                serde_json::json!({"type": "assistant", "cwd": cwd, "n": 2}),
+            );
             std::fs::write(p.join(format!("{csid}.jsonl")), text).unwrap();
             cfg
+        }
+
+        /// A permissive environment: sync on, tenant resolvable, no hosting
+        /// terminal, adoption confirmed iff `confirm`.
+        fn env(
+            t: Option<Arc<SessionTranscriptTailer>>,
+            cfg: Vec<PathBuf>,
+            confirm: bool,
+        ) -> TranscriptBindEnv {
+            TranscriptBindEnv {
+                cloud_sync_enabled: true,
+                tailer: t,
+                watched_config_dirs: cfg,
+                session_tenant: Box::new(|_| Ok(None)),
+                session_terminal: Box::new(|_| None),
+                confirm_adoption: Box::new(move |_, _, _| {
+                    Box::pin(async move {
+                        if confirm {
+                            Ok(())
+                        } else {
+                            Err("coord unreachable (test)".to_string())
+                        }
+                    })
+                }),
+            }
+        }
+
+        /// Drive the core, retrying across the process-global registration
+        /// kill switch the coord_register suite toggles.
+        async fn call(
+            headers: &HeaderMap,
+            body: &[u8],
+            mk: impl Fn() -> TranscriptBindEnv,
+        ) -> (StatusCode, serde_json::Value) {
+            for _ in 0..200 {
+                let (status, v) = transcript_bind_core(headers, body, mk()).await;
+                if status == StatusCode::CONFLICT && v["error"] == "registration_disabled" {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                return (status, v);
+            }
+            panic!("registration stayed disabled")
         }
 
         /// No nonce, or one this runner never minted, under EITHER header:
@@ -1437,19 +1651,16 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (t, outbox) = tailer(dir.path());
             let csid = uuid::Uuid::new_v4().to_string();
-            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n");
+            let cfg = config_with(dir.path(), &csid, "/anywhere");
 
             let stranger = format!("{}", uuid::Uuid::new_v4().simple());
             let mut legacy = HeaderMap::new();
             legacy.insert("x-coord-mcp-proxy-key", stranger.parse().unwrap());
             for headers in [HeaderMap::new(), bearer(&stranger), legacy] {
-                let cfg = cfg.clone();
                 let (status, v) = transcript_bind_core(
                     &headers,
                     &body(&csid),
-                    || true,
-                    Some(t.clone()),
-                    move || vec![cfg],
+                    env(Some(t.clone()), vec![cfg.clone()], true),
                 )
                 .await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1458,22 +1669,51 @@ mod tests {
             assert!(outbox.pending().unwrap().is_empty());
         }
 
+        /// A nonce for workdir A cannot bind session B (whose cwd is another
+        /// workdir): 403 `not_caller_session`, nothing written.
+        #[tokio::test]
+        async fn a_nonce_cannot_bind_another_workdirs_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, _wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, "/some/other/workdir");
+
+            let (status, v) = call(&bearer(&nonce), &body(&csid), || {
+                env(Some(t.clone()), vec![cfg.clone()], true)
+            })
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+            assert_eq!(v["error"], "not_caller_session");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn unresolvable_tenant_is_403() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let mut e = env(Some(t), vec![cfg], true);
+            e.session_tenant = Box::new(|_| Err(serde_json::json!({"code": "test"})));
+            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(v["error"], "tenant_unresolvable");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
         /// The toggle off answers 409 `sync_disabled` and writes nothing.
         #[tokio::test]
         async fn disabled_toggle_is_sync_disabled_and_writes_nothing() {
             let dir = tempfile::tempdir().unwrap();
             let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
             let csid = uuid::Uuid::new_v4().to_string();
-            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n");
-
-            let (status, v) = transcript_bind_core(
-                &bearer(&registered_nonce()),
-                &body(&csid),
-                || false,
-                Some(t),
-                move || vec![cfg],
-            )
-            .await;
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let mut e = env(Some(t), vec![cfg], true);
+            e.cloud_sync_enabled = false;
+            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(v["error"], "sync_disabled");
             assert!(outbox.pending().unwrap().is_empty());
@@ -1483,7 +1723,7 @@ mod tests {
         async fn malformed_ids_are_400() {
             let dir = tempfile::tempdir().unwrap();
             let (t, _outbox) = tailer(dir.path());
-            let nonce = registered_nonce();
+            let (nonce, _wd) = registered_nonce();
             for raw in [
                 serde_json::json!({ "claude_code_session_id": "../../etc/passwd" }),
                 serde_json::json!({
@@ -1494,16 +1734,14 @@ mod tests {
                 let (status, v) = transcript_bind_core(
                     &bearer(&nonce),
                     raw.to_string().as_bytes(),
-                    || true,
-                    Some(t.clone()),
-                    Vec::new,
+                    env(Some(t.clone()), Vec::new(), true),
                 )
                 .await;
                 assert_eq!(status, StatusCode::BAD_REQUEST);
                 assert_eq!(v["error"], "malformed_id");
             }
             let (status, v) =
-                transcript_bind_core(&bearer(&nonce), b"{", || true, Some(t), Vec::new).await;
+                transcript_bind_core(&bearer(&nonce), b"{", env(Some(t), Vec::new(), true)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(v["error"], "malformed_request");
         }
@@ -1512,70 +1750,96 @@ mod tests {
         async fn unwatched_jsonl_is_422() {
             let dir = tempfile::tempdir().unwrap();
             let (t, outbox) = tailer(dir.path());
+            let (nonce, _wd) = registered_nonce();
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = dir.path().join("empty-cfg");
-            let (status, v) = transcript_bind_core(
-                &bearer(&registered_nonce()),
-                &body(&csid),
-                || true,
-                Some(t),
-                move || vec![cfg],
-            )
-            .await;
+            let (status, v) =
+                transcript_bind_core(&bearer(&nonce), &body(&csid), env(Some(t), vec![cfg], true))
+                    .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(v["error"], "jsonl_not_watched");
             assert!(v["detail"].as_str().unwrap().contains("empty-cfg"));
             assert!(outbox.pending().unwrap().is_empty());
         }
 
-        /// The happy path end to end through the door, then a re-bind.
+        /// The happy path end to end through the door, then a re-bind that
+        /// returns the SAME row and replays nothing.
         #[tokio::test]
         async fn binds_and_replays_then_rebind_replays_nothing() {
             let dir = tempfile::tempdir().unwrap();
             let (t, _outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
             let csid = uuid::Uuid::new_v4().to_string();
-            let cfg = config_with(dir.path(), &csid, "{\"n\":1}\n{\"n\":2}\n");
-            let nonce = registered_nonce();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let file_len =
+                std::fs::metadata(cfg.join("projects").join("p").join(format!("{csid}.jsonl")))
+                    .unwrap()
+                    .len();
 
-            // The registration kill switch is process-global and toggled by
-            // the coord_register suite; retry across it like the tailer tests.
-            let mut first = None;
-            for _ in 0..200 {
-                let cfg = cfg.clone();
-                let (status, v) = transcript_bind_core(
-                    &bearer(&nonce),
-                    &body(&csid),
-                    || true,
-                    Some(t.clone()),
-                    move || vec![cfg],
-                )
-                .await;
-                if status == StatusCode::CONFLICT && v["error"] == "registration_disabled" {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                first = Some((status, v));
-                break;
-            }
-            let (status, v) = first.expect("bound");
+            let mk = || env(Some(t.clone()), vec![cfg.clone()], true);
+            let (status, v) = call(&bearer(&nonce), &body(&csid), mk).await;
             assert_eq!(status, StatusCode::OK, "{v}");
             assert_eq!(v["bound"], true);
             assert_eq!(v["already_bound"], false);
-            assert_eq!(v["replayed_bytes"], 16);
+            assert_eq!(v["adopted"], false);
+            assert_eq!(v["replayed_bytes"], file_len);
             assert_eq!(v["replayed_chunks"], 1);
+            assert!(v["replay_stopped_at"].is_null());
+            let first_row = v["coord_session_id"].clone();
 
-            let (status, v) = transcript_bind_core(
-                &bearer(&nonce),
-                &body(&csid),
-                || true,
-                Some(t),
-                move || vec![cfg],
-            )
-            .await;
+            let (status, v) = call(&bearer(&nonce), &body(&csid), mk).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["already_bound"], true);
+            assert_eq!(v["coord_session_id"], first_row, "no second row");
             assert_eq!(v["replayed_bytes"], 0);
             assert_eq!(v["replayed_chunks"], 0);
+        }
+
+        /// A supplied coord session coord cannot confirm is refused
+        /// `adoption_unconfirmed`, and NOTHING is bound or written — no fresh
+        /// row beside the one the caller named.
+        #[tokio::test]
+        async fn unconfirmed_adoption_is_refused_and_writes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let requested = uuid::Uuid::new_v4();
+
+            let (status, v) = call(&bearer(&nonce), &body_adopting(&csid, requested), || {
+                env(Some(t.clone()), vec![cfg.clone()], false)
+            })
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{v}");
+            assert_eq!(v["error"], "adoption_unconfirmed");
+            assert!(outbox.pending().unwrap().is_empty(), "no row, no chunk");
+        }
+
+        /// A confirmed coord session is adopted; the same id for ANOTHER
+        /// session of the caller's is then refused `coord_session_in_use`.
+        #[tokio::test]
+        async fn confirmed_adoption_is_adopted_and_cannot_be_adopted_twice() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let (a, b) = (
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            let cfg = config_with(dir.path(), &a, &wd);
+            config_with(dir.path(), &b, &wd);
+            let requested = uuid::Uuid::new_v4();
+            let mk = || env(Some(t.clone()), vec![cfg.clone()], true);
+
+            let (status, v) = call(&bearer(&nonce), &body_adopting(&a, requested), mk).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(v["adopted"], true);
+            assert_eq!(v["coord_session_id"], serde_json::json!(requested));
+
+            let (status, v) = call(&bearer(&nonce), &body_adopting(&b, requested), mk).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{v}");
+            assert_eq!(v["error"], "coord_session_in_use");
         }
     }
 

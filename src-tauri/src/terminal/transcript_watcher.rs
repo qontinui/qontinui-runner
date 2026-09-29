@@ -26,6 +26,7 @@
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::OnceCell;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -322,6 +323,18 @@ fn record_cohort_wake(wake: &CohortWake) {
 /// after `set()` — it's just a `Send + Sync` wrapper for the
 /// not-necessarily-Sync watcher handle.
 static WATCHER: OnceCell<std::sync::Mutex<Vec<RecommendedWatcher>>> = OnceCell::new();
+
+/// The config dirs whose `projects/` root this process's watcher is actually
+/// watching, set once when it starts. Empty until then (and forever on a
+/// runner whose watcher never started).
+static WATCHED_CONFIG_DIRS: OnceCell<Vec<PathBuf>> = OnceCell::new();
+
+/// The config dirs the transcript watcher watches — the only roots a
+/// `POST /sessions/transcript-bind` may bind a JSONL from, since a file
+/// elsewhere would never be tailed after the bind.
+pub fn watched_config_dirs() -> Vec<PathBuf> {
+    WATCHED_CONFIG_DIRS.get().cloned().unwrap_or_default()
+}
 
 /// Errors a tail task can return. Non-fatal — the supervisor logs and
 /// proceeds.
@@ -678,6 +691,7 @@ async fn run_orchestrator(
     // ── 2. Live watching ──────────────────────────────────────────────────
 
     let mut watchers: Vec<RecommendedWatcher> = Vec::new();
+    let mut watched_dirs: Vec<PathBuf> = Vec::new();
     for config_dir in &config_dirs {
         let projects_root = config_dir.join("projects");
         if !projects_root.exists() {
@@ -709,7 +723,12 @@ async fn run_orchestrator(
         }
         info!("transcript_watcher: watching {:?}", projects_root);
         watchers.push(watcher);
+        watched_dirs.push(config_dir.clone());
     }
+
+    // Record which config dirs are ACTUALLY watched, so
+    // `POST /sessions/transcript-bind` binds only files this watcher tails.
+    let _ = WATCHED_CONFIG_DIRS.set(watched_dirs);
 
     // Stash watchers so they live until process exit. Re-entry into
     // `start_transcript_watcher` is rejected by the `OnceCell` guard above.
@@ -1547,9 +1566,39 @@ async fn tail_session(
         // advanced past exactly `bytes`), so the tailer can place it against
         // the session's file mark and never re-emit bytes a
         // `POST /sessions/transcript-bind` replay already carried.
+        //
+        // Two-step so this async loop never blocks on the tailer's session
+        // lock: `try_emit_batch` handles the common case (lock free, batch at
+        // the mark) inline — the same bounded local append this loop has
+        // always done synchronously — and returns false having done NOTHING
+        // otherwise. Only then does the batch go to a blocking thread, and it
+        // is AWAITED, so this tail's batches stay in file order and none is
+        // dropped for contention. The fallback runs only while a
+        // `/sessions/transcript-bind` replay holds the lock or a gap/rewrite
+        // needs the file read, so it adds no steady-state blocking-pool load
+        // (the per-wake fan-out that `commit_report`'s bounded queue exists to
+        // prevent).
         if let Some(t) = tailer.as_ref() {
             let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
-            t.on_appended(&session_id, file_start, &bytes, truncated);
+            if t.admit(
+                &session_id,
+                bytes.len(),
+                crate::settings::get_cloud_sync_enabled(),
+            ) && !t.try_emit_batch(&session_id, &path, file_start, &bytes, truncated)
+            {
+                let (t, sid, p, b) = (t.clone(), session_id.clone(), path.clone(), bytes.clone());
+                if let Err(e) = spawn_blocking_tracked(move || {
+                    t.emit_batch(&sid, &p, file_start, &b, truncated)
+                })
+                .await
+                {
+                    warn!(
+                        "transcript_watcher: deferred transcript emit for {} failed to run: {} \
+                         (the file mark is unchanged; the next batch or a bind carries it)",
+                        session_id, e
+                    );
+                }
+            }
         }
     }
 }
@@ -1558,7 +1607,7 @@ async fn tail_session(
 /// `terminal::transcript::encode_project_path` (which is private). Kept tiny
 /// + intentional duplication so the watcher doesn't have to re-export
 /// internal helpers.
-fn encode_for_lookup(project_path: &str) -> String {
+pub(crate) fn encode_for_lookup(project_path: &str) -> String {
     let normalized = project_path
         .replace('\\', "/")
         .trim_end_matches('/')
