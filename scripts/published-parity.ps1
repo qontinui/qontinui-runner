@@ -477,6 +477,52 @@ function Dump-ParityRunnerDiagnostics {
 # because nothing tested it.
 
 # ---------------------------------------------------------------------------
+# Which DATABASE ARM a booted leg took, read positively from the leg itself.
+#
+# This is the acceptance signal for per-leg embedded-PG isolation, and it exists
+# because the obvious signal does NOT work. The tempting test is the survivor
+# census: with per-leg roots, each leg owns its cluster, so `Drop` should stop
+# it and the leaked postgres tree should disappear. It cannot carry that weight
+# -- `Stop-ParityProcessTree` ends in `Stop-Process -Force`, and a force-kill on
+# Windows does not run Rust `Drop`, so a cluster can survive because it was
+# KILLED rather than because it was ATTACHED. The identical observation has two
+# causes and the census cannot separate them.
+#
+# The arm reads the property under test directly. From embedded_pg.rs's `DbArm`,
+# surfaced at `/health` -> `data.database.arm` (mcp_api.rs, "Recording which is
+# the only way /health can answer the question at all"):
+#
+#   shared root    leg A `embedded-owned`, leg B `embedded-attached`
+#   per-leg roots  BOTH legs `embedded-owned`
+#
+# `data.database.embeddedPort` is the second, independent half: its own doc says
+# "Two runners reporting the same port is the observable form of the attach
+# path's claim: one cluster, joined, not two fighting over a locked data dir."
+# Same port on both legs means one cluster however the arms read.
+#
+# Needs no teardown to cooperate, and is one GET beside the boot poll.
+# $null on any failure -- UNKNOWN, never a claim that the arm is owned.
+# ---------------------------------------------------------------------------
+function Get-ParityDbArm {
+    param([int]$Port)
+    try {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
+            -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        $h = $resp.Content | ConvertFrom-Json
+        $db = $null
+        if ($h.PSObject.Properties.Name -contains 'data' -and $h.data) { $db = $h.data.database }
+        elseif ($h.PSObject.Properties.Name -contains 'database') { $db = $h.database }
+        if ($null -eq $db) { return [PSCustomObject]@{ arm = $null; embedded_port = $null } }
+        $arm = $null; $port = $null
+        if ($db.PSObject.Properties.Name -contains 'arm') { $arm = [string]$db.arm }
+        if ($db.PSObject.Properties.Name -contains 'embeddedPort') { $port = $db.embeddedPort }
+        return [PSCustomObject]@{ arm = $arm; embedded_port = $port }
+    } catch {
+        return [PSCustomObject]@{ arm = $null; embedded_port = $null }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Provisioning drive (plan
 # 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
 # Phase 5).
@@ -724,6 +770,12 @@ function Get-ManifestOverHttp {
         # Fill the session-provisioning rows BEFORE reading the manifest: the
         # ledger is process-wide state, so the read below carries whatever the
         # drive just recorded. Same step, same workdir shape, on both legs.
+        # Positive read of the DB arm, before the drive touches anything.
+        $dbArm = Get-ParityDbArm -Port $port
+        Write-Host ("    database arm: {0}   embedded port: {1}" -f `
+            $(if ($null -eq $dbArm.arm) { 'unknown' } else { $dbArm.arm }), `
+            $(if ($null -eq $dbArm.embedded_port) { 'none' } else { $dbArm.embedded_port }))
+
         $drive = Invoke-ParityProvisioningDrive -Port $port -Label $Label -TerminalRetrySecs $TerminalRetrySecs
         # The witness is CORROBORATION. It must never be able to cost us the
         # manifest read it exists to check: on CI run 36615500004 a throw in here
@@ -745,10 +797,10 @@ function Get-ManifestOverHttp {
         $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/capability-manifest" `
             -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
         $manifest = $resp.Content | ConvertFrom-Json
-        return [PSCustomObject]@{ Manifest = $manifest; Door = "http:GET /capability-manifest"; Error = $null; Raw = $resp.Content; Drive = $drive; Witness = $witness }
+        return [PSCustomObject]@{ Manifest = $manifest; Door = "http:GET /capability-manifest"; Error = $null; Raw = $resp.Content; Drive = $drive; Witness = $witness; DbArm = $dbArm }
     } catch {
         if ($runner) { Dump-ParityRunnerDiagnostics -Runner $runner }
-        return [PSCustomObject]@{ Manifest = $null; Door = "http:GET /capability-manifest"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null }
+        return [PSCustomObject]@{ Manifest = $null; Door = "http:GET /capability-manifest"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null; DbArm = $null }
     } finally {
         if ($runner -and $runner.Process) {
             Stop-ParityProcessTree -RootPid $runner.Process.Id
@@ -773,15 +825,16 @@ function Get-ManifestOverCli {
                 Raw      = $null
                 Drive    = $null
                 Witness  = $null
+                DbArm    = $null
                 Error    = ("the CLI door returned no output. On a RELEASE build that is expected " +
                             "rather than informative: the published binary is GUI-subsystem " +
                             "(windows_subsystem = `"windows`"), so redirected stdout can come back " +
                             "empty. It is NOT evidence the binary produced nothing. Use -Door http.")
             }
         }
-        return [PSCustomObject]@{ Manifest = ($text | ConvertFrom-Json); Door = "cli:--capability-manifest --json"; Error = $null; Raw = $text; Drive = $null; Witness = $null }
+        return [PSCustomObject]@{ Manifest = ($text | ConvertFrom-Json); Door = "cli:--capability-manifest --json"; Error = $null; Raw = $text; Drive = $null; Witness = $null; DbArm = $null }
     } catch {
-        return [PSCustomObject]@{ Manifest = $null; Door = "cli:--capability-manifest --json"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null }
+        return [PSCustomObject]@{ Manifest = $null; Door = "cli:--capability-manifest --json"; Error = $_.Exception.Message; Raw = $null; Drive = $null; Witness = $null; DbArm = $null }
     }
 }
 
@@ -904,6 +957,26 @@ if ($NegativeControl) {
     Write-Host ("  leg A witness: commands={0} skills={1} agents={2}" -f (& $shown $wA.commands), (& $shown $wA.skills), (& $shown $wA.agents))
     Write-Host ("  leg B witness: commands={0} skills={1} agents={2}" -f (& $shown $wB.commands), (& $shown $wB.skills), (& $shown $wB.agents))
     Write-Host ("  slash_commands_status across the two legs: {0}" -f (Get-ParitySlashCommandsStatus -DevWitness $wA -PublishedWitness $wB))
+    # The per-leg embedded-PG isolation claim, read positively rather than
+    # inferred from teardown residue. BOTH legs owning is the fix working; either
+    # leg reading `embedded-attached`, or both reporting the same embedded port,
+    # means they shared one cluster.
+    $armA = $(if ($legA.DbArm) { $legA.DbArm.arm } else { $null })
+    $armB = $(if ($legB.DbArm) { $legB.DbArm.arm } else { $null })
+    $portA = $(if ($legA.DbArm) { $legA.DbArm.embedded_port } else { $null })
+    $portB = $(if ($legB.DbArm) { $legB.DbArm.embedded_port } else { $null })
+    Write-Host ("  database arm: leg A {0} (port {1}) / leg B {2} (port {3})" -f `
+        $(if ($null -eq $armA) { 'unknown' } else { $armA }), `
+        $(if ($null -eq $portA) { 'none' } else { $portA }), `
+        $(if ($null -eq $armB) { 'unknown' } else { $armB }), `
+        $(if ($null -eq $portB) { 'none' } else { $portB }))
+    if ($armA -eq 'embedded-attached' -or $armB -eq 'embedded-attached') {
+        Write-Host "  NOTE: a leg ATTACHED to another cluster -- the two legs shared a database. Per-leg QONTINUI_EMBEDDED_PG_DIR is not in effect." -ForegroundColor Yellow
+    } elseif ($null -ne $portA -and $portA -eq $portB) {
+        Write-Host "  NOTE: both legs report embedded port $portA -- one cluster, joined. Per-leg QONTINUI_EMBEDDED_PG_DIR is not in effect." -ForegroundColor Yellow
+    } elseif ($armA -eq 'embedded-owned' -and $armB -eq 'embedded-owned') {
+        Write-Host "  per-leg embedded-PG isolation CONFIRMED: both legs own their own cluster."
+    }
     Write-Host ""
 
     # The assertion. A row difference on a checkout-resolved capability is what
@@ -1018,6 +1091,13 @@ $observability = [PSCustomObject]@{
     provisioning_witness       = [PSCustomObject]@{
         dev       = $devRead.Witness
         published = $pubRead.Witness
+    }
+    # Which database arm each leg took, and the embedded cluster's port. Two
+    # legs reporting `embedded-attached` / the SAME port are sharing one
+    # cluster, which couples two legs that must differ in one property only.
+    database_arm               = [PSCustomObject]@{
+        dev       = $devRead.DbArm
+        published = $pubRead.DbArm
     }
     self_report_disagrees      = @($selfReportDisagreements)
     slash_commands_status      = $slashCommandsStatus
