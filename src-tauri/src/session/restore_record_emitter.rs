@@ -142,6 +142,10 @@ pub struct RestoreRecordEmitter {
     /// Registry keys already debug-logged as "no coord session — skipping",
     /// so the skip line fires once per record, not once per refresh.
     skipped: Mutex<HashSet<String>>,
+    /// The owning tenant of a coord session, stamped into each row at enqueue
+    /// ([`super::session_tenant_stamp`]) so a replay after a restart can still
+    /// present the right credential. The process-wide lookup by default.
+    tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
 }
 
 impl RestoreRecordEmitter {
@@ -176,7 +180,18 @@ impl RestoreRecordEmitter {
             gate,
             last_emitted: Mutex::new(HashMap::new()),
             skipped: Mutex::new(HashSet::new()),
+            tenant_of: Box::new(super::session_tenant_stamp::lookup),
         }
+    }
+
+    /// Replace the tenant lookup (tests; production keeps the process-wide
+    /// one `main.rs` installs).
+    pub fn with_tenant_lookup(
+        mut self,
+        tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
+    ) -> Self {
+        self.tenant_of = tenant_of;
+        self
     }
 
     /// Mirror one registry record. Gate 1
@@ -210,7 +225,17 @@ impl RestoreRecordEmitter {
             return;
         };
 
-        let payload = restore_record_payload(rec, self.machine_id, transcript_exists);
+        // The record's own durable spawn tenant first (it survives a restart),
+        // then the live lookup for the hosting coord session.
+        let tenant = rec
+            .tenant_id
+            .as_deref()
+            .and_then(|t| Uuid::parse_str(t.trim()).ok())
+            .or_else(|| (self.tenant_of)(session_id));
+        let payload = super::session_tenant_stamp::stamp(
+            restore_record_payload(rec, self.machine_id, transcript_exists),
+            tenant,
+        );
 
         // Debounce: only re-emit when the material wire fields (or the
         // coord session they attach to) actually changed. The lock spans
@@ -370,47 +395,53 @@ fn restore_record_payload_for_adapter(
     })
 }
 
+/// A fully-populated registry record for tests in this and sibling modules
+/// (the struct has no `Default`).
+#[cfg(test)]
+pub(crate) fn sample_record(id: &str, terminal_id: &str) -> TerminalSessionRecord {
+    TerminalSessionRecord {
+        claude_session_id: id.to_string(),
+        config_dir: Some("C:/accounts/hotmail".to_string()),
+        working_dir: Some("C:/repo".to_string()),
+        page_id: "default".to_string(),
+        zone_index: 1,
+        title: Some("Claude 1".to_string()),
+        terminal_id: terminal_id.to_string(),
+        opened_at: 1,
+        last_seen_at: 2,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+        origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+        restore_pending_at: None,
+        confirmed_at: Some(3),
+        handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
+        finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
+        finish_reason: None,
+        finish_synced: false,
+        spawn_device_default: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
     use tempfile::tempdir;
 
     fn rec(id: &str, terminal_id: &str) -> TerminalSessionRecord {
-        TerminalSessionRecord {
-            claude_session_id: id.to_string(),
-            config_dir: Some("C:/accounts/hotmail".to_string()),
-            working_dir: Some("C:/repo".to_string()),
-            page_id: "default".to_string(),
-            zone_index: 1,
-            title: Some("Claude 1".to_string()),
-            terminal_id: terminal_id.to_string(),
-            opened_at: 1,
-            last_seen_at: 2,
-            state: "open".to_string(),
-            closed_at: None,
-            close_reason: None,
-            provider: DEFAULT_PROVIDER.to_string(),
-            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
-            restore_pending_at: None,
-            confirmed_at: Some(3),
-            handle: None,
-            account_label: None,
-            account_wrapper: None,
-            session_name: None,
-            name_source: None,
-            tenant_id: None,
-            task_run_id: None,
-            bypass_permissions: None,
-            restored_from_boot_at: None,
-            restore_tier: None,
-            finished_at: None,
-            wind_down_outcome: None,
-            wind_down_at: None,
-            finish_reason: None,
-            finish_synced: false,
-            spawn_device_default: None,
-        }
+        sample_record(id, terminal_id)
     }
 
     /// Emitter over a tempdir outbox with a fixed terminal→coord-session

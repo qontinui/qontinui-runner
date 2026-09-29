@@ -603,11 +603,29 @@ impl RungObservation {
 pub struct RungEmitter {
     outbox: Arc<OutboxWriter>,
     machine_id: Uuid,
+    /// The owning tenant of a lane session, stamped into each row at enqueue
+    /// ([`super::session_tenant_stamp`]) so a replay after a restart can still
+    /// present the right credential. The process-wide lookup by default.
+    tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
 }
 
 impl RungEmitter {
     pub fn new(outbox: Arc<OutboxWriter>, machine_id: Uuid) -> Self {
-        Self { outbox, machine_id }
+        Self {
+            outbox,
+            machine_id,
+            tenant_of: Box::new(super::session_tenant_stamp::lookup),
+        }
+    }
+
+    /// Replace the tenant lookup (tests; production keeps the process-wide
+    /// one `main.rs` installs).
+    pub fn with_tenant_lookup(
+        mut self,
+        tenant_of: Box<dyn Fn(Uuid) -> Option<Uuid> + Send + Sync>,
+    ) -> Self {
+        self.tenant_of = tenant_of;
+        self
     }
 
     /// Record one observation under `lane_session_id`.
@@ -625,7 +643,7 @@ impl RungEmitter {
             self.machine_id,
             lane_session_id,
             SessionEventKind::CoordTransportRung,
-            obs.payload(),
+            super::session_tenant_stamp::stamp(obs.payload(), (self.tenant_of)(lane_session_id)),
         ) {
             // Arm (c) of a dropped observation (plan
             // 2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-

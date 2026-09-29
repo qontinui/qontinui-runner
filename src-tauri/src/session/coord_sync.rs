@@ -486,6 +486,19 @@ impl CoordSync {
                     detail: snippet(&msg),
                 }
             }
+            // Neither is produced for a `started` row (both belong to the
+            // owner-only output/event kinds), but the match stays total so a
+            // future caller cannot read one as a confirmation.
+            Ok(PushOutcome::CredentialPending(cause)) => CoordRegistrationFailure {
+                kind: "credential_pending",
+                status: None,
+                detail: cause.to_string(),
+            },
+            Ok(PushOutcome::DroppedLocally(why)) => CoordRegistrationFailure {
+                kind: "dropped_locally",
+                status: None,
+                detail: why.to_string(),
+            },
             Err(_elapsed) => CoordRegistrationFailure {
                 kind: "timeout",
                 status: None,
@@ -769,6 +782,23 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// Sessions holding owner-only rows (`output_chunk`, `restore-record`,
+    /// `coord-transport-rung`) because no live device credential resolved or
+    /// coord answered 401 — see [`is_credential_gated_kind`].
+    pub credential_pending_sessions: u64,
+    /// Held rows dropped, oldest first, to keep a session under
+    /// [`CREDENTIAL_PENDING_CAP_BYTES`]. Counted since this process booted.
+    pub dropped_credential_pending_over_cap: u64,
+    /// Held rows whose scope is `Unresolved` on a multi-bound device, dropped
+    /// once older than [`UNRESOLVABLE_PENDING_MAX_AGE_DAYS`]: that is not a
+    /// dark credential that will recover.
+    pub dropped_credential_pending_unresolvable: u64,
+    /// `output_chunk` rows coord answered 404 (absent session, or — once coord
+    /// enforces ownership — a session this device does not own).
+    pub dropped_not_owner: u64,
+    /// Sessions whose transcript rows stopped because coord answered 429
+    /// `transcript_sync_disabled` (the tenant turned transcript sync off).
+    pub transcript_sync_refused_sessions: u64,
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -822,6 +852,11 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        "credentialPendingSessions": counted(h.credential_pending_sessions),
+        "droppedCredentialPendingOverCap": counted(h.dropped_credential_pending_over_cap),
+        "droppedCredentialPendingUnresolvable": counted(h.dropped_credential_pending_unresolvable),
+        "droppedNotOwner": counted(h.dropped_not_owner),
+        "transcriptSyncRefusedSessions": counted(h.transcript_sync_refused_sessions),
         "observedAt": h.observed_at,
     })
 }
@@ -1020,6 +1055,156 @@ fn is_best_effort_kind(kind: &str) -> bool {
         || kind == SessionEventKind::OperatorTouch.as_str()
 }
 
+// ---------------------------------------------------------------------------
+// Credential-pending: the third drain posture
+// ---------------------------------------------------------------------------
+
+/// Kinds drained under the CREDENTIAL-PENDING posture (plan
+/// `2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous`,
+/// decision 3 and Phase 2).
+///
+/// These are the three writes to coord's `POST /sessions/:id/output` and
+/// `/events`, which coord admits only from the OWNING device's credential. So:
+///
+/// - with no live credential (an absent or `PresentButDead` slot, or an
+///   `Unresolved` scope on a multi-bound device) the row is NOT SENT — an
+///   anonymous write can only be refused;
+/// - a **401** from coord is the same condition seen from the other side, and
+///   is held too — never `PermanentFailure`. A **403** is NOT: the only 403
+///   these routes answer is `post_event`'s control-plane-kind refusal, which
+///   is permanent, and holding it would pin that row until the cap.
+///
+/// A held row is left UNACKED in the file and its session's chain CONTINUES
+/// past it — the third posture beside the chain-blocking default and
+/// [`is_best_effort_kind`]. Holding it at the head of the chain would stall the
+/// session's `started`/heartbeat/`closed` rows behind a credential the runner
+/// may not recover for hours. That is safe for exactly these kinds because
+/// coord is order-independent for them: output is idempotent on
+/// `(session, stream, chunk_offset)` and events on `(session, seq)`.
+///
+/// Retries run on a slow per-session timer ([`CREDENTIAL_PENDING_RETRY`]), are
+/// unbounded in count, and never count toward
+/// [`QUARANTINE_AFTER_SERVING_FAILURES`] or the drain's outage abort. They are
+/// bounded instead by bytes ([`CREDENTIAL_PENDING_CAP_BYTES`]) and, for a scope
+/// that can never resolve, by age ([`UNRESOLVABLE_PENDING_MAX_AGE_DAYS`]).
+fn is_credential_gated_kind(kind: &str) -> bool {
+    kind == SessionEventKind::OutputChunk.as_str()
+        || kind == SessionEventKind::RestoreRecord.as_str()
+        || kind == SessionEventKind::CoordTransportRung.as_str()
+}
+
+/// How long a session holding credential-pending rows waits before its held
+/// rows are tried again. Slow on purpose: a dark credential is the refresher's
+/// to recover, and until it does every attempt is a local no-op or a 401.
+const CREDENTIAL_PENDING_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// Per-session byte cap on held credential-pending rows. Above coord's own
+/// 10 MiB per-session warm FIFO (`WARM_SESSION_CAP_BYTES`), so nothing coord
+/// could have kept is dropped early. Beyond it the OLDEST held rows are
+/// dropped as `dropped_credential_pending_over_cap`. Overridable with
+/// `QONTINUI_SESSION_OUTBOX_CREDENTIAL_PENDING_CAP_BYTES`.
+const CREDENTIAL_PENDING_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A held row whose scope is `Unresolved` on a multi-bound device is dropped
+/// as `dropped_credential_pending_unresolvable` once it is older than this.
+/// After a restart the registry no longer holds its session, so the owning
+/// tenant is not coming back — unlike a dark credential, waiting cannot fix it.
+const UNRESOLVABLE_PENDING_MAX_AGE_DAYS: i64 = 7;
+
+/// `output_chunk` rows Ack-dropped on a 404 since this process booted. Today a
+/// 404 means coord has no such session; once coord enforces ownership it is
+/// also the (deliberately indistinguishable) answer to a session this device
+/// does not own — the runner-side twin of coord's `non_owner` observation.
+/// Surfaced on `GET /health` `sessionOutbox.droppedNotOwner`.
+pub(crate) static OUTPUT_CHUNK_DROPPED_NOT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// Why an owner-only row is being held.
+#[derive(Debug, Clone)]
+enum CredentialPending {
+    /// No live credential resolved, so the row was never sent.
+    NoCredential(crate::auth::NoCredential),
+    /// Coord answered 401 to the credential that was presented.
+    Refused(String),
+}
+
+impl CredentialPending {
+    /// `Unresolved` scope on a multi-bound device: the one cause waiting will
+    /// not cure, which is why it alone carries an age bound.
+    fn unresolvable(&self) -> bool {
+        matches!(
+            self,
+            CredentialPending::NoCredential(
+                crate::auth::NoCredential::UnresolvedOnMultiBound { .. }
+            )
+        )
+    }
+}
+
+impl std::fmt::Display for CredentialPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialPending::NoCredential(cause) => {
+                write!(f, "no live device credential ({cause}) — not sent")
+            }
+            CredentialPending::Refused(detail) => {
+                write!(f, "coord refused the credential: {}", snippet(detail))
+            }
+        }
+    }
+}
+
+/// Whether a held `Unresolved` row has outlived
+/// [`UNRESOLVABLE_PENDING_MAX_AGE_DAYS`].
+fn unresolvable_row_expired(recorded_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(recorded_at)
+        > chrono::Duration::days(UNRESOLVABLE_PENDING_MAX_AGE_DAYS)
+}
+
+/// Approximate retained bytes of one held row, for the per-session cap. An
+/// `output_chunk`'s size is its base64 payload; the two event kinds are small
+/// and measured by their serialized payload.
+fn held_row_bytes(rec: &OutboxRecord) -> u64 {
+    rec.payload
+        .get("payload_b64")
+        .and_then(JsonValue::as_str)
+        .map(str::len)
+        .unwrap_or_else(|| rec.payload.to_string().len()) as u64
+}
+
+/// Sessions whose transcript rows coord refused with 429
+/// `transcript_sync_disabled` since this process booted. In memory by design:
+/// "until the next start" — a restart asks coord again.
+fn transcript_sync_refused_cell() -> &'static Mutex<HashSet<Uuid>> {
+    static CELL: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether the tenant refused `session_id`'s transcript sync (coord 429
+/// `transcript_sync_disabled`). The transcript emitter and the PTY pipe stop
+/// producing that session's output chunks once this is `true`, and the drain
+/// drops any it already queued without sending them.
+pub(crate) fn transcript_sync_refused(session_id: Uuid) -> bool {
+    transcript_sync_refused_cell()
+        .lock()
+        .map(|s| s.contains(&session_id))
+        .unwrap_or(false)
+}
+
+/// Record the refusal. Returns `true` the first time, so the caller logs once.
+pub(crate) fn note_transcript_sync_refused(session_id: Uuid) -> bool {
+    transcript_sync_refused_cell()
+        .lock()
+        .map(|mut s| s.insert(session_id))
+        .unwrap_or(false)
+}
+
+fn transcript_sync_refused_count() -> u64 {
+    transcript_sync_refused_cell()
+        .lock()
+        .map(|s| s.len() as u64)
+        .unwrap_or(0)
+}
+
 /// How many per-session push chains run at once (plan
 /// `2026-07-28-runner-many-sessions-performance` §7a/B6).
 ///
@@ -1052,6 +1237,19 @@ struct ChainOutcome {
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
+    /// `Some(cause)` when an owner-only row was HELD this tick (see
+    /// [`is_credential_gated_kind`]): the session's credential-pending timer
+    /// is (re)armed. Never a `blocked_on` — the chain ran on past it.
+    credential_pending: Option<String>,
+    /// An owner-only row reached coord and was answered with something other
+    /// than a 401 — the credential is live again for this session.
+    credential_ok: bool,
+    /// Held rows dropped this tick as `dropped_credential_pending_unresolvable`.
+    dropped_unresolvable: u64,
+    /// At least one row was dispatched (sent, or refused locally before
+    /// sending). A chain whose every row sat out a credential-pending timer
+    /// did nothing, and must not keep the drain at its busy cadence.
+    attempted_any: bool,
 }
 
 /// Push one session's records in seq order.
@@ -1064,12 +1262,19 @@ struct ChainOutcome {
 /// retry is how one poisoned row used to stall every session on the box. Any
 /// other failure still trips it, so an outage stays bounded to
 /// [`MAX_CONCURRENT_PUSH_CHAINS`] requests a tick.
+///
+/// `credential_deferred` is set while this session's credential-pending timer
+/// is running: its owner-only rows are skipped unsent (left pending) and the
+/// rest of the chain drains as usual. Once one owner-only row comes back
+/// credential-pending in a tick, the chain's remaining owner-only rows are
+/// skipped the same way — the answer for them would be identical.
 async fn push_chain(
     inner: Arc<CoordSyncInner>,
     records: Vec<OutboxRecord>,
     mut attempts: HashMap<(Uuid, i64), u32>,
     abort: Arc<AtomicBool>,
     trip_abort: bool,
+    credential_deferred: bool,
 ) -> ChainOutcome {
     let mut out = ChainOutcome {
         session_id: records.first().map(|r| r.session_id).unwrap_or_default(),
@@ -1080,7 +1285,12 @@ async fn push_chain(
         had_transport_error: false,
         blocked_on: None,
         aborted: false,
+        credential_pending: None,
+        credential_ok: false,
+        dropped_unresolvable: 0,
+        attempted_any: false,
     };
+    let mut credential_held = credential_deferred;
 
     for rec in records {
         if abort.load(Ordering::Relaxed) {
@@ -1089,7 +1299,73 @@ async fn push_chain(
             out.aborted = true;
             break;
         }
-        match push_record(&inner, &rec).await {
+        let gated = is_credential_gated_kind(&rec.event_kind);
+        // A refused transcript is dropped whatever the credential state: the
+        // tenant said no, and holding it would only wait to be told again.
+        let refused = rec.event_kind == SessionEventKind::OutputChunk.as_str()
+            && transcript_sync_refused(rec.session_id);
+        if gated && credential_held && !refused {
+            // Credential-pending: left unACKed in the file, chain continues.
+            continue;
+        }
+        out.attempted_any = true;
+        let outcome = if refused {
+            PushOutcome::DroppedLocally(
+                "the tenant refused this session's transcript sync (coord 429 \
+                 transcript_sync_disabled) — dropped unsent until the next start",
+            )
+        } else {
+            push_record(&inner, &rec).await
+        };
+        if gated
+            && matches!(
+                outcome,
+                PushOutcome::Acked | PushOutcome::PermanentFailure(_)
+            )
+        {
+            out.credential_ok = true;
+        }
+        match outcome {
+            PushOutcome::CredentialPending(cause) => {
+                let key = (rec.session_id, rec.seq);
+                if cause.unresolvable() && unresolvable_row_expired(rec.recorded_at, Utc::now()) {
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        kind = %rec.event_kind,
+                        recorded_at = %rec.recorded_at,
+                        reason = "dropped_credential_pending_unresolvable",
+                        "coord_sync: held row's owning tenant cannot be resolved on this \
+                         multi-bound device and it is older than \
+                         {UNRESOLVABLE_PENDING_MAX_AGE_DAYS} days — dropping it"
+                    );
+                    out.succeeded.push(key);
+                    out.cleared.push(key);
+                    out.dropped_unresolvable += 1;
+                    continue;
+                }
+                tracing::debug!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    kind = %rec.event_kind,
+                    cause = %cause,
+                    "coord_sync: owner-only row held (credential-pending) — the chain continues"
+                );
+                out.credential_pending = Some(cause.to_string());
+                credential_held = true;
+                continue;
+            }
+            PushOutcome::DroppedLocally(why) => {
+                tracing::debug!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    kind = %rec.event_kind,
+                    why,
+                    "coord_sync: row dropped locally"
+                );
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+            }
             PushOutcome::Acked => {
                 out.acked_by_coord = true;
                 out.succeeded.push((rec.session_id, rec.seq));
@@ -1216,6 +1492,61 @@ struct DrainState {
     last_ack: Option<Instant>,
     /// Ticks in which coord took at least one row. Strictly increasing.
     ack_ticks: u64,
+    /// Sessions holding credential-pending rows, with when their held rows
+    /// are next tried ([`CREDENTIAL_PENDING_RETRY`]). Pruned every tick to the
+    /// sessions that still have pending rows. Deliberately apart from
+    /// [`Self::retry`]: nothing here ever counts toward quarantine.
+    credential_pending: HashMap<Uuid, Instant>,
+    /// Held rows dropped over the per-session cap, since this drain started.
+    dropped_credential_pending_over_cap: u64,
+    /// Held `Unresolved` rows aged out, since this drain started.
+    dropped_credential_pending_unresolvable: u64,
+    /// Per-session cap on held bytes; `None` reads
+    /// `QONTINUI_SESSION_OUTBOX_CREDENTIAL_PENDING_CAP_BYTES`, defaulting to
+    /// [`CREDENTIAL_PENDING_CAP_BYTES`]. `Some` only in tests.
+    credential_pending_cap_bytes: Option<u64>,
+}
+
+impl DrainState {
+    fn credential_pending_cap(&self) -> u64 {
+        self.credential_pending_cap_bytes.unwrap_or_else(|| {
+            env_u64(
+                "QONTINUI_SESSION_OUTBOX_CREDENTIAL_PENDING_CAP_BYTES",
+                CREDENTIAL_PENDING_CAP_BYTES,
+            )
+        })
+    }
+}
+
+/// The held rows to drop so each credential-pending session stays under `cap`
+/// bytes: per session, its owner-only rows oldest first (lowest seq) until the
+/// rest fit. `pending` is in `(session_id, seq)` order.
+fn credential_pending_over_cap(
+    pending: &[OutboxRecord],
+    holding: &HashMap<Uuid, Instant>,
+    cap: u64,
+) -> Vec<(Uuid, i64)> {
+    let mut per_session: HashMap<Uuid, Vec<(i64, u64)>> = HashMap::new();
+    for r in pending {
+        if holding.contains_key(&r.session_id) && is_credential_gated_kind(&r.event_kind) {
+            per_session
+                .entry(r.session_id)
+                .or_default()
+                .push((r.seq, held_row_bytes(r)));
+        }
+    }
+    let mut drop = Vec::new();
+    for (sid, rows) in per_session {
+        let mut total: u64 = rows.iter().map(|(_, b)| *b).sum();
+        for (seq, bytes) in rows {
+            if total <= cap {
+                break;
+            }
+            total -= bytes;
+            drop.push((sid, seq));
+        }
+    }
+    drop
 }
 
 /// What one drain tick did, for the loop's sleep decision.
@@ -1314,14 +1645,26 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     };
     let pending_sessions: HashSet<Uuid> = pending.iter().map(|r| r.session_id).collect();
     state.retry.retain(|sid, _| pending_sessions.contains(sid));
+    state
+        .credential_pending
+        .retain(|sid, _| pending_sessions.contains(sid));
     if pending.is_empty() {
         let quarantined = state.quarantined.len() as u64;
+        let (over_cap, unresolvable) = (
+            state.dropped_credential_pending_over_cap,
+            state.dropped_credential_pending_unresolvable,
+        );
         with_outbox_health(|h| {
             h.observed_at = Some(Utc::now());
             h.pending = 0;
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
+            h.credential_pending_sessions = 0;
+            h.dropped_credential_pending_over_cap = over_cap;
+            h.dropped_credential_pending_unresolvable = unresolvable;
+            h.dropped_not_owner = OUTPUT_CHUNK_DROPPED_NOT_OWNER.load(Ordering::Relaxed);
+            h.transcript_sync_refused_sessions = transcript_sync_refused_count();
         });
         return TickResult::idle();
     }
@@ -1338,12 +1681,39 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|r| ((r.session_id, r.seq), r.recorded_at))
         .collect();
 
+    // Held credential-pending rows over the per-session byte cap go first,
+    // oldest first — counted and logged, never silently.
+    let over_cap: HashSet<(Uuid, i64)> = credential_pending_over_cap(
+        &pending,
+        &state.credential_pending,
+        state.credential_pending_cap(),
+    )
+    .into_iter()
+    .collect();
+    if !over_cap.is_empty() {
+        state.dropped_credential_pending_over_cap += over_cap.len() as u64;
+        let sessions: HashSet<Uuid> = over_cap.iter().map(|(s, _)| *s).collect();
+        for sid in sessions {
+            tracing::warn!(
+                session = %sid,
+                dropped = over_cap.iter().filter(|(s, _)| *s == sid).count(),
+                cap_bytes = state.credential_pending_cap(),
+                reason = "dropped_credential_pending_over_cap",
+                "coord_sync: credential-pending rows over the per-session cap — dropping the \
+                 oldest (GET /health sessionOutbox.droppedCredentialPendingOverCap)"
+            );
+        }
+    }
+
     // Group into per-session chains. `pending()` returns records sorted by
     // (session_id, seq), so each chain is already in seq order.
     let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
     let mut to_quarantine: Vec<OutboxRecord> = Vec::new();
     for rec in pending {
         if held.contains(&rec.session_id) {
+            continue;
+        }
+        if over_cap.contains(&(rec.session_id, rec.seq)) {
             continue;
         }
         if state.quarantined.contains(&rec.session_id) {
@@ -1358,15 +1728,18 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
+    succeeded.extend(over_cap.iter().copied());
 
     // A session still inside its own backoff sits this tick out.
+    let chains_before = chains.len();
     chains.retain(|chain| {
         state
             .retry
             .get(&chain[0].session_id)
             .is_none_or(|r| r.next_attempt_at <= now)
     });
-    let ran_any = !chains.is_empty();
+    let backoff_skipped = chains.len() < chains_before;
+    let any_chain = !chains.is_empty();
 
     let abort = Arc::new(AtomicBool::new(false));
     let outcomes: Vec<ChainOutcome> = futures::stream::iter(chains.into_iter().map(|chain| {
@@ -1381,12 +1754,17 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .retry
             .get(&sid)
             .is_some_and(|r| state.ack_ticks > r.failed_at_ack_tick);
+        let credential_deferred = state
+            .credential_pending
+            .get(&sid)
+            .is_some_and(|next| *next > now);
         push_chain(
             inner.clone(),
             chain,
             session_attempts,
             abort.clone(),
             trip_abort,
+            credential_deferred,
         )
     }))
     .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
@@ -1395,9 +1773,49 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     let mut had_transport_error = false;
     let mut delivered = false;
+    let mut ran_any = false;
     let mut blocked: Vec<(Uuid, String)> = Vec::new();
     for outcome in outcomes {
         delivered |= outcome.acked_by_coord;
+        ran_any |= outcome.attempted_any || outcome.aborted;
+        state.dropped_credential_pending_unresolvable += outcome.dropped_unresolvable;
+        // The credential-pending timer: (re)armed by a hold, cleared by an
+        // owner-only row coord answered with anything but a 401. A tick in
+        // which the session's owner-only rows all sat out the timer leaves it
+        // as it was. None of this touches `state.retry`, so it can neither
+        // quarantine the session nor feed the outage abort.
+        match (&outcome.credential_pending, outcome.credential_ok) {
+            (Some(cause), _) => {
+                let first = state
+                    .credential_pending
+                    .insert(outcome.session_id, now + CREDENTIAL_PENDING_RETRY)
+                    .is_none();
+                if first {
+                    tracing::warn!(
+                        session = %outcome.session_id,
+                        cause = %cause,
+                        retry_in_secs = CREDENTIAL_PENDING_RETRY.as_secs(),
+                        "coord_sync: holding this session's output/event rows until a live \
+                         device credential can send them (credential-pending — not dropped, \
+                         and the session's other rows keep draining)"
+                    );
+                }
+            }
+            (None, true) => {
+                if state
+                    .credential_pending
+                    .remove(&outcome.session_id)
+                    .is_some()
+                {
+                    tracing::info!(
+                        session = %outcome.session_id,
+                        "coord_sync: device credential is live again — releasing this \
+                         session's held output/event rows"
+                    );
+                }
+            }
+            (None, false) => {}
+        }
         succeeded.extend(outcome.succeeded);
         had_transport_error |= outcome.had_transport_error;
         for (key, attempts) in outcome.attempts {
@@ -1486,22 +1904,37 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .collect();
     let retrying = state.retry.len() as u64;
     let quarantined = state.quarantined.len() as u64;
+    let credential_pending = state.credential_pending.len() as u64;
+    let (over_cap_total, unresolvable_total) = (
+        state.dropped_credential_pending_over_cap,
+        state.dropped_credential_pending_unresolvable,
+    );
     with_outbox_health(|h| {
         h.observed_at = Some(Utc::now());
         h.pending = remaining.len() as u64;
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
+        h.credential_pending_sessions = credential_pending;
+        h.dropped_credential_pending_over_cap = over_cap_total;
+        h.dropped_credential_pending_unresolvable = unresolvable_total;
+        h.dropped_not_owner = OUTPUT_CHUNK_DROPPED_NOT_OWNER.load(Ordering::Relaxed);
+        h.transcript_sync_refused_sessions = transcript_sync_refused_count();
     });
 
+    // An outage is a failure that TRIPPED the abort (a fresh failure, or one
+    // with no coord-taken row since the last) while coord took nothing. A lone
+    // session failing on its own row does not trip it, so it can no longer
+    // push the whole loop into the 60 s backoff and delay every healthy row
+    // behind it.
+    let outage = abort.load(Ordering::Relaxed) && !delivered && had_transport_error;
     TickResult {
-        // An outage is a failure that TRIPPED the abort (a fresh failure, or
-        // one with no coord-taken row since the last) while coord took
-        // nothing. A lone session failing on its own row does not trip it, so
-        // it can no longer push the whole loop into the 60 s backoff and
-        // delay every healthy row behind it.
-        outage: abort.load(Ordering::Relaxed) && !delivered && had_transport_error,
-        idle: false,
+        outage,
+        // Every pending row is a held credential-pending row sitting out its
+        // timer (nothing ran, nothing is on a failure backoff): nothing is
+        // due for minutes, so tick at the idle cadence rather than re-reading
+        // the held rows every second.
+        idle: any_chain && !ran_any && !backoff_skipped && !outage,
         ran_any,
     }
 }
@@ -1573,6 +2006,13 @@ enum PushOutcome {
     /// 4xx (other than 409) — coord refuses this payload permanently.
     /// ACK locally so the queue moves forward.
     PermanentFailure(String),
+    /// An owner-only row ([`is_credential_gated_kind`]) with no live
+    /// credential to send it under, or one coord answered 401. HELD: left
+    /// unACKed, retried on the slow per-session timer, never a failure.
+    CredentialPending(CredentialPending),
+    /// Dropped without contacting coord. ACKed out of the outbox, but — unlike
+    /// [`PushOutcome::Acked`] — never evidence that coord is serving.
+    DroppedLocally(&'static str),
 }
 
 async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOutcome {
@@ -1793,11 +2233,18 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // drops on 429/5xx), these chunks ride the outbox for
             // at-least-once delivery — coord's warm tier is idempotent on
             // (session_id, stream, chunk_offset), so a replay is a no-op.
+            //
+            // OWNER-ONLY (see `is_credential_gated_kind`): with no live
+            // credential this row is held, never sent anonymously.
             let url = format!("{base}/sessions/{}/output", rec.session_id);
             let body = output_chunk_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-                .send()
-                .await
+            match crate::auth::try_attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            {
+                Ok(rb) => rb.send().await,
+                Err(cause) => {
+                    return PushOutcome::CredentialPending(CredentialPending::NoCredential(cause))
+                }
+            }
         }
         "restore-record" => {
             // Restore-registry mirror (plan
@@ -1808,15 +2255,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // outbox can replay freely. The payload is the binding
             // {provider, authoritative_session_id, cwd, launch_command,
             // restore_tier, machine_id} contract the web UI reads.
+            // Owner-only, like `output_chunk`: held without a live credential.
             let url = format!("{base}/sessions/{}/events", rec.session_id);
             let body = json!({
                 "seq": rec.seq,
                 "event_kind": rec.event_kind,
-                "payload": rec.payload,
+                "payload": super::session_tenant_stamp::strip_tenant_carrier(&rec.payload),
             });
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-                .send()
-                .await
+            match crate::auth::try_attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            {
+                Ok(rb) => rb.send().await,
+                Err(cause) => {
+                    return PushOutcome::CredentialPending(CredentialPending::NoCredential(cause))
+                }
+            }
         }
         "coord-transport-rung" => {
             // WHICH transport rung carried one coord call (plan
@@ -1836,15 +2288,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // failure the phase exists to prevent — see
             // `drain_pushes_coord_transport_rung_to_events_endpoint`, which
             // fails if this arm is removed.
+            // Owner-only, like `output_chunk`: held without a live credential.
             let url = format!("{base}/sessions/{}/events", rec.session_id);
             let body = json!({
                 "seq": rec.seq,
                 "event_kind": rec.event_kind,
-                "payload": rec.payload,
+                "payload": super::session_tenant_stamp::strip_tenant_carrier(&rec.payload),
             });
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-                .send()
-                .await
+            match crate::auth::try_attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            {
+                Ok(rb) => rb.send().await,
+                Err(cause) => {
+                    return PushOutcome::CredentialPending(CredentialPending::NoCredential(cause))
+                }
+            }
         }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
@@ -1869,8 +2326,37 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return finding_outcome(rec, resp).await;
             }
             let status = resp.status();
+            if is_credential_gated_kind(kind) && status == StatusCode::UNAUTHORIZED {
+                // Coord wants the OWNING device's credential and did not get a
+                // usable one. That is the runner's credential to recover, not
+                // a verdict on the row — hold it, never ACK-drop it. (403 is
+                // deliberately NOT here: see `is_credential_gated_kind`.)
+                let detail = resp.text().await.unwrap_or_default();
+                return PushOutcome::CredentialPending(CredentialPending::Refused(format!(
+                    "{status}: {detail}"
+                )));
+            }
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
+                if detail.contains("transcript_sync_disabled") {
+                    // The tenant turned transcript sync off. A consent
+                    // refusal, not a failure: drop this row, and stop the
+                    // session's transcript rows until the next start (the
+                    // emitters consult `transcript_sync_refused`, and the
+                    // drain drops any already queued without sending them).
+                    // Retrying it as a transport error would ask forever and
+                    // block the session's chain while doing so.
+                    if note_transcript_sync_refused(rec.session_id) {
+                        tracing::info!(
+                            session = %rec.session_id,
+                            seq = rec.seq,
+                            "coord_sync: the tenant has transcript sync turned off (429 \
+                             transcript_sync_disabled) — dropping this session's output \
+                             chunks until the next start"
+                        );
+                    }
+                    return PushOutcome::Acked;
+                }
                 if detail.contains("warm_quota_exceeded") {
                     // Tenant warm-quota exceeded (gate 2, enforced
                     // coord-side). Retrying can't help until quota frees,
@@ -1986,6 +2472,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     return PushOutcome::Conflict { row };
                 }
                 return PushOutcome::Acked;
+            }
+            if kind == "output_chunk" && status == StatusCode::NOT_FOUND {
+                // Today's drop, now counted: coord answers 404 alike for an
+                // absent session and for one this device does not own (plan
+                // decision 4), so this is the runner-side view of `non_owner`.
+                OUTPUT_CHUNK_DROPPED_NOT_OWNER.fetch_add(1, Ordering::Relaxed);
             }
             let detail = resp.text().await.unwrap_or_default();
             // 4xx → Ack-drop; 5xx → transient. Shared classifier.
@@ -3604,6 +4096,17 @@ mod tests {
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
         events_status: Option<u16>,
+        /// The `Authorization` header each `POST /sessions/:id/events`
+        /// carried, index-aligned with `events`.
+        events_auth: Vec<Option<String>>,
+        /// When set, `POST /sessions/:id/output` answers this status with
+        /// `output_body` (or `{"error":"fake"}`) instead of 200. The request
+        /// is still recorded in `outputs`.
+        output_status: Option<u16>,
+        output_body: Option<JsonValue>,
+        /// The `Authorization` header each `POST /sessions/:id/output`
+        /// carried, index-aligned with `outputs`.
+        output_auth: Vec<Option<String>>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
@@ -3761,9 +4264,28 @@ mod tests {
                 post(
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
+                     headers: axum::http::HeaderMap,
                      Json(body): Json<JsonValue>| async move {
-                        state.lock().await.outputs.push((id, body.clone()));
-                        (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                        let mut g = state.lock().await;
+                        g.outputs.push((id, body.clone()));
+                        g.output_auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
+                        match g.output_status.and_then(|s| AxumStatus::from_u16(s).ok()) {
+                            Some(status) => (
+                                status,
+                                Json(
+                                    g.output_body
+                                        .clone()
+                                        .unwrap_or_else(|| json!({"error": "fake"})),
+                                ),
+                            )
+                                .into_response(),
+                            None => (AxumStatus::OK, Json(json!({"id": id}))).into_response(),
+                        }
                     },
                 ),
             )
@@ -3772,9 +4294,16 @@ mod tests {
                 post(
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
+                     headers: axum::http::HeaderMap,
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
                         g.events.push((id, body.clone()));
+                        g.events_auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
                         let status = g
                             .events_status
                             .and_then(|s| AxumStatus::from_u16(s).ok())
@@ -3975,6 +4504,28 @@ mod tests {
         (format!("http://{}", addr), rec_clone)
     }
 
+    /// An isolated ambient holding a LIVE device credential in the legacy
+    /// slot. The owner-only kinds (`output_chunk`, `restore-record`,
+    /// `coord-transport-rung`) are HELD without one, so any test that expects
+    /// them on the wire must hold this. The keychain is disabled so no test
+    /// token reaches the developer's real credential store.
+    fn with_live_device_credential() -> crate::test_env::IsolatedAmbient {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        crate::auth::AuthManager::new()
+            .store_tokens(&device_jwt_for(&Uuid::now_v7()), "")
+            .expect("the legacy slot holds a live device JWT");
+        amb
+    }
+
+    /// An isolated ambient with NO device credential at all — the dark-box
+    /// posture.
+    fn with_dark_device_credential() -> crate::test_env::IsolatedAmbient {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb
+    }
+
     fn build_outbox(dir: &std::path::Path) -> Arc<OutboxWriter> {
         Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap())
     }
@@ -4108,7 +4659,7 @@ mod tests {
     /// `{chunk_offset, payload_b64, stream}` and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_output_chunk_to_output_endpoint() {
-        let _amb = crate::test_env::isolated_ambient();
+        let _amb = with_live_device_credential();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -4175,6 +4726,7 @@ mod tests {
     /// fails at the `assert_eq!` below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_coord_transport_rung_to_events_endpoint() {
+        let _amb = with_live_device_credential();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -4364,6 +4916,7 @@ mod tests {
         siblings: [&'static AtomicU64; 2],
     ) -> (u64, TransportRungDrainDropped) {
         let _guard = drop_counter_lock().lock().await;
+        let _amb = with_live_device_credential();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -4506,7 +5059,7 @@ mod tests {
     /// verbatim, and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_restore_record_to_events_endpoint() {
-        let _amb = crate::test_env::isolated_ambient();
+        let _amb = with_live_device_credential();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -4799,6 +5352,7 @@ mod tests {
             HashMap::new(),
             abort.clone(),
             true,
+            false,
         )
         .await;
 
@@ -4844,7 +5398,15 @@ mod tests {
             .collect();
 
         let abort = Arc::new(AtomicBool::new(true));
-        let outcome = push_chain(coord.inner.clone(), records, HashMap::new(), abort, false).await;
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort,
+            false,
+            false,
+        )
+        .await;
 
         assert!(outcome.succeeded.is_empty());
         assert!(!outcome.had_transport_error);
@@ -4928,6 +5490,7 @@ mod tests {
             records,
             HashMap::new(),
             abort.clone(),
+            false,
             false,
         )
         .await;
@@ -5220,6 +5783,11 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            credential_pending_sessions: 2,
+            dropped_credential_pending_over_cap: 4,
+            dropped_credential_pending_unresolvable: 5,
+            dropped_not_owner: 6,
+            transcript_sync_refused_sessions: 7,
         });
         for key in [
             "pending",
@@ -5228,6 +5796,11 @@ mod tests {
             "lastFailure",
             "retryingSessions",
             "quarantinedSessions",
+            "credentialPendingSessions",
+            "droppedCredentialPendingOverCap",
+            "droppedCredentialPendingUnresolvable",
+            "droppedNotOwner",
+            "transcriptSyncRefusedSessions",
             "observedAt",
         ] {
             assert!(
@@ -5236,6 +5809,13 @@ mod tests {
             );
         }
         assert_eq!(observed["pending"], 3);
+        assert_eq!(observed["droppedCredentialPendingOverCap"], 4);
+        assert_eq!(observed["droppedCredentialPendingUnresolvable"], 5);
+        assert_eq!(observed["droppedNotOwner"], 6);
+        assert!(
+            unobserved["droppedCredentialPendingOverCap"].is_null(),
+            "a drop counter before the first tick is UNKNOWN, not zero"
+        );
         assert_eq!(observed["lastFailure"]["kind"], "server_error");
         assert_eq!(observed["lastFailure"]["status"], 503);
         assert!(observed["lastFailure"]["at"].is_string());
@@ -7675,5 +8255,637 @@ mod tests {
             "the fetch must not log a refusal itself — only the loop can tell a standing \
              refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
         );
+    }
+
+    // ========================================================================
+    // Plan
+    // `2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous`,
+    // Phase 2 — the runner HOLDS owner-only rows it cannot authenticate
+    // (credential-pending) instead of sending them anonymously or dropping them.
+    // ========================================================================
+
+    /// A test CoordSync whose heartbeat/stale timers never fire, so only the
+    /// ticks a test drives touch coord.
+    fn quiet_coord(outbox: Arc<OutboxWriter>, base: String) -> CoordSync {
+        CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+    }
+
+    /// Queue one transcript `output_chunk` row carrying `payload_b64`.
+    fn record_output(
+        outbox: &OutboxWriter,
+        machine: Uuid,
+        session: Uuid,
+        offset: i64,
+        payload_b64: &str,
+    ) -> OutboxRecord {
+        outbox
+            .record(
+                machine,
+                session,
+                SessionEventKind::OutputChunk,
+                json!({
+                    "stream": "transcript",
+                    "chunk_offset": offset,
+                    "payload_b64": payload_b64,
+                }),
+            )
+            .unwrap()
+    }
+
+    fn record_restore(outbox: &OutboxWriter, machine: Uuid, session: Uuid) -> OutboxRecord {
+        outbox
+            .record(
+                machine,
+                session,
+                SessionEventKind::RestoreRecord,
+                json!({"provider": "claude", "restore_tier": "full"}),
+            )
+            .unwrap()
+    }
+
+    fn record_rung(outbox: &OutboxWriter, machine: Uuid, session: Uuid) -> OutboxRecord {
+        let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            None,
+            None,
+            None,
+            None,
+            crate::session::coord_transport_rung::OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            crate::session::coord_transport_rung::OPERATION_READ,
+            None,
+        );
+        outbox
+            .record(
+                machine,
+                session,
+                SessionEventKind::CoordTransportRung,
+                obs.payload(),
+            )
+            .unwrap()
+    }
+
+    fn pending_keys(outbox: &OutboxWriter) -> Vec<(Uuid, i64)> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect()
+    }
+
+    /// With NO live device credential, all three owner-only kinds are held:
+    /// nothing reaches the wire (not even anonymously), every row stays in the
+    /// outbox, and the session is credential-pending rather than failing. Once
+    /// a credential is live and the timer is due, the held rows land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dark_credential_holds_output_rows_without_sending() {
+        let _amb = with_dark_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let out = record_output(&outbox, machine, session, 0, "aGVsbG8=");
+        let restore = record_restore(&outbox, machine, session);
+        let rung = record_rung(&outbox, machine, session);
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        {
+            let g = rec.lock().await;
+            assert!(
+                g.outputs.is_empty() && g.events.is_empty(),
+                "a dark credential must send NOTHING — an anonymous write can only be refused"
+            );
+        }
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![
+                (session, out.seq),
+                (session, restore.seq),
+                (session, rung.seq)
+            ],
+            "held, never dropped"
+        );
+        assert!(state.credential_pending.contains_key(&session));
+        assert!(
+            !state.retry.contains_key(&session),
+            "credential-pending is not a failure backoff"
+        );
+
+        // A second tick inside the timer issues nothing either.
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(rec.lock().await.outputs.is_empty());
+
+        // The credential recovers; once the timer is due the rows land with it.
+        crate::auth::AuthManager::new()
+            .store_tokens(&device_jwt_for(&Uuid::now_v7()), "")
+            .unwrap();
+        state.credential_pending.insert(session, Instant::now());
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        assert_eq!(g.outputs.len(), 1);
+        assert_eq!(g.events.len(), 2);
+        assert!(g
+            .output_auth
+            .iter()
+            .chain(&g.events_auth)
+            .all(Option::is_some));
+        drop(g);
+        assert!(outbox.pending().unwrap().is_empty());
+        assert!(!state.credential_pending.contains_key(&session));
+    }
+
+    /// A 401 from coord on an owner-only route is credential-pending: the row
+    /// stays in the outbox, the session is NOT retrying or failing, and nothing
+    /// is ACK-dropped. MUTATION: restore the ACK-drop on 401 (drop the
+    /// `UNAUTHORIZED` arm in `push_record`, so the shared classifier makes it
+    /// a `PermanentFailure`) and the row leaves the outbox — this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_refusal_is_credential_pending_not_permanent() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.output_status = Some(401);
+            g.output_body = Some(json!({"error": "device_credential_required"}));
+            g.events_status = Some(401);
+        }
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let out = record_output(&outbox, machine, session, 0, "aGVsbG8=");
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert_eq!(
+            rec.lock().await.outputs.len(),
+            1,
+            "sent once, with the credential"
+        );
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![(session, out.seq)],
+            "a 401 is the runner's credential to recover — the row is held, not ACK-dropped"
+        );
+        assert!(state.credential_pending.contains_key(&session));
+        assert!(!state.retry.contains_key(&session));
+
+        // The /events kinds are held on a 401 the same way.
+        let other = Uuid::new_v4();
+        let restore = record_restore(&outbox, machine, other);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(pending_keys(&outbox).contains(&(other, restore.seq)));
+        assert!(state.credential_pending.contains_key(&other));
+    }
+
+    /// Credential-pending retries are unbounded and never count toward
+    /// quarantine — even while coord keeps serving other sessions, which is
+    /// exactly the evidence that quarantines a session whose row coord refuses.
+    /// MUTATION: count credential-pending toward quarantine (report it as the
+    /// chain's `blocked_on`) and the session is quarantined — this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_pending_never_quarantines_a_session() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_status = Some(401);
+        let coord = quiet_coord(outbox.clone(), base);
+        let machine = Uuid::new_v4();
+        let (held, healthy) = (Uuid::new_v4(), Uuid::new_v4());
+        let out = record_output(&outbox, machine, held, 0, "aGVsbG8=");
+        let mut state = DrainState::default();
+
+        let rounds = QUARANTINE_AFTER_SERVING_FAILURES as usize + 3;
+        for _ in 0..rounds {
+            // Coord is serving: another session's row is taken every round.
+            outbox
+                .record(machine, healthy, SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+            if let Some(next) = state.credential_pending.get_mut(&held) {
+                *next = Instant::now();
+            }
+            if let Some(r) = state.retry.get_mut(&held) {
+                r.next_attempt_at = Instant::now();
+            }
+            drain_tick(&coord.inner, &mut state).await;
+        }
+
+        assert!(
+            !state.quarantined.contains(&held),
+            "a dark credential must never quarantine a session"
+        );
+        assert!(!state.retry.contains_key(&held));
+        assert_eq!(
+            rec.lock().await.outputs.len(),
+            rounds,
+            "retried every time its timer came due — unbounded in count"
+        );
+        assert_eq!(pending_keys(&outbox), vec![(held, out.seq)]);
+        assert!(!std::fs::metadata(quarantine_path(&outbox)).is_ok_and(|m| m.len() > 0));
+    }
+
+    /// Past the per-session byte cap, the OLDEST held rows are dropped with a
+    /// counted reason, surfaced on `/health` `sessionOutbox`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_cap_drops_oldest_with_a_counted_reason() {
+        let _amb = with_dark_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let chunk = "A".repeat(40);
+        let seqs: Vec<i64> = (0..4)
+            .map(|i| record_output(&outbox, machine, session, i * 30, &chunk).seq)
+            .collect();
+        let mut state = DrainState {
+            credential_pending_cap_bytes: Some(100),
+            ..DrainState::default()
+        };
+
+        // Tick 1 learns the session is credential-pending (160 held bytes).
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(state.dropped_credential_pending_over_cap, 0);
+        // Tick 2 enforces the cap: 160 → drop the two oldest → 80 <= 100.
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert_eq!(
+            state.dropped_credential_pending_over_cap, 2,
+            "dropped with a counted reason"
+        );
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![(session, seqs[2]), (session, seqs[3])],
+            "the OLDEST held rows go first; the newest are kept"
+        );
+        assert!(rec.lock().await.outputs.is_empty(), "nothing was sent");
+        let rendered = render_session_outbox_health(&SessionOutboxHealth {
+            observed_at: Some(Utc::now()),
+            dropped_credential_pending_over_cap: state.dropped_credential_pending_over_cap,
+            ..SessionOutboxHealth::default()
+        });
+        assert_eq!(rendered["droppedCredentialPendingOverCap"], 2);
+    }
+
+    /// Coord's 429 `transcript_sync_disabled` is consent, not failure: the row
+    /// is ACK-dropped, the session's queued and later output rows are dropped
+    /// without being sent, and its lifecycle rows keep going.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_sync_disabled_acks_and_stops_the_session_stream() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.output_status = Some(429);
+            g.output_body = Some(json!({
+                "error": "transcript_sync_disabled",
+                "stream": "transcript",
+                "column_missing": false,
+            }));
+        }
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        record_output(&outbox, machine, session, 0, "aGVsbG8=");
+        record_output(&outbox, machine, session, 5, "aGVsbG8=");
+        outbox
+            .record(machine, session, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert!(transcript_sync_refused(session));
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "ACK-dropped, not retried forever"
+        );
+        {
+            let g = rec.lock().await;
+            assert_eq!(
+                g.outputs.len(),
+                1,
+                "after the refusal the session's next chunk is dropped unsent"
+            );
+            assert!(
+                g.patches.iter().any(|(id, _)| *id == session),
+                "the refusal does not block the session's lifecycle rows"
+            );
+        }
+        assert!(!state.retry.contains_key(&session));
+
+        // A chunk queued later is dropped without a request, too.
+        record_output(&outbox, machine, session, 10, "aGVsbG8=");
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(rec.lock().await.outputs.len(), 1);
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// The held row sits in the file while the session's lifecycle rows queued
+    /// BEHIND it drain. MUTATION: make credential-pending break the chain
+    /// (`break` instead of `continue` in `push_chain`'s credential-pending
+    /// arm) and the heartbeat and close never reach coord — this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_pending_row_does_not_block_the_sessions_lifecycle_rows() {
+        let _amb = with_dark_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let out = record_output(&outbox, machine, session, 0, "aGVsbG8=");
+        outbox
+            .record(machine, session, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        outbox
+            .record(machine, session, SessionEventKind::Closed, json!({}))
+            .unwrap();
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        let g = rec.lock().await;
+        assert!(
+            g.patches.iter().any(|(id, _)| *id == session),
+            "the heartbeat behind the held chunk went out"
+        );
+        assert_eq!(g.deletes, vec![session], "and so did the close");
+        assert!(g.outputs.is_empty());
+        drop(g);
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![(session, out.seq)],
+            "only the held chunk is left"
+        );
+    }
+
+    /// 403 is NOT credential-pending: after coord's Phase 3 the only 403 these
+    /// routes answer is `post_event`'s control-plane-kind refusal, which is
+    /// permanent. MUTATION: widen the hold to 403 and the row is pinned in the
+    /// outbox — this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_403_is_still_permanent() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.events_status = Some(403);
+        let coord = quiet_coord(outbox.clone(), base);
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        record_restore(&outbox, machine, session);
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert_eq!(rec.lock().await.events.len(), 1);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a 403 is a permanent refusal — ACK-dropped"
+        );
+        assert!(!state.credential_pending.contains_key(&session));
+    }
+
+    /// The `output_chunk` 404 drop is counted as `dropped_not_owner`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_chunk_404_is_counted_as_not_owner() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.output_status = Some(404);
+        let coord = quiet_coord(outbox.clone(), base);
+        record_output(&outbox, Uuid::new_v4(), Uuid::new_v4(), 0, "aGVsbG8=");
+        let before = OUTPUT_CHUNK_DROPPED_NOT_OWNER.load(Ordering::Relaxed);
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert!(outbox.pending().unwrap().is_empty(), "today's drop is kept");
+        assert!(OUTPUT_CHUNK_DROPPED_NOT_OWNER.load(Ordering::Relaxed) > before);
+    }
+
+    /// Every enqueuer of the owner-only kinds stamps the session's owning
+    /// tenant into the row when it knows it — so a replay after a restart
+    /// (registry gone) still selects that tenant's credential — and the stamp
+    /// never reaches coord's stored event body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enqueued_rows_carry_the_session_tenant() {
+        let _amb = with_live_device_credential();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let machine = Uuid::new_v4();
+        let (session, tenant) = (Uuid::new_v4(), Uuid::now_v7());
+        // This device holds `tenant`'s own slot, so a row stamped with it can
+        // be sent under that credential.
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant, &device_jwt_for(&tenant))
+            .unwrap();
+        let lookup = move |sid: Uuid| (sid == session).then_some(tenant);
+
+        // The transport-rung mirror.
+        let rung = crate::session::coord_transport_rung::RungEmitter::new(outbox.clone(), machine)
+            .with_tenant_lookup(Box::new(lookup));
+        let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            None,
+            None,
+            None,
+            None,
+            crate::session::coord_transport_rung::OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            crate::session::coord_transport_rung::OPERATION_READ,
+            None,
+        );
+        rung.emit(session, &obs);
+
+        // The restore-record emitter — from the live lookup, and from the
+        // record's own durable spawn tenant when the lookup knows nothing.
+        let restore = crate::session::restore_record_emitter::RestoreRecordEmitter::with_gate(
+            outbox.clone(),
+            machine,
+            Box::new(move |_terminal: &str| Some(session)),
+            Box::new(|| true),
+        )
+        .with_tenant_lookup(Box::new(lookup));
+        restore.emit(
+            &crate::session::restore_record_emitter::sample_record("sess-a", "term-a"),
+            None,
+        );
+        let durable_tenant = Uuid::now_v7();
+        let mut durable = crate::session::restore_record_emitter::sample_record("sess-b", "term-b");
+        durable.tenant_id = Some(durable_tenant.to_string());
+        let restore_blind =
+            crate::session::restore_record_emitter::RestoreRecordEmitter::with_gate(
+                outbox.clone(),
+                machine,
+                Box::new(move |_terminal: &str| Some(session)),
+                Box::new(|| true),
+            )
+            .with_tenant_lookup(Box::new(|_| None));
+        restore_blind.emit(&durable, None);
+
+        // The transcript lane (the emitter the tailer also feeds).
+        let registrar = Arc::new(
+            crate::claude_session::coord_register::AiCoordRegistrar::with_tenant_resolver(
+                outbox.clone(),
+                machine,
+                || Some(Uuid::from_u128(0x5eed)),
+            ),
+        );
+        let transcript = crate::session::transcript_emitter::TranscriptEmitter::new(
+            outbox.clone(),
+            machine,
+            registrar.clone(),
+        );
+        let key = Uuid::new_v4().to_string();
+        let ai_session = (0..100)
+            .find_map(|_| {
+                registrar
+                    .register_session(&key, "tenant stamp test", None)
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(10));
+                        None
+                    })
+            })
+            .expect("register_session");
+        transcript.emit_inner(&key, "a block");
+
+        let rows = outbox.pending().unwrap();
+        let tenant_of = |kind: &str, sid: Uuid| -> Vec<JsonValue> {
+            rows.iter()
+                .filter(|r| r.event_kind == kind && r.session_id == sid)
+                .map(|r| r.payload["tenant_id"].clone())
+                .collect()
+        };
+        assert_eq!(
+            tenant_of("coord-transport-rung", session),
+            vec![json!(tenant.to_string())]
+        );
+        assert_eq!(
+            tenant_of("restore-record", session),
+            vec![json!(tenant.to_string()), json!(durable_tenant.to_string())]
+        );
+        assert_eq!(
+            tenant_of("output_chunk", ai_session),
+            vec![json!(Uuid::from_u128(0x5eed))]
+        );
+
+        // The drain reads the stamp with no registry at all (post-restart) …
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = quiet_coord(outbox.clone(), base);
+        let rung_row = rows
+            .iter()
+            .find(|r| r.event_kind == "coord-transport-rung")
+            .unwrap();
+        assert_eq!(
+            record_session_tenant(&coord.inner, rung_row),
+            TenantScope::Owned(tenant)
+        );
+        // … and strips it off the verbatim `/events` body.
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        assert!(!g.events.is_empty());
+        for (_, body) in &g.events {
+            assert!(
+                body["payload"].get("tenant_id").is_none(),
+                "the runner-internal tenant carrier must not reach coord: {body}"
+            );
+        }
+    }
+
+    /// A held row whose scope is `Unresolved` on a multi-bound device is not
+    /// waiting on a credential that will recover. Past the age bound it is
+    /// dropped with a counted reason; a younger one is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unresolvable_pending_rows_age_out_with_a_counted_reason() {
+        let amb = with_live_device_credential();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": b.to_string()}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // An UNSTAMPED row written eight days ago (before a restart), then
+        // opened the way the runner opens its outbox at boot.
+        let dir = tempfile::tempdir().unwrap();
+        let (machine, session) = (Uuid::new_v4(), Uuid::new_v4());
+        let old = OutboxRecord {
+            machine_id: machine,
+            session_id: session,
+            seq: 1,
+            event_kind: SessionEventKind::OutputChunk.as_str().to_string(),
+            payload: json!({"stream": "transcript", "chunk_offset": 0, "payload_b64": "aGk="}),
+            recorded_at: Utc::now() - chrono::Duration::days(UNRESOLVABLE_PENDING_MAX_AGE_DAYS + 1),
+            acked_at: None,
+        };
+        std::fs::write(
+            dir.path().join("outbox.jsonl"),
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .unwrap();
+        let outbox = build_outbox(dir.path());
+        let young = record_output(&outbox, machine, session, 2, "aGk=");
+        assert!(young.seq > old.seq);
+
+        let (base, rec) = spawn_fake_coord().await;
+        // No registry attached: exactly the post-restart shape.
+        let coord = quiet_coord(outbox.clone(), base);
+        let mut state = DrainState::default();
+
+        drain_tick(&coord.inner, &mut state).await;
+
+        assert_eq!(
+            state.dropped_credential_pending_unresolvable, 1,
+            "the aged-out row is dropped with a counted reason"
+        );
+        assert_eq!(
+            pending_keys(&outbox),
+            vec![(session, young.seq)],
+            "a young unresolvable row is still held"
+        );
+        assert!(
+            rec.lock().await.outputs.is_empty(),
+            "an Unresolved scope on a multi-bound device sends nothing"
+        );
+        assert!(state.credential_pending.contains_key(&session));
+    }
+
+    /// The owner-only kinds, and ONLY them, take the credential-pending posture.
+    #[test]
+    fn credential_pending_posture_covers_exactly_the_owner_only_kinds() {
+        for kind in [
+            SessionEventKind::OutputChunk,
+            SessionEventKind::RestoreRecord,
+            SessionEventKind::CoordTransportRung,
+        ] {
+            assert!(is_credential_gated_kind(kind.as_str()), "{kind:?}");
+            assert!(!is_best_effort_kind(kind.as_str()), "{kind:?}");
+        }
+        for kind in [
+            SessionEventKind::Started,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::Closed,
+            SessionEventKind::StateChange,
+            SessionEventKind::HelperTaskCreated,
+            SessionEventKind::FindingPosted,
+        ] {
+            assert!(!is_credential_gated_kind(kind.as_str()), "{kind:?}");
+        }
     }
 }
