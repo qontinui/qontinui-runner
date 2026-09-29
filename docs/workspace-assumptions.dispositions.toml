@@ -246,16 +246,6 @@ reviewed = [
 
 [[disposition]]
 class = "supervisor_dependency"
-file = "src/mcp/ai_session.rs"
-symbol = "run_prompt"
-disposition = "fallback_correct"
-note = "Passes check_supervisor_available() == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent or unknown (None) selects the supervisor-DOWN rules block."
-reviewed = [
-    "super::auto_continue::check_supervisor_available() == Some(true),",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
 file = "src/mcp/app_discovery.rs"
 symbol = "desktop_ports_merged"
 disposition = "fallback_correct"
@@ -314,13 +304,13 @@ class = "supervisor_dependency"
 file = "src/mcp/auto_continue.rs"
 symbol = "observe_supervisor_at"
 disposition = "fallback_correct"
-note = "Pure observation builder over one address; port/base_url are null when the address does not parse."
+note = "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
 reviewed = [
+    "match confirm_supervisor_identity(&base_url, remaining) {",
+    "match probe_supervisor_at(&host_port, budget.min(SUPERVISOR_PROBE_TIMEOUT)) {",
     "\"the configured supervisor URL {supervisor_url:?} names no port, so nothing was probed\"",
-    "Some(true) => match confirm_supervisor_identity(&base_url, identity_budget) {",
     "let Some(host_port) = crate::api_config::supervisor_host_port(supervisor_url) else {",
     "let scheme = supervisor_url.split_once(\"://\").map_or(\"http\", |x| x.0);",
-    "match probe_supervisor_at(&host_port, tcp_budget) {",
     "supervisor_url: &str,",
     "pub fn observe_supervisor_at(",
 ]
@@ -453,7 +443,7 @@ class = "supervisor_dependency"
 file = "src/mcp/auto_continue.rs"
 symbol = "confirm_supervisor_identity"
 disposition = "fallback_correct"
-note = "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+note = "GET <base>/health within the observation's remaining deadline (no redirects, no proxy), body capped at 64 KiB; anything but a supervisor-shaped body reads observed=false with a reason."
 reviewed = [
     "fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {",
     "if is_supervisor_health(&body) {",
@@ -477,4 +467,14 @@ disposition = "fallback_correct"
 note = "Resolves host:port and tries every address within one bounded budget; an absent supervisor reads Some(false), unresolvable None."
 reviewed = [
     "pub fn probe_supervisor_at(addr: &str, budget: std::time::Duration) -> Option<bool> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "run_prompt"
+disposition = "fallback_correct"
+note = "Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block."
+reviewed = [
+    "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
 ]

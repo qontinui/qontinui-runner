@@ -2115,10 +2115,10 @@
       "class": "supervisor_dependency",
       "file": "src/mcp/ai_session.rs",
       "symbol": "run_prompt",
-      "excerpt": "super::auto_continue::check_supervisor_available() == Some(true),",
+      "excerpt": "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Passes check_supervisor_available() == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent or unknown (None) selects the supervisor-DOWN rules block."
+      "note": "Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block."
     },
     {
       "class": "supervisor_dependency",
@@ -2181,7 +2181,7 @@
       "excerpt": "fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+      "note": "GET <base>/health within the observation's remaining deadline (no redirects, no proxy), body capped at 64 KiB; anything but a supervisor-shaped body reads observed=false with a reason."
     },
     {
       "class": "supervisor_dependency",
@@ -2190,7 +2190,7 @@
       "excerpt": "if is_supervisor_health(&body) {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "GET <base>/health bounded by 1.5 s; anything but a supervisor-shaped body reads observed=false with a reason."
+      "note": "GET <base>/health within the observation's remaining deadline (no redirects, no proxy), body capped at 64 KiB; anything but a supervisor-shaped body reads observed=false with a reason."
     },
     {
       "class": "supervisor_dependency",
@@ -2244,16 +2244,7 @@
       "excerpt": "\"the configured supervisor URL {supervisor_url:?} names no port, so nothing was probed\"",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
-    },
-    {
-      "class": "supervisor_dependency",
-      "file": "src/mcp/auto_continue.rs",
-      "symbol": "observe_supervisor_at",
-      "excerpt": "Some(true) => match confirm_supervisor_identity(&base_url, identity_budget) {",
-      "count": 1,
-      "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
@@ -2262,7 +2253,7 @@
       "excerpt": "let Some(host_port) = crate::api_config::supervisor_host_port(supervisor_url) else {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
@@ -2271,16 +2262,25 @@
       "excerpt": "let scheme = supervisor_url.split_once(\"://\").map_or(\"http\", |x| x.0);",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
       "file": "src/mcp/auto_continue.rs",
       "symbol": "observe_supervisor_at",
-      "excerpt": "match probe_supervisor_at(&host_port, tcp_budget) {",
+      "excerpt": "match confirm_supervisor_identity(&base_url, remaining) {",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
+    },
+    {
+      "class": "supervisor_dependency",
+      "file": "src/mcp/auto_continue.rs",
+      "symbol": "observe_supervisor_at",
+      "excerpt": "match probe_supervisor_at(&host_port, budget.min(SUPERVISOR_PROBE_TIMEOUT)) {",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
@@ -2289,7 +2289,7 @@
       "excerpt": "pub fn observe_supervisor_at(",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
@@ -2298,7 +2298,7 @@
       "excerpt": "supervisor_url: &str,",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Pure observation builder over one address; port/base_url are null when the address does not parse."
+      "note": "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
     },
     {
       "class": "supervisor_dependency",
