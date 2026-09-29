@@ -50,8 +50,11 @@
 //!      record's `procStart` is compared with `/proc/<pid>/stat` field 22
 //!      (both are the start time in clock ticks since boot — equal on every
 //!      record checked on merytshost 2026-09-29); where that cannot be read,
-//!      `startedAt` is compared with the census's process age within
-//!      [`START_TOLERANCE_MS`]. A record neither check can reach is accepted
+//!      `startedAt` is compared with the process start the census implies
+//!      (its snapshot time minus the process age) inside the ONE-SIDED window
+//!      [`START_LEAD_MS`] / [`START_LAG_MS`]. An empty or non-numeric
+//!      `procStart` counts as absent and falls through to that `startedAt`
+//!      check. A record neither check can reach is accepted
 //!      on its `pid` match alone — the census only lists live `claude`
 //!      processes, so a reused pid would also have to be a `claude`.
 //!
@@ -79,12 +82,19 @@ pub const ACTIVE_WINDOW_MS: i64 = 30 * 60 * 1000;
 /// to low tens on a 250-session box), so it is bounded per request.
 pub const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
-/// How far a record's `startedAt` may sit from the census's process start
-/// before the record is judged to belong to another process. `age_s` has
-/// one-second resolution and Claude Code stamps `startedAt` after its own
-/// startup, so the two legitimately differ by seconds; a reused pid differs
-/// by the lifetime of the earlier process.
-pub const START_TOLERANCE_MS: i64 = 60 * 1000;
+/// The window `startedAt - process_start` must fall in for a record to
+/// belong to the live process, where `process_start` is the census snapshot
+/// time minus the process age. It is ONE-SIDED because Claude Code stamps
+/// `startedAt` after its own startup: over 249 records on merytshost
+/// (2026-09-29) the lag was always positive, from +0.9 s to +78 s, and 1 in
+/// 249 exceeded 60 s. So the lead allows only for `age_s`'s one-second
+/// resolution and clock rounding, and the lag allows a slow start with
+/// headroom. A reused pid differs by the lifetime of the earlier process —
+/// typically hours or days, and always on the NEGATIVE side, because the
+/// stale record was written before the live process began.
+pub const START_LEAD_MS: i64 = 5 * 1000;
+/// See [`START_LEAD_MS`].
+pub const START_LAG_MS: i64 = 5 * 60 * 1000;
 
 /// One process's activity class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +158,14 @@ pub struct RecordEvidence {
     pub last_message_ms: Option<i64>,
 }
 
-/// A live `claude` pid whose record should be read, with the census's own
-/// process age for the non-Linux identity check.
+/// A live `claude` pid whose record should be read, with the start time the
+/// census implies for it (`checked_at_ms - age_s * 1000`, from the SAME
+/// snapshot — never a later clock read, which would skew it by however long
+/// the request took) for the `startedAt` identity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LivePid {
     pub pid: u32,
-    pub age_s: Option<i64>,
+    pub process_started_ms: Option<i64>,
 }
 
 /// The raw on-disk record. Only the keys this module reads are modelled so a
@@ -174,12 +186,16 @@ struct RawRecord {
 }
 
 impl RawRecord {
+    /// `None` for an absent, empty or non-numeric value: a `procStart` that
+    /// cannot be a tick count says nothing, so the `startedAt` check decides
+    /// rather than a guaranteed mismatch against `/proc`.
     fn proc_start(&self) -> Option<String> {
-        match self.proc_start.as_ref()? {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        }
+        let text = match self.proc_start.as_ref()? {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())).then_some(text)
     }
 }
 
@@ -273,15 +289,13 @@ fn parse_record(bytes: &str, pid: u32) -> Result<(RawRecord, RecordEvidence), ()
 fn same_process(
     raw: &RawRecord,
     live: LivePid,
-    now_ms: i64,
     proc_start: &dyn Fn(u32) -> Option<String>,
 ) -> Option<bool> {
     if let (Some(recorded), Some(actual)) = (raw.proc_start(), proc_start(live.pid)) {
         return Some(recorded == actual);
     }
-    let (started_at, age_s) = (raw.started_at?, live.age_s?);
-    let process_started_ms = now_ms - age_s * 1000;
-    Some((started_at - process_started_ms).abs() <= START_TOLERANCE_MS)
+    let lag_ms = raw.started_at? - live.process_started_ms?;
+    Some((-START_LEAD_MS..=START_LAG_MS).contains(&lag_ms))
 }
 
 /// The kernel's start time for `pid` in clock ticks since boot — field 22 of
@@ -353,7 +367,6 @@ pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
 pub fn read_records(
     config_dirs: &[PathBuf],
     pids: &[LivePid],
-    now_ms: i64,
     proc_start: &dyn Fn(u32) -> Option<String>,
 ) -> HashMap<u32, RecordReading> {
     let wanted: std::collections::HashSet<u32> = pids.iter().map(|p| p.pid).collect();
@@ -383,7 +396,7 @@ pub fn read_records(
         .map(|&live| {
             let reading = match found.get(&live.pid) {
                 None => RecordReading::Missing,
-                Some(candidates) => read_one(live, candidates, now_ms, proc_start),
+                Some(candidates) => read_one(live, candidates, proc_start),
             };
             (live.pid, reading)
         })
@@ -393,7 +406,6 @@ pub fn read_records(
 fn read_one(
     live: LivePid,
     candidates: &[(PathBuf, PathBuf)],
-    now_ms: i64,
     proc_start: &dyn Fn(u32) -> Option<String>,
 ) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
@@ -407,7 +419,7 @@ fn read_one(
         else {
             continue;
         };
-        if same_process(&raw, live, now_ms, proc_start) == Some(false) {
+        if same_process(&raw, live, proc_start) == Some(false) {
             reused = true;
             continue;
         }
@@ -486,7 +498,10 @@ mod tests {
     }
 
     fn live(pid: u32) -> LivePid {
-        LivePid { pid, age_s: None }
+        LivePid {
+            pid,
+            process_started_ms: None,
+        }
     }
 
     #[test]
@@ -788,7 +803,6 @@ mod tests {
         let readings = read_records(
             &[dir.clone(), other, root.path().join("absent")],
             &pids,
-            NOW,
             &no_proc,
         );
         let class = |pid: u32| classify_from_record(&readings[&pid], NOW);
@@ -805,7 +819,9 @@ mod tests {
 
     /// A record left by an EARLIER holder of the pid is `PidReused` →
     /// unknown: by `procStart` where the kernel's start time is readable, by
-    /// `startedAt` against the process age where it is not.
+    /// `startedAt` against the census's implied process start where it is
+    /// not. The `startedAt` window is one-sided (Claude Code stamps it AFTER
+    /// the process starts), and each edge is pinned.
     #[test]
     fn a_record_from_an_earlier_holder_of_the_pid_is_pid_reused() {
         let root = scratch("reuse");
@@ -820,45 +836,55 @@ mod tests {
             )
             .unwrap();
         };
-        let started = NOW - 3_600_000; // an hour ago
+        let started = NOW - 3_600_000; // the process began an hour ago
         rec(1, "500", started); // procStart matches the kernel
         rec(2, "400", started); // procStart disagrees
-        rec(3, "", started); // /proc unreadable: startedAt matches the age
-        rec(4, "", NOW - 86_400_000); // /proc unreadable: started a day ago
+        rec(3, "", started + 78_000); // the largest lag measured: same process
+        rec(4, "", NOW - 86_400_000); // written a day before the process began
         rec(5, "", started); // neither check reachable: accepted
+        rec(6, "", started + 1_000); // empty procStart = absent: startedAt decides
+        rec(7, "abc", started + 1_000); // non-numeric procStart = absent too
+        rec(8, "", started + START_LAG_MS); // lag edge, inclusive
+        rec(9, "", started + START_LAG_MS + 1); // one past the lag edge
+        rec(10, "", started - START_LEAD_MS); // lead edge, inclusive
+        rec(11, "", started - START_LEAD_MS - 1); // one past the lead edge
         let kernel = |pid: u32| match pid {
-            1 | 2 => Some("500".to_string()),
+            1 | 2 | 6 | 7 => Some("500".to_string()),
             _ => None,
         };
+        let at = |pid: u32| LivePid {
+            pid,
+            process_started_ms: Some(started),
+        };
         let pids = [
-            LivePid {
-                pid: 1,
-                age_s: None,
-            },
-            LivePid {
-                pid: 2,
-                age_s: None,
-            },
-            LivePid {
-                pid: 3,
-                age_s: Some(3_600 - 5),
-            },
-            LivePid {
-                pid: 4,
-                age_s: Some(3_600),
-            },
-            LivePid {
-                pid: 5,
-                age_s: None,
-            },
+            live(1),
+            live(2),
+            at(3),
+            at(4),
+            live(5),
+            at(6),
+            at(7),
+            at(8),
+            at(9),
+            at(10),
+            at(11),
         ];
-        let readings = read_records(&[dir], &pids, NOW, &kernel);
-        assert_eq!(classify_from_record(&readings[&1], NOW), Activity::Idle);
-        assert_eq!(readings[&2], RecordReading::PidReused);
-        assert_eq!(classify_from_record(&readings[&2], NOW), Activity::Unknown);
-        assert_eq!(classify_from_record(&readings[&3], NOW), Activity::Idle);
-        assert_eq!(readings[&4], RecordReading::PidReused);
-        assert_eq!(classify_from_record(&readings[&5], NOW), Activity::Idle);
+        let readings = read_records(&[dir], &pids, &kernel);
+        for pid in [1, 3, 5, 6, 7, 8, 10] {
+            assert_eq!(
+                classify_from_record(&readings[&pid], NOW),
+                Activity::Idle,
+                "pid {pid}: {:?}",
+                readings[&pid]
+            );
+        }
+        for pid in [2, 4, 9, 11] {
+            assert_eq!(readings[&pid], RecordReading::PidReused, "pid {pid}");
+            assert_eq!(
+                classify_from_record(&readings[&pid], NOW),
+                Activity::Unknown
+            );
+        }
     }
 
     #[test]
@@ -874,7 +900,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let readings = read_records(&[dir], &[live(20)], NOW, &no_proc);
+        let readings = read_records(&[dir], &[live(20)], &no_proc);
         assert_eq!(classify_from_record(&readings[&20], NOW), Activity::Stale);
     }
 
