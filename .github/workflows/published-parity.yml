@@ -1224,6 +1224,26 @@ jobs:
           CODE: ${{ steps.control.outputs.exit-code }}
         run: |
           echo "control step outcome: ${OUTCOME:-<none>}   exit code: ${CODE:-<none>}"
+          # The verdict also goes to the JOB SUMMARY, because the check
+          # CONCLUSION cannot carry it: this step exits 0 both when the
+          # instrument is certified and when it could not look, and those are
+          # opposite facts. A reader who never opens a log would otherwise see
+          # one green tick for both -- which is the exact confusion this whole
+          # plan exists to remove, pointed at the plan's own gate. Written for
+          # every outcome, including the unknown ones.
+          summarize() {  # <headline> <detail>
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### Parity harness negative control"
+                echo ""
+                echo "$1"
+                echo ""
+                echo "$2"
+                echo ""
+                echo "_Exit code \`${CODE:-<none>}\`, step outcome \`${OUTCOME:-<none>}\`, log marker \`${marker}\`. This gate judges the HARNESS, never a parity outcome._"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
           marker="none"
           if grep -q 'NEGATIVE-CONTROL FAILED' negative-control.log 2>/dev/null; then marker="failed"; fi
           if grep -q 'NEGATIVE-CONTROL OK'     negative-control.log 2>/dev/null; then marker="ok"; fi
@@ -1232,6 +1252,7 @@ jobs:
           case "${CODE:-}" in
             1)
               echo "::error::The parity harness is BLIND: taking the entire qontinui-claude-config checkout away changed no checkout-sensitive capability row. Its defect count -- including a 0 -- carries no information until this is fixed."
+              summarize "**BLIND.** Removing the entire \`qontinui-claude-config\` checkout changed no checkout-sensitive capability row." "The harness cannot see the class it exists to measure, so its defect count -- including a 0 -- carries no information until this is fixed."
               sed -n '/Negative control verdict/,$p' negative-control.log 2>/dev/null || true
               exit 1
               ;;
@@ -1240,10 +1261,12 @@ jobs:
                 echo "::warning::The control exited 0 but its log carries no OK marker (marker='${marker}'). Reporting the exit code, and flagging the disagreement."
               fi
               echo "The instrument demonstrably sees the class."
+              summarize "**CERTIFIED.** The instrument sees the class." "A checkout-sensitive capability row moved when the checkout was taken away. Read \`rows observed on BOTH legs\` and the survivor census in the uploaded log for what else the run established."
               exit 0
               ;;
             2)
               echo "::warning::The negative control could not run (exit 2) -- no dev exe, or a leg failed to boot. That is UNKNOWN, not a pass and not a failure; read the uploaded log."
+              summarize "**UNKNOWN -- the control could not run** (exit 2: no dev exe, or a leg failed to boot)." "This is NOT a pass. Nothing was certified about the harness on this run, and the green tick above means only that an inability to look is not treated as a failure."
               exit 0
               ;;
             124)
@@ -1253,14 +1276,17 @@ jobs:
               # on a slow box -- not an unexplained code, and emphatically not
               # "blind".
               echo "::warning::The negative control TIMED OUT (exit 124 from invoke-ps51-detached at -TimeoutSec 1500). UNKNOWN, not blind -- read the uploaded log for the survivor census."
+              summarize "**UNKNOWN -- the control timed out** (exit 124 at \`-TimeoutSec 1500\`)." "This is NOT a pass and NOT a blind verdict. Nothing was certified about the harness on this run."
               exit 0
               ;;
             "")
               echo "::warning::The negative control produced no exit code at all (step outcome '${OUTCOME:-none}', log marker '${marker}') -- it was cancelled, timed out at the STEP bound, or never ran. UNKNOWN -- read the uploaded log."
+              summarize "**UNKNOWN -- the control produced no exit code** (cancelled, killed at the step bound, or never ran)." "This is NOT a pass. Nothing was certified about the harness on this run."
               exit 0
               ;;
             *)
               echo "::warning::The negative control exited with an unexpected code '${CODE}' (step outcome '${OUTCOME:-none}', log marker '${marker}'). UNKNOWN, not blind -- read the uploaded log."
+              summarize "**UNKNOWN -- unexpected exit code \`${CODE}\`**." "This is NOT a pass and NOT a blind verdict. Nothing was certified about the harness on this run."
               exit 0
               ;;
           esac
