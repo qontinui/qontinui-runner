@@ -323,7 +323,8 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # while the list stays complete — a narrowed list clears a guilty pusher.
 for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
     crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
-    src-tauri/.cargo/config.toml .cargo/config.toml; do
+    src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config \
+    rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain; do
     fixture
     commit_change "$input" "# touched"
     decide
@@ -623,7 +624,7 @@ echo "  -- the probe's reach is derived from the input list --"
 # the exclusion, so a markdown push there is MINE. Iterating the library's own
 # list, so a new directory input is covered the day it is added.
 for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
-    case "${PDIR##*/}" in *.*) continue ;; esac
+    case "$PDIR" in */) PDIR="${PDIR%/}" ;; *) continue ;; esac
     fixture
     seed_base "$PDIR/src/v.rs" '#[derive(JsonSchema)] struct V; const B: &str = include_str!("../x.md");'
     commit_change "$PDIR/x.md" "# a body"
@@ -632,18 +633,119 @@ for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
         "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
 done
 
-# The derivation's rule — no `.` in the last component means a directory —
-# checked against the real tree for every entry that exists there.
+# The marking — a trailing `/` means a directory — checked against the real
+# tree for every entry that exists there.
 if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
     MISCLASSIFIED=""
     for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "$PDIR" in */) want=dir; PDIR="${PDIR%/}" ;; *) want=file ;; esac
         [ -e "$REPO_ROOT/$PDIR" ] || continue
-        case "${PDIR##*/}" in *.*) want=file ;; *) want=dir ;; esac
         if [ -d "$REPO_ROOT/$PDIR" ]; then got=dir; else got=file; fi
         [ "$want" = "$got" ] || MISCLASSIFIED+=" $PDIR($got)"
     done
     check "every input's dir/file classification matches the real tree" "" "$MISCLASSIFIED"
 fi
+
+echo "  -- every in-repo path dependency is an input --"
+
+# The input list names crates by hand, and two were once missing. This walks
+# the manifests instead — toolchain-free — from src-tauri/Cargo.toml and the
+# root Cargo.toml (its [patch.*] and workspace dependencies), following each
+# in-repo path dependency to its own manifest, and prints any that no
+# directory entry covers.
+#
+# `path = "…"` values from dependency-shaped sections only (any section whose
+# name contains `dependencies`, and `[patch.*]`), so the `path` of a
+# `[[bin]]`/`[lib]`/`[[test]]` target is not mistaken for a dependency.
+cargo_path_deps() {
+    awk '
+        /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+        { sub(/#.*/, "") }
+        sec ~ /dependencies/ || sec ~ /^\[patch/ {
+            s = $0
+            while (match(s, /(^|[^_a-zA-Z0-9])path *= *"[^"]*"/)) {
+                v = substr(s, RSTART, RLENGTH)
+                sub(/^.*path *= *"/, "", v); sub(/"$/, "", v)
+                print v
+                s = substr(s, RSTART + RLENGTH)
+            }
+        }' "$1"
+}
+# Lexical, so an out-of-repo sibling that is not checked out (CI) still
+# resolves: `a/b/../../../x` becomes `../x`, which is outside the repo.
+normalize_rel() {
+    local IFS=/ part out=() n
+    read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|.) ;;
+            ..) n="${#out[@]}"
+                if [ "$n" -gt 0 ] && [ "${out[$((n - 1))]}" != ".." ]; then unset "out[$((n - 1))]"; out=("${out[@]}")
+                else out+=(".."); fi ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    printf '%s\n' "${out[*]}"
+}
+uncovered_path_deps() {
+    local root="$1" m dir dep rel entry covered seen=" "
+    local queue=("src-tauri/Cargo.toml" "Cargo.toml")
+    while [ "${#queue[@]}" -gt 0 ]; do
+        m="${queue[0]}"; queue=("${queue[@]:1}")
+        case "$seen" in *" $m "*) continue ;; esac
+        seen+="$m "
+        [ -f "$root/$m" ] || continue
+        dir="$(dirname "$m")"
+        while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            rel="$(normalize_rel "$dir/$dep")"
+            case "$rel" in ..|../*|'') continue ;; esac
+            covered=no
+            for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+                case "$entry" in */) case "$rel/" in "$entry"*) covered=yes ;; esac ;; esac
+            done
+            [ "$covered" = yes ] || printf '%s (from %s)\n' "$rel" "$m"
+            queue+=("$rel/Cargo.toml")
+        done < <(cargo_path_deps "$root/$m")
+    done
+}
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    check "every in-repo path dependency of the export build is under an input" \
+        "" "$(uncovered_path_deps "$REPO_ROOT")"
+    SEEN_DEPS="$(cargo_path_deps "$REPO_ROOT/src-tauri/Cargo.toml" | grep -c . || true)"
+    if [ "${SEEN_DEPS:-0}" -gt 0 ]; then
+        pass_note "  and it read $SEEN_DEPS path dependencies from src-tauri/Cargo.toml"
+    else
+        fail_note "  it read no path dependency from src-tauri/Cargo.toml — the parser is broken"
+    fi
+fi
+
+# Non-vacuity: a tree that adds the pty-holder crate as a dependency (and a
+# transitive one behind it) is caught; a target `path` and an out-of-repo
+# sibling are not.
+premise_fixture 'fn f() {}'
+mkdir -p "$PREMISE_FIXTURE/crates/pty-holder"
+cat > "$PREMISE_FIXTURE/src-tauri/Cargo.toml" <<'TOML'
+[package]
+name = "x"
+
+[dependencies]
+qontinui-spec-check = { path = "../crates/spec-check" }
+qontinui-pty-holder = { path = "../crates/pty-holder" }
+qontinui-types = { path = "../../qontinui-schemas/rust" }
+
+[[bin]]
+name = "export_schemas"
+path = "src/bin/export_schemas.rs"
+TOML
+cat > "$PREMISE_FIXTURE/crates/pty-holder/Cargo.toml" <<'TOML'
+[target.'cfg(unix)'.dependencies]
+frame = { path = "../frame-proto" }
+TOML
+PTY_OUT="$(uncovered_path_deps "$PREMISE_FIXTURE")"
+check "a new pty-holder path dependency, and its own, are reported uncovered" \
+    "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
+    "$PTY_OUT"
 
 echo "  -- the premise gates the exclusion at decision time --"
 
@@ -714,7 +816,7 @@ shim_case() {
     check "  and the reason names the call" "yes" \
         "$(grep -qF -- "$want_reason" "$WORK/.state" && echo yes || echo no)"
 }
-shim_case "git diff base..HEAD" '*" diff --name-only --no-renames -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so this push's commits"
+shim_case "git diff base..HEAD" '*" diff --name-only --no-renames -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so the commits since the merge-base"
 shim_case "git diff --cached"   '*" diff --name-only --no-renames -z --cached HEAD -- "*' "git diff --cached HEAD failed"
 shim_case "git diff (worktree)" '*" diff --name-only --no-renames -z -- "*'             "git diff (working tree) failed"
 shim_case "git ls-files"        '*" ls-files "*'                              "ls-files --others failed"
