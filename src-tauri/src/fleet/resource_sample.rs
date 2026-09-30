@@ -733,7 +733,42 @@ struct MemoryStatus {
 
 /// Both memory pairs in bytes, from ONE OS call. `None` when the call fails —
 /// callers fail OPEN.
+///
+/// Every successful reading is also handed to
+/// `qontinui_runner_lib::util::resource_exhaustion::note_memory_reading`, so
+/// the allocation-failure breadcrumb — which runs inside a failing allocator
+/// and may not call the OS or allocate — can report the last reading this
+/// runner took (plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0). Zero extra syscalls: it records what the spawn gate and the
+/// publisher were reading anyway.
 fn memory_status() -> Option<MemoryStatus> {
+    let m = read_memory_status()?;
+    qontinui_runner_lib::util::resource_exhaustion::note_memory_reading(m.into());
+    Some(m)
+}
+
+impl From<MemoryStatus> for qontinui_runner_lib::util::resource_exhaustion::MemoryReading {
+    fn from(m: MemoryStatus) -> Self {
+        Self {
+            free_commit: m.commit_available,
+            commit_limit: m.commit_total,
+            free_phys: m.phys_available,
+        }
+    }
+}
+
+/// A live reading in the shape the spawn-failure classifier's edge event
+/// carries — registered with
+/// `resource_exhaustion::register_memory_reader` at startup, because the lib
+/// cannot name this bin-only module. Reading it also refreshes the cache.
+pub(crate) fn exhaustion_memory_reading(
+) -> Option<qontinui_runner_lib::util::resource_exhaustion::MemoryReading> {
+    memory_status().map(Into::into)
+}
+
+/// The OS call behind [`memory_status`].
+fn read_memory_status() -> Option<MemoryStatus> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};

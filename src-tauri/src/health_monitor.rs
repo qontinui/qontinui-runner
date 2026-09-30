@@ -1042,14 +1042,22 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 
 /// Append one line to `wedge-incidents.log`.
 ///
-/// **The single writer for that file.** Every rung with an incident worth
-/// surviving the process goes through here: the backend and UI-thread wedge
-/// detectors in this module, `webview_recovery`'s latched-recovery report
-/// (`recovery_wedged`), and `coord_outside_observer`'s four coord-liveness
-/// classes (`coord_unreachable`, `coord_worker_dead`, `coord_no_leader`,
-/// `coord_liveness_unknown` — plan
+/// **The single writer for that file — with one deliberate exception.** Every
+/// rung with an incident worth surviving the process goes through here: the
+/// backend and UI-thread wedge detectors in this module, `webview_recovery`'s
+/// latched-recovery report (`recovery_wedged`), and `coord_outside_observer`'s
+/// four coord-liveness classes (`coord_unreachable`, `coord_worker_dead`,
+/// `coord_no_leader`, `coord_liveness_unknown` — plan
 /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
-/// Phase 3b). A second incident file would be one more observability
+/// Phase 3b).
+///
+/// The exception is `qontinui_runner_lib::alloc_breadcrumb`, which writes the
+/// SAME line format (tokens `alloc_failure`, `commit_exhaustion`,
+/// `resource_exhaustion`) through a handle it opened at startup. It cannot come
+/// through here: its `alloc_failure` line is written from inside a failing
+/// allocator, and this function allocates (`format!`, `chrono`). Plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0. A second incident file would be one more observability
 /// channel nobody greps — and this one is already the first thing to read after
 /// an unexplained outage, because `runner-lifecycle.log` is truncated at every
 /// startup.
@@ -1223,8 +1231,10 @@ fn watchdog_heartbeat_path(dir: &Path) -> PathBuf {
 }
 
 /// Path of the append-only incident log (shared with the monitor's own
-/// breadcrumb, so one file answers "what happened to this runner").
-fn wedge_incidents_path(dir: &Path) -> PathBuf {
+/// breadcrumb, so one file answers "what happened to this runner"). Also
+/// handed to `alloc_breadcrumb::install` at startup and read back by the
+/// next boot's crash harvest (`crash_observability`).
+pub(crate) fn wedge_incidents_path(dir: &Path) -> PathBuf {
     dir.join("wedge-incidents.log")
 }
 

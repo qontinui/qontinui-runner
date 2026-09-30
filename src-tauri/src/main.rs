@@ -1567,6 +1567,21 @@ fn install_app_runtime() {
     }
 }
 
+/// The process allocator: `std::alloc::System`, observed. On a null return it
+/// writes ONE `alloc_failure` line to `wedge-incidents.log` (through a handle
+/// `crash_observability::install_live_crash_writer` opens) and returns the null
+/// unchanged, so the default handler aborts exactly as before — but the next
+/// boot's harvest can now say the runner died of an allocation failure, with
+/// the last memory reading, instead of `unknown (WER harvest)`. The success
+/// path is one null check. Plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0; see `qontinui_runner_lib::alloc_breadcrumb` for the rules its
+/// failure arm lives by. Registered HERE, in the runner bin only: the lib's
+/// other binaries keep the plain system allocator.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
+    qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
+
 fn main() {
     // The capability manifest (`--capability-manifest[ --json]`,
     // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
