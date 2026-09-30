@@ -744,10 +744,20 @@ gen_events_attribution() {
     # while the untracked listing (which keeps the REAL index, so that a file
     # staged for later does not read as untracked) does not either. So when
     # the hook's index is a different file from the real one, a fifth source,
-    # `staged-later`, reads `git diff --cached HEAD` against the REAL index,
-    # minus paths already labelled `staged`. The union is then at least what
-    # one `git diff HEAD` plus `ls-files --others` saw before the hook index
-    # was honoured, and the verdict cannot move toward clearing.
+    # `staged-later`, reads `git diff --cached --ita-visible-in-index HEAD`
+    # against the REAL index, minus paths already labelled `staged`. The
+    # union is then at least what one `git diff HEAD` plus `ls-files
+    # --others` saw before the hook index was honoured, and the verdict cannot
+    # move toward clearing.
+    #
+    # `--ita-visible-in-index` is what makes that true for an intent-to-add
+    # (`git add -N`) input: plain `--cached` hides it, the temporary index
+    # lacks it, and the untracked listing sees it as tracked — so without the
+    # flag `git add -N new.rs; git commit other.txt` read PRE-EXISTING. Only
+    # here: at a plain commit the working-tree diff already reports it, as
+    # "not in this commit" (git does not commit an intent-to-add entry), and
+    # the flag on the `staged` source would call it "staged for this commit",
+    # which is false.
     local index_env=() staged_later=0
     if [ -n "${GEN_EVENTS_HOOK_INDEX_FILE:-}" ] && [ -n "${GEN_EVENTS_HOOK_GIT_DIR:-}" ] \
        && [ "$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" = "$GEN_EVENTS_HOOK_GIT_DIR" ]; then
@@ -783,7 +793,7 @@ gen_events_attribution() {
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"; return 0; } ;;
             staged-later)
                 [ "$staged_later" = "1" ] || continue
-                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached --ita-visible-in-index HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD against the real index failed, so inputs staged for a later commit could not be read"; return 0; } ;;
         esac
