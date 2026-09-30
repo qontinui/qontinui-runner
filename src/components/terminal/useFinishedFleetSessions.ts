@@ -14,6 +14,12 @@ import { walkFinishedFleetSessions, type FinishedFleetRead } from "./remoteSessi
  * Every row is re-checked against its own `sessionStatus`
  * (`walkFinishedFleetSessions`), because a coord predating the filter ignores
  * the parameter and serves every session.
+ *
+ * The read is `unavailable` — never a candidate list — when coord does not
+ * name this runner's device (`callerDeviceId` null) or cannot read the device
+ * identity columns: the bulk end must never be able to reach a LOCAL session,
+ * and without both it cannot tell one from a remote one. An `ok` read carries
+ * the `callerDeviceId` that `closeAllFinishedCandidates` excludes by.
  */
 export function useFinishedFleetSessions(): {
   read: FinishedFleetRead;

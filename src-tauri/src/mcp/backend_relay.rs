@@ -1962,7 +1962,7 @@ async fn handle_inbound<S>(
                     // closes the remote terminal it announced
                     // (`deliver_create_reply`), and a full reply lane ends the
                     // connection through `end_connection`.
-                    if runs_off_read_loop(msg_type) {
+                    if runs_off_read_loop(msg_type, &data) {
                         let api_state = api_state.clone();
                         let writer = writer.clone();
                         let end_connection = end_connection.clone();
@@ -4647,8 +4647,27 @@ const REMOTE_CREATE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// remote create and otherwise only sends.
 const SPAWNED_OFF_READ_LOOP: &[&str] = &["terminal_create", "terminal_end"];
 
-fn runs_off_read_loop(msg_type: &str) -> bool {
-    SPAWNED_OFF_READ_LOOP.contains(&msg_type)
+/// Does this inbound frame run in its own task?
+///
+/// Decided on the OPERATION, not the outer `type`: a carrier such as
+/// `{"type":"terminal","subtype":"terminal_end","payload":{…}}` dispatches to
+/// the very same `terminal_end` arm, so keyed on `type` alone it waited out a
+/// 60 s graceful end ON the read loop. A carrier is resolved through
+/// [`route_relay_frame`] — the same unwrapping `handle_relay_command` applies,
+/// so the two can never disagree about what a frame is. A frame that routing
+/// refuses dispatches nothing slow, and stays inline. Non-carrier frames skip
+/// the routing (and its clone) entirely: this runs for every inbound frame.
+fn runs_off_read_loop(msg_type: &str, data: &Value) -> bool {
+    if SPAWNED_OFF_READ_LOOP.contains(&msg_type) {
+        return true;
+    }
+    if !REMOTE_ENVELOPE_TYPES.contains(&msg_type) {
+        return false;
+    }
+    match route_relay_frame(msg_type, data) {
+        RelayRoute::Dispatch { msg_type, .. } => SPAWNED_OFF_READ_LOOP.contains(&msg_type.as_str()),
+        RelayRoute::Refuse(_) => false,
+    }
 }
 
 /// Send a spawned `terminal_create`'s reply, and deal with a reply that cannot
@@ -5413,8 +5432,8 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
 /// `remote_terminal_exit`), and that this handler does not duplicate.
 async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     use crate::mcp::remote_terminal::{
-        admit_terminal_end, execute_terminal_end, grants, now_epoch_secs, terminal_ended_frame,
-        AdmittedEnd, EndOutcome, EndVerdict,
+        admit_terminal_end, end_slots, execute_terminal_end, grants, now_epoch_secs,
+        single_flight_end, terminal_ended_frame, AdmittedEnd, EndOutcome, EndVerdict,
     };
     let Some(tm) = api_state
         .app_handle
@@ -5514,23 +5533,28 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
     let graceful_id = terminal_id.clone();
     let close_tm = tm.clone();
     let close_id = terminal_id.clone();
-    let verdict = execute_terminal_end(
-        force,
-        move || async move {
-            graceful_tm
-                .graceful_exit(
-                    &graceful_id,
-                    crate::terminal::graceful_exit::DEFAULT_DEADLINE,
-                )
-                .await
-        },
-        move || async move {
-            match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
-                Ok(result) => result,
-                Err(e) => Err(format!("close task failed: {e}")),
-            }
-        },
-    )
+    // Single-flight per terminal: a second end while this one's driver runs is
+    // answered `refused` / `end_already_running` and starts nothing. The slot
+    // is guard-held, so it is freed on every path this leaves by, panic too.
+    let verdict = single_flight_end(end_slots(), &terminal_id, move || {
+        execute_terminal_end(
+            force,
+            move || async move {
+                graceful_tm
+                    .graceful_exit(
+                        &graceful_id,
+                        crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+                    )
+                    .await
+            },
+            move || async move {
+                match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
+                    Ok(result) => result,
+                    Err(e) => Err(format!("close task failed: {e}")),
+                }
+            },
+        )
+    })
     .await;
     info!(
         grant_jti = %grant.grant_jti,
@@ -8169,15 +8193,16 @@ mod relay_routing_tests {
     /// loop consults AND on the read loop consulting it.
     #[test]
     fn a_graceful_end_never_runs_on_the_serial_read_loop() {
-        assert!(super::runs_off_read_loop("terminal_end"));
-        assert!(super::runs_off_read_loop("terminal_create"));
+        let bare = serde_json::json!({});
+        assert!(super::runs_off_read_loop("terminal_end", &bare));
+        assert!(super::runs_off_read_loop("terminal_create", &bare));
         for inline in [
             "terminal_input",
             "terminal_attach",
             "terminal_close",
             "heartbeat",
         ] {
-            assert!(!super::runs_off_read_loop(inline), "{inline}");
+            assert!(!super::runs_off_read_loop(inline, &bare), "{inline}");
         }
         const SRC: &str = include_str!("backend_relay.rs");
         let read_loop = SRC
@@ -8185,7 +8210,7 @@ mod relay_routing_tests {
             .expect("read loop not found");
         let body = SRC.get(read_loop..).expect("char boundary");
         let spawn_site = body
-            .find("if runs_off_read_loop(msg_type) {")
+            .find("if runs_off_read_loop(msg_type, &data) {")
             .expect("the read loop must consult runs_off_read_loop");
         let inline_site = body
             .find("let response = handle_relay_command(&api_state, msg_type, &data).await;")
@@ -8194,6 +8219,56 @@ mod relay_routing_tests {
             spawn_site < inline_site,
             "the spawn branch must be decided BEFORE the inline dispatch"
         );
+    }
+
+    /// A `terminal_end` carried in a `terminal` envelope dispatches to the same
+    /// 60 s graceful-end arm, so it must run off the read loop exactly like the
+    /// bare frame — the predicate decides on the operation, not the carrier.
+    #[test]
+    fn an_enveloped_terminal_end_also_runs_off_the_read_loop() {
+        let remote = serde_json::json!({
+            "grant_jti": "j1",
+            "source_device_id": "src",
+            "kind": "attach",
+        });
+        let enveloped = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "payload": { "request_id": "r1", "force": false, "remote": remote },
+        });
+        assert!(super::runs_off_read_loop("terminal", &enveloped));
+        // Envelope-level remote block, carried down by routing.
+        let outer_block = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "remote": remote,
+            "payload": { "request_id": "r1" },
+        });
+        assert!(super::runs_off_read_loop("terminal", &outer_block));
+        // Two levels deep.
+        let nested = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal",
+            "payload": enveloped,
+        });
+        assert!(super::runs_off_read_loop("terminal", &nested));
+        // Other carriers of fast operations stay inline.
+        let input = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "payload": { "terminal_id": "t", "data": "x" },
+        });
+        assert!(!super::runs_off_read_loop("terminal", &input));
+        let chat = serde_json::json!({ "type": "chat", "subtype": "chat_message", "payload": {} });
+        assert!(!super::runs_off_read_loop("chat", &chat));
+        // A refused envelope dispatches nothing slow.
+        let disagreeing = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "remote": remote,
+            "payload": { "remote": { "grant_jti": "other", "source_device_id": "src" } },
+        });
+        assert!(!super::runs_off_read_loop("terminal", &disagreeing));
     }
 
     /// The relay's `remote_terminal_ended` — rebuilt from the target's

@@ -1357,6 +1357,91 @@ where
     }
 }
 
+/// The `reason` a second concurrent `terminal_end` on one terminal answers with.
+pub const END_ALREADY_RUNNING: &str = "end_already_running";
+
+/// Per-terminal single-flight for `terminal_end` (TARGET role).
+///
+/// Each `terminal_end` runs in its own task (`runs_off_read_loop`), so two ends
+/// for one terminal — a double click, a retry after a source-side timeout, a
+/// bulk close overlapping a tab's own end — would otherwise drive two
+/// `graceful_exit`s (two `/exit`s typed, two deadlines, two closes racing) at
+/// the same PTY. The second is answered `refused` / [`END_ALREADY_RUNNING`]
+/// instead, and never starts a driver. The slot is held by an
+/// [`EndSlotGuard`], so it is released on every path the first end leaves by
+/// — reply, error, and panic unwinding alike.
+#[derive(Debug, Default)]
+pub struct EndSlots {
+    running: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Holds one terminal's end slot; dropping it frees the slot.
+#[derive(Debug)]
+pub struct EndSlotGuard<'a> {
+    slots: &'a EndSlots,
+    terminal_id: String,
+}
+
+impl EndSlots {
+    fn running(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        // A panic while the set was held cannot leave it half-written (every
+        // mutation is one insert/remove), so a poisoned lock is still sound.
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take `terminal_id`'s slot, or `None` when an end already holds it.
+    pub fn try_acquire(&self, terminal_id: &str) -> Option<EndSlotGuard<'_>> {
+        if !self.running().insert(terminal_id.to_string()) {
+            return None;
+        }
+        Some(EndSlotGuard {
+            slots: self,
+            terminal_id: terminal_id.to_string(),
+        })
+    }
+
+    /// Whether an end currently holds `terminal_id`'s slot.
+    pub fn is_running(&self, terminal_id: &str) -> bool {
+        self.running().contains(terminal_id)
+    }
+}
+
+impl Drop for EndSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.slots.running().remove(&self.terminal_id);
+    }
+}
+
+/// The process-wide end slots `handle_terminal_end` single-flights through.
+pub fn end_slots() -> &'static EndSlots {
+    static SLOTS: OnceLock<EndSlots> = OnceLock::new();
+    SLOTS.get_or_init(EndSlots::default)
+}
+
+/// Run `drive` (the end's driver — `execute_terminal_end`) only if no other
+/// end holds `terminal_id`'s slot; otherwise answer `refused` /
+/// [`END_ALREADY_RUNNING`] without calling it. The slot is held across the
+/// whole `drive` future and freed by the guard however it finishes.
+pub async fn single_flight_end<D, DF>(slots: &EndSlots, terminal_id: &str, drive: D) -> EndVerdict
+where
+    D: FnOnce() -> DF,
+    DF: std::future::Future<Output = EndVerdict>,
+{
+    let Some(_slot) = slots.try_acquire(terminal_id) else {
+        return EndVerdict::new(
+            EndOutcome::Refused,
+            None,
+            Some(format!(
+                "{END_ALREADY_RUNNING}: an end for terminal {terminal_id} is already running \
+                 on this device"
+            )),
+        );
+    };
+    drive().await
+}
+
 /// The target's `terminal_ended` reply. Echoes the frame's `request_id` and
 /// `remote` block (plus a top-level `grant_jti`) — the keys the relay
 /// correlates a target reply by, exactly as `terminal_attached` carries them.
@@ -2436,6 +2521,22 @@ type PendingAttach = oneshot::Sender<Result<AttachedReply, AttachError>>;
 type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
 type PendingEnd = oneshot::Sender<EndReply>;
 
+/// Drop guard for one `pending_end` entry — see [`RemoteAttachClient::end`].
+struct PendingEndGuard<'a> {
+    pending: &'a Mutex<HashMap<String, PendingEnd>>,
+    request_id: String,
+}
+
+impl Drop for PendingEndGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.remove(&self.request_id);
+    }
+}
+
 /// How long a remote end waits for `remote_terminal_ended`.
 ///
 /// The top rung of a fixed ladder (plan
@@ -2866,6 +2967,16 @@ impl RemoteAttachClient {
         if let Ok(mut pending) = self.pending_end.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        // Removes the waiter on EVERY exit, including the one no `return`
+        // spells: this future being DROPPED before it settles (the HTTP caller
+        // of `/ui-bridge/tauri/invoke` disconnecting). Without it the entry
+        // outlived its only reader until the next reconnect drained the map.
+        // Removal is by a fresh uuid, so it never touches another end's slot,
+        // and after a reply it is a no-op (the inbound arm already took it).
+        let _waiter = PendingEndGuard {
+            pending: &self.pending_end,
+            request_id: request_id.clone(),
+        };
         // See `attach`: an unheld pump means the frame would never be sent.
         if !self.outbound_pump_state().0 {
             self.take_pending_end(&request_id);
@@ -4896,6 +5007,98 @@ mod tests {
         );
     }
 
+    /// Two concurrent ends on ONE terminal: the second is refused
+    /// `end_already_running` and never starts a driver; the first proceeds and
+    /// its slot is released when it finishes.
+    #[tokio::test]
+    async fn a_second_concurrent_end_on_one_terminal_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(EndSlots::default());
+        let drivers = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+
+        let first = {
+            let slots = slots.clone();
+            let drivers = drivers.clone();
+            tokio::spawn(async move {
+                single_flight_end(&slots, "term-A", || async move {
+                    drivers.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    EndVerdict::new(EndOutcome::Ended, Some("graceful"), None)
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("first end started");
+        assert!(slots.is_running("term-A"));
+
+        let second = single_flight_end(&slots, "term-A", || {
+            let drivers = drivers.clone();
+            async move {
+                drivers.fetch_add(1, Ordering::SeqCst);
+                EndVerdict::new(EndOutcome::Ended, Some("graceful"), None)
+            }
+        })
+        .await;
+        assert_eq!(second.outcome, EndOutcome::Refused);
+        assert!(second
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with(END_ALREADY_RUNNING));
+        assert_eq!(drivers.load(Ordering::SeqCst), 1, "no second driver");
+
+        // A different terminal is not blocked by term-A's end.
+        let other = single_flight_end(&slots, "term-B", || async {
+            EndVerdict::new(EndOutcome::Ended, Some("force"), None)
+        })
+        .await;
+        assert_eq!(other.outcome, EndOutcome::Ended);
+
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        assert_eq!(first.outcome, EndOutcome::Ended);
+        assert!(!slots.is_running("term-A"), "slot released after the end");
+
+        // And a later end on the same terminal runs again.
+        let again = single_flight_end(&slots, "term-A", || async {
+            EndVerdict::new(EndOutcome::NotFound, None, None)
+        })
+        .await;
+        assert_eq!(again.outcome, EndOutcome::NotFound);
+    }
+
+    /// A driver that panics (or whose task is cancelled) still frees the slot:
+    /// the guard is released by unwinding, not by a reply path.
+    #[tokio::test]
+    async fn a_panicking_end_releases_its_slot() {
+        let slots = Arc::new(EndSlots::default());
+        let s = slots.clone();
+        let panicked = tokio::spawn(async move {
+            single_flight_end(&s, "term-P", || async {
+                panic!("driver blew up");
+            })
+            .await
+        })
+        .await;
+        assert!(panicked.unwrap_err().is_panic());
+        assert!(!slots.is_running("term-P"));
+
+        let s = slots.clone();
+        let parked = tokio::spawn(async move {
+            single_flight_end(&s, "term-C", std::future::pending::<EndVerdict>).await
+        });
+        tokio::task::yield_now().await;
+        while !slots.is_running("term-C") {
+            tokio::task::yield_now().await;
+        }
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+        assert!(!slots.is_running("term-C"));
+    }
+
     #[test]
     fn terminal_ended_frame_carries_the_contract_fields() {
         let frame = end_frame(
@@ -4997,6 +5200,33 @@ mod tests {
         assert_eq!(reply.via.as_deref(), Some("force"));
         assert_eq!(reply.terminal_id.as_deref(), Some("remote-term"));
         assert!(client.pending_end.lock().unwrap().is_empty());
+    }
+
+    /// A caller that goes away (the `/ui-bridge/tauri/invoke` HTTP client
+    /// disconnecting) DROPS the `end` future mid-wait. Its waiter must go with
+    /// it, not sit in `pending_end` until the next reconnect.
+    #[tokio::test]
+    async fn a_dropped_end_future_leaves_no_waiter_behind() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Fresh { grant: "g" },
+                false,
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        // The frame was sent, so the waiter is registered and parked.
+        let _sent = pump.recv().await.expect("frame sent");
+        assert_eq!(client.pending_end.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            client.pending_end.lock().unwrap().is_empty(),
+            "a dropped end must not leak its pending_end entry"
+        );
     }
 
     #[tokio::test]

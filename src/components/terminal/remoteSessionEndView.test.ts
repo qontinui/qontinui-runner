@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 
 import {
+  CALLER_DEVICE_CHANGED_MESSAGE,
+  CALLER_DEVICE_COLUMNS_UNAVAILABLE_MESSAGE,
+  CALLER_DEVICE_UNKNOWN_MESSAGE,
   closeAllFinishedCandidates,
   closeAllFinishedLabel,
   describeEndResult,
@@ -169,10 +172,28 @@ describe("closeAllFinishedCandidates — N counts REMOTE finished sessions only"
   ];
 
   it("excludes this device, non-finished, closed, unaddressable and already-ended rows", () => {
-    const ids = closeAllFinishedCandidates(sessions, new Set(["remote-ended-here"])).map(
-      (s) => s.sessionId,
-    );
+    const ids = closeAllFinishedCandidates(
+      sessions,
+      new Set(["remote-ended-here"]),
+      "dev-local",
+    ).map((s) => s.sessionId);
     expect(ids).toEqual(["remote-finished", "remote-done"]);
+  });
+
+  it("excludes a row on the caller's device even when coord says isCallerDevice: false", () => {
+    const rows = [
+      row({ sessionId: "remote-finished" }),
+      row({ sessionId: "mislabelled-local", deviceId: "dev-local", isCallerDevice: false }),
+      row({ sessionId: "padded-local", deviceId: " dev-local ", isCallerDevice: false }),
+    ];
+    const ids = closeAllFinishedCandidates(rows, new Set(), "dev-local").map((s) => s.sessionId);
+    expect(ids).toEqual(["remote-finished"]);
+  });
+
+  it("offers nothing when the caller device is unknown", () => {
+    for (const caller of [null, undefined, "", "  "]) {
+      expect(closeAllFinishedCandidates(sessions, new Set(), caller)).toEqual([]);
+    }
   });
 });
 
@@ -232,6 +253,43 @@ describe("walkFinishedFleetSessions", () => {
       page([row({ sessionId: "x", sessionStatus: null })], { workAxisColumnsPresent: false });
     const read = await walkFinishedFleetSessions(fetch);
     expect(read.kind).toBe("unavailable");
+  });
+
+  it("an ok read carries the caller device it was read as", async () => {
+    const read = await walkFinishedFleetSessions(async () => page([row({ sessionId: "a" })]));
+    expect(read.kind === "ok" && read.callerDeviceId).toBe("dev-local");
+  });
+
+  it("an unknown caller device is unavailable, never candidates", async () => {
+    for (const callerDeviceId of [null, "", "  "]) {
+      const read = await walkFinishedFleetSessions(async () =>
+        page([row({ sessionId: "a" })], { callerDeviceId }),
+      );
+      expect(read.kind).toBe("unavailable");
+      expect(closeAllFinishedLabel(read, 0)).toBe("Close all finished (unavailable)");
+      if (read.kind === "unavailable") expect(read.message).toBe(CALLER_DEVICE_UNKNOWN_MESSAGE);
+    }
+  });
+
+  it("degraded device identity columns are unavailable, never candidates", async () => {
+    const read = await walkFinishedFleetSessions(async () =>
+      page([row({ sessionId: "a" })], { deviceIdentityColumnsPresent: false }),
+    );
+    expect(read.kind).toBe("unavailable");
+    expect(closeAllFinishedLabel(read, 0)).toBe("Close all finished (unavailable)");
+    if (read.kind === "unavailable") {
+      expect(read.message).toBe(CALLER_DEVICE_COLUMNS_UNAVAILABLE_MESSAGE);
+    }
+  });
+
+  it("a later page that names a different caller device is unavailable", async () => {
+    const read = await walkFinishedFleetSessions(async ({ cursor }) =>
+      cursor === null
+        ? page([row({ sessionId: "a" })], { nextCursor: "c1" })
+        : page([row({ sessionId: "b" })], { callerDeviceId: "dev-other" }),
+    );
+    expect(read.kind).toBe("unavailable");
+    if (read.kind === "unavailable") expect(read.message).toBe(CALLER_DEVICE_CHANGED_MESSAGE);
   });
 
   it("a transport failure is an error with no number", async () => {
@@ -330,7 +388,9 @@ describe("wiring", () => {
   it("the bulk confirm re-reads first and runs over exactly the list it showed", () => {
     const picker = read("./FleetSessionPicker.tsx");
     expect(picker).toContain("const read = await refreshFinished();");
-    expect(picker).toContain("closeAllFinishedCandidates(read.sessions, endedHere)");
+    expect(picker).toMatch(
+      /closeAllFinishedCandidates\(\s*read\.sessions,\s*endedHere,\s*read\.callerDeviceId,?\s*\)/,
+    );
     const dialog = read("./CloseAllFinishedDialog.tsx");
     // The run iterates the `items` prop — no fetch inside the dialog.
     expect(dialog).toContain("await runBounded(\n      items,");
