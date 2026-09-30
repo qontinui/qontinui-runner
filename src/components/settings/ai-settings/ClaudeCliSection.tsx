@@ -785,6 +785,31 @@ export function ClaudeCliSection({
                   </div>
                 </button>
               </div>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.claude_cli.account_selection_pinned ?? false}
+                  onChange={(e) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      claude_cli: {
+                        ...prev.claude_cli,
+                        account_selection_pinned: e.target.checked,
+                      },
+                    }))
+                  }
+                  className="mt-0.5 accent-primary"
+                />
+                <span>
+                  <span className="text-xs font-medium block">
+                    Pin this machine&apos;s selection mode (ignore fleet policy)
+                  </span>
+                  <span className="text-[10px] text-muted-foreground block">
+                    When unpinned, a fleet-wide account selection mode set by the operator overrides
+                    the mode chosen here. Applies to every runner on this machine.
+                  </span>
+                </span>
+              </label>
             </div>
           )}
 

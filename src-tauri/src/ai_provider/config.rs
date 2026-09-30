@@ -193,7 +193,17 @@ impl std::fmt::Display for ClaudeConfigDirSource {
 pub fn get_effective_config_dir(
     cli_settings: &settings::ClaudeCliSettings,
 ) -> (Option<String>, ClaudeConfigDirSource) {
-    let (candidate, source) = match cli_settings.account_selection_mode {
+    // The EFFECTIVE mode, not the raw field: a locally-`manual`, UNPINNED
+    // machine under a fleet auto mode has the picker rotate
+    // (`pick_best_account` reads the same resolver), and matching the raw
+    // field here would discard that pick and spawn on the manual `config_dir`
+    // — the fleet value would half-apply. Resolved off `cli_settings` itself —
+    // callers hand in a roster-overlaid settings document (normally
+    // `get_ai_settings().claude_cli`, the same source `effective_selection_mode`
+    // reads) — so the mode and its pin come from the document this function
+    // was given.
+    let mode = crate::claude_accounts::resolve_for_cli_settings(cli_settings);
+    let (candidate, source) = match mode {
         // Both auto modes (`LeastUsage` and `HighestExpectedUsage`) pin their
         // choice via the same `RESOLVED_CONFIG_DIR` set by `pick_best_account`
         // — the source names predate `HighestExpectedUsage` but still apply:
@@ -832,6 +842,10 @@ mod tests {
     /// test in this crate. The arms exercised here touch no shared state.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
+        // The mode is resolved against the process-global fleet cache; pin it
+        // to "no fleet opinion" so a concurrently running poller test cannot
+        // turn these `Manual` fixtures into an auto mode.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let unconfigured = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
             config_dir: None,
@@ -862,6 +876,7 @@ mod tests {
     /// happen.
     #[test]
     fn effective_config_dir_override_is_verbatim_and_names_itself() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let cli = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
             config_dir: Some("/configured/but/ignored".to_string()),
