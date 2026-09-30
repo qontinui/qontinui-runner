@@ -878,7 +878,16 @@ mod tests {
     ///   (`.join("src/x.rs")`, `.join("src").join("x.rs")`) or a
     ///   `concat!(env!(…), "/src/x.rs")` — is an offender, whatever wraps it
     ///   later: the read and the cut belong in one call, `read_own`.
-    ///   Limitation: a path built with `format!` is not resolved.
+    ///   Limitation — these self-path spellings are NOT resolved and pass
+    ///   silently: a path built with `format!`; a path split across
+    ///   statements (`let root = Path::new(env!(…)); … root.join("src/x.rs")`);
+    ///   a path held in a const or variable (`.join(SELF_REL)`);
+    ///   `std::env::var("CARGO_MANIFEST_DIR")` read at test run time; a bare
+    ///   `include_bytes!("x.rs")` (only `include_str!` is scanned); a
+    ///   statement with no `;` before the next item (a tail expression), whose
+    ///   `.join` chain can run on into the next function; and a `.join` after a
+    ///   `concat!(…)` root. None has a site today; widen the scan before
+    ///   introducing one.
     fn scan_self_reads(
         path: &std::path::Path,
         text: &str,
