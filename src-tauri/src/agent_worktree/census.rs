@@ -2853,17 +2853,7 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
     }
     let sample = publish_volume_sample(volumes);
     warn_on_low_disk_throttled(&sample.volumes);
-    // Shared cargo target lock state rides the same device-level tick. It
-    // reads `/proc`, so like the mount probe it runs on the blocking pool; a
-    // failed task is UNKNOWN (`None` → field omitted), never an empty list.
-    let cargo_locks = match spawn_blocking_tracked(super::cargo_locks::probe_current).await {
-        Ok(locks) => locks,
-        Err(e) => {
-            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
-            None
-        }
-    };
-    post_volumes_to_coord(sample.volumes.clone(), cargo_locks).await;
+    post_volumes_to_coord(sample.volumes.clone()).await;
     Some(sample)
 }
 
@@ -2956,10 +2946,7 @@ fn volume_poster_needs_rebuild(prev: Option<&VolumePosterKey>, next: &VolumePost
 /// keyed on the resolved identity + coord base so an active-profile switch
 /// still rebuilds it and `resolve_dest` stays the one place the
 /// secondary-instance identity guard is enforced.
-async fn post_volumes_to_coord(
-    volumes: Vec<VolumeReport>,
-    cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
-) {
+async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     // Held across the resolution await: there is exactly one publisher task,
     // so this serializes nothing that was ever concurrent, and it keeps the
     // cache read and its refresh atomic.
@@ -2986,7 +2973,44 @@ async fn post_volumes_to_coord(
     let Some(cached) = guard.as_mut() else {
         return;
     };
+    // Nothing will be sent (coord unconfigured, or a secondary instance): skip
+    // the `/proc` probe entirely rather than measure for nobody.
+    if cached.poster.dest.is_none() {
+        return;
+    }
+    let cargo_locks = probe_cargo_locks().await;
     cached.poster.post_volumes(volumes, cargo_locks).await;
+}
+
+/// Upper bound on the shared-target lock probe. It reads `/proc` and, on an
+/// unconfirmed holder, scans `/proc/*/fd` — normally milliseconds, but a
+/// saturated box must not stall the volume POST behind it.
+const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared cargo target lock state for this tick
+/// ([`super::cargo_locks::probe_current`]) on the blocking pool, bounded by
+/// [`CARGO_LOCK_PROBE_TIMEOUT`]. A failed or timed-out probe is UNKNOWN
+/// (`None` → the field is omitted), never an empty list.
+async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
+    match tokio::time::timeout(
+        CARGO_LOCK_PROBE_TIMEOUT,
+        spawn_blocking_tracked(super::cargo_locks::probe_current),
+    )
+    .await
+    {
+        Ok(Ok(locks)) => locks,
+        Ok(Err(e)) => {
+            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
+            None
+        }
+        Err(_) => {
+            debug!(
+                "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN this tick",
+                CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
