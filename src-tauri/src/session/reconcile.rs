@@ -271,7 +271,7 @@ pub fn decide_bind_for_live_pty(
     // The grade follows the EVIDENCE, not the uniqueness gate. With a live
     // anchor the bind is start-filtered and earns `observed` (auto-resume). With
     // no anchor the filter above was a no-op, so "unique in this cwd" is all we
-    // have — the same guess `reconciled` exists to quarantine. Grading it
+    // have — the same guess `reconciled` exists to grade down. Grading it
     // `observed` would let the weakest evidence take the strongest path.
     let correlated_origin = if anchor_start_unix > 0 {
         BindOrigin::Observed
