@@ -5087,6 +5087,13 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         refusal["remote"] = crate::mcp::remote_terminal::remote_echo(data);
                         return Some(refusal);
                     }
+                    // Reap it if no source ever attaches (a reply lost at relay
+                    // teardown). Plan 2026-09-23-remote-create-residuals-…, Phase 1.
+                    crate::mcp::remote_create_reaper::arm_remote_created(
+                        tm.clone(),
+                        &info.id,
+                        terminal["coordSessionId"].as_str().map(str::to_string),
+                    );
                 }
                 let mut frame = serde_json::json!({
                     "type": "terminal_created",
@@ -5295,6 +5302,9 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
             }
         }
     };
+
+    // Bound: this terminal is owned, so the attach-deadline reaper spares it.
+    crate::mcp::remote_create_reaper::mark_attached(&terminal_id);
 
     // A fresh binding starts with an open gate: a stale pause from an earlier
     // attachment under the same grant must not silence the new one. (Phase 5.)
