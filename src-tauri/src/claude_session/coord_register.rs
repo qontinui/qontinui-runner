@@ -1351,9 +1351,12 @@ impl AiCoordRegistrar {
         }
 
         // A `Closed` row carries no body — the drain loop maps it to
-        // `PATCH /sessions/:id {state:"closed"}`, which coord finalizes like
-        // any close (claim release, `closed` event). A 429 is retried; a
-        // missing coord row (404) is ACK-dropped.
+        // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
+        // close (claim release, `closed` event) as of the companion
+        // qontinui-coord change (plan
+        // `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+        // Phase 3), which this depends on. A 429 is retried; a missing coord
+        // row (404) is ACK-dropped.
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
