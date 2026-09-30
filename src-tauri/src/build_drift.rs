@@ -590,10 +590,28 @@ pub async fn run_periodic() {
         crate::resource_guard::ShedPolicy::SkipTick,
     );
     loop {
-        if shed.admit(&crate::resource_guard::background_work_verdict()) {
-            check_and_report().await;
-        }
+        drift_cycle(
+            &mut shed,
+            &crate::resource_guard::background_work_verdict(),
+            check_and_report,
+        )
+        .await;
         tokio::time::sleep(CHECK_INTERVAL).await;
+    }
+}
+
+/// One periodic tick: run `check` only if `shed` admits `verdict`. The verdict
+/// and the check are injected so a test can prove a shed tick reaches no `git`.
+async fn drift_cycle<F, Fut>(
+    shed: &mut crate::resource_guard::BackgroundShed,
+    verdict: &crate::resource_guard::BackgroundWork,
+    check: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if shed.admit(verdict) {
+        check().await;
     }
 }
 
@@ -656,6 +674,49 @@ async fn check_and_report() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 3 (plan 2026-09-23-…-ungated): a drift tick at WARN or CRITICAL
+    /// never runs the check — so never reaches `git_trunk` — and logs the shed
+    /// once; the next `Run` tick checks again with no backoff.
+    #[test]
+    fn drift_cycle_sheds_the_check_at_warn_and_critical() {
+        use crate::resource_guard::{
+            capture_logs, test_skip_verdict, test_throttle_verdict, BackgroundShed, BackgroundWork,
+            ShedPolicy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let checks = AtomicUsize::new(0);
+        let counter = &checks;
+        let check = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed = BackgroundShed::new("build_drift", ShedPolicy::SkipTick);
+                for _ in 0..5 {
+                    drift_cycle(&mut shed, &test_skip_verdict(), check).await;
+                    drift_cycle(&mut shed, &test_throttle_verdict(), check).await;
+                }
+                assert_eq!(
+                    checks.load(Ordering::SeqCst),
+                    0,
+                    "a shed tick checks nothing"
+                );
+                drift_cycle(&mut shed, &BackgroundWork::Run, check).await;
+                assert_eq!(checks.load(Ordering::SeqCst), 1);
+            })
+        });
+        assert_eq!(
+            logs.matches("skipping build_drift's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
 
     #[test]
     fn divergence_is_prefix_match_on_the_12_char_embedded_sha() {

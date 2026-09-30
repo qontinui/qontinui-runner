@@ -934,6 +934,14 @@ struct ExternalScanCache {
 /// one knows nothing and must not overwrite something that was known.
 static EXTERNAL_SCAN_CACHE: StdMutex<Option<ExternalScanCache>> = StdMutex::new(None);
 
+/// Oldest cached enumeration a shed call may still serve.
+///
+/// Past this, a cached list says more about the box as it WAS than as it is —
+/// ten minutes is twenty of the frontend's 30 s polls, enough for sessions to
+/// have started and finished — so a shed call older than this answers UNKNOWN
+/// (`success: false`) rather than a stale count that reads as current.
+const EXTERNAL_SCAN_CACHE_MAX_AGE_MS: i64 = 10 * 60 * 1000;
+
 /// Edge-triggered shed logger for the enumeration — see
 /// [`crate::resource_guard::ShedLog`]. A `static` because the spender is a Tauri
 /// command, not a loop with a frame to own it.
@@ -983,7 +991,8 @@ pub async fn transcript_find_external_processes(
 ///   `stale: true` and the time it was observed. The previous answer, labelled,
 ///   is the honest one; the frontend treats it exactly as it treats "keep the
 ///   last count".
-/// - With nothing cached (a runner that has never finished one), the answer is
+/// - With nothing cached (a runner that has never finished one), or only a
+///   result older than [`EXTERNAL_SCAN_CACHE_MAX_AGE_MS`], the answer is
 ///   `success: false` — UNKNOWN, the same shape a degraded scan produces.
 ///
 /// **Never an empty list.** An empty `processes` reads as "no external Claude
@@ -1011,7 +1020,12 @@ fn external_processes_response(
     );
 
     if shed {
-        let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|c| now_ms - c.observed_at_ms <= EXTERNAL_SCAN_CACHE_MAX_AGE_MS);
         return match cached {
             Some(ExternalScanCache {
                 processes,
@@ -1023,7 +1037,7 @@ fn external_processes_response(
                     .into_iter()
                     .filter(|p| !managed_pids.contains(&p.pid))
                     .collect();
-                let age_s = (chrono::Utc::now().timestamp_millis() - observed_at_ms).max(0) / 1000;
+                let age_s = (now_ms - observed_at_ms).max(0) / 1000;
                 CommandResponse {
                     success: true,
                     message: Some(format!(
@@ -1043,7 +1057,8 @@ fn external_processes_response(
                 success: false,
                 message: Some(
                     "External Claude processes were not enumerated: the scan was skipped under \
-                     memory pressure and no earlier result exists. This is UNKNOWN, not zero."
+                     memory pressure and no result from the last 10 minutes exists. This is \
+                     UNKNOWN, not zero."
                         .to_string(),
                 ),
                 data: None,
@@ -1455,6 +1470,28 @@ mod tests {
         let cache = StdMutex::new(None);
         let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
         let resp = external_processes_response(&test_throttle_verdict(), &[], &cache, &log, |_| {
+            panic!("a shed call must not enumerate")
+        });
+        assert!(!resp.success);
+        assert!(resp.data.is_none());
+        assert!(resp.message.unwrap().contains("UNKNOWN"));
+    }
+
+    /// A cached answer past its maximum age is UNKNOWN, not a stale count.
+    #[test]
+    fn a_cached_answer_older_than_ten_minutes_is_unknown() {
+        use crate::resource_guard::{test_skip_verdict, ShedLog};
+
+        let old = chrono::Utc::now().timestamp_millis() - EXTERNAL_SCAN_CACHE_MAX_AGE_MS - 1_000;
+        let cache = StdMutex::new(Some(ExternalScanCache {
+            processes: vec![transcript::ExternalClaudeProcess {
+                pid: 5,
+                working_directory: None,
+            }],
+            observed_at_ms: old,
+        }));
+        let log = StdMutex::new(ShedLog::new("transcript_wmi_enumeration"));
+        let resp = external_processes_response(&test_skip_verdict(), &[], &cache, &log, |_| {
             panic!("a shed call must not enumerate")
         });
         assert!(!resp.success);

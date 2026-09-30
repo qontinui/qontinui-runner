@@ -1091,11 +1091,12 @@ pub(crate) async fn session_commit_state_inner(
     //
     // RT-P0: this probe fires from `dispatcher::auto_register_file` (every
     // Edit/Write hook) and from `transcript_watcher::tail_session` (every
-    // transcript append that lands rows), debounced only 500 ms and only PER
-    // SESSION — so N concurrent sessions produce up to 2N probes a second. Each
-    // probe runs one timeout-less `git rev-parse --show-toplevel` per touched
-    // directory plus a `git status` and a mid-merge check per repo, all via
-    // `std::process::Command::output()`.
+    // transcript append that lands rows) — through
+    // `emit_commit_state_for_session`, whose per-session pacing, global
+    // in-flight cap and shedding bound how often it runs — and from the
+    // frontend's 30 s `get_session_commit_state` poll. Each probe runs one
+    // `git rev-parse --show-toplevel` per touched directory plus a `git status`
+    // and a mid-merge check per repo.
     //
     // Run inline in this `async fn` (as it was), every one of those subprocess
     // round-trips parked a MAIN-runtime worker for its full duration. With
@@ -1104,12 +1105,12 @@ pub(crate) async fn session_commit_state_inner(
     // socket is still there — and then answering nothing at all, `/health` and
     // `/web-integration/status` included.
     //
-    // A blocking-pool thread is the right home for a subprocess wait. Note the
-    // remaining hazard this does NOT close, documented in
-    // `process_helpers.rs`: an actually-HUNG git (index.lock, a credential
-    // prompt, an unreachable remote) still consumes its thread forever, because
-    // `Command::output()` has no timeout. `process_helpers::run_with_timeout`
-    // is the in-tree remedy for that and these call sites do not use it yet.
+    // A blocking-pool thread is the right home for a subprocess wait. Each of
+    // those `git` calls is bounded: `git_status_subset` runs them through
+    // `process_helpers::run_probe` under its `GIT_TIMEOUT` (20 s PER CALL), so
+    // an actually-hung git (index.lock, a stalled mount) holds this thread for
+    // at most 20 s per call — up to 3–7 calls, i.e. a couple of minutes for a
+    // pathological probe — and then gives it back.
     tokio::task::spawn_blocking(move || commit_state_from_touched_files(files))
         .await
         .map_err(|e| {
@@ -1194,44 +1195,42 @@ fn commit_state_from_touched_files(files: Vec<String>) -> crate::git_status_subs
     }
 }
 
-/// Per-session debounce store for `emit_commit_state_for_session`. 500 ms
-/// window prevents N consecutive `auto_register_file` hooks from firing N
-/// commit-state probes when one batch (e.g. a MultiEdit-equivalent loop in a
-/// single turn) just changed the same set.
-static COMMIT_STATE_DEBOUNCE: once_cell::sync::OnceCell<
-    dashmap::DashMap<String, std::time::Instant>,
-> = once_cell::sync::OnceCell::new();
+/// The minimum interval between two commit-state probes of ONE session, at a
+/// `Run` verdict.
+///
+/// A burst of Edit/Write hooks inside one window collapses into at most one
+/// probe at the window's start and ONE trailing probe at its end (see
+/// [`decide_commit_state_emit`]), so the final state of a burst is always
+/// probed — never dropped on the floor, as the pre-Phase-3 debounce did.
+const COMMIT_STATE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Per-session debounce window for commit-state-changed emits.
-const COMMIT_STATE_DEBOUNCE_MS: u128 = 500;
-
-/// How much longer the per-session debounce is while the background-work
+/// How much longer the per-session window is while the background-work
 /// verdict is THROTTLE (free commit below the warn floor): 500 ms → 5 s.
 ///
 /// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
-/// Phase 3. The debounce is what bounds this spender's RATE (`2N` probes a
-/// second across N sessions at 500 ms); ten times the window is a tenth of the
-/// rate, which on the ~12-session box that aborted takes the commit-state probe
-/// from ~24 a second to ~2.4 — while a session that is actively editing still
-/// gets a fresh badge every five seconds, and the frontend's own 30 s poll
-/// (`useCommitState.ts`) is unchanged underneath it.
-const COMMIT_STATE_THROTTLE_FACTOR: u128 = 10;
+/// Phase 3. The window is what bounds this spender's RATE (`2N` probes a second
+/// across N sessions at 500 ms); ten times the window is a tenth of the rate,
+/// which on the ~12-session box that aborted takes the commit-state probe from
+/// ~24 a second to ~2.4 — while a session that is actively editing still gets a
+/// fresh badge every five seconds (the burst's trailing probe included), and
+/// the frontend's own 30 s poll (`useCommitState.ts`) is unchanged underneath.
+const COMMIT_STATE_THROTTLE_FACTOR: u32 = 10;
 
 /// Global cap on commit-state probes in flight at once, across every session.
 ///
 /// Phase 3 of the same plan: this spender had NO global bound — one
-/// independent `spawn_blocking` per session per emit, each running 3–7 `git`
-/// (each `git` one `CreateProcess` plus two `pipe-drain` threads) and holding a
-/// blocking-pool thread for up to `GIT_TIMEOUT = 20 s`. It is the only spender
-/// whose burst scales with session count, and the measured shape preceding the
-/// commit-exhaustion aborts.
+/// independent `spawn_blocking` per session per emit. A probe is 3–7
+/// sequential `git` calls (each one `CreateProcess` plus two `pipe-drain`
+/// threads), and each call may hold its blocking-pool thread for up to
+/// `GIT_TIMEOUT = 20 s` — so a pathological probe holds its thread for up to
+/// 3–7 × 20 s. It is the only spender whose burst scales with session count,
+/// and the measured shape preceding the commit-exhaustion aborts.
 ///
 /// **Four**, because that is what the work needs and no more: a probe is
 /// sequential `git` calls on one blocking thread, so four in flight is at most
 /// four `git` children and ~12 threads — against a blocking pool of 512 — while
 /// still refreshing four sessions' badges in parallel. A probe that finds the
-/// tracker empty never reaches `git` at all, so the cap only ever queues real
-/// work.
+/// tracker empty never reaches `git` at all.
 ///
 /// **Unconditional, not only at WARN** — the plan asks for the cap at WARN, and
 /// this is strictly stronger. The cap costs a healthy box nothing it would
@@ -1249,101 +1248,209 @@ const COMMIT_STATE_MAX_IN_FLIGHT: usize = 4;
 static COMMIT_STATE_SHED_LOG: std::sync::Mutex<crate::resource_guard::ShedLog> =
     std::sync::Mutex::new(crate::resource_guard::ShedLog::new("git_status_subset"));
 
-/// The global in-flight cap and per-session coalescing for commit-state
-/// probes.
-///
-/// Two structures, two jobs:
+/// The per-session probe window a verdict allows, or `None` at SKIP (do not
+/// probe at all).
+fn commit_state_window(
+    verdict: &crate::resource_guard::BackgroundWork,
+) -> Option<std::time::Duration> {
+    use crate::resource_guard::BackgroundWork;
+    match verdict {
+        BackgroundWork::Run => Some(COMMIT_STATE_WINDOW),
+        BackgroundWork::Throttle(_) => Some(COMMIT_STATE_WINDOW * COMMIT_STATE_THROTTLE_FACTOR),
+        BackgroundWork::Skip(_) => None,
+    }
+}
+
+/// A session's outstanding-driver slot.
+#[derive(Debug, Default, Clone, Copy)]
+struct CommitStateSlot {
+    /// Another request arrived after the current probe STARTED, so the driver
+    /// owes one more probe.
+    rerun: bool,
+    /// At least one of those requests must not be shed (the post-commit
+    /// emit). Sticky until the rerun it caused actually starts.
+    forced: bool,
+}
+
+#[derive(Debug, Default)]
+struct CommitStateBook {
+    /// session id → its driver's slot; present iff a driver is outstanding.
+    slots: std::collections::HashMap<String, CommitStateSlot>,
+    /// session id → when its most recent probe STARTED. The per-session pacing
+    /// clock, shared by a driver's reruns and by the next driver.
+    last_start: std::collections::HashMap<String, std::time::Instant>,
+}
+
+/// The global in-flight cap, per-session coalescing and per-session pacing for
+/// commit-state probes.
 ///
 /// - `permits` bounds how many probes run AT ONCE, across all sessions
 ///   ([`COMMIT_STATE_MAX_IN_FLIGHT`]).
-/// - `outstanding` bounds how many probes a single session can have QUEUED to
-///   one. A session with a driver already outstanding does not spawn a second;
-///   it sets that driver's `rerun` flag instead, and the driver probes once more
-///   after its current probe. Without this, a cap would turn a burst into a
-///   queue that grows with session count × wait time and then replays stale
-///   requests one by one; with it, the queue is at most one entry per session,
-///   and the probe that finally runs reads the tracker as it is THEN — so the
-///   last edit of a burst is never the one lost.
+/// - A session's slot bounds how many probes it can have QUEUED to one. A
+///   session with a driver already outstanding does not spawn a second; it sets
+///   that driver's `rerun` flag instead. Every request that landed before a
+///   probe STARTS is answered by that probe (the flag is cleared at the start),
+///   and one that lands during it earns exactly one more — which reads the
+///   tracker as it is then, so the last edit of a burst is never the one lost.
+///   Without this, a cap would turn a burst into a queue that grows with
+///   session count × wait time and replays stale requests one by one.
+/// - `last_start` paces each session: no two probes of one session start
+///   closer than the verdict's window, reruns included.
 pub(crate) struct CommitStateLimiter {
     permits: tokio::sync::Semaphore,
-    /// session id → "another request arrived while this driver was busy".
-    outstanding: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    book: std::sync::Mutex<CommitStateBook>,
+}
+
+/// Releases a session's slot if its driver unwinds or is cancelled, so a
+/// panicking probe (or a dropped task) can never wedge that session's badge:
+/// with the slot left behind, every later `claim` would coalesce into a driver
+/// that no longer exists. Normal exits release under the book lock themselves
+/// and disarm this.
+struct SlotRelease<'a> {
+    limiter: &'a CommitStateLimiter,
+    session_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for SlotRelease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.limiter.book().slots.remove(self.session_id);
+        }
+    }
 }
 
 impl CommitStateLimiter {
     pub(crate) fn new(max_in_flight: usize) -> Self {
         Self {
             permits: tokio::sync::Semaphore::new(max_in_flight),
-            outstanding: std::sync::Mutex::new(std::collections::HashMap::new()),
+            book: std::sync::Mutex::new(CommitStateBook::default()),
         }
     }
 
+    fn book(&self) -> std::sync::MutexGuard<'_, CommitStateBook> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Claim this session's driver slot. `true` ⇒ the caller must start a
-    /// driver ([`Self::drive`]); `false` ⇒ one is already outstanding and has
-    /// been asked to probe once more when it finishes.
-    pub(crate) fn claim(&self, session_id: &str) -> bool {
-        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
-        match outstanding.get_mut(session_id) {
-            Some(rerun) => {
-                *rerun = true;
+    /// driver ([`Self::drive`]); `false` ⇒ one is already outstanding and now
+    /// owes one more probe. `force` makes that owed probe unsheddable.
+    pub(crate) fn claim(&self, session_id: &str, force: bool) -> bool {
+        let mut book = self.book();
+        match book.slots.get_mut(session_id) {
+            Some(slot) => {
+                slot.rerun = true;
+                slot.forced |= force;
                 false
             }
             None => {
-                outstanding.insert(session_id.to_string(), false);
+                book.slots
+                    .insert(session_id.to_string(), CommitStateSlot::default());
                 true
             }
         }
     }
 
-    /// Run `probe` under a global permit, then once more per coalesced request,
-    /// for as long as `still_admitted()` allows. Always releases the session's
-    /// slot on the way out, so the next [`Self::claim`] starts a fresh driver.
+    /// How long a new driver for this session must wait before its first probe
+    /// so that it starts no sooner than `window` after the previous one did.
+    pub(crate) fn delay_until_due(
+        &self,
+        session_id: &str,
+        window: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let due = *self.book().last_start.get(session_id)? + window;
+        (due > now).then(|| due - now)
+    }
+
+    #[cfg(test)]
+    fn record_start(&self, session_id: &str, at: std::time::Instant) {
+        self.book().last_start.insert(session_id.to_string(), at);
+    }
+
+    /// Wait `initial_delay`, run `probe` under a global permit, then once more
+    /// per coalesced request. Always releases the session's slot on the way
+    /// out — including on unwind or cancellation ([`SlotRelease`]) — so the next
+    /// [`Self::claim`] starts a fresh driver.
     ///
-    /// `still_admitted` is consulted only before a RERUN: the first probe was
-    /// admitted by the caller at the emit head, and a verdict that flips to
-    /// SKIP while a rerun is pending drops that rerun — the badge is then
-    /// refreshed by the next hook, or by the frontend's 30 s poll.
+    /// `pace` is consulted before an unforced RERUN: `None` (SKIP) drops it —
+    /// the badge is then refreshed by the next hook, or by the frontend's 30 s
+    /// poll — and `Some(window)` delays it until `window` after the previous
+    /// probe started. A FORCED rerun is neither shed nor paced.
     pub(crate) async fn drive<P, Fut>(
         &self,
         session_id: &str,
-        mut still_admitted: impl FnMut() -> bool,
+        initial_delay: Option<std::time::Duration>,
+        mut pace: impl FnMut() -> Option<std::time::Duration>,
         mut probe: P,
     ) where
         P: FnMut() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        let mut release = SlotRelease {
+            limiter: self,
+            session_id,
+            armed: true,
+        };
+        if let Some(delay) = initial_delay {
+            tokio::time::sleep(delay).await;
+        }
         loop {
-            // Never closed, so the `Err` arm is unreachable; if it ever were
-            // reached, falling through to release the slot is still correct.
-            if let Ok(_permit) = self.permits.acquire().await {
+            let permit = self.permits.acquire().await;
+            {
+                // Every request that landed before this instant is answered by
+                // the probe about to start.
+                let mut book = self.book();
+                if let Some(slot) = book.slots.get_mut(session_id) {
+                    *slot = CommitStateSlot::default();
+                }
+                book.last_start
+                    .insert(session_id.to_string(), std::time::Instant::now());
+            }
+            // The semaphore is never closed, so `permit` is always `Ok`; if it
+            // ever were not, skipping the probe and releasing is still correct.
+            if permit.is_ok() {
                 probe().await;
             }
-            let pending = {
-                let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
-                let pending = outstanding
-                    .get_mut(session_id)
-                    .map(std::mem::take)
-                    .unwrap_or(false);
-                if !pending {
+            drop(permit);
+
+            let (slot, last_start) = {
+                let mut book = self.book();
+                let slot = book.slots.get(session_id).copied().unwrap_or_default();
+                if !slot.rerun {
                     // Removed under the same lock that read "no rerun", so a
                     // `claim` either lands before (and is seen as a rerun) or
                     // after (and starts a fresh driver) — never in between.
-                    outstanding.remove(session_id);
+                    book.slots.remove(session_id);
                 }
-                pending
+                (slot, book.last_start.get(session_id).copied())
             };
-            if !pending {
+            if !slot.rerun {
+                release.armed = false;
                 return;
             }
-            // Consulted OUTSIDE the lock: the live verdict can read settings
-            // from disk, and `claim` runs on the hook path. A `claim` landing
-            // in this gap only re-sets the flag on a slot still present.
-            if !still_admitted() {
-                self.outstanding
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(session_id);
+            if slot.forced {
+                continue;
+            }
+            // Consulted OUTSIDE the lock: the live verdict can read settings,
+            // and `claim` runs on the hook path. A `claim` landing in this gap
+            // only re-sets flags on a slot that is still present.
+            let Some(window) = pace() else {
+                // Shed — unless a forced claim landed while we asked.
+                let mut book = self.book();
+                if book.slots.get(session_id).is_some_and(|s| s.forced) {
+                    continue;
+                }
+                book.slots.remove(session_id);
+                release.armed = false;
                 return;
+            };
+            if let Some(started) = last_start {
+                let due = started + window;
+                let now = std::time::Instant::now();
+                if due > now {
+                    tokio::time::sleep(due - now).await;
+                }
             }
         }
     }
@@ -1353,6 +1460,40 @@ impl CommitStateLimiter {
 fn commit_state_limiter() -> &'static CommitStateLimiter {
     static LIMITER: std::sync::OnceLock<CommitStateLimiter> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| CommitStateLimiter::new(COMMIT_STATE_MAX_IN_FLIGHT))
+}
+
+/// What one background commit-state emit does.
+#[derive(Debug, PartialEq, Eq)]
+enum EmitDecision {
+    /// SKIP: nothing probed, nothing recorded.
+    Shed,
+    /// A driver is already outstanding and now owes one more probe.
+    Coalesced,
+    /// Start a driver, after this delay (the rest of the session's window).
+    Start(Option<std::time::Duration>),
+}
+
+/// The pure decision behind [`emit_commit_state_for_session`], over an
+/// injected verdict, limiter and clock.
+///
+/// SKIP returns before touching the limiter, so it records no pacing timestamp
+/// and claims no slot: the first trigger after the pressure clears probes
+/// immediately. Otherwise the emit claims the session's slot; a request inside
+/// the window is not DROPPED but deferred to the window's end — one trailing
+/// probe, into which every later request of the burst coalesces.
+fn decide_commit_state_emit(
+    verdict: &crate::resource_guard::BackgroundWork,
+    limiter: &CommitStateLimiter,
+    session_id: &str,
+    now: std::time::Instant,
+) -> EmitDecision {
+    let Some(window) = commit_state_window(verdict) else {
+        return EmitDecision::Shed;
+    };
+    if !limiter.claim(session_id, false) {
+        return EmitDecision::Coalesced;
+    }
+    EmitDecision::Start(limiter.delay_until_due(session_id, window, now))
 }
 
 /// Spawn a fire-and-forget task that probes `session_commit_state_inner` and
@@ -1367,22 +1508,24 @@ fn commit_state_limiter() -> &'static CommitStateLimiter {
 /// `commit_session_progress_inner` (after a commit / no-op return) uses
 /// [`emit_commit_state_after_commit`] instead — see there for why.
 ///
-/// ## Shedding (plan `2026-09-23-…-ungated`, Phase 3)
+/// ## Pacing and shedding (plan `2026-09-23-…-ungated`, Phase 3)
 ///
 /// This is the head of the `git_status_subset` spender, and both triggers pass
 /// through it, so the gate lives here rather than at either call site. Per the
 /// background-work verdict ([`crate::resource_guard::background_work_verdict`]):
 ///
-/// - **Run** (or UNKNOWN reading, or guard disabled): the 500 ms per-session
-///   debounce, as before.
-/// - **Throttle**: the debounce is [`COMMIT_STATE_THROTTLE_FACTOR`]× longer.
-/// - **Skip**: the emit is dropped WITHOUT recording a debounce timestamp, so
-///   the first trigger after the pressure clears probes immediately. A skipped
-///   emit costs a stale badge until that trigger, or the frontend's 30 s poll
-///   (`get_session_commit_state`, which this does not gate) — never a permanent
-///   one.
+/// - **Run** (or UNKNOWN reading, or guard disabled): no two probes of one
+///   session start within [`COMMIT_STATE_WINDOW`] (500 ms).
+/// - **Throttle**: that window is [`COMMIT_STATE_THROTTLE_FACTOR`]× longer.
+/// - **Skip**: nothing is probed and nothing is recorded, so the first trigger
+///   after the pressure clears probes immediately. A skipped emit costs a stale
+///   badge until that trigger, or the frontend's 30 s poll
+///   (`get_session_commit_state`, which this does not gate) — never a
+///   permanent one.
 ///
-/// And at every verdict, the probe runs under the global in-flight cap
+/// Inside a window a request is deferred, not dropped: the burst gets one
+/// trailing probe at the window's end ([`decide_commit_state_emit`]). At every
+/// verdict the probe runs under the global in-flight cap
 /// [`COMMIT_STATE_MAX_IN_FLIGHT`] with per-session coalescing
 /// ([`CommitStateLimiter`]).
 ///
@@ -1407,66 +1550,54 @@ pub fn emit_commit_state_for_session(app_handle: tauri::AppHandle, session_id: S
     use crate::resource_guard::{BackgroundWork, ShedState};
 
     let verdict = crate::resource_guard::background_work_verdict();
-    let (window_ms, state) = match &verdict {
-        BackgroundWork::Run => (COMMIT_STATE_DEBOUNCE_MS, ShedState::Running),
-        BackgroundWork::Throttle(_) => (
-            COMMIT_STATE_DEBOUNCE_MS * COMMIT_STATE_THROTTLE_FACTOR,
-            ShedState::Throttled,
-        ),
-        BackgroundWork::Skip(_) => (0, ShedState::Skipped),
+    let state = match &verdict {
+        BackgroundWork::Run => ShedState::Running,
+        BackgroundWork::Throttle(_) => ShedState::Throttled,
+        BackgroundWork::Skip(_) => ShedState::Skipped,
     };
     COMMIT_STATE_SHED_LOG
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .note(state, &verdict);
-    if state == ShedState::Skipped {
-        return;
-    }
 
-    // Debounce: if this session emitted within the window, drop.
-    let store = COMMIT_STATE_DEBOUNCE.get_or_init(dashmap::DashMap::new);
-    let now = std::time::Instant::now();
-    if let Some(prev) = store.get(&session_id) {
-        if now.duration_since(*prev).as_millis() < window_ms {
-            return;
-        }
+    let limiter = commit_state_limiter();
+    match decide_commit_state_emit(&verdict, limiter, &session_id, std::time::Instant::now()) {
+        EmitDecision::Shed | EmitDecision::Coalesced => {}
+        EmitDecision::Start(delay) => spawn_commit_state_driver(app_handle, session_id, delay),
     }
-    store.insert(session_id.clone(), now);
-
-    spawn_commit_state_driver(app_handle, session_id, true);
 }
 
 /// The post-commit emit: `commit_session_progress_inner` has just cleared the
 /// session's touched-files tracker and wants the badge to flip to `Empty` now,
 /// rather than on the next 30 s frontend poll.
 ///
-/// Not shed and not debounced, because it is the tail of an OPERATOR action
-/// (the commit button) and because it costs no `git` at all: with the tracker
+/// Not shed and not paced, because it is the tail of an OPERATOR action (the
+/// commit button) and because it costs no `git` at all: with the tracker
 /// cleared, `session_commit_state_inner` returns `Empty` from the PG read
 /// before reaching the git probe. Shedding it would buy nothing and leave a
-/// `Dirty` badge on a tree the operator just committed. It still runs under the
-/// global cap and per-session coalescing, so it can never add to a burst.
+/// `Dirty` badge on a tree the operator just committed. When a background
+/// driver is already outstanding it coalesces into it as a FORCED rerun, which
+/// that driver can neither shed nor pace — so it is never lost to a SKIP that
+/// arrives while it waits. It still runs under the global cap, so it can never
+/// add to a burst.
 fn emit_commit_state_after_commit(app_handle: tauri::AppHandle, session_id: String) {
-    spawn_commit_state_driver(app_handle, session_id, false);
+    if commit_state_limiter().claim(&session_id, true) {
+        spawn_commit_state_driver(app_handle, session_id, None);
+    }
 }
 
-/// Start (or coalesce into) the session's commit-state driver. `shed_reruns`
-/// says whether a coalesced RERUN consults the background-work verdict first.
-fn spawn_commit_state_driver(app_handle: tauri::AppHandle, session_id: String, shed_reruns: bool) {
+/// Spawn the session's commit-state driver. The caller has already claimed its
+/// slot.
+fn spawn_commit_state_driver(
+    app_handle: tauri::AppHandle,
+    session_id: String,
+    initial_delay: Option<std::time::Duration>,
+) {
     let limiter = commit_state_limiter();
-    if !limiter.claim(&session_id) {
-        return;
-    }
     tauri::async_runtime::spawn(async move {
-        let still_admitted = || {
-            !shed_reruns
-                || !matches!(
-                    crate::resource_guard::background_work_verdict(),
-                    crate::resource_guard::BackgroundWork::Skip(_)
-                )
-        };
+        let pace = || commit_state_window(&crate::resource_guard::background_work_verdict());
         let probe = || probe_and_emit_commit_state(app_handle.clone(), session_id.clone());
-        limiter.drive(&session_id, still_admitted, probe).await;
+        limiter.drive(&session_id, initial_delay, pace, probe).await;
     });
 }
 
@@ -3848,18 +3979,32 @@ pub mod emergency_quit {
 #[cfg(test)]
 mod commit_state_limiter_tests {
     use super::*;
+    use crate::resource_guard::{test_skip_verdict, test_throttle_verdict, BackgroundWork};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
-    /// A probe that counts itself and holds its permit for `hold_ms`.
-    fn counting_probe(
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    /// A probe that counts itself; the FIRST call signals `started` and then
+    /// holds its permit until `release` fires, so a test can land requests
+    /// while a probe is provably in flight. Later calls return at once.
+    fn gated_probe(
         probes: Arc<AtomicUsize>,
-        hold_ms: u64,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     ) -> impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         move || {
-            let probes = probes.clone();
+            let (probes, started, release) = (probes.clone(), started.clone(), release.clone());
             Box::pin(async move {
-                probes.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+                if probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
             })
         }
     }
@@ -3885,7 +4030,10 @@ mod commit_state_limiter_tests {
             let mut drivers = Vec::new();
             for i in 0..SESSIONS {
                 let session = format!("session-{i}");
-                assert!(limiter.claim(&session), "a fresh session starts a driver");
+                assert!(
+                    limiter.claim(&session, false),
+                    "a fresh session starts a driver"
+                );
                 let limiter = limiter.clone();
                 let (in_flight, peak, probed) = (in_flight.clone(), peak.clone(), probed.clone());
                 drivers.push(tokio::spawn(async move {
@@ -3895,12 +4043,14 @@ mod commit_state_limiter_tests {
                         async move {
                             let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                             peak.fetch_max(now, Ordering::SeqCst);
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            tokio::time::sleep(Duration::from_millis(5)).await;
                             in_flight.fetch_sub(1, Ordering::SeqCst);
                             probed.fetch_add(1, Ordering::SeqCst);
                         }
                     };
-                    limiter.drive(&session, || true, probe).await;
+                    limiter
+                        .drive(&session, None, || Some(Duration::ZERO), probe)
+                        .await;
                 }));
             }
             for d in drivers {
@@ -3916,27 +4066,30 @@ mod commit_state_limiter_tests {
         assert_eq!(probed.load(Ordering::SeqCst), SESSIONS);
     }
 
-    /// Per-session coalescing: requests that arrive while a session's driver is
-    /// busy do not queue one probe each — they collapse into ONE rerun, which
-    /// reads the tracker as it is then. The slot is released afterwards, so the
-    /// next request starts a fresh driver.
+    /// Per-session coalescing, deterministically: requests landing while the
+    /// session's probe is provably in flight collapse into ONE rerun, and the
+    /// slot is released afterwards.
     #[test]
     fn commit_state_requests_coalesce_into_one_rerun_per_session() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let probes = Arc::new(AtomicUsize::new(0));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            assert!(limiter.claim("s"));
-            let (l, probe) = (limiter.clone(), counting_probe(probes.clone(), 20));
-            let driver = tokio::spawn(async move { l.drive("s", || true, probe).await });
-            // Let the first probe start, then fire a burst at the busy session.
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let probe = gated_probe(probes.clone(), started.clone(), release.clone());
+            let driver =
+                tokio::spawn(
+                    async move { l.drive("s", None, || Some(Duration::ZERO), probe).await },
+                );
+            started.notified().await;
             for _ in 0..10 {
-                assert!(!limiter.claim("s"), "a busy session coalesces");
+                assert!(!limiter.claim("s", false), "a busy session coalesces");
             }
+            release.notify_one();
             driver.await.unwrap();
         });
         assert_eq!(
@@ -3945,31 +4098,217 @@ mod commit_state_limiter_tests {
             "one probe + one coalesced rerun"
         );
         assert!(
-            limiter.claim("s"),
+            limiter.claim("s", false),
             "the slot is released once the driver ends"
         );
     }
 
-    /// A coalesced rerun is dropped when the verdict has flipped to SKIP by the
-    /// time it would run — and the slot is still released, so the badge is not
-    /// wedged: the next trigger after the pressure clears starts a driver.
+    /// An unforced rerun is shed when the verdict is SKIP by the time it would
+    /// run, and the slot is still released — the badge is not wedged.
     #[test]
     fn commit_state_rerun_is_shed_at_skip_without_wedging_the_slot() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let probes = Arc::new(AtomicUsize::new(0));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            assert!(limiter.claim("s"));
-            let (l, probe) = (limiter.clone(), counting_probe(probes.clone(), 20));
-            let driver = tokio::spawn(async move { l.drive("s", || false, probe).await });
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            assert!(!limiter.claim("s"));
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let probe = gated_probe(probes.clone(), started.clone(), release.clone());
+            let driver = tokio::spawn(async move { l.drive("s", None, || None, probe).await });
+            started.notified().await;
+            assert!(!limiter.claim("s", false));
+            release.notify_one();
             driver.await.unwrap();
         });
         assert_eq!(probes.load(Ordering::SeqCst), 1, "the rerun was shed");
-        assert!(limiter.claim("s"), "and the slot was released");
+        assert!(limiter.claim("s", false), "and the slot was released");
+    }
+
+    /// W1: a FORCED claim (the post-commit emit) that coalesces into a running
+    /// background driver is never shed, even at SKIP — and it stays forced
+    /// even if an unforced claim lands after it.
+    #[test]
+    fn a_forced_rerun_is_never_shed() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let probe = gated_probe(probes.clone(), started.clone(), release.clone());
+            let driver = tokio::spawn(async move { l.drive("s", None, || None, probe).await });
+            started.notified().await;
+            assert!(!limiter.claim("s", true), "coalesces as forced");
+            assert!(
+                !limiter.claim("s", false),
+                "a later unforced claim keeps it forced"
+            );
+            release.notify_one();
+            driver.await.unwrap();
+        });
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the forced rerun ran at SKIP"
+        );
+        assert!(limiter.claim("s", false));
+    }
+
+    /// W4: a panicking probe does not wedge the session — the unwind releases
+    /// its slot, so the next request starts a fresh driver.
+    #[test]
+    fn a_panicking_probe_does_not_wedge_the_session() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let driver = tokio::spawn(async move {
+                l.drive(
+                    "s",
+                    None,
+                    || Some(Duration::ZERO),
+                    || async { panic!("probe blew up") },
+                )
+                .await
+            });
+            assert!(driver.await.is_err(), "the driver panicked");
+        });
+        assert!(limiter.claim("s", false), "the slot was released on unwind");
+        // And the permit came back: a cap-1 limiter still admits a probe.
+        let one = CommitStateLimiter::new(1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        rt().block_on(async {
+            let one = Arc::new(one);
+            assert!(one.claim("a", false));
+            let o = one.clone();
+            let _ = tokio::spawn(async move {
+                o.drive("a", None, || None, || async { panic!("boom") })
+                    .await
+            })
+            .await;
+            assert!(one.claim("b", false));
+            let r = ran.clone();
+            one.drive(
+                "b",
+                None,
+                || None,
+                move || {
+                    let r = r.clone();
+                    async move {
+                        r.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .await;
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// W5: SKIP records nothing — no slot, no pacing timestamp — so the first
+    /// emit after the pressure clears starts at once.
+    #[test]
+    fn a_skip_emit_records_no_timestamp_and_claims_no_slot() {
+        let limiter = CommitStateLimiter::new(4);
+        let now = Instant::now();
+        assert_eq!(
+            decide_commit_state_emit(&test_skip_verdict(), &limiter, "s", now),
+            EmitDecision::Shed
+        );
+        assert!(limiter.book().last_start.get("s").is_none());
+        assert!(limiter.book().slots.get("s").is_none());
+        assert_eq!(
+            decide_commit_state_emit(&BackgroundWork::Run, &limiter, "s", now),
+            EmitDecision::Start(None)
+        );
+    }
+
+    /// W5 + W2: THROTTLE multiplies the window, and a request inside the window
+    /// is deferred to its end (one trailing probe), not dropped. Later requests
+    /// of the same burst coalesce into that trailing probe.
+    #[test]
+    fn throttle_multiplies_the_window_and_defers_rather_than_drops() {
+        let t0 = Instant::now();
+        let one_second_later = t0 + Duration::from_secs(1);
+
+        // Run: 1 s after the last probe is past the 500 ms window.
+        let run = CommitStateLimiter::new(4);
+        run.record_start("s", t0);
+        assert_eq!(
+            decide_commit_state_emit(&BackgroundWork::Run, &run, "s", one_second_later),
+            EmitDecision::Start(None)
+        );
+
+        // Throttle: the window is 5 s, so the same request is deferred 4 s …
+        let throttled = CommitStateLimiter::new(4);
+        throttled.record_start("s", t0);
+        assert_eq!(
+            decide_commit_state_emit(&test_throttle_verdict(), &throttled, "s", one_second_later),
+            EmitDecision::Start(Some(
+                COMMIT_STATE_WINDOW * COMMIT_STATE_THROTTLE_FACTOR - Duration::from_secs(1)
+            ))
+        );
+        // … and the rest of the burst folds into that one trailing probe.
+        for _ in 0..5 {
+            assert_eq!(
+                decide_commit_state_emit(
+                    &test_throttle_verdict(),
+                    &throttled,
+                    "s",
+                    one_second_later
+                ),
+                EmitDecision::Coalesced
+            );
+        }
+    }
+
+    /// W2 end to end: a burst inside the window yields exactly one immediate
+    /// probe and exactly one trailing probe.
+    #[test]
+    fn a_burst_gets_exactly_one_trailing_probe() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let window = Duration::from_millis(40);
+        rt().block_on(async {
+            let mut drivers = Vec::new();
+            for _ in 0..6 {
+                let verdict_window = Some(window);
+                let now = Instant::now();
+                let decision = {
+                    if !limiter.claim("s", false) {
+                        EmitDecision::Coalesced
+                    } else {
+                        EmitDecision::Start(limiter.delay_until_due("s", window, now))
+                    }
+                };
+                if let EmitDecision::Start(delay) = decision {
+                    let (l, p) = (limiter.clone(), probes.clone());
+                    drivers.push(tokio::spawn(async move {
+                        l.drive(
+                            "s",
+                            delay,
+                            move || verdict_window,
+                            move || {
+                                let p = p.clone();
+                                async move {
+                                    p.fetch_add(1, Ordering::SeqCst);
+                                }
+                            },
+                        )
+                        .await
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            for d in drivers {
+                d.await.unwrap();
+            }
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 2, "leading + one trailing");
     }
 }
