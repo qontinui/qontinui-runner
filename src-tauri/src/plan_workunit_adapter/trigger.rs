@@ -26,7 +26,9 @@
 //! that silently outranked the setting, and the resolver's env read is gone.
 //! The binary's `plans_dir_migration` seeds a BLANK setting at primary boot
 //! from that retired shim, else from `QONTINUI_PLANS_DIR` outside runner
-//! context — a write into the setting, never a resolver rung. The markdown-plan carrier is the optional top coordination tier,
+//! context — a write into the setting, never a resolver rung. So turning the
+//! tier off durably means removing that env export as well as clearing the
+//! setting. The markdown-plan carrier is the optional top coordination tier,
 //! so a runner with nothing configured no-ops (it never scans, never pushes) —
 //! claims/intent and coord-native work-units are unaffected.
 //!
