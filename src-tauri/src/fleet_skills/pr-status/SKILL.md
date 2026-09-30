@@ -75,6 +75,16 @@ Two shapes:
    Always print `last_verified_at`. Print `blockers`, `required_checks` rollup,
    and `dep_edges` when non-empty. For a reconstructed card, print
    `(reconstructed from pr_events — repo_branches row aged out)`.
+
+   Print `labels` (the card's `coord.pr_labels` rows, `{name, source,
+   added_at}`) when non-empty, as `labels: <name> (<source>), …`. This is the
+   only card field showing the `coord_skill` rows coord never mirrors to
+   GitHub, so it can differ from `gh pr view --json labels`. **`labels: null`
+   is UNKNOWN** (coord could not read the table), not "no labels": print
+   `labels: ? UNKNOWN (read failed)` and never render it as an empty list.
+   `[]` means coord looked and found none. For a PR with **no card at all**
+   the HTTP twin is `GET /coord/agent-pr-labels?repo=<owner/name>&pr_number=<n>`
+   (device or agent JWT; `coord-read.ps1 labels` in the `coord` Agent Skill).
 4. **Never cache the result in memory.** The whole point is that this read is
    always fresh and self-describing. If you want to record something durable
    about the PR, record the **narrative** (why it exists, its recurring failure
