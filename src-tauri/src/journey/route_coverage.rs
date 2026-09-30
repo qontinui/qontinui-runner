@@ -8,8 +8,9 @@
 //!
 //! axum 0.8 cannot enumerate a live router, so — like
 //! `mcp::ui_bridge::manifest_drift_tests::manifest_matches_route_calls` — the
-//! routes are read from the `.route("/ui-bridge/…", …post(handler)…)` and
-//! `add_dual!(…, post, …)` registrations in the source.
+//! routes are read from the router registrations in the source (the route
+//! registration calls and the dual-prefix macro). Comment lines are blanked
+//! before scanning, so a registration quoted in prose is never counted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -424,6 +425,31 @@ const LEDGER_CALLS: &[&str] = &[
     "record_sdk_batch(",
 ];
 
+/// `src` with every line whose first non-blank characters are `//` (a line,
+/// doc or inner-doc comment) blanked, line count preserved. A registration
+/// quoted in a comment is prose, not a mounted route (B1).
+fn strip_comment_lines(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn comment_lines_are_not_scanned() {
+    let src = "//! .route(\"/ui-bridge/x\", post(h))\n    /// doc\n        .route(\"/ui-bridge/y\", post(g))";
+    let stripped = strip_comment_lines(src);
+    assert!(!stripped.contains("/ui-bridge/x"));
+    assert!(stripped.contains("/ui-bridge/y"));
+    assert_eq!(stripped.lines().count(), src.lines().count());
+}
+
 fn rust_sources() -> Vec<(std::path::PathBuf, String)> {
     fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -435,7 +461,7 @@ fn rust_sources() -> Vec<(std::path::PathBuf, String)> {
                 walk(&path, out);
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push((path, text));
+                    out.push((path, strip_comment_lines(&text)));
                 }
             }
         }
