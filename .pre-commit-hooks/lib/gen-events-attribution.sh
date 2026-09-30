@@ -64,13 +64,16 @@
 #
 # What the guard covers: text or directory embeds (`include_str!`,
 # `include_bytes!`, `include_dir!`) beside `JsonSchema` or a `schemars(`
-# attribute in the same file; a `#[doc = include_*!(..)]` attribute anywhere;
+# attribute in the same file; a `#[doc = include_*!(..)]` attribute anywhere,
+# including `#[doc = concat!(.., include_str!(..))]`;
 # a single-line `schemars(..)` attribute whose value does not BEGIN with a
 # string or numeric literal (`description`, `title`, `example`, `default`,
 # `extend("key" = EXPR)` — schemars 1 takes expressions for all of them); and
 # a build script that names a markdown path at all; and markdown compiled AS
-# RUST — `include!("x.md")` or `#[path = "x.md"] mod m;` — which is not data at
-# all and can define a JsonSchema type outright.
+# RUST — `include!` with any delimiter (`(`, `[`, `{`, spaced or not),
+# `#[path = "x.md"] mod m;`, `#[cfg_attr(.., path = "x.md")]` and its
+# rustfmt-wrapped form — which is not data at all and can define a JsonSchema
+# type outright.
 #
 # What it does NOT see, stated so nobody mistakes it for a proof:
 #  - an embed in a file with neither `JsonSchema` nor `schemars(`, used by a
@@ -250,6 +253,26 @@ _gen_events_both() {
     LC_ALL=C comm -12 <(printf '%s\n' "$1" | sed '/^$/d') <(printf '%s\n' "$2" | sed '/^$/d')
 }
 
+# One file-level arm: print "<path>: $1" for each path in both lists $2 and $3.
+# Exit 0 none, 1 some, 2 the intersection itself failed (with an ERROR line).
+# The intersection is captured BEFORE it is looped over: fed straight into a
+# `while` through `< <(..)`, a failing `comm` would lose its status and the arm
+# would read as empty — a clean premise nobody measured.
+_gen_events_premise_arm() {
+    local what="$1" both f hit=0
+    if ! both="$(_gen_events_both "$2" "$3")"; then
+        echo "ERROR intersecting the premise lists failed (comm), so an arm could not run"
+        return 2
+    fi
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s: %s\n' "$f" "$what"
+        hit=1
+    done <<< "$both"
+    [ "$hit" = "1" ] && return 1
+    return 0
+}
+
 # Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
 # way it could. Exit 0: premise holds. Exit 1: violated. Exit 2: the probe
 # itself failed or could not be verified (its ERROR lines are printed too) —
@@ -266,7 +289,13 @@ gen_events_markdown_premise_violations() {
     schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
     inc_dir="$(gen_events_premise_grep "$dir" -l -F 'include_dir!' | LC_ALL=C sort)" || probe_failed=1
     schemars_attr="$(gen_events_premise_grep "$dir" -l -F 'schemars(' | LC_ALL=C sort)" || probe_failed=1
-    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include!\(|#!?\[path[[:space:]]*=' | LC_ALL=C sort)" || probe_failed=1
+    # Every macro delimiter (`include!(`, `include![`, `include!{`, spaced),
+    # `#[path =`, `#[cfg_attr(.., path =`, and a line that BEGINS `path = "` —
+    # the rustfmt-wrapped cfg_attr. Anchored to attribute syntax rather than
+    # any `, path =`: tracing's `debug!(path = %p, ..)` and format!'s named
+    # `path=` sit beside `.md"` literals in four real files, and would drop
+    # the exclusion on every decision.
+    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"' | LC_ALL=C sort)" || probe_failed=1
     inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | sed '/^$/d' | LC_ALL=C sort -u)"
 
     # A failed probe prints its ERROR line into whichever list it fed, and
@@ -291,44 +320,43 @@ gen_events_markdown_premise_violations() {
         probe_failed=1
     fi
 
+    # Arms 1-4 are file-level intersections; `_gen_events_premise_arm`
+    # reports each, and a failed intersection fails the probe rather than
+    # reading as a clean arm.
+    local arm_rc
+    #
     # Arm 1: text-embeds anything in a file that mentions JsonSchema. No `.md"`
     # conjunct: a path assembled as `concat!(.., "/x.", "md")` names no `.md"`
     # literal, and the real tree has no such co-occurrence to spare.
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        printf '%s: include_str!/include_bytes! in a file that mentions JsonSchema\n' "$line"
-        found=1
-    done < <(_gen_events_both "$inc_text" "$schema")
+    _gen_events_premise_arm "include_str!/include_bytes! in a file that mentions JsonSchema" \
+        "$inc_text" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
     # Arm 2: `include_dir!` embeds whole trees (fleet_skills.rs, fleet_agents.rs
     # ship markdown this way) and never names a `.md` literal, so any use of it
     # beside JsonSchema is a violation on its own.
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        printf '%s: include_dir! in a file that mentions JsonSchema\n' "$line"
-        found=1
-    done < <(_gen_events_both "$inc_dir" "$schema")
+    _gen_events_premise_arm "include_dir! in a file that mentions JsonSchema" \
+        "$inc_dir" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
     # Arm 3: any embed in a file that carries a schemars attribute. File-level,
     # so a rustfmt-wrapped `#[schemars(description = include_str!(..))]` is
     # caught though no single line holds both halves.
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        printf '%s: include_*! in a file with a schemars( attribute\n' "$line"
-        found=1
-    done < <(_gen_events_both "$inc_any" "$schemars_attr")
+    _gen_events_premise_arm "include_*! in a file with a schemars( attribute" \
+        "$inc_any" "$schemars_attr" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
     # Arm 4: markdown compiled AS RUST. `include!` splices a file in as Rust
-    # source and `#[path = ..]` makes it a module — either can define a
-    # JsonSchema type, so the file's extension says nothing. File-level
-    # (`include!`/`#[path` anywhere, plus any `.md"` literal anywhere) so a
+    # source and a `path` attribute makes it a module — either can define a
+    # JsonSchema type, so the file's extension says nothing. File-level (the
+    # macro or attribute anywhere, plus any `.md"` literal anywhere) so a
     # `concat!` or wrapped form is caught too; the real tree's six uses, in
     # four files, name `.rs` files and OUT_DIR, and stay quiet.
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        printf '%s: include!/#[path] in a file that names a .md path\n' "$line"
-        found=1
-    done < <(_gen_events_both "$as_rust" "$md_lit")
+    _gen_events_premise_arm "include!/path attribute in a file that names a .md path" \
+        "$as_rust" "$md_lit" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
     # Arm 5: a doc attribute fed from a file becomes the schema's `description`.
-    # Anchored to attribute syntax so `let doc = include_str!(..)` is not one.
-    line="$(gen_events_premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*include_(str|bytes)!')" || probe_failed=1
+    # Anchored to attribute syntax so `let doc = include_str!(..)` is not one;
+    # an optional `concat!(..` before the embed covers `doc = concat!("x",
+    # include_str!(..))`.
+    line="$(gen_events_premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*(concat!\(.*)?include_(str|bytes)!')" || probe_failed=1
     if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
     # Arm 6: schemars 1 takes EXPRESSIONS for description, title, example,
     # default and `extend("key" = EXPR)`, so any `=` in a schemars attribute
