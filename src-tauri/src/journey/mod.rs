@@ -17,6 +17,7 @@
 //! - [`frontier`]  the batched frontier upsert
 //! - [`health`]    `GET /apps/{app_id}/journey/health`
 //! - [`retention`] the runner-side 90-day prune of its own database
+//! - `route_coverage` (test) every POST route under `/ui-bridge` is classified
 
 pub mod capture;
 pub mod cursor;
@@ -24,6 +25,9 @@ pub mod frontier;
 pub mod health;
 pub mod node;
 pub mod retention;
+
+#[cfg(test)]
+mod route_coverage;
 
 /// Axum routes exported by this module. Merged into the main router in
 /// `mcp_api.rs` beside `spec_api::routes()`, under the same per-app

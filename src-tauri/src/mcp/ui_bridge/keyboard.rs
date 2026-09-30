@@ -502,6 +502,20 @@ pub fn parse_send_keys_to_page_request(
     })
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/key` is an element action on the focused element; the key is never read.
+pub async fn ui_bridge_dispatch_key_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("key");
+    let result =
+        ui_bridge_dispatch_key_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// POST /ui-bridge/control/key
 ///
 /// Dispatch a document/window-level `KeyboardEvent` sequence (`keydown`,
@@ -521,7 +535,7 @@ pub fn parse_send_keys_to_page_request(
 /// Returns `{"dispatched": <n>, "target": "<canonical>", "defaultPrevented": <bool>}`,
 /// where `defaultPrevented` reflects the LAST `keydown` and tells the caller
 /// whether a handler actually consumed the shortcut.
-pub async fn ui_bridge_dispatch_key_handler(
+async fn ui_bridge_dispatch_key_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -550,6 +564,20 @@ pub async fn ui_bridge_dispatch_key_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "dispatch_key", payload).await)
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/send-keys` is an element action on the focused element; the keys are never read.
+pub async fn ui_bridge_send_keys_to_page_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("send_keys");
+    let result =
+        ui_bridge_send_keys_to_page_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// POST /ui-bridge/control/page/send-keys
 ///
 /// The SDK-declared document-level key dispatch (`sendKeysToPage`, ui-bridge
@@ -567,7 +595,7 @@ pub async fn ui_bridge_dispatch_key_handler(
 ///
 /// ⚠ `target: "activeElement"` can type into whatever is focused — see the
 /// module docs. It is opt-in only here too.
-pub async fn ui_bridge_send_keys_to_page_handler(
+async fn ui_bridge_send_keys_to_page_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

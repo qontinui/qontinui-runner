@@ -81,12 +81,12 @@ pub(crate) fn runner_instance() -> String {
 /// - `Some(true)` — the action was attempted and failed (a 5xx, or a 200 whose
 ///   envelope says `success: false`) — an `error` edge;
 /// - `Some(false)` — the action succeeded.
-pub(crate) fn control_action_verdict<T: serde::Serialize>(
+pub(crate) fn control_action_verdict<T: serde::Serialize, E: serde::Serialize>(
     result: &Result<
         axum::Json<crate::mcp::types::ApiResponse<T>>,
         (
             axum::http::StatusCode,
-            axum::Json<crate::mcp::types::ApiResponse<()>>,
+            axum::Json<crate::mcp::types::ApiResponse<E>>,
         ),
     >,
 ) -> Option<bool> {
@@ -95,6 +95,60 @@ pub(crate) fn control_action_verdict<T: serde::Serialize>(
         Err((status, _)) if status.is_client_error() => None,
         Err(_) => Some(true),
     }
+}
+
+/// Record a CONTROL-surface action from its handler's result (M3). The
+/// control routes drive the runner's own webview, so the cursor is the
+/// runner app's main window. A 4xx the runner answered itself records
+/// nothing ([`control_action_verdict`]).
+pub(crate) fn record_control_result<T: serde::Serialize, E: serde::Serialize>(
+    state: &Arc<crate::mcp::types::ApiState>,
+    result: &Result<
+        axum::Json<crate::mcp::types::ApiResponse<T>>,
+        (
+            axum::http::StatusCode,
+            axum::Json<crate::mcp::types::ApiResponse<E>>,
+        ),
+    >,
+    action: ActionSpec,
+) {
+    if let Some(failed) = control_action_verdict(result) {
+        record_action(
+            state.app_state.pg_db.clone(),
+            CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
+            action,
+            Provenance::default(),
+            failed,
+        );
+    }
+}
+
+/// Record an SDK-route action from its JSON answer (M3). `active_app` is the
+/// active SDK connection read BEFORE dispatch; with none, the dispatch reached
+/// no app and nothing is recorded. A relay refusal records nothing (m3); an
+/// explicit `success: false` is an `error` edge.
+pub(crate) fn record_sdk_result(
+    state: &Arc<crate::mcp::types::ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    response: &serde_json::Value,
+    action: ActionSpec,
+) {
+    let Some((app_id, app_version)) = active_app else {
+        return;
+    };
+    if sdk_refusal(response) {
+        return;
+    }
+    record_action(
+        state.app_state.pg_db.clone(),
+        CursorKey::new(app_id, None),
+        action,
+        Provenance {
+            app_version,
+            run_id: None,
+        },
+        response.get("success") == Some(&serde_json::Value::Bool(false)),
+    );
 }
 
 /// Is a snapshot request FILTERED (M2)? `visibleOnly`, `currentRouteOnly`,
@@ -1169,117 +1223,6 @@ mod tests {
             );
         }
         assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
-    }
-
-    // ---- choke-point coverage -----------------------------------------------
-
-    /// The body of the top-level item `fn <name>` in `source`: from its
-    /// signature to the next top-level item. Text-level on purpose — the
-    /// handlers need a live `ApiState` to run, and what this pins is the
-    /// WIRING, which is otherwise invisible: a transport whose handler never
-    /// calls the ledger writes no row and fails nothing.
-    fn item_body<'a>(source: &'a str, name: &str) -> &'a str {
-        let start = [
-            format!("\npub async fn {name}("),
-            format!("\nasync fn {name}("),
-            format!("\nfn {name}("),
-            format!("\npub(crate) fn {name}("),
-        ]
-        .iter()
-        .find_map(|sig| source.find(sig.as_str()))
-        .unwrap_or_else(|| panic!("handler `{name}` not found"));
-        let rest = source.get(start + 1..).unwrap_or_default();
-        let end = rest
-            .match_indices("\n}\n")
-            .next()
-            .map(|(i, _)| i + 3)
-            .unwrap_or(rest.len());
-        rest.get(..end).unwrap_or(rest)
-    }
-
-    /// Every choke point — the five D3 paths plus the SDK component and batch
-    /// routes recorded under the same action kinds — and both snapshot
-    /// routes that close pending edges, must call the ledger. A missing
-    /// transport would otherwise be invisible: edges for whichever transport a
-    /// skill uses would simply never appear.
-    #[test]
-    fn every_choke_point_calls_the_ledger() {
-        // cargo runs tests with CWD = crate root (src-tauri).
-        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
-        let elements = read("src/mcp/ui_bridge/elements.rs");
-        let bookmarks = read("src/mcp/ui_bridge/bookmarks.rs");
-        let sdk = read("src/mcp/sdk_client.rs");
-
-        let cases: [(&str, &str, &str); 14] = [
-            // (1) control element action
-            (
-                "elements",
-                "ui_bridge_execute_action_handler",
-                "record_action(",
-            ),
-            // (2) control batch
-            (
-                "elements",
-                "ui_bridge_batch_actions_handler",
-                "record_action(",
-            ),
-            // (3) control component action
-            (
-                "elements",
-                "ui_bridge_execute_component_action_handler",
-                "record_action(",
-            ),
-            // (4) SDK element action
-            ("sdk", "handle_element_action", "record_action("),
-            // (5) execute-with-diff: two runner routes + the SDK twin
-            (
-                "bookmarks",
-                "ui_bridge_execute_with_diff_handler",
-                "record_diff_result(",
-            ),
-            (
-                "bookmarks",
-                "ui_bridge_with_diff_handler",
-                "record_diff_result(",
-            ),
-            ("bookmarks", "record_diff_result", "record_diff("),
-            ("sdk", "handle_ct_execute_with_diff", "record_diff("),
-            // SDK component action — recorded as `component_action`
-            (
-                "sdk",
-                "handle_component_action",
-                "record_sdk_component_action(",
-            ),
-            (
-                "sdk",
-                "record_sdk_component_action",
-                "ActionSpec::component(",
-            ),
-            // SDK batch routes — recorded as `batch_action`
-            ("sdk", "handle_execute_batch_action", "record_sdk_batch("),
-            ("sdk", "handle_control_batch", "record_sdk_batch("),
-            // Snapshots that close pending edges
-            (
-                "elements",
-                "ui_bridge_get_snapshot_handler",
-                "record_snapshot(",
-            ),
-            ("sdk", "handle_snapshot", "record_journey_snapshot("),
-        ];
-        for (file, handler, call) in cases {
-            let source = match file {
-                "elements" => &elements,
-                "bookmarks" => &bookmarks,
-                _ => &sdk,
-            };
-            assert!(
-                item_body(source, handler).contains(call),
-                "{file}::{handler} must call `{call}` — without it this transport writes no \
-                 journey row"
-            );
-        }
-        assert!(item_body(&sdk, "record_journey_snapshot").contains("record_snapshot("));
-        assert!(item_body(&sdk, "record_sdk_batch").contains("ActionSpec::batch("));
     }
 
     // ---- privacy -----------------------------------------------------------

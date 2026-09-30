@@ -226,6 +226,41 @@ pub(crate) fn first_target(step: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// A fill-form body's field count and first target element id, if any
+/// (`fields` as an array of `{elementId|id, …}` or as an id → value map).
+/// Values are never read.
+pub(crate) fn form_fields(body: &serde_json::Value) -> (usize, Option<String>) {
+    match body.get("fields") {
+        Some(serde_json::Value::Array(arr)) => (
+            arr.len(),
+            arr.first().and_then(|f| {
+                first_target(f).or_else(|| {
+                    f.get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })
+            }),
+        ),
+        Some(serde_json::Value::Object(map)) => (map.len(), None),
+        _ => (0, None),
+    }
+}
+
+/// The navigation trigger a request asks for: `replace` when it says so
+/// (`replace: true`, or `mode`/`history` = `"replace"`), else `push`.
+pub(crate) fn push_or_replace(body: &serde_json::Value) -> NavigationTriggerKind {
+    let says_replace = body.get("replace") == Some(&serde_json::Value::Bool(true))
+        || ["mode", "history", "navigation"]
+            .iter()
+            .any(|k| body.get(*k).and_then(|v| v.as_str()) == Some("replace"));
+    if says_replace {
+        NavigationTriggerKind::Replace
+    } else {
+        NavigationTriggerKind::Push
+    }
+}
+
 /// Build the wire trigger, resolving the target against the affordances of
 /// the snapshot the action was taken FROM.
 ///
@@ -845,6 +880,29 @@ mod tests {
         assert!(
             ActionSpec::batch(&[]).is_none(),
             "an empty batch acted on nothing"
+        );
+    }
+
+    #[test]
+    fn request_readers_never_read_values() {
+        let (n, first) =
+            form_fields(&json!({"fields": [{"elementId": "a", "value": "secret"}, {"id": "b"}]}));
+        assert_eq!((n, first.as_deref()), (2, Some("a")));
+        assert_eq!(
+            form_fields(&json!({"fields": {"a": "x", "b": "y"}})),
+            (2, None)
+        );
+        assert_eq!(
+            push_or_replace(&json!({"url": "/x"})),
+            NavigationTriggerKind::Push
+        );
+        assert_eq!(
+            push_or_replace(&json!({"replace": true})),
+            NavigationTriggerKind::Replace
+        );
+        assert_eq!(
+            push_or_replace(&json!({"mode": "replace"})),
+            NavigationTriggerKind::Replace
         );
     }
 

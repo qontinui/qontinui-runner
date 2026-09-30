@@ -3951,10 +3951,24 @@ pub async fn ui_bridge_find_by_text_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/click-by-text` is an element action with no element id (null target).
+pub async fn ui_bridge_click_by_text_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_text");
+    let result =
+        ui_bridge_click_by_text_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Click an element by its visible text content.
 /// POST /ui-bridge/control/page/click-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
-pub async fn ui_bridge_click_by_text_handler(
+async fn ui_bridge_click_by_text_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -4019,10 +4033,24 @@ pub async fn ui_bridge_click_by_text_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/click-by-selector` is an element action with no element id (null target).
+pub async fn ui_bridge_click_by_selector_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_selector");
+    let result =
+        ui_bridge_click_by_selector_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Click an element by CSS selector.
 /// POST /ui-bridge/control/page/click-by-selector
 /// Body: { "selector": "button[type='submit']", "index": 0 }
-pub async fn ui_bridge_click_by_selector_handler(
+async fn ui_bridge_click_by_selector_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -4288,6 +4316,19 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
     })
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/type-into` is an element action; the typed text is never read.
+pub async fn ui_bridge_type_into_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("type_into");
+    let result = ui_bridge_type_into_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// Type text into an element by CSS selector or label.
 /// POST /ui-bridge/control/page/type-into
 /// Body: { "selector": "textarea", "text": "hello", "clear": true, "index": 0 }
@@ -4323,7 +4364,7 @@ fn type_into_action_payload(element_id: &str, text: &str, clear: bool) -> serde_
 /// `execute_action` reports no post-action value (`getElementState` carries no
 /// `value`), and inventing a third round-trip to read one back is worse than
 /// pointing callers at `POST /control/page/read-value`.
-pub async fn ui_bridge_type_into_handler(
+async fn ui_bridge_type_into_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
