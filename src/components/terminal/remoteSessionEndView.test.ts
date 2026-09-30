@@ -139,6 +139,19 @@ describe("describeEndResult — an unknown is never rendered as ended", () => {
     expect(describeEndResult(res({ outcome: "still_running" }), true).offerForce).toBe(false);
   });
 
+  it("an `end_already_running` refusal reads as already ending, offers no force", () => {
+    const v = describeEndResult(
+      res({
+        outcome: "refused",
+        reason: "end_already_running: an end for terminal t-1 is already running on this device",
+      }),
+    );
+    expect(v.label).toBe("already ending");
+    expect(v.isEnded).toBe(false);
+    expect(v.offerForce).toBe(false);
+    expect(v.headline).not.toMatch(/still running/);
+  });
+
   it("`not_found` is 'already gone', hides the row, and is not ended", () => {
     const v = describeEndResult(res({ outcome: "not_found", via: null }));
     expect(v.label).toBe("already gone");
