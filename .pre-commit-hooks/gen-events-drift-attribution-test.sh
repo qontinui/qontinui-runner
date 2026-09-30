@@ -479,70 +479,31 @@ check "  but once in the flat list" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED
 echo "  -- premise guard: markdown still cannot reach schemas.json --"
 
 # The markdown exclusion is a NARROWING of the input list, which the library
-# header forbids except on evidence. The evidence is that markdown reaches the
-# binary only as `include_str!` string consts, which schemars never reads. This
-# section re-checks that against the REAL tree on every run, so the exclusion
-# cannot outlive its premise. It prints one line per violation; git grep's
-# exit 1 means "no match", anything above 1 is a broken query and is reported
-# as a violation rather than read as clean.
-PREMISE_PATHS=(src-tauri/src src-tauri/clorinde crates/spec-check)
-premise_grep() {
-    local dir="$1"; shift
-    local out rc
-    out="$(git -C "$dir" grep "$@" -- "${PREMISE_PATHS[@]}" 2>&1)"; rc=$?
-    if [ "$rc" -gt 1 ]; then
-        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "$out"
-    elif [ "$rc" -eq 0 ]; then
-        printf '%s\n' "$out"
-    fi
-}
-markdown_premise_violations() {
-    local dir="$1" f
-    # A file that include_str!s something, names a `.md"` literal, and mentions
-    # JsonSchema. Deliberately wider than "include_str!(\"x.md\")" on one line:
-    # it also catches concat!/multi-line forms, and the price is only a
-    # possible false alarm, which is the safe direction for a guard.
-    local with_include with_md with_schema
-    with_include="$(premise_grep "$dir" -l -F 'include_str!' | sort)"
-    with_md="$(premise_grep "$dir" -l -E '\.md"' | sort)"
-    with_schema="$(premise_grep "$dir" -l -F 'JsonSchema' | sort)"
-    for f in $with_include; do
-        case "$f" in ERROR) printf '%s\n' "$with_include"; break ;; esac
-        if printf '%s\n' "$with_md" | grep -qxF "$f" \
-           && printf '%s\n' "$with_schema" | grep -qxF "$f"; then
-            printf '%s: include_str! of markdown in a file that mentions JsonSchema\n' "$f"
-        fi
-    done
-    printf '%s\n' "$with_md" "$with_schema" | grep '^ERROR' || true
-    # A doc attribute fed from a file becomes the schema's `description`.
-    # Anchored to attribute syntax so `let doc = include_str!(..)` does not match.
-    premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*include_str!'
-    # schemars 1 takes expressions for description/title, so anything but a
-    # string literal there could be an include_str!'d const from another file.
-    premise_grep "$dir" -n -E 'schemars\(.*include_str!|schemars\(.*(description|title)[[:space:]]*=[[:space:]]*[^"[:space:]]'
-}
-
+# header forbids except on evidence. The library re-checks that evidence on
+# every decision (`gen_events_markdown_premise_violations`); this runs the SAME
+# function against the REAL tree, so a violation is loud here too rather than
+# only quietly widening the next pusher's list.
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 REPO_TOP="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$REPO_TOP" ] && REPO_TOP="$(cd "$REPO_TOP" && pwd -P)"
 if [ "$REPO_TOP" != "$REPO_ROOT" ]; then
     skip_note "premise guard: $REPO_ROOT is not a git checkout, so the real tree cannot be read"
 else
-    VIOLATIONS="$(markdown_premise_violations "$REPO_ROOT")"
-    if [ -z "$VIOLATIONS" ]; then
+    VIOLATIONS="$(gen_events_markdown_premise_violations "$REPO_ROOT")" && PREMISE_RC=0 || PREMISE_RC=$?
+    if [ "$PREMISE_RC" -eq 0 ] && [ -z "$VIOLATIONS" ]; then
         pass_note "no markdown in the real tree can reach schemas.json"
     else
-        fail_note "markdown may now reach schemas.json:"
+        fail_note "markdown may now reach schemas.json (premise exit $PREMISE_RC):"
         printf '%s\n' "$VIOLATIONS" | sed 's/^/         /'
-        printf '       lib/gen-events-attribution.sh excludes *.md from attribution on the\n'
-        printf '       premise that it cannot. With that false, the exclusion would CLEAR a\n'
-        printf '       pusher whose markdown moved the bindings. Remove the exclusion, or\n'
-        printf '       restructure so the markdown stays out of any JsonSchema type.\n'
+        printf '       Every attribution decision now drops the *.md exclusion and blames\n'
+        printf '       markdown again. Restructure so no markdown can reach a JsonSchema\n'
+        printf '       type, or delete the exclusion if that is no longer true by design.\n'
     fi
     # Non-vacuity on the real tree: the guard must actually be SEEING the
-    # include_str!'d markdown it reasons about. Zero would mean the query
-    # broke, not that the premise holds.
-    INCLUDED_MD="$(premise_grep "$REPO_ROOT" -l -E 'include_str!\([^)]*\.md"' | grep -vc '^ERROR' || true)"
+    # embedded markdown it reasons about. Zero would mean the query broke, not
+    # that the premise holds. Counted as `.rs` paths only, so a multi-line
+    # error message cannot inflate it.
+    INCLUDED_MD="$(gen_events_premise_grep "$REPO_ROOT" -l -E 'include_(str|bytes)!\([^)]*\.md"' | grep -c '\.rs$' || true)"
     if [ "${INCLUDED_MD:-0}" -gt 0 ]; then
         pass_note "  and it saw the $INCLUDED_MD files that include_str! markdown"
     else
@@ -550,7 +511,7 @@ else
     fi
 fi
 
-# Non-vacuity on a fixture: each arm must fire on a tree that violates it, and
+# Non-vacuity on fixtures: each arm must fire on a tree that violates it, and
 # the `let doc = include_str!` shape the real tree carries must not.
 premise_fixture() {
     local root
@@ -562,23 +523,132 @@ premise_fixture() {
     git init --quiet --initial-branch=main "$root"
     mkdir -p "$root/src-tauri/src"
     printf '%s\n' "$1" > "$root/src-tauri/src/m.rs"
-    git -C "$root" add -A >/dev/null
     PREMISE_FIXTURE="$root"
 }
 premise_case() {
-    local label="$1" want="$2" body="$3" got
+    local label="$1" want="$2" body="$3" got rc
     premise_fixture "$body"
-    if [ -n "$(markdown_premise_violations "$PREMISE_FIXTURE")" ]; then got="violation"; else got="clean"; fi
+    gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null && rc=0 || rc=$?
+    case "$rc" in 0) got="clean" ;; 1) got="violation" ;; *) got="probe-failed($rc)" ;; esac
     check "$label" "$want" "$got"
 }
 premise_case "guard fires: include_str! .md beside JsonSchema" violation \
     '#[derive(JsonSchema)] struct S; const B: &str = include_str!("b.md");'
+premise_case "guard fires: include_bytes! .md beside JsonSchema" violation \
+    '#[derive(JsonSchema)] struct S; const B: &[u8] = include_bytes!("b.md");'
+premise_case "guard fires: include_dir! beside JsonSchema, no .md literal needed" violation \
+    '#[derive(JsonSchema)] struct S; static D: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");'
 premise_case "guard fires: #[doc = include_str!(..)]" violation \
     '#[doc = include_str!("b.md")] struct S;'
 premise_case "guard fires: schemars(description = CONST)" violation \
     '#[schemars(description = BODY)] struct S;'
+premise_case "guard fires: a rustfmt-wrapped schemars attribute with an embed" violation \
+    "$(printf '#[schemars(\n    description = include_str!(\n        "b.md"\n    )\n)]\nstruct S;')"
 premise_case "guard is quiet on let doc = include_str!(..) with no JsonSchema" clean \
     'fn t() { let doc = include_str!("b.md"); }'
+
+echo "  -- the premise gates the exclusion at decision time --"
+
+# The guard is not advisory: a tree that violates it gets NO markdown
+# exclusion, so a markdown-only push is blamed again — the safe direction.
+fixture
+seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_commands/x.md");'
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body a JsonSchema type embeds"
+decide
+check "with the premise violated, a committed .md is MINE" "mine" "$ATTRIBUTION_STATE"
+if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+    pass_note "  and the decision says why: $ATTRIBUTION_EXCLUDES_DROPPED_REASON"
+else
+    fail_note "  the exclusion was dropped without a reason"
+fi
+
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+decide
+check "with the premise intact, the exclusion applies and no reason is set" \
+    "pre-existing|" "$ATTRIBUTION_STATE|$ATTRIBUTION_EXCLUDES_DROPPED_REASON"
+
+echo "  -- a git failure is UNAVAILABLE, never a cleared pusher --"
+
+# A `git` on PATH that fails exactly one subcommand and passes the rest to the
+# real one. Before the fix, `$(git ... || true)` turned such a failure into an
+# empty list, i.e. "touched nothing", i.e. PRE-EXISTING.
+REAL_GIT="$(command -v git)"
+git_shim_failing() {
+    local sub="$1" dir
+    dir="$(dirname "$WORK")/shim-$sub"
+    mkdir -p "$dir"
+    printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = "%s" ] && { echo "shim: %s fails" >&2; exit 128; }; done\nexec "%s" "$@"\n' \
+        "$sub" "$sub" "$REAL_GIT" > "$dir/git"
+    chmod +x "$dir/git"
+    printf '%s' "$dir"
+}
+fixture
+commit_change "src/app.ts" "// ui"
+SHIM="$(git_shim_failing ls-files)"
+( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.state" )
+check "a failing git ls-files is UNAVAILABLE, not PRE-EXISTING" \
+    "unavailable" "$(cut -d'|' -f1 < "$WORK/.state")"
+check "  and the reason names the call" "yes" \
+    "$(grep -q 'ls-files' "$WORK/.state" && echo yes || echo no)"
+
+# The premise probe failing is treated as a violation: exclusion dropped.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+SHIM="$(git_shim_failing grep)"
+( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a failing premise probe drops the exclusion, so the .md is MINE" \
+    "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
+check "  and says the probe failed" "yes" \
+    "$(grep -q 'probe failed' "$WORK/.state" && echo yes || echo no)"
+
+echo "  -- the MINE message the hook prints --"
+
+# `gen_events_render_mine` renders from the ATTRIBUTION_* variables alone, so
+# these set them directly rather than building a repo per case.
+render_with() {
+    ATTRIBUTION_BASE_REF="origin/main"
+    ATTRIBUTION_BASE_SHA="0123456789abcdef"
+    ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
+    ATTRIBUTION_TOUCHED_DETAIL="$1"
+    RENDERED="$(gen_events_render_mine)"
+}
+has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+check "all committed: the lead line says this push" yes "$(has 'This push changes sources')"
+check "  the file is labelled committed" yes "$(has 'src-tauri/src/lib.rs  (committed in this push)')"
+check "  no set-aside advice" no "$(has 'git stash push')"
+check "  the pre-existing caveat is kept" yes "$(has 'Part of the diff may still be pre-existing')"
+
+render_with "$(detail_line Cargo.lock uncommitted)"
+check "uncommitted only: the lead line blames the working tree, not the push" \
+    "yes|no" "$(has 'Your working tree (not this push' )|$(has 'This push changes')"
+check "  the file is labelled as not in the push" \
+    yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
+check "  the advice stashes exactly that path, untracked included" \
+    yes "$(has 'git stash push --include-untracked -m "gen-events-drift-')"
+check "  and names it" yes "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- Cargo.lock$' && echo yes || echo no)"
+check "  restores by sha, never pop, never checkout" \
+    "yes|no" "$(has 'git stash apply <that sha>')|$(has 'git checkout --')"
+
+render_with "$(detail_line src-tauri/src/new.rs untracked)"
+check "untracked: labelled as not in the push" \
+    yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
+check "  and included in the stash command" yes \
+    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- src-tauri/src/new.rs$' && echo yes || echo no)"
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)"
+check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
+check "  both labels are printed" "yes|yes" \
+    "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
+check "  and the dirty half gets set-aside advice" yes \
+    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- src-tauri/src/lib.rs$' && echo yes || echo no)"
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+RENDERED="$(gen_events_render_mine)"
+check "a dropped exclusion is stated in one line" yes "$(has 'Markdown was counted as a codegen input this time')"
 
 echo
 if [ "$SKIP" -gt 0 ]; then
