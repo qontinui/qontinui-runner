@@ -91,7 +91,8 @@ pub(crate) async fn prune_once(pg: &PgDb) {
             return;
         }
     };
-    match journey_schema_supported(&conn).await {
+    let probe = journey_schema_supported(&conn).await;
+    match probe {
         SchemaProbe::Present => {}
         SchemaProbe::Absent { missing } => {
             health::record_prune_skipped(
@@ -147,6 +148,12 @@ pub async fn run_journey_edge_retention_loop(pg: Arc<PgDb>) {
     tokio::time::sleep(STARTUP_DELAY).await;
     loop {
         prune_once(&pg).await;
+        // The same tick sweeps pending edges older than the TTL, so an
+        // action no snapshot ever followed still lands as to_node_unobserved.
+        super::capture::enqueue_edge_observation(
+            Arc::clone(&pg),
+            super::capture::JourneyEvent::Sweep,
+        );
         tokio::time::sleep(INTERVAL).await;
     }
 }

@@ -615,12 +615,12 @@ pub async fn ui_bridge_batch_actions_handler(
     // Recorded as `ChokePoint::BatchAction`, the same kind as the SDK batch
     // routes (`sdk_client::record_sdk_batch`): the choke point names the
     // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
-    if let Some(action) = crate::journey::capture::ActionSpec::batch(&steps) {
+    if let Some(action) = crate::journey::cursor::ActionSpec::batch(&steps) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
-            crate::spec_api::storage::RUNNER_APP_ID,
+            crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
             action,
-            crate::journey::capture::Provenance::default(),
+            crate::journey::cursor::Provenance::default(),
             failed > 0,
         );
     }
@@ -1152,6 +1152,17 @@ pub async fn ui_bridge_execute_action_handler(
         .or_else(|| serde_json::from_str(&String::from_utf8_lossy(&body_bytes)).ok())
         .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from));
     let task_run_id = query.task_run_id;
+    // The cursor scope: the pop-out window this action targets (query wins,
+    // then the body field — the same precedence the dispatch applies).
+    let window_scope = query.window_label.clone().or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("windowLabel")
+                    .and_then(|w| w.as_str())
+                    .map(String::from)
+            })
+    });
     let result = execute_action_dispatch(
         State(Arc::clone(&state)),
         Path(id.clone()),
@@ -1166,13 +1177,16 @@ pub async fn ui_bridge_execute_action_handler(
     ) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
-            crate::spec_api::storage::RUNNER_APP_ID,
-            crate::journey::capture::ActionSpec::element(
+            crate::journey::cursor::CursorKey::new(
+                crate::spec_api::storage::RUNNER_APP_ID,
+                window_scope.as_deref(),
+            ),
+            crate::journey::cursor::ActionSpec::element(
                 &id,
                 &action,
                 qontinui_types::journey::ChokePoint::ElementAction,
             ),
-            crate::journey::capture::Provenance {
+            crate::journey::cursor::Provenance {
                 app_version: None,
                 run_id: crate::journey::capture::run_id_from_task_run(task_run_id),
             },
@@ -2566,9 +2580,9 @@ pub async fn ui_bridge_execute_component_action_handler(
     if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
-            &app_id,
-            crate::journey::capture::ActionSpec::component(&id, &action_id),
-            crate::journey::capture::Provenance::default(),
+            crate::journey::cursor::CursorKey::new(app_id, None),
+            crate::journey::cursor::ActionSpec::component(&id, &action_id),
+            crate::journey::cursor::Provenance::default(),
             failed,
         );
     }
@@ -2887,10 +2901,14 @@ pub async fn ui_bridge_get_last_discovered_handler(
 /// Filtering happens in this Rust handler (not via a special SDK code path),
 /// because `get_snapshot` participates in the dedup cache keyed by type, and
 /// filtering client-side here keeps the cached payload shared across callers.
+///
+/// The body is returned as an `Arc<Value>` so the response, the
+/// co-occurrence capture and the journey ledger share ONE copy of what can be
+/// a multi-megabyte snapshot.
 pub async fn ui_bridge_get_snapshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<Arc<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let truthy = |v: &String| {
         let s = v.trim();
         s == "1" || s.eq_ignore_ascii_case("true")
@@ -3118,20 +3136,29 @@ pub async fn ui_bridge_get_snapshot_handler(
             // The page label is resolved inside `enqueue_observation` from the
             // snapshot's own `page.pageContext` / `page.pathname` — the caller
             // has no scope knowledge the snapshot doesn't already carry.
+            let data = Arc::new(data);
             let pg_db_for_obs = state.app_state.pg_db.clone();
-            let snapshot_for_obs = Arc::new(data.clone());
+            let snapshot_for_obs = Arc::clone(&data);
             let runner_instance = crate::journey::capture::runner_instance();
             // Journey ledger (plan 2026-09-20-ui-bridge-represents-the-users-
             // path-and-the-passage-of-time, D3): this snapshot closes the
             // pending edge an earlier action opened. The control surface
             // drives the runner's OWN webview, so the app is the runner's —
-            // a transport fact, the same key the action handlers use.
-            crate::journey::capture::record_snapshot(
-                state.app_state.pg_db.clone(),
-                crate::spec_api::storage::RUNNER_APP_ID,
-                None,
-                Arc::clone(&snapshot_for_obs),
-            );
+            // a transport fact, the same key the action handlers use — and the
+            // cursor is the main window (this route takes no windowLabel).
+            // A FILTERED snapshot is not the page's configuration, so it is
+            // not recorded (the co-occurrence capture keeps its behaviour).
+            if !(visible_only || current_route_only || with_disabled_only) {
+                crate::journey::capture::record_snapshot(
+                    state.app_state.pg_db.clone(),
+                    crate::journey::cursor::CursorKey::new(
+                        crate::spec_api::storage::RUNNER_APP_ID,
+                        None,
+                    ),
+                    None,
+                    Arc::clone(&data),
+                );
+            }
             tokio::spawn(async move {
                 crate::state_discovery::enqueue_observation(
                     pg_db_for_obs,
@@ -3163,7 +3190,7 @@ pub async fn ui_bridge_get_snapshot_handler(
                         "elements": [],
                         "note": "SDK was not connected. This is a native window capture fallback — no element tree is available."
                     });
-                    Ok(Json(ApiResponse::success(data)))
+                    Ok(Json(ApiResponse::success(Arc::new(data))))
                 }
                 None => {
                     error!("UI Bridge API: native capture fallback also failed");

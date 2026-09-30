@@ -167,24 +167,32 @@ mod tests {
 
         // DELETE: an edge fired from that node at that affordance names the
         // SAME (node_key, fingerprint) pair in its frontier DELETE.
-        let mut cursors = crate::journey::capture::Cursors::default();
-        let key = crate::journey::capture::CursorKey {
+        use crate::journey::cursor::{ActionSpec, CursorKey, Cursors, Observed};
+        let now = std::time::Instant::now();
+        let seen = || Observed {
+            node: node(),
+            digest: "d".into(),
+        };
+        let mut cursors = Cursors::default();
+        let key = CursorKey {
             app_id: "app".into(),
             runner_instance: "primary".into(),
+            scope: None,
         };
-        cursors.observe(&key, node(), aff);
+        cursors.observe(&key, seen(), aff, now);
         cursors.open(
             &key,
-            &crate::journey::capture::ActionSpec::element(
+            &ActionSpec::element(
                 "b",
                 "click",
                 qontinui_types::journey::ChokePoint::ElementAction,
             ),
             Default::default(),
-            false,
+            None,
+            now,
         );
         let edge = cursors
-            .observe(&key, node(), Default::default())
+            .observe(&key, seen(), Default::default(), now)
             .expect("closed");
         let binds =
             crate::journey::capture::edge_insert(&crate::journey::capture::finalize(edge)).unwrap();
@@ -228,6 +236,7 @@ mod tests {
                         fingerprint: fp.into(),
                         role: Some("button".into()),
                         declared_effect: effect,
+                        navigation: false,
                     },
                     action_effects: BTreeMap::new(),
                 },

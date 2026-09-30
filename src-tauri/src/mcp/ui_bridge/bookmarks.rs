@@ -117,10 +117,10 @@ fn record_diff_result(
         .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(true));
     crate::journey::capture::record_diff(
         state.app_state.pg_db.clone(),
-        crate::spec_api::storage::RUNNER_APP_ID,
+        crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
         request_body,
         &response,
-        crate::journey::capture::Provenance::default(),
+        crate::journey::cursor::Provenance::default(),
         route_failed || action_failed,
     );
 }

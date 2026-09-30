@@ -181,6 +181,44 @@ pub(crate) struct Affordance {
     /// The affordance's declared effect, fail-closed (see
     /// [`element_declared_effect`]).
     pub declared_effect: Option<IrEffect>,
+    /// Plan D4 rule 3's explicit navigation arm: `role` ∈ {link, menuitem,
+    /// tab} or `type` ∈ {link, menuitem}. Nothing else counts (not
+    /// `semanticType`, not a parent context — see D4 "Resolved").
+    pub navigation: bool,
+}
+
+/// D4 rule 3: an explicit navigation role or type.
+pub(crate) fn is_navigation_affordance(role: Option<&str>, element_type: Option<&str>) -> bool {
+    let norm = |s: &str| s.trim().to_ascii_lowercase();
+    role.map(norm)
+        .is_some_and(|r| matches!(r.as_str(), "link" | "menuitem" | "tab"))
+        || element_type
+            .map(norm)
+            .is_some_and(|t| matches!(t.as_str(), "link" | "menuitem"))
+}
+
+/// Digest of a snapshot's interactive ELEMENT affordances: the sorted,
+/// deduped set of their fingerprints, hashed. Two snapshots with equal node
+/// keys but different digests exposed different affordances, so an edge
+/// between them is `changed`, never `no_change`.
+pub(crate) fn affordance_digest(index: &AffordanceIndex) -> String {
+    use sha2::{Digest, Sha256};
+    let fingerprints: std::collections::BTreeSet<&str> = index
+        .elements
+        .values()
+        .map(|e| e.affordance.fingerprint.as_str())
+        .collect();
+    let mut hasher = Sha256::new();
+    for fp in fingerprints {
+        hasher.update(fp.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// An element's affordance plus its per-action declared effects, kept so a
@@ -326,6 +364,13 @@ pub(crate) fn extract_affordances(snapshot: &serde_json::Value) -> AffordanceInd
             ElementAffordance {
                 affordance: Affordance {
                     fingerprint: stable_element_fingerprint(element),
+                    navigation: is_navigation_affordance(
+                        extract_role(element).as_deref(),
+                        element
+                            .get("type")
+                            .or_else(|| element.get("tagName"))
+                            .and_then(|v| v.as_str()),
+                    ),
                     role: extract_role(element),
                     declared_effect: element_declared_effect(element),
                 },
@@ -358,6 +403,7 @@ pub(crate) fn extract_affordances(snapshot: &serde_json::Value) -> AffordanceInd
                     fingerprint: component_action_fingerprint(component_id, action_id),
                     role: None,
                     declared_effect: parse_effect(action.get("effect")),
+                    navigation: false,
                 },
             );
         }
@@ -551,6 +597,32 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_is_order_free_and_sees_a_changed_affordance_set() {
+        let a = extract_affordances(&json!({"elements": [
+            {"id": "x", "label": "X", "actions": ["click"]},
+            {"id": "y", "label": "Y", "actions": ["click"]}]}));
+        let b = extract_affordances(&json!({"elements": [
+            {"id": "y", "label": "Y", "actions": ["click"]},
+            {"id": "x", "label": "X", "actions": ["click"]}]}));
+        let c = extract_affordances(&json!({"elements": [
+            {"id": "x", "label": "X", "actions": ["click"]}]}));
+        assert_eq!(affordance_digest(&a), affordance_digest(&b));
+        assert_ne!(affordance_digest(&a), affordance_digest(&c));
+    }
+
+    #[test]
+    fn only_explicit_roles_and_types_are_navigation() {
+        assert!(is_navigation_affordance(Some("link"), None));
+        assert!(is_navigation_affordance(Some("Tab"), None));
+        assert!(is_navigation_affordance(None, Some("menuitem")));
+        assert!(!is_navigation_affordance(Some("button"), Some("button")));
+        assert!(
+            !is_navigation_affordance(None, Some("tab")),
+            "tab is a ROLE arm only"
+        );
+    }
+
+    #[test]
     fn distinct_dedups_by_fingerprint_keeping_the_worst_effect() {
         let mut idx = AffordanceIndex::default();
         for (id, effect) in [
@@ -564,6 +636,7 @@ mod tests {
                         fingerprint: "same".into(),
                         role: None,
                         declared_effect: effect,
+                        navigation: false,
                     },
                     action_effects: BTreeMap::new(),
                 },

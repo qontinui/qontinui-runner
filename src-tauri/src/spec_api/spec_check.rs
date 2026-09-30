@@ -137,7 +137,7 @@ fn apply_thresholds_to_result(
 /// The evaluator core every entry point shares: the pure crate evaluation,
 /// then the app's configured thresholds applied to the overall and per-state
 /// classifications. `post_spec_check`, the batch [`evaluate_one`] and the
-/// in-process [`evaluate_page_in_process`] all go through here, so the three
+/// in-process [`evaluate_loaded`] all go through here, so the three
 /// cannot disagree on what a classification means.
 fn evaluate_ir_classified(
     snapshot: &UIBridgeSnapshot,
@@ -171,24 +171,27 @@ async fn fetch_app_for_thresholds(
     }
 }
 
-/// Evaluate ONE page spec against a snapshot the caller already holds, in
-/// process — no HTTP route, no snapshot fetch, no `spec.*` events, no helper
-/// spot-check. For callers that need the classification as an input rather
-/// than as a published check (the journey ledger resolves a node from it on
-/// a spawned task, never on a request path).
+/// A page spec loaded for in-process evaluation, with the app row whose
+/// thresholds classify its result.
+pub(crate) struct LoadedPageSpec {
+    pub ir: qontinui_types::ir::IrPageSpec,
+    pub app: Option<qontinui_types::apps::App>,
+}
+
+/// Load ONE page spec for in-process evaluation — the async half (registry
+/// and filesystem reads). Pair with [`evaluate_loaded`], which is sync and
+/// CPU-bound, so a caller can run it on a blocking thread.
 ///
 /// `Ok(None)` means there is no spec to evaluate: the app is not registered,
 /// the page id is not a valid spec id, or no IR document exists for it.
 /// `Err` means the question could not be answered (the specs root could not be
 /// resolved for a registered app, or the IR document is malformed) — distinct
 /// from "no spec", so a caller does not read a failure as an absence.
-pub(crate) async fn evaluate_page_in_process(
+pub(crate) async fn load_page_spec(
     pg: &crate::database::pg::PgDb,
     app_id: &str,
     page_id: &str,
-    snapshot: &UIBridgeSnapshot,
-    fingerprint: qontinui_types::spec_check::BridgeFingerprint,
-) -> Result<Option<SpecCheckResult>, String> {
+) -> Result<Option<LoadedPageSpec>, String> {
     if invalid_page_id(page_id) {
         return Ok(None);
     }
@@ -197,19 +200,31 @@ pub(crate) async fn evaluate_page_in_process(
         Err(qontinui_types::apps::AppError::NotRegistered { .. }) => return Ok(None),
         Err(e) => return Err(format!("specs root for app {app_id}: {e}")),
     };
-    let ir = match storage::read_ir(&root, app_id, page_id)? {
-        Some(ir) => ir,
-        None => return Ok(None),
+    let Some(ir) = storage::read_ir(&root, app_id, page_id)? else {
+        return Ok(None);
     };
-    let app_option = fetch_app_for_thresholds(pg, app_id).await;
-    Ok(Some(evaluate_ir_classified(
+    let app = fetch_app_for_thresholds(pg, app_id).await;
+    Ok(Some(LoadedPageSpec { ir, app }))
+}
+
+/// Evaluate a loaded page spec against a snapshot the caller already holds —
+/// no HTTP route, no snapshot fetch, no `spec.*` events, no helper
+/// spot-check. For callers that need the classification as an input rather
+/// than as a published check (the journey ledger resolves a node from it on
+/// a blocking thread, never on a request path).
+pub(crate) fn evaluate_loaded(
+    snapshot: &UIBridgeSnapshot,
+    loaded: &LoadedPageSpec,
+    fingerprint: qontinui_types::spec_check::BridgeFingerprint,
+) -> SpecCheckResult {
+    evaluate_ir_classified(
         snapshot,
-        &ir,
+        &loaded.ir,
         fingerprint,
         format!("scs_inproc_{}", uuid::Uuid::now_v7()),
         String::new(),
-        app_option.as_ref(),
-    )))
+        loaded.app.as_ref(),
+    )
 }
 
 // ===========================================================================

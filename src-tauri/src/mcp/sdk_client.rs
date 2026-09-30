@@ -1389,31 +1389,28 @@ async fn app_version_for(state: &Arc<ApiState>, app_id: &str) -> Option<String> 
         .and_then(|c| c.app_info.version.clone())
 }
 
-/// A snapshot body as the SDK answered it: the `{success, data}` envelope's
-/// `data` when present, else the body itself.
-fn snapshot_payload(body: &serde_json::Value) -> serde_json::Value {
-    match body.get("data") {
-        Some(inner) if inner.is_object() => inner.clone(),
-        _ => body.clone(),
-    }
-}
-
-/// Journey ledger (D3): a successful snapshot of `app_id` closes that app's
-/// pending edge.
+/// Journey ledger (D3): a successful, UNFILTERED snapshot of `app_id` (in
+/// `scope`, the relay tab it was pinned to) closes that cursor's pending
+/// edge. A filtered snapshot (`withDisabledOnly`, `recency`, …) is not the
+/// page's configuration, so it records nothing. The body is shared with the
+/// response (`Arc`), never deep-copied; the worker reads through the SDK's
+/// `{success, data}` envelope itself.
 fn record_journey_snapshot(
     state: &Arc<ApiState>,
     app_id: &str,
+    scope: Option<&str>,
     app_version: Option<String>,
-    body: &serde_json::Value,
+    body: &Arc<serde_json::Value>,
+    filtered: bool,
 ) {
-    if body.get("success") == Some(&serde_json::Value::Bool(false)) {
+    if filtered || body.get("success") == Some(&serde_json::Value::Bool(false)) {
         return;
     }
     crate::journey::capture::record_snapshot(
         state.app_state.pg_db.clone(),
-        app_id,
+        crate::journey::cursor::CursorKey::new(app_id, scope),
         app_version,
-        Arc::new(snapshot_payload(body)),
+        Arc::clone(body),
     );
 }
 
@@ -1543,13 +1540,13 @@ async fn handle_element_action(
     };
     crate::journey::capture::record_action(
         state.app_state.pg_db.clone(),
-        &journey_app,
-        crate::journey::capture::ActionSpec::element(
+        crate::journey::cursor::CursorKey::new(journey_app, tab_id),
+        crate::journey::cursor::ActionSpec::element(
             &id,
             &action_name,
             qontinui_types::journey::ChokePoint::SdkElementAction,
         ),
-        crate::journey::capture::Provenance {
+        crate::journey::cursor::Provenance {
             app_version,
             run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
         },
@@ -1623,6 +1620,9 @@ async fn handle_snapshot(
     };
     let want_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
         || query.get("with_disabled_only").is_some_and(truthy);
+    // A filtered snapshot is not the page's configuration: the journey ledger
+    // records only unfiltered ones (M2).
+    let filtered = want_disabled_only || query.contains_key("recency");
     // Per-tab routing (Item #4): pin the snapshot to a specific connected tab
     // when `?tabId=` (or `?targetTabId=`) is supplied. Lets a caller snapshot
     // tab A while tab B is the relay's primary, instead of always getting the
@@ -1677,7 +1677,8 @@ async fn handle_snapshot(
         {
             Ok(data) => {
                 let version = app_version_for(&state, app_id).await;
-                record_journey_snapshot(&state, app_id, version, &data);
+                let data = Arc::new(data);
+                record_journey_snapshot(&state, app_id, tab_id, version, &data, filtered);
                 (StatusCode::OK, Json(data)).into_response()
             }
             Err(e) => (
@@ -1700,8 +1701,9 @@ async fn handle_snapshot(
     .await
     {
         Ok(data) => {
+            let data = Arc::new(data);
             if let Some((app_id, version)) = active_app {
-                record_journey_snapshot(&state, &app_id, version, &data);
+                record_journey_snapshot(&state, &app_id, tab_id, version, &data, filtered);
             }
             (StatusCode::OK, Json(data)).into_response()
         }
@@ -1710,17 +1712,18 @@ async fn handle_snapshot(
             debug!("SDK snapshot unavailable, falling back to control endpoint");
             match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
                 Ok(data) => {
+                    let body = Arc::new(serde_json::json!({ "success": true, "data": data }));
+                    // The runner's own webview: its cursor is the main window.
+                    // The fallback ignores the SDK filters, so it is unfiltered.
                     record_journey_snapshot(
                         &state,
                         crate::spec_api::storage::RUNNER_APP_ID,
                         None,
-                        &data,
+                        None,
+                        &body,
+                        false,
                     );
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({ "success": true, "data": data })),
-                    )
-                        .into_response()
+                    (StatusCode::OK, Json(body)).into_response()
                 }
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
@@ -3999,10 +4002,10 @@ async fn handle_ct_execute_with_diff(
         let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
         crate::journey::capture::record_diff(
             state.app_state.pg_db.clone(),
-            &app_id,
+            crate::journey::cursor::CursorKey::new(app_id, None),
             &body,
             &response,
-            crate::journey::capture::Provenance {
+            crate::journey::cursor::Provenance {
                 app_version,
                 run_id: None,
             },
@@ -4566,9 +4569,9 @@ fn record_sdk_component_action(
 ) {
     crate::journey::capture::record_action(
         state.app_state.pg_db.clone(),
-        app_id,
-        crate::journey::capture::ActionSpec::component(component_id, action_id),
-        crate::journey::capture::Provenance {
+        crate::journey::cursor::CursorKey::new(app_id, None),
+        crate::journey::cursor::ActionSpec::component(component_id, action_id),
+        crate::journey::cursor::Provenance {
             app_version,
             run_id: None,
         },
@@ -4593,15 +4596,15 @@ fn record_sdk_batch(
 ) {
     let (Some((app_id, app_version)), Some(action)) = (
         active_app,
-        crate::journey::capture::ActionSpec::batch(action_steps),
+        crate::journey::cursor::ActionSpec::batch(action_steps),
     ) else {
         return;
     };
     crate::journey::capture::record_action(
         state.app_state.pg_db.clone(),
-        &app_id,
+        crate::journey::cursor::CursorKey::new(app_id, None),
         action,
-        crate::journey::capture::Provenance {
+        crate::journey::cursor::Provenance {
             app_version,
             run_id: None,
         },

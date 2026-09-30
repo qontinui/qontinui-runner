@@ -11,13 +11,15 @@
 //!
 //! Submodules:
 //! - [`node`]      pure node resolution + affordance extraction
-//! - [`capture`]   the choke-point entry points, the pending-edge state
-//!   machine, the schema probe, and the single worker that writes
+//! - [`cursor`]    the pure pending-edge state machine and triggers
+//! - [`capture`]   the choke-point entry points, the schema probe, and the
+//!   single worker that writes
 //! - [`frontier`]  the batched frontier upsert
 //! - [`health`]    `GET /apps/{app_id}/journey/health`
 //! - [`retention`] the runner-side 90-day prune of its own database
 
 pub mod capture;
+pub mod cursor;
 pub mod frontier;
 pub mod health;
 pub mod node;

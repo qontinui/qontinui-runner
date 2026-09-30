@@ -18,14 +18,14 @@
 //! `tokio::spawn`s could run in either order and close an edge with the wrong
 //! destination.
 //!
-//! - **Diff paths write immediately**: the execute-with-diff response carries
-//!   `beforeSnapshot` / `afterSnapshot`, so from/to nodes resolve from those.
-//!   A diff response without them (the WebSocket relay's `{actionResult, diff}`
-//!   shape) degrades to the no-snapshot rule below rather than guessing.
-//! - **No-snapshot paths open a PENDING edge** per `(app_id, runner_instance)`
-//!   whose `from_node` is the last node this runner resolved for the app. The
-//!   next snapshot of that app closes it; a second action arriving first
-//!   closes it with `to_node: None`, `outcome: to_node_unobserved` (D3).
+//! - **Every action opens a PENDING edge** (see [`super::cursor`]) whose
+//!   `from_node` is the last node this runner resolved for the cursor; the
+//!   next control/SDK snapshot of that cursor closes it. Execute-with-diff is
+//!   no exception: its `SemanticSnapshot`s are not a shape the spec evaluator
+//!   reads, so they would be a SECOND node-identity source. A diff contributes
+//!   only an outcome hint (`error` / `settle_timeout`).
+//! - A second action arriving first, or a pending edge older than
+//!   [`super::cursor::PENDING_TTL`], closes as `to_node_unobserved` (D3).
 //!
 //! Node resolution (Phase 0 decision 1) never fetches a snapshot and never
 //! runs on a request path: it evaluates the ONE page spec matched to the
@@ -38,23 +38,23 @@
 //! counted into [`super::health`], which `GET /apps/{app_id}/journey/health`
 //! reports. A ledger that stopped growing must never read as a finished one.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
-use qontinui_types::journey::{
-    ChokePoint, EdgeOutcome, JourneyEdgeObservation, JourneyNode, JourneyTrigger,
-    NavigationTriggerKind, RunKind,
-};
+use qontinui_types::journey::{EdgeOutcome, JourneyEdgeObservation, JourneyNode, RunKind};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::database::pg::PgDb;
 
+use super::cursor::{
+    failure_hint, ActionSpec, CursorKey, Cursors, EdgeDraft, Observed, Provenance,
+};
 use super::frontier;
 use super::health;
 use super::node::{
-    build_node, component_action_fingerprint, extract_affordances, page_identity,
-    present_state_ids, unknown_node, AffordanceIndex, SpecLookup,
+    affordance_digest, build_node, extract_affordances, page_identity, present_state_ids,
+    AffordanceIndex, SpecLookup,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,187 +72,6 @@ pub(crate) fn runner_instance() -> String {
     std::env::var("QONTINUI_RUNNER_ROLE")
         .ok()
         .unwrap_or_else(|| "primary".to_string())
-}
-
-/// One pending-edge slot per app per runner instance.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CursorKey {
-    pub app_id: String,
-    pub runner_instance: String,
-}
-
-impl CursorKey {
-    pub(crate) fn new(app_id: impl Into<String>) -> Self {
-        Self {
-            app_id: app_id.into(),
-            runner_instance: runner_instance(),
-        }
-    }
-}
-
-/// Who acted, as far as the request says. Nothing here is invented: an absent
-/// value is `None` and lands as SQL NULL ("not reported").
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Provenance {
-    /// `SdkAppInfo.version` of the app acted on; `None` = not reported (U4).
-    pub app_version: Option<String>,
-    /// The caller's run: the `task_run_id` query parameter the action routes
-    /// already read for `ui_bridge_events` persistence; `None` when absent.
-    pub run_id: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Triggers
-// ---------------------------------------------------------------------------
-
-/// What an action targeted, by the identifiers the request itself names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TriggerTarget {
-    /// An element, by its registry id (resolved to a fingerprint against the
-    /// snapshot the action was taken from).
-    Element(String),
-    /// A component action.
-    Component {
-        component_id: String,
-        action_id: String,
-    },
-    /// The request named no resolvable target (e.g. a natural-language
-    /// `instruction` on execute-with-diff).
-    Unresolved,
-}
-
-/// An action as a handler describes it. CLOSED over structure: there is no
-/// field for a typed value, and the constructors below read only the action
-/// NAME and the TARGET id out of a request body — never `params`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActionSpec {
-    /// Wire `actionType`: the action verb, a component action id, or
-    /// `batch:<n>`.
-    pub action_type: String,
-    /// The action whose declared effect the trigger carries (a custom action
-    /// id on an element). `None` when no single action applies (a batch).
-    pub effect_action: Option<String>,
-    pub target: TriggerTarget,
-    pub choke_point: ChokePoint,
-}
-
-impl ActionSpec {
-    /// An element action (`/control/element/{id}/action`, the SDK twin).
-    pub(crate) fn element(element_id: &str, action: &str, choke_point: ChokePoint) -> Self {
-        Self {
-            action_type: action.to_string(),
-            effect_action: Some(action.to_string()),
-            target: TriggerTarget::Element(element_id.to_string()),
-            choke_point,
-        }
-    }
-
-    /// A batch of element actions is ONE trigger: `actionType` is
-    /// `batch:<n>` and the target is the FIRST step's element. `None` for an
-    /// empty batch — nothing acted.
-    pub(crate) fn batch(steps: &[serde_json::Value]) -> Option<Self> {
-        let first = steps.first()?;
-        let target = first
-            .get("elementId")
-            .or_else(|| first.get("element_id"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|id| TriggerTarget::Element(id.to_string()))
-            .unwrap_or(TriggerTarget::Unresolved);
-        Some(Self {
-            action_type: format!("batch:{}", steps.len()),
-            effect_action: None,
-            target,
-            choke_point: ChokePoint::BatchAction,
-        })
-    }
-
-    /// A component action.
-    pub(crate) fn component(component_id: &str, action_id: &str) -> Self {
-        Self {
-            action_type: action_id.to_string(),
-            effect_action: None,
-            target: TriggerTarget::Component {
-                component_id: component_id.to_string(),
-                action_id: action_id.to_string(),
-            },
-            choke_point: ChokePoint::ComponentAction,
-        }
-    }
-
-    /// An execute-with-diff request body, in either spelling the routes
-    /// accept (`elementAction: {elementId, action}` or the flat
-    /// `elementId` + `operation`/`action`). A body carrying only an
-    /// `instruction` has no structural target.
-    pub(crate) fn with_diff(body: &serde_json::Value) -> Self {
-        let envelope = body.get("elementAction");
-        let element_id = envelope
-            .and_then(|e| e.get("elementId"))
-            .or_else(|| body.get("elementId"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        let action = envelope
-            .and_then(|e| e.get("action"))
-            .or_else(|| body.get("operation"))
-            .or_else(|| body.get("action"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        let action_type = match (action, body.get("instruction").is_some()) {
-            (Some(a), _) => a.to_string(),
-            (None, true) => "instruction".to_string(),
-            (None, false) => "unknown".to_string(),
-        };
-        Self {
-            effect_action: action.map(String::from),
-            action_type,
-            target: element_id
-                .map(|id| TriggerTarget::Element(id.to_string()))
-                .unwrap_or(TriggerTarget::Unresolved),
-            choke_point: ChokePoint::ExecuteWithDiff,
-        }
-    }
-}
-
-/// Build the wire trigger, resolving the target against the affordances of
-/// the snapshot the action was taken FROM.
-///
-/// An element id absent from that snapshot yields `targetFingerprint: None`
-/// ("not resolved") rather than a fingerprint of something else. A component
-/// action's fingerprint is derived from its ids, so it resolves without a
-/// snapshot; its declared effect still needs one.
-pub(crate) fn resolve_trigger(action: &ActionSpec, from: &AffordanceIndex) -> JourneyTrigger {
-    let (target_fingerprint, target_role, declared_effect) = match &action.target {
-        TriggerTarget::Element(id) => match from.elements.get(id) {
-            Some(el) => (
-                Some(el.affordance.fingerprint.clone()),
-                el.affordance.role.clone(),
-                action
-                    .effect_action
-                    .as_ref()
-                    .and_then(|a| el.action_effects.get(a).copied().flatten()),
-            ),
-            None => (None, None, None),
-        },
-        TriggerTarget::Component {
-            component_id,
-            action_id,
-        } => (
-            Some(component_action_fingerprint(component_id, action_id)),
-            None,
-            from.component_actions
-                .get(&(component_id.clone(), action_id.clone()))
-                .and_then(|a| a.declared_effect),
-        ),
-        TriggerTarget::Unresolved => (None, None, None),
-    };
-    JourneyTrigger {
-        action_type: action.action_type.clone(),
-        target_fingerprint,
-        target_role,
-        declared_effect,
-        navigation_trigger: NavigationTriggerKind::Affordance,
-        choke_point: action.choke_point,
-    }
 }
 
 /// Did a control-route action act on the UI, and did it fail?
@@ -282,164 +101,6 @@ pub(crate) fn control_action_verdict<T: serde::Serialize>(
 /// the ledger's `run_id`.
 pub(crate) fn run_id_from_task_run(task_run_id: Option<i64>) -> Option<String> {
     task_run_id.map(|id| id.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Pending-edge state machine (pure)
-// ---------------------------------------------------------------------------
-
-/// How an edge closed. `failed` wins over a settle timeout, which wins over
-/// the key comparison: an errored action's destination is data, but its
-/// outcome is the error.
-pub(crate) fn outcome_of(
-    from: &JourneyNode,
-    to: Option<&JourneyNode>,
-    failed: bool,
-    settle_timed_out: bool,
-) -> EdgeOutcome {
-    match to {
-        None => EdgeOutcome::ToNodeUnobserved,
-        Some(_) if failed => EdgeOutcome::Error,
-        Some(_) if settle_timed_out => EdgeOutcome::SettleTimeout,
-        Some(to) if to.key() == from.key() => EdgeOutcome::NoChange,
-        Some(_) => EdgeOutcome::Changed,
-    }
-}
-
-/// An edge ready to be finalized into a row.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EdgeDraft {
-    pub key: CursorKey,
-    pub provenance: Provenance,
-    pub from_node: JourneyNode,
-    pub to_node: Option<JourneyNode>,
-    pub trigger: JourneyTrigger,
-    pub outcome: EdgeOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct PendingEdge {
-    from_node: JourneyNode,
-    trigger: JourneyTrigger,
-    failed: bool,
-    provenance: Provenance,
-}
-
-impl PendingEdge {
-    fn close(self, key: &CursorKey, to: Option<JourneyNode>) -> EdgeDraft {
-        let outcome = outcome_of(&self.from_node, to.as_ref(), self.failed, false);
-        EdgeDraft {
-            key: key.clone(),
-            provenance: self.provenance,
-            from_node: self.from_node,
-            to_node: to,
-            trigger: self.trigger,
-            outcome,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct Cursor {
-    last_node: Option<JourneyNode>,
-    last_affordances: AffordanceIndex,
-    pending: Option<PendingEdge>,
-}
-
-/// Per-`(app_id, runner_instance)` journey state: the last node resolved, its
-/// affordances, and at most ONE pending edge.
-#[derive(Debug, Default)]
-pub(crate) struct Cursors {
-    map: HashMap<CursorKey, Cursor>,
-}
-
-impl Cursors {
-    /// An action with no snapshot in hand. Opens a pending edge from the last
-    /// node this runner resolved for the app (an unmodelled unknown node when
-    /// none is known yet — the edge is still recorded, never skipped).
-    ///
-    /// Returns the edge this action DISPLACED: a still-pending previous action
-    /// closes with an unobserved destination.
-    pub(crate) fn open(
-        &mut self,
-        key: &CursorKey,
-        action: &ActionSpec,
-        provenance: Provenance,
-        failed: bool,
-    ) -> Option<EdgeDraft> {
-        let cursor = self.map.entry(key.clone()).or_default();
-        let displaced = cursor.pending.take().map(|p| p.close(key, None));
-        cursor.pending = Some(PendingEdge {
-            from_node: cursor.last_node.clone().unwrap_or_else(unknown_node),
-            trigger: resolve_trigger(action, &cursor.last_affordances),
-            failed,
-            provenance,
-        });
-        displaced
-    }
-
-    /// A snapshot resolved into `node`. Closes the pending edge (if any) with
-    /// `node` as its destination, and makes `node` the from-node of whatever
-    /// comes next.
-    pub(crate) fn observe(
-        &mut self,
-        key: &CursorKey,
-        node: JourneyNode,
-        affordances: AffordanceIndex,
-    ) -> Option<EdgeDraft> {
-        let cursor = self.map.entry(key.clone()).or_default();
-        let closed = cursor
-            .pending
-            .take()
-            .map(|p| p.close(key, Some(node.clone())));
-        cursor.last_node = Some(node);
-        cursor.last_affordances = affordances;
-        closed
-    }
-
-    /// An execute-with-diff with BOTH snapshots in hand. The before-snapshot is
-    /// itself an observation (it closes any pending edge); the diff edge is
-    /// written immediately; the after-snapshot becomes the last node.
-    ///
-    /// Returns the drafts in write order: the closed pending edge (if any),
-    /// then the diff edge.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_immediate(
-        &mut self,
-        key: &CursorKey,
-        from: JourneyNode,
-        from_affordances: AffordanceIndex,
-        to: JourneyNode,
-        to_affordances: AffordanceIndex,
-        action: &ActionSpec,
-        provenance: Provenance,
-        failed: bool,
-        settle_timed_out: bool,
-    ) -> Vec<EdgeDraft> {
-        let trigger = resolve_trigger(action, &from_affordances);
-        let mut drafts: Vec<EdgeDraft> = self
-            .observe(key, from.clone(), from_affordances)
-            .into_iter()
-            .collect();
-        let outcome = outcome_of(&from, Some(&to), failed, settle_timed_out);
-        drafts.push(EdgeDraft {
-            key: key.clone(),
-            provenance,
-            from_node: from,
-            to_node: Some(to.clone()),
-            trigger,
-            outcome,
-        });
-        let cursor = self.map.entry(key.clone()).or_default();
-        cursor.last_node = Some(to);
-        cursor.last_affordances = to_affordances;
-        drafts
-    }
-
-    /// Pending edges currently open, across every app.
-    pub(crate) fn pending_count(&self) -> usize {
-        self.map.values().filter(|c| c.pending.is_some()).count()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,33 +383,28 @@ pub(crate) async fn journey_schema_supported(client: &tokio_postgres::Client) ->
 // ---------------------------------------------------------------------------
 
 /// One thing a handler saw. Carries only what the worker needs; a snapshot
-/// is shared, not copied, with the co-occurrence capture.
+/// is shared (`Arc`), never deep-copied, with the response and the
+/// co-occurrence capture.
 #[derive(Debug)]
 pub(crate) enum JourneyEvent {
-    /// A no-snapshot action (opens a pending edge).
+    /// An action (opens a pending edge). `hint` is the outcome it forces
+    /// (`error` / `settle_timeout`), if any.
     Action {
         key: CursorKey,
         provenance: Provenance,
         action: ActionSpec,
-        failed: bool,
+        hint: Option<EdgeOutcome>,
     },
-    /// A successful snapshot of the app (closes a pending edge).
+    /// A successful, UNFILTERED snapshot of the cursor's page (closes a
+    /// pending edge). May be the SDK's `{success, data}` envelope; the worker
+    /// reads through it ([`snapshot_view`]).
     Snapshot {
         key: CursorKey,
         app_version: Option<String>,
         snapshot: Arc<serde_json::Value>,
     },
-    /// An execute-with-diff. `before` / `after` are `None` when the response
-    /// carried no snapshots; the edge then takes the pending-edge rule.
-    Diff {
-        key: CursorKey,
-        provenance: Provenance,
-        action: ActionSpec,
-        failed: bool,
-        settle_timed_out: bool,
-        before: Option<serde_json::Value>,
-        after: Option<serde_json::Value>,
-    },
+    /// Close every pending edge older than the TTL (the retention tick).
+    Sweep,
 }
 
 /// Events buffered between the handlers and the worker. A snapshot can be
@@ -775,10 +431,10 @@ pub(crate) fn enqueue_edge_observation(pg_db: Arc<PgDb>, event: JourneyEvent) {
     }
 }
 
-/// A no-snapshot action through a choke point.
+/// An action through a choke point. `failed` becomes the `error` hint.
 pub(crate) fn record_action(
     pg_db: Arc<PgDb>,
-    app_id: &str,
+    key: CursorKey,
     action: ActionSpec,
     provenance: Provenance,
     failed: bool,
@@ -786,66 +442,78 @@ pub(crate) fn record_action(
     enqueue_edge_observation(
         pg_db,
         JourneyEvent::Action {
-            key: CursorKey::new(app_id),
+            key,
             provenance,
             action,
-            failed,
+            hint: failure_hint(failed),
         },
     );
 }
 
-/// A successful snapshot of an app.
+/// A successful, unfiltered snapshot.
 pub(crate) fn record_snapshot(
     pg_db: Arc<PgDb>,
-    app_id: &str,
+    key: CursorKey,
     app_version: Option<String>,
     snapshot: Arc<serde_json::Value>,
 ) {
     enqueue_edge_observation(
         pg_db,
         JourneyEvent::Snapshot {
-            key: CursorKey::new(app_id),
+            key,
             app_version,
             snapshot,
         },
     );
 }
 
-/// An execute-with-diff response. Reads `beforeSnapshot`, `afterSnapshot`,
-/// `settleTimedOut` at the top level or under `data` (the in-process SDK
-/// server's `success(result)` envelope).
+/// The outcome hint of an execute-with-diff response: `error` when the route
+/// failed (`failed`) or the diff result's `actionSuccess` is present and not
+/// `true` (top level or under `data`); else `settle_timeout` when
+/// `settleTimedOut` is true; else none (the closing snapshot decides).
+pub(crate) fn diff_outcome_hint(response: &serde_json::Value, failed: bool) -> Option<EdgeOutcome> {
+    let field = |name: &str| {
+        response
+            .get(name)
+            .or_else(|| response.get("data").and_then(|d| d.get(name)))
+            .filter(|v| !v.is_null())
+    };
+    let action_failed = field("actionSuccess").is_some_and(|v| v != &serde_json::Value::Bool(true));
+    if failed || action_failed {
+        return Some(EdgeOutcome::Error);
+    }
+    (field("settleTimedOut").and_then(|v| v.as_bool()) == Some(true))
+        .then_some(EdgeOutcome::SettleTimeout)
+}
+
+/// An execute-with-diff: a pending edge like every other action, carrying
+/// the diff's outcome hint.
 pub(crate) fn record_diff(
     pg_db: Arc<PgDb>,
-    app_id: &str,
+    key: CursorKey,
     request_body: &serde_json::Value,
     response: &serde_json::Value,
     provenance: Provenance,
     failed: bool,
 ) {
-    let field = |name: &str| {
-        response
-            .get(name)
-            .or_else(|| response.get("data").and_then(|d| d.get(name)))
-            .filter(|v| v.is_object())
-            .cloned()
-    };
-    let settle_timed_out = response
-        .get("settleTimedOut")
-        .or_else(|| response.get("data").and_then(|d| d.get("settleTimedOut")))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     enqueue_edge_observation(
         pg_db,
-        JourneyEvent::Diff {
-            key: CursorKey::new(app_id),
+        JourneyEvent::Action {
+            key,
             provenance,
             action: ActionSpec::with_diff(request_body),
-            failed,
-            settle_timed_out,
-            before: field("beforeSnapshot"),
-            after: field("afterSnapshot"),
+            hint: diff_outcome_hint(response, failed),
         },
     );
+}
+
+/// The snapshot inside a body: the SDK `{success, data}` envelope's `data`
+/// when it is an object, else the body itself.
+pub(crate) fn snapshot_view(body: &serde_json::Value) -> &serde_json::Value {
+    match body.get("data") {
+        Some(inner) if inner.is_object() => inner,
+        _ => body,
+    }
 }
 
 async fn run_worker(pg_db: Arc<PgDb>, mut rx: mpsc::Receiver<JourneyEvent>) {
@@ -862,9 +530,9 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             key,
             provenance,
             action,
-            failed,
+            hint,
         } => {
-            if let Some(displaced) = cursors.open(&key, &action, provenance, failed) {
+            if let Some(displaced) = cursors.open(&key, &action, provenance, hint, Instant::now()) {
                 write_edge(pg, displaced).await;
             }
         }
@@ -873,67 +541,24 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             app_version,
             snapshot,
         } => {
-            let node = resolve_node(pg, &key.app_id, app_version, &snapshot).await;
-            let affordances = extract_affordances(&snapshot);
-            let closed = cursors.observe(&key, node.clone(), affordances.clone());
+            let node = resolve_node(pg, &key.app_id, app_version, Arc::clone(&snapshot)).await;
+            let affordances = extract_affordances(snapshot_view(&snapshot));
+            let observed = Observed {
+                node: node.clone(),
+                digest: affordance_digest(&affordances),
+            };
+            let closed = cursors.observe(&key, observed, affordances.clone(), Instant::now());
             let run_id = closed.as_ref().and_then(|d| d.provenance.run_id.clone());
             if let Some(draft) = closed {
                 write_edge(pg, draft).await;
             }
             write_frontier(pg, &key.app_id, &node, &affordances, run_id).await;
         }
-        JourneyEvent::Diff {
-            key,
-            provenance,
-            action,
-            failed,
-            settle_timed_out,
-            before,
-            after,
-        } => match (before, after) {
-            (Some(before), Some(after)) => {
-                let app_version = provenance.app_version.clone();
-                let run_id = provenance.run_id.clone();
-                let from = resolve_node(pg, &key.app_id, app_version.clone(), &before).await;
-                let to = resolve_node(pg, &key.app_id, app_version, &after).await;
-                let from_aff = extract_affordances(&before);
-                let to_aff = extract_affordances(&after);
-                let drafts = cursors.record_immediate(
-                    &key,
-                    from.clone(),
-                    from_aff.clone(),
-                    to.clone(),
-                    to_aff.clone(),
-                    &action,
-                    provenance,
-                    failed,
-                    settle_timed_out,
-                );
-                let mut drafts = drafts.into_iter();
-                let (closed_pending, diff_edge) = match (drafts.next(), drafts.next()) {
-                    (Some(a), Some(b)) => (Some(a), Some(b)),
-                    (Some(only), None) => (None, Some(only)),
-                    _ => (None, None),
-                };
-                if let Some(d) = closed_pending {
-                    write_edge(pg, d).await;
-                }
-                // The from-node's frontier first, so the diff edge's own
-                // frontier DELETE clears the affordance it fired.
-                write_frontier(pg, &key.app_id, &from, &from_aff, run_id.clone()).await;
-                if let Some(d) = diff_edge {
-                    write_edge(pg, d).await;
-                }
-                write_frontier(pg, &key.app_id, &to, &to_aff, run_id).await;
+        JourneyEvent::Sweep => {
+            for draft in cursors.sweep(Instant::now()) {
+                write_edge(pg, draft).await;
             }
-            // No snapshots in the response (the relay shape): the diff route
-            // is still a choke point, so the action opens a pending edge.
-            _ => {
-                if let Some(displaced) = cursors.open(&key, &action, provenance, failed) {
-                    write_edge(pg, displaced).await;
-                }
-            }
-        },
+        }
     }
 }
 
@@ -948,62 +573,46 @@ fn should_warn_spec_lookup_once() -> bool {
 }
 
 /// Resolve a snapshot to its node (Phase 0 decision 1): evaluate the ONE page
-/// spec matched to the snapshot's page, in process, against the snapshot in
-/// hand. Never fetches a snapshot; runs only on the worker.
+/// spec matched to the snapshot's page against the snapshot in hand. Never
+/// fetches a snapshot; runs only on the worker, and the CPU-bound parse and
+/// evaluation run on a blocking thread over the shared snapshot (no copy).
 async fn resolve_node(
     pg: &PgDb,
     app_id: &str,
     app_version: Option<String>,
-    snapshot: &serde_json::Value,
+    snapshot: Arc<serde_json::Value>,
 ) -> JourneyNode {
-    let identity = page_identity(snapshot);
+    let identity = page_identity(snapshot_view(&snapshot));
     let lookup = match identity.spec_lookup_label.clone() {
         None => SpecLookup::NoSpec,
         Some(page_id) => {
-            match crate::spec_api::spec_check::parse_supplied_snapshot(snapshot.clone()) {
-                Ok(parsed) => {
-                    let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
-                        app_id: app_id.to_string(),
-                        app_version,
-                        route: None,
-                        bridge_version: None,
-                        snapshot_timestamp: String::new(),
-                        element_count: parsed.elements.len() as u32,
-                    };
-                    match crate::spec_api::spec_check::evaluate_page_in_process(
-                        pg,
-                        app_id,
-                        &page_id,
-                        &parsed,
-                        fingerprint,
-                    )
-                    .await
-                    {
-                        Ok(Some(result)) => SpecLookup::Evaluated {
-                            spec_id: page_id,
-                            present_state_ids: present_state_ids(&result),
-                        },
-                        Ok(None) => SpecLookup::NoSpec,
-                        Err(e) => {
-                            if should_warn_spec_lookup_once() {
-                                warn!(
-                                    "journey::capture: spec lookup for app {} page {} failed ({}); \
-                                     the node is recorded unmodelled. Warned once per process.",
-                                    app_id, page_id, e
-                                );
-                            }
-                            SpecLookup::NoSpec
-                        }
+            match crate::spec_api::spec_check::load_page_spec(pg, app_id, &page_id).await {
+                Ok(None) => SpecLookup::NoSpec,
+                Err(e) => {
+                    if should_warn_spec_lookup_once() {
+                        warn!(
+                            "journey::capture: spec lookup for app {} page {} failed ({}); \
+                             the node is recorded unmodelled. Warned once per process.",
+                            app_id, page_id, e
+                        );
                     }
+                    SpecLookup::NoSpec
                 }
-                // Not a control snapshot (a `SemanticSnapshot` from a diff):
-                // the evaluator cannot read it, so the node is unmodelled — but
-                // it still names the spec when one exists.
-                Err(_) => {
-                    if spec_exists(pg, app_id, &page_id).await {
-                        SpecLookup::NotEvaluable { spec_id: page_id }
-                    } else {
-                        SpecLookup::NoSpec
+                Ok(Some(loaded)) => {
+                    let app_id = app_id.to_string();
+                    let snap = Arc::clone(&snapshot);
+                    let evaluated = tokio::task::spawn_blocking(move || {
+                        evaluate_present_states(snapshot_view(&snap), &loaded, app_id, app_version)
+                    })
+                    .await;
+                    match evaluated {
+                        Ok(Some(present_state_ids)) => SpecLookup::Evaluated {
+                            spec_id: page_id,
+                            present_state_ids,
+                        },
+                        // Not a canonical control snapshot, or the blocking
+                        // task failed: a spec exists but was not evaluated.
+                        Ok(None) | Err(_) => SpecLookup::NotEvaluable { spec_id: page_id },
                     }
                 }
             }
@@ -1012,21 +621,26 @@ async fn resolve_node(
     build_node(&identity, &lookup)
 }
 
-async fn spec_exists(pg: &PgDb, app_id: &str, page_id: &str) -> bool {
-    if page_id.is_empty()
-        || page_id.contains("..")
-        || page_id.contains('/')
-        || page_id.contains('\\')
-    {
-        return false;
-    }
-    match crate::spec_api::storage::resolve_specs_root(pg, app_id).await {
-        Ok(root) => matches!(
-            crate::spec_api::storage::read_ir(&root, app_id, page_id),
-            Ok(Some(_))
-        ),
-        Err(_) => false,
-    }
+/// Parse the snapshot (borrowing, not copying) and evaluate the loaded spec
+/// against it. `None` when the snapshot is not the canonical control shape.
+fn evaluate_present_states(
+    snapshot: &serde_json::Value,
+    loaded: &crate::spec_api::spec_check::LoadedPageSpec,
+    app_id: String,
+    app_version: Option<String>,
+) -> Option<Vec<String>> {
+    use serde::Deserialize;
+    let parsed = qontinui_types::ui_bridge::UIBridgeSnapshot::deserialize(snapshot).ok()?;
+    let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
+        app_id,
+        app_version,
+        route: None,
+        bridge_version: None,
+        snapshot_timestamp: String::new(),
+        element_count: parsed.elements.len() as u32,
+    };
+    let result = crate::spec_api::spec_check::evaluate_loaded(&parsed, loaded, fingerprint);
+    Some(present_state_ids(&result))
 }
 
 /// Get a pooled connection and the probe's answer, or record why not.
@@ -1125,8 +739,10 @@ async fn write_frontier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journey::cursor::resolve_trigger;
     use crate::journey::node::{Affordance, ElementAffordance};
     use qontinui_types::ir::IrEffect;
+    use qontinui_types::journey::ChokePoint;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1134,6 +750,7 @@ mod tests {
         CursorKey {
             app_id: "qontinui-web".into(),
             runner_instance: "primary".into(),
+            scope: None,
         }
     }
 
@@ -1146,227 +763,44 @@ mod tests {
         )
     }
 
+    fn seen(spec: &str, states: &[&str]) -> Observed {
+        Observed {
+            node: node(spec, states),
+            digest: "d".into(),
+        }
+    }
+
     fn click(id: &str) -> ActionSpec {
         ActionSpec::element(id, "click", ChokePoint::ElementAction)
     }
 
     fn affordances_with(id: &str, fp: &str) -> AffordanceIndex {
         let mut idx = AffordanceIndex::default();
-        let mut action_effects = BTreeMap::new();
-        action_effects.insert("wipe".to_string(), Some(IrEffect::Destructive));
         idx.elements.insert(
             id.to_string(),
             ElementAffordance {
                 affordance: Affordance {
                     fingerprint: fp.to_string(),
                     role: Some("button".into()),
-                    declared_effect: Some(IrEffect::Destructive),
+                    declared_effect: Some(IrEffect::Write),
+                    navigation: false,
                 },
-                action_effects,
+                action_effects: BTreeMap::new(),
             },
         );
         idx
-    }
-
-    // ---- pending-edge state machine -------------------------------------
-
-    #[test]
-    fn an_action_then_a_snapshot_closes_one_changed_edge() {
-        let mut c = Cursors::default();
-        assert!(c
-            .observe(
-                &key(),
-                node("home", &["idle"]),
-                affordances_with("b", "fp-b")
-            )
-            .is_none());
-        assert!(c
-            .open(&key(), &click("b"), Provenance::default(), false)
-            .is_none());
-        assert_eq!(c.pending_count(), 1);
-        let edge = c
-            .observe(
-                &key(),
-                node("detail", &["open"]),
-                AffordanceIndex::default(),
-            )
-            .expect("the snapshot closes the pending edge");
-        assert_eq!(c.pending_count(), 0);
-        assert_eq!(edge.outcome, EdgeOutcome::Changed);
-        assert_eq!(edge.from_node.key(), "home#idle");
-        assert_eq!(
-            edge.to_node.as_ref().map(|n| n.key()).as_deref(),
-            Some("detail#open")
-        );
-        assert_eq!(edge.trigger.target_fingerprint.as_deref(), Some("fp-b"));
-        assert_eq!(edge.trigger.target_role.as_deref(), Some("button"));
-        assert_eq!(edge.trigger.choke_point, ChokePoint::ElementAction);
-    }
-
-    #[test]
-    fn a_dead_click_is_a_no_change_row_not_an_absent_one() {
-        let mut c = Cursors::default();
-        c.observe(&key(), node("home", &["idle"]), AffordanceIndex::default());
-        c.open(&key(), &click("b"), Provenance::default(), false);
-        let edge = c
-            .observe(&key(), node("home", &["idle"]), AffordanceIndex::default())
-            .unwrap();
-        assert_eq!(edge.outcome, EdgeOutcome::NoChange);
-        assert!(finalize(edge).validate().is_ok());
-    }
-
-    #[test]
-    fn a_second_action_overwrites_the_first_as_unobserved() {
-        let mut c = Cursors::default();
-        c.observe(&key(), node("home", &["idle"]), AffordanceIndex::default());
-        assert!(c
-            .open(&key(), &click("a"), Provenance::default(), false)
-            .is_none());
-        let displaced = c
-            .open(&key(), &click("b"), Provenance::default(), false)
-            .expect("the first pending edge is displaced");
-        assert_eq!(displaced.outcome, EdgeOutcome::ToNodeUnobserved);
-        assert!(displaced.to_node.is_none());
-        assert_eq!(
-            c.pending_count(),
-            1,
-            "the second action is now the pending one"
-        );
-        // The second edge still starts at the last OBSERVED node: nothing was
-        // seen between the two actions.
-        let second = c
-            .observe(&key(), node("x", &["y"]), AffordanceIndex::default())
-            .unwrap();
-        assert_eq!(second.from_node.key(), "home#idle");
-        assert_eq!(second.trigger.action_type, "click");
-    }
-
-    #[test]
-    fn an_action_before_any_snapshot_starts_at_an_unknown_node() {
-        let mut c = Cursors::default();
-        c.open(&key(), &click("b"), Provenance::default(), false);
-        let edge = c
-            .observe(&key(), node("home", &["idle"]), AffordanceIndex::default())
-            .unwrap();
-        assert_eq!(edge.from_node.key(), "unmodelled:unknown");
-        assert_eq!(
-            edge.trigger.target_fingerprint, None,
-            "no snapshot → unresolved target"
-        );
-        assert!(finalize(edge).validate().is_ok());
-    }
-
-    #[test]
-    fn a_failed_action_closes_as_error() {
-        let mut c = Cursors::default();
-        c.observe(&key(), node("home", &["idle"]), AffordanceIndex::default());
-        c.open(&key(), &click("b"), Provenance::default(), true);
-        let edge = c
-            .observe(&key(), node("home", &["idle"]), AffordanceIndex::default())
-            .unwrap();
-        assert_eq!(edge.outcome, EdgeOutcome::Error);
-    }
-
-    #[test]
-    fn apps_have_independent_pending_edges() {
-        let mut c = Cursors::default();
-        let other = CursorKey {
-            app_id: "qontinui-runner".into(),
-            runner_instance: "primary".into(),
-        };
-        c.open(&key(), &click("a"), Provenance::default(), false);
-        assert!(c
-            .open(&other, &click("b"), Provenance::default(), false)
-            .is_none());
-        assert_eq!(c.pending_count(), 2);
-    }
-
-    // ---- diff path -------------------------------------------------------
-
-    #[test]
-    fn a_diff_writes_one_edge_and_moves_the_cursor() {
-        let mut c = Cursors::default();
-        let action = ActionSpec::with_diff(&json!({"elementId": "b", "operation": "wipe"}));
-        let drafts = c.record_immediate(
-            &key(),
-            node("home", &["idle"]),
-            affordances_with("b", "fp-b"),
-            node("home", &["empty"]),
-            AffordanceIndex::default(),
-            &action,
-            Provenance {
-                app_version: Some("1.2.3".into()),
-                run_id: Some("42".into()),
-            },
-            false,
-            false,
-        );
-        assert_eq!(drafts.len(), 1);
-        let edge = &drafts[0];
-        assert_eq!(edge.outcome, EdgeOutcome::Changed);
-        assert_eq!(edge.trigger.choke_point, ChokePoint::ExecuteWithDiff);
-        assert_eq!(edge.trigger.action_type, "wipe");
-        assert_eq!(edge.trigger.declared_effect, Some(IrEffect::Destructive));
-        assert_eq!(edge.provenance.run_id.as_deref(), Some("42"));
-        // The after-node is the from-node of the next action.
-        c.open(&key(), &click("z"), Provenance::default(), false);
-        let next = c
-            .observe(&key(), node("q", &["r"]), AffordanceIndex::default())
-            .unwrap();
-        assert_eq!(next.from_node.key(), "home#empty");
-    }
-
-    #[test]
-    fn a_diff_before_snapshot_closes_a_pending_edge_first() {
-        let mut c = Cursors::default();
-        c.observe(&key(), node("a", &["1"]), AffordanceIndex::default());
-        c.open(&key(), &click("x"), Provenance::default(), false);
-        let drafts = c.record_immediate(
-            &key(),
-            node("b", &["2"]),
-            AffordanceIndex::default(),
-            node("b", &["2"]),
-            AffordanceIndex::default(),
-            &ActionSpec::with_diff(&json!({"elementId": "y", "action": "click"})),
-            Provenance::default(),
-            false,
-            true,
-        );
-        assert_eq!(drafts.len(), 2);
-        assert_eq!(drafts[0].to_node.as_ref().unwrap().key(), "b#2");
-        assert_eq!(drafts[0].outcome, EdgeOutcome::Changed);
-        assert_eq!(drafts[1].outcome, EdgeOutcome::SettleTimeout);
-    }
-
-    #[test]
-    fn outcome_precedence() {
-        let a = node("a", &["1"]);
-        let b = node("b", &["1"]);
-        assert_eq!(
-            outcome_of(&a, None, true, true),
-            EdgeOutcome::ToNodeUnobserved
-        );
-        assert_eq!(outcome_of(&a, Some(&b), true, true), EdgeOutcome::Error);
-        assert_eq!(
-            outcome_of(&a, Some(&b), false, true),
-            EdgeOutcome::SettleTimeout
-        );
-        assert_eq!(
-            outcome_of(&a, Some(&a), false, false),
-            EdgeOutcome::NoChange
-        );
-        assert_eq!(outcome_of(&a, Some(&b), false, false), EdgeOutcome::Changed);
     }
 
     // ---- row construction -------------------------------------------------
 
     #[test]
     fn an_unobserved_edge_binds_sql_null_never_json_null() {
+        let now = Instant::now();
         let mut c = Cursors::default();
-        c.observe(&key(), node("a", &["1"]), AffordanceIndex::default());
-        c.open(&key(), &click("x"), Provenance::default(), false);
+        c.observe(&key(), seen("a", &["1"]), AffordanceIndex::default(), now);
+        c.open(&key(), &click("x"), Provenance::default(), None, now);
         let displaced = c
-            .open(&key(), &click("y"), Provenance::default(), false)
+            .open(&key(), &click("y"), Provenance::default(), None, now)
             .unwrap();
         let binds = edge_insert(&finalize(displaced)).expect("a valid row");
         assert_eq!(binds.to_node, None, "to_node must bind SQL NULL");
@@ -1376,11 +810,17 @@ mod tests {
 
     #[test]
     fn an_observed_edge_binds_its_nodes_as_objects() {
+        let now = Instant::now();
         let mut c = Cursors::default();
-        c.observe(&key(), node("a", &["1"]), affordances_with("x", "fp-x"));
-        c.open(&key(), &click("x"), Provenance::default(), false);
+        c.observe(
+            &key(),
+            seen("a", &["1"]),
+            affordances_with("x", "fp-x"),
+            now,
+        );
+        c.open(&key(), &click("x"), Provenance::default(), None, now);
         let edge = c
-            .observe(&key(), node("b", &["2"]), AffordanceIndex::default())
+            .observe(&key(), seen("b", &["2"]), AffordanceIndex::default(), now)
             .unwrap();
         let binds = edge_insert(&finalize(edge)).unwrap();
         assert!(binds.from_node.is_object());
@@ -1477,6 +917,127 @@ mod tests {
         let ok: Result<_, (StatusCode, Json<ApiResponse<()>>)> =
             Ok(Json(ApiResponse::success(serde_json::json!({}))));
         assert_eq!(control_action_verdict(&ok), Some(false));
+    }
+
+    // ---- diff outcome hint (M5, m4) -----------------------------------------
+
+    #[test]
+    fn diff_hint_follows_the_route_failure_rule() {
+        let ok = json!({"actionSuccess": true, "settleTimedOut": false});
+        assert_eq!(diff_outcome_hint(&ok, false), None);
+        assert_eq!(
+            diff_outcome_hint(&ok, true),
+            Some(EdgeOutcome::Error),
+            "success:false"
+        );
+        let action_failed = json!({"success": true, "data": {"actionSuccess": false}});
+        assert_eq!(
+            diff_outcome_hint(&action_failed, false),
+            Some(EdgeOutcome::Error)
+        );
+        let settle = json!({"data": {"actionSuccess": true, "settleTimedOut": true}});
+        assert_eq!(
+            diff_outcome_hint(&settle, false),
+            Some(EdgeOutcome::SettleTimeout)
+        );
+        let relay = json!({"actionResult": {}, "diff": {}});
+        assert_eq!(
+            diff_outcome_hint(&relay, false),
+            None,
+            "absent means undecided"
+        );
+    }
+
+    /// M5: ONE node-identity source. The same page, seen through the control
+    /// snapshot route and through the SDK's `{success, data}` envelope,
+    /// resolves to one key — and a diff-path action closes onto that key.
+    #[test]
+    fn the_same_page_resolves_to_one_key_regardless_of_path() {
+        let page = json!({
+            "activeTab": "settings",
+            "page": {"pathname": "/", "route": {"pattern": "/settings"}},
+            "elements": [{"id": "b", "label": "Save", "actions": ["click"]}]
+        });
+        let enveloped = json!({"success": true, "data": page.clone()});
+        let control = build_node(&page_identity(snapshot_view(&page)), &SpecLookup::NoSpec);
+        let sdk = build_node(
+            &page_identity(snapshot_view(&enveloped)),
+            &SpecLookup::NoSpec,
+        );
+        assert_eq!(control.key(), sdk.key());
+        assert_eq!(
+            affordance_digest(&extract_affordances(snapshot_view(&page))),
+            affordance_digest(&extract_affordances(snapshot_view(&enveloped)))
+        );
+
+        let now = Instant::now();
+        let mut c = Cursors::default();
+        let observed = |n: &JourneyNode, v: &serde_json::Value| Observed {
+            node: n.clone(),
+            digest: affordance_digest(&extract_affordances(snapshot_view(v))),
+        };
+        c.observe(
+            &key(),
+            observed(&control, &page),
+            extract_affordances(&page),
+            now,
+        );
+        c.open(
+            &key(),
+            &ActionSpec::with_diff(&json!({"elementId": "b", "action": "click"})),
+            Provenance::default(),
+            diff_outcome_hint(&json!({"actionSuccess": true}), false),
+            now,
+        );
+        let edge = c
+            .observe(
+                &key(),
+                observed(&sdk, &enveloped),
+                extract_affordances(snapshot_view(&enveloped)),
+                now,
+            )
+            .unwrap();
+        assert_eq!(edge.from_node.key(), edge.to_node.unwrap().key());
+        assert_eq!(edge.outcome, EdgeOutcome::NoChange);
+    }
+
+    // ---- schema probe cache (M1) --------------------------------------------
+
+    #[test]
+    fn a_failed_probe_is_not_cached_past_the_backoff() {
+        let t0 = std::time::Instant::now();
+        let failed = SchemaProbe::Failed {
+            error: "connection reset".into(),
+        };
+        let cache = cache_after(&failed, t0);
+        assert_eq!(
+            cached_answer(&cache, t0 + std::time::Duration::from_secs(1)),
+            Some(failed.clone()),
+            "inside the backoff the failure is reused (no probe storm)"
+        );
+        assert_eq!(
+            cached_answer(&cache, t0 + PROBE_RETRY_BACKOFF),
+            None,
+            "after the backoff the next call probes again"
+        );
+    }
+
+    #[test]
+    fn present_and_absent_are_settled() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(86_400);
+        for answer in [
+            SchemaProbe::Present,
+            SchemaProbe::Absent {
+                missing: vec!["project.journey_frontier"],
+            },
+        ] {
+            assert_eq!(
+                cached_answer(&cache_after(&answer, t0), later),
+                Some(answer)
+            );
+        }
+        assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
     }
 
     // ---- choke-point coverage -----------------------------------------------
@@ -1590,87 +1151,6 @@ mod tests {
         assert!(item_body(&sdk, "record_sdk_batch").contains("ActionSpec::batch("));
     }
 
-    // ---- schema probe cache (M1) --------------------------------------------
-
-    #[test]
-    fn a_failed_probe_is_not_cached_past_the_backoff() {
-        let t0 = std::time::Instant::now();
-        let failed = SchemaProbe::Failed {
-            error: "connection reset".into(),
-        };
-        let cache = cache_after(&failed, t0);
-        assert_eq!(
-            cached_answer(&cache, t0 + std::time::Duration::from_secs(1)),
-            Some(failed.clone()),
-            "inside the backoff the failure is reused (no probe storm)"
-        );
-        assert_eq!(
-            cached_answer(&cache, t0 + PROBE_RETRY_BACKOFF),
-            None,
-            "after the backoff the next call probes again"
-        );
-    }
-
-    #[test]
-    fn present_and_absent_are_settled() {
-        let t0 = std::time::Instant::now();
-        let later = t0 + std::time::Duration::from_secs(86_400);
-        for answer in [
-            SchemaProbe::Present,
-            SchemaProbe::Absent {
-                missing: vec!["project.journey_frontier"],
-            },
-        ] {
-            assert_eq!(
-                cached_answer(&cache_after(&answer, t0), later),
-                Some(answer)
-            );
-        }
-        assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
-    }
-
-    // ---- request parsing ---------------------------------------------------
-
-    #[test]
-    fn a_batch_is_one_trigger_on_its_first_target() {
-        let steps = vec![
-            json!({"elementId": "first", "action": "type", "params": {"text": "x"}}),
-            json!({"elementId": "second", "action": "click"}),
-        ];
-        let spec = ActionSpec::batch(&steps).unwrap();
-        assert_eq!(spec.action_type, "batch:2");
-        assert_eq!(spec.target, TriggerTarget::Element("first".into()));
-        assert_eq!(spec.choke_point, ChokePoint::BatchAction);
-        assert!(
-            ActionSpec::batch(&[]).is_none(),
-            "an empty batch acted on nothing"
-        );
-    }
-
-    #[test]
-    fn a_component_trigger_fingerprint_matches_the_frontier_key() {
-        let t = resolve_trigger(
-            &ActionSpec::component("grid", "purge"),
-            &AffordanceIndex::default(),
-        );
-        assert_eq!(
-            t.target_fingerprint.as_deref(),
-            Some("component:grid:purge")
-        );
-        assert_eq!(t.choke_point, ChokePoint::ComponentAction);
-    }
-
-    #[test]
-    fn with_diff_reads_both_spellings() {
-        let a =
-            ActionSpec::with_diff(&json!({"elementAction": {"elementId": "e", "action": "click"}}));
-        assert_eq!(a.target, TriggerTarget::Element("e".into()));
-        assert_eq!(a.action_type, "click");
-        let b = ActionSpec::with_diff(&json!({"instruction": "open the settings"}));
-        assert_eq!(b.target, TriggerTarget::Unresolved);
-        assert_eq!(b.action_type, "instruction");
-    }
-
     // ---- privacy -----------------------------------------------------------
 
     /// Typed text never reaches a row: the sentinel is typed through an action
@@ -1700,27 +1180,42 @@ mod tests {
         let before = snapshot("");
         let after = snapshot(SENTINEL);
 
+        let now = Instant::now();
         let mut c = Cursors::default();
-        let from_identity = page_identity(&before);
-        let from = build_node(&from_identity, &SpecLookup::NoSpec);
-        c.observe(&key(), from.clone(), extract_affordances(&before));
-        c.open(&key(), &spec, Provenance::default(), false);
-        let to_identity = page_identity(&after);
-        let to = build_node(&to_identity, &SpecLookup::NoSpec);
+        let from = build_node(&page_identity(&before), &SpecLookup::NoSpec);
+        let from_aff = extract_affordances(&before);
+        c.observe(
+            &key(),
+            Observed {
+                node: from.clone(),
+                digest: affordance_digest(&from_aff),
+            },
+            from_aff.clone(),
+            now,
+        );
+        c.open(&key(), &spec, Provenance::default(), None, now);
+        let to = build_node(&page_identity(&after), &SpecLookup::NoSpec);
+        let to_aff = extract_affordances(&after);
         let edge = c
-            .observe(&key(), to.clone(), extract_affordances(&after))
+            .observe(
+                &key(),
+                Observed {
+                    node: to.clone(),
+                    digest: affordance_digest(&to_aff),
+                },
+                to_aff.clone(),
+                now,
+            )
             .unwrap();
 
         let row = serde_json::to_string(&finalize(edge.clone())).unwrap();
         let binds = edge_insert(&finalize(edge)).unwrap();
-        let frontier_after =
-            frontier::frontier_batch("qontinui-web", &to, &extract_affordances(&after), None)
-                .unwrap()
-                .unwrap();
-        let frontier_before =
-            frontier::frontier_batch("qontinui-web", &from, &extract_affordances(&before), None)
-                .unwrap()
-                .unwrap();
+        let frontier_after = frontier::frontier_batch("qontinui-web", &to, &to_aff, None)
+            .unwrap()
+            .unwrap();
+        let frontier_before = frontier::frontier_batch("qontinui-web", &from, &from_aff, None)
+            .unwrap()
+            .unwrap();
 
         for (what, text) in [
             ("edge row", row),
