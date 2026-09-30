@@ -201,9 +201,18 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     "src-tauri/scripts/generate_types.sh"
     # In-repo path dependencies of the crate `export_schemas` links into
     # (`qontinui-db = { path = "./clorinde" }`,
-    #  `qontinui-spec-check = { path = "../crates/spec-check" }`).
+    #  `qontinui-spec-check = { path = "../crates/spec-check" }`,
+    #  `qontinui-runner-stats = { path = "../crates/runner-stats" }`,
+    #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`), and the
+    # vendored crate the root manifest's `[patch.crates-io]` substitutes into
+    # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
+    # crates were missing until 2026-09-30: an edit to either cleared a guilty
+    # pusher. Re-check against `grep 'path = ' */Cargo.toml` when adding one.
     "src-tauri/clorinde"
     "crates/spec-check"
+    "crates/runner-stats"
+    "crates/runner-win32"
+    "vendor"
     "Cargo.toml"
     "Cargo.lock"
     # The compiler that expands the `schemars` derive. A channel bump is a real
@@ -228,6 +237,9 @@ GEN_EVENTS_PREMISE_PATHS=(
     ":(glob)src-tauri/src/**/*.rs"
     ":(glob)src-tauri/clorinde/**/*.rs"
     ":(glob)crates/spec-check/**/*.rs"
+    ":(glob)crates/runner-stats/**/*.rs"
+    ":(glob)crates/runner-win32/**/*.rs"
+    ":(glob)vendor/**/*.rs"
 )
 
 # Build scripts the export build runs. A build script can read a markdown file
@@ -237,6 +249,9 @@ GEN_EVENTS_PREMISE_BUILD_SCRIPTS=(
     ":(glob)src-tauri/src/**/build.rs"
     ":(glob)src-tauri/clorinde/**/build.rs"
     ":(glob)crates/spec-check/**/build.rs"
+    ":(glob)crates/runner-stats/**/build.rs"
+    ":(glob)crates/runner-win32/**/build.rs"
+    ":(glob)vendor/**/build.rs"
 )
 
 # `git grep` in the WORKING TREE of $1, untracked and gitignored files included
@@ -272,8 +287,13 @@ gen_events_premise_grep() {
 # Paths in both of two newline lists, one per line. `comm` over sorted lists
 # rather than a `for f in $list` loop, which would word-split a path with a
 # space.
+#
+# The inputs are fed by `printf` alone — a builtin with no failure to lose
+# inside `<(..)` — so `comm`'s own status, which the caller checks, is the
+# only one that matters. An empty list becomes one empty line, which can
+# only intersect as an empty line, and the caller skips those.
 _gen_events_both() {
-    LC_ALL=C comm -12 <(printf '%s\n' "$1" | sed '/^$/d') <(printf '%s\n' "$2" | sed '/^$/d')
+    LC_ALL=C comm -12 <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
 # One file-level arm: print "<path>: $1" for each path in both lists $2 and $3.
@@ -319,7 +339,7 @@ gen_events_markdown_premise_violations() {
     # `path=` sit beside `.md"` literals in four real files, and would drop
     # the exclusion on every decision.
     as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"' | LC_ALL=C sort)" || probe_failed=1
-    inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | sed '/^$/d' | LC_ALL=C sort -u)"
+    inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | LC_ALL=C sort -u)" || probe_failed=1
 
     # A failed probe prints its ERROR line into whichever list it fed, and
     # `sort` returns 0 over it — so the lists are scanned, not just the flags.
@@ -428,8 +448,8 @@ _gen_events_read_z() {
 #   ATTRIBUTION_TOUCHED newline-separated codegen inputs this push touches
 #   ATTRIBUTION_TOUCHED_DETAIL  the same paths as `<path><TAB><source>` lines,
 #                       source one of `committed` (in merge-base..HEAD),
-#                       `uncommitted` (staged or unstaged, `git diff HEAD`) or
-#                       `untracked`. A path in several sources gets one line
+#                       `staged` (`git diff --cached HEAD`), `unstaged`
+#                       (working tree against the index) or `untracked`. A path in several sources gets one line
 #                       per source — see the computation for why. Paths are
 #                       raw, never C-quoted; one holding a tab or newline
 #                       appears in its `printf %q` form (`$'a\tb.rs'`).
@@ -475,15 +495,6 @@ gen_events_attribution() {
         return 0
     fi
 
-    # Three sources, because a push carries all three: commits already made,
-    # anything staged or unstaged (this hook also runs at pre-commit), and
-    # brand-new untracked sources that a `git diff` cannot see.
-    #
-    # Kept apart rather than merged at once, because they are not equally the
-    # push's. Only `committed` is IN the push; the other two are the pusher's
-    # working tree, which the regeneration reads — so they still make the
-    # verdict `mine` — but which the author may not realise is involved (#1667
-    # was blamed for a dirty Cargo.lock it never pushed). The detail says which.
     # The markdown exclusion applies only while its premise holds for the tree
     # being attributed. `&& rc=0 || rc=$?` rather than a bare assignment: the
     # hook runs under `set -e`, and a non-zero here is an answer, not a crash.
@@ -511,17 +522,36 @@ gen_events_attribution() {
     # label then names a file that does not exist. `--no-renames` so both
     # halves of a rename are listed: the old path's disappearance moves the
     # bindings as surely as the new path's arrival.
+    #
+    # Four sources, because a push or a commit carries them all: commits
+    # already made, staged changes, unstaged changes, and brand-new untracked
+    # sources that a `git diff` cannot see. Kept apart rather than merged,
+    # because they are not equally the pusher's: only `committed` is IN a
+    # push, and only `staged` is in the commit being made at pre-commit. The
+    # rest is working tree, which the regeneration reads — so it still makes
+    # the verdict `mine` — but which the author may not realise is involved
+    # (#1667 was blamed for a dirty Cargo.lock it never pushed).
+    #
+    # Staged and unstaged are two calls (`--cached`, then working tree against
+    # the index) rather than one `git diff HEAD`, because at pre-commit that
+    # line IS the question "is it in this commit?". Their union covers
+    # everything `git diff HEAD` did, and slightly more (a path staged and
+    # then reverted in the working tree) — the wider, safe direction.
     local touched_lines="" detail_lines="" src
-    for src in committed uncommitted untracked; do
+    for src in committed staged unstaged untracked; do
         case "$src" in
             committed)
                 _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z "$ATTRIBUTION_BASE_SHA" HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so this push's commits could not be read"; return 0; } ;;
-            uncommitted)
-                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z HEAD \
+            staged)
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
-                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff HEAD failed, so the working tree could not be read"; return 0; } ;;
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD failed, so the staged changes could not be read"; return 0; } ;;
+            unstaged)
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff (working tree) failed, so the unstaged changes could not be read"; return 0; } ;;
             untracked)
                 _gen_events_read_z < <(git -C "$repo" ls-files --others --exclude-standard -z \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
@@ -561,6 +591,11 @@ gen_events_attribution() {
 # self-test can pin it: which lead line, and which label on which file. Reads
 # the ATTRIBUTION_* variables a `mine` decision set.
 #
+# Stage-aware. The hook runs at pre-commit AND pre-push, and "this push" is
+# false at pre-commit: there the staged input IS the change being made.
+# pre-commit sets PRE_COMMIT_TO_REF only for a push (lib/push-range.sh reads
+# it the same way), so its absence means a commit or a manual run.
+#
 # It prints no commands. Earlier versions printed a set-aside recipe (a
 # tag-found stash, then a clean-worktree route), and each revision still had a
 # case where following it did damage in a stash shared by every worktree —
@@ -568,29 +603,46 @@ gen_events_attribution() {
 # entry behind. What to do with local state is the pusher's call; the message
 # states the facts that call needs.
 gen_events_render_mine() {
-    local p src label has_committed=0 has_local=0
+    local stage="commit" p src label own=0 earlier=0 local_only=0
+    [ -n "${PRE_COMMIT_TO_REF:-}" ] && stage="push"
+
+    # `own`: something in the change being made (committed for a push, staged
+    # for a commit). `earlier`: commits already on the branch, at pre-commit.
+    # `local_only`: working tree outside that change.
     while IFS=$'\t' read -r p src; do
         [ -n "$p" ] || continue
-        if [ "$src" = "committed" ]; then has_committed=1; else has_local=1; fi
+        case "$stage:$src" in
+            push:committed|commit:staged) own=1 ;;
+            commit:committed)             earlier=1 ;;
+            *)                            local_only=1 ;;
+        esac
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
 
-    # "This push" is only true of committed entries. With none, the drift is
-    # still the pusher's to look at — the regen read their working tree — but
-    # saying their PUSH changed the inputs would be the false claim #1667 met.
-    if [ "$has_committed" = "1" ]; then
-        echo "This push changes sources that feed them, so the diff below is yours."
+    # Name the change as what it is. With nothing of its own, the drift is
+    # still the author's to look at — the regen read their tree — but saying
+    # THIS change moved the inputs would be the false claim #1667 met.
+    if [ "$own" = "1" ]; then
+        echo "This $stage changes sources that feed them, so the diff below is yours."
+    elif [ "$earlier" = "1" ]; then
+        echo "Commits already on this branch (not this commit) change sources that feed"
+        echo "them, so the diff below is yours to check."
     else
-        echo "Your working tree (not this push's commits) changes sources that feed them,"
+        echo "Your working tree (not this $stage's changes) changes sources that feed them,"
         echo "so the diff below is yours to check."
     fi
     echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
     while IFS=$'\t' read -r p src; do
         [ -n "$p" ] || continue
-        case "$src" in
-            committed)   label="committed in this push" ;;
-            uncommitted) label="uncommitted changes — not part of this push" ;;
-            untracked)   label="untracked — not part of this push" ;;
-            *)           label="source unknown: '$src'" ;;
+        case "$stage:$src" in
+            push:committed)   label="committed in this push" ;;
+            push:staged)      label="staged, not committed — not part of this push" ;;
+            push:unstaged)    label="uncommitted changes — not part of this push" ;;
+            push:untracked)   label="untracked — not part of this push" ;;
+            commit:committed) label="already committed on this branch" ;;
+            commit:staged)    label="staged for this commit" ;;
+            commit:unstaged)  label="unstaged — not in this commit" ;;
+            commit:untracked) label="untracked — not in this commit" ;;
+            *)                label="source unknown: '$src'" ;;
         esac
         echo "    $p  ($label)"
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
@@ -602,11 +654,19 @@ gen_events_render_mine() {
        && printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qE "\.md'?\$"; then
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
     fi
-    if [ "$has_local" = "1" ]; then
-        echo "Inputs marked 'not part of this push' are local working-tree state that the"
-        echo "regeneration read. If they are unintended, set them aside so the working tree"
-        echo "matches HEAD and push again; if the drift then disappears, it came from them,"
-        echo "not from this push."
+    # Working tree outside the change being made. At pre-push that is staged,
+    # unstaged and untracked input; at pre-commit, unstaged and untracked.
+    if [ "$local_only" = "1" ]; then
+        if [ "$stage" = "push" ]; then
+            echo "Inputs marked 'not part of this push' are local working-tree state that the"
+            echo "regeneration read. If they are unintended, set them aside so the working tree"
+            echo "matches HEAD and push again; if the drift then disappears, it came from them,"
+            echo "not from this push."
+        else
+            echo "Inputs marked 'not in this commit' are working-tree state that the"
+            echo "regeneration read although this commit does not carry them. If the drift"
+            echo "is theirs, it will follow you to the push unless they are dealt with."
+        fi
     fi
     echo "Part of the diff may still be pre-existing — the baseline is a build"
     echo "artifact in a shared checkout and may have been behind before you began."

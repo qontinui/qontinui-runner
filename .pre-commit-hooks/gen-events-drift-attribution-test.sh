@@ -251,16 +251,16 @@ fixture
 printf '// dirty\n' >> "$WORK/src-tauri/src/lib.rs"
 decide
 check "an UNSTAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
-check "  and it is labelled uncommitted" \
-    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  and it is labelled unstaged" \
+    "$(detail_line src-tauri/src/lib.rs unstaged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 printf '// staged\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add -A >/dev/null
 decide
 check "a STAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
-check "  and it is labelled uncommitted" \
-    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  and it is labelled staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 # A new module is invisible to `git diff`, which is why the library also
 # consults `ls-files --others`. Without that arm this case reads as innocent.
@@ -321,7 +321,8 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # in-repo path dependency or the toolchain pin can move it without any
 # `src-tauri/src` file changing. Pinned here because the asymmetry only works
 # while the list stays complete — a narrowed list clears a guilty pusher.
-for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml; do
+for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
+    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs; do
     fixture
     commit_change "$input" "# touched"
     decide
@@ -465,7 +466,7 @@ printf '# dirty\n' >> "$WORK/Cargo.lock"
 decide
 check "committed lib.rs + dirty Cargo.lock is still MINE" "mine" "$ATTRIBUTION_STATE"
 check "  and the detail tells the two sources apart" \
-    "$(detail_line Cargo.lock uncommitted)"$'\n'"$(detail_line src-tauri/src/lib.rs committed)" \
+    "$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs committed)" \
     "$ATTRIBUTION_TOUCHED_DETAIL"
 check "  while the flat list is unchanged" \
     "Cargo.lock"$'\n'"src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
@@ -476,7 +477,7 @@ commit_change "src-tauri/src/lib.rs" "// committed"
 printf '// and dirty\n' >> "$WORK/src-tauri/src/lib.rs"
 decide
 check "a committed AND dirty path is listed under both sources" \
-    "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)" \
+    "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs unstaged)" \
     "$ATTRIBUTION_TOUCHED_DETAIL"
 check "  but once in the flat list" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
 
@@ -679,7 +680,8 @@ shim_case() {
         "$(grep -qF -- "$want_reason" "$WORK/.state" && echo yes || echo no)"
 }
 shim_case "git diff base..HEAD" '*" diff --name-only --no-renames -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so this push's commits"
-shim_case "git diff HEAD"       '*" diff --name-only --no-renames -z HEAD -- "*'          "git diff HEAD failed"
+shim_case "git diff --cached"   '*" diff --name-only --no-renames -z --cached HEAD -- "*' "git diff --cached HEAD failed"
+shim_case "git diff (worktree)" '*" diff --name-only --no-renames -z -- "*'             "git diff (working tree) failed"
 shim_case "git ls-files"        '*" ls-files "*'                              "ls-files --others failed"
 
 # The premise probe failing is treated as a violation: exclusion dropped.
@@ -693,6 +695,23 @@ check "  and says the probe failed" "yes" \
     "$(grep -q 'probe failed' "$WORK/.state" && echo yes || echo no)"
 check "  quoting the first ERROR line, with no fallback text appended" "yes|no" \
     "$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)|$(grep -qF 'no ERROR line' "$WORK/.state" && echo yes || echo no)"
+
+# The same without pipefail: a failed grep's status is then lost at the `|
+# sort` in each list's pipeline, and only the scan for ERROR lines catches it.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+( set +o pipefail; PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "without pipefail, a failing probe still drops the exclusion" "mine|yes" \
+    "$(cut -d'|' -f1 < "$WORK/.state")|$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)"
+
+# And the case where that scan is the ONLY catch: only the `-l` list greps
+# fail (arms 5-7 run without a pipe and would catch their own), in a tree with
+# no schema toolchain (so the vacuity check cannot fire either).
+premise_fixture 'fn f() {}'
+LSHIM="$(git_shim_failing grep-l '*" grep "*" -l "*')"
+( set +o pipefail; PATH="$LSHIM:$PATH"
+  gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null; echo "$?" > "$PREMISE_FIXTURE/.rc" )
+check "without pipefail, failed list greps alone still fail the probe" "2" "$(cat "$PREMISE_FIXTURE/.rc")"
 
 # A failing `comm` — the intersection behind arms 1-4 — must fail the probe,
 # not leave those arms silently empty.
@@ -733,58 +752,101 @@ check "set -e: a failed-probe MINE decision and render exit 0" "0" "$SETE_RC"
 echo "  -- the MINE message the hook prints --"
 
 # `gen_events_render_mine` renders from the ATTRIBUTION_* variables alone, so
-# these set them directly rather than building a repo per case.
+# these set them directly rather than building a repo per case. The stage is
+# set explicitly every time — this suite itself runs from a hook, where
+# PRE_COMMIT_TO_REF may already be set — through RENDER_STAGE: `push` sets
+# PRE_COMMIT_TO_REF as pre-commit does for a push, `commit` unsets it.
+RENDER_STAGE="push"
+render_now() {
+    if [ "$RENDER_STAGE" = "push" ]; then
+        RENDERED="$(PRE_COMMIT_TO_REF=0123456789abcdef gen_events_render_mine)"
+    else
+        RENDERED="$(unset PRE_COMMIT_TO_REF; gen_events_render_mine)"
+    fi
+}
 render_with() {
     ATTRIBUTION_BASE_REF="origin/main"
     ATTRIBUTION_BASE_SHA="0123456789abcdef"
     ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
     ATTRIBUTION_TOUCHED_DETAIL="$1"
-    RENDERED="$(gen_events_render_mine)"
+    render_now
 }
 has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
 
 LOCAL_NOTE="Inputs marked 'not part of this push' are local working-tree state"
 LOCAL_REMEDY="set them aside so the working tree"
+NO_COMMANDS_RE='git (stash|checkout|worktree|reset)'
 
+echo "     (at pre-push)"
+RENDER_STAGE="push"
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 check "all committed: the lead line says this push" yes "$(has 'This push changes sources')"
 check "  the file is labelled committed" yes "$(has 'src-tauri/src/lib.rs  (committed in this push)')"
 check "  no working-tree note" no "$(has "$LOCAL_NOTE")"
 check "  the pre-existing caveat is kept" yes "$(has 'Part of the diff may still be pre-existing')"
 
-render_with "$(detail_line Cargo.lock uncommitted)"
-check "uncommitted only: the lead line blames the working tree, not the push" \
+render_with "$(detail_line Cargo.lock unstaged)"
+check "unstaged only: the lead line blames the working tree, not the push" \
     "yes|no" "$(has 'Your working tree (not this push' )|$(has 'This push changes')"
 check "  the file is labelled as not in the push" \
     yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
 check "  the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
+# The primary guard: the message runs nothing. The wording check below it
+# only pins that the old "commit or discard" advice did not come back.
+check "  and the message prints no commands" no \
+    "$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
 check "  and it says to set them aside, not to commit them" "yes|no" \
     "$(has "$LOCAL_REMEDY")|$(has 'commit or discard')"
-check "  and the message prints no commands" no \
-    "$(printf '%s\n' "$RENDERED" | grep -qE 'git (stash|checkout|worktree|reset)' && echo yes || echo no)"
+
+render_with "$(detail_line src-tauri/src/lib.rs staged)"
+check "staged at pre-push: labelled as not in the push" \
+    yes "$(has 'src-tauri/src/lib.rs  (staged, not committed — not part of this push)')"
 
 render_with "$(detail_line src-tauri/src/new.rs untracked)"
 check "untracked: labelled as not in the push" \
     yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
 check "  and gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
 
-render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)"
+render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs unstaged)"
 check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
 check "  both labels are printed" "yes|yes" \
     "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
 check "  and the dirty half gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
+
+echo "     (at pre-commit, or a manual run)"
+# There the staged input IS the change being made; "this push" and "push
+# again" would both be false.
+RENDER_STAGE="commit"
+render_with "$(detail_line src-tauri/src/lib.rs staged)"
+check "staged at pre-commit: the lead line says this commit" "yes|no" \
+    "$(has 'This commit changes sources')|$(has 'push')"
+check "  and labels it staged for this commit" yes "$(has 'src-tauri/src/lib.rs  (staged for this commit)')"
+check "  with no working-tree note" "no|no" "$(has "$LOCAL_NOTE")|$(has "not in this commit' are")"
+
+render_with "$(detail_line src-tauri/src/lib.rs unstaged)"$'\n'"$(detail_line src-tauri/src/new.rs untracked)"
+check "unstaged and untracked at pre-commit: not this commit's changes" "yes|no" \
+    "$(has "Your working tree (not this commit's changes)")|$(has 'push again')"
+check "  labelled not in this commit" "yes|yes" \
+    "$(has 'src-tauri/src/lib.rs  (unstaged — not in this commit)')|$(has 'src-tauri/src/new.rs  (untracked — not in this commit)')"
+check "  with the commit-stage note, and no commands" "yes|no" \
+    "$(has "Inputs marked 'not in this commit' are working-tree state")|$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
+
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+check "earlier commits at pre-commit: named as the branch's, not this commit's" "yes|yes|no" \
+    "$(has 'Commits already on this branch (not this commit)')|$(has '(already committed on this branch)')|$(has 'This commit changes')"
+RENDER_STAGE="push"
 
 # The dropped-exclusion line is for a pusher who is being blamed FOR markdown;
 # with no `.md` among the blamed paths it would explain nothing.
 render_with "$(detail_line src-tauri/src/fleet_commands/x.md committed)"
 ATTRIBUTION_TOUCHED="src-tauri/src/fleet_commands/x.md"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
-RENDERED="$(gen_events_render_mine)"
+render_now
 check "a dropped exclusion is stated when an .md is blamed" yes "$(has 'Markdown was counted as a codegen input this time')"
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 ATTRIBUTION_TOUCHED="src-tauri/src/lib.rs"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
-RENDERED="$(gen_events_render_mine)"
+render_now
 check "  and not when no .md is blamed" no "$(has 'Markdown was counted as a codegen input this time')"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
@@ -840,15 +902,15 @@ fixture
 seed_base "src-tauri/src/a.rs" "// a module"
 git -C "$WORK" mv src-tauri/src/a.rs src-tauri/src/b.rs
 decide
-check "a staged rename lists both halves as uncommitted" \
-    "$(detail_line src-tauri/src/a.rs uncommitted)"$'\n'"$(detail_line src-tauri/src/b.rs uncommitted)" \
+check "a staged rename lists both halves as staged" \
+    "$(detail_line src-tauri/src/a.rs staged)"$'\n'"$(detail_line src-tauri/src/b.rs staged)" \
     "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 git -C "$WORK" rm --quiet src-tauri/src/lib.rs
 decide
-check "a staged git rm is listed as uncommitted" \
-    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
+check "a staged git rm is listed as staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 echo
 if [ "$SKIP" -gt 0 ]; then
