@@ -17,6 +17,7 @@ pub mod graceful_exit;
 pub mod grid;
 pub mod interceptor;
 pub mod manager;
+pub mod operator_input; // Operator-input emitter: one event per (terminal, channel, 60s bucket) of human/ambiguous-door PTY input, never the bytes (plan 2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record, Phase 2)
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_scan;
 pub mod pane_io;
