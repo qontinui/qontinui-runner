@@ -3451,3 +3451,47 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Agent truth (plan 2026-09-20-terminal-session-state-comes-from-events-not-
+// screen-scraping, Phases 3-4) — the webview's contract with the runner's
+// per-terminal reducer.
+// ============================================================================
+
+/// Every live pane's merged verdict, hook delivery and per-source last-seen
+/// ages (`[{ terminalId, verdict, hookDelivery, lastSeenAgeMs }]`). Changes are
+/// pushed as the `terminal-agent-state` event; this is the initial read.
+#[tauri::command]
+pub fn get_terminal_agent_states(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<Vec<crate::terminal::agent_state::TerminalAgentState>, String> {
+    Ok(crate::terminal::agent_state::read_all(&terminal_manager))
+}
+
+/// The webview offers its OWN fallback detectors to the runner's reducer, so
+/// the merge happens in one place. `source` is `"regex"` (with `state` one of
+/// `working | approval_shaped | question_shaped | completed | error | idle`)
+/// or `"screen_stability"` (with `busy`) — the two LOWEST-ranked sources, so
+/// nothing offered here can outrank a hook or read as authoritative.
+#[tauri::command]
+pub fn offer_agent_observation(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+    source: String,
+    state: Option<String>,
+    busy: Option<bool>,
+) -> Result<(), String> {
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let obs =
+        crate::terminal::agent_state::webview_observation(&source, state.as_deref(), busy, now_ms)?;
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("no live terminal {terminal_id}"))?;
+    session
+        .agent_state_slot()
+        .lock()
+        .map_err(|e| format!("agent-state slot poisoned: {e}"))?
+        .offer(&obs, now_ms);
+    crate::terminal::agent_state::publish_session(&session, &terminal_id);
+    Ok(())
+}
