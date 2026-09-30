@@ -48,7 +48,8 @@
 //!   [`AiCoordRegistrar::register_sniffed_session`]).
 //! - **R3 heartbeat** → `Heartbeat` outbox row (`PATCH {heartbeat:true}`) on
 //!   operator interaction only.
-//! - **R5 close** → `Closed` outbox row (`DELETE /sessions/:id`) + index evict.
+//! - **R5 close** → `Closed` outbox row (`PATCH /sessions/:id {state:"closed"}`)
+//!   + index evict.
 //!
 //! ## Gating (P0.3)
 //!
@@ -987,8 +988,9 @@ impl AiCoordRegistrar {
         }
 
         // A `Closed` row carries no body — the drain loop maps it to
-        // `DELETE /sessions/:id`. Best-effort; a missing coord row DELETEs as
-        // idempotent success.
+        // `PATCH /sessions/:id {state:"closed"}`, which coord finalizes like
+        // any close (claim release, `closed` event). A 429 is retried; a
+        // missing coord row (404) is ACK-dropped.
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
             session_id,
