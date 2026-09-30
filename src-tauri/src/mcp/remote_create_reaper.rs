@@ -461,7 +461,8 @@ mod tests {
         reaper.arm("owned", None, t0);
         reaper.arm("young", None, t0 + N);
         reaper.mark_attached("owned", t0);
-        // Marking a terminal the reaper never armed is a no-op.
+        // Marking a terminal the reaper never armed leaves only an unarmed
+        // marker, never an armed row — it is never reaped.
         reaper.mark_attached("local-terminal", t0);
         let (closed, close) = recorder();
 
