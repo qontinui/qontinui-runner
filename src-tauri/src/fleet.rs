@@ -83,10 +83,13 @@ pub(crate) fn served_git_sha() -> Option<&'static str> {
 /// The runner-observed keys of the device-status `details` object —
 /// `wedge_incidents` + `wedge_incidents_error` (G2) and `capability` +
 /// `capability_error` + `capability_omitted` (G4). Every key is always present,
-/// the unused ones as JSON `null`: coord merges `details` per top-level key and
-/// a `null` removes one, so these ride beside `coord_credential` without either
-/// writer erasing the other, and a stale error or array is retired by the next
-/// pass. Blocking IO; call from a blocking context.
+/// the unused ones as JSON `null`. Once coord's Phase 5 PR serves, coord merges
+/// `details` per top-level key and a `null` removes one, so these ride beside
+/// `coord_credential` without either writer erasing the other, and a stale
+/// error or array is retired by the next pass. Before that PR serves, coord
+/// replaces `details` wholesale on every post — which is why the refresher
+/// never posts these keys without the `coord_credential` bag beside them.
+/// Blocking IO; call from a blocking context.
 pub(crate) fn observed_status_details() -> serde_json::Map<String, serde_json::Value> {
     let mut details = serde_json::Map::new();
     wedge_report::publish_into(&mut details);
