@@ -458,7 +458,11 @@ fn read_paired_user_file_at(path: &std::path::Path) -> Option<PairedUserFile> {
 /// read-decide-write, never nested: none of the five calls another while
 /// holding it (plan
 /// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
-/// review finding 4).
+/// review finding 4). The heal's two credential copies
+/// ([`preserve_legacy_credential`], [`copy_default_into_legacy_slot`]) also
+/// take it — each alone, after the heal's file-write guard is dropped — so
+/// their recheck-then-write is atomic against a pairing's credential writes
+/// (review round 3).
 static PAIRED_USER_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take [`PAIRED_USER_WRITE`]. A poisoned lock is recovered: it guards no
@@ -1454,9 +1458,13 @@ struct HealSource {
 ///
 /// The recheck, the rename-aside of an unparseable file and the write run
 /// under [`paired_user_write_lock`], so a pairing that lands while the slots
-/// were being read is never overwritten (review finding 4). The legacy-slot
-/// copies run after the lock is released — no credential-store I/O is done
-/// while holding it. An unparseable file is renamed aside to
+/// were being read is never overwritten (review finding 4). The credential
+/// copies run after that guard is dropped, each re-taking the lock briefly
+/// and RE-CHECKING before it writes — the preserve only while its tenant
+/// still has no usable slot, the default's legacy copy only while the file
+/// still names the healed default and user and the legacy slot still holds
+/// what the heal read — so a pairing that lands in between is never
+/// overwritten either (review round 3). An unparseable file is renamed aside to
 /// `paired_user.json.unparseable-<UTC timestamp>` before the write, never
 /// silently destroyed (review finding 7).
 ///
@@ -1475,18 +1483,22 @@ pub(crate) fn heal_vanished_paired_user_with(
     path: &std::path::Path,
     bound: &CoordBoundTenantsRead,
 ) -> PairedUserHeal {
-    heal_vanished_paired_user_hooked(mgr, path, bound, &|| {})
+    heal_vanished_paired_user_hooked(mgr, path, bound, &|| {}, &|| {})
 }
 
-/// [`heal_vanished_paired_user_with`] with a hook run after the credentials
-/// are read and immediately BEFORE the write lock is taken — the window a
-/// concurrent pairing can land in. Production passes a no-op; the recheck
-/// test lands a real pairing there.
+/// [`heal_vanished_paired_user_with`] with two hooks, one per window a
+/// concurrent pairing can land in: `before_write` runs after the credentials
+/// are read and immediately BEFORE the write lock is taken for the file
+/// write; `before_copy` runs after that lock is released and immediately
+/// BEFORE the credential copies ([`preserve_legacy_credential`] and the
+/// default's legacy-slot copy). Production passes no-ops; the recheck tests
+/// land real pairings there.
 fn heal_vanished_paired_user_hooked(
     mgr: &crate::auth::AuthManager,
     path: &std::path::Path,
     bound: &CoordBoundTenantsRead,
     before_write: &dyn Fn(),
+    before_copy: &dyn Fn(),
 ) -> PairedUserHeal {
     let cause = match paired_user_vanished_cause(path) {
         Ok(Some(cause)) => cause,
@@ -1511,8 +1523,16 @@ fn heal_vanished_paired_user_hooked(
             ))
         }
     };
-    let legacy_jwt = match crate::auth::read_legacy_slot(mgr) {
-        crate::auth::SlotRead::Usable(tok) => Some(tok),
+    // ONE read of the legacy slot: both the heal source (when usable) and the
+    // snapshot the default copy compares against under the lock, so a write
+    // that lands in between is seen rather than overwritten (review round 3).
+    let legacy_before = mgr.probe_access_token();
+    let legacy_jwt = match &legacy_before {
+        crate::secure_storage::StoredTokenRead::Present(tok)
+            if crate::auth::slot_jwt_is_usable(tok) =>
+        {
+            Some(tok.clone())
+        }
         _ => None,
     };
     if slot_tenants.is_empty() && legacy_jwt.is_none() {
@@ -1695,21 +1715,17 @@ fn heal_vanished_paired_user_hooked(
         }
         cause
     };
-    // D4: the legacy access_token slot holds the DEFAULT binding's JWT. Done
-    // after the write lock is released. Ordering is still safe: the preserve
-    // runs before the replacing `store_tokens`; and a pairing that lands in
-    // between reads the file just written, keeps `default_tenant` as its
-    // default, and so writes the legacy slot only when it pairs that same
-    // tenant — whose (older) JWT this copy would then restore, never another
-    // tenant's.
+    // D4: the legacy access_token slot holds the DEFAULT binding's JWT. The
+    // copies run after the file-write lock is released, each re-taking it
+    // briefly and RE-CHECKING before it writes (review round 3): a pairing
+    // (`persist_pairing_with`, which writes its credentials under the same
+    // lock) that landed in between must never have its fresh token replaced
+    // by the older one this heal read. The preserve still precedes the
+    // replacing `store_tokens`.
+    before_copy();
     if legacy_default != Some(default_tenant) {
         preserve_legacy_credential(mgr, legacy_jwt.as_deref(), legacy_tenant, known);
-        if let Err(e) = mgr.store_tokens(&default_source.jwt, "") {
-            tracing::warn!(
-                "paired_user.json heal: default {default_tenant} chosen but the legacy \
-                 access_token write failed: {e:#} (the per-tenant slot still serves it)"
-            );
-        }
+        copy_default_into_legacy_slot(mgr, path, default_source, &legacy_before);
     }
     tracing::warn!(
         "paired_user.json was {cause} at {} while valid device JWTs existed — HEALED it from \
@@ -1732,9 +1748,10 @@ fn heal_vanished_paired_user_hooked(
 /// lists that tenant as bound (a bound tenant whose token failed another
 /// guard, e.g. a missing `user_id` claim). A tenant OUTSIDE the known set is
 /// one coord unbound: preserving its token would mint a `device_jwt:<tenant>`
-/// slot that reconcile never removes, that the refresher keeps refreshing,
-/// and whose posture feeds the fold and the heartbeat's slot fallback (review
-/// round 2, MEDIUM 1). Its token is discarded (logged, never its content) and
+/// slot for an unbound tenant, which the refresher would keep refreshing and
+/// which would feed the credential posture (the fold and the heartbeat's slot
+/// fallback) until the next confirmed reconcile clears it as an orphan
+/// ([`reconcile_paired_bindings_with`]) (review round 2, MEDIUM 1). Its token is discarded (logged, never its content) and
 /// overwritten. Best-effort and logged; a claimless token has no slot to go
 /// to and is overwritten, as before.
 fn preserve_legacy_credential(
@@ -1746,6 +1763,11 @@ fn preserve_legacy_credential(
     let (Some(jwt), Some(lt)) = (legacy_jwt, legacy_tenant) else {
         return;
     };
+    // The usable-slot check and the write are one step under the write lock,
+    // so a pairing for `lt` that lands meanwhile (it writes `lt`'s slot under
+    // the same lock) is seen and never overwritten with this older token
+    // (review round 3). Nothing called here takes the lock.
+    let _write = paired_user_write_lock();
     if matches!(
         crate::auth::read_tenant_slot(mgr, &lt),
         crate::auth::SlotRead::Usable(_)
@@ -1770,6 +1792,72 @@ fn preserve_legacy_credential(
             "paired_user.json heal: could not preserve tenant {lt}'s legacy credential in its \
              per-tenant slot ({e:#}) before re-pointing the default"
         ),
+    }
+}
+
+/// The heal's D4 copy of the default binding's JWT into the legacy
+/// `access_token` slot (which `store_tokens` also mirrors into
+/// `device_jwt:<default>`), done under [`paired_user_write_lock`] and ONLY
+/// while nothing has moved since the heal read and wrote (review round 3):
+///
+/// - the file still names `source.tenant` as its default, and that binding —
+///   and the file's top-level `user_id` — still name `source`'s user (a
+///   re-pair by a different user leaves a file naming THAT user, which the
+///   old user's JWT must not be written beside);
+/// - the legacy slot still holds exactly what the heal read before it
+///   decided (`legacy_before`). A different token means a pairing or a
+///   refresh wrote a fresher credential there; an unreadable read on either
+///   side means nothing is established — both skip.
+///
+/// A skipped copy costs nothing durable: the per-tenant slot still serves the
+/// default, and whatever write moved the state carries its own credential.
+/// Tokens are compared, never logged. Nothing called here takes the lock.
+fn copy_default_into_legacy_slot(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    source: &HealSource,
+    legacy_before: &crate::secure_storage::StoredTokenRead,
+) {
+    use crate::secure_storage::StoredTokenRead;
+    let _write = paired_user_write_lock();
+    let default_tenant = source.tenant;
+    let file_still_ours = read_paired_user_file_at(path).is_some_and(|pf| {
+        let default_is_ours = pf
+            .effective_default_tenant_id()
+            .and_then(|d| uuid::Uuid::parse_str(d.trim()).ok())
+            == Some(default_tenant);
+        let binding_user_is_ours = pf.effective_bindings().iter().any(|b| {
+            uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(default_tenant)
+                && b.user_id.trim() == source.binding.user_id
+        });
+        default_is_ours && binding_user_is_ours && pf.user_id.trim() == source.binding.user_id
+    });
+    if !file_still_ours {
+        tracing::warn!(
+            "paired_user.json heal: the file no longer names default {default_tenant} for the \
+             healed user (a pairing landed after the heal wrote it) — leaving the legacy \
+             access_token to that pairing"
+        );
+        return;
+    }
+    let unchanged = match (legacy_before, &mgr.probe_access_token()) {
+        (StoredTokenRead::Present(a), StoredTokenRead::Present(b)) => a == b,
+        (StoredTokenRead::Absent, StoredTokenRead::Absent) => true,
+        _ => false,
+    };
+    if !unchanged {
+        tracing::warn!(
+            "paired_user.json heal: the legacy access_token changed (or could not be read) \
+             since the heal read it — not overwriting it with the healed default \
+             {default_tenant}'s credential (the per-tenant slot still serves it)"
+        );
+        return;
+    }
+    if let Err(e) = mgr.store_tokens(&source.jwt, "") {
+        tracing::warn!(
+            "paired_user.json heal: default {default_tenant} chosen but the legacy \
+             access_token write failed: {e:#} (the per-tenant slot still serves it)"
+        );
     }
 }
 
@@ -7019,10 +7107,16 @@ mod vanished_paired_user_heal_tests {
         mgr.store_tenant_device_jwt(&tb(), &live(T_B, USER_2))
             .expect("slot B");
         let paired_jwt = live(T_A, USER);
-        let heal = heal_vanished_paired_user_hooked(&mgr, &path, &known(&[ta(), tb()]), &|| {
-            persist_pairing_with(&mgr, &path, &pair_resp_for(&paired_jwt), ta())
-                .expect("the concurrent pairing");
-        });
+        let heal = heal_vanished_paired_user_hooked(
+            &mgr,
+            &path,
+            &known(&[ta(), tb()]),
+            &|| {
+                persist_pairing_with(&mgr, &path, &pair_resp_for(&paired_jwt), ta())
+                    .expect("the concurrent pairing");
+            },
+            &|| {},
+        );
         assert_eq!(heal, PairedUserHeal::NotNeeded);
         let pf = read_file(&path);
         assert_eq!(pf.bindings.len(), 1, "{pf:?}");
@@ -7035,6 +7129,128 @@ mod vanished_paired_user_heal_tests {
             mgr.get_access_token().ok().as_deref(),
             Some(paired_jwt.as_str()),
             "the pairing's legacy-slot write is not overwritten"
+        );
+    }
+
+    /// Review round 3: a pairing that lands AFTER the heal wrote the file
+    /// and BEFORE its credential copies is never overwritten by them — the
+    /// copies re-take the write lock and re-check first. Four arms, each on
+    /// its own store: the same user re-pairing the healed default; a
+    /// DIFFERENT user re-pairing it; the file rewritten to name another user
+    /// with the legacy slot untouched; and a pairing for the tenant whose
+    /// legacy credential the preserve step would otherwise have copied.
+    #[test]
+    fn a_pairing_that_lands_before_the_credential_copy_is_never_overwritten() {
+        fn pair_resp_as(token: &str, user: &str) -> PairCompleteResponse {
+            PairCompleteResponse {
+                user_id: user.to_string(),
+                ..pair_resp_for(token)
+            }
+        }
+        let heal_b_with = |mgr: &crate::auth::AuthManager,
+                           path: &std::path::Path,
+                           bound: &[uuid::Uuid],
+                           hook: &dyn Fn()| {
+            let heal = heal_vanished_paired_user_hooked(mgr, path, &known(bound), &|| {}, hook);
+            assert!(
+                matches!(&heal, PairedUserHeal::Healed { default_tenant, .. }
+                    if *default_tenant == tb()),
+                "{heal:?}"
+            );
+        };
+
+        // Arm 1 — the healed default's own user re-pairs B in the window.
+        let (_d1, path, mgr) = store("copy_same_user");
+        let old_b = live(T_B, USER_2);
+        mgr.store_tenant_device_jwt(&tb(), &old_b).expect("slot B");
+        let fresh_b = device_jwt(T_B, Some(USER_2), 4 * 60 * 60);
+        assert_ne!(old_b, fresh_b);
+        heal_b_with(&mgr, &path, &[tb()], &|| {
+            persist_pairing_with(&mgr, &path, &pair_resp_as(&fresh_b, USER_2), tb())
+                .expect("the concurrent pairing");
+        });
+        assert_eq!(
+            mgr.get_access_token().ok().as_deref(),
+            Some(fresh_b.as_str()),
+            "the pairing's legacy-slot token is not replaced by the heal's older one"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb()).unwrap().as_deref(),
+            Some(fresh_b.as_str()),
+            "nor is its device_jwt:<B> slot (store_tokens mirrors into it)"
+        );
+
+        // Arm 2 — a DIFFERENT user re-pairs B in the window: the file names
+        // that user, and the old user's JWT is not written beside it.
+        let (_d2, path, mgr) = store("copy_other_user");
+        mgr.store_tenant_device_jwt(&tb(), &old_b).expect("slot B");
+        let fresh_b_user = device_jwt(T_B, Some(USER), 4 * 60 * 60);
+        heal_b_with(&mgr, &path, &[tb()], &|| {
+            persist_pairing_with(&mgr, &path, &pair_resp_as(&fresh_b_user, USER), tb())
+                .expect("the re-pair by another user");
+        });
+        assert_eq!(read_paired_user_id_at(&path).as_deref(), Some(USER));
+        assert_eq!(
+            mgr.get_access_token().ok().as_deref(),
+            Some(fresh_b_user.as_str())
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb()).unwrap().as_deref(),
+            Some(fresh_b_user.as_str())
+        );
+
+        // Arm 3 — the file is rewritten to name another user while the
+        // legacy slot is untouched: the user recheck alone skips the copy.
+        let (_d3, path, mgr) = store("copy_file_user_moved");
+        mgr.store_tenant_device_jwt(&tb(), &old_b).expect("slot B");
+        heal_b_with(&mgr, &path, &[tb()], &|| {
+            let _w = paired_user_write_lock();
+            write_paired_user_file(
+                &path,
+                &PairedUserFile {
+                    user_id: USER.into(),
+                    tenant_id: Some(T_B.into()),
+                    bindings: vec![PairedBinding {
+                        tenant_id: T_B.into(),
+                        user_id: USER.into(),
+                        paired_at: Some(chrono::Utc::now().to_rfc3339()),
+                    }],
+                    default_tenant_id: Some(T_B.into()),
+                },
+            )
+            .expect("the moved file");
+        });
+        assert!(
+            matches!(
+                mgr.probe_access_token(),
+                crate::secure_storage::StoredTokenRead::Absent
+            ),
+            "no JWT is written to the legacy slot beside a file naming another user"
+        );
+
+        // Arm 4 — the preserve step: C's legacy credential (bound, but no
+        // user_id claim) would be copied into device_jwt:<C>; a pairing for C
+        // lands first, so its fresh slot is kept. The default copy still
+        // runs (file and legacy slot unchanged for B).
+        let (_d4, path, mgr) = store("copy_preserve");
+        let jwt_c = device_jwt(T_C, None, 3600);
+        mgr.store_tokens(&jwt_c, "").expect("legacy = C");
+        mgr.clear_tenant_device_jwt(&tc()).expect("legacy-only");
+        mgr.store_tenant_device_jwt(&tb(), &old_b).expect("slot B");
+        let fresh_c = live(T_C, USER);
+        heal_b_with(&mgr, &path, &[tb(), tc()], &|| {
+            persist_pairing_with(&mgr, &path, &pair_resp_for(&fresh_c), tc())
+                .expect("the pairing for C");
+        });
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tc()).unwrap().as_deref(),
+            Some(fresh_c.as_str()),
+            "the pairing's device_jwt:<C> is not replaced by the legacy token"
+        );
+        assert_eq!(
+            mgr.get_access_token().ok().as_deref(),
+            Some(old_b.as_str()),
+            "with nothing moved for B, the default copy still runs"
         );
     }
 
@@ -7092,7 +7308,8 @@ mod vanished_paired_user_heal_tests {
     /// JWT is copied over it — the copy never destroys a bound tenant's
     /// credential. One for a tenant OUTSIDE coord's known set is discarded
     /// instead: no `device_jwt:<tenant>` slot is created for an unbound
-    /// tenant, since reconcile would never remove it.
+    /// tenant, since the refresher would keep it alive and it would feed the
+    /// credential posture until the next confirmed reconcile cleared it.
     #[test]
     fn a_non_qualifying_legacy_credential_is_preserved_before_it_is_replaced() {
         // Arm 1 — bound but non-qualifying (missing user_id): preserved.
