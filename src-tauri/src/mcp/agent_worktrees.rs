@@ -234,7 +234,7 @@ async fn wip_orphans_handler(
 /// `reason` is one of `dirty` (G1) | `pinned` | `session-live` (G3) |
 /// `building` (G6) | `not-landed` (G2) | `main-merge` (G4) | `grace` (G5) |
 /// `not-a-candidate` | `stale-census` | `undeclared-not-removable` |
-/// `landed-idle-not-removable` | `sinkless-rejunction` | `not-cleared` |
+/// `landed-idle-not-removable` | `not-cleared` |
 /// `coord-unreachable` | `absent` | `not-reapable` | `error`. Every refusal is listed — never a silent drop.
 async fn reclaim_handler(
     State(_state): State<Arc<ApiState>>,
