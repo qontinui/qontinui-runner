@@ -585,11 +585,18 @@ pub(crate) struct CoordCredentialBag {
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
     /// [`COORD_CREDENTIAL_STALE_AFTER_PASSES`] × [`REFRESH_CHECK_INTERVAL`], in
-    /// seconds. Coord's status upsert replaces `details` wholesale and stamps
-    /// `updated_at`, so the row's age IS this bag's age — and a runner that went
-    /// offline while `ok: true` would otherwise read `live` forever. Declared
-    /// here, beside the cadence it is derived from, so the console keeps no
-    /// constant of its own (the fleet-health `sample_stale_after_secs` pattern).
+    /// seconds. Coord's status upsert MERGES `details` per top-level key (a
+    /// writer owns only the keys it sends; a top-level `null` removes one; coord
+    /// stamps the reserved `details._coord_received_at`, which the runner never
+    /// sends), so the row's `updated_at` moves on ANY writer's post and no
+    /// longer dates this bag. What dates it is this runner's own cadence: every
+    /// refresher pass re-posts this bag together with the runner's other keys
+    /// (`wedge_incidents`, `capability`) at least every
+    /// [`REFRESH_CHECK_INTERVAL`] — see [`republish_device_status`] — and a
+    /// runner that went offline while `ok: true` would otherwise read `live`
+    /// forever. Declared here, beside the cadence it is derived from, so the
+    /// console keeps no constant of its own (the fleet-health
+    /// `sample_stale_after_secs` pattern).
     pub stale_after_secs: u64,
 }
 
@@ -677,18 +684,23 @@ async fn observed_details() -> serde_json::Map<String, serde_json::Value> {
     }
 }
 
-/// The whole `details` object this publisher owns: `coord_credential` plus the
-/// observed keys. Coord merges `details` per top-level key, so each key here is
-/// this publisher's alone and no other `/coord/status` poster erases it.
+/// The whole `details` object this publisher owns: `coord_credential` (when
+/// there is one to send) plus the observed keys. Coord merges `details` per
+/// top-level key, so each key here is this publisher's alone and no other
+/// `/coord/status` poster erases it. Never sends coord's reserved
+/// `_coord_received_at`.
 fn status_details(
-    bag: CoordCredentialBag,
+    bag: Option<CoordCredentialBag>,
     observed: serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Value {
     let mut details = observed;
-    details.insert(
-        "coord_credential".to_string(),
-        serde_json::to_value(bag).unwrap_or(serde_json::Value::Null),
-    );
+    if let Some(bag) = bag {
+        // A serialisation failure omits the key (the merge keeps coord's
+        // stored bag) — sending JSON `null` would DELETE it.
+        if let Ok(v) = serde_json::to_value(bag) {
+            details.insert("coord_credential".to_string(), v);
+        }
+    }
     serde_json::Value::Object(details)
 }
 
@@ -705,9 +717,47 @@ fn status_details(
 ///
 /// A publish failure ONLY `warn!`s — it must never break the refresher loop
 /// (the loop's job is keeping the JWT fresh; telemetry is strictly best-effort).
+///
+/// The health is remembered so [`republish_device_status`] can re-post it
+/// from the loop's quiet branches.
 async fn publish_coord_credential_status(
     auth_manager: &crate::auth::AuthManager,
     health: &CoordCredentialHealth,
+) {
+    *LAST_PUBLISHED_HEALTH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(health.clone());
+    post_device_status(auth_manager, Some(health)).await;
+}
+
+/// The last health [`publish_coord_credential_status`] posted in this process.
+static LAST_PUBLISHED_HEALTH: std::sync::Mutex<Option<CoordCredentialHealth>> =
+    std::sync::Mutex::new(None);
+
+/// Re-post the device status from a loop branch that computed no fresh
+/// credential health — the idle waits and the pairing bails — so the
+/// runner-observed keys (`wedge_incidents`, `capability`) reach coord at least
+/// every [`REFRESH_CHECK_INTERVAL`] whatever branch the loop sits in, and in
+/// the SAME post as `coord_credential`.
+///
+/// The bag is re-derived from the CURRENT posture with the last published
+/// health as its fallback, i.e. exactly what a publish now would say. When no
+/// health has been published yet in this process the post carries the observed
+/// keys alone: coord's per-key merge then leaves any stored `coord_credential`
+/// untouched rather than being handed an invented one.
+async fn republish_device_status(auth_manager: &crate::auth::AuthManager) {
+    let last = LAST_PUBLISHED_HEALTH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    post_device_status(auth_manager, last.as_ref()).await;
+}
+
+/// The `POST /coord/status` itself: `coord_credential` when a health is given,
+/// plus the runner-observed keys, always.
+async fn post_device_status(
+    auth_manager: &crate::auth::AuthManager,
+    health: Option<&CoordCredentialHealth>,
 ) {
     // device_id: env override first (multi-instance / test), else machine.json.
     let device_id = std::env::var("QONTINUI_MACHINE_ID")
@@ -752,7 +802,7 @@ async fn publish_coord_credential_status(
     // C4 — the cross-repo contract. The bag carries the POSTURE and derives
     // `ok` from it, so coord's dark scan and qontinui-web's console finally see
     // what `/health` sees.
-    let bag = coord_credential_bag(health, coord_credential_posture().as_ref());
+    let bag = health.map(|h| coord_credential_bag(h, coord_credential_posture().as_ref()));
     let details = status_details(bag, observed_details().await);
     let mut body = serde_json::json!({
         "device_id": device_uuid,
@@ -4812,14 +4862,25 @@ async fn refresher_loop(
                     continue;
                 }
                 // Nothing to do until tier changes. Block on shutdown or
-                // kick (set_runner_tier kicks us on every transition).
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
-                        return;
+                // kick (set_runner_tier kicks us on every transition) — but
+                // re-post the device status every REFRESH_CHECK_INTERVAL
+                // meanwhile, so the observed keys (wedge incidents, capability
+                // verdicts) never go stale on a runner parked here. The re-post
+                // is the only thing the timer does; the loop body does not
+                // re-run until a kick.
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
+                            return;
+                        }
+                        _ = kick_rx.changed() => break,
+                        _ = tokio::time::sleep(REFRESH_CHECK_INTERVAL) => {
+                            republish_device_status(&auth_manager).await;
+                        }
                     }
-                    _ = kick_rx.changed() => continue,
                 }
+                continue;
             }
             Decision::Idle => {
                 // Phase 1b: a fresh JWT → publish ok so any stale alert self-
@@ -4955,6 +5016,7 @@ async fn refresher_loop(
                 let pair_base = resolve_pair_base(&settings_snapshot);
                 if pair_base.is_empty() {
                     warn!("device_jwt_refresher: backend_url empty — cannot pair");
+                    republish_device_status(&auth_manager).await;
                     if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                         .await
                     {
@@ -4973,6 +5035,7 @@ async fn refresher_loop(
                             "device_jwt_refresher: machine.json unreadable: {e} \
                              — run `qontinui_profile device init` to create it"
                         );
+                        republish_device_status(&auth_manager).await;
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
                         {
@@ -9526,7 +9589,7 @@ mod tenant_slot_refresh_tests {
         let mut observed = serde_json::Map::new();
         observed.insert("wedge_incidents".into(), serde_json::json!([]));
         observed.insert("capability_error".into(), serde_json::json!("no home"));
-        let d = status_details(bag.clone(), observed);
+        let d = status_details(Some(bag.clone()), observed.clone());
         let obj = d.as_object().expect("details is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -9535,6 +9598,17 @@ mod tenant_slot_refresh_tests {
             ["capability_error", "coord_credential", "wedge_incidents"]
         );
         assert_eq!(d["coord_credential"], serde_json::to_value(bag).unwrap());
+        assert_eq!(d["wedge_incidents"], serde_json::json!([]));
+        assert!(
+            obj.keys().all(|k| k != "_coord_received_at"),
+            "coord's reserved key"
+        );
+
+        // No health published yet: the observed keys go alone, and the
+        // credential key is ABSENT (merge keeps coord's) — never `null`
+        // (which the merge reads as "delete it").
+        let d = status_details(None, observed);
+        assert!(d.get("coord_credential").is_none());
         assert_eq!(d["wedge_incidents"], serde_json::json!([]));
     }
 
