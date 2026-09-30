@@ -2568,6 +2568,7 @@ mod tests {
             tenant_id: None,
             volumes: Vec::new(),
             worktrees: rows,
+            cargo_locks: None,
         }
     }
 

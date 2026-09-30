@@ -439,6 +439,7 @@ fn merged_snapshot(
             tenant_id,
             volumes,
             worktrees,
+            cargo_locks: None,
         }),
         taken_at: now,
         build_ms,
@@ -692,6 +693,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: chunk.rows,
+            cargo_locks: None,
         };
         self.send(body, true).await;
     }
@@ -706,7 +708,11 @@ impl ChunkPoster {
     /// exactly as stale after it as before, and letting a 60 s volume POST
     /// open the gate would hand the reclaim poller the previous boot's stale
     /// census — precisely the husk-creating race the gate exists to prevent.
-    async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+    async fn post_volumes(
+        &mut self,
+        volumes: Vec<VolumeReport>,
+        cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
+    ) {
         // DEFENSIVE, not a live path: the only caller
         // ([`sample_and_publish_volumes`]) already returns on an empty probe,
         // so this branch is currently unreachable. It is kept because the
@@ -723,6 +729,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: Vec::new(),
+            cargo_locks,
         };
         self.send(body, false).await;
     }
@@ -1237,6 +1244,14 @@ pub struct WorktreeCensusReq {
     pub tenant_id: Option<Uuid>,
     pub volumes: Vec<VolumeReport>,
     pub worktrees: Vec<WorktreeCensus>,
+    /// Shared cargo target-dir lock state (plan
+    /// `2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats`
+    /// Phase 2). Carried ONLY on the 60 s volumes-only POST — it is device-level
+    /// and minute-fresh, like `volumes`; a census chunk leaves it `None`.
+    /// OMITTED when `None` = UNKNOWN (non-Linux, or the probe failed), so an
+    /// older coord is unaffected; `Some(vec![])` = measured, no shared targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,6 +2625,7 @@ fn build_census_chunked(
         tenant_id,
         volumes,
         worktrees,
+        cargo_locks: None,
     }
 }
 
@@ -2837,7 +2853,17 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
     }
     let sample = publish_volume_sample(volumes);
     warn_on_low_disk_throttled(&sample.volumes);
-    post_volumes_to_coord(sample.volumes.clone()).await;
+    // Shared cargo target lock state rides the same device-level tick. It
+    // reads `/proc`, so like the mount probe it runs on the blocking pool; a
+    // failed task is UNKNOWN (`None` → field omitted), never an empty list.
+    let cargo_locks = match spawn_blocking_tracked(super::cargo_locks::probe_current).await {
+        Ok(locks) => locks,
+        Err(e) => {
+            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
+            None
+        }
+    };
+    post_volumes_to_coord(sample.volumes.clone(), cargo_locks).await;
     Some(sample)
 }
 
@@ -2930,7 +2956,10 @@ fn volume_poster_needs_rebuild(prev: Option<&VolumePosterKey>, next: &VolumePost
 /// keyed on the resolved identity + coord base so an active-profile switch
 /// still rebuilds it and `resolve_dest` stays the one place the
 /// secondary-instance identity guard is enforced.
-async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
+async fn post_volumes_to_coord(
+    volumes: Vec<VolumeReport>,
+    cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
+) {
     // Held across the resolution await: there is exactly one publisher task,
     // so this serializes nothing that was ever concurrent, and it keeps the
     // cache read and its refresh atomic.
@@ -2957,7 +2986,7 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     let Some(cached) = guard.as_mut() else {
         return;
     };
-    cached.poster.post_volumes(volumes).await;
+    cached.poster.post_volumes(volumes, cargo_locks).await;
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
@@ -4897,6 +4926,7 @@ mod tests {",
                     // Same PATH, different repo — must be a distinct key.
                     row("qontinui-coord", "D:/x/a", 30),
                 ],
+                cargo_locks: None,
             }),
             taken_at: chrono::Utc::now() - chrono::Duration::hours(2),
             build_ms: 12_345,
@@ -4993,6 +5023,7 @@ mod tests {",
                 tenant_id: None,
                 volumes: Vec::new(),
                 worktrees: vec![row("qontinui-runner", "D:/x/a", 5)],
+                cargo_locks: None,
             },
             777,
         );
