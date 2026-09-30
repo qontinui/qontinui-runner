@@ -5157,7 +5157,7 @@ pub fn spawn_tree_publisher() {
             // from.
             let mut shed = crate::resource_guard::BackgroundShed::new(
                 "tree_publisher",
-                crate::resource_guard::ShedPolicy::SkipWithBackoff,
+                crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
             );
             loop {
                 tick.tick().await;
@@ -5864,7 +5864,8 @@ mod tests {
             .unwrap();
         let ((), logs) = capture_logs(|| {
             rt.block_on(async {
-                let mut shed = BackgroundShed::new("tree_publisher", ShedPolicy::SkipWithBackoff);
+                let mut shed =
+                    BackgroundShed::new("tree_publisher", ShedPolicy::ThrottleAndBackoff);
                 let skip = test_skip_verdict();
                 for _ in 0..10 {
                     shed_gated_cycle(&mut shed, &skip, "fleet::tree_publisher", publish).await;
@@ -5900,6 +5901,32 @@ mod tests {
             1,
             "{logs}"
         );
+    }
+
+    /// Sustained WARN thins the tree publisher to one publish every fourth
+    /// tick rather than stopping it.
+    #[test]
+    fn tree_publisher_tick_runs_one_tick_in_four_at_sustained_warn() {
+        use crate::resource_guard::{test_throttle_verdict, BackgroundShed, ShedPolicy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let publishes = AtomicUsize::new(0);
+        let counter = &publishes;
+        let publish = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut shed = BackgroundShed::new("tree_publisher", ShedPolicy::ThrottleAndBackoff);
+            let throttle = test_throttle_verdict();
+            for _ in 0..8 {
+                shed_gated_cycle(&mut shed, &throttle, "fleet::tree_publisher", publish).await;
+            }
+        });
+        assert_eq!(publishes.load(Ordering::SeqCst), 2);
     }
 
     /// The auto-fresh engine skips at WARN as well as CRITICAL, and resumes on

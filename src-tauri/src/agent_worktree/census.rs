@@ -3036,7 +3036,7 @@ pub fn spawn_census() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shed = crate::resource_guard::BackgroundShed::new(
             "worktree_census",
-            crate::resource_guard::ShedPolicy::SkipWithBackoff,
+            crate::resource_guard::ShedPolicy::ThrottleAndBackoff,
         );
         loop {
             tick.tick().await;
@@ -3057,9 +3057,10 @@ pub fn spawn_census() {
 /// Phase 3. The census is the largest single burst the runner makes — ~12–15
 /// `git` per worktree row, ≈2,500 spawns per tick on a ~200-row box — and until
 /// this gate it ran on schedule straight through a commit exhaustion, each
-/// failed spawn one more WARN. Below the warn floor the tick is skipped; below
-/// the critical floor it is skipped and the loop backs off
-/// ([`crate::resource_guard::ShedPolicy::SkipWithBackoff`]), so an oscillating
+/// failed spawn one more WARN. Below the warn floor the walk runs one tick in
+/// four (a quarter of the rate, never stopped); below the critical floor it is
+/// skipped and the loop backs off
+/// ([`crate::resource_guard::ShedPolicy::ThrottleAndBackoff`]), so an oscillating
 /// box is not handed the whole burst on the first tick it pokes back above the
 /// floor. A skipped census loses nothing: the next walk recomputes every row.
 ///
@@ -3122,7 +3123,8 @@ mod tests {
             .unwrap();
         let ((), logs) = capture_logs(|| {
             rt.block_on(async {
-                let mut shed = BackgroundShed::new("worktree_census", ShedPolicy::SkipWithBackoff);
+                let mut shed =
+                    BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
                 let skip = test_skip_verdict();
                 for _ in 0..10 {
                     census_cycle(&mut shed, &skip, walk).await;
@@ -3146,6 +3148,43 @@ mod tests {
         );
     }
 
+    /// Sustained WARN thins the census, it does not stop it: one walk every
+    /// fourth tick, logged once.
+    #[test]
+    fn census_cycle_runs_one_tick_in_four_at_sustained_warn() {
+        use crate::resource_guard::{
+            capture_logs, test_throttle_verdict, BackgroundShed, ShedPolicy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let walks = AtomicUsize::new(0);
+        let counter = &walks;
+        let walk = move || async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(BuildOutcome::Skipped)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), logs) = capture_logs(|| {
+            rt.block_on(async {
+                let mut shed =
+                    BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
+                let throttle = test_throttle_verdict();
+                for _ in 0..12 {
+                    census_cycle(&mut shed, &throttle, walk).await;
+                }
+            })
+        });
+        assert_eq!(walks.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            logs.matches("throttling worktree_census's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
     /// UNKNOWN runs as today: a `Run` verdict walks on every tick.
     #[test]
     fn census_cycle_walks_every_tick_when_run() {
@@ -3162,7 +3201,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut shed = BackgroundShed::new("worktree_census", ShedPolicy::SkipWithBackoff);
+            let mut shed = BackgroundShed::new("worktree_census", ShedPolicy::ThrottleAndBackoff);
             for _ in 0..3 {
                 census_cycle(&mut shed, &BackgroundWork::Run, walk).await;
             }
