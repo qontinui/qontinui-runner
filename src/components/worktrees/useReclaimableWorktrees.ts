@@ -44,7 +44,6 @@ export type SkipReason =
   /** Landed, clean and idle — coord offers only a rejunction, never a removal. */
   | "landed-idle-not-removable"
   /** coord withheld a rejunction with no real target/node_modules copy to re-link. */
-  | "sinkless-rejunction"
   /** coord gave no verdict — it never evaluated the path, or sent an unknown token. */
   | "not-cleared"
   | "coord-unreachable"
@@ -178,7 +177,6 @@ export const REASON_LABEL: Record<SkipReason, string> = {
   "stale-census": "census stale",
   "undeclared-not-removable": "undeclared",
   "landed-idle-not-removable": "idle, keep-only",
-  "sinkless-rejunction": "nothing to relink",
   "not-cleared": "not cleared",
   "coord-unreachable": "coord offline",
   absent: "gone",
