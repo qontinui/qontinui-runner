@@ -904,7 +904,7 @@ fn collect_host_lane() -> ResourceSample {
     //
     // The shadow runs HERE because this is the one periodic, off-runtime,
     // off-spawn-path loop that already holds every input it needs: the free
-    // commit reading, physical RAM and core count (so the `ci_node`
+    // commit reading, physical RAM (via the capability built from that reading) and core count (so the `ci_node`
     // admitted-concurrency alternative is sized from THIS reading, not from a
     // `host_sizing::probe` sysinfo refresh), and the settings document loaded
     // just above. What it does add, exactly: the capability probe itself (a
@@ -915,7 +915,10 @@ fn collect_host_lane() -> ResourceSample {
     // shipped one does.
     let capability = super::machine_capability::probe_from(reading);
     let host = crate::ci_node::host_sizing::HostCapacity {
-        mem_bytes: reading.map(|m| m.phys_total).filter(|b| *b > 0),
+        // The CAPABILITY's figure, not the raw reading's: it carries the
+        // `/proc/meminfo` `MemTotal` fallback for a reading `memory_status`
+        // withheld, so the alternative is not blinded by `MemAvailable == 0`.
+        mem_bytes: capability.phys_total,
         cpus: s
             .cpu_cores
             .and_then(|c| u32::try_from(c).ok())
