@@ -156,11 +156,6 @@ const ASK_OPERATOR: &str = include_str!("fleet_commands/ask-operator.md");
 /// there, then re-vendor.
 const AUDIT: &str = include_str!("fleet_commands/audit.md");
 
-/// `/auto-fix` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/auto-fix.md` (canonical) — edit it
-/// there, then re-vendor.
-const AUTO_FIX: &str = include_str!("fleet_commands/auto-fix.md");
-
 /// `/auto-improve` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/auto-improve.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -206,16 +201,6 @@ const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 /// there, then re-vendor.
 const CREATE_TUTORIAL: &str = include_str!("fleet_commands/create-tutorial.md");
 
-/// `/debug-loop` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/debug-loop.md` (canonical) — edit it
-/// there, then re-vendor.
-const DEBUG_LOOP: &str = include_str!("fleet_commands/debug-loop.md");
-
-/// `/debug` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/debug.md` (canonical) — edit it
-/// there, then re-vendor.
-const DEBUG: &str = include_str!("fleet_commands/debug.md");
-
 /// `/find-debt` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/find-debt.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -246,11 +231,6 @@ const IMPROVE_ALL: &str = include_str!("fleet_commands/improve-all.md");
 /// there, then re-vendor.
 const MANUAL_TEST_COORD_LOOP: &str = include_str!("fleet_commands/manual-test-coord-loop.md");
 
-/// `/manual-test-coord` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/manual-test-coord.md` (canonical) — edit it
-/// there, then re-vendor.
-const MANUAL_TEST_COORD: &str = include_str!("fleet_commands/manual-test-coord.md");
-
 /// `/manual-test-loop` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/manual-test-loop.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -261,11 +241,6 @@ const MANUAL_TEST_LOOP: &str = include_str!("fleet_commands/manual-test-loop.md"
 /// there, then re-vendor.
 const MANUAL_TEST: &str = include_str!("fleet_commands/manual-test.md");
 
-/// `/merge-train-steward` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/merge-train-steward.md` (canonical) — edit it
-/// there, then re-vendor.
-const MERGE_TRAIN_STEWARD: &str = include_str!("fleet_commands/merge-train-steward.md");
-
 /// `/mobile-dev` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/mobile-dev.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -275,11 +250,6 @@ const MOBILE_DEV: &str = include_str!("fleet_commands/mobile-dev.md");
 /// qontinui-claude-config `.claude/commands/mobile-verify.md` (canonical) — edit it
 /// there, then re-vendor.
 const MOBILE_VERIFY: &str = include_str!("fleet_commands/mobile-verify.md");
-
-/// `/mtc` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/mtc.md` (canonical) — edit it
-/// there, then re-vendor.
-const MTC: &str = include_str!("fleet_commands/mtc.md");
 
 /// `/name` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/name.md` (canonical) — edit it
@@ -295,11 +265,6 @@ const NEXT_STEPS: &str = include_str!("fleet_commands/next-steps.md");
 /// qontinui-claude-config `.claude/commands/organize-notes.md` (canonical) — edit it
 /// there, then re-vendor.
 const ORGANIZE_NOTES: &str = include_str!("fleet_commands/organize-notes.md");
-
-/// `/publish-runner` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/publish-runner.md` (canonical) — edit it
-/// there, then re-vendor.
-const PUBLISH_RUNNER: &str = include_str!("fleet_commands/publish-runner.md");
 
 /// `/pull-all` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/pull-all.md` (canonical) — edit it
@@ -406,11 +371,6 @@ const SYMBOL_CLAIMS_WARN: &str = include_str!("fleet_commands/symbol-claims-warn
 /// there, then re-vendor.
 const TEST_UI_BRIDGE: &str = include_str!("fleet_commands/test-ui-bridge.md");
 
-/// `/ufix` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/ufix.md` (canonical) — edit it
-/// there, then re-vendor.
-const UFIX: &str = include_str!("fleet_commands/ufix.md");
-
 /// `/ui-bridge` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/ui-bridge.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -435,11 +395,6 @@ const VALIDATE: &str = include_str!("fleet_commands/validate.md");
 /// qontinui-claude-config `.claude/commands/verify-plan-status.md` (canonical) — edit it
 /// there, then re-vendor.
 const VERIFY_PLAN_STATUS: &str = include_str!("fleet_commands/verify-plan-status.md");
-
-/// `/verify-web` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/verify-web.md` (canonical) — edit it
-/// there, then re-vendor.
-const VERIFY_WEB: &str = include_str!("fleet_commands/verify-web.md");
 
 /// `/vet-imp` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/vet-imp.md` (canonical) — edit it
@@ -468,7 +423,6 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("analyze-subagent", ANALYZE_SUBAGENT),
     ("ask-operator", ASK_OPERATOR),
     ("audit", AUDIT),
-    ("auto-fix", AUTO_FIX),
     ("auto-improve", AUTO_IMPROVE),
     ("auto-review", AUTO_REVIEW),
     ("babysit-prs", BABYSIT_PRS),
@@ -478,25 +432,19 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
     ("create-tutorial", CREATE_TUTORIAL),
-    ("debug-loop", DEBUG_LOOP),
-    ("debug", DEBUG),
     ("find-debt", FIND_DEBT),
     ("find-misplaced", FIND_MISPLACED),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
     ("manual-test-coord-loop", MANUAL_TEST_COORD_LOOP),
-    ("manual-test-coord", MANUAL_TEST_COORD),
     ("manual-test-loop", MANUAL_TEST_LOOP),
     ("manual-test", MANUAL_TEST),
-    ("merge-train-steward", MERGE_TRAIN_STEWARD),
     ("mobile-dev", MOBILE_DEV),
     ("mobile-verify", MOBILE_VERIFY),
-    ("mtc", MTC),
     ("name", NAME),
     ("next-steps", NEXT_STEPS),
     ("organize-notes", ORGANIZE_NOTES),
-    ("publish-runner", PUBLISH_RUNNER),
     ("pull-all", PULL_ALL),
     ("pull-scoped", PULL_SCOPED),
     ("pvi", PVI),
@@ -518,13 +466,11 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("summarize-session", SUMMARIZE_SESSION),
     ("symbol-claims-warn", SYMBOL_CLAIMS_WARN),
     ("test-ui-bridge", TEST_UI_BRIDGE),
-    ("ufix", UFIX),
     ("ui-bridge", UI_BRIDGE),
     ("unattended", UNATTENDED),
     ("update-spec", UPDATE_SPEC),
     ("validate", VALIDATE),
     ("verify-plan-status", VERIFY_PLAN_STATUS),
-    ("verify-web", VERIFY_WEB),
     ("vet-imp", VET_IMP),
     ("workflow-runs", WORKFLOW_RUNS),
 ];
