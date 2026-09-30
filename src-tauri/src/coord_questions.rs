@@ -53,6 +53,19 @@ struct AskQuestionPayload<'a> {
     context: Option<&'a str>,
     agent_session_id: Option<Uuid>,
     device_id: Option<Uuid>,
+    /// The asking session's recommended answer, so the operator receives a
+    /// fork WITH a recommendation rather than an open question (plan
+    /// `2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen`,
+    /// Phase 3). Omitted from the wire when `None`: coord's
+    /// `AskQuestionRequest` is read with a plain (non-strict) `Json`
+    /// extractor, so an older coord ignores the key and a newer one stores
+    /// NULL for an absent one — sending `null` would say nothing more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommendation: Option<&'a str>,
+    /// What changes if the operator overturns `recommendation`. Same
+    /// omit-when-`None` rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    if_overturned: Option<&'a str>,
 }
 
 /// Subset of the coord-returned row this client cares about. Coord
@@ -113,6 +126,8 @@ pub async fn post_question(
     context: Option<&str>,
     agent_session_id: Option<Uuid>,
     device_id: Option<Uuid>,
+    recommendation: Option<&str>,
+    if_overturned: Option<&str>,
 ) -> Result<Uuid, CoordQuestionError> {
     let url = format!(
         "{}/agents/{}/ask-question",
@@ -126,6 +141,8 @@ pub async fn post_question(
         context,
         agent_session_id,
         device_id,
+        recommendation,
+        if_overturned,
     };
 
     let client = reqwest::Client::builder()
@@ -271,6 +288,8 @@ pub async fn ask_via_coord(
     context: Option<&str>,
     agent_session_id: Option<Uuid>,
     device_id: Option<Uuid>,
+    recommendation: Option<&str>,
+    if_overturned: Option<&str>,
     poll_timeout: Duration,
 ) -> Result<String, CoordQuestionError> {
     let question_id = post_question(
@@ -282,6 +301,8 @@ pub async fn ask_via_coord(
         context,
         agent_session_id,
         device_id,
+        recommendation,
+        if_overturned,
     )
     .await?;
     poll_answer(coord_base, question_id, poll_timeout).await
@@ -376,6 +397,8 @@ mod tests {
             Some("phase-3"),
             "Are we go for launch?",
             &options,
+            None,
+            None,
             None,
             None,
             None,
@@ -479,6 +502,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         match result {
@@ -503,6 +528,8 @@ mod tests {
                 Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             ),
             device_id: Some(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()),
+            recommendation: Some("ship it"),
+            if_overturned: Some("the phase slips a week"),
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert_eq!(v["question"], "Q?");
@@ -514,5 +541,28 @@ mod tests {
             "11111111-1111-1111-1111-111111111111"
         );
         assert_eq!(v["device_id"], "22222222-2222-2222-2222-222222222222");
+        assert_eq!(v["recommendation"], "ship it");
+        assert_eq!(v["if_overturned"], "the phase slips a week");
+    }
+
+    #[test]
+    fn ask_question_payload_omits_absent_recommendation_fields() {
+        // An absent recommendation is omitted from the wire, not sent as
+        // `null` — the question is then served as an open question.
+        let options = serde_json::json!(["a"]);
+        let payload = AskQuestionPayload {
+            question: "Q?",
+            options: &options,
+            plan_phase: None,
+            context: None,
+            agent_session_id: None,
+            device_id: None,
+            recommendation: None,
+            if_overturned: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        let obj = v.as_object().expect("payload is an object");
+        assert!(!obj.contains_key("recommendation"), "got: {v}");
+        assert!(!obj.contains_key("if_overturned"), "got: {v}");
     }
 }

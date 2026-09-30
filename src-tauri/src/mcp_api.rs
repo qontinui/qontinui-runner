@@ -4091,6 +4091,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_label_unset",
     "coord_pr_status",
     "coord_predict_resource_collisions",
+    // The one-screen project-state read (plan
+    // 2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen,
+    // Phase 3) — read-only; without it a runner-proxied session is refused it.
+    "coord_project_state",
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
@@ -4121,6 +4125,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_work_unit_add_citation",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
+    // Read-only; the project-state door's `row_count` is checked against it
+    // (same plan, Phase 1 acceptance (d)).
+    "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
