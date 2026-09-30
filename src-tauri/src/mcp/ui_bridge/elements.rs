@@ -2563,7 +2563,7 @@ pub async fn ui_bridge_execute_component_action_handler(
     // component id owns it (see `component_action_dispatch`); otherwise the
     // runner's own webview does. Read before dispatch, from the same registry
     // lookup the dispatch makes.
-    let app_id = match state.app_registry.get(&id).await {
+    let app_id = match state.app_registry.get_live(&id).await {
         Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
         _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
     };
