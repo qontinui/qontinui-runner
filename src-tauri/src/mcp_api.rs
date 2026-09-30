@@ -1998,19 +1998,18 @@ async fn health(
         match tokio::task::spawn_blocking(crate::fleet::machine_capability::probe).await {
             Ok(capability) => (
                 serde_json::to_value(&capability).unwrap_or(serde_json::Value::Null),
-                serde_json::json!({
-                    "armed": false,
-                    "scale": crate::resource_guard::commit_ladder_scale(&capability),
-                    "referenceCommitLimit": crate::resource_guard::REFERENCE_COMMIT_LIMIT,
-                    "scaleMax": crate::resource_guard::SCALE_MAX,
-                }),
+                crate::resource_guard::commit_ladder_shadow_health_json(Ok(&capability)),
             ),
-            Err(e) => (
-                serde_json::json!({
-                    "capabilityUnknown": { "all": format!("capability probe task failed: {e}") },
-                }),
-                serde_json::Value::Null,
-            ),
+            Err(e) => {
+                let reason = format!("capability probe task failed: {e}");
+                (
+                    serde_json::to_value(crate::fleet::machine_capability::unknown_everywhere(
+                        &reason,
+                    ))
+                    .unwrap_or(serde_json::Value::Null),
+                    crate::resource_guard::commit_ladder_shadow_health_json(Err(&reason)),
+                )
+            }
         };
 
     // AI provider circuit breaker states
@@ -2651,8 +2650,10 @@ async fn health(
         // Phase 2, SHADOW: the factor the resource guard's byte ladder WOULD be
         // scaled by on this machine (`armed: false` — no verdict uses it; the
         // per-rung comparison is logged edge-triggered under the
-        // `resource_guard::commit_ladder_shadow` target). `null` when the
-        // capability probe task failed.
+        // `resource_guard::commit_ladder_shadow` target). `scaleSource` says
+        // why (`derived` | `below_reference` | `unknown_identity`); when the
+        // probe task failed, `scale`/`scaleSource` are null and `reason` says
+        // why — the object is always present.
         "commitLadderShadow": commit_ladder_shadow_json,
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
