@@ -191,10 +191,19 @@ fn measure(corpus: &Corpus, mut f: impl FnMut(&[u8], u64)) -> (u64, u64, u64) {
         }
     }
     let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    (rounds * corpus.frames.len() as u64, rounds * corpus_bytes, ns)
+    (
+        rounds * corpus.frames.len() as u64,
+        rounds * corpus_bytes,
+        ns,
+    )
 }
 
-fn report(bench: &str, corpus: &Corpus, (frames, bytes, ns): (u64, u64, u64), extra: serde_json::Value) {
+fn report(
+    bench: &str,
+    corpus: &Corpus,
+    (frames, bytes, ns): (u64, u64, u64),
+    extra: serde_json::Value,
+) {
     let mut line = serde_json::json!({
         "bench": bench,
         "corpus": corpus.name,
@@ -338,14 +347,26 @@ fn corpus_generator_produces_the_documented_shapes() {
             assert_eq!(visible, cells, "{} visible cells", corpus.name);
             // SGR-heavy: well over one escape byte per visible cell, and
             // never beyond the 256 KiB sync-flush frame cap.
-            assert!(frame.len() > cells * 3, "{} too sparse: {}", corpus.name, frame.len());
-            assert!(frame.len() < 256 * 1024, "{} over the frame cap", corpus.name);
+            assert!(
+                frame.len() > cells * 3,
+                "{} too sparse: {}",
+                corpus.name,
+                frame.len()
+            );
+            assert!(
+                frame.len() < 256 * 1024,
+                "{} over the frame cap",
+                corpus.name
+            );
         }
     }
     // The two larger screens straddle the relay's 49 152-byte hazard; the
     // smallest does not always — which is the point of measuring all three.
     let over = |i: usize| a[i].frames.iter().all(|f| f.len() > 49_152);
-    assert!(over(1) && over(2), "200x60 and 250x80 repaints exceed 49152 bytes");
+    assert!(
+        over(1) && over(2),
+        "200x60 and 250x80 repaints exceed 49152 bytes"
+    );
 
     let typing = &a[3];
     assert_eq!(typing.name, "typing_1to8");

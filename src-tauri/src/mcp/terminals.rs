@@ -1027,7 +1027,9 @@ pub async fn get_coord_session_handler(
 /// [`crate::terminal::transport_stats`]. Read-only; process-global.
 pub async fn get_transport_stats_handler(
 ) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
-    Json(ApiResponse::success(crate::terminal::transport_stats::snapshot()))
+    Json(ApiResponse::success(
+        crate::terminal::transport_stats::snapshot(),
+    ))
 }
 
 /// POST /terminals/transport-stats — zero the counters and return the
@@ -1035,7 +1037,9 @@ pub async fn get_transport_stats_handler(
 /// window per reset without a separate read.
 pub async fn reset_transport_stats_handler(
 ) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
-    Json(ApiResponse::success(crate::terminal::transport_stats::reset()))
+    Json(ApiResponse::success(
+        crate::terminal::transport_stats::reset(),
+    ))
 }
 
 // ============================================================================
@@ -1393,7 +1397,9 @@ mod tests {
                     .await
                     .unwrap();
                 let status = resp.status();
-                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
                 (status, String::from_utf8(bytes.to_vec()).unwrap())
             }
         };
@@ -1402,7 +1408,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["success"], true);
-        assert!(v.pointer("/data/frame_size_hist/counts").is_some(), "{body}");
+        assert!(
+            v.pointer("/data/frame_size_hist/counts").is_some(),
+            "{body}"
+        );
 
         let (status, body) = call(Method::POST).await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "reset-handler"));
