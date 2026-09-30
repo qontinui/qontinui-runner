@@ -60,7 +60,7 @@ pub(crate) const FRONTIER_UPSERT_SQL: &str = concat!(
     "INSERT INTO project.journey_frontier\n",
     "    (app_id, node_key, node, affordance_fingerprint, affordance_role,\n",
     "     declared_effect, reason, last_seen_run_id)\n",
-    "SELECT $1, $2, $3::jsonb, a.fp, a.role, a.effect, 'not_yet_activated', $4\n",
+    "SELECT $1::text, $2::text, $3::jsonb, a.fp, a.role, a.effect, 'not_yet_activated', $4::text\n",
     "  FROM unnest($5::text[], $6::text[], $7::text[]) AS a(fp, role, effect)\n",
     " WHERE NOT EXISTS (\n",
     "     SELECT 1 FROM project.journey_edge_observations e\n",

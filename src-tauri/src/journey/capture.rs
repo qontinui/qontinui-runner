@@ -974,7 +974,8 @@ async fn writable_connection(pg: &PgDb) -> Option<deadpool_postgres::Object> {
             return None;
         }
     };
-    match journey_schema_supported(&conn).await {
+    let probe = journey_schema_supported(&conn).await;
+    match probe {
         SchemaProbe::Present => Some(conn),
         SchemaProbe::Absent { .. } | SchemaProbe::Failed { .. } => {
             health::record_not_written();
@@ -1412,6 +1413,117 @@ mod tests {
         let ok: Result<_, (StatusCode, Json<ApiResponse<()>>)> =
             Ok(Json(ApiResponse::success(serde_json::json!({}))));
         assert_eq!(control_action_verdict(&ok), Some(false));
+    }
+
+    // ---- choke-point coverage -----------------------------------------------
+
+    /// The body of the top-level item `fn <name>` in `source`: from its
+    /// signature to the next top-level item. Text-level on purpose — the
+    /// handlers need a live `ApiState` to run, and what this pins is the
+    /// WIRING, which is otherwise invisible: a transport whose handler never
+    /// calls the ledger writes no row and fails nothing.
+    fn item_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = [
+            format!("\npub async fn {name}("),
+            format!("\nasync fn {name}("),
+            format!("\nfn {name}("),
+            format!("\npub(crate) fn {name}("),
+        ]
+        .iter()
+        .find_map(|sig| source.find(sig.as_str()))
+        .unwrap_or_else(|| panic!("handler `{name}` not found"));
+        let rest = source.get(start + 1..).unwrap_or_default();
+        let end = rest
+            .match_indices("\n}\n")
+            .next()
+            .map(|(i, _)| i + 3)
+            .unwrap_or(rest.len());
+        rest.get(..end).unwrap_or(rest)
+    }
+
+    /// Every choke point — the five D3 paths plus the SDK component and batch
+    /// routes recorded under the same action kinds — and both snapshot
+    /// routes that close pending edges, must call the ledger. A missing
+    /// transport would otherwise be invisible: edges for whichever transport a
+    /// skill uses would simply never appear.
+    #[test]
+    fn every_choke_point_calls_the_ledger() {
+        // cargo runs tests with CWD = crate root (src-tauri).
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+        let elements = read("src/mcp/ui_bridge/elements.rs");
+        let bookmarks = read("src/mcp/ui_bridge/bookmarks.rs");
+        let sdk = read("src/mcp/sdk_client.rs");
+
+        let cases: [(&str, &str, &str); 14] = [
+            // (1) control element action
+            (
+                "elements",
+                "ui_bridge_execute_action_handler",
+                "record_action(",
+            ),
+            // (2) control batch
+            (
+                "elements",
+                "ui_bridge_batch_actions_handler",
+                "record_action(",
+            ),
+            // (3) control component action
+            (
+                "elements",
+                "ui_bridge_execute_component_action_handler",
+                "record_action(",
+            ),
+            // (4) SDK element action
+            ("sdk", "handle_element_action", "record_action("),
+            // (5) execute-with-diff: two runner routes + the SDK twin
+            (
+                "bookmarks",
+                "ui_bridge_execute_with_diff_handler",
+                "record_diff_result(",
+            ),
+            (
+                "bookmarks",
+                "ui_bridge_with_diff_handler",
+                "record_diff_result(",
+            ),
+            ("bookmarks", "record_diff_result", "record_diff("),
+            ("sdk", "handle_ct_execute_with_diff", "record_diff("),
+            // SDK component action — recorded as `component_action`
+            (
+                "sdk",
+                "handle_component_action",
+                "record_sdk_component_action(",
+            ),
+            (
+                "sdk",
+                "record_sdk_component_action",
+                "ActionSpec::component(",
+            ),
+            // SDK batch routes — recorded as `batch_action`
+            ("sdk", "handle_execute_batch_action", "record_sdk_batch("),
+            ("sdk", "handle_control_batch", "record_sdk_batch("),
+            // Snapshots that close pending edges
+            (
+                "elements",
+                "ui_bridge_get_snapshot_handler",
+                "record_snapshot(",
+            ),
+            ("sdk", "handle_snapshot", "record_journey_snapshot("),
+        ];
+        for (file, handler, call) in cases {
+            let source = match file {
+                "elements" => &elements,
+                "bookmarks" => &bookmarks,
+                _ => &sdk,
+            };
+            assert!(
+                item_body(source, handler).contains(call),
+                "{file}::{handler} must call `{call}` — without it this transport writes no \
+                 journey row"
+            );
+        }
+        assert!(item_body(&sdk, "record_journey_snapshot").contains("record_snapshot("));
+        assert!(item_body(&sdk, "record_sdk_batch").contains("ActionSpec::batch("));
     }
 
     // ---- request parsing ---------------------------------------------------

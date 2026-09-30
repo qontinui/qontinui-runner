@@ -73,7 +73,7 @@ pub(crate) fn page_identity(snapshot: &serde_json::Value) -> PageIdentity {
     let semantic_page_name =
         non_blank(page.and_then(|p| p.get("pageName"))).map(pathname_to_spec_id);
 
-    let page_label = resolve_declared_page_label(snapshot).or(semantic_page_name.clone());
+    let page_label = resolve_declared_page_label(snapshot).or(semantic_page_name);
     let spec_lookup_label = page_label.clone().or_else(|| resolve_page_label(snapshot));
 
     let pathname_template = non_blank(

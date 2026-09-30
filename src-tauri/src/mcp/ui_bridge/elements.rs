@@ -612,6 +612,9 @@ pub async fn ui_bridge_batch_actions_handler(
 
     // Journey ledger choke point (D3): a batch is ONE trigger — `batch:<n>`
     // on its first target — opening one pending edge, not one per step.
+    // Recorded as `ChokePoint::BatchAction`, the same kind as the SDK batch
+    // routes (`sdk_client::record_sdk_batch`): the choke point names the
+    // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
     if let Some(action) = crate::journey::capture::ActionSpec::batch(&steps) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
@@ -2556,7 +2559,10 @@ pub async fn ui_bridge_execute_component_action_handler(
         request,
     )
     .await;
-    // Journey ledger choke point (D3).
+    // Journey ledger choke point (D3). Recorded as
+    // `ChokePoint::ComponentAction`, the same kind as the SDK component action
+    // (`sdk_client::record_sdk_component_action`): the choke point names the
+    // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
     if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),

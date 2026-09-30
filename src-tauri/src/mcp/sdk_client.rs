@@ -4503,7 +4503,7 @@ async fn handle_component_action(
     // Per-app-id dispatch: skip the active-SDK-connection probe and route
     // straight to the named registered app.
     if let Some(app_id) = query.get("app_id").map(|s| s.as_str()) {
-        return match dispatch_app_request_by_id(
+        let response = match dispatch_app_request_by_id(
             &state,
             app_id,
             "executeComponentAction",
@@ -4514,12 +4514,16 @@ async fn handle_component_action(
         )
         .await
         {
-            Ok(data) => Json(data),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            Ok(data) => data,
+            Err(e) => serde_json::json!({ "success": false, "error": e }),
         };
+        let version = app_version_for(&state, app_id).await;
+        record_sdk_component_action(&state, app_id, version, &id, &action_id, &response);
+        return Json(response);
     }
 
-    match dispatch_app_request(
+    let active_app = active_app_identity(&state).await;
+    let response = match dispatch_app_request(
         &state,
         "executeComponentAction",
         ws_payload,
@@ -4529,9 +4533,80 @@ async fn handle_component_action(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    // With no active SDK app the dispatch reached nothing: no app, no edge.
+    if let Some((app_id, version)) = active_app {
+        record_sdk_component_action(&state, &app_id, version, &id, &action_id, &response);
     }
+    Json(response)
+}
+
+/// Whether an SDK route's JSON answer is an explicit failure.
+fn sdk_response_failed(response: &serde_json::Value) -> bool {
+    response.get("success") == Some(&serde_json::Value::Bool(false))
+}
+
+/// Journey ledger choke point for the SDK component action (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, D3).
+///
+/// Recorded as `ChokePoint::ComponentAction`, the same kind as the control
+/// route `/control/component/{id}/action/{action_id}`: `ChokePoint` names the
+/// ACTION KIND, not the transport, so whether a component action arrived over
+/// the SDK route or the control route is NOT recorded in the ledger. Same
+/// pending-edge rule as its control twin (no snapshot in hand).
+fn record_sdk_component_action(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    app_version: Option<String>,
+    component_id: &str,
+    action_id: &str,
+    response: &serde_json::Value,
+) {
+    crate::journey::capture::record_action(
+        state.app_state.pg_db.clone(),
+        app_id,
+        crate::journey::capture::ActionSpec::component(component_id, action_id),
+        crate::journey::capture::Provenance {
+            app_version,
+            run_id: None,
+        },
+        sdk_response_failed(response),
+    );
+}
+
+/// Journey ledger choke point for the two SDK batch routes (D3).
+///
+/// Recorded as `ChokePoint::BatchAction`, the same kind as the control route
+/// `/control/batch-actions`: `ChokePoint` names the ACTION KIND, not the
+/// transport, so whether a batch arrived over an SDK route or the control
+/// route is NOT recorded in the ledger. Same rule as the control twin: the
+/// batch is ONE trigger (`batch:<n>` on its first target) opening one pending
+/// edge. `action_steps` are the steps that act on an element; an empty batch
+/// acted on nothing and records nothing, as does a batch with no active app.
+fn record_sdk_batch(
+    state: &Arc<ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    action_steps: &[serde_json::Value],
+    response: &serde_json::Value,
+) {
+    let (Some((app_id, app_version)), Some(action)) = (
+        active_app,
+        crate::journey::capture::ActionSpec::batch(action_steps),
+    ) else {
+        return;
+    };
+    crate::journey::capture::record_action(
+        state.app_state.pg_db.clone(),
+        &app_id,
+        action,
+        crate::journey::capture::Provenance {
+            app_version,
+            run_id: None,
+        },
+        sdk_response_failed(response),
+    );
 }
 
 /// GET /ui-bridge/sdk/control/element/:id/state-generic — Get generic element state
@@ -4627,8 +4702,15 @@ async fn handle_execute_batch_action(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    // `BatchActionRequest.steps[]` — every step acts on an element.
+    let steps = body
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    let response = match dispatch_app_request(
         &state,
         "executeBatchAction",
         serde_json::json!({ "request": body.clone() }),
@@ -4638,9 +4720,23 @@ async fn handle_execute_batch_action(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    record_sdk_batch(&state, active_app, &steps, &response);
+    Json(response)
+}
+
+/// The steps of a `ControlBatchRequest` that act on an element
+/// (`type: "action"`); `wait` and `snapshot` steps act on nothing.
+fn control_batch_action_steps(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body.get("actions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|step| step.get("type").and_then(|t| t.as_str()) == Some("action"))
+        .cloned()
+        .collect()
 }
 
 /// POST /ui-bridge/sdk/control/batch — Execute a batched control request
@@ -4648,8 +4744,10 @@ async fn handle_control_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    let steps = control_batch_action_steps(&body);
+    let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    let response = match dispatch_app_request(
         &state,
         "controlBatch",
         body.clone(),
@@ -4659,9 +4757,11 @@ async fn handle_control_batch(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    record_sdk_batch(&state, active_app, &steps, &response);
+    Json(response)
 }
 
 // =============================================================================
