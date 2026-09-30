@@ -1136,7 +1136,7 @@ mod console_jam_tests {
         // Split so the needle never appears verbatim on a code line --- this
         // check would otherwise match itself.
         let needle = concat!("with_writer(std::io::", "stdout");
-        let src = include_str!("logging.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("logging.rs"));
         let offenders: Vec<(usize, &str)> = src
             .lines()
             .enumerate()

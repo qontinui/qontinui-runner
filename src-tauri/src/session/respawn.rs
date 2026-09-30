@@ -1213,14 +1213,9 @@ mod tests {
     /// guard — a future edit that adds a close here trips it.
     #[test]
     fn respawn_module_never_closes_the_source() {
-        let src = include_str!("respawn.rs");
-        // Scan the PRODUCTION half only: everything before the test module.
-        // (This very test names the forbidden strings, so including it would
-        // trip the guard on itself.)
-        let production = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the module has a production half");
+        // Scan the PRODUCTION half only. (This very test names the forbidden
+        // strings, so including it would trip the guard on itself.)
+        let production = crate::source_pin::ProdSource::of(include_str!("respawn.rs"));
         // Ignore the doc/comment prose that explains the divergence; look only
         // at what the module could actually EXECUTE.
         let code: String = production

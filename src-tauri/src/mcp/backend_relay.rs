@@ -5762,10 +5762,10 @@ mod tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_created_reply_echoes_the_admitted_grant_jti() {
-        const DISPATCHER: &str = include_str!("backend_relay.rs");
+        let dispatcher = crate::source_pin::ProdSource::of(include_str!("backend_relay.rs"));
 
         // The producer's reply-construction region.
-        let cstart = DISPATCHER
+        let cstart = dispatcher
             .find("\"type\": \"terminal_created\",")
             .expect("terminal_created reply construction not found");
         // Bounded STRUCTURALLY, by the sibling `Err` arm's own frame, not by a
@@ -5774,10 +5774,10 @@ mod tests {
         // offset 2194, and the test then reported the production code missing
         // a key it sets 400 characters further down — a false accusation
         // indistinguishable from the real defect it is meant to catch.
-        let region_end = DISPATCHER[cstart..]
+        let region_end = dispatcher[cstart..]
             .find("\"type\": \"error\",")
             .expect("the Err arm that bounds this region was not found");
-        let region = &DISPATCHER[cstart..cstart + region_end];
+        let region = &dispatcher[cstart..cstart + region_end];
         assert!(
             region.contains("frame[\"grant_jti\"]"),
             "the terminal_created reply does not echo a top-level `grant_jti`, \
@@ -5811,7 +5811,7 @@ mod tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_reply_handle_inbound_knows_passes_both_inbound_gates() {
-        const DISPATCHER: &str = include_str!("backend_relay.rs");
+        let dispatcher = crate::source_pin::ProdSource::of(include_str!("backend_relay.rs"));
         const CLIENT: &str = include_str!("remote_terminal.rs");
 
         // The reply types `handle_inbound` acts on, read from its own match
@@ -5848,19 +5848,19 @@ mod tests {
         // included — from satisfying the check. It asserts textual presence
         // within a region, NOT that a match arm exists, so a quoted mention
         // inside a region would still satisfy it. Keep mentions backticked.
-        let admit_start = DISPATCHER
+        let admit_start = dispatcher
             .find("const REMOTE_SOURCE_ADMITTED:")
             .expect("admission list not found");
-        let admit = &DISPATCHER[admit_start
+        let admit = &dispatcher[admit_start
             ..admit_start
-                + DISPATCHER[admit_start..]
+                + dispatcher[admit_start..]
                     .find("];")
                     .expect("unterminated admission list")];
 
-        let disp_start = DISPATCHER
+        let disp_start = dispatcher
             .find("fn handle_relay_command(")
             .expect("dispatcher not found");
-        let disp_rest = &DISPATCHER[disp_start..];
+        let disp_rest = &dispatcher[disp_start..];
         // Anchored on the `_` ARM, not on the warn phrase: that phrase's FIRST
         // occurrence after the fn is inside a comment ~50 lines earlier, which
         // silently cut the scanned region short and left the arms after it

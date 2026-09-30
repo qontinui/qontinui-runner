@@ -556,7 +556,7 @@ mod tests {
     /// the router root is invisible to it and needs its own.
     #[test]
     fn route_entries_match_the_registered_routes() {
-        let source = include_str!("session_repository.rs");
+        let source = crate::source_pin::ProdSource::of(include_str!("session_repository.rs"));
         let registered: Vec<String> = source
             .lines()
             .filter_map(|l| l.trim().strip_prefix(".route(\""))
@@ -661,7 +661,7 @@ mod tests {
         // credentials this loopback surface does not, so a write here would be
         // an unauthenticated local process using the runner's own credential to
         // put content into the operator's session archive.
-        let source = include_str!("session_repository.rs");
+        let source = crate::source_pin::ProdSource::of(include_str!("session_repository.rs"));
         // The needle is assembled from two literals so this assertion does not
         // match its own source line.
         let post_import = concat!("axum::routing::", "post");

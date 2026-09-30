@@ -12595,7 +12595,7 @@ mod tests {
         // shipped that way and CI caught it. `concat!` keeps the needle itself
         // off the haystack; the comment filter handles the header.
         const RETIRED_FLAG: &str = concat!("QONTINUI_SESSION_COORD_", "IDENTITY_ENABLED");
-        let src = include_str!("coord_mcp.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("coord_mcp.rs"));
         let offenders: Vec<String> = src
             .lines()
             .enumerate()

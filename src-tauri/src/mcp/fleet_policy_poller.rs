@@ -3689,8 +3689,8 @@ mod tests {
     #[test]
     fn briefing_store_path_resolves_the_config_dir_without_creating_it() {
         // ---- (1) the SOURCE invariant: which resolver the body names -------
-        const SRC: &str = include_str!("fleet_policy_poller.rs");
-        let body: Vec<&str> = SRC
+        let src = crate::source_pin::ProdSource::of(include_str!("fleet_policy_poller.rs"));
+        let body: Vec<&str> = src
             .lines()
             .skip_while(|l| !l.contains("fn briefing_store_path()"))
             .skip(1)

@@ -4032,15 +4032,7 @@ mod tests {
     /// not something a unit test can conjure portably.
     #[test]
     fn the_dirty_probe_is_bounded_by_a_deadline() {
-        const SRC: &str = include_str!("orphan_target_reaper.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("orphan_target_reaper.rs"));
         let f = prod
             .split_once("pub fn worktree_is_dirty(")
             .map(|(_, after)| after)
@@ -4170,15 +4162,7 @@ mod tests {",
     /// exists", which no runtime assertion can observe.
     #[test]
     fn read_errors_are_only_ever_appended_through_the_recording_seam() {
-        const SRC: &str = include_str!("orphan_target_reaper.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("orphan_target_reaper.rs"));
         // The one legitimate push is inside `record_read_error` itself.
         let seam = prod
             .split_once("fn record_read_error(")
@@ -4210,15 +4194,7 @@ mod tests {",
     /// as often and is dry-run by default.
     #[test]
     fn the_periodic_cycle_yields_to_an_in_flight_preview_walk() {
-        const SRC: &str = include_str!("orphan_target_reaper.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("orphan_target_reaper.rs"));
         let spawn = prod
             .split_once("pub fn spawn_orphan_reaper() {")
             .map(|(_, after)| after)
@@ -4250,15 +4226,7 @@ mod tests {",
     /// the ungated version would have N instances racing over the same paths.
     #[test]
     fn the_periodic_reaper_is_instance_gated() {
-        const SRC: &str = include_str!("orphan_target_reaper.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("orphan_target_reaper.rs"));
         let spawn = prod
             .split_once("pub fn spawn_orphan_reaper() {")
             .map(|(_, after)| after)

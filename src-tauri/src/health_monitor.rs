@@ -3149,7 +3149,7 @@ mod tests {
         // depends on its own formatting is a false alarm waiting to happen.
         let store_needle = concat!("HEARTBEAT_MS", ".store");
         let wall_needle = concat!("chrono::Utc", "::now");
-        let src = include_str!("health_monitor.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("health_monitor.rs"));
         for line in src.lines() {
             let l = line.trim();
             if l.starts_with("//") {
@@ -3392,20 +3392,15 @@ mod tests {
     /// probe/metrics split below already uses: the production probe loop must
     /// construct EACH detector with `with_diagnostics(..)`, never `default()`.
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_probe_loop_builds_its_diagnostics_rig_at_start() {
-        let src = include_str!("health_monitor.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("health_monitor.rs"));
         let body = src
             .split("pub fn start_health_monitor()")
             .nth(1)
             .expect("start_health_monitor must exist");
-        // Production code only: every test below drives `WedgeDetector::default()`
-        // on purpose, and that is the property the second assertion protects, not
-        // one it should trip over.
-        let body = &body[..body.find("#[cfg(test)]").unwrap_or(body.len())];
+        // Production code only — `ProdSource` has removed the test modules: every
+        // test below drives `WedgeDetector::default()` on purpose, and that is the
+        // property the second assertion protects, not one it should trip over.
         assert!(
             body.contains("WedgeDetector::with_diagnostics(WedgeKind::Backend)"),
             "the probe loop no longer builds the backend rung's Phase-4 rig eagerly — a \
@@ -3444,7 +3439,7 @@ mod tests {
     /// the probe loop nor before the probe's first stamp.
     #[test]
     fn the_probe_loop_does_not_share_a_thread_with_the_metrics_work() {
-        let src = include_str!("health_monitor.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("health_monitor.rs"));
         let body = src
             .split("pub fn start_health_monitor()")
             .nth(1)

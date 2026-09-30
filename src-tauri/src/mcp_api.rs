@@ -14765,8 +14765,10 @@ mod coord_mcp_body_gate_tests {
                 .is_ok(),
             "membership is a binary_search, so the entry must sit in sorted position"
         );
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = crate::build_drift::parse_tool_policy_consts(
+            &crate::source_pin::ProdSource::of(include_str!("mcp_api.rs")),
+        )
+        .expect("mcp_api.rs parses");
         assert_eq!(
             parsed
                 .allowed
@@ -15425,8 +15427,10 @@ mod coord_mcp_body_gate_tests {
     /// silently against the one file it exists to read.
     #[test]
     fn trunk_policy_parser_round_trips_this_files_consts() {
-        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let p = crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::of(
+            include_str!("mcp_api.rs"),
+        ))
+        .expect("mcp_api.rs parses");
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
             p.allowed_prefixes,
@@ -17398,7 +17402,7 @@ mod coord_provision_session_gate_tests {
     /// `the_health_handler_emits_the_supervised_workers_block`).
     #[test]
     fn the_health_handler_emits_the_active_tenant_fields() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()
@@ -17441,7 +17445,7 @@ mod coord_provision_session_gate_tests {
     /// pin the active-tenant fields use.
     #[test]
     fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()
@@ -19473,7 +19477,7 @@ mod oauth_dcr_surface_absent_tests {
     /// match it.
     #[test]
     fn no_oauth_or_dcr_route_is_registered_in_this_router() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         for (_, path) in OAUTH_PATHS {
             let needle = format!(".route(\"{path}\"");
             assert!(

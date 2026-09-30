@@ -5777,38 +5777,6 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 mod tests {
     use super::*;
 
-    /// The production half of a module's source, with the test module cut off.
-    ///
-    /// A pin must never scan `#[cfg(test)]` code: a call site written inside a
-    /// test would otherwise satisfy "the writer is guarded" while production
-    /// code had none, and a negative assertion would match its own string
-    /// literal. The first version of the pin below failed exactly that way.
-    ///
-    /// Splits on the test MODULE header, not on a bare `#[cfg(test)]`. Several
-    /// of the modules scanned here carry test-only helpers in production
-    /// position — `census.rs`'s `publish_census_for_test` sits ~1200 lines
-    /// above the writers — so splitting on the attribute alone would silently
-    /// truncate the scan to a prefix containing no call sites at all, and the
-    /// pin would then pass or fail for reasons unrelated to the guard.
-    fn prod_part(src: &'static str) -> &'static str {
-        src.split_once(
-            "
-#[cfg(test)]
-mod tests {",
-        )
-        .map(|(before, _)| before)
-        .unwrap_or(src)
-    }
-
-    /// Collapse all whitespace so the pin matches a call site regardless of how
-    /// `rustfmt` wrapped it. The guard call is ~90 columns before indentation,
-    /// so it sits right at the wrap boundary — a pin that required it on one
-    /// physical line would fail the day a writer moved one nesting level in,
-    /// reporting a missing guard that is in fact present.
-    fn squeezed(src: &str) -> String {
-        src.chars().filter(|c| !c.is_whitespace()).collect()
-    }
-
     /// Every machine-scoped writer must consult the guard.
     ///
     /// Pinned at the SOURCE level because the predicate reads `QONTINUI_PORT`,
@@ -5832,7 +5800,7 @@ mod tests {",
         let modules = [
             (
                 "fleet.rs",
-                include_str!("fleet.rs"),
+                crate::source_pin::ProdSource::of(include_str!("fleet.rs")),
                 5,
                 "the boot budget publish, the republisher, the heartbeat, and the tree \
                  publisher at BOTH its spawn and its write (`publish_tree_state`, which is \
@@ -5840,21 +5808,21 @@ mod tests {",
             ),
             (
                 "agent_worktree/census.rs",
-                include_str!("agent_worktree/census.rs"),
+                crate::source_pin::ProdSource::of(include_str!("agent_worktree/census.rs")),
                 2,
                 "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
                  every walk trigger routes through",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
-                include_str!("agent_worktree/fs_backstop.rs"),
+                crate::source_pin::ProdSource::of(include_str!("agent_worktree/fs_backstop.rs")),
                 1,
                 "the canonical-drift tick, which scans the shared canonical checkouts and \
                  POSTs device-keyed",
             ),
             (
                 "main.rs",
-                include_str!("main.rs"),
+                crate::source_pin::ProdSource::of(include_str!("main.rs")),
                 1,
                 "the plan adapter's `ScanReportGate`, handed to `spawn_if_configured` — the \
                  scan-root reading is one web row per device, so a secondary's report would \
@@ -5863,7 +5831,10 @@ mod tests {",
         ];
 
         for (name, src, want, what) in modules {
-            let found = squeezed(prod_part(src)).matches(GUARD).count();
+            // Production half only (a call site written inside a test must not
+            // satisfy the pin), comment lines dropped, whitespace squeezed so the
+            // match survives however `rustfmt` wrapped the call.
+            let found = src.squeezed().matches(GUARD).count();
             assert!(
                 found >= want,
                 "{name}: expected at least {want} guarded call site(s) — {what} — but found \

@@ -272,6 +272,11 @@ pub(crate) mod test_env {
     pub(crate) use crate::ambient::test_support::*;
 }
 
+/// Source pins read the production half of a file only — see the module doc.
+/// Declared from BOTH crate roots: each carries its own module tree of pins.
+#[cfg(test)]
+mod source_pin;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================

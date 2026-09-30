@@ -2794,7 +2794,8 @@ mod tests {
         // contains its own substrings, which is a tautology, not a test.
         // Extracted by LINE so a multi-byte character in the file cannot make
         // a byte-offset slice panic.
-        let source_lines: Vec<&str> = include_str!("plan_library.rs").lines().collect();
+        let prod = crate::source_pin::ProdSource::of(include_str!("plan_library.rs"));
+        let source_lines: Vec<&str> = prod.lines().collect();
 
         fn window(lines: &[&str], anchor: &str, before: usize, after: usize) -> String {
             let at = lines
@@ -3168,7 +3169,7 @@ mod tests {
     /// a re-typed copy would assert only that the copy matches itself.
     #[test]
     fn the_forward_table_has_a_row_for_every_registered_route() {
-        let source = include_str!("plan_library.rs");
+        let source = crate::source_pin::ProdSource::of(include_str!("plan_library.rs"));
         let rows: Vec<&str> = source
             .lines()
             .take_while(|l| l.starts_with("//!"))
@@ -3239,7 +3240,7 @@ mod tests {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");
         let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
-        let src = include_str!("plan_library.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("plan_library.rs"));
 
         let start = src
             .find(fn_header.as_str())

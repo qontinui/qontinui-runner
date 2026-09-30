@@ -2074,11 +2074,7 @@ MemAvailable:   15335424 kB
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_wsl_lane_still_takes_exactly_one_fork() {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         let start = prod
             .find("async fn collect_wsl_lane()")
             .expect("the WSL lane collector must exist");
@@ -2112,11 +2108,7 @@ MemAvailable:   15335424 kB
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_wsl_lane_publishes_a_disk_axis() {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         let start = prod
             .find("async fn collect_wsl_lane()")
             .expect("the WSL lane collector must exist");
@@ -2198,11 +2190,8 @@ MemAvailable:   15335424 kB
     /// Production source of `fleet.rs`, with its test module split off so a
     /// call site written inside a test cannot satisfy a pin that production
     /// code fails.
-    fn fleet_prod_src() -> &'static str {
-        const SRC: &str = include_str!("../fleet.rs");
-        SRC.split_once("\n#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(SRC)
+    fn fleet_prod_src() -> crate::source_pin::ProdSource<'static> {
+        crate::source_pin::ProdSource::of(include_str!("../fleet.rs"))
     }
 
     /// §A2, the load-bearing one: **a secondary must publish no samples.**
@@ -2270,11 +2259,7 @@ MemAvailable:   15335424 kB
     /// the periodic publisher already exists; adding a second one is the defect).
     #[test]
     fn the_sampler_has_no_timer_of_its_own() {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         assert!(
             !prod.contains("tokio::spawn"),
             "the sampler rides `spawn_budget_republisher`'s loop — a task of its \
@@ -2700,18 +2685,14 @@ MemAvailable:   15335424 kB
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn collect_host_lane_src() -> &'static str {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+    fn collect_host_lane_src() -> String {
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         let start = prod
             .find("fn collect_host_lane()")
             .expect("the host lane collector must exist");
         let body = &prod[start..];
         let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
-        &body[..end]
+        body[..end].to_string()
     }
 
     /// The spawn gate must NOT have grown either reading.
@@ -2730,11 +2711,7 @@ MemAvailable:   15335424 kB
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_spawn_gate_reading_did_not_grow_the_spawn_pressure_probes() {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         let start = prod
             .find("pub(crate) fn spawn_gate_reading()")
             .expect("the gate's reading must exist");
@@ -2815,11 +2792,7 @@ MemAvailable:   15335424 kB
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn one_os_call_yields_both_readings() {
-        const SRC: &str = include_str!("resource_sample.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("resource_sample.rs"));
         let body_of = |sig: &str| -> &str {
             let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
             let rest = &prod[start..];
