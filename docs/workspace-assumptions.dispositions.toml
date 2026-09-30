@@ -388,3 +388,13 @@ note = "Not a tenant: the public OAuth client id of the Claude CLI app, identica
 reviewed = [
     "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
 ]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/capability_report.rs"
+symbol = "doctor_mechanism_id"
+disposition = "fallback_correct"
+note = "A capability-record NAME in the transcribed capability-doctor.sh alias table (a mechanism id string), not tooling the runner invokes."
+reviewed = [
+    "\"install-pwsh-linux\" | \"installer-pwsh-linux\" => \"installer_pwsh_linux\",",
+]
