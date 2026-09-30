@@ -42,7 +42,7 @@ SKIP=0
 WORK=""
 UPSTREAM=""
 
-# Every fixture root, removed on exit. `fixture` is called ~20 times and each
+# Every fixture root, removed on exit. `fixture` is called dozens of times and each
 # call builds an upstream repo plus a clone, so without this a run leaves that
 # many trees behind in $TMPDIR — on a dev box that is a slow leak, and on a
 # CI runner it is disk the next job wanted. Same shape as the scratch cleanup
@@ -542,7 +542,7 @@ premise_fixture() {
 }
 premise_case() {
     local label="$1" want="$2" body="$3" rel="${4:-}" got rc
-    premise_fixture "$body" $rel
+    premise_fixture "$body" "$rel"
     gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null && rc=0 || rc=$?
     case "$rc" in 0) got="clean" ;; 1) got="violation" ;; *) got="probe-failed($rc)" ;; esac
     check "$label" "$want" "$got"
@@ -561,6 +561,8 @@ premise_case "guard fires: #[doc = concat!(.., include_str!(..))]" violation \
     '#[doc = concat!("Intro. ", include_str!("b.md"))] struct S;'
 premise_case "guard fires: schemars(description = CONST)" violation \
     '#[schemars(description = BODY)] struct S;'
+premise_case "guard fires: include_dir! beside a schemars attribute, no JsonSchema token" violation \
+    '#[schemars(title = "x")] struct S; static D: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");'
 premise_case "guard fires: a rustfmt-wrapped schemars attribute with an embed" violation \
     "$(printf '#[schemars(\n    description = include_str!(\n        "b.md"\n    )\n)]\nstruct S;')"
 premise_case "guard is quiet on let doc = include_str!(..) with no JsonSchema" clean \
@@ -631,6 +633,14 @@ for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
     decide
     check "a violation under $PDIR is probed, so its .md is MINE" "mine|yes" \
         "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+    # And its build scripts: one that reads markdown, with no JsonSchema in
+    # sight, is reachable only through the derived `<dir>/**/build.rs`.
+    fixture
+    seed_base "$PDIR/build.rs" 'fn main() { std::fs::read_to_string("x.md").unwrap(); }'
+    commit_change "$PDIR/x.md" "# a body"
+    decide
+    check "a build script under $PDIR reading markdown is probed, so its .md is MINE" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
 done
 
 # The marking — a trailing `/` means a directory — checked against the real
@@ -648,71 +658,13 @@ fi
 
 echo "  -- every in-repo path dependency is an input --"
 
-# The input list names crates by hand, and two were once missing. This walks
-# the manifests instead — toolchain-free — from src-tauri/Cargo.toml and the
-# root Cargo.toml (its [patch.*] and workspace dependencies), following each
-# in-repo path dependency to its own manifest, and prints any that no
-# directory entry covers.
-#
-# `path = "…"` values from dependency-shaped sections only (any section whose
-# name contains `dependencies`, and `[patch.*]`), so the `path` of a
-# `[[bin]]`/`[lib]`/`[[test]]` target is not mistaken for a dependency.
-cargo_path_deps() {
-    awk '
-        /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
-        { sub(/#.*/, "") }
-        sec ~ /dependencies/ || sec ~ /^\[patch/ {
-            s = $0
-            while (match(s, /(^|[^_a-zA-Z0-9])path *= *"[^"]*"/)) {
-                v = substr(s, RSTART, RLENGTH)
-                sub(/^.*path *= *"/, "", v); sub(/"$/, "", v)
-                print v
-                s = substr(s, RSTART + RLENGTH)
-            }
-        }' "$1"
-}
-# Lexical, so an out-of-repo sibling that is not checked out (CI) still
-# resolves: `a/b/../../../x` becomes `../x`, which is outside the repo.
-normalize_rel() {
-    local IFS=/ part out=() n
-    read -ra parts <<< "$1"
-    for part in "${parts[@]}"; do
-        case "$part" in
-            ''|.) ;;
-            ..) n="${#out[@]}"
-                if [ "$n" -gt 0 ] && [ "${out[$((n - 1))]}" != ".." ]; then unset "out[$((n - 1))]"; out=("${out[@]}")
-                else out+=(".."); fi ;;
-            *) out+=("$part") ;;
-        esac
-    done
-    printf '%s\n' "${out[*]}"
-}
-uncovered_path_deps() {
-    local root="$1" m dir dep rel entry covered seen=" "
-    local queue=("src-tauri/Cargo.toml" "Cargo.toml")
-    while [ "${#queue[@]}" -gt 0 ]; do
-        m="${queue[0]}"; queue=("${queue[@]:1}")
-        case "$seen" in *" $m "*) continue ;; esac
-        seen+="$m "
-        [ -f "$root/$m" ] || continue
-        dir="$(dirname "$m")"
-        while IFS= read -r dep; do
-            [ -n "$dep" ] || continue
-            rel="$(normalize_rel "$dir/$dep")"
-            case "$rel" in ..|../*|'') continue ;; esac
-            covered=no
-            for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
-                case "$entry" in */) case "$rel/" in "$entry"*) covered=yes ;; esac ;; esac
-            done
-            [ "$covered" = yes ] || printf '%s (from %s)\n' "$rel" "$m"
-            queue+=("$rel/Cargo.toml")
-        done < <(cargo_path_deps "$root/$m")
-    done
-}
+# The walk lives in the library (`gen_events_uncovered_path_deps`), shared
+# with the `gen-events-path-deps` hook that runs it on every Cargo.toml edit;
+# here it is run on the real tree and proved able to fail on a fixture.
 if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
     check "every in-repo path dependency of the export build is under an input" \
-        "" "$(uncovered_path_deps "$REPO_ROOT")"
-    SEEN_DEPS="$(cargo_path_deps "$REPO_ROOT/src-tauri/Cargo.toml" | grep -c . || true)"
+        "" "$(gen_events_uncovered_path_deps "$REPO_ROOT")"
+    SEEN_DEPS="$(_gen_events_cargo_path_deps "$REPO_ROOT/src-tauri/Cargo.toml" | grep -c . || true)"
     if [ "${SEEN_DEPS:-0}" -gt 0 ]; then
         pass_note "  and it read $SEEN_DEPS path dependencies from src-tauri/Cargo.toml"
     else
@@ -721,8 +673,10 @@ if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
 fi
 
 # Non-vacuity: a tree that adds the pty-holder crate as a dependency (and a
-# transitive one behind it) is caught; a target `path` and an out-of-repo
-# sibling are not.
+# transitive one behind it) is caught; target `path`s and an out-of-repo
+# sibling are not. The target paths point OUTSIDE every input on purpose —
+# under an input they would be "covered" and prove nothing about the section
+# filter that is supposed to skip them.
 premise_fixture 'fn f() {}'
 mkdir -p "$PREMISE_FIXTURE/crates/pty-holder"
 cat > "$PREMISE_FIXTURE/src-tauri/Cargo.toml" <<'TOML'
@@ -734,15 +688,18 @@ qontinui-spec-check = { path = "../crates/spec-check" }
 qontinui-pty-holder = { path = "../crates/pty-holder" }
 qontinui-types = { path = "../../qontinui-schemas/rust" }
 
+[lib]
+path = "../tools/lib.rs"
+
 [[bin]]
 name = "export_schemas"
-path = "src/bin/export_schemas.rs"
+path = "bin/export_schemas.rs"
 TOML
 cat > "$PREMISE_FIXTURE/crates/pty-holder/Cargo.toml" <<'TOML'
 [target.'cfg(unix)'.dependencies]
 frame = { path = "../frame-proto" }
 TOML
-PTY_OUT="$(uncovered_path_deps "$PREMISE_FIXTURE")"
+PTY_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
 check "a new pty-holder path dependency, and its own, are reported uncovered" \
     "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
     "$PTY_OUT"
@@ -998,6 +955,11 @@ check "  and when the blamed .md is a %q-escaped name" yes "$(has 'Markdown was 
 # The hook's own verdict lines (outside the renderer) name the stage too.
 check "gen-events-drift.sh words its verdicts and bypass by stage" "yes|no" \
     "$(grep -qF 'Bypass for this $STAGE only: SKIP=gen-events-drift $BYPASS_CMD' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)|$(grep -qE '^[^#]*(log|fail) "[^"]*(not caused by|Nothing to do for|whether) this push' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
+
+# The stage helper's three answers: pre-commit sets PRE_COMMIT_TO_REF and
+# PRE_COMMIT_REMOTE_NAME for a push; either alone means push.
+check "gen_events_stage: TO_REF alone, REMOTE_NAME alone, neither" "push|push|commit" \
+    "$(unset PRE_COMMIT_REMOTE_NAME; PRE_COMMIT_TO_REF=abc gen_events_stage)|$(unset PRE_COMMIT_TO_REF; PRE_COMMIT_REMOTE_NAME=origin gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME; gen_events_stage)"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.

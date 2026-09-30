@@ -116,8 +116,8 @@
 # exclusion and is not changed by it.
 # It errs the other way on purpose elsewhere, and each of these merely costs
 # the exclusion: a raw-string literal (`title = r"x"`), a `true` value, or an
-# `=` inside a string (`title = "a=b"`) in a schemars attribute; and a Rust raw string holding TOML whose line begins
-# `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
+# `=` inside a string (`title = "a=b"`) in a schemars attribute; and a Rust
+# raw string holding TOML whose line begins `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
 # as a wrapped cfg_attr the day that file also gains a `.md"` literal; and a
 # crate doc `#![doc = include_str!("../README.md")]`, which arm 5 flags on
 # every push. That last is deliberately not carved out: a crate doc cannot
@@ -219,8 +219,10 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
     # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
-    # pusher. The self-test now walks the manifests and fails on any in-repo
-    # path dependency no entry covers; to look by hand,
+    # pusher. `gen_events_uncovered_path_deps` below now walks the manifests
+    # and reports any in-repo path dependency no entry covers; the
+    # `gen-events-path-deps` pre-commit hook runs it on every Cargo.toml edit,
+    # and the attribution self-test runs it too. To look by hand,
     # `git grep -n 'path *= *"' -- '*Cargo.toml'`.
     "src-tauri/clorinde/"
     "crates/spec-check/"
@@ -275,6 +277,76 @@ _gen_events_derive_premise_paths() {
     done
 }
 _gen_events_derive_premise_paths
+
+# `path = "…"` values in the manifest at $1, from dependency-shaped sections
+# only — any section whose name contains `dependencies`, and `[patch.*]` — so
+# the `path` of a `[[bin]]`/`[lib]`/`[[test]]` target is not taken for a
+# dependency. Comments are stripped first.
+_gen_events_cargo_path_deps() {
+    awk '
+        /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+        { sub(/#.*/, "") }
+        sec ~ /dependencies/ || sec ~ /^\[patch/ {
+            s = $0
+            while (match(s, /(^|[^_a-zA-Z0-9])path *= *"[^"]*"/)) {
+                v = substr(s, RSTART, RLENGTH)
+                sub(/^.*path *= *"/, "", v); sub(/"$/, "", v)
+                print v
+                s = substr(s, RSTART + RLENGTH)
+            }
+        }' "$1"
+}
+
+# A relative path with `.` and `..` folded away, lexically: `a/b/../../../x`
+# becomes `../x`. No filesystem access, so an out-of-repo sibling that is not
+# checked out (CI) still resolves — to something outside the repo.
+_gen_events_normalize_rel() {
+    local IFS=/ part parts out=() n
+    read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|.) ;;
+            ..) n="${#out[@]}"
+                if [ "$n" -gt 0 ] && [ "${out[$((n - 1))]}" != ".." ]; then
+                    unset "out[$((n - 1))]"; out=("${out[@]}")
+                else
+                    out+=("..")
+                fi ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    printf '%s\n' "${out[*]}"
+}
+
+# Every in-repo path dependency of the export build that no DIRECTORY entry of
+# GEN_EVENTS_ATTRIBUTION_PATHS covers, one `<path> (from <manifest>)` per line;
+# empty when the list is complete. Walks from src-tauri/Cargo.toml and the
+# root Cargo.toml (its [patch.*] and workspace dependencies), following each
+# in-repo dependency to its own manifest. Out-of-repo paths are skipped: a push
+# to this repo cannot change them. The input list names crates by hand, and
+# two were once missing — this is what keeps it honest.
+gen_events_uncovered_path_deps() {
+    local root="$1" m dir dep rel entry covered seen=" "
+    local queue=("src-tauri/Cargo.toml" "Cargo.toml")
+    while [ "${#queue[@]}" -gt 0 ]; do
+        m="${queue[0]}"; queue=("${queue[@]:1}")
+        case "$seen" in *" $m "*) continue ;; esac
+        seen+="$m "
+        [ -f "$root/$m" ] || continue
+        dir="$(dirname "$m")"
+        while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            rel="$(_gen_events_normalize_rel "$dir/$dep")"
+            case "$rel" in ..|../*|'') continue ;; esac
+            covered=no
+            for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+                case "$entry" in */) case "$rel/" in "$entry"*) covered=yes ;; esac ;; esac
+            done
+            [ "$covered" = yes ] || printf '%s (from %s)\n' "$rel" "$m"
+            queue+=("$rel/Cargo.toml")
+        done < <(_gen_events_cargo_path_deps "$root/$m")
+    done
+}
 
 # Which hook stage is running: `push` when pre-commit is running a pre-push
 # hook — it sets PRE_COMMIT_TO_REF and PRE_COMMIT_REMOTE_NAME then, and
