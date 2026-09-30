@@ -2466,9 +2466,8 @@ pub(crate) const BINDING_GAP_ASK_REASON: &str = "no headless path can seed this 
 /// through coord's `record_pairing`, which makes the paired tenant this
 /// device's home (`coord.devices.tenant_id`), and qontinui-web rotates the
 /// device's single machine key to it.
-pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
-     device's home tenant in coord and rotates its machine key to it — that is how \
-     pairing works until coord offers a per-binding seed door";
+pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "the terminal pair also makes this tenant \
+     the device's home tenant in coord — \"Connect all my workspaces\" does not";
 
 /// One tenant's state within the CURRENT lapse — the record that makes
 /// "exactly once" survive a restart, and the ask the UI reads back.
