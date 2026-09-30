@@ -996,6 +996,31 @@ pub struct PairAllTenantsResponse {
     pub results: Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
 }
 
+static PAIR_ALL_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII claim on the single in-flight [`pair_all_tenants`] flow.
+struct PairAllInFlight;
+
+impl PairAllInFlight {
+    fn acquire() -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        PAIR_ALL_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| PairAllInFlight)
+            .map_err(|_| {
+                "a workspace sign-in is already in progress — finish it in your browser first"
+                    .to_string()
+            })
+    }
+}
+
+impl Drop for PairAllInFlight {
+    fn drop(&mut self) {
+        PAIR_ALL_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Pure: the default selection when the caller names no tenants — the
 /// tenants the published binding-gap view says are bound with no credential.
 /// An UNKNOWN view selects nothing and says why: the runner does not guess
@@ -1042,14 +1067,18 @@ pub(crate) fn default_pair_selection(
 /// disk, and the `autonomy-binding-gap` nudge emitted so the banner and the
 /// Settings card re-read `get_binding_gaps`.
 #[tauri::command]
-pub async fn pair_all_tenants(
-    app: AppHandle,
+pub async fn pair_all_tenants<R: Runtime>(
+    app: AppHandle<R>,
     tenant_ids: Option<Vec<String>>,
 ) -> Result<PairAllTenantsResponse, String> {
     use qontinui_runner_lib::pair::{
         pair_via_browser_multi, persist_collected_pairings, read_device_id_from_disk,
         TenantPairStatus,
     };
+
+    // One browser flow at a time, process-wide: the banner and the Settings
+    // card each own a button, and two concurrent flows would open two sign-ins.
+    let _in_flight = PairAllInFlight::acquire()?;
 
     let explicit: Vec<uuid::Uuid> = tenant_ids
         .unwrap_or_default()
@@ -1085,8 +1114,17 @@ pub async fn pair_all_tenants(
     let device_for_blocking = device_id.clone();
     let results = spawn_blocking_tracked(move || {
         let collected = pair_via_browser_multi(&coord_base, &for_blocking, None)?;
-        let device = collected.device_id.clone().unwrap_or(device_for_blocking);
-        persist_collected_pairings(&collected, &for_blocking, &device)
+        // The flow was bound to THIS device's machine.json id at pair-start;
+        // persist under that id, never under an echo that disagrees with it.
+        if let Some(echoed) = collected.device_id.as_deref() {
+            if echoed.trim() != device_for_blocking {
+                warn!(
+                    "pair_all_tenants: coord echoed device_id {echoed} but this flow \
+                     was started for {device_for_blocking} — keeping the local id"
+                );
+            }
+        }
+        persist_collected_pairings(&collected, &for_blocking, &device_for_blocking)
     })
     .await
     .map_err(|e| format!("pair_all_tenants task panicked: {e}"))??;

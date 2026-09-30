@@ -1863,7 +1863,14 @@ pub(crate) fn parse_callback(
 
 fn callback_page(outcome: &Result<CallbackCapture, CallbackRefusal>) -> String {
     match outcome {
-        Ok(_) => "<h1>&#10003; Runner paired</h1>\
+        // The collect flow has NOT got its credentials yet — `pair-collect`
+        // runs after this page, and can still fail or skip every tenant — so
+        // the page must not claim the runner is paired.
+        Ok(CallbackCapture::Collect { .. }) => "<h1>&#10003; Sign-in complete</h1>\
+                  <p>Return to the runner to finish connecting your workspaces.</p>\
+                  <script>setTimeout(()=>window.close(),2000);</script>"
+            .to_string(),
+        Ok(CallbackCapture::Token { .. }) => "<h1>&#10003; Runner paired</h1>\
                   <p>You can close this tab and return to the runner.</p>\
                   <script>setTimeout(()=>window.close(),2000);</script>"
             .to_string(),
@@ -2381,7 +2388,10 @@ pub struct TenantPairOutcome {
 
 /// Persist every minted token of a multi-tenant pair through
 /// [`persist_pairing`]'s additive writer: each token lands in ITS tenant's
-/// slot, bindings are appended, and an established default is never moved.
+/// slot, bindings are appended, and an ESTABLISHED default is never moved. On
+/// a device with no default yet (no `paired_user.json`), the first minted
+/// tenant in request order becomes the default, exactly as a first single pair
+/// does.
 /// Returns one outcome per REQUESTED tenant, in request order.
 pub fn persist_collected_pairings(
     resp: &PairCollectResponse,
@@ -7020,6 +7030,26 @@ mod pair_multi_collect_tests {
             mgr.get_tenant_device_jwt(&t(T_C)).unwrap().as_deref(),
             Some("jwt.c")
         );
+    }
+
+    #[test]
+    fn on_a_fresh_device_the_first_minted_tenant_becomes_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                skipped(T_A, "not_a_member"),
+                minted(T_B, "jwt.b"),
+                minted(T_C, "jwt.c"),
+            ],
+        };
+        persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_A), t(T_B), t(T_C)], DEVICE);
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pf.bindings.len(), 2);
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_B));
+        assert_eq!(mgr.get_access_token().unwrap(), "jwt.b");
     }
 
     #[test]

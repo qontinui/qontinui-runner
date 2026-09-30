@@ -67,9 +67,9 @@ fn src_root() -> PathBuf {
 /// flow's own docs explain why it avoids `pair-cli` — cannot fail the scan.
 fn code_only(src: &str) -> String {
     src.lines()
-        .map(|l| match l.find("//") {
+        .map(|l| match l.split_once("//") {
             // Keep `//` inside a string literal such as "http://…".
-            Some(i) if !l[..i].contains('"') => &l[..i],
+            Some((code, _)) if !code.contains('"') => code,
             _ => l,
         })
         .collect::<Vec<_>>()
@@ -81,15 +81,18 @@ fn fn_body(src: &str, name: &str) -> Option<String> {
     let needle = format!("fn {name}(");
     let needle_generic = format!("fn {name}<");
     let start = src.find(&needle).or_else(|| src.find(&needle_generic))?;
-    let open = start + src[start..].find('{')?;
+    // `find` returns char boundaries, and `{`/`}` are one byte, so every
+    // `get` below lands on a boundary; `get` keeps it panic-free regardless.
+    let tail = src.get(start..)?;
+    let open = tail.find('{')?;
     let mut depth = 0usize;
-    for (i, c) in src[open..].char_indices() {
+    for (i, c) in tail.get(open..)?.char_indices() {
         match c {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(src[start..=open + i].to_string());
+                    return tail.get(..=open + i).map(str::to_string);
                 }
             }
             _ => {}

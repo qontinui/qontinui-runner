@@ -2305,7 +2305,9 @@ pub struct BindingGapView {
 /// * the report is UNKNOWN, or the bound set cannot be read now → every row
 ///   is unknown (a stale or unreadable `coord_bound_tenants.json` lands here);
 /// * a tenant the report does not name as a gap but which this box holds no
-///   credential for (coord bound it after the report was published) → unknown.
+///   credential for (coord bound it after the report was published) → unknown;
+/// * a tenant the report names as a gap that the current bound set no longer
+///   contains (coord unbound it since) → unknown.
 pub(crate) fn binding_gap_view(
     report: &BindingGapReport,
     bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
@@ -2355,6 +2357,14 @@ pub(crate) fn binding_gap_view(
         .iter()
         .filter_map(|g| uuid::Uuid::parse_str(g).ok())
         .collect();
+    let bound_now: std::collections::HashSet<uuid::Uuid> = match bound {
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(ids) => {
+            ids.iter().copied().collect()
+        }
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown(_) => {
+            unreachable!("the Unknown arm returned above")
+        }
+    };
     universe.extend(gaps.iter().copied());
     BindingGapView {
         status: "measured",
@@ -2362,8 +2372,14 @@ pub(crate) fn binding_gap_view(
         rows: universe
             .iter()
             .map(|t| {
-                let state = if gaps.contains(t) {
+                // A gap is only a gap while coord still binds the tenant: one
+                // the published report names but the CURRENT bound set no
+                // longer does (unbound since) is unknown — never offered for
+                // pairing, which would re-create a binding coord removed.
+                let state = if gaps.contains(t) && bound_now.contains(t) {
                     TenantCredentialState::NoCredential
+                } else if gaps.contains(t) {
+                    TenantCredentialState::Unknown
                 } else if covered.contains(t) {
                     TenantCredentialState::Connected
                 } else {
@@ -9151,11 +9167,35 @@ mod tenant_slot_refresh_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
-        for (file, item) in [
-            ("src/commands/auth.rs", "async fn finalize_signed_in("),
+        // `(file, fn, the call that persists, the calls that may retire)`.
+        // The two web-integration doors retire through their shared
+        // `finish_explicit_pairing`, which is itself held to the rule below.
+        const RETIRE: &str = "retire_rejection_streaks_after_pairing(";
+        const SHARED: &str = "finish_explicit_pairing(";
+        for (file, item, persist_needle, retire_needles) in [
+            (
+                "src/commands/auth.rs",
+                "async fn finalize_signed_in(",
+                "persist_pairing(",
+                &[RETIRE][..],
+            ),
             (
                 "src/commands/web_integration.rs",
                 "pub async fn redeem_pair_code(",
+                "persist_pairing(",
+                &[RETIRE, SHARED][..],
+            ),
+            (
+                "src/commands/web_integration.rs",
+                "pub async fn pair_all_tenants<",
+                "persist_collected_pairings(",
+                &[RETIRE, SHARED][..],
+            ),
+            (
+                "src/commands/web_integration.rs",
+                "async fn finish_explicit_pairing(",
+                "",
+                &[RETIRE][..],
             ),
         ] {
             // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
@@ -9185,10 +9225,12 @@ mod tenant_slot_refresh_tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let persisted = body
-                .find("persist_pairing(")
+                .find(persist_needle)
                 .unwrap_or_else(|| panic!("{item} persists a pairing"));
-            let retired = body
-                .find("retire_rejection_streaks_after_pairing(")
+            let retired = retire_needles
+                .iter()
+                .filter_map(|n| body.find(n))
+                .min()
                 .unwrap_or_else(|| {
                     panic!(
                         "{item} in {file} must retire the old credential's rejection \
@@ -9197,7 +9239,7 @@ mod tenant_slot_refresh_tests {
                     )
                 });
             assert!(
-                retired > persisted,
+                retired >= persisted,
                 "{item}: the retirement must come AFTER persist_pairing succeeds"
             );
         }
@@ -11277,6 +11319,22 @@ mod binding_gap_view_tests {
         assert_eq!(
             states(&view),
             vec![(late.to_string(), TenantCredentialState::Unknown)]
+        );
+    }
+
+    /// A gap coord has since UNBOUND is not offered for pairing.
+    #[test]
+    fn a_gap_no_longer_bound_is_unknown_not_no_credential() {
+        let gone = tenant(5);
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![gone.to_string()]),
+            &CoordBoundTenantsRead::Known(vec![]),
+            Some(&[]),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        assert_eq!(
+            states(&view),
+            vec![(gone.to_string(), TenantCredentialState::Unknown)]
         );
     }
 
