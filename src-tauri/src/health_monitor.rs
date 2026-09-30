@@ -168,7 +168,7 @@ const WATCHDOG_MONITOR_STALL_SECS: i64 = 180;
 /// While a breadcrumb-worthy condition persists, re-append at most this often
 /// so a multi-hour wedge leaves a readable trail instead of a 15s-cadence
 /// flood.
-const WATCHDOG_REPEAT_SECS: i64 = 300;
+pub(crate) const WATCHDOG_REPEAT_SECS: i64 = 300;
 
 /// Set while the *native message loop* is believed hung, so other in-process
 /// surfaces can read it without waiting on the monitor thread.
@@ -1224,7 +1224,7 @@ fn watchdog_heartbeat_path(dir: &Path) -> PathBuf {
 
 /// Path of the append-only incident log (shared with the monitor's own
 /// breadcrumb, so one file answers "what happened to this runner").
-fn wedge_incidents_path(dir: &Path) -> PathBuf {
+pub(crate) fn wedge_incidents_path(dir: &Path) -> PathBuf {
     dir.join("wedge-incidents.log")
 }
 

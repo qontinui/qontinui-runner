@@ -58,6 +58,43 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// G4 — every capability record under the capability state dir, carried on
+/// the device-status heartbeat as `details.capability`. Also owns the one
+/// capability-dir resolver the skill-parity writer below uses.
+pub(crate) mod capability_report;
+
+/// G2 — `wedge-incidents.log`, read from a persisted cursor and carried on the
+/// device-status heartbeat as `details.wedge_incidents`.
+pub(crate) mod wedge_report;
+
+/// The git SHA this binary was built from (`build.rs`'s 12-char
+/// `QONTINUI_GIT_SHA`), or `None` for the `"unknown"` fallback of a build with
+/// no git — the one definition of "this build's identity" that the fleet
+/// heartbeat's `git_sha` and every published `build_id` share.
+pub(crate) fn served_git_sha() -> Option<&'static str> {
+    let s = env!("QONTINUI_GIT_SHA");
+    if s == "unknown" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The runner-observed keys of the device-status `details` object —
+/// `wedge_incidents` (G2) and `capability` (G4), or a sibling `*_error` string
+/// for either the runner could not look at. Coord merges `details` per key, so
+/// these ride beside `coord_credential` without either writer erasing the
+/// other. Blocking IO; call from a blocking context.
+pub(crate) fn observed_status_details() -> serde_json::Map<String, serde_json::Value> {
+    let mut details = serde_json::Map::new();
+    wedge_report::publish_into(&mut details);
+    capability_report::publish_into(
+        &mut details,
+        capability_report::read_capability_records(chrono::Utc::now()),
+    );
+    details
+}
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -1921,14 +1958,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // drift verdict feeds origin/main's SHA + commits-behind; it's `None`
     // overall until the first periodic check completes, yielding None for
     // both derived fields.
-    let git_sha = {
-        let s = env!("QONTINUI_GIT_SHA");
-        if s == "unknown" {
-            None
-        } else {
-            Some(s)
-        }
-    };
+    let git_sha = served_git_sha();
     let drift = crate::build_drift::latest();
     let main_sha = drift.as_ref().and_then(|d| d.main_sha.clone());
     let commits_behind = drift.as_ref().and_then(|d| d.commits_behind);
@@ -2621,30 +2651,17 @@ const SKILL_PARITY_MECHANISM: &str = "fleet-skill-bundle-parity";
 /// `~/.qontinui` would put the record somewhere the doctor is not looking, which is
 /// the writer/reader divergence that script's own header records as having
 /// survived undetected until 2026-09-04 — reintroduced from the other side.
+///
+/// The directory comes from [`capability_report::capability_state_dir`], the
+/// one resolver the G4 reader uses too, so this writer and that reader cannot
+/// disagree about where records live.
 fn skill_parity_record_path() -> Option<PathBuf> {
-    skill_parity_record_path_from(
-        std::env::var("QONTINUI_CAPABILITY_STATE_DIR")
-            .ok()
-            .as_deref(),
-        qontinui_runner_lib::ambient::qontinui_dir().as_deref(),
-    )
+    capability_report::capability_state_dir().map(skill_parity_record_in)
 }
 
-/// Pure core of [`skill_parity_record_path`], so the precedence and the
-/// blank-value branch are testable without mutating the process environment
-/// that other tests in this binary read. `qontinui_dir` is the ambient
-/// `~/.qontinui` resolved by `ambient::qontinui_dir()` — the one seam.
-fn skill_parity_record_path_from(
-    state_dir: Option<&str>,
-    qontinui_dir: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    let file = format!("{SKILL_PARITY_MECHANISM}.json");
-    if let Some(dir) = state_dir {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir).join(&file));
-        }
-    }
-    qontinui_dir.map(|d| d.join("capability").join(file))
+/// The record's path inside a resolved capability directory.
+fn skill_parity_record_in(dir: PathBuf) -> PathBuf {
+    dir.join(format!("{SKILL_PARITY_MECHANISM}.json"))
 }
 
 fn join_rel(root: &std::path::Path, parts: &[&str]) -> PathBuf {
@@ -8569,6 +8586,9 @@ mod tests {",
         let qdir = qontinui_runner_lib::ambient::qontinui_dir_from(None, Some("/home/u".into()))
             .expect("a home yields a ~/.qontinui");
         let qdir = qdir.as_path();
+        let skill_parity_record_path_from = |state: Option<&str>, q: Option<&std::path::Path>| {
+            capability_report::capability_state_dir_from(state, q).map(skill_parity_record_in)
+        };
         assert_eq!(
             skill_parity_record_path_from(Some("/state"), Some(qdir)),
             Some(std::path::PathBuf::from(
