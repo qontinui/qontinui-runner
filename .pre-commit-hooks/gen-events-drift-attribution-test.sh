@@ -1052,16 +1052,25 @@ echo "  -- at pre-commit, 'staged' means the index the commit is built from --"
 # a fixture runs the drift hook's own sequence — clear the git env, detect
 # the stage, attribute from the hook's cwd — records the detail, and fails
 # so the commit never lands.
+# With `subdir`, the hook moves into src-tauri/ after recording the index and
+# attributes the top level from there — the recorded path must not depend on
+# the cwd it is used from.
 index_hook_fixture() {
+    local mode="${1:-}" attribute_line='gen_events_attribution "$PWD"'
     fixture
     local hooks="$(dirname "$WORK")/index-hooks"
     mkdir -p "$hooks"
+    if [ "$mode" = "subdir" ]; then
+        attribute_line='cd src-tauri && gen_events_attribution "$(git rev-parse --show-toplevel)"'
+    fi
     cat > "$hooks/pre-commit" <<HOOK
 #!/usr/bin/env bash
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 gen_events_clear_inherited_git_env
+printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
 gen_events_detect_stage_from_stdin
-gen_events_attribution "\$PWD"
+$attribute_line
+printf '%s\n' "\$ATTRIBUTION_STATE" > "$WORK/.hook-state"
 printf '%s\n' "\$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.hook-detail"
 exit 1
 HOOK
@@ -1069,6 +1078,7 @@ HOOK
     git -C "$WORK" config core.hooksPath "$hooks"
 }
 hook_detail() { cat "$WORK/.hook-detail" 2>/dev/null; }
+hook_state() { cat "$WORK/.hook-state" 2>/dev/null; }
 
 index_hook_fixture
 printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
@@ -1082,13 +1092,61 @@ printf '# bumped\n' >> "$WORK/Cargo.lock"
 git -C "$WORK" add Cargo.lock
 ( cd "$WORK" && git commit -qm "partial" -- src-tauri/src/lib.rs ) >/dev/null 2>&1
 check "commit <path>: the named path is staged; a pre-staged other path is not in this commit" \
-    "$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+    "$(detail_line Cargo.lock staged-later)"$'\n'"$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs staged)" \
+    "$(hook_detail)"
 
 index_hook_fixture
 printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add src-tauri/src/lib.rs
 ( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
 check "a plain commit (relative GIT_INDEX_FILE) still labels the staged path staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# Honouring the hook's index must never NARROW the sources. Under `commit
+# <path>` the temporary index lacks what the real index holds for a later
+# commit; without the `staged-later` source these two read PRE-EXISTING with
+# an empty detail — a committer cleared over an input the regeneration reads.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with a NEW input staged for later: MINE, labelled staged-later" \
+    "mine|$(detail_line src-tauri/src/new.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+index_hook_fixture
+printf '// staged edit\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+git -C "$WORK" show HEAD:src-tauri/src/lib.rs > "$WORK/src-tauri/src/lib.rs"
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with an edit staged for later, working copy restored: MINE, staged-later" \
+    "mine|$(detail_line src-tauri/src/lib.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+# `commit -a` with a path ALREADY staged: it is in both indexes, and is listed
+# once, as staged — not a second time as staged-later.
+index_hook_fixture
+printf '// staged\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+printf '// and more\n' >> "$WORK/src-tauri/src/lib.rs"
+( cd "$WORK" && git commit -qam "commit -a" ) >/dev/null 2>&1
+check "commit -a over an already-staged path lists it once, as staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# The recorded index path is absolute, so it means the same file from any
+# cwd; git hands a plain commit the RELATIVE `.git/index`. Pinned directly —
+# through `git -C` a relative path would still resolve against the repo top,
+# so no label could show the difference — and by labels from a subdirectory.
+index_hook_fixture subdir
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+HOOK_INDEX="$(cat "$WORK/.hook-index" 2>/dev/null)"
+check "a relative GIT_INDEX_FILE is recorded absolute, naming the real file" "yes|yes" \
+    "$(case "$HOOK_INDEX" in /*|[A-Za-z]:[/\\]*) echo yes ;; *) echo no ;; esac)|$([ -f "$HOOK_INDEX" ] && echo yes || echo no)"
+check "  and attribution from a subdirectory labels the staged path staged" \
     "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
 
 # The hook's index is used only for the hook's repo: attribution of some
