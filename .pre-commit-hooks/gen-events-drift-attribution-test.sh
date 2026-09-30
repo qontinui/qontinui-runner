@@ -546,6 +546,8 @@ premise_case() {
 }
 premise_case "guard fires: include_str! .md beside JsonSchema" violation \
     '#[derive(JsonSchema)] struct S; const B: &str = include_str!("b.md");'
+premise_case "guard fires: include_str!(concat!(.., \"/x.\", \"md\")) beside JsonSchema" violation \
+    "$(printf '#[derive(JsonSchema)] struct S;\nconst B: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/x.", "md"));')"
 premise_case "guard fires: include_bytes! .md beside JsonSchema" violation \
     '#[derive(JsonSchema)] struct S; const B: &[u8] = include_bytes!("b.md");'
 premise_case "guard fires: include_dir! beside JsonSchema, no .md literal needed" violation \
@@ -609,6 +611,15 @@ for AS_RUST in 'include!("fleet_commands/x.md");' '#[path = "fleet_commands/x.md
         "mine|yes" "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
 done
 
+# A gitignored source still compiles, so the premise probe must read it.
+fixture
+seed_base ".gitignore" "src-tauri/src/gen.rs"
+printf '#[derive(JsonSchema)] struct S;\nconst B: &str = include_str!("fleet_commands/x.md");\n' > "$WORK/src-tauri/src/gen.rs"
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+decide
+check "a gitignored violating source is seen: the committed .md is MINE" \
+    "mine|yes" "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in *"src-tauri/src/gen.rs"*) echo yes ;; *) echo no ;; esac)"
+
 fixture
 commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
 decide
@@ -656,6 +667,8 @@ check "a failing premise probe drops the exclusion, so the .md is MINE" \
     "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
 check "  and says the probe failed" "yes" \
     "$(grep -q 'probe failed' "$WORK/.state" && echo yes || echo no)"
+check "  quoting the first ERROR line, with no fallback text appended" "yes|no" \
+    "$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)|$(grep -qF 'no ERROR line' "$WORK/.state" && echo yes || echo no)"
 
 echo "  -- the MINE message the hook prints --"
 
@@ -671,6 +684,7 @@ render_with() {
 has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
 
 LOCAL_NOTE="Inputs marked 'not part of this push' are local working-tree state"
+LOCAL_REMEDY="set them aside so the working tree"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 check "all committed: the lead line says this push" yes "$(has 'This push changes sources')"
@@ -684,6 +698,8 @@ check "uncommitted only: the lead line blames the working tree, not the push" \
 check "  the file is labelled as not in the push" \
     yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
 check "  the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
+check "  and it says to set them aside, not to commit them" "yes|no" \
+    "$(has "$LOCAL_REMEDY")|$(has 'commit or discard')"
 check "  and the message prints no commands" no \
     "$(printf '%s\n' "$RENDERED" | grep -qE 'git (stash|checkout|worktree|reset)' && echo yes || echo no)"
 
