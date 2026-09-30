@@ -68,7 +68,9 @@
 # a single-line `schemars(..)` attribute whose value is anything but a string
 # or numeric literal (`description`, `title`, `example`, `default`,
 # `extend("key" = EXPR)` — schemars 1 takes expressions for all of them); and
-# a build script that names a markdown path at all.
+# a build script that names a markdown path at all; and markdown compiled AS
+# RUST — `include!("x.md")` or `#[path = "x.md"] mod m;` — which is not data at
+# all and can define a JsonSchema type outright.
 #
 # What it does NOT see, stated so nobody mistakes it for a proof:
 #  - an embed in a file with neither `JsonSchema` nor `schemars(`, used by a
@@ -76,7 +78,10 @@
 #    value sits on its own line, or through a `macro_rules!` that builds the
 #    attribute;
 #  - a build script that reaches markdown through a path it assembles without
-#    ever writing a `.md"` or `"md"` literal (a glob over a directory, say).
+#    ever writing a `.md"` or `"md"` literal (a glob over a directory, say);
+#  - `include!`/`#[path]` of a markdown file whose name is assembled without a
+#    `.md"` literal (`include!(concat!(env!("OUT_DIR"), "/gen.rs"))` is the
+#    real tree's form, and names no markdown).
 # It errs the other way on purpose elsewhere: a raw-string literal
 # (`title = r"x"`) or a `true` value reads as a violation and merely costs the
 # exclusion.
@@ -229,17 +234,26 @@ gen_events_premise_grep() {
 # while a miss clears a guilty pusher.
 gen_events_markdown_premise_violations() {
     local dir="$1" probe_failed=0 found=0
-    local inc_text md_lit schema inc_dir schemars_attr inc_any line
+    local inc_text md_lit schema inc_dir schemars_attr inc_any as_rust line
     inc_text="$(gen_events_premise_grep "$dir" -l -E 'include_(str|bytes)!' | LC_ALL=C sort)" || probe_failed=1
     md_lit="$(gen_events_premise_grep "$dir" -l -E '\.md"' | LC_ALL=C sort)" || probe_failed=1
     schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
     inc_dir="$(gen_events_premise_grep "$dir" -l -F 'include_dir!' | LC_ALL=C sort)" || probe_failed=1
     schemars_attr="$(gen_events_premise_grep "$dir" -l -F 'schemars(' | LC_ALL=C sort)" || probe_failed=1
     inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | sed '/^$/d' | LC_ALL=C sort -u)"
+    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include!\(|#!?\[path[[:space:]]*=' | LC_ALL=C sort)" || probe_failed=1
+    # Decision-time vacuity: a tree that HAS the schema exporter but in which
+    # no file mentions JsonSchema means the query is not seeing what it
+    # should, and every arm intersecting with that list is unfalsifiable. That
+    # is an unverifiable premise, not a clean one.
+    if [ -f "$dir/src-tauri/src/bin/export_schemas.rs" ] && [ -z "$schema" ]; then
+        echo "ERROR no file mentions JsonSchema although src-tauri/src/bin/export_schemas.rs exists — the premise probe is not seeing the tree"
+        probe_failed=1
+    fi
     # A failed probe prints its ERROR line into whichever list it fed, and
     # `sort` returns 0 over it — so the lists are scanned, not just the flags.
-    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" | grep -q '^ERROR'; then
-        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" | grep '^ERROR'
+    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep -q '^ERROR'; then
+        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'
         probe_failed=1
     fi
 
@@ -271,6 +285,17 @@ gen_events_markdown_premise_violations() {
         printf '%s: include_*! in a file with a schemars( attribute\n' "$line"
         found=1
     done < <(_premise_both "$inc_any" "$schemars_attr")
+    # Arm 7: markdown compiled AS RUST. `include!` splices a file in as Rust
+    # source and `#[path = ..]` makes it a module — either can define a
+    # JsonSchema type, so the file's extension says nothing. File-level
+    # (`include!`/`#[path` anywhere, plus any `.md"` literal anywhere) so a
+    # `concat!` or wrapped form is caught too; the real tree's four uses name
+    # `.rs` files and OUT_DIR, and stay quiet.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s: include!/#[path] in a file that names a .md path\n' "$line"
+        found=1
+    done < <(_premise_both "$as_rust" "$md_lit")
     unset -f _premise_both
     # Arm 4: a doc attribute fed from a file becomes the schema's `description`.
     # Anchored to attribute syntax so `let doc = include_str!(..)` is not one.
@@ -388,7 +413,7 @@ gen_events_attribution() {
     elif [ "$premise_rc" -eq 1 ]; then
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
     else
-        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${premise%%$'\n'*})"
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed ($(printf '%s\n' "$premise" | grep -m1 '^ERROR' || echo 'no ERROR line'))"
     fi
 
     # Each call's status is checked, not swallowed: an empty list from a git
@@ -481,12 +506,18 @@ gen_events_render_mine() {
             *)           label="source unknown: '$src'" ;;
         esac
         [ "$flag" = "escaped" ] && { label+="; name shell-escaped"; escaped_seen=1; }
-        # The stash word, built here while the escaped flag is in hand. `:/`
-        # (top-level pathspec magic) so it works from any subdirectory; %q so
-        # a space, quote or non-ASCII byte survives the shell. An escaped path
-        # is already a shell word — `:/` concatenates onto it unquoted.
+        # The stash word, built here while the escaped flag is in hand.
+        # `:(top,literal)`: `top` so it works from any subdirectory, `literal`
+        # so `*?[` in a name are not globbed (`a[1].rs` would otherwise also
+        # stash a modified `a1.rs`). The magic is single-quoted — its parens
+        # are shell syntax — and the path follows as its own %q word, or as
+        # the already-escaped word, concatenated.
         if [ "$src" != "committed" ]; then
-            if [ "$flag" = "escaped" ]; then not_pushed+=(":/$p"); else not_pushed+=("$(printf '%q' ":/$p")"); fi
+            if [ "$flag" = "escaped" ]; then
+                not_pushed+=("':(top,literal)'$p")
+            else
+                not_pushed+=("':(top,literal)'$(printf '%q' "$p")")
+            fi
         fi
         echo "    $p  ($label)"
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
@@ -498,23 +529,27 @@ gen_events_render_mine() {
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
     fi
 
-    # The set-aside advice. Not plain `git stash` (misses untracked files) and
-    # not `git checkout -- <path>` (fails on untracked, destroys tracked work).
-    # And never `git stash pop` or a positional stash@{n} remembered from
-    # earlier: the stash stack is shared by every worktree of the repo and
-    # other sessions push to it, so the entry is found by its unique message.
+    # The set-aside advice. Not plain `git stash` (misses untracked files),
+    # not `git checkout -- <path>` (fails on untracked, destroys tracked
+    # work), and not a WIP commit (that puts the inputs IN the push, so the
+    # verdict cannot move). The stash-free route comes first; the stash route
+    # finds its entry by a unique message, never by `pop` or a remembered
+    # stash@{n}, because the stack is shared by every worktree of the repo.
     if [ "${#not_pushed[@]}" -gt 0 ]; then
         local tag
         tag="gen-events-drift-$(date +%Y%m%d%H%M%S)-$$"
         echo "Entries marked 'not part of this push' come from your working tree, which the"
-        echo "regeneration reads. To see whether the drift is yours, set them aside and"
-        echo "re-run — with a temporary WIP commit, or a stash entry found BY ITS TAG:"
+        echo "regeneration reads. To see whether the drift is yours, check without them:"
+        echo "  - stash-free: run this hook from a clean checkout of HEAD (a detached"
+        echo "    worktree; QONTINUI_SCHEMAS_DIR points it at the schemas checkout)."
+        echo "    A WIP commit does NOT work — it puts them in the push."
+        echo "  - or set them aside in the shared stash, found by its tag (bash):"
         echo "    git stash push --include-untracked -m \"$tag\" -- ${not_pushed[*]}"
         echo "    git stash list --format='%H %gs' | grep $tag    # note that sha"
-        echo "  then re-run the push, and restore:"
+        echo "    then re-run the push, and restore:"
         echo "    git stash apply --index <that sha>"
-        echo "    git stash list --format='%gd %gs' | grep $tag   # its CURRENT stash@{n}"
-        echo "    git stash drop 'stash@{n}'"
+        echo "    git stash list --format='%gd %gs' | grep $tag   # re-find it NOW: a concurrent"
+        echo "    git stash drop 'stash@{n}'                     # push renumbers the stack"
         echo "  Never \`git stash pop\`: the stack is shared, and a pop can take another session's entry."
     fi
     echo "Part of the diff may still be pre-existing — the baseline is a build"

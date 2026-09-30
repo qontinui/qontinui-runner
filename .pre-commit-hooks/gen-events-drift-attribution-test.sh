@@ -560,6 +560,16 @@ premise_case "guard fires: schemars(extend(\"description\" = CONST))" violation 
     '#[schemars(extend("description" = BODY))] struct S;'
 premise_case "guard is quiet on literal schemars values (string and number)" clean \
     '#[schemars(title = "S", range(min = 1))] struct S;'
+premise_case "guard fires: include!(\"x.md\")" violation \
+    'include!("body.md");'
+premise_case "guard fires: #[path = \"x.md\"] mod" violation \
+    '#[path = "body.md"] mod body;'
+premise_case "guard fires: include!(concat!(..)) naming a .md" violation \
+    "$(printf 'include!(concat!(\n    env!("CARGO_MANIFEST_DIR"),\n    "/body.md"\n));')"
+premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) and #[path = x.rs]" clean \
+    "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
+premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \
+    'fn main() {}' src-tauri/src/bin/export_schemas.rs
 premise_case "guard fires: a build script reading markdown" violation \
     'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
 premise_case "guard fires: a build script filtering on the md extension" violation \
@@ -576,11 +586,22 @@ seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &s
 commit_change "src-tauri/src/fleet_commands/x.md" "# a body a JsonSchema type embeds"
 decide
 check "with the premise violated, a committed .md is MINE" "mine" "$ATTRIBUTION_STATE"
-if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
-    pass_note "  and the decision says why: $ATTRIBUTION_EXCLUDES_DROPPED_REASON"
-else
-    fail_note "  the exclusion was dropped without a reason"
-fi
+case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in
+    "markdown may reach schemas.json ("*)
+        pass_note "  and the decision says why: $ATTRIBUTION_EXCLUDES_DROPPED_REASON" ;;
+    *)
+        fail_note "  want a violation reason, got: '${ATTRIBUTION_EXCLUDES_DROPPED_REASON}'" ;;
+esac
+
+# Markdown compiled AS RUST, in both spellings: the exclusion must drop.
+for AS_RUST in 'include!("fleet_commands/x.md");' '#[path = "fleet_commands/x.md"] mod body;'; do
+    fixture
+    seed_base "src-tauri/src/schema.rs" "$AS_RUST"
+    commit_change "src-tauri/src/fleet_commands/x.md" "#[derive(JsonSchema)] struct S;"
+    decide
+    check "with markdown compiled as Rust ($AS_RUST), a committed .md is MINE" \
+        "mine|yes" "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+done
 
 fixture
 commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
@@ -656,7 +677,7 @@ check "  the file is labelled as not in the push" \
     yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
 check "  the advice stashes exactly that path, untracked included" \
     yes "$(has 'git stash push --include-untracked -m "gen-events-drift-')"
-check "  and names it, top-level anchored" yes "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/Cargo.lock$' && echo yes || echo no)"
+check "  and names it as a top-level literal pathspec" yes "$(has "-- ':(top,literal)'Cargo.lock")"
 check "  restores by sha, never pop, never checkout" \
     "yes|no" "$(has 'git stash apply --index <that sha>')|$(has 'git checkout --')"
 check "  and drops the entry by re-finding it by tag" yes "$(has "git stash drop 'stash@{n}'")"
@@ -665,19 +686,27 @@ render_with "$(detail_line src-tauri/src/new.rs untracked)"
 check "untracked: labelled as not in the push" \
     yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
 check "  and included in the stash command" yes \
-    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/src-tauri/src/new.rs$' && echo yes || echo no)"
+    "$(has "-- ':(top,literal)'src-tauri/src/new.rs")"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)"
 check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
 check "  both labels are printed" "yes|yes" \
     "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
 check "  and the dirty half gets set-aside advice" yes \
-    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/src-tauri/src/lib.rs$' && echo yes || echo no)"
+    "$(has "-- ':(top,literal)'src-tauri/src/lib.rs")"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
 RENDERED="$(gen_events_render_mine)"
 check "a dropped exclusion is stated in one line" yes "$(has 'Markdown was counted as a codegen input this time')"
+render_with "$(detail_line Cargo.lock uncommitted)"
+check "the stash-free route comes first, with the WIP-commit trap named" "yes|yes|yes" \
+    "$(has 'stash-free: run this hook from a clean checkout of HEAD')|$(has 'A WIP commit does NOT work')|$(printf '%s\n' "$RENDERED" | grep -n -e 'stash-free' -e 'git stash push' | head -1 | grep -q 'stash-free' && echo yes || echo no)"
+
+# Everything above pins the renderer; this pins that the hook still USES it,
+# so the tests describe the message a pusher actually sees.
+check "gen-events-drift.sh renders its MINE arm through gen_events_render_mine" yes \
+    "$(grep -qE '^[[:space:]]*gen_events_render_mine[[:space:]]*\|' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
 
 echo "  -- odd file names: real paths, and a set-aside command that runs --"
 
@@ -723,6 +752,18 @@ STASH_REF="$(git -C "$WORK" stash list --format='%gd %gs' | grep -F "$STASH_TAG"
 git -C "$WORK" stash drop "$STASH_REF" >/dev/null 2>&1
 check "  and apply-by-sha then drop-by-tag restores them and empties the stack" "yes|yes|0" \
     "$([ -e "$WORK/$ODD_E" ] && echo yes || echo no)|$([ -e "$WORK/$ODD_Q" ] && echo yes || echo no)|$(git -C "$WORK" stash list | wc -l | tr -d ' ')"
+
+# `literal` magic: without it `a[1].rs` is a glob and the stash also takes a
+# modified, tracked `a1.rs` that the message never named.
+fixture
+seed_base "src-tauri/src/a1.rs" "// tracked"
+printf '// my edit\n' >> "$WORK/src-tauri/src/a1.rs"
+printf '// bracketed\n' > "$WORK/src-tauri/src/a[1].rs"
+render_with "$(detail_line 'src-tauri/src/a[1].rs' untracked)"
+STASH_CMD="$(printf '%s\n' "$RENDERED" | sed -n 's/^    \(git stash push .*\)$/\1/p')"
+( cd "$WORK" && eval "$STASH_CMD" ) >/dev/null 2>&1
+check "a stash of a[1].rs takes a[1].rs and leaves a modified a1.rs alone" "no|yes" \
+    "$([ -e "$WORK/src-tauri/src/a[1].rs" ] && echo yes || echo no)|$(grep -q 'my edit' "$WORK/src-tauri/src/a1.rs" && echo yes || echo no)"
 
 echo
 if [ "$SKIP" -gt 0 ]; then
