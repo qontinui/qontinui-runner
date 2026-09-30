@@ -57,6 +57,11 @@ pub struct UpdateScheduledTaskRequest {
     pub auto_fix_on_failure: Option<bool>,
     #[serde(default, alias = "success_criteria")]
     pub success_criteria: Option<Option<String>>,
+    /// Absent = leave the conditions alone; `null` = clear them (also how a
+    /// row flagged `conditionsError` is repaired to "no conditions"); an
+    /// object = replace them. Deserialized explicitly for the same reason as
+    /// `timezone`: serde folds `null` into the outer `None` by default.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub conditions: Option<Option<crate::scheduler::ScheduleConditions>>,
     #[serde(default, alias = "catch_up_policy")]
     pub catch_up_policy: Option<crate::scheduler::CatchUpPolicy>,
@@ -80,13 +85,15 @@ pub struct UpdateSchedulerSettingsRequest {
     pub timezone: Option<Option<String>>,
 }
 
-/// `"timezone": null` -> `Some(None)`; `"timezone": "X"` -> `Some(Some(X))`;
-/// absent -> `None` (via `#[serde(default)]`).
-fn deserialize_double_option<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+/// Three-state field: `"field": null` -> `Some(None)`; `"field": value` ->
+/// `Some(Some(value))`; absent -> `None` (via `#[serde(default)]`, which must
+/// accompany it — without it an absent field is an error).
+fn deserialize_double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<String>::deserialize(d).map(Some)
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// A failed scheduler read. It is answered as a 500 rather than as an empty
@@ -426,8 +433,9 @@ pub async fn delete_scheduled_task(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
-    // Verify task exists first
-    pg.get_scheduled_task(&id)
+    // Verify task exists first — as STORED: a row flagged `conditionsError`
+    // must stay deletable (the runnable read refuses it).
+    pg.get_stored_scheduled_task(&id)
         .await
         .map_err(|e| {
             (
@@ -884,5 +892,35 @@ mod tests {
             .unwrap();
         assert!(update.contains("let write_conditions = request.conditions.is_some();"));
         assert!(update.contains("&read_modified_at, write_conditions)"));
+    }
+
+    /// `conditions` on an update is three-state: absent leaves them, `null`
+    /// clears them (and repairs a flagged row), an object replaces them.
+    #[test]
+    fn update_conditions_absent_null_and_object_are_three_different_requests() {
+        let absent: UpdateScheduledTaskRequest = serde_json::from_str(r#"{"name":"n"}"#).unwrap();
+        assert!(absent.conditions.is_none());
+        let null: UpdateScheduledTaskRequest =
+            serde_json::from_str(r#"{"conditions":null}"#).unwrap();
+        assert!(matches!(null.conditions, Some(None)));
+        let object: UpdateScheduledTaskRequest =
+            serde_json::from_str(r#"{"conditions":{"timeoutMinutes":30}}"#).unwrap();
+        assert!(matches!(
+            object.conditions,
+            Some(Some(ref c)) if c.timeout_minutes == Some(30)
+        ));
+    }
+
+    /// Delete checks existence against the STORED row, so a flagged row is
+    /// deletable rather than a 500.
+    #[test]
+    fn delete_checks_existence_against_the_stored_row() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn delete_scheduled_task(")
+            .expect("delete handler");
+        let (body, _) = body.split_once("\n}\n").expect("delete handler ends");
+        assert!(body.contains("pg.get_stored_scheduled_task(&id)"));
+        assert!(!body.contains("pg.get_scheduled_task(&id)"));
     }
 }
