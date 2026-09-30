@@ -47,6 +47,7 @@ vi.mock("../contexts", () => ({
     closeTerminal: () => {},
     terminalRefs: { current: new Map() },
     sessionStates: { "tab-a": "needs-input" },
+    agentVerdicts: {},
     pageId: "page-1",
     stateTimeAccum: { current: {} },
     // Every field below that a handler READS as pre-state has to be present,

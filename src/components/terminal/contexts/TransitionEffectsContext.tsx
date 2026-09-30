@@ -96,7 +96,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     async (zoneIdx: number): Promise<RestartOutcome> => {
       const oldTabId = zoneLayout.assignments[zoneIdx];
       const oldTab = tabs.find((t) => t.id === oldTabId);
-      const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "idle") : "idle";
+      const state = oldTabId ? (stateTracking.sessionStates[oldTabId] ?? "unknown") : "unknown";
       if (state !== "completed" && state !== "error") {
         return { restarted: false, reason: "not-restartable", state };
       }
@@ -149,6 +149,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     tabs,
     assignments: zoneLayout.assignments,
     getLastOutputLines,
+    agentVerdicts: stateTracking.agentVerdicts,
     terminalRefs: terminalRefs.current,
     stateEntryTimeRef: stateTracking.stateEntryTimeRef,
     stateTimeAccumRef: stateTracking.stateTimeAccum,

@@ -19,6 +19,7 @@ import {
   type PrChipTone,
   type SessionInfoState,
 } from "./useSessionInfo";
+import { stateSourceText, type AgentTruthEntry } from "./agentTruth";
 
 /**
  * Per-session identity + PR dropdown for the zone header (plan
@@ -105,6 +106,49 @@ function InfoRow({ row, zoneIndex }: { row: InfoRowSpec; zoneIndex: number }) {
           {copied ? <Check className="w-2.5 h-2.5" /> : <Copy className="w-2.5 h-2.5" />}
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * "State source" — how this terminal's state chip is known (plan
+ * `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+ * Phase 4): `hooks` when an event reported it, otherwise `inferred from screen
+ * (hooks not firing: <reason>)` from the runner's hook-delivery verdict. It
+ * does not depend on the session-info read, so it renders even when that read
+ * is unavailable. A runner that has reported nothing renders `unknown`, never
+ * a guess.
+ */
+function StateSourceRow({
+  agentTruth,
+  zoneIndex,
+}: {
+  agentTruth: AgentTruthEntry | undefined;
+  zoneIndex: number;
+}) {
+  const text = stateSourceText(agentTruth);
+  const hooks = agentTruth?.verdict.source === "hook";
+  return (
+    <div
+      id={sessionInfoElementId("state-source", zoneIndex)}
+      data-testid={sessionInfoElementId("state-source", zoneIndex)}
+      data-session-info-field="state-source"
+      data-session-info-value={text ?? undefined}
+      data-session-info-unknown={text === null ? "true" : undefined}
+      data-hook-delivery={agentTruth?.hookDelivery.status}
+      className="flex items-center gap-1.5 px-2 py-1 border-b border-[#2a2d3d]"
+    >
+      <span className="text-[9px] text-[#565f89] w-[68px] shrink-0">State source</span>
+      <span
+        className="text-[10px] font-mono truncate flex-1"
+        style={{
+          color: text === null ? PANEL_MUTED : hooks ? PANEL_TEXT : TONE_COLORS.partial,
+          fontStyle: text === null ? "italic" : undefined,
+        }}
+        title={text ?? UNKNOWN_TEXT}
+      >
+        {text ?? UNKNOWN_TEXT}
+      </span>
     </div>
   );
 }
@@ -230,9 +274,12 @@ function SessionInfoPanelBody({
 export function SessionInfoDropdown({
   claudeSessionId,
   zoneIndex,
+  agentTruth,
 }: {
   claudeSessionId?: string;
   zoneIndex: number;
+  /** The runner's verdict + hook delivery for this terminal, for the "State source" row. */
+  agentTruth?: AgentTruthEntry;
 }) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -368,6 +415,7 @@ export function SessionInfoDropdown({
           className="absolute left-0 top-full mt-0.5 w-72 rounded-lg shadow-xl z-50 overflow-hidden"
           style={{ backgroundColor: PANEL_BG, border: `1px solid ${PANEL_BORDER}` }}
         >
+          <StateSourceRow agentTruth={agentTruth} zoneIndex={zoneIndex} />
           <SessionInfoPanelBody
             state={state}
             zoneIndex={zoneIndex}

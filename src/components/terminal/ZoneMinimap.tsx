@@ -14,6 +14,7 @@ import {
 const DRAG_THRESHOLD = 3;
 
 const STATE_COLORS: Record<SessionState, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -309,7 +310,7 @@ export function ZoneMinimap() {
         <svg width={mapW} height={mapH}>
           {layout.zones.map((zone, idx) => {
             const tabId = assignments[idx];
-            const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
+            const state = tabId ? (sessionStates[tabId] ?? "unknown") : "unknown";
             const isFocused = idx === focusedZone;
             const [colStart, colSpan] = parseGridValue(zone.col, columns);
             const [rowStart, rowSpan] = parseGridValue(zone.row, rows);

@@ -856,9 +856,9 @@ function TerminalPageInner({
       workingDir: t.workingDir ?? "",
       // `sessionStates` keys are tab.id; tabs without a tracked state
       // (plain pwsh, freshly-created AI tabs before the state machine
-      // observes them) fall through to "idle" so the field is always
-      // a valid `TerminalSessionState`.
-      state: stateTracking.sessionStates[t.id] ?? "idle",
+      // observes them) fall through to "unknown" — never a guessed "idle" —
+      // so the field is always a valid `TerminalSessionState`.
+      state: stateTracking.sessionStates[t.id] ?? "unknown",
       isAlive: Boolean(t.isAlive),
       exitCode: t.exitCode,
       type: t.type ?? "terminal",
@@ -1092,6 +1092,7 @@ function TerminalPageInner({
     setActiveId,
     zoneLayout,
     sessionStates: stateTracking.sessionStates,
+    agentVerdicts: stateTracking.agentVerdicts,
     handleRestartInZone,
     labelsAndTags,
     focusHistory,

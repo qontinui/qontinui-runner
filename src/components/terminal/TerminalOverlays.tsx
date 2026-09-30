@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { deliverApprovals } from "./approveAll";
+import { partitionPermissionAsks } from "./agentTruth";
 import { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 import { CommandPalette } from "./CommandPalette";
 import { ZoneDiffOverlay } from "./ZoneDiffOverlay";
@@ -56,7 +57,7 @@ const noop = () => {};
 export function TerminalOverlays({ onSortZones = noop, onExport = noop }: TerminalOverlaysProps) {
   const session = useTerminalSession();
   const { tabs, zoneLayout, terminalRefs } = session;
-  const { sessionStates, snapshots, pageId } = session;
+  const { sessionStates, agentVerdicts, snapshots, pageId } = session;
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
   const transitionEffects = useTransitionEffects();
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
@@ -93,7 +94,12 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
   );
 
   const approveAll = useCallback(async () => {
-    const ni = tabs.filter((t) => sessionStates[t.id] === "needs-input");
+    // Only hook-reported permission asks (`isAuthoritativePermissionAsk`).
+    const { actionable: ni, skippedInferred } = partitionPermissionAsks(
+      tabs,
+      sessionStates,
+      agentVerdicts,
+    );
     const report = await deliverApprovals(
       ni.map((t) => t.id),
       terminalRefs.current,
@@ -104,14 +110,15 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
     // approve-all is legible afterwards rather than only in the moment.
     addHistoryEvent(
       "Approve all",
-      report.delivered === report.targeted
+      (report.delivered === report.targeted
         ? `${report.delivered} sessions`
-        : `${report.delivered} of ${report.targeted} sessions`,
+        : `${report.delivered} of ${report.targeted} sessions`) +
+        (skippedInferred.length > 0 ? `; skipped ${skippedInferred.length} inferred` : ""),
       undefined,
       report.delivered === report.targeted ? "#9ece6a" : "#e0af68",
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
-  }, [tabs, sessionStates, incrementMetric, addHistoryEvent]);
+  }, [tabs, sessionStates, agentVerdicts, incrementMetric, addHistoryEvent]);
 
   return (
     <>
@@ -154,6 +161,7 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
           tabs={tabs}
           assignments={zoneLayout.assignments}
           sessionStates={sessionStates}
+          agentVerdicts={agentVerdicts}
           focusedZone={zoneLayout.focusedZone}
           onFocusZone={zoneLayout.setFocusedZone}
           onApproveTab={approveTab}
