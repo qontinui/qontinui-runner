@@ -413,9 +413,10 @@ do_install() {
             case "$API_CODE" in 200|201|204) ;; *) die_unknown "created task $id, then PUT {\"enabled\":false} answered HTTP $API_CODE -- it may be ENABLED: $(snip "$API_BODY")" ;; esac
         fi
         verify_by_id "$id"
-        # The upsert key is the NAME, found through the list route -- and that
-        # route answers an empty list when its own Postgres read fails
-        # (mcp/scheduler.rs list_scheduled_tasks). If the new task is not
+        # The upsert key is the NAME, found through the list route -- and on a
+        # runner built before qontinui-runner#1865 that route answers an empty
+        # list when its own Postgres read fails (mcp/scheduler.rs
+        # list_scheduled_tasks; #1865 makes it a 500). If the new task is not
         # listed, every later --install would create another one.
         list_named
         [ "${#TASKS[@]}" -eq 1 ] && [ "$(task_id "${TASKS[0]}")" = "$id" ] \
