@@ -1872,10 +1872,11 @@ EOF
 
 **`"phase": null`, not `{}` — `details` is a per-key merge.** coord merges
 `details` per top-level key: a writer owns only the keys it sends, and a key sent
-as JSON `null` is removed. So `"details": {}` changes NOTHING — it would leave
-this run's `phase` on the row indefinitely — and it must never be used to "clear"
-(it cannot erase the runner's own `coord_credential` / `wedge_incidents` /
-`capability` keys either, which is the point of the merge; plan
+as JSON `null` is removed. So `"details": {}` changes NOTHING (once coord's
+per-key merge is serving; before that, details is replaced wholesale) — it would
+leave this run's `phase` on the row indefinitely — and it must never be used to
+"clear" (it cannot erase the runner's own `coord_credential` /
+`wedge_incidents` / `capability` keys either, which is the point of the merge; plan
 `2026-09-20-the-second-ratchet-domain-is-operations-and-its-cost-is-compared-to-the-first`
 Phase 5). Never send `_coord_received_at`: it is coord's reserved receipt-stamp key
 and a post carrying it is refused 400.
