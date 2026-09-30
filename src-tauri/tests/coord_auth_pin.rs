@@ -211,7 +211,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
         1,
     ),
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
-    ("pair.rs", "bootstrap", 1),
+    // pair-start (the browser flows share ONE call site) and pair-collect —
+    // the attended multi-tenant flow's second half, which RECEIVES the
+    // credentials and so cannot present one (plan
+    // `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`).
+    ("pair.rs", "bootstrap", 2),
     ("pair.rs", "not-coord", 2),
     ("session_bus.rs", "device-jwt-required", 1),
     ("session_bus.rs", "not-coord", 1),

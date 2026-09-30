@@ -1867,6 +1867,31 @@ pub async fn get_binding_gap_asks() -> Option<Vec<serde_json::Value>> {
     .flatten()
 }
 
+/// Read the per-tenant credential state — the binding-gap cell the device-JWT
+/// refresher publishes (`publish_binding_gaps`), expanded to one row per
+/// tenant in `coord_bound_tenants ∪ slots ∪ default`.
+///
+/// The ONE source the Settings card's "Workspaces" rows and the binding-gap
+/// banner both derive from (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`,
+/// D3), so the two cannot disagree. `status: "unknown"` (a stale or unreadable
+/// `coord_bound_tenants.json`, an unreadable slot store, or no refresher pass
+/// yet) renders every row `unknown` — never `connected`. `null` only when the
+/// blocking read itself failed.
+#[tauri::command]
+pub async fn get_binding_gaps() -> Option<serde_json::Value> {
+    tokio::task::spawn_blocking(|| {
+        let am = crate::auth::AuthManager::new();
+        serde_json::to_value(crate::mcp::device_jwt_refresher::current_binding_gap_view(
+            &am,
+        ))
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -1892,6 +1917,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             kick_device_jwt_refresher_cmd,
             get_coord_credential_posture,
             get_binding_gap_asks,
+            get_binding_gaps,
         ])
         .build()
 }

@@ -1755,30 +1755,127 @@ pub fn pair_with_pair_code(
 }
 
 // ============================================================================
-// Pair: browser (--browser, default)
+// Pair: browser (--browser, default) and the multi-tenant COLLECT flow
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize)]
+/// Query string of the loopback `/auth/runner-token-callback` redirect.
+///
+/// Every field but `state` is optional on the WIRE because the two browser
+/// flows deliver different things. The single-tenant flow
+/// ([`pair_via_browser`]) receives the device JWT in `?token=`. The
+/// multi-tenant flow ([`pair_via_browser_multi`]) receives only `state`,
+/// `token_id` and `collect=1`: its tokens are fetched from coord's
+/// `pair-collect` with a verifier only this process holds, and never travel
+/// through a URL (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`,
+/// D1 "Delivery"). Which fields are REQUIRED is decided by [`parse_callback`]
+/// per [`CallbackMode`], not by serde, so a malformed redirect gets a readable
+/// page rather than a bare 400.
+#[derive(Clone, Deserialize)]
 pub(crate) struct CallbackQuery {
     pub state: String,
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default)]
     pub token_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CallbackCapture {
-    pub token: String,
+    /// `1` on the collect flow's redirect. Informational: see
+    /// [`CallbackMode::Collect`] for why it is not required.
+    #[serde(default)]
     #[allow(dead_code)]
-    pub token_id: Option<String>,
+    pub collect: Option<String>,
 }
 
-/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
-/// `POST /coord/devices/pair-start` to register the flow and obtain a
-/// coord-minted state nonce + redirect URL, opens the browser, waits for
-/// the user's click + redirect which delivers the device-token JWT
-/// directly via the callback query params (coord's `pair-complete` is
-/// called by the web frontend, not the runner).
+/// Which delivery the loopback callback expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackMode {
+    /// Single-tenant: the redirect carries the device JWT in `?token=`.
+    Token,
+    /// Multi-tenant: the redirect only signals that coord's `pair-complete`
+    /// ran. Any `token` on it is IGNORED — the collect flow's credentials come
+    /// from `pair-collect` alone, so a token in the URL is never trusted or
+    /// stored. `collect=1` is not required either: an un-upgraded web page
+    /// redirects with the first tenant's `?token=` and no `collect`, and the
+    /// flow must still collect every tenant rather than fail.
+    Collect,
+}
+
+/// What the loopback callback captured.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CallbackCapture {
+    Token {
+        token: String,
+        token_id: Option<String>,
+    },
+    Collect {
+        token_id: Option<String>,
+    },
+}
+
+/// Redacts the token: a capture must be loggable without leaking a credential.
+impl std::fmt::Debug for CallbackCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token { token_id, .. } => f
+                .debug_struct("Token")
+                .field("token", &"<redacted>")
+                .field("token_id", token_id)
+                .finish(),
+            Self::Collect { token_id } => f
+                .debug_struct("Collect")
+                .field("token_id", token_id)
+                .finish(),
+        }
+    }
+}
+
+/// Why a callback was refused. Each maps to its own browser page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackRefusal {
+    StateMismatch,
+    MissingToken,
+}
+
+fn non_blank(v: &Option<String>) -> Option<String> {
+    v.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Pure: decide what one callback request delivered. See [`CallbackMode`].
+pub(crate) fn parse_callback(
+    q: &CallbackQuery,
+    expected_state: &str,
+    mode: CallbackMode,
+) -> Result<CallbackCapture, CallbackRefusal> {
+    if q.state != expected_state {
+        return Err(CallbackRefusal::StateMismatch);
+    }
+    let token_id = non_blank(&q.token_id);
+    match mode {
+        CallbackMode::Token => match non_blank(&q.token) {
+            Some(token) => Ok(CallbackCapture::Token { token, token_id }),
+            None => Err(CallbackRefusal::MissingToken),
+        },
+        CallbackMode::Collect => Ok(CallbackCapture::Collect { token_id }),
+    }
+}
+
+fn callback_page(outcome: &Result<CallbackCapture, CallbackRefusal>) -> String {
+    match outcome {
+        Ok(_) => "<h1>&#10003; Runner paired</h1>\
+                  <p>You can close this tab and return to the runner.</p>\
+                  <script>setTimeout(()=>window.close(),2000);</script>"
+            .to_string(),
+        Err(CallbackRefusal::StateMismatch) => "<h1>State mismatch</h1><p>The callback state did \
+             not match the pending flow. Restart the pairing.</p>"
+            .to_string(),
+        Err(CallbackRefusal::MissingToken) => "<h1>Pairing incomplete</h1><p>The browser \
+             returned no credential for this runner. Restart the pairing.</p>"
+            .to_string(),
+    }
+}
+
 /// Body of the anonymous `POST /coord/devices/pair-start` that opens the
 /// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
 /// device and refuses a `pair-complete` for any other (`device_mismatch`,
@@ -1802,10 +1899,81 @@ fn pair_start_request_body(
     })
 }
 
-pub fn pair_via_browser(
+/// The multi-tenant twin of [`pair_start_request_body`]: `tenant_ids` INSTEAD
+/// of `tenant_id` (coord refuses a body carrying both), the optional
+/// `home_tenant_id` only when the caller names one — coord never moves the
+/// device's home pointer otherwise — and the `collect_challenge` that makes
+/// the per-tenant tokens collectable only by the holder of the verifier.
+fn pair_start_multi_request_body(
+    device_id: &str,
+    callback_url: &str,
+    device_hostname: &str,
+    web_pair_url: &str,
+    tenant_ids: &[uuid::Uuid],
+    home_tenant_id: Option<uuid::Uuid>,
+    collect_challenge: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "callback_url":      callback_url,
+        "device_hostname":   device_hostname,
+        "device_name":       device_hostname,
+        "web_pair_url":      web_pair_url,
+        "tenant_ids":        tenant_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        "device_id":         device_id,
+        "collect_challenge": collect_challenge,
+    });
+    if let Some(home) = home_tenant_id {
+        body["home_tenant_id"] = serde_json::Value::String(home.to_string());
+    }
+    body
+}
+
+/// The most tenants one `pair-start` may name (coord's own bound).
+pub const PAIR_MULTI_MAX_TENANTS: usize = 32;
+
+/// A fresh collect verifier: 32 CSPRNG bytes, base64url without padding
+/// (43 chars). Held in memory for the length of one flow and never logged,
+/// persisted or put in a URL.
+pub(crate) fn generate_collect_verifier() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `collect_challenge = base64url-no-pad(SHA-256(verifier))` — the PKCE S256
+/// derivation, reused from [`crate::cognito::code_challenge_s256`] so the two
+/// cannot drift.
+pub(crate) fn collect_challenge_for(verifier: &str) -> String {
+    crate::cognito::code_challenge_s256(verifier)
+}
+
+/// The resolved ends of one browser round-trip, handed to the caller's
+/// `pair-start` body builder.
+struct BrowserPairEnds<'a> {
+    device_id: &'a str,
+    callback_url: &'a str,
+    hostname: &'a str,
+    web_pair_url: &'a str,
+}
+
+/// What one completed browser round-trip produced.
+struct BrowserRoundTrip {
+    device_id: String,
+    state: String,
+    capture: CallbackCapture,
+}
+
+/// The browser round-trip BOTH flows share: bind a loopback callback, register
+/// the flow with coord's anonymous `pair-start` (body built by the caller),
+/// open the browser, and wait up to 5 minutes for the redirect that
+/// [`parse_callback`] accepts under `mode`.
+fn browser_pair_round_trip(
     coord_base: &str,
-    tenant_id: uuid::Uuid,
-) -> Result<PairCompleteResponse, String> {
+    mode: CallbackMode,
+    build_pair_start_body: impl FnOnce(&BrowserPairEnds<'_>) -> serde_json::Value,
+) -> Result<BrowserRoundTrip, String> {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1848,13 +2016,12 @@ pub fn pair_via_browser(
     // obtain a coord-minted state nonce + redirect URL.
     let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
-    let pair_start_body = pair_start_request_body(
-        &device_id,
-        &callback_url,
-        &hostname_now,
-        &web_pair_url,
-        tenant_id,
-    );
+    let pair_start_body = build_pair_start_body(&BrowserPairEnds {
+        device_id: &device_id,
+        callback_url: &callback_url,
+        hostname: &hostname_now,
+        web_pair_url: &web_pair_url,
+    });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1904,9 +2071,10 @@ pub fn pair_via_browser(
     let state_expected = state_nonce.clone();
 
     // Spawn a current-thread tokio runtime + axum server on a worker
-    // thread. This is a self-contained loopback callback server for the
-    // CLI pair flow — it depends on no Tauri-side state (ApiState/AppState),
-    // so it runs independently of the runner's main HTTP server.
+    // thread. This is a self-contained loopback callback server — it depends
+    // on no Tauri-side state (ApiState/AppState), so it runs independently of
+    // the runner's main HTTP server and serves the CLI and the in-app
+    // `pair_all_tenants` command alike.
     let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
     let server_handle = std::thread::spawn(move || -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1924,23 +2092,11 @@ pub fn pair_via_browser(
                     let state_for_route = state_for_route.clone();
                     let received_for_route = received_for_route.clone();
                     async move {
-                        if q.state != state_for_route {
-                            return Html(
-                                "<h1>State mismatch</h1><p>The callback state did \
-                                 not match the pending flow. Restart the pairing.</p>"
-                                    .to_string(),
-                            );
+                        let outcome = parse_callback(&q, &state_for_route, mode);
+                        if let Ok(capture) = &outcome {
+                            *received_for_route.lock().expect("mutex") = Some(capture.clone());
                         }
-                        *received_for_route.lock().expect("mutex") = Some(CallbackCapture {
-                            token: q.token.clone(),
-                            token_id: q.token_id.clone(),
-                        });
-                        Html(
-                            "<h1>&#10003; Runner paired</h1>\
-                             <p>You can close this tab.</p>\
-                             <script>setTimeout(()=>window.close(),2000);</script>"
-                                .to_string(),
-                        )
+                        Html(callback_page(&outcome))
                     }
                 }),
             );
@@ -2000,26 +2156,51 @@ pub fn pair_via_browser(
     // is still running; it'll time out on its own.
     drop(server_handle);
 
+    Ok(BrowserRoundTrip {
+        device_id,
+        state: state_nonce,
+        capture,
+    })
+}
+
+/// Browser-mediated single-tenant pair. See [`browser_pair_round_trip`] for
+/// the loopback mechanics; the redirect delivers the device-token JWT directly
+/// via `?token=` (coord's `pair-complete` is called by the web frontend, not
+/// the runner).
+pub fn pair_via_browser(
+    coord_base: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
+    let trip = browser_pair_round_trip(coord_base, CallbackMode::Token, |ends| {
+        pair_start_request_body(
+            ends.device_id,
+            ends.callback_url,
+            ends.hostname,
+            ends.web_pair_url,
+            tenant_id,
+        )
+    })?;
+    let CallbackCapture::Token { token, token_id } = trip.capture else {
+        return Err("pair: the browser callback delivered no token".to_string());
+    };
+
     // The JWT is already in the callback redirect — coord's pair-complete
     // was called by the web frontend (step 4 of the browser-pair flow),
     // which minted the JWT and forwarded it via the redirect's `?token=`
     // param. No second HTTP call to coord is needed; we build the
     // PairCompleteResponse directly from the captured token.
     //
-    // `capture.token` = device-token JWT (coord-issued).
-    // `capture.token_id` = device_id forwarded by the web redirect.
+    // `token` = device-token JWT (coord-issued).
+    // `token_id` = device_id forwarded by the web redirect.
     // `user_id` is decoded from the JWT payload (best-effort; persist
     //  path re-validates).
-    let user_id = tenant_id_from_jwt_claim(&capture.token, "user_id")
-        .or_else(|| tenant_id_from_jwt_claim(&capture.token, "sub"))
+    let user_id = tenant_id_from_jwt_claim(&token, "user_id")
+        .or_else(|| tenant_id_from_jwt_claim(&token, "sub"))
         .unwrap_or_default();
-    let resp_device_id = capture
-        .token_id
-        .clone()
-        .unwrap_or_else(|| device_id.clone());
+    let resp_device_id = token_id.unwrap_or_else(|| trip.device_id.clone());
 
     Ok(PairCompleteResponse {
-        token: capture.token,
+        token,
         user_id,
         device_id: Some(resp_device_id),
         jti: None,
@@ -2029,6 +2210,269 @@ pub fn pair_via_browser(
         // is minted server-side and arrives via the pair-cli response path.
         device_machine_key: None,
     })
+}
+
+/// One tenant's row in coord's `pair-collect` answer.
+#[derive(Clone, Deserialize)]
+pub struct PairCollectResult {
+    pub tenant_id: String,
+    /// `minted` or `skipped`.
+    pub status: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub expires_at: Option<serde_json::Value>,
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+}
+
+/// Redacts the token.
+impl std::fmt::Debug for PairCollectResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairCollectResult")
+            .field("tenant_id", &self.tenant_id)
+            .field("status", &self.status)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_id", &self.token_id)
+            .field("skipped_reason", &self.skipped_reason)
+            .finish()
+    }
+}
+
+/// Coord's `POST /coord/devices/pair-collect` answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairCollectResponse {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub results: Vec<PairCollectResult>,
+}
+
+fn pair_collect_request_body(state: &str, device_id: &str, verifier: &str) -> serde_json::Value {
+    serde_json::json!({
+        "state":            state,
+        "device_id":        device_id,
+        "collect_verifier": verifier,
+    })
+}
+
+/// Collect the per-tenant tokens coord's `pair-complete` stored against
+/// `state`. Single-use on coord's side.
+fn pair_collect(
+    coord_base: &str,
+    state: &str,
+    device_id: &str,
+    verifier: &str,
+) -> Result<PairCollectResponse, String> {
+    let url = format!("{}/coord/devices/pair-collect", coord_base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    // coord-auth-exempt(bootstrap): `POST /coord/devices/pair-collect` is the
+    // second half of the anonymous pair-start flow — it is how this device
+    // RECEIVES the credentials the attended browser sign-in minted, so it
+    // cannot require one. Possession of the state nonce plus the verifier whose
+    // SHA-256 was registered at pair-start IS the credential.
+    let resp = client
+        .post(&url)
+        .json(&pair_collect_request_body(state, device_id, verifier))
+        .send()
+        .map_err(|e| format!("POST {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        let what = match status.as_u16() {
+            404 => "the pairing flow is unknown or expired — start again",
+            409 => "these credentials were already collected — start again",
+            403 => "coord refused the collect verifier",
+            _ => "collect failed",
+        };
+        return Err(format!("POST {url} -> HTTP {status}: {what}: {body_text}"));
+    }
+    resp.json()
+        .map_err(|e| format!("decode pair-collect response failed: {e}"))
+}
+
+/// Order-preserving de-duplication of a tenant selection.
+fn dedup_tenants(tenant_ids: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    tenant_ids
+        .iter()
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .collect()
+}
+
+/// Attended multi-tenant pair: ONE browser sign-in, one device JWT per
+/// requested tenant the signed-in user is a member of.
+///
+/// The home tenant (`coord.devices.tenant_id`) moves only when
+/// `home_tenant_id` is named; this flow never goes through qontinui-web's
+/// `pair-cli`, so the device machine key is not rotated either. Tokens are not
+/// delivered by the redirect: coord stores them against the flow and this
+/// function collects them with a verifier whose challenge it registered at
+/// `pair-start`, so a token never appears in a URL.
+///
+/// Returns coord's per-tenant answer UNPERSISTED — see
+/// [`persist_collected_pairings`].
+pub fn pair_via_browser_multi(
+    coord_base: &str,
+    tenant_ids: &[uuid::Uuid],
+    home_tenant_id: Option<uuid::Uuid>,
+) -> Result<PairCollectResponse, String> {
+    let tenant_ids = dedup_tenants(tenant_ids);
+    if tenant_ids.is_empty() {
+        return Err("pair: no tenant selected".to_string());
+    }
+    if tenant_ids.len() > PAIR_MULTI_MAX_TENANTS {
+        return Err(format!(
+            "pair: {} tenants selected, at most {PAIR_MULTI_MAX_TENANTS} per sign-in",
+            tenant_ids.len()
+        ));
+    }
+    if let Some(home) = home_tenant_id {
+        if !tenant_ids.contains(&home) {
+            return Err(format!(
+                "pair: home tenant {home} is not among the selected tenants"
+            ));
+        }
+    }
+    let verifier = generate_collect_verifier();
+    let challenge = collect_challenge_for(&verifier);
+    let trip = browser_pair_round_trip(coord_base, CallbackMode::Collect, |ends| {
+        pair_start_multi_request_body(
+            ends.device_id,
+            ends.callback_url,
+            ends.hostname,
+            ends.web_pair_url,
+            &tenant_ids,
+            home_tenant_id,
+            &challenge,
+        )
+    })?;
+    pair_collect(coord_base, &trip.state, &trip.device_id, &verifier)
+}
+
+/// Where one requested tenant ended up after a multi-tenant pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantPairStatus {
+    /// Coord minted a token and it is persisted in this tenant's slot.
+    Connected,
+    /// Coord declined this tenant (e.g. `not_a_member`); nothing was written.
+    Skipped,
+    /// Coord minted a token but this box could not persist it.
+    Failed,
+}
+
+/// One requested tenant's outcome — the row `pair_all_tenants` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TenantPairOutcome {
+    pub tenant_id: String,
+    pub status: TenantPairStatus,
+    /// Why the tenant was skipped or failed. `None` when connected.
+    pub skipped_reason: Option<String>,
+}
+
+/// Persist every minted token of a multi-tenant pair through
+/// [`persist_pairing`]'s additive writer: each token lands in ITS tenant's
+/// slot, bindings are appended, and an established default is never moved.
+/// Returns one outcome per REQUESTED tenant, in request order.
+pub fn persist_collected_pairings(
+    resp: &PairCollectResponse,
+    requested: &[uuid::Uuid],
+    device_id: &str,
+) -> Result<Vec<TenantPairOutcome>, String> {
+    use crate::auth::AuthManager;
+    let mgr = AuthManager::new();
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let outcomes = persist_collected_pairings_with(&mgr, &path, resp, requested, device_id);
+    if outcomes
+        .iter()
+        .any(|o| o.status == TenantPairStatus::Connected)
+    {
+        // Same best-effort device_id record `persist_pairing` makes.
+        if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
+            if let Err(e) = storage.store_device_id_fresh(device_id) {
+                tracing::debug!("store_device_id non-fatal: {e}");
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Parameterized core of [`persist_collected_pairings`], for hermetic tests.
+pub(crate) fn persist_collected_pairings_with(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    resp: &PairCollectResponse,
+    requested: &[uuid::Uuid],
+    device_id: &str,
+) -> Vec<TenantPairOutcome> {
+    let requested = dedup_tenants(requested);
+    let outcome = |t: &uuid::Uuid, status, reason: Option<String>| TenantPairOutcome {
+        tenant_id: t.to_string(),
+        status,
+        skipped_reason: reason,
+    };
+    requested
+        .iter()
+        .map(|tenant| {
+            let Some(row) = resp
+                .results
+                .iter()
+                .find(|r| uuid::Uuid::parse_str(r.tenant_id.trim()).ok() == Some(*tenant))
+            else {
+                return outcome(
+                    tenant,
+                    TenantPairStatus::Skipped,
+                    Some("not_returned_by_coord".to_string()),
+                );
+            };
+            match row.status.as_str() {
+                "minted" => {
+                    let Some(token) = non_blank(&row.token) else {
+                        return outcome(
+                            tenant,
+                            TenantPairStatus::Failed,
+                            Some("coord reported minted but returned no token".to_string()),
+                        );
+                    };
+                    let user_id = tenant_id_from_jwt_claim(&token, "user_id")
+                        .or_else(|| tenant_id_from_jwt_claim(&token, "sub"))
+                        .unwrap_or_default();
+                    let pair = PairCompleteResponse {
+                        token,
+                        user_id,
+                        device_id: Some(device_id.to_string()),
+                        jti: non_blank(&row.token_id),
+                        exp: None,
+                        tenant_id: Some(tenant.to_string()),
+                        device_machine_key: None,
+                    };
+                    match persist_pairing_with(mgr, path, &pair, *tenant) {
+                        Ok(()) => outcome(tenant, TenantPairStatus::Connected, None),
+                        Err(e) => outcome(tenant, TenantPairStatus::Failed, Some(e)),
+                    }
+                }
+                "skipped" => outcome(
+                    tenant,
+                    TenantPairStatus::Skipped,
+                    Some(non_blank(&row.skipped_reason).unwrap_or_else(|| "unspecified".into())),
+                ),
+                other => outcome(
+                    tenant,
+                    TenantPairStatus::Failed,
+                    Some(format!("coord returned an unrecognised status `{other}`")),
+                ),
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -6287,5 +6731,413 @@ mod supersede_is_never_pure_loss_tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(superseded_siblings(&tmp.path().join("paired_user.json")).is_empty());
         assert!(superseded_siblings(Path::new("/nonexistent/dir/paired_user.json")).is_empty());
+    }
+}
+
+/// Plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// Phase 3 — the attended multi-tenant COLLECT flow: its challenge
+/// derivation, its callback parsing, the collect call, and the additive
+/// persistence of N tokens.
+#[cfg(test)]
+mod pair_multi_collect_tests {
+    use super::*;
+
+    const T_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const T_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const T_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const USER: &str = "22222222-2222-4222-8222-222222222222";
+    const DEVICE: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn t(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).unwrap()
+    }
+
+    fn test_mgr(dir: &std::path::Path) -> crate::auth::AuthManager {
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
+            .expect("test storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    fn query(state: &str, token: Option<&str>, collect: Option<&str>) -> CallbackQuery {
+        CallbackQuery {
+            state: state.to_string(),
+            token: token.map(str::to_string),
+            token_id: Some(DEVICE.to_string()),
+            collect: collect.map(str::to_string),
+        }
+    }
+
+    fn minted(tenant: &str, token: &str) -> PairCollectResult {
+        PairCollectResult {
+            tenant_id: tenant.to_string(),
+            status: "minted".to_string(),
+            token: Some(token.to_string()),
+            token_id: Some(format!("jti-{tenant}")),
+            expires_at: None,
+            skipped_reason: None,
+        }
+    }
+
+    fn skipped(tenant: &str, reason: &str) -> PairCollectResult {
+        PairCollectResult {
+            tenant_id: tenant.to_string(),
+            status: "skipped".to_string(),
+            token: None,
+            token_id: None,
+            expires_at: None,
+            skipped_reason: Some(reason.to_string()),
+        }
+    }
+
+    #[test]
+    fn collect_challenge_is_the_s256_of_the_verifier() {
+        // RFC 7636 Appendix B test vector.
+        assert_eq!(
+            collect_challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn collect_verifier_is_32_random_bytes_base64url_and_its_challenge_43_chars() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let v = generate_collect_verifier();
+        assert_eq!(v.len(), 43, "32 bytes base64url-no-pad is 43 chars");
+        assert_eq!(URL_SAFE_NO_PAD.decode(&v).expect("base64url").len(), 32);
+        assert_ne!(v, generate_collect_verifier(), "verifiers must not repeat");
+        let c = collect_challenge_for(&v);
+        assert_eq!(c.len(), 43, "coord requires a 43-char challenge");
+        assert!(!c.contains('=') && !c.contains('+') && !c.contains('/'));
+    }
+
+    #[test]
+    fn collect_mode_accepts_a_redirect_with_no_token() {
+        let got = parse_callback(&query("s1", None, Some("1")), "s1", CallbackMode::Collect);
+        assert_eq!(
+            got,
+            Ok(CallbackCapture::Collect {
+                token_id: Some(DEVICE.to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn collect_mode_ignores_a_token_in_the_url() {
+        // An un-upgraded web page still appends the first tenant's `?token=`.
+        // The collect flow must neither need it nor keep it.
+        for collect in [Some("1"), None] {
+            let got = parse_callback(
+                &query("s1", Some("jwt.from.url"), collect),
+                "s1",
+                CallbackMode::Collect,
+            )
+            .expect("accepted");
+            assert!(
+                matches!(got, CallbackCapture::Collect { .. }),
+                "collect mode must not capture a URL token: {got:?}"
+            );
+            assert!(!format!("{got:?}").contains("jwt.from.url"));
+        }
+    }
+
+    #[test]
+    fn a_state_mismatch_is_refused_in_both_modes() {
+        for mode in [CallbackMode::Collect, CallbackMode::Token] {
+            assert_eq!(
+                parse_callback(&query("other", Some("jwt"), Some("1")), "s1", mode),
+                Err(CallbackRefusal::StateMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn token_mode_still_requires_the_token() {
+        assert_eq!(
+            parse_callback(&query("s1", None, Some("1")), "s1", CallbackMode::Token),
+            Err(CallbackRefusal::MissingToken)
+        );
+        assert_eq!(
+            parse_callback(&query("s1", Some("  "), None), "s1", CallbackMode::Token),
+            Err(CallbackRefusal::MissingToken)
+        );
+        let got = parse_callback(&query("s1", Some("jwt.x"), None), "s1", CallbackMode::Token)
+            .expect("token delivered");
+        assert_eq!(
+            got,
+            CallbackCapture::Token {
+                token: "jwt.x".to_string(),
+                token_id: Some(DEVICE.to_string())
+            }
+        );
+        assert!(
+            !format!("{got:?}").contains("jwt.x"),
+            "Debug must redact the token"
+        );
+    }
+
+    #[test]
+    fn multi_pair_start_body_sends_tenant_ids_and_the_challenge_never_tenant_id() {
+        let body = pair_start_multi_request_body(
+            DEVICE,
+            "http://127.0.0.1:1/auth/runner-token-callback",
+            "spaceship",
+            "https://web.test/connect-runner",
+            &[t(T_A), t(T_B)],
+            None,
+            "chal",
+        );
+        assert_eq!(body["tenant_ids"], serde_json::json!([T_A, T_B]));
+        assert_eq!(body["collect_challenge"], "chal");
+        assert_eq!(body["device_id"], DEVICE);
+        assert!(
+            body.get("tenant_id").is_none(),
+            "coord refuses a body carrying both tenant_id and tenant_ids"
+        );
+        assert!(
+            body.get("home_tenant_id").is_none(),
+            "no home repoint unless one is explicitly named"
+        );
+        let with_home =
+            pair_start_multi_request_body(DEVICE, "cb", "h", "w", &[t(T_A)], Some(t(T_A)), "chal");
+        assert_eq!(with_home["home_tenant_id"], T_A);
+    }
+
+    #[test]
+    fn multi_pair_refuses_a_bad_selection_before_any_network_call() {
+        // An unroutable base: reaching the network would error differently.
+        let base = "http://127.0.0.1:9";
+        assert!(pair_via_browser_multi(base, &[], None)
+            .unwrap_err()
+            .contains("no tenant"));
+        let many: Vec<uuid::Uuid> = (0..=PAIR_MULTI_MAX_TENANTS)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        assert!(pair_via_browser_multi(base, &many, None)
+            .unwrap_err()
+            .contains("at most"));
+        assert!(pair_via_browser_multi(base, &[t(T_A)], Some(t(T_B)))
+            .unwrap_err()
+            .contains("home tenant"));
+    }
+
+    #[test]
+    fn collect_body_carries_state_device_and_verifier() {
+        let body = pair_collect_request_body("s1", DEVICE, "verifier");
+        assert_eq!(
+            body,
+            serde_json::json!({"state": "s1", "device_id": DEVICE, "collect_verifier": "verifier"})
+        );
+    }
+
+    #[test]
+    fn collect_response_decodes_both_row_shapes() {
+        let raw = serde_json::json!({
+            "device_id": DEVICE,
+            "results": [
+                {"tenant_id": T_A, "status": "minted", "token": "jwt.a", "token_id": "j1", "expires_at": 1_900_000_000},
+                {"tenant_id": T_B, "status": "skipped", "skipped_reason": "not_a_member"}
+            ]
+        });
+        let resp: PairCollectResponse = serde_json::from_value(raw).expect("decode");
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].token.as_deref(), Some("jwt.a"));
+        assert_eq!(
+            resp.results[1].skipped_reason.as_deref(),
+            Some("not_a_member")
+        );
+        assert!(
+            !format!("{resp:?}").contains("jwt.a"),
+            "Debug must redact tokens"
+        );
+    }
+
+    /// Phase 3 gate: persisting N tokens leaves the default binding and the
+    /// legacy `access_token` slot untouched, and appends N bindings.
+    #[test]
+    fn persisting_n_tokens_appends_n_bindings_and_leaves_the_default_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+
+        // The established home: tenant A, paired earlier.
+        let home = PairCompleteResponse {
+            token: "jwt.a.home".to_string(),
+            user_id: USER.to_string(),
+            device_id: None,
+            jti: None,
+            exp: None,
+            tenant_id: None,
+            device_machine_key: None,
+        };
+        persist_pairing_with(&mgr, &path, &home, t(T_A)).expect("seed home");
+        let legacy_before = mgr.get_access_token().unwrap();
+
+        let resp = PairCollectResponse {
+            device_id: Some(DEVICE.to_string()),
+            results: vec![minted(T_B, "jwt.b"), minted(T_C, "jwt.c")],
+        };
+        let outcomes =
+            persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_B), t(T_C)], DEVICE);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == TenantPairStatus::Connected),
+            "{outcomes:?}"
+        );
+
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.bindings.len(),
+            3,
+            "two bindings appended to the home one"
+        );
+        assert_eq!(
+            pf.default_tenant_id.as_deref(),
+            Some(T_A),
+            "default untouched"
+        );
+        assert_eq!(
+            pf.tenant_id.as_deref(),
+            Some(T_A),
+            "legacy mirror untouched"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            legacy_before,
+            "legacy access_token slot untouched"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_A)).unwrap().as_deref(),
+            Some("jwt.a.home"),
+            "the home tenant's slot is byte-identical"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_B)).unwrap().as_deref(),
+            Some("jwt.b")
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_C)).unwrap().as_deref(),
+            Some("jwt.c")
+        );
+    }
+
+    #[test]
+    fn skipped_unrequested_and_missing_tenants_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                skipped(T_A, "not_a_member"),
+                // Coord answered for a tenant nobody asked for: ignored.
+                minted(T_C, "jwt.c.unrequested"),
+                PairCollectResult {
+                    token: None,
+                    ..minted(T_B, "x")
+                },
+            ],
+        };
+        let outcomes =
+            persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_A), t(T_B), t(T_A)], DEVICE);
+        assert_eq!(
+            outcomes,
+            vec![
+                TenantPairOutcome {
+                    tenant_id: T_A.to_string(),
+                    status: TenantPairStatus::Skipped,
+                    skipped_reason: Some("not_a_member".to_string()),
+                },
+                TenantPairOutcome {
+                    tenant_id: T_B.to_string(),
+                    status: TenantPairStatus::Failed,
+                    skipped_reason: Some("coord reported minted but returned no token".to_string()),
+                },
+            ],
+            "one row per REQUESTED tenant, deduplicated, in request order"
+        );
+        assert!(!path.exists(), "nothing minted, so no binding was written");
+        assert_eq!(mgr.get_tenant_device_jwt(&t(T_C)).unwrap(), None);
+
+        let none_back = persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &PairCollectResponse {
+                device_id: None,
+                results: vec![],
+            },
+            &[t(T_B)],
+            DEVICE,
+        );
+        assert_eq!(
+            none_back[0].skipped_reason.as_deref(),
+            Some("not_returned_by_coord")
+        );
+    }
+
+    /// `pair_collect` against a mock coord: the body it sends, and a 409
+    /// mapped to a readable error.
+    #[test]
+    fn pair_collect_posts_the_verifier_and_maps_errors() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(200u16));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (seen2, status2) = (seen.clone(), status.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                use axum::{http::StatusCode, routing::post, Json, Router};
+                let app = Router::new().route(
+                    "/coord/devices/pair-collect",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let seen = seen2.clone();
+                        let status = status2.clone();
+                        async move {
+                            *seen.lock().unwrap() = Some(body);
+                            let code = *status.lock().unwrap();
+                            let body = if code == 200 {
+                                serde_json::json!({"device_id": DEVICE, "results": [
+                                    {"tenant_id": T_A, "status": "minted", "token": "jwt.a",
+                                     "token_id": "j", "expires_at": 1}]})
+                                .to_string()
+                            } else {
+                                r#"{"error":"already_collected"}"#.to_string()
+                            };
+                            (StatusCode::from_u16(code).unwrap(), body)
+                        }
+                    }),
+                );
+                let l = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(l, app)
+                    .with_graceful_shutdown(async {
+                        let _ = rx.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        let resp = pair_collect(&base, "s1", DEVICE, "the-verifier").expect("collect");
+        assert_eq!(resp.results[0].token.as_deref(), Some("jwt.a"));
+        assert_eq!(
+            seen.lock().unwrap().clone().unwrap(),
+            serde_json::json!({"state": "s1", "device_id": DEVICE, "collect_verifier": "the-verifier"})
+        );
+
+        *status.lock().unwrap() = 409;
+        let err = pair_collect(&base, "s1", DEVICE, "the-verifier").unwrap_err();
+        assert!(err.contains("already collected"), "{err}");
+
+        let _ = tx.send(());
+        server.join().unwrap();
     }
 }

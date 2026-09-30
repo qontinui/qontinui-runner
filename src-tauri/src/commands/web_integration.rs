@@ -752,6 +752,109 @@ pub async fn test_web_integration_connection(
 // redeem_pair_code — paste-pair via single-use 5-min code (Phase 2a.3)
 // ---------------------------------------------------------------------------
 
+/// Everything an EXPLICIT, interactive pairing does after its credentials are
+/// persisted — shared by [`redeem_pair_code`] and [`pair_all_tenants`] so the
+/// two doors cannot drift. `tenants` are the tenants whose slots were just
+/// written; `command` labels the log lines.
+async fn finish_explicit_pairing(command: &str, tenants: &[uuid::Uuid]) {
+    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
+    // tenant is the default), so every rejection coord recorded against the OLD
+    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
+    // stores a working credential and the next refresher pass re-reads the stale
+    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
+    let default_binding = crate::auth::default_binding_tenant();
+    for tenant_id in tenants {
+        crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+            *tenant_id,
+            default_binding,
+        );
+    }
+
+    // Redeeming a pair code IS an explicit interactive credential acquisition —
+    // the operator typed a code that a signed-in web session minted — so it ends
+    // any interactive logout, exactly like a Cognito sign-in does.
+    //
+    // Without this, an operator who used the autonomy-preserving logout and then
+    // re-paired by code was dead-ended: the device JWT is valid, the runner is
+    // Tier 2 with the relay online and autonomy running, but `check_auth_status`
+    // still short-circuits on the persisted marker and reports
+    // `authenticated:false` forever — so the App gate renders LoginScreen, with
+    // the very Settings pane where a pair code is entered unreachable behind it.
+    // (This command is allowlisted over the UI-Bridge HTTP surface for
+    // agent-driven pairing, so it is a live path, not a theoretical one.)
+    //
+    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
+    // must not un-logout the operator. Placed HERE rather than inside
+    // `persist_pairing` also on purpose: the background device-JWT refresher
+    // writes the same credential slots, and clearing on that path would silently
+    // un-logout the operator on the next refresh cycle.
+    if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
+        warn!("{command}: could not clear the interactive sign-out marker: {e}");
+    }
+
+    // Promote to Tier 2 (qontinui_account) now that a device JWT is in
+    // hand. Redeeming a pair code IS a cloud-account bind, so the runner
+    // must leave Tier Local for the WS relay to come online. Defensive:
+    // the Settings UI also promotes after redeem, but a headless / UI-Bridge
+    // caller that doesn't run the FE path still ends up online. Idempotent —
+    // a no-op when already at Tier 2.
+    //
+    // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
+    // helper the headless CLI door (`qontinui_profile device pair`) calls —
+    // reached here through `settings::promote_tier_to_account`, the bin-side
+    // door that additionally drops this process's settings parse cache (the
+    // lib cannot: the cache is bin-side).
+    // That door used to write the pairing credentials and never touch the
+    // tier, so the box that most needs Tier 2 was the only one that could not
+    // reach it. One writer, two doors: they cannot drift again. The helper
+    // owns all three conditions of `settings::should_persist_migration` —
+    // nothing-to-persist, `!is_secondary`, and (structurally, via its
+    // `serde_json::Value` edit) an authoritative source.
+    match settings::promote_tier_to_account() {
+        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
+            info!(
+                "{command}: promoted runner to Tier QontinuiAccount in {}",
+                path.display()
+            );
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
+            debug!("{command}: runner already at Tier QontinuiAccount — no settings write");
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
+            // A secondary must never write the shared settings.json (it would
+            // demote the primary), but THIS process still holds a device JWT
+            // and needs Tier 2 to bring its relay online — so apply the tier
+            // as the in-memory-only overlay, which is never persisted.
+            // Guarded on there being no runtime override already: an explicit
+            // operator choice (`set_runner_tier`) is authoritative over an
+            // inferred promotion, and that precedence must not be inverted.
+            if settings::in_memory_tier().is_none() {
+                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
+                warn!("{command}: secondary runner — applying tier in-memory only, skipping the settings.json write");
+            } else {
+                warn!("{command}: secondary runner with an explicit runtime tier override — leaving it alone");
+            }
+        }
+        Err(e) => {
+            warn!("{command}: tier promotion persist failed (continuing): {e}");
+        }
+    }
+
+    // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
+    // only when the tier changed. `persist_pairing` above just wrote a fresh
+    // device-JWT into the slot the relay reads, but a re-pair on a runner that
+    // is ALREADY Tier 2 (the common case: an idle runner whose 4h JWT expired)
+    // used to skip these kicks entirely — they lived inside the `tier !=
+    // QontinuiAccount` branch. The result was a fresh JWT staged on disk that
+    // nothing ever told the live relay/refresher to pick up, so the runner sat
+    // `ws_connected:false` until a full restart despite a valid pairing.
+    // Idempotent: the refresher no-ops when the JWT is still fresh, and a kick
+    // to a connected relay just re-evaluates its idle gate.
+    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    info!("{command}: kicked relay + device-JWT refresher to pick up the fresh pairing");
+}
+
 /// Wire response for [`redeem_pair_code`].
 ///
 /// Mirrors the runner-side ``PairCompleteResponse`` shape so the frontend
@@ -865,99 +968,7 @@ pub async fn redeem_pair_code(
         .map_err(|e| format!("persist pairing task panicked: {e}"))?
         .map_err(|e| format!("persist pairing: {}", e))?;
 
-    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
-    // tenant is the default), so every rejection coord recorded against the OLD
-    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
-    // stores a working credential and the next refresher pass re-reads the stale
-    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
-    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
-        tenant_id,
-        crate::auth::default_binding_tenant(),
-    );
-
-    // Redeeming a pair code IS an explicit interactive credential acquisition —
-    // the operator typed a code that a signed-in web session minted — so it ends
-    // any interactive logout, exactly like a Cognito sign-in does.
-    //
-    // Without this, an operator who used the autonomy-preserving logout and then
-    // re-paired by code was dead-ended: the device JWT is valid, the runner is
-    // Tier 2 with the relay online and autonomy running, but `check_auth_status`
-    // still short-circuits on the persisted marker and reports
-    // `authenticated:false` forever — so the App gate renders LoginScreen, with
-    // the very Settings pane where a pair code is entered unreachable behind it.
-    // (This command is allowlisted over the UI-Bridge HTTP surface for
-    // agent-driven pairing, so it is a live path, not a theoretical one.)
-    //
-    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
-    // must not un-logout the operator. Placed HERE rather than inside
-    // `persist_pairing` also on purpose: the background device-JWT refresher
-    // writes the same credential slots, and clearing on that path would silently
-    // un-logout the operator on the next refresh cycle.
-    if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
-        warn!("redeem_pair_code: could not clear the interactive sign-out marker: {e}");
-    }
-
-    // Promote to Tier 2 (qontinui_account) now that a device JWT is in
-    // hand. Redeeming a pair code IS a cloud-account bind, so the runner
-    // must leave Tier Local for the WS relay to come online. Defensive:
-    // the Settings UI also promotes after redeem, but a headless / UI-Bridge
-    // caller that doesn't run the FE path still ends up online. Idempotent —
-    // a no-op when already at Tier 2.
-    //
-    // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
-    // helper the headless CLI door (`qontinui_profile device pair`) calls —
-    // reached here through `settings::promote_tier_to_account`, the bin-side
-    // door that additionally drops this process's settings parse cache (the
-    // lib cannot: the cache is bin-side).
-    // That door used to write the pairing credentials and never touch the
-    // tier, so the box that most needs Tier 2 was the only one that could not
-    // reach it. One writer, two doors: they cannot drift again. The helper
-    // owns all three conditions of `settings::should_persist_migration` —
-    // nothing-to-persist, `!is_secondary`, and (structurally, via its
-    // `serde_json::Value` edit) an authoritative source.
-    match settings::promote_tier_to_account() {
-        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
-            info!(
-                "redeem_pair_code: promoted runner to Tier QontinuiAccount in {}",
-                path.display()
-            );
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
-            debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
-            // A secondary must never write the shared settings.json (it would
-            // demote the primary), but THIS process still holds a device JWT
-            // and needs Tier 2 to bring its relay online — so apply the tier
-            // as the in-memory-only overlay, which is never persisted.
-            // Guarded on there being no runtime override already: an explicit
-            // operator choice (`set_runner_tier`) is authoritative over an
-            // inferred promotion, and that precedence must not be inverted.
-            if settings::in_memory_tier().is_none() {
-                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
-                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping the settings.json write");
-            } else {
-                warn!("redeem_pair_code: secondary runner with an explicit runtime tier override — leaving it alone");
-            }
-        }
-        Err(e) => {
-            warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
-        }
-    }
-
-    // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
-    // only when the tier changed. `persist_pairing` above just wrote a fresh
-    // device-JWT into the slot the relay reads, but a re-pair on a runner that
-    // is ALREADY Tier 2 (the common case: an idle runner whose 4h JWT expired)
-    // used to skip these kicks entirely — they lived inside the `tier !=
-    // QontinuiAccount` branch. The result was a fresh JWT staged on disk that
-    // nothing ever told the live relay/refresher to pick up, so the runner sat
-    // `ws_connected:false` until a full restart despite a valid pairing.
-    // Idempotent: the refresher no-ops when the JWT is still fresh, and a kick
-    // to a connected relay just re-evaluates its idle gate.
-    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-    info!("redeem_pair_code: kicked relay + device-JWT refresher to pick up the fresh pairing");
+    finish_explicit_pairing("redeem_pair_code", &[tenant_id]).await;
 
     let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
 
@@ -973,6 +984,160 @@ pub async fn redeem_pair_code(
     })
 }
 
+// ---------------------------------------------------------------------------
+// pair_all_tenants — "Connect all my workspaces" (plan
+// 2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command,
+// Phase 3 / D1)
+// ---------------------------------------------------------------------------
+
+/// Wire response for [`pair_all_tenants`]: one row per requested tenant.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairAllTenantsResponse {
+    pub results: Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
+}
+
+/// Pure: the default selection when the caller names no tenants — the
+/// tenants the published binding-gap view says are bound with no credential.
+/// An UNKNOWN view selects nothing and says why: the runner does not guess
+/// which workspaces to pair.
+pub(crate) fn default_pair_selection(
+    view: &crate::mcp::device_jwt_refresher::BindingGapView,
+) -> Result<Vec<uuid::Uuid>, String> {
+    use crate::mcp::device_jwt_refresher::TenantCredentialState;
+    if view.status != "measured" {
+        return Err(format!(
+            "which workspaces lack a credential is UNKNOWN ({}) — name the tenants to connect",
+            view.reason.as_deref().unwrap_or("no reason recorded")
+        ));
+    }
+    let gaps: Vec<uuid::Uuid> = view
+        .rows
+        .iter()
+        .filter(|r| r.state == TenantCredentialState::NoCredential)
+        .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
+        .collect();
+    if gaps.is_empty() {
+        return Err("every workspace this device is bound to already has a credential".to_string());
+    }
+    Ok(gaps)
+}
+
+/// "Connect all my workspaces": ONE attended browser sign-in that mints a
+/// device JWT for every selected tenant and persists each into its own slot.
+///
+/// - `tenant_ids` omitted or empty → the binding-gap tenants
+///   ([`default_pair_selection`]).
+/// - Goes through coord's `pair-start` / `pair-complete` / `pair-collect`
+///   ([`qontinui_runner_lib::pair::pair_via_browser_multi`]) — never web
+///   `pair-cli` and never `machine-credential/exchange`, so the device's HOME
+///   tenant does not move and its machine key is not rotated (no
+///   `home_tenant_id` is sent).
+/// - Persistence is additive ([`qontinui_runner_lib::pair::persist_collected_pairings`]):
+///   bindings are appended and an established default is never moved.
+/// - A tenant coord declines (e.g. `not_a_member`) is a `skipped` row, not an
+///   error for the whole batch.
+///
+/// Afterwards: the shared post-pairing steps (rejection streaks retired per
+/// tenant, relay + refresher kicked), the binding-gap cell republished from
+/// disk, and the `autonomy-binding-gap` nudge emitted so the banner and the
+/// Settings card re-read `get_binding_gaps`.
+#[tauri::command]
+pub async fn pair_all_tenants(
+    app: AppHandle,
+    tenant_ids: Option<Vec<String>>,
+) -> Result<PairAllTenantsResponse, String> {
+    use qontinui_runner_lib::pair::{
+        pair_via_browser_multi, persist_collected_pairings, read_device_id_from_disk,
+        TenantPairStatus,
+    };
+
+    let explicit: Vec<uuid::Uuid> = tenant_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|t| {
+            uuid::Uuid::parse_str(t.trim()).map_err(|e| format!("malformed tenant id {t:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let selection = if explicit.is_empty() {
+        let view = spawn_blocking_tracked(|| {
+            crate::mcp::device_jwt_refresher::current_binding_gap_view(
+                &crate::auth::AuthManager::new(),
+            )
+        })
+        .await
+        .map_err(|e| format!("binding-gap read panicked: {e}"))?;
+        default_pair_selection(&view)?
+    } else {
+        explicit
+    };
+
+    let coord_base = qontinui_runner_lib::profiles::connected_coord_base()
+        .ok_or_else(|| "this runner is not connected to a coordinator".to_string())?;
+    let device_id =
+        read_device_id_from_disk().map_err(|e| format!("could not read device identity: {e}"))?;
+
+    info!(
+        "pair_all_tenants: opening one browser sign-in for {} tenant(s): {:?}",
+        selection.len(),
+        selection
+    );
+    let for_blocking = selection.clone();
+    let device_for_blocking = device_id.clone();
+    let results = spawn_blocking_tracked(move || {
+        let collected = pair_via_browser_multi(&coord_base, &for_blocking, None)?;
+        let device = collected.device_id.clone().unwrap_or(device_for_blocking);
+        persist_collected_pairings(&collected, &for_blocking, &device)
+    })
+    .await
+    .map_err(|e| format!("pair_all_tenants task panicked: {e}"))??;
+
+    let connected: Vec<uuid::Uuid> = results
+        .iter()
+        .filter(|r| r.status == TenantPairStatus::Connected)
+        .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
+        .collect();
+    for r in &results {
+        info!(
+            "pair_all_tenants: tenant {} -> {:?}{}",
+            r.tenant_id,
+            r.status,
+            r.skipped_reason
+                .as_deref()
+                .map(|why| format!(" ({why})"))
+                .unwrap_or_default()
+        );
+    }
+    if !connected.is_empty() {
+        finish_explicit_pairing("pair_all_tenants", &connected).await;
+    }
+
+    // Republish the gap cell from disk NOW rather than on the next refresher
+    // pass, then nudge the UI to re-read it (the event is only a nudge — the
+    // UI's state comes from `get_binding_gaps`).
+    let _ = spawn_blocking_tracked(|| {
+        crate::mcp::device_jwt_refresher::republish_binding_gaps_now(
+            &crate::auth::AuthManager::new(),
+        )
+    })
+    .await;
+    for r in &results {
+        let payload = serde_json::json!({
+            "tenant_id": r.tenant_id,
+            "open": r.status != TenantPairStatus::Connected,
+        });
+        if let Err(e) = app.emit(
+            crate::mcp::device_jwt_refresher::AUTONOMY_BINDING_GAP_EVENT,
+            payload,
+        ) {
+            warn!(
+                "pair_all_tenants: binding-gap nudge failed (the view stays readable by pull): {e}"
+            );
+        }
+    }
+
+    Ok(PairAllTenantsResponse { results })
+}
+
 /// Tauri plugin exposing all web-integration commands.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_web_integration")
@@ -982,6 +1147,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_web_integration_settings,
             test_web_integration_connection,
             redeem_pair_code,
+            pair_all_tenants,
         ])
         .build()
 }
