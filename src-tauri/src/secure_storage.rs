@@ -452,6 +452,89 @@ struct StoredTokens {
     /// themselves.
     #[serde(default)]
     interactive_signed_out: bool,
+    /// The newest coord device JWT this store has held, kept ONLY as the
+    /// bearer for web's `GET /api/v1/devices/{device_id}/pending-redeem`
+    /// (`mcp::pending_redeem`; plan
+    /// `2026-09-26-authenticate-and-perpetually-renew-a-specific-runner-from-qontinui-web`).
+    ///
+    /// Why a slot of its own: the refresher's automatic exit CLEARS a dead
+    /// per-tenant slot (`Cleared { .. }`), a default logout clears
+    /// `access_token`, and the paired-user reconcile clears dropped tenants —
+    /// so exactly the stranded (`unrefreshable`) device the poll exists for
+    /// would otherwise hold no token to prove which device it is. Maintained
+    /// in ONE place, [`SecureStorage::save_tokens`] (see
+    /// [`refresh_redeem_anchor`]), so every writer — present and future —
+    /// keeps it without knowing it exists: a newer device JWT supersedes it, a
+    /// clear leaves it. Emptied only by the full sign-out
+    /// ([`SecureStorage::clear_tokens`], an explicit "forget this device") and
+    /// re-seeded after a successful redeem
+    /// ([`SecureStorage::reset_redeem_anchor`]). It is a bearer credential
+    /// like the slots it copies; never log it. `#[serde(default)]` keeps
+    /// older `.enc` files readable.
+    #[serde(default)]
+    redeem_anchor_jwt: Option<String>,
+}
+
+/// `exp` of a DEVICE JWT (`sub_type == "device"` with a `device_id` claim),
+/// decoded without verification; `None` for anything else. Only ranks
+/// candidates for [`refresh_redeem_anchor`] — web is the verifier.
+fn device_jwt_anchor_exp(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let mut parts = token.trim().splitn(3, '.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let is_device = claims
+        .get("sub_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("device"));
+    let has_device_id = claims
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|d| !d.trim().is_empty());
+    (is_device && has_device_id)
+        .then(|| claims.get("exp").and_then(|v| v.as_i64()))
+        .flatten()
+}
+
+/// Set `redeem_anchor_jwt` on a serialized [`StoredTokens`] to the newest
+/// device JWT among the current anchor, `access_token` and every per-tenant
+/// slot. A slot that was just cleared is simply not a candidate, so the
+/// previous anchor survives it; a newer token replaces it.
+fn refresh_redeem_anchor(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    for key in ["redeem_anchor_jwt", "access_token"] {
+        if let Some(t) = obj.get(key).and_then(|v| v.as_str()) {
+            candidates.push(t.to_string());
+        }
+    }
+    if let Some(slots) = obj.get("tenant_device_jwts").and_then(|v| v.as_object()) {
+        candidates.extend(
+            slots
+                .values()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string),
+        );
+    }
+    let newest = candidates
+        .into_iter()
+        .filter_map(|t| device_jwt_anchor_exp(&t).map(|exp| (exp, t)))
+        .max_by_key(|(exp, _)| *exp)
+        .map(|(_, t)| t);
+    if let Some(t) = newest {
+        obj.insert(
+            "redeem_anchor_jwt".to_string(),
+            serde_json::Value::String(t),
+        );
+    }
 }
 
 /// Write posture for a read-modify-write over a possibly-unreadable store.
@@ -683,7 +766,11 @@ impl SecureStorage {
     /// not a substitute for the file mode against the local-reader threat this
     /// hardening exists for.
     fn save_tokens(&self, tokens: &StoredTokens) -> Result<()> {
-        let json = serde_json::to_vec(tokens).context("Failed to serialize tokens")?;
+        // Every write keeps the pending-redeem anchor current — see
+        // `StoredTokens::redeem_anchor_jwt`.
+        let mut value = serde_json::to_value(tokens).context("Failed to serialize tokens")?;
+        refresh_redeem_anchor(&mut value);
+        let json = serde_json::to_vec(&value).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
 
@@ -847,6 +934,9 @@ impl SecureStorage {
         // already reports signed-out, but keep the flag consistent so a
         // partially-failed wipe can't leave the UI showing signed-in.
         tokens.interactive_signed_out = true;
+        // A full sign-out forgets the device: the pending-redeem anchor goes
+        // too (every slot it could be re-seeded from is already empty).
+        tokens.redeem_anchor_jwt = None;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
         Ok(())
@@ -1401,6 +1491,23 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// The pending-redeem anchor (`StoredTokens::redeem_anchor_jwt`), expired
+    /// or not. `Ok(None)` when none was ever kept.
+    pub fn get_redeem_anchor_jwt(&self) -> Result<Option<String>> {
+        Ok(self.load_tokens()?.redeem_anchor_jwt)
+    }
+
+    /// Drop the pending-redeem anchor after it has been spent on a successful
+    /// redeem. The save re-seeds it from the device JWTs the store holds NOW
+    /// (the one the redeem just persisted), so the spent token is gone and the
+    /// next dark episode still has an anchor.
+    pub fn reset_redeem_anchor(&self) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write()?;
+        tokens.redeem_anchor_jwt = None;
+        self.save_tokens(&tokens)?;
+        Ok(())
+    }
+
     /// Deletes the storage file entirely.
     ///
     /// The reset affordance behind the "your credential store is corrupt" banner
@@ -1485,6 +1592,98 @@ mod tests {
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
         SecureStorage::with_path(storage_path).unwrap()
+    }
+
+    /// A JWT-shaped DEVICE token (signature unchecked locally).
+    fn anchor_test_jwt(device_id: &str, exp: i64, sub_type: &str) -> String {
+        use base64::Engine as _;
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let claims = serde_json::json!({"sub_type": sub_type, "device_id": device_id, "exp": exp});
+        format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"RS256"}"#),
+            enc(claims.to_string().as_bytes())
+        )
+    }
+
+    /// The pending-redeem anchor survives every clear the refresher, a default
+    /// logout and the reconcile perform; a newer device JWT supersedes it;
+    /// non-device tokens never become it; a full sign-out drops it; and
+    /// `reset_redeem_anchor` re-seeds it from what the store holds now.
+    #[test]
+    fn test_redeem_anchor_survives_clears_and_tracks_the_newest_device_jwt() {
+        let storage = create_test_storage("test_redeem_anchor");
+        let did = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let tenant = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+        let old = anchor_test_jwt(did, 1_000, "device");
+        let newer = anchor_test_jwt(did, 2_000, "device");
+        let newest = anchor_test_jwt(did, 3_000, "device");
+
+        assert_eq!(storage.get_redeem_anchor_jwt().unwrap(), None);
+
+        // Seeded by an ordinary slot write.
+        storage.store_tenant_device_jwt(&tenant, &old).unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(old.as_str())
+        );
+
+        // A newer token in ANOTHER slot supersedes it.
+        storage.store_tokens(&newer, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // The refresher's `Cleared` path and a default logout clear the slots;
+        // the anchor survives both.
+        storage.clear_tenant_device_jwt(&tenant).unwrap();
+        storage.clear_interactive_session().unwrap();
+        assert!(storage.get_access_token().is_err());
+        assert!(storage.get_tenant_device_jwt(&tenant).unwrap().is_none());
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // An agent token or an older device token never displaces it.
+        storage
+            .store_tenant_device_jwt(&tenant, &anchor_test_jwt(did, 9_999, "agent"))
+            .unwrap();
+        storage.store_tokens(&old, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+
+        // After a redeem stored `newest`, reset drops the spent anchor and
+        // re-seeds from what is held now.
+        storage.store_tokens(&newest, "").unwrap();
+        storage.clear_tokens().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap(),
+            None,
+            "full sign-out drops it"
+        );
+        storage.store_tokens(&old, "").unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(old.as_str())
+        );
+        storage.clear_interactive_session().unwrap();
+        storage.reset_redeem_anchor().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap(),
+            None,
+            "reset with nothing held leaves no anchor"
+        );
+        storage.store_tokens(&newest, "").unwrap();
+        storage.reset_redeem_anchor().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newest.as_str()),
+            "reset re-seeds from the credential the redeem stored"
+        );
     }
 
     #[test]
