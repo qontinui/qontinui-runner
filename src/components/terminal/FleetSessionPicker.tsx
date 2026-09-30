@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
@@ -6,6 +7,7 @@ import {
   Link2,
   Monitor,
   Plus,
+  Power,
   RefreshCw,
   Search,
   Server,
@@ -13,6 +15,7 @@ import {
 } from "lucide-react";
 import {
   useFleetSessions,
+  deviceLabel as fleetDeviceLabel,
   groupByDevice,
   type FleetSession,
   type FleetSessionsResponse,
@@ -59,6 +62,22 @@ import {
   type DeviceCreateState,
 } from "./remoteCreate";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { RemoteSessionEndFlow, type RemoteEndTarget } from "./RemoteSessionEndFlow";
+import { CloseAllFinishedDialog, type BulkEndItem } from "./CloseAllFinishedDialog";
+import { useFinishedFleetSessions } from "./useFinishedFleetSessions";
+import {
+  closeAllFinishedCandidates,
+  closeAllFinishedLabel,
+  closeAllFinishedTitle,
+  endButtonState,
+  endedHiddenMessage,
+  fleetSessionEndId,
+  fleetSessionEndResultId,
+  FLEET_CLOSE_ALL_FINISHED_ID,
+  FLEET_ENDED_HIDDEN_ID,
+  FLEET_FINISHED_UNAVAILABLE_ID,
+  type EndResultView,
+} from "./remoteSessionEndView";
 import { formatRelativeTime } from "../../lib/formatting";
 
 /**
@@ -404,8 +423,38 @@ export function FleetSessionPicker() {
     limit: server.limit,
   });
 
+  /**
+   * Sessions THIS UI saw end (`ended`) or found already gone (`not_found`).
+   * Hidden from the list because coord learns a device's close late (plan
+   * `2026-09-30-close-remote-sessions-from-the-local-runner`, Risks) — the
+   * fleet row would otherwise re-offer a session that no longer exists. A
+   * note says how many are hidden and why.
+   */
+  const [endedHere, setEndedHere] = useState<ReadonlySet<string>>(() => new Set());
+  /** The last end result per row that did NOT end it — kept inline. */
+  const [endResults, setEndResults] = useState<Record<string, EndResultView>>({});
+  const [endTarget, setEndTarget] = useState<RemoteEndTarget | null>(null);
+  const [bulkItems, setBulkItems] = useState<{ items: BulkEndItem[]; moreExist: boolean } | null>(
+    null,
+  );
+  const finished = useFinishedFleetSessions();
+  const refreshFinished = finished.refresh;
+
   const visible = useMemo(() => filterFleetSessions(sessions, text), [sessions, text]);
-  const groups = useMemo(() => groupByDevice(visible), [visible]);
+  const groups = useMemo(
+    () => groupByDevice(visible.filter((s) => !endedHere.has(s.sessionId))),
+    [visible, endedHere],
+  );
+  const finishedCandidates = useMemo(
+    () =>
+      finished.read.kind === "ok"
+        ? closeAllFinishedCandidates(finished.read.sessions, endedHere)
+        : [],
+    [finished.read, endedHere],
+  );
+  const endedHiddenNote = endedHiddenMessage(
+    sessions.filter((s) => endedHere.has(s.sessionId)).length,
+  );
   const stateOptions = useMemo(
     () => fleetStateOptions(stateCatalog, server.state),
     [stateCatalog, server.state],
@@ -562,6 +611,56 @@ export function FleetSessionPicker() {
 
   const remoteCount = visible.filter((s) => !s.isCallerDevice).length;
 
+  /** Fold one row's end result in: hide it if it ended/was gone, else keep the line. */
+  const recordEnd = useCallback((sessionId: string, view: EndResultView) => {
+    if (view.hidesRow) {
+      setEndedHere((prev) => new Set(prev).add(sessionId));
+      setEndResults((prev) => {
+        if (!(sessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+    } else {
+      setEndResults((prev) => ({ ...prev, [sessionId]: view }));
+    }
+  }, []);
+
+  const refreshAll = useCallback(() => {
+    void refresh();
+    void refreshFinished();
+  }, [refresh, refreshFinished]);
+
+  /**
+   * Open the bulk confirm over a FRESH read. Paging under the filter is not a
+   * snapshot — a session can become finished mid-walk — so the count on the
+   * button is re-derived at the moment of confirming, and the dialog then runs
+   * over exactly the list it SHOWED (a snapshot in `bulkItems`; nothing is
+   * re-fetched between confirm and run). The client-side finished guard is
+   * applied again inside `closeAllFinishedCandidates`.
+   */
+  const [bulkPreparing, setBulkPreparing] = useState(false);
+  const openBulk = useCallback(async () => {
+    setBulkPreparing(true);
+    try {
+      const read = await refreshFinished();
+      if (read.kind !== "ok") return;
+      const candidates = closeAllFinishedCandidates(read.sessions, endedHere);
+      if (candidates.length === 0) return;
+      setBulkItems({
+        moreExist: read.capped,
+        items: candidates.map((s) => ({
+          sessionId: s.sessionId,
+          deviceId: s.deviceId,
+          deviceLabel: fleetDeviceLabel(s),
+          sessionLabel: remoteSessionLabel(s),
+        })),
+      });
+    } finally {
+      setBulkPreparing(false);
+    }
+  }, [refreshFinished, endedHere]);
+
   return (
     <div
       data-page-element={FLEET_SESSION_PICKER_ELEMENT}
@@ -661,9 +760,28 @@ export function FleetSessionPicker() {
             Clear
           </button>
         )}
+        {/* Close all finished (Phase 5c). The count is REMOTE finished
+            sessions from coord's `session_status=finished` read — never this
+            device's, and never a number when that read failed. */}
+        <button
+          type="button"
+          data-ui-bridge-id={FLEET_CLOSE_ALL_FINISHED_ID}
+          data-finished-read={finished.read.kind}
+          data-finished-count={finished.read.kind === "ok" ? finishedCandidates.length : ""}
+          onClick={() => void openBulk()}
+          disabled={bulkPreparing || finished.read.kind !== "ok" || finishedCandidates.length === 0}
+          aria-disabled={
+            bulkPreparing || finished.read.kind !== "ok" || finishedCandidates.length === 0
+          }
+          title={closeAllFinishedTitle(finished.read, finishedCandidates.length)}
+          className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#e0af68]/15 text-[#e0af68] hover:bg-[#e0af68]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Power className="w-2.5 h-2.5" />
+          {closeAllFinishedLabel(finished.read, finishedCandidates.length)}
+        </button>
         <button
           data-ui-bridge-id={FLEET_PICKER_REFRESH_ID}
-          onClick={() => void refresh()}
+          onClick={refreshAll}
           disabled={loading || loadingMore}
           className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
           // coord's `nextCursor: null` is "last page AS OF NOW" and nothing
@@ -674,6 +792,30 @@ export function FleetSessionPicker() {
           <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
         </button>
       </div>
+
+      {(finished.read.kind === "unavailable" || finished.read.kind === "error") && (
+        <div
+          data-ui-bridge-id={FLEET_FINISHED_UNAVAILABLE_ID}
+          data-finished-read={finished.read.kind}
+          className="flex items-start gap-1.5 px-3 py-1 text-[10px] text-[#e0af68] border-b border-[#2a2d3d]"
+        >
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <span className="min-w-0 break-words">
+            {finished.read.kind === "unavailable"
+              ? "Finished filter unavailable — "
+              : "Could not read finished sessions — "}
+            {finished.read.message}
+          </span>
+        </div>
+      )}
+      {endedHiddenNote && (
+        <div
+          data-ui-bridge-id={FLEET_ENDED_HIDDEN_ID}
+          className="px-3 py-1 text-[10px] text-[#565f89] border-b border-[#2a2d3d]"
+        >
+          {endedHiddenNote}
+        </div>
+      )}
 
       {/* Search over the loaded page. Client-side, and the title says so. */}
       <div className="px-3 pt-1.5">
@@ -1073,6 +1215,8 @@ export function FleetSessionPicker() {
 
                 {g.sessions.map((s) => {
                   const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
+                  const endBtn = endButtonState(s, response?.deviceIdentityColumnsPresent);
+                  const endResult = endResults[s.sessionId];
                   const row = attachState[s.sessionId];
                   const pending = row?.pending === true;
                   // The attach is not a single round trip: a target that has
@@ -1119,6 +1263,33 @@ export function FleetSessionPicker() {
                           )}
                           {pending ? (waitingLine ? "Waiting…" : "Attaching…") : "Attach"}
                         </button>
+                        {/* End on remote (Phase 5b). Not offered for this
+                          machine's own sessions — those are local. */}
+                        {!s.isCallerDevice && (
+                          <button
+                            type="button"
+                            data-ui-bridge-id={fleetSessionEndId(s.sessionId)}
+                            onClick={() =>
+                              setEndTarget({
+                                deviceId: s.deviceId,
+                                deviceLabel: g.label,
+                                sessionId: s.sessionId,
+                                sessionLabel: remoteSessionLabel(s),
+                              })
+                            }
+                            disabled={endBtn.disabled}
+                            aria-disabled={endBtn.disabled}
+                            aria-label="End on remote session"
+                            title={
+                              endBtn.reason ??
+                              `End this session on ${g.label} (graceful /exit, confirmed first)`
+                            }
+                            className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#e0af68]/15 text-[#e0af68] hover:bg-[#e0af68]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <Power className="w-2.5 h-2.5" />
+                            End
+                          </button>
+                        )}
                       </div>
                       {(() => {
                         // The row's most recent OBSERVED instant, beside the
@@ -1208,6 +1379,21 @@ export function FleetSessionPicker() {
                           {waitingLine}
                         </div>
                       )}
+                      {endResult && (
+                        <div
+                          data-ui-bridge-id={fleetSessionEndResultId(s.sessionId)}
+                          data-end-outcome={endResult.outcome}
+                          className="mt-0.5 text-[10px] break-words"
+                          role="status"
+                        >
+                          <span className={endResult.toneClass}>End: {endResult.label}</span>
+                          <span className="text-[#565f89]">
+                            {" "}
+                            — {endResult.headline}
+                            {endResult.detail ? ` (${endResult.detail})` : ""}
+                          </span>
+                        </div>
+                      )}
                       {row?.error && (
                         <div
                           data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
@@ -1235,6 +1421,30 @@ export function FleetSessionPicker() {
           </>
         )}
       </div>
+
+      {endTarget && (
+        <RemoteSessionEndFlow
+          target={endTarget}
+          onClose={(_result, view) => {
+            if (view) recordEnd(endTarget.sessionId, view);
+            setEndTarget(null);
+          }}
+        />
+      )}
+      {bulkItems &&
+        createPortal(
+          <CloseAllFinishedDialog
+            items={bulkItems.items}
+            moreExist={bulkItems.moreExist}
+            onClose={(results) => {
+              for (const [id, view] of Object.entries(results)) {
+                if (view) recordEnd(id, view);
+              }
+              setBulkItems(null);
+            }}
+          />,
+          document.body,
+        )}
     </div>
   );
 }
