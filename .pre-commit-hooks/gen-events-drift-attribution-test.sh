@@ -1020,6 +1020,17 @@ check "gen_events_stage under the direct shim: ref line on stdin, empty stdin" "
 check "gen-events-drift.sh reads the stage from stdin before deciding it" yes \
     "$(awk '/^gen_events_detect_stage_from_stdin$/ {d=NR} /^STAGE="\$\(gen_events_stage\)"$/ {s=NR} END {print (d && s && d < s) ? "yes" : "no"}' "$SCRIPT_DIR/gen-events-drift.sh")"
 
+# The staged-later source is working tree outside the change being made, at
+# either stage: never "this commit"/"this push" in the lead line.
+RENDER_STAGE="commit"
+render_with "$(detail_line src-tauri/src/new.rs staged-later)"
+check "staged-later at pre-commit: lead line and label" "yes|no|yes" \
+    "$(has "Your working tree (not this commit's changes)")|$(has 'This commit changes')|$(has 'src-tauri/src/new.rs  (staged for a later commit — not in this commit)')"
+RENDER_STAGE="push"
+render_with "$(detail_line src-tauri/src/new.rs staged-later)"
+check "staged-later at pre-push: lead line and label" "yes|no|yes" \
+    "$(has 'Your working tree (not this push')|$(has 'This push changes')|$(has 'src-tauri/src/new.rs  (staged for a later commit — not part of this push)')"
+
 # Regression for the suite's own isolation: with the environment a pre-push
 # run of this suite inherits re-exported, the commit-stage cases must still
 # read `commit`. Before the fix these read `push` and 8 cases failed.
@@ -1063,8 +1074,11 @@ index_hook_fixture() {
     if [ "$mode" = "subdir" ]; then
         attribute_line='cd src-tauri && gen_events_attribution "$(git rev-parse --show-toplevel)"'
     fi
+    # git puts its own exec-path first on a hook's PATH, so a shim on the
+    # committer's PATH never reaches the hook; HOOK_PATH_PREFIX re-adds one.
     cat > "$hooks/pre-commit" <<HOOK
 #!/usr/bin/env bash
+[ -z "\${HOOK_PATH_PREFIX:-}" ] || PATH="\$HOOK_PATH_PREFIX:\$PATH"
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 gen_events_clear_inherited_git_env
 printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
@@ -1124,6 +1138,44 @@ git -C "$WORK" add README
 ( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
 check "commit <path> with an edit staged for later, working copy restored: MINE, staged-later" \
     "mine|$(detail_line src-tauri/src/lib.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+# An INTENT-TO-ADD input (`git add -N`): `--cached` hides it, the temporary
+# index lacks it, and the untracked listing sees it as tracked — so only the
+# staged-later source's `--ita-visible-in-index` keeps it. Without that flag
+# this read PRE-EXISTING.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add -N src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "commit <path> with an intent-to-add input: MINE, labelled staged-later" \
+    "mine|$(detail_line src-tauri/src/new.rs staged-later)" "$(hook_state)|$(hook_detail)"
+
+# At a plain commit the working-tree diff reports it — accurately, as not in
+# this commit, since git does not commit an intent-to-add entry.
+index_hook_fixture
+printf '// new module\n' > "$WORK/src-tauri/src/new.rs"
+git -C "$WORK" add -N src-tauri/src/new.rs
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit with an intent-to-add input: MINE, not in this commit" \
+    "mine|$(detail_line src-tauri/src/new.rs unstaged)" "$(hook_state)|$(hook_detail)"
+
+# When the hook's index IS the real index (a plain commit), the staged-later
+# read must not run at all: it would only repeat the staged source. A logging
+# `git`, placed first on the HOOK's PATH, records every call the hook makes.
+index_hook_fixture
+GIT_LOG_SHIM="$(dirname "$WORK")/shim-gitlog"
+mkdir -p "$GIT_LOG_SHIM"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$WORK/.git-calls" "$(command -v git)" > "$GIT_LOG_SHIM/git"
+chmod +x "$GIT_LOG_SHIM/git"
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+( cd "$WORK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit never runs the staged-later read (same index)" "yes|0" \
+    "$(grep -qF -- '--cached HEAD' "$WORK/.git-calls" 2>/dev/null && echo yes || echo no)|$(grep -cF -- '--ita-visible-in-index' "$WORK/.git-calls" 2>/dev/null || true)"
 
 # `commit -a` with a path ALREADY staged: it is in both indexes, and is listed
 # once, as staged — not a second time as staged-later.
