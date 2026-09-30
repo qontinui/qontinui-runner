@@ -86,6 +86,28 @@ import { formatRelativeTime } from "../../lib/formatting";
 export const FLEET_SESSION_PICKER_ELEMENT = "fleet-session-picker";
 export const FLEET_DEVICE_GROUP_ELEMENT = "fleet-device-group";
 export const FLEET_SESSION_ROW_ELEMENT = "fleet-session-row";
+/**
+ * Control id for the picker's ROOT — the element carrying every `data-fleet-*`.
+ *
+ * `data-page-element` does NOT put an element in
+ * `GET /ui-bridge/control/snapshot`: the scanner registers interactive
+ * elements plus anything carrying `data-ui-bridge-id`, and a `<div>` has
+ * neither a role nor a qualifying tag (the same finding `pastSessionRowId`
+ * exists for, documented at `PastSessionsView.tsx`). Without this stamp the
+ * whole projected block below is reachable only by an explicit selector, and
+ * a driver reading the snapshot sees none of it.
+ *
+ * What it COSTS, because the rest of this docstring only says what it buys.
+ * Registering a container also emits that container's `text` and
+ * `textContent`, both UNCAPPED — only `label` is capped, at 80 codepoints — so
+ * the panel's visible text joins the snapshot twice more, on top of the
+ * per-row copies each `fleetSessionRowId` already contributes. At a few
+ * hundred sessions that is tens of KB per snapshot. And `inferElementType`
+ * calls a role-less `div` `generic`, whose actions include `click`, so a
+ * walker exercising every registered element will click a full-panel
+ * container. Both are equally true of `pastSessionRowId`; neither is free.
+ */
+export const FLEET_PICKER_ROOT_ID = "terminal.fleet-picker-root";
 export const FLEET_PICKER_REFRESH_ID = "terminal.fleet-picker-refresh";
 export const FLEET_PICKER_RETRY_ID = "terminal.fleet-picker-retry";
 export const FLEET_PICKER_STALE_ID = "terminal.fleet-picker-stale";
@@ -393,7 +415,27 @@ export function FleetSessionPicker() {
   const truncation = fleetTruncation(response, sessions.length, hasMore);
   const notice = degradedNotice(response);
   const filtersActive = hasActiveFleetFilter(server, text);
-  const emptyRead = fleetEmptyReadMessage(appliedQuery ?? server, text);
+  // Pass the tenant the envelope says this read covered, so an empty page names
+  // its scope instead of claiming the fleet. `fleetEmptyReadMessage` says
+  // UNKNOWN rather than guessing when it is missing: coord types it
+  // `tenant_id: Uuid`, but `fleet_sessions_list` hands the body back as an
+  // untyped `serde_json::Value`, so nothing actually checks the field.
+  //
+  // Completeness is coord's POSITIVE signal — `kind === "none"`, coord said
+  // this was the last page — rather than the absence of `"more-available"`,
+  // which would read `unreachable` (coord served a cursor the walk can no
+  // longer use) as a finished walk. That is defence in depth, not a live bug:
+  // wherever this message renders the accumulation is empty, so the last page
+  // was empty, so it carried no cursor (coord's `finish_page` truncates to
+  // `limit >= 1` rows before minting one) and the kind is always `"none"`.
+  // Reading the positive signal costs nothing and does not depend on that
+  // chain holding.
+  const emptyRead = fleetEmptyReadMessage(
+    appliedQuery ?? server,
+    text,
+    response?.tenantId ?? null,
+    truncation.kind === "none",
+  );
   const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);
   const filteredOut = fleetFilteredOutMessage(
     sessions.length,
@@ -497,6 +539,10 @@ export function FleetSessionPicker() {
   return (
     <div
       data-page-element={FLEET_SESSION_PICKER_ELEMENT}
+      // Registers the root so the `data-fleet-*` block below is CAPTURED as
+      // `dataset` in the control snapshot. `data-page-element` alone leaves it
+      // scrapeable by selector only — see `FLEET_PICKER_ROOT_ID`.
+      data-ui-bridge-id={FLEET_PICKER_ROOT_ID}
       // The discovery state, projected for a UI Bridge driver in one read
       // rather than scraped off control labels.
       //
@@ -511,6 +557,24 @@ export function FleetSessionPicker() {
       data-fleet-matched={visible.length}
       data-fleet-pages={pagesLoaded}
       data-fleet-truncation={truncation.kind}
+      // The tenant the served rows were scoped to — the fact whose absence let
+      // an empty read claim the whole fleet on 2026-09-28. It belongs in this
+      // block and not beside the prose that states it, for two separate
+      // reasons: `read-value` returns an element's text and never its
+      // attributes, so the sentence is all that route can see; and only a
+      // REGISTERED element contributes its `dataset` to the control snapshot,
+      // which is what the `data-ui-bridge-id` above buys for this block and
+      // for nothing else in the subtree.
+      //
+      // "" covers both "no successful read yet" and "coord named no tenant",
+      // the same convention as `data-fleet-error-code`. They are told apart by
+      // `data-fleet-truncation`: `fleetTruncation(null, ..)` is "unknown", and
+      // `loaded` implies a non-null response (both set in one tick), so
+      // "unknown" means no successful read and anything else means coord
+      // answered without naming a tenant. NOT `data-fleet-loaded`, which reads
+      // 0 for both in the only state this attribute is about — the empty
+      // read — so it settles the question exactly where it never arises.
+      data-fleet-tenant={response?.tenantId ?? ""}
       // coord's stable machine code for the last failed read. Projected because
       // the banner beside it carries PROSE, which is explicitly not the
       // contract — a driver that had to match on the sentence would break on
@@ -529,13 +593,34 @@ export function FleetSessionPicker() {
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]">
         <Server className="w-3 h-3 text-[#565f89] shrink-0" />
         <span className="text-[10px] text-[#565f89] font-medium truncate">
-          {fleetCountSummary({
-            matched: visible.length,
-            loaded: sessions.length,
-            devices: groups.length,
-            devicesLoaded,
-            remote: remoteCount,
-          })}
+          {/* Suppressed at zero rows, and that is the FIRST line of the
+              2026-09-28 false report, not a tidy-up: `fleetCountSummary` emits
+              "0 sessions on 0 devices" with no scope at all, directly under a
+              panel titled Fleet and directly above the message. Fixing only
+              the sentence below would have left the same unscoped claim on the
+              line an operator reads first. With no rows it carries nothing the
+              scoped message does not — all five of its inputs are necessarily
+              0, so the suppressed string is always exactly that one — so it is
+              not rendered rather than being given a second copy of the tenant.
+              `visible.length` would be the WRONG predicate: at 47 loaded and 0
+              matched it would suppress "0 of 47 loaded on 0 of 3 devices",
+              which is the most informative reading of this line. Two knock-on
+              effects, both benign: the count is also suppressed in the error
+              and not-loaded empty states, where a different string renders;
+              and a UI Bridge `read-value` on this span returns `null` there
+              (`readGatedValue` takes the text path for a span, and an empty
+              `textContent` becomes `undefined ?? null`), not "". The
+              tenant itself is projected as an ATTRIBUTE on the root element,
+              not read off this prose. */}
+          {sessions.length === 0
+            ? null
+            : fleetCountSummary({
+                matched: visible.length,
+                loaded: sessions.length,
+                devices: groups.length,
+                devicesLoaded,
+                remote: remoteCount,
+              })}
         </span>
         <div className="flex-1" />
         {filtersActive && (
@@ -772,9 +857,19 @@ export function FleetSessionPicker() {
                 page it answered with was empty. "This is a failed read" over
                 that is a false claim in the other direction, which is the whole
                 distinction the inline banner below already draws. The empty
-                state has to draw it too: this branch is reached when coord
-                serves an empty page carrying a cursor and the walk then stalls
-                on the next one. */}
+                state has to draw it too.
+
+                ⚠️ The `walkStalled` arm below is DEAD, and this comment used to
+                claim the reachability that would make it live ("coord serves an
+                empty page carrying a cursor and the walk then stalls on the
+                next one"). Two independent reasons it cannot happen. coord's
+                `finish_page` truncates to `limit >= 1` rows before minting a
+                cursor, so an empty page carries none. And `fleetCursorStalled`
+                requires `sent !== null`, so stalling needs a cursor from an
+                earlier page, which needs that page to have had rows — putting
+                `sessions.length` above 0 and this whole branch out of reach.
+                Left in place as defence rather than deleted, but labelled, so
+                the next reader does not take it for an observed state. */}
             <div className="mt-1 text-[#565f89]">
               {walkStalled
                 ? "coord answered — this page was empty and the walk cannot advance past it."

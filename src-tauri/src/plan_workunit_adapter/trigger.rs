@@ -14123,18 +14123,28 @@ Body.
     async fn an_attested_not_demotable_denial_retires_the_pair_and_keeps_metadata_flowing() {
         // The adapter last drove the unit, so no deferral: the Transition
         // superseded -> draft reaches coord, and coord refuses it.
+        assert_permanent_denial_retires_pair("superseded", "draft", ATTESTED_NOT_DEMOTABLE).await;
+    }
+
+    /// Two cycles against a coord row at `current` that coord refuses to move
+    /// to `file_status` with a `422` carrying `body`. The adapter is the last
+    /// actor, so the runner does not defer and the Transition reaches coord.
+    /// Cycle 1 retires the `(s, file_status)` pair; cycle 2 takes
+    /// [`StatusWrite::RetiredPermanently`]: no transition re-issued, no status
+    /// on the wire, and the metadata-only upsert still sent.
+    async fn assert_permanent_denial_retires_pair(current: &str, file_status: &str, body: &str) {
         let sink = FakeSink {
             last_actor: Some(ADAPTER_ACTOR.to_string()),
-            deny_status: Some(("draft".to_string(), 422, ATTESTED_NOT_DEMOTABLE.to_string())),
+            deny_status: Some((file_status.to_string(), 422, body.to_string())),
             ..Default::default()
         };
         sink.statuses
             .lock()
             .unwrap()
-            .insert("s".to_string(), "superseded".to_string());
+            .insert("s".to_string(), current.to_string());
         let mut r = Reconciler::new();
 
-        let first = r.cycle(&sink, &[unit("s", "draft")]).await;
+        let first = r.cycle(&sink, &[unit("s", file_status)]).await;
         assert_eq!(first.retired_permanent, 1, "the denial retires the pair");
         assert_eq!(
             first.errors, 0,
@@ -14143,22 +14153,19 @@ Body.
         assert_eq!(first.forbidden, 0, "...nor a principal-wide verdict");
         assert_eq!(*sink.transition_attempts.lock().unwrap(), 1);
         assert_eq!(
-            r.forb.retirement_for("s", "draft"),
+            r.forb.retirement_for("s", file_status),
             Some(RetirementReason::PermanentForStatus)
         );
-        assert_eq!(
-            r.forb.retirement_for("s", "superseded"),
-            None,
-            "pair, not slug"
-        );
+        assert_eq!(r.forb.retirement_for("s", current), None, "pair, not slug");
 
         let upserts_before = *sink.upsert_calls.lock().unwrap();
-        let second = r.cycle(&sink, &[unit("s", "draft")]).await;
+        let second = r.cycle(&sink, &[unit("s", file_status)]).await;
         assert_eq!(
             second.retired_permanent, 1,
             "cycle 2 takes StatusWrite::RetiredPermanently"
         );
         assert_eq!(second.errors, 0);
+        assert_eq!(second.transitions, 0);
         assert_eq!(
             *sink.transition_attempts.lock().unwrap(),
             1,
@@ -14176,8 +14183,118 @@ Body.
         assert!(last.metadata.is_some(), "provenance keeps reaching coord");
         assert_eq!(
             sink.statuses.lock().unwrap().get("s").map(String::as_str),
-            Some("superseded")
+            Some(current),
+            "coord's status stands"
         );
+    }
+
+    // --- Plan 2026-09-28 Phase 3: a hand-set Free status survives a runner start
+
+    /// One cold-start cycle (empty `last_applied`, as after a runner start)
+    /// against a coord row that holds `current` and was last moved by `owner`,
+    /// with the plan file stamped `vetted`. Asserts the adapter DEFERS: no
+    /// status on any upsert, no transition attempted, coord's status intact,
+    /// and nothing remembered as applied.
+    async fn assert_cold_start_defers_to_owner(current: &str, owner: &str) {
+        let sink = FakeSink {
+            last_actor: Some(owner.to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), current.to_string());
+        let mut r = Reconciler::new();
+        assert!(r.mem.is_empty(), "cold start: no last-applied memory");
+
+        let summary = r.cycle(&sink, &[unit("s", "vetted")]).await;
+
+        assert_eq!(summary.transitions, 0);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            0,
+            "zero upserts carry a status (the pre-`8e3a3cf75` UpsertWithStatus overwrite)"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            0,
+            "zero transitions were even attempted"
+        );
+        assert_eq!(
+            summary.seeded, 1,
+            "the cold start seeds `{current}` from coord"
+        );
+        assert_eq!(
+            summary.deferred, 1,
+            "`{owner}` owns the unit, so the push is Deferred"
+        );
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the status-less provenance refresh still ran"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("s").map(String::as_str),
+            Some(current),
+            "coord's hand-set status stands"
+        );
+        assert!(
+            !r.mem.contains_key("s"),
+            "a deferral applied nothing, so nothing is remembered as applied"
+        );
+    }
+
+    /// **A hand-set `blocked` survives a runner start.** This is the
+    /// 2026-09-06 arm of plan
+    /// `2026-09-28-a-hand-set-blocked-status-does-not-survive-a-derive-retraction-or-an-old-build-scan`:
+    /// an agent moved the unit to `blocked`, the plan file still reads
+    /// `vetted`, and a runner starts with empty `last_applied`. A build
+    /// predating `8e3a3cf75` answered `decide_push(None)` =
+    /// `UpsertWithStatus`, which bypasses the owner deferral and overwrote
+    /// `blocked` with `vetted`. With the seed block the unit seeds to
+    /// `blocked`, the push is a `Transition`, and the agent's ownership defers
+    /// it.
+    ///
+    /// Neuter check (run 2026-09-29): replace the seed condition
+    /// `prev.is_none() && status_write == StatusWrite::Allowed` with `false`
+    /// and this test (and its derive-owned twin) fails at the
+    /// `status_upsert_calls == 0` assertion: one upsert carries a status, the
+    /// `UpsertWithStatus` overwrite of `blocked` with `vetted`.
+    #[tokio::test]
+    async fn a_hand_set_blocked_survives_a_runner_start() {
+        assert_cold_start_defers_to_owner("blocked", "device:x:agent:y").await;
+    }
+
+    /// The derive-owned twin: coord's derive worker last moved the unit (the
+    /// shipped retraction's `in_progress`). `is_real_agent_actor` counts
+    /// `coord::derive_worker` as an owner, so a cold start defers to it too.
+    #[tokio::test]
+    async fn a_derive_owned_in_progress_survives_a_runner_start() {
+        assert_cold_start_defers_to_owner("in_progress", "coord::derive_worker").await;
+    }
+
+    /// The body plan
+    /// `2026-09-28-a-hand-set-blocked-status-does-not-survive-a-derive-retraction-or-an-old-build-scan`
+    /// Phase 2 specifies for coord's scanner-defers-to-owner guard (landing in
+    /// qontinui-coord alongside this test; not on coord `main` when written).
+    const SCANNER_DEFERS_TO_OWNER: &str =
+        r#"{"error":"scanner_defers_to_owner","terminality":"permanent"}"#;
+
+    /// **coord's (Phase 2) `scanner_defers_to_owner` denial is consumed with no
+    /// runner change**: a `422` carrying `terminality: "permanent"` for
+    /// `(s, vetted)` retires the pair, and the next cycle takes
+    /// [`StatusWrite::RetiredPermanently`]: no status write, no transition, but
+    /// the metadata-only upsert still goes out.
+    ///
+    /// coord mirrors `is_real_agent_actor`, so in steady state the runner has
+    /// already deferred and this denial never fires. What it covers is the
+    /// read-then-write race: the runner's `last_actor` read still sees the
+    /// adapter, and a caller moves the unit to `blocked` before the runner's
+    /// transition reaches coord, which then refuses it.
+    #[tokio::test]
+    async fn a_scanner_defers_to_owner_denial_retires_the_pair_and_keeps_metadata_flowing() {
+        assert_permanent_denial_retires_pair("blocked", "vetted", SCANNER_DEFERS_TO_OWNER).await;
     }
 
     /// **A scan must say whether it was COMPLETE — an empty or short vector

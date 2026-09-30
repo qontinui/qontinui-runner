@@ -804,10 +804,14 @@ pub async fn session_briefing_handler(
     // `check_supervisor_available` is a BLOCKING 500ms TCP connect; parking a
     // tokio worker on it for every panel load is not acceptable on a shared
     // runtime.
+    // Only an OBSERVED listener selects the supervisor arm; an unparseable
+    // address (`None`) or a failed join renders the supervisor-down arm.
     let supervisor_available =
         spawn_blocking_tracked(crate::mcp::auto_continue::check_supervisor_available)
             .await
-            .unwrap_or(false);
+            .ok()
+            .flatten()
+            == Some(true);
     let rules = crate::mcp::ai_session::runner_rules_prefix(supervisor_available, api_port);
 
     Json(ApiResponse::success(briefing_payload(

@@ -2,8 +2,10 @@
  * CiRunnerSettings.tsx
  *
  * Settings panel for enabling/disabling a GitHub Actions self-hosted CI runner
- * on this machine. Communicates with the supervisor process at localhost:9875
- * which manages the runner lifecycle (install, start, stop, uninstall).
+ * on this machine. Communicates with the dev supervisor, which manages the
+ * runner lifecycle (install, start, stop, uninstall). A development-environment
+ * surface: rendered only when the runner OBSERVES a supervisor, at the address
+ * that observation reports (see `SupervisorGate`).
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -13,6 +15,7 @@ import { SectionHeader } from "./SectionHeader";
 import { getAccentColors, type AccentColor } from "@/design-system";
 import type { LogFunction } from "./types";
 import { useTenant } from "@/contexts/TenantContext";
+import { SupervisorGate } from "./SupervisorGate";
 import { UnpairedError, bearerFromDeviceToken, deviceTokenArgs } from "./ciRunnerDeviceToken";
 
 // --- Types ---
@@ -84,7 +87,6 @@ interface CiRunnerSettingsProps {
   onLog: LogFunction;
 }
 
-const SUPERVISOR_BASE = "http://localhost:9875";
 const POLL_INTERVAL_MS = 10_000;
 // Upper bound on a single status fetch. The supervisor now serves
 // `/ci-runner/status` from its cached probe state in <100 ms, but if it is
@@ -211,6 +213,17 @@ function StatusBadge({ status }: { status: CiRunnerDisplayState }) {
 }
 
 export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
+  return (
+    <SupervisorGate>
+      {(supervisorBase) => <CiRunnerPanel onLog={onLog} supervisorBase={supervisorBase} />}
+    </SupervisorGate>
+  );
+}
+
+function CiRunnerPanel({
+  onLog,
+  supervisorBase,
+}: CiRunnerSettingsProps & { supervisorBase: string }) {
   const { defaultTenantIdForNewSessions, candidates } = useTenant();
   const [status, setStatus] = useState<CiRunnerStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -227,7 +240,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), STATUS_FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/status`, {
+      const resp = await fetch(`${supervisorBase}/ci-runner/status`, {
         signal: controller.signal,
       });
       if (!resp.ok) {
@@ -256,10 +269,11 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       clearTimeout(timeoutId);
       setLoading(false);
     }
-  }, []);
+  }, [supervisorBase]);
 
   // Poll status on mount and every POLL_INTERVAL_MS
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async poll updates state in a callback, not synchronously
     void fetchStatus();
     timerRef.current = setInterval(() => {
       void fetchStatus();
@@ -275,7 +289,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     setActionSuccess(null);
     try {
       const authHeader = await deviceBearerHeader(candidates, defaultTenantIdForNewSessions);
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/enable`, {
+      const resp = await fetch(`${supervisorBase}/ci-runner/enable`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authHeader },
         body: JSON.stringify({
@@ -303,7 +317,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog, candidates, defaultTenantIdForNewSessions]);
+  }, [fetchStatus, onLog, candidates, defaultTenantIdForNewSessions, supervisorBase]);
 
   const handleDisable = useCallback(async () => {
     setActionLoading(true);
@@ -311,7 +325,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     setActionSuccess(null);
     try {
       const authHeader = await deviceBearerHeader(candidates, defaultTenantIdForNewSessions);
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/disable`, {
+      const resp = await fetch(`${supervisorBase}/ci-runner/disable`, {
         method: "POST",
         headers: { Authorization: authHeader },
       });
@@ -335,14 +349,14 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog, candidates, defaultTenantIdForNewSessions]);
+  }, [fetchStatus, onLog, candidates, defaultTenantIdForNewSessions, supervisorBase]);
 
   const handleStart = useCallback(async () => {
     setActionLoading(true);
     setError(null);
     setActionSuccess(null);
     try {
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/start`, {
+      const resp = await fetch(`${supervisorBase}/ci-runner/start`, {
         method: "POST",
       });
       if (!resp.ok) {
@@ -360,14 +374,14 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog]);
+  }, [fetchStatus, onLog, supervisorBase]);
 
   const handleStop = useCallback(async () => {
     setActionLoading(true);
     setError(null);
     setActionSuccess(null);
     try {
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/stop`, {
+      const resp = await fetch(`${supervisorBase}/ci-runner/stop`, {
         method: "POST",
       });
       if (!resp.ok) {
@@ -385,7 +399,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog]);
+  }, [fetchStatus, onLog, supervisorBase]);
 
   if (loading) {
     return (

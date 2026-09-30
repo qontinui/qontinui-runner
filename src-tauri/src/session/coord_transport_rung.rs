@@ -30,7 +30,7 @@
 //!   [`TRANSPORT_RUNGS`] and anything unrecognised becomes
 //!   [`TRANSPORT_UNKNOWN`]. A caller string never reaches
 //!   `coord.session_events` verbatim.
-//! - The four declaration headers are STRIPPED from the upstream forward
+//! - The five declaration headers are STRIPPED from the upstream forward
 //!   (`coord_mcp_forward_header_is_dropped`), exactly as the caller-session
 //!   header is, so a client-supplied claim never reaches coord as if coord had
 //!   observed it.
@@ -78,6 +78,12 @@ pub const REPORTER_STEP_HEADER: &str = "x-qontinui-reporter-step";
 /// Header a caller declares the rungs it already tried and was refused by,
 /// BEFORE this one — comma-separated, each value from [`TRANSPORT_RUNGS`].
 pub const ATTEMPTED_HEADER: &str = "x-qontinui-transport-attempted";
+/// Header a caller declares WHY the rungs in [`ATTEMPTED_HEADER`] refused it —
+/// one value from [`FAILURE_CLASSES`] (plan
+/// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
+/// Phase 3). Declared by the component that classified the fault, never
+/// inferred later from logs.
+pub const FAILURE_CLASS_HEADER: &str = "x-qontinui-failure-class";
 
 /// Every declaration header, in one slice — the set
 /// `coord_mcp_forward_header_is_dropped` strips from the upstream forward, and
@@ -88,6 +94,7 @@ pub const DECLARATION_HEADERS: &[&str] = &[
     REPORTER_HEADER,
     REPORTER_STEP_HEADER,
     ATTEMPTED_HEADER,
+    FAILURE_CLASS_HEADER,
 ];
 
 /// Is `name` one of this module's declaration headers?
@@ -130,6 +137,14 @@ pub const TRANSPORT_RUNGS: &[&str] = &[
     "write_forwarder",
 ];
 
+/// The rung a FLEET-PROVISIONED native MCP client declares — the stdio shim in
+/// code, and the http arm of `coord_mcp::http_proxy_config_json` in the static
+/// `headers` map (plan
+/// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
+/// Phase 1, Design decision D1). Named so the config writer and this
+/// vocabulary cannot spell it two ways.
+pub const TRANSPORT_NATIVE_MCP: &str = "native_mcp";
+
 /// The reporter a call gets when it declared none. Distinct from
 /// [`TRANSPORT_UNKNOWN`]: "nobody tagged this call" and "this caller tagged it
 /// with something we do not model" are different producer-side facts, and the
@@ -142,10 +157,41 @@ pub const REPORTER_UNTAGGED: &str = "untagged";
 pub const REPORTERS: &[&str] = &[
     "coord",
     "coord-revive",
+    "coord-skill",
     "gate",
     "mcp-client",
     "policy",
     "runner-proxy",
+    "unattended",
+];
+
+/// The reporter a native MCP client declares — see [`TRANSPORT_NATIVE_MCP`].
+pub const REPORTER_MCP_CLIENT: &str = "mcp-client";
+
+/// The failure class a declared value outside [`FAILURE_CLASSES`] resolves to.
+/// A member of the vocabulary itself, for the same reason [`TRANSPORT_UNKNOWN`]
+/// is one of [`TRANSPORT_RUNGS`]: the payload only ever carries a closed value.
+pub const FAILURE_CLASS_UNCLASSIFIED: &str = "unclassified";
+
+/// THE closed failure-class vocabulary — why a refused rung refused (plan
+/// `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`,
+/// Phase 3, Design decision D3). Coord mirrors this list in
+/// `agent_door_observer.rs` (same plan, Phase 3, coord half, in a sibling PR),
+/// and a qontinui-claude-config parity lint pins the producers' literals.
+/// Until both of those land, reordering or respelling an entry here is an
+/// UNGUARDED wire change — treat the order and spelling as a contract anyway.
+///
+/// NOT sorted (the plan's order is the contract), so membership is a linear
+/// scan — eight entries.
+pub const FAILURE_CLASSES: &[&str] = &[
+    "runner_nonce",
+    "runner_transport",
+    "coord_upstream",
+    "http_200_not_mcp",
+    "credential_unusable",
+    "tool_masked",
+    "client_disconnected",
+    FAILURE_CLASS_UNCLASSIFIED,
 ];
 
 /// Outcome: the declared rung carried the call to this door.
@@ -256,6 +302,27 @@ pub fn parse_attempted(raw: Option<&str>) -> Vec<&'static str> {
         }
     }
     out
+}
+
+/// Resolve a caller-declared failure class to the closed vocabulary.
+///
+/// `None` (no header) and an empty value yield `None` — the caller declared no
+/// failure, which is the ordinary case for a first-rung hit. Any other
+/// unrecognised value yields [`FAILURE_CLASS_UNCLASSIFIED`]: the caller DID
+/// declare a failure, so dropping it would hide that one happened, and the
+/// caller's own bytes still never reach the payload.
+pub fn parse_failure_class(raw: Option<&str>) -> Option<&'static str> {
+    let trimmed = raw?.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        FAILURE_CLASSES
+            .iter()
+            .copied()
+            .find(|c| *c == trimmed)
+            .unwrap_or(FAILURE_CLASS_UNCLASSIFIED),
+    )
 }
 
 /// Bound and charset-lock a caller-declared `reporter_step`.
@@ -412,6 +479,12 @@ pub struct RungObservation {
     pub reporter_step: Option<String>,
     /// CALLER-DECLARED rungs refused before this one. Advisory.
     pub attempted: Vec<&'static str>,
+    /// CALLER-DECLARED, validated against [`FAILURE_CLASSES`]. Advisory. Why
+    /// the rungs in `attempted` refused — classified by the component that saw
+    /// the refusal. Deliberately a separate key from `failure_reason`, which
+    /// is RUNNER-OBSERVED: one field with two provenances is the confusion the
+    /// advisory/observed split exists to prevent.
+    pub failure_class: Option<&'static str>,
     /// RUNNER-OBSERVED failure cause, when `outcome` is not
     /// [`OUTCOME_OK`]. Reserved: the proxy emits its row BEFORE the upstream
     /// forward (so the row exists even if the runner dies mid-hop), and at that
@@ -431,7 +504,7 @@ pub struct RungObservation {
 }
 
 impl RungObservation {
-    /// Reduce four raw caller-declared header values (any or all absent) plus
+    /// Reduce five raw caller-declared header values (any or all absent) plus
     /// the runner's own observations to a validated observation.
     ///
     /// An untagged caller is a first-class result here, not a `None`:
@@ -442,6 +515,7 @@ impl RungObservation {
         reporter: Option<&str>,
         reporter_step: Option<&str>,
         attempted: Option<&str>,
+        failure_class: Option<&str>,
         outcome: &'static str,
         door: impl Into<String>,
         operation: &'static str,
@@ -467,6 +541,7 @@ impl RungObservation {
             reporter: parse_reporter(reporter),
             reporter_step: parse_reporter_step(reporter_step),
             attempted: parse_attempted(attempted),
+            failure_class: parse_failure_class(failure_class),
             failure_reason: None,
             operation,
             agent_session_id,
@@ -496,6 +571,9 @@ impl RungObservation {
             "reporter": self.reporter,
             "reporter_step": self.reporter_step,
             "attempted": self.attempted,
+            // Additive to v1 (no `PAYLOAD_VERSION` bump): a consumer that
+            // predates it ignores the key, and `null` means "none declared".
+            "failure_class": self.failure_class,
             "failure_reason": self.failure_reason,
             "operation": self.operation,
             "off_cascade": self.off_cascade(),
@@ -670,6 +748,105 @@ mod tests {
         }
     }
 
+    /// Plan 2026-09-20 first-rung, Phases 2 and 3: the two producer reporters
+    /// the plan adds, and the failure-class vocabulary pinned in its CONTRACT
+    /// order — coord mirrors this list, so a reorder is a wire change.
+    #[test]
+    fn reporters_and_failure_classes_carry_the_first_rung_plan_values() {
+        for want in ["unattended", "coord-skill"] {
+            assert!(REPORTERS.contains(&want), "{want} missing from REPORTERS");
+            assert_eq!(
+                parse_reporter(Some(want)),
+                want,
+                "{want} must not fold to unknown"
+            );
+        }
+        assert_eq!(REPORTERS.len(), 8);
+        assert_eq!(
+            FAILURE_CLASSES,
+            [
+                "runner_nonce",
+                "runner_transport",
+                "coord_upstream",
+                "http_200_not_mcp",
+                "credential_unusable",
+                "tool_masked",
+                "client_disconnected",
+                "unclassified",
+            ]
+        );
+        assert_eq!(FAILURE_CLASS_HEADER, "x-qontinui-failure-class");
+        assert!(DECLARATION_HEADERS.contains(&FAILURE_CLASS_HEADER));
+        assert!(is_declaration_header("X-Qontinui-Failure-Class"));
+        assert_eq!(TRANSPORT_NATIVE_MCP, "native_mcp");
+        assert!(TRANSPORT_RUNGS.contains(&TRANSPORT_NATIVE_MCP));
+        assert_eq!(REPORTER_MCP_CLIENT, "mcp-client");
+        assert!(REPORTERS.contains(&REPORTER_MCP_CLIENT));
+    }
+
+    #[test]
+    fn parse_failure_class_is_closed_and_absent_is_none() {
+        for c in FAILURE_CLASSES {
+            assert_eq!(parse_failure_class(Some(c)), Some(*c));
+        }
+        assert_eq!(
+            parse_failure_class(Some("  Tool_Masked ")),
+            Some("tool_masked")
+        );
+        // Absent / empty: no failure declared.
+        assert_eq!(parse_failure_class(None), None);
+        assert_eq!(parse_failure_class(Some("   ")), None);
+        // Declared but unrecognised: a failure DID happen, the caller's bytes
+        // never pass through.
+        for hostile in ["runner-nonce", "timeout", "a.b.*>"] {
+            assert_eq!(
+                parse_failure_class(Some(hostile)),
+                Some(FAILURE_CLASS_UNCLASSIFIED),
+                "{hostile:?} must map to unclassified"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_class_is_its_own_payload_key_not_failure_reason() {
+        let obs = RungObservation::from_declaration(
+            Some("remote_mcp"),
+            Some("mcp-client"),
+            None,
+            Some("native_mcp"),
+            Some("coord_upstream"),
+            OUTCOME_OK,
+            "d",
+            OPERATION_READ,
+            None,
+        );
+        assert_eq!(obs.failure_class, Some("coord_upstream"));
+        let p = obs.payload();
+        assert_eq!(p["failure_class"], json!("coord_upstream"));
+        assert_eq!(
+            p["failure_reason"],
+            JsonValue::Null,
+            "runner-observed field untouched"
+        );
+        assert_eq!(p["v"], json!(1), "additive key: no PAYLOAD_VERSION bump");
+
+        // Untagged call: the key is present and null, never absent.
+        let untagged = RungObservation::from_declaration(
+            None,
+            None,
+            None,
+            None,
+            None,
+            OUTCOME_OK,
+            "d",
+            OPERATION_READ,
+            None,
+        )
+        .payload();
+        assert!(untagged.get("failure_class").is_some());
+        assert_eq!(untagged["failure_class"], JsonValue::Null);
+    }
+
     #[test]
     fn parse_transport_maps_every_unrecognised_value_to_unknown() {
         // Recognised values round-trip, case- and whitespace-insensitively.
@@ -693,6 +870,7 @@ mod tests {
     #[test]
     fn untagged_caller_is_a_visible_arm() {
         let obs = RungObservation::from_declaration(
+            None,
             None,
             None,
             None,
@@ -736,6 +914,7 @@ mod tests {
         let obs = RungObservation::from_declaration(
             Some("off_cascade"),
             Some("policy"),
+            None,
             None,
             None,
             OUTCOME_OK,
@@ -813,6 +992,7 @@ mod tests {
             Some("policy"),
             Some("2"),
             Some("native_mcp"),
+            None,
             OUTCOME_OK,
             "https://coord.qontinui.io/mcp",
             OPERATION_READ,
@@ -843,6 +1023,7 @@ mod tests {
         );
         let emitter = RungEmitter::new(outbox, Uuid::new_v4());
         let obs = RungObservation::from_declaration(
+            None,
             None,
             None,
             None,

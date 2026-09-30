@@ -1012,7 +1012,8 @@ pub fn classify_latch(age_ms: Option<u64>) -> LatchReport {
 /// run reportable.
 static RECOVERY_LATCH: InFlightLatch = InFlightLatch::new();
 
-/// Held between `destroy()` and the rebuild — the exit veto's flag. Carries the
+/// Held across the recreate swap — taken before `capture_placement`'s window
+/// reads and released after the rebuild — the exit veto's flag. Carries the
 /// same age term so a permanent [`ExitVeto::VetoSwapInFlight`] is legible;
 /// **what the veto decides is unchanged**.
 static WINDOW_SWAP_LATCH: InFlightLatch = InFlightLatch::new();
@@ -1050,8 +1051,22 @@ static EXHAUSTION_SURFACED: AtomicBool = AtomicBool::new(false);
 /// pumping again, which is that rung's equivalent of the incident reset.
 static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 
-/// True while the recovery ladder is between `destroy()` and the rebuild of the
+/// And one more: latches once the user has been told a recovery run is
+/// wedged — it has held the single-flight latch past the ladder's own maximum,
+/// blocked on the window system either before or after `destroy()` of the old
 /// main window.
+///
+/// Paired with [`RECOVERY_WEDGE_REPORTED`], not independent of it:
+/// [`report_recovery_wedge`] returns early once that latch is armed, so the
+/// notice is reached only on the call that arms it — one breadcrumb and one
+/// notice per wedge. This latch is the at-most-once guard
+/// [`surface_incident_to_user`] requires of every caller. Both are re-armed
+/// together by [`InProgressGuard::drop`], so a later wedge surfaces again.
+static RECOVERY_WEDGE_SURFACED: AtomicBool = AtomicBool::new(false);
+
+/// True while the recovery ladder is inside the recreate swap of the main
+/// window — from before its placement reads, through `destroy()`, to the
+/// rebuild.
 ///
 /// **Load-bearing, not cosmetic.** Tauri treats "the last window was destroyed"
 /// as an exit request: `tauri-runtime-wry`'s `TaoWindowEvent::Destroyed` arm
@@ -1285,7 +1300,13 @@ fn surface_exhaustion_to_user(app: &tauri::AppHandle, attempts: u32) {
          crash originates inside WebView2 rather than in Qontinui."
     );
 
-    if surface_incident_to_user(app, &EXHAUSTION_SURFACED, TITLE, &body) {
+    if surface_incident_to_user(
+        app,
+        &EXHAUSTION_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationAndDialog,
+    ) {
         error!(
             attempts,
             "UI recovery exhausted — surfaced to the user natively (notification + dialog)"
@@ -1345,7 +1366,13 @@ pub fn report_native_ui_thread_hang(app: &tauri::AppHandle, unresponsive_for_sec
          runner's dev-logs directory."
     );
 
-    if surface_incident_to_user(app, &NATIVE_HANG_SURFACED, TITLE, &body) {
+    if surface_incident_to_user(
+        app,
+        &NATIVE_HANG_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationAndDialog,
+    ) {
         error!(
             unresponsive_for_secs,
             "Native UI thread hang surfaced to the user (notification always; dialog only if \
@@ -1362,7 +1389,18 @@ pub fn clear_native_ui_thread_hang() {
     NATIVE_HANG_SURFACED.store(false, Ordering::SeqCst);
 }
 
-/// The one place an incident becomes an OS-native notification + dialog.
+/// Which native channels [`surface_incident_to_user`] posts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncidentChannels {
+    /// The OS toast plus a dialog. The dialog is enqueued onto the event loop,
+    /// so it appears only once that loop is pumping.
+    NotificationAndDialog,
+    /// The OS toast alone — for an incident whose text would be wrong by the
+    /// time a loop-queued dialog could appear.
+    NotificationOnly,
+}
+
+/// The one place an incident becomes an OS-native notification (+ dialog).
 ///
 /// Returns `true` when this call is the one that surfaced it, so the caller
 /// can log exactly once. `latch` makes that at-most-once per incident:
@@ -1373,6 +1411,7 @@ fn surface_incident_to_user(
     latch: &AtomicBool,
     title: &str,
     body: &str,
+    channels: IncidentChannels,
 ) -> bool {
     // Server mode has no desktop to surface to. `trigger_ui_recovery` returns
     // before reaching here, but this is defence in depth for any future caller.
@@ -1391,7 +1430,7 @@ fn surface_incident_to_user(
         }
     }
 
-    {
+    if channels == IncidentChannels::NotificationAndDialog {
         use tauri_plugin_dialog::DialogExt;
         // Non-blocking `show`: a modal `blocking_show` here would park a
         // runtime thread on user input during an active incident.
@@ -1597,7 +1636,7 @@ pub async fn trigger_ui_recovery(
     //    past it — see `RECOVERY_WEDGE_AFTER_MS`.
     if let Err(in_flight_ms) = RECOVERY_LATCH.try_take(latch_now_ms()) {
         if in_flight_ms >= RECOVERY_WEDGE_AFTER_MS {
-            report_recovery_wedge(reason, in_flight_ms);
+            report_recovery_wedge(app, reason, in_flight_ms);
             return RecoveryOutcome::Wedged { in_flight_ms };
         }
         debug!(
@@ -1795,15 +1834,35 @@ pub async fn trigger_ui_recovery(
     }
 }
 
-/// Surface a latched-off recovery: one `error!` and one durable line in
-/// `wedge-incidents.log`, at most once per wedge.
+/// Surface a latched-off recovery: one `error!`, one durable line in
+/// `wedge-incidents.log`, and one OS-native notice to the user, each at most
+/// once per wedge.
 ///
 /// The breadcrumb goes into the **existing** incident sink rather than a new
 /// file. `wedge-incidents.log` is already the one place to read after an
 /// unexplained outage — and `runner-lifecycle.log` is truncated at every
 /// startup, so a restart destroys the evidence of the wedge that provoked it.
 /// Same writer, same grammar as `ui_thread_wedged` / `backend_wedged`.
-fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
+///
+/// # Why it also surfaces natively
+///
+/// A breadcrumb nobody is looking at does not stop the one harmful reaction to
+/// this condition: an operator who sees the main window freeze or vanish and
+/// restarts the runner, destroying every session in flight to "fix" something
+/// that usually resolves itself once the window system answers. No in-app
+/// surface can carry the notice: the wedge may be detected while
+/// `recreate_main_window` is still blocked in `capture_placement`'s getters
+/// (old window frozen on screen) or after `destroy()` (no window at all) — in
+/// neither state is there a live webview to render a banner — and the
+/// supervisor is dev-only and must never carry user-facing behaviour (module
+/// docs). So it goes through [`surface_incident_to_user`], like the exhaustion
+/// and native-hang incidents, but **toast only**: the toast is posted off the
+/// main thread, whereas a dialog would be queued onto the stuck loop and could
+/// appear only after the wedge had ended — telling the user to end a process
+/// that had already recovered. Plan
+/// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`,
+/// Phase 5.
+fn report_recovery_wedge(app: &tauri::AppHandle, refused: RecoveryReason, in_flight_ms: u64) {
     if RECOVERY_WEDGE_REPORTED.swap(true, Ordering::SeqCst) {
         debug!(
             refused_reason = refused.as_str(),
@@ -1831,6 +1890,39 @@ fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
             refused.as_str()
         ),
     );
+
+    // The warning leads, in the title and the first sentence: this is the
+    // incident's ONLY channel (no dialog), and a Windows toast shows only the
+    // first few wrapped lines of its body, so what must not be missed — do not
+    // end the runner reflexively — cannot sit in a later paragraph.
+    const TITLE: &str = "Qontinui Runner — UI recovery stuck; don't end the runner yet";
+    // The whole run's in-flight time (backoff, reload watch and recreate), not
+    // only the time spent blocked on the window system — so the text says
+    // "trying to recover for", never "waiting on the window system for".
+    let in_flight_secs = in_flight_ms / 1000;
+    let body = format!(
+        "Your sessions and the API are still running; ending the runner process ends every \
+         session in flight. The window has been recovering for {in_flight_secs} s and may be \
+         frozen or missing until the window system answers — it can come back on its own. \
+         If the window is back, ignore this.\n\n\
+         If it has not returned after several minutes it may be stuck for good; the only way \
+         out is ending the Qontinui Runner process, so check \
+         http://127.0.0.1:9876/restart-readiness first. Details are in wedge-incidents.log in \
+         the runner's dev-logs directory."
+    );
+    // Toast only: a loop-queued dialog could appear only after the wedge ended.
+    if surface_incident_to_user(
+        app,
+        &RECOVERY_WEDGE_SURFACED,
+        TITLE,
+        &body,
+        IncidentChannels::NotificationOnly,
+    ) {
+        error!(
+            in_flight_ms,
+            "UI recovery wedge surfaced to the user (OS notification only)"
+        );
+    }
 }
 
 /// Verdict of a post-rung pong watch (reload or recreate).
@@ -2229,14 +2321,16 @@ fn ui_bridge_last_pong(app: &tauri::AppHandle) -> Option<std::sync::Arc<AtomicU6
 
 /// Releases [`RECOVERY_LATCH`] even if the recovery future is dropped.
 ///
-/// Also re-arms [`RECOVERY_WEDGE_REPORTED`], so a future wedge is a fresh
-/// incident with its own breadcrumb rather than a silent repeat.
+/// Also re-arms [`RECOVERY_WEDGE_REPORTED`] and [`RECOVERY_WEDGE_SURFACED`], so
+/// a future wedge is a fresh incident with its own breadcrumb and its own user
+/// notice rather than a silent repeat.
 struct InProgressGuard;
 
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
         RECOVERY_LATCH.release();
         RECOVERY_WEDGE_REPORTED.store(false, Ordering::SeqCst);
+        RECOVERY_WEDGE_SURFACED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -2358,7 +2452,10 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     let _swap = SwapGuard;
 
     // Preserve whatever the operator had on screen. These are tao/HWND reads,
-    // independent of the (dead) WebView2 host, so they still answer.
+    // independent of the (dead) WebView2 host — but they are `window_getter!`
+    // round-trips that DO block on the tao event loop, with no timeout. A
+    // wedged loop therefore stalls the run here, before `destroy()`, with the
+    // old window still on screen (which `report_recovery_wedge` must allow for).
     let mut spec = base_spec.clone();
     if let Some(existing) = app.get_webview_window(label) {
         spec.placement = capture_placement(&existing, &base_spec.placement);
@@ -2493,16 +2590,44 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
 
 /// Best-effort: rebuild where the window actually is, not where it booted.
 fn capture_placement(win: &tauri::WebviewWindow, fallback: &WindowPlacement) -> WindowPlacement {
-    if win.is_maximized().unwrap_or(false) {
+    placement_from_snapshot(
+        win.is_minimized().unwrap_or(false),
+        win.is_maximized().unwrap_or(false),
+        win.outer_position().ok().map(|p| (p.x, p.y)),
+        win.outer_size().ok().map(|s| (s.width, s.height)),
+        fallback,
+    )
+}
+
+/// The placement a recreate should rebuild at, from one read of the old window.
+///
+/// A minimized main window must not be rebuilt where it "is": on Windows that
+/// is the iconic sentinel `(-32000, -32000)` with a small non-zero caption-strip
+/// size, which would rebuild the window parked off-screen — the main-window
+/// twin of the pop-out geometry bug (plan
+/// `2026-09-28-runner-popout-window-geometry-poisoning-and-webview-recovery-wedge`).
+/// So a minimized window, and any rect the shared
+/// [`crate::window_assignments::is_restorable_rect`] rejects, falls back to the
+/// boot placement. Pure, so the decision is testable without a live window.
+fn placement_from_snapshot(
+    minimized: bool,
+    maximized: bool,
+    pos: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
+    fallback: &WindowPlacement,
+) -> WindowPlacement {
+    if minimized {
+        return fallback.clone();
+    }
+    if maximized {
         return WindowPlacement::Maximized;
     }
-    match (win.outer_position(), win.outer_size()) {
-        (Ok(pos), Ok(size)) if size.width > 0 && size.height > 0 => WindowPlacement::Positioned {
-            x: pos.x,
-            y: pos.y,
-            w: size.width,
-            h: size.height,
-        },
+    match (pos, size) {
+        (Some((x, y)), Some((w, h)))
+            if crate::window_assignments::is_restorable_rect(x, y, w, h) =>
+        {
+            WindowPlacement::Positioned { x, y, w, h }
+        }
         _ => fallback.clone(),
     }
 }
@@ -3617,6 +3742,88 @@ mod tests {
         );
         // Leave the shared statics as we found them for the other tests.
         EXHAUSTION_SURFACED.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn placement_from_snapshot_never_rebuilds_at_a_minimized_position() {
+        // `SecondaryDefault` as the fallback: distinguishable from every
+        // placement the snapshot itself can produce.
+        let fb = WindowPlacement::SecondaryDefault;
+        let is_fallback = |p: WindowPlacement| matches!(p, WindowPlacement::SecondaryDefault);
+        // Windows' minimized main window: the sentinel corner with a small,
+        // NON-zero caption strip — a size-only guard lets this through.
+        assert!(is_fallback(placement_from_snapshot(
+            true,
+            false,
+            Some((-32000, -32000)),
+            Some((160, 28)),
+            &fb
+        )));
+        // Minimized wins even over a maximized read or a plausible rect.
+        assert!(is_fallback(placement_from_snapshot(
+            true,
+            true,
+            Some((10, 10)),
+            Some((800, 600)),
+            &fb
+        )));
+        // The sentinel without a minimized report is rejected by the shared rule.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((-32000, -32000)),
+            Some((160, 28)),
+            &fb
+        )));
+    }
+
+    #[test]
+    fn placement_from_snapshot_keeps_a_real_window_where_it_is() {
+        let fb = WindowPlacement::SecondaryDefault;
+        let is_fallback = |p: WindowPlacement| matches!(p, WindowPlacement::SecondaryDefault);
+        assert!(matches!(
+            placement_from_snapshot(false, false, Some((-1920, 40)), Some((1200, 800)), &fb),
+            WindowPlacement::Positioned {
+                x: -1920,
+                y: 40,
+                w: 1200,
+                h: 800
+            }
+        ));
+        assert!(matches!(
+            placement_from_snapshot(false, true, Some((0, 0)), Some((1920, 1040)), &fb),
+            WindowPlacement::Maximized
+        ));
+        // A zero size or an unreadable rect keeps the fallback, as before.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((10, 10)),
+            Some((0, 0)),
+            &fb
+        )));
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            None,
+            Some((800, 600)),
+            &fb
+        )));
+    }
+
+    #[test]
+    fn dropping_the_in_progress_guard_re_arms_the_wedge_surfacing_latch() {
+        // Each wedge is its own incident: once the run in flight returns, the
+        // next wedge must surface to the user again, not stay silenced by the
+        // last one. No test takes `RECOVERY_LATCH`, and its release is
+        // idempotent (`latch_release_is_idempotent`), so dropping a guard here
+        // disturbs nothing else.
+        RECOVERY_WEDGE_SURFACED.store(true, Ordering::SeqCst);
+        RECOVERY_WEDGE_REPORTED.store(true, Ordering::SeqCst);
+        drop(InProgressGuard);
+        assert!(!RECOVERY_WEDGE_SURFACED.load(Ordering::SeqCst));
+        assert!(!RECOVERY_WEDGE_REPORTED.load(Ordering::SeqCst));
+        assert!(!RECOVERY_LATCH.is_held());
     }
 
     #[test]

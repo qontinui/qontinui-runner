@@ -86,7 +86,7 @@ pub struct RegisterAppRequest {
     #[serde(default)]
     pub transport: Option<String>,
     /// Absolute URL where the runner can reach this app's UI Bridge endpoints,
-    /// e.g. "http://127.0.0.1:9875/supervisor-bridge". Preferred.
+    /// e.g. "http://127.0.0.1:1420/ui-bridge". Preferred.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Legacy — used when `base_url` is absent.
@@ -151,6 +151,24 @@ pub struct RegisterAppResponse {
     #[serde(flatten)]
     pub app: DiscoveredApp,
     pub transport: crate::mcp::app_registry::AppTransport,
+    /// Agent-visible provenance, served with NO gate (plan
+    /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`): the
+    /// header origin the runner VERIFIED this registrant at, and the requester
+    /// class it was admitted under. An agent can see what it is driving
+    /// without being blocked by the binding.
+    ///
+    /// ALWAYS serialized, deliberately not `skip_serializing_if`: `null` has
+    /// to mean "an operator-trust registrant, which sends no `Origin`" and
+    /// ABSENT has to mean "this runner predates the binding". Phase 2b's
+    /// `waitForUiBridgeRegistration` falls back to `tabs[0]` on exactly that
+    /// second case, and an omitted field would collapse the two.
+    pub verified_origin: Option<String>,
+    pub principal_class: &'static str,
+    /// The EFFECTIVE per-entry TTL the runner stored, in ms — R5 caps a
+    /// browser principal's `keepAliveSecs` at `REGISTRATION_TTL_MS`, and
+    /// without this echo a page that asked for an hour gets a 200 and no hint
+    /// its entry dies in 30 s. `null` means the global default.
+    pub keep_alive_ms: Option<i64>,
 }
 
 // ============================================================================
@@ -166,7 +184,8 @@ const WEB_DEV_PORTS: &[u16] = &[
 
 const DESKTOP_APP_PORTS: &[u16] = &[
     1420, // Tauri dev server
-    9875, // Qontinui Supervisor
+    // No supervisor port here: a published runner has no supervisor. When one
+    // IS observed, `desktop_ports_merged` adds the port the observation read.
     9876, // Qontinui Runner
     9877, 9878, // Runner fallback ports
     8888, // Electron common
@@ -315,17 +334,37 @@ async fn user_discovery_ports() -> Vec<u16> {
         .unwrap_or_default()
 }
 
-/// Merge the hardcoded desktop port list with user-configured ports, dedup
-/// while preserving the original order (defaults first, user entries after).
-async fn desktop_ports_merged() -> Vec<u16> {
-    let mut seen = std::collections::HashSet::new();
-    let mut merged: Vec<u16> = Vec::with_capacity(DESKTOP_APP_PORTS.len());
-    for &p in DESKTOP_APP_PORTS {
-        if seen.insert(p) {
-            merged.push(p);
-        }
+/// The supervisor's port, only when a supervisor was OBSERVED listening —
+/// the same probe `GET /supervisor/observation` serves, not a literal.
+async fn observed_supervisor_port() -> Option<u16> {
+    let obs = spawn_blocking_tracked(crate::mcp::auto_continue::observe_supervisor)
+        .await
+        .ok()?;
+    observed_port(&obs)
+}
+
+/// PURE: the port to scan for an observation — only an observed listener.
+fn observed_port(obs: &crate::mcp::auto_continue::SupervisorObservation) -> Option<u16> {
+    if obs.observed == Some(true) {
+        obs.port
+    } else {
+        None
     }
-    for p in user_discovery_ports().await {
+}
+
+/// Merge the hardcoded desktop port list, an OBSERVED supervisor's port, and
+/// user-configured ports; dedup while preserving the order (defaults first,
+/// then the supervisor, then user entries).
+async fn desktop_ports_merged() -> Vec<u16> {
+    let (supervisor, user) = tokio::join!(observed_supervisor_port(), user_discovery_ports());
+    merge_ports(DESKTOP_APP_PORTS, supervisor, &user)
+}
+
+/// PURE: ordered, deduplicated union.
+fn merge_ports(defaults: &[u16], supervisor: Option<u16>, user: &[u16]) -> Vec<u16> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<u16> = Vec::with_capacity(defaults.len() + 1 + user.len());
+    for &p in defaults.iter().chain(supervisor.iter()).chain(user.iter()) {
         if seen.insert(p) {
             merged.push(p);
         }
@@ -621,16 +660,29 @@ async fn ios_forward(
 /// Also accepts the legacy manual `{url, port, basePath}` shape when `baseUrl`
 /// is absent, so existing callers keep working.
 ///
-/// `_principal` (the origin guard's classification of the caller) is carried
-/// for the principal binding of plan
-/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`; not consulted
-/// yet.
+/// Bound to the caller's principal (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`): R-opaque
+/// refuses a browser with no usable `Origin`, R4 refuses a body `origin` /
+/// `baseUrl` that disagrees with the header and a browser-declared WebSocket
+/// transport, and R1/R5 refuse a claim on an id another principal holds.
 pub(crate) async fn register_app(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
     Json(req): Json<RegisterAppRequest>,
 ) -> Result<Json<ApiResponse<RegisterAppResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::mcp::app_registry::AppTransport;
+    use crate::mcp::relay_binding::{BindingMode, Principal, Refusal};
+
+    const ROUTE: &str = "POST /ui-bridge/apps/register";
+    let binding = state.binding.clone();
+    let mode = binding.config.binding;
+    let principal = binding
+        .principal(requester.as_ref().map(|e| &e.0), None, ROUTE)
+        .map_err(Refusal::into_http)?;
+    let browser_origin = match &principal {
+        Principal::Browser { origin, .. } if mode != BindingMode::Off => Some(origin.clone()),
+        _ => None,
+    };
 
     // Parse the declared transport (defaults to HTTP when absent). Unknown
     // values are rejected so wrappers get a clear signal rather than being
@@ -648,6 +700,38 @@ pub(crate) async fn register_app(
             ));
         }
     };
+
+    // Major 4: bound the KEY, not just the count of rows. A row now outlives
+    // its TTL as a reservation, so an unbounded `appId` would let one origin
+    // park its quota of rows on multi-megabyte keys for the whole window,
+    // against a 100 MB body limit.
+    if req.app_id.chars().count() > crate::mcp::app_registry::MAX_APP_ID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(format!(
+                "appId exceeds {} characters",
+                crate::mcp::app_registry::MAX_APP_ID_LEN
+            ))),
+        ));
+    }
+
+    // R4's transport arm: only the WS handler creates WebSocket entries, so a
+    // browser page phoning home may not declare one. `useCommandRelay` always
+    // sends `transport:"http"`.
+    if browser_origin.is_some()
+        && (transport == AppTransport::Websocket || req.websocket_conn_id.is_some())
+    {
+        binding
+            .meter(
+                mode,
+                &principal,
+                ROUTE,
+                Refusal::origin_mismatch(
+                    "A browser registration may not declare a WebSocket transport or a websocketConnId; only the /ui-bridge/ws handler creates those entries",
+                ),
+            )
+            .map_err(Refusal::into_http)?;
+    }
 
     // Derive a canonical (origin, port, base_path) triple from either the
     // preferred `base_url` or the legacy `url` + `port` + `base_path` shape.
@@ -711,6 +795,33 @@ pub(crate) async fn register_app(
         }
     };
 
+    // R4's origin arm: a browser's self-declared `origin` and the origin of
+    // the `baseUrl` / `url` the runner would POST to must both be the origin
+    // the request was actually sent from. `origin_url` is already the
+    // canonical `scheme://host:port` derived above.
+    if let Some(header) = &browser_origin {
+        for (label, declared) in [
+            ("origin", req.origin.as_deref()),
+            ("baseUrl", Some(origin_url.as_str())),
+        ] {
+            let Some(raw) = declared.map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let matches = crate::mcp::origin_guard::NormOrigin::parse(raw)
+                .is_some_and(|d| d.same_principal(header));
+            if !matches {
+                let message = if label == "origin" {
+                    "The declared `origin` is not the origin this request was sent from"
+                } else {
+                    "The declared `baseUrl` / `url` is not on the origin this request was sent from"
+                };
+                binding
+                    .meter(mode, &principal, ROUTE, Refusal::origin_mismatch(message))
+                    .map_err(Refusal::into_http)?;
+            }
+        }
+    }
+
     let app = DiscoveredApp {
         app_id: req.app_id.clone(),
         app_name: req.app_name,
@@ -726,25 +837,56 @@ pub(crate) async fn register_app(
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
 
-    state
+    // The LIVE WebSocket routing slot for this id, read before the registry
+    // lock and handed to `claim`. Without it this door displaces a live WS
+    // holder with no handshake at all — and it is the door that decides the
+    // dispatch target, since `AppDispatcher` reads the REGISTRY.
+    let slot_holder = if mode == BindingMode::Off {
+        None
+    } else {
+        state
+            .ws_connection_manager
+            .holder_for_app(&req.app_id)
+            .await
+            .map(|(_, p)| p)
+    };
+
+    // R1/R5: the check and the write under ONE registry lock. `claimed`
+    // carries the EFFECTIVE keep-alive, which R5 may have capped.
+    let claimed = state
         .app_registry
-        .upsert(
+        .claim(
+            &binding,
+            &principal,
+            ROUTE,
+            slot_holder.as_ref(),
             app.clone(),
             req.origin,
             transport,
             req.websocket_conn_id,
             keep_alive_ms,
         )
-        .await;
+        .await
+        .map_err(Refusal::into_http)?;
 
     debug!(
-        "[app-registry] registered appId={} origin={} port={} basePath={} transport={:?} keepAliveMs={:?}",
-        app.app_id, app.url, app.port, app.base_path, transport, keep_alive_ms
+        "[app-registry] registered appId={} url={} port={} basePath={} transport={:?} keepAliveMs={:?} class={} verifiedOrigin={:?}",
+        app.app_id,
+        app.url,
+        app.port,
+        app.base_path,
+        transport,
+        claimed.keep_alive_ms,
+        principal.class_str(),
+        principal.verified_origin(),
     );
 
     Ok(Json(ApiResponse::success(RegisterAppResponse {
         app,
         transport,
+        verified_origin: principal.verified_origin(),
+        principal_class: principal.class_str(),
+        keep_alive_ms: claimed.keep_alive_ms,
     })))
 }
 
@@ -760,22 +902,49 @@ pub(crate) async fn list_registered_apps(
         .await
         .into_iter()
         .map(|e| RegisterAppResponse {
-            app: e.app,
             transport: e.transport,
+            verified_origin: e.verified_origin(),
+            principal_class: e.principal_class(),
+            keep_alive_ms: e.keep_alive_ms,
+            app: e.app,
         })
         .collect();
     Json(ApiResponse::success(apps))
 }
 
 /// Explicit deregistration — useful on `beforeunload` when the SDK can still
-/// send a beacon. Returns `true` if an entry was removed.
+/// send a beacon. Returns `true` if a live entry was released.
+///
+/// R2: only the holder's own principal, or an operator-trust caller, may
+/// release an entry; anyone else gets `UIB_REGISTRATION_HELD`.
+///
+/// "Released" is not always "removed". An operator-trust holder's row is
+/// dropped outright — an agent's id is free the moment it lets go — while a
+/// browser holder's row is RETAINED, marked released, and so stops being live:
+/// it leaves `/ui-bridge/apps/registered` and every routing reader at once,
+/// but stays present as that holder's own reservation for
+/// `BINDING_TOMBSTONE_MS`, so a page polling the registered list cannot win
+/// the reload race. Keeping the reservation on the row is what makes the two
+/// ways a registration can end — this DELETE and a plain expiry — behave
+/// identically, rather than punishing the SDK that bothers to send a beacon.
 pub(crate) async fn deregister_app(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
     Path(app_id): Path<String>,
-) -> Json<ApiResponse<bool>> {
-    let removed = state.app_registry.remove(&app_id).await;
-    Json(ApiResponse::success(removed))
+) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::mcp::relay_binding::Refusal;
+
+    const ROUTE: &str = "DELETE /ui-bridge/apps/register/{app_id}";
+    let binding = state.binding.clone();
+    let principal = binding
+        .principal(requester.as_ref().map(|e| &e.0), None, ROUTE)
+        .map_err(Refusal::into_http)?;
+    let removed = state
+        .app_registry
+        .release(&binding, &app_id, &principal, None, ROUTE)
+        .await
+        .map_err(Refusal::into_http)?;
+    Ok(Json(ApiResponse::success(removed)))
 }
 
 // ============================================================================
@@ -897,6 +1066,9 @@ pub(crate) async fn wait_for_app_inner(
                 .map(|e| RegisterAppResponse {
                     app: e.app.clone(),
                     transport: e.transport,
+                    verified_origin: e.verified_origin(),
+                    principal_class: e.principal_class(),
+                    keep_alive_ms: e.keep_alive_ms,
                 })
         };
 
@@ -991,7 +1163,10 @@ async fn dispatch_to_app_inner(
     app_id: &str,
     req: &AppDispatchRequest,
 ) -> (StatusCode, ApiResponse<serde_json::Value>) {
-    let entry = match registry.get(app_id).await {
+    // `get_live`: a reservation-only row is not dispatchable, and answering
+    // 404 here is the same status `dispatch`'s `NotRegistered` maps to —
+    // reached truthfully instead of after building a payload from a dead row.
+    let entry = match registry.get_live(app_id).await {
         Some(e) => e,
         None => {
             return (
@@ -1431,7 +1606,7 @@ mod tests {
 
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
         registry
             .upsert(
                 sample_app("wapp"),
@@ -1469,12 +1644,16 @@ mod tests {
         assert_eq!(v["payload"], serde_json::json!({"x": 1}));
 
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(serde_json::json!({"ok": true})),
-                error: None,
-            })
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(serde_json::json!({"ok": true})),
+                    error: None,
+                },
+            )
             .await;
 
         let (status, body) = handle.await.unwrap();
@@ -1557,5 +1736,42 @@ mod tests {
         let observed_body = captured_body.lock().await.clone();
         assert_eq!(observed_body["action"], "doThing");
         assert_eq!(observed_body["params"]["alpha"], 42);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_port_tests {
+    use super::*;
+    use crate::mcp::auto_continue::SupervisorObservation;
+
+    fn obs(observed: Option<bool>, port: Option<u16>) -> SupervisorObservation {
+        SupervisorObservation {
+            observed,
+            probed_at: String::new(),
+            port,
+            base_url: None,
+            reason: None,
+        }
+    }
+
+    /// No supervisor port is hard-coded into the scan: a published runner has
+    /// no supervisor, and scanning its port anyway assumes a dev box.
+    #[test]
+    fn the_default_desktop_scan_names_no_supervisor_port() {
+        let supervisor_default: u16 = crate::api_config::DEFAULT_SUPERVISOR_PORT;
+        assert!(!DESKTOP_APP_PORTS.contains(&supervisor_default));
+    }
+
+    #[test]
+    fn only_an_observed_supervisor_contributes_its_port() {
+        assert_eq!(observed_port(&obs(Some(true), Some(4242))), Some(4242));
+        assert_eq!(observed_port(&obs(Some(false), Some(4242))), None);
+        assert_eq!(observed_port(&obs(None, None)), None);
+    }
+
+    #[test]
+    fn merge_keeps_order_and_dedups() {
+        assert_eq!(merge_ports(&[1, 2], Some(3), &[2, 4, 3]), vec![1, 2, 3, 4]);
+        assert_eq!(merge_ports(&[1, 2], None, &[5]), vec![1, 2, 5]);
     }
 }

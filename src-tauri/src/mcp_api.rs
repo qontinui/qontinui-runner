@@ -1161,13 +1161,21 @@ async fn health(
     // heartbeat's own snapshot comment names.
     let (ping_emit_failures, last_ping_emit_ok, last_ping_emit_fail) =
         crate::ui_error::ping_emit_report();
+    // The RECEIVE side (plan 2026-09-09 pong receive path), from ONE read of
+    // the headroom census and the EMFILE stamp — the same inputs the verdict
+    // beside it is classified from, so the two cannot disagree.
+    let (fd_inputs, fd_exhausted_errors) = crate::ui_error::fd_pressure_snapshot_now();
+    let ping_now_ms = crate::ui_error::now_ms_epoch_pub();
     let ping_delivery =
         crate::ui_error::classify_ping_delivery(crate::ui_error::PingDeliveryInputs {
             last_emit_ok_ms: last_ping_emit_ok,
             last_emit_fail_ms: last_ping_emit_fail,
-            now_ms: crate::ui_error::now_ms_epoch_pub(),
+            now_ms: ping_now_ms,
+            fd: fd_inputs,
         });
+    let fd_pressure = crate::ui_error::classify_fd_pressure(fd_inputs, ping_now_ms);
     let false_death_suppressed = crate::ui_error::false_death_suppressed_count();
+    let fd_starved_suppressed = crate::ui_error::fd_starved_suppressed_count();
     let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
         probe_wedged: crate::ui_error::native_ui_probe_verdict(),
         window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
@@ -1400,7 +1408,7 @@ async fn health(
             // failing emit makes a live UI look dead. `pingEmitFailures` is the
             // instrument the 119,012-failure storm had none of;
             // `pingDelivery` is the verdict the recovery trigger now consults:
-            // "ping_delivered" | "ping_undeliverable" | "unknown".
+            // "ping_delivered" | "ping_undeliverable" | "fd_starved" | "unknown".
             // `falseDeathSuppressed` counts the recreates NOT performed
             // because the ping could not be delivered — published so the
             // suppression is as visible as the recovery would have been.
@@ -1409,6 +1417,20 @@ async fn health(
             "lastPingEmitFail": last_ping_emit_fail,
             "pingDelivery": ping_delivery.as_str(),
             "falseDeathSuppressed": false_death_suppressed,
+            // Descriptor pressure — the RECEIVE side (plan 2026-09-09 pong
+            // receive path). A pong lands on an accepted socket, so a runner
+            // out of descriptors cannot receive one however alive the UI is;
+            // `pingDelivery: "fd_starved"` is that verdict, and
+            // `fdStarvedSuppressed` counts the recreates it declined.
+            // `fdPressure`: "starved" | "ample" | "unknown". Every
+            // measurement is `null` when it was not taken — never 0.
+            "fdPressure": fd_pressure.as_str(),
+            "fdOpen": fd_inputs.open,
+            "fdSoftLimit": fd_inputs.soft_limit,
+            "fdHeadroom": fd_inputs.headroom(),
+            "fdExhaustedErrors": fd_exhausted_errors,
+            "lastFdExhausted": (fd_inputs.last_exhausted_ms > 0).then_some(fd_inputs.last_exhausted_ms),
+            "fdStarvedSuppressed": fd_starved_suppressed,
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
@@ -1599,6 +1621,12 @@ async fn health(
         // `{driftedTools: [], …}` = observed clean. Same producer as
         // `/coord-mcp/tool-policy`'s field, never re-derived.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // `coord_mcp_tenant_verdict_total{verdict}` since boot (plan
+        // 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
+        // answer-names-its-tenant, Phase 2): how coord-mcp answers compared
+        // with the tenant of each session's repo. A series at 0 = observed
+        // none; a build that serves no such key is UNKNOWN, not zero.
+        "coordMcpTenantVerdict": crate::coord_mcp_tenant::verdict_counts_json(),
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
@@ -1639,6 +1667,13 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // UI Bridge relay principal binding (plan 2026-09-17-ui-bridge-relay-
+        // registration-is-unauthenticated): both kill-switch modes, the
+        // per-rule wouldRefuse/refused counts and the last 20 (rule, class,
+        // route) tuples. Phase 4 decides the graduation of R6, R8 and
+        // R9-unkeyed from exactly these counters, so they are served here
+        // rather than only to the test harness. The tuples carry no origin.
+        "uiBridgeBinding": state.relay_binding.health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -3452,6 +3487,7 @@ fn hand_off_transport_rung(
         hdr(rung::REPORTER_HEADER),
         hdr(rung::REPORTER_STEP_HEADER),
         hdr(rung::ATTEMPTED_HEADER),
+        declared_failure_class(headers),
         // Runner-observed: this rung DID carry the call as far as this door.
         // The row is written before the upstream forward on purpose — the
         // metric asks whether the rung reached the door, and a row written
@@ -3476,6 +3512,21 @@ fn hand_off_transport_rung(
     // `outboxWriteFailed`.
     transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
     tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+}
+
+/// The raw `x-qontinui-failure-class` declaration, for
+/// [`crate::session::coord_transport_rung::parse_failure_class`].
+///
+/// Unlike the other declaration headers, a PRESENT value that is not visible
+/// ASCII (`to_str()` fails) must not read as absent: the header's presence is
+/// itself the claim "a rung failed", and dropping it would lose a declared
+/// failure. So it is handed on as `"unclassified"` — a member of the closed
+/// vocabulary — and the caller's bytes still never reach the payload.
+fn declared_failure_class(headers: &axum::http::HeaderMap) -> Option<&str> {
+    use crate::session::coord_transport_rung as rung;
+    headers
+        .get(rung::FAILURE_CLASS_HEADER)
+        .map(|v| v.to_str().unwrap_or(rung::FAILURE_CLASS_UNCLASSIFIED))
 }
 
 /// Why the pure lifecycle selection produced no caller. Each variant names the
@@ -4060,6 +4111,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_migration_queue",
     "coord_mute_gate",
     "coord_notify_sensitive_action",
+    "coord_operator_touch_classify",
     "coord_orient",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
@@ -6944,6 +6996,19 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
+    // Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
+    // answer-names-its-tenant, Phase 2: compare the tenant coord says ANSWERED
+    // (`_meta["io.qontinui/answered_by"]`) with the tenant of the repo this
+    // session stands in, and SAY it when they differ — `_meta` never reaches
+    // the model, so a disagreement left there reaches nobody. `tools/call`
+    // only; an agreeing answer's bytes pass through untouched. A non-2xx is a
+    // transport answer, not a tool result, and is never annotated.
+    let bytes = if (200..300).contains(&status) {
+        coord_mcp_apply_tenant_verdict(nonce.as_deref(), &body, bytes).await
+    } else {
+        bytes
+    };
+
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
     // advertises a tool it would refuse to forward. See
@@ -7070,6 +7135,69 @@ async fn coord_mcp_proxy_handler(
         )
             .into_response()
     })
+}
+
+/// The coord-mcp proxy's tenant comparison for one upstream answer (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 2). See [`crate::coord_mcp_tenant`] for the rules.
+///
+/// The expectation is the nonce binding's. Only a binding's FIRST resolution
+/// is awaited here (the mint usually finished it in the background already;
+/// single-flight, bounded by the resolver's own budget, never under a lock). A
+/// settled answer is returned as is; a transient unknown is returned at once
+/// and, once its retry window has passed, retried in a background task — a
+/// retry never delays a `tools/call`. A key with no live
+/// binding — a superseded key inside its grace window — carries no
+/// expectation, which is UNKNOWN and said, never agreement.
+async fn coord_mcp_apply_tenant_verdict(
+    nonce: Option<&str>,
+    request: &[u8],
+    response: bytes::Bytes,
+) -> bytes::Bytes {
+    // Cheap pre-check: this runs on every proxied answer, and only a
+    // `tools/call` is compared. A hit still goes through the real parse.
+    const NEEDLE: &[u8] = b"tools/call";
+    if !request.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return response;
+    }
+    let (expected, caller_named) =
+        match nonce.and_then(crate::coord_mcp::session_expectation_for_nonce) {
+            Some((expectation, workdir)) => (
+                expectation.resolve(workdir.as_deref()).await,
+                expectation.caller_named().cloned(),
+            ),
+            None => (
+                qontinui_runner_lib::repo_tenant::CwdTenant::unknown(
+                    "this proxy key has no live binding to carry an expectation \
+                     (a superseded key inside its grace window)",
+                ),
+                None,
+            ),
+        };
+    let key = nonce.unwrap_or("").to_string();
+    let mut claim_first_notice = || crate::coord_mcp_tenant::claim_unverified_notice(&key);
+    let (out, verdicts) = crate::coord_mcp_tenant::apply_tenant_verdict(
+        request,
+        response,
+        &expected,
+        caller_named.as_ref(),
+        &mut claim_first_notice,
+    );
+    for v in &verdicts {
+        if let crate::coord_mcp_tenant::TenantVerdict::Mismatch { expected, answered } = &v.verdict
+        {
+            warn!(
+                verdict = "mismatch",
+                expected_tenant = %expected.label(),
+                expected_source = %expected.source,
+                answered_tenant = ?answered.tenant_id,
+                "coord-mcp proxy: a coord answer came from a different tenant than this \
+                 session's working directory implies — annotated TENANT MISMATCH"
+            );
+        }
+    }
+    crate::coord_mcp_tenant::record_verdicts(nonce, &verdicts);
+    out
 }
 
 /// The ONLY coord READ routes the nonce-gated read passthrough may reach:
@@ -9855,7 +9983,7 @@ pub fn create_router(
     // registrations share the same ring.
     app_handle.manage(api_state.supervision_state.clone());
 
-    // Spawn the background sweeper that evicts stale phone-home registrations.
+    // Spawn the background sweeper that drops rows whose reservation lapsed.
     crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
 
     // Set up UI Bridge response listener
@@ -12452,9 +12580,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod transport_rung_counter_tests {
     use super::{
-        hand_off_transport_rung, record_event_lane_miss, transport_rung_emitted_counter,
-        transport_rung_health_snapshot, transport_rung_lane_miss_counters,
-        transport_rung_snapshot_from, EventLaneMiss, LANE_MISS_SLOTS,
+        declared_failure_class, hand_off_transport_rung, record_event_lane_miss,
+        transport_rung_emitted_counter, transport_rung_health_snapshot,
+        transport_rung_lane_miss_counters, transport_rung_snapshot_from, EventLaneMiss,
+        LANE_MISS_SLOTS,
     };
     use std::sync::atomic::Ordering;
 
@@ -12637,7 +12766,14 @@ mod transport_rung_counter_tests {
     /// and the observation really reaches the outbox, so this is the hand-off
     /// counted, not a bare counter bump.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn successful_emit_increments_emitted() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
         use crate::session::coord_transport_rung::{RungEmitter, TRANSPORT_HEADER};
         use crate::session::local_store::OutboxWriter;
 
@@ -12690,6 +12826,155 @@ mod transport_rung_counter_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 1: a proxied call carrying EXACTLY the
+    /// static headers the http-arm `.mcp.json` document declares yields a row
+    /// tagged `native_mcp` / `mcp-client`. Built from the document itself, not
+    /// from hand-typed header names, so the config writer and the proxy reader
+    /// are proven to agree end to end.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn proxied_call_with_the_http_arm_headers_is_tagged_native_mcp() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::RungEmitter;
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let lane = uuid::Uuid::new_v4();
+
+        // The headers the MCP client sends are the document's static map.
+        let doc = crate::coord_mcp::http_proxy_config_json(9876, "nonce-under-test", false);
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in doc["mcpServers"]["coord-mcp"]["headers"]
+            .as_object()
+            .expect("headers object")
+        {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.as_str().unwrap().parse().unwrap(),
+            );
+        }
+
+        hand_off_transport_rung(
+            emitter,
+            lane,
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                let p = &pending[0].payload;
+                assert_eq!(p["transport"], serde_json::json!("native_mcp"));
+                assert_eq!(p["reporter"], serde_json::json!("mcp-client"));
+                assert_eq!(p["failure_class"], serde_json::Value::Null);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 3: a declared failure class reaches
+    /// the payload's own `failure_class` key through the proxy's header read —
+    /// validated, and never in the runner-observed `failure_reason`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn proxied_failure_class_declaration_lands_in_failure_class() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::{
+            RungEmitter, ATTEMPTED_HEADER, FAILURE_CLASS_HEADER, TRANSPORT_HEADER,
+        };
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "loopback_proxy".parse().unwrap());
+        headers.insert(ATTEMPTED_HEADER, "native_mcp".parse().unwrap());
+        headers.insert(FAILURE_CLASS_HEADER, "Runner_Nonce".parse().unwrap());
+
+        hand_off_transport_rung(
+            emitter,
+            uuid::Uuid::new_v4(),
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                let p = &pending[0].payload;
+                assert_eq!(p["failure_class"], serde_json::json!("runner_nonce"));
+                assert_eq!(p["failure_reason"], serde_json::Value::Null);
+                assert_eq!(p["attempted"], serde_json::json!(["native_mcp"]));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    /// A present `x-qontinui-failure-class` header whose value is not visible
+    /// ASCII is a declared failure, not an absent one: it resolves to
+    /// `unclassified`, never to `None`.
+    #[test]
+    fn non_ascii_failure_class_header_is_unclassified_not_dropped() {
+        use crate::session::coord_transport_rung::{
+            parse_failure_class, FAILURE_CLASS_HEADER, FAILURE_CLASS_UNCLASSIFIED,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            declared_failure_class(&headers),
+            None,
+            "absent stays absent"
+        );
+
+        headers.insert(
+            FAILURE_CLASS_HEADER,
+            axum::http::HeaderValue::from_bytes(b"runner_n\xffnce").unwrap(),
+        );
+        assert!(headers[FAILURE_CLASS_HEADER].to_str().is_err());
+        let raw = declared_failure_class(&headers);
+        assert_eq!(raw, Some(FAILURE_CLASS_UNCLASSIFIED));
+        assert_eq!(parse_failure_class(raw), Some(FAILURE_CLASS_UNCLASSIFIED));
+
+        headers.insert(FAILURE_CLASS_HEADER, "tool_masked".parse().unwrap());
+        assert_eq!(
+            parse_failure_class(declared_failure_class(&headers)),
+            Some("tool_masked")
+        );
     }
 }
 
@@ -19895,6 +20180,186 @@ mod supervised_workers_health_tests {
         assert!(
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
+        );
+    }
+}
+
+/// `/health` `uiBridgeBinding` (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`, Phase 1).
+///
+/// Phase 4 graduates R6, R8 and R9-unkeyed from exactly these counters, so an
+/// OPERATOR has to be able to read them — `relay_binding/tests.rs` serves its
+/// own `/test-health` stub, which proves nothing about the real handler.
+/// `ApiState` owns a `tauri::AppHandle` no test can build, so the RENDER is
+/// asserted through `RelayBinding::health_json` and the WIRING against the
+/// handler's own source, the same split the `supervised_workers` block above
+/// uses for the same reason.
+#[cfg(test)]
+mod ui_bridge_binding_health_tests {
+    use crate::mcp::relay_binding::{BindingConfig, BindingMode, RelayBinding};
+
+    #[test]
+    fn the_block_renders_both_modes_the_env_names_and_per_rule_counts() {
+        let binding = RelayBinding::new(BindingConfig {
+            binding: BindingMode::Enforce,
+            active_binding: BindingMode::Shadow,
+        });
+        binding.counters.record("R1", true);
+        binding.counters.record("R6", false);
+
+        let v = binding.health_json();
+        assert_eq!(v["binding"], "enforce");
+        assert_eq!(v["activeBinding"], "shadow");
+        assert_eq!(v["bindingEnv"], "QONTINUI_RUNNER_UIBRIDGE_BINDING");
+        assert_eq!(
+            v["activeBindingEnv"],
+            "QONTINUI_RUNNER_UIBRIDGE_ACTIVE_BINDING"
+        );
+        assert_eq!(v["rules"]["R1"]["refused"], 1, "{v}");
+        assert_eq!(v["rules"]["R6"]["wouldRefuse"], 1, "{v}");
+        assert!(
+            v["recent"].is_array(),
+            "the (rule, class, route) tuples: {v}"
+        );
+        // Round 4 renamed `tombstoneMs` -> `reservationMs` (the reservation
+        // lives on the registry ROW; there is no side map) and added `maxRows`.
+        // Pinned by VALUE, not by `is_i64`: a missing key reads as
+        // `Value::Null`, whose `is_i64()` is `false`, so the shape assertion
+        // this replaces went red on the rename instead of reporting it — and a
+        // future rename of either key must fail here rather than silently serve
+        // an operator a block with the field gone.
+        assert_eq!(
+            v["reservationMs"],
+            crate::mcp::relay_binding::BINDING_TOMBSTONE_MS,
+            "{v}"
+        );
+        assert_eq!(v["maxRows"], crate::mcp::app_registry::MAX_ROWS, "{v}");
+        // m-1: the ceiling that actually refuses a browser principal. An
+        // operator reading `registryFullRefusals` beside `maxRows` alone
+        // would be looking at the wrong number, and Phase 4 graduates from
+        // this block.
+        assert_eq!(
+            v["operatorHeadroom"],
+            crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(
+            v["browserMaxRows"],
+            crate::mcp::app_registry::MAX_ROWS - crate::mcp::app_registry::OPERATOR_HEADROOM,
+            "{v}"
+        );
+        assert_eq!(v["registryFullRefusals"], 0, "{v}");
+    }
+
+    #[test]
+    fn the_health_handler_emits_the_ui_bridge_binding_block() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"uiBridgeBinding\": state.relay_binding.health_json()"),
+            "async fn health must emit `uiBridgeBinding` from the ONE shared \
+             RelayBinding on ApiState — the relay_binding test harness's \
+             /test-health stub is not this surface"
+        );
+        assert!(
+            src.contains(".route(\"/health\", get(health))"),
+            "`/health` must still be served by `health`"
+        );
+    }
+
+    /// The wiring assertion above proves the LINE is present. It does not
+    /// prove `state.relay_binding` is the SAME instance the relays mutate — a
+    /// refactor that constructed a second `RelayBinding` would leave both
+    /// tests green while `/health` reported zeros forever, which is exactly
+    /// the surface Phase 4 graduates R6, R8 and R9-unkeyed from.
+    ///
+    /// `ApiState` owns a `tauri::AppHandle` no test can build, so this is
+    /// pinned where it is decided: production constructs the binding EXACTLY
+    /// once, and `RelayState`'s `FromRef` only ever clones that `Arc`.
+    #[test]
+    fn production_constructs_exactly_one_relay_binding() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        // Strip the test modules: their fixtures legitimately build their own.
+        //
+        // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
+        // FIRST occurrence, which in this file is about 62% of the way in, so
+        // a second construction added after that line was invisible and the
+        // test passed by placement luck.
+        //
+        // Skip only a column-0 `#[cfg(test)]` that gates a `mod` — that is the
+        // shape whose body closes with a column-0 `}`. A `#[cfg(test)]` on a
+        // bare `fn` or `use` would otherwise make this swallow production code
+        // up to the next column-0 brace, so it is asserted, not assumed.
+        let lines: Vec<&str> = src.lines().collect();
+        let mut production = String::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let next = lines.get(i + 1).copied().unwrap_or("");
+                assert!(
+                    next.starts_with("mod "),
+                    "column-0 #[cfg(test)] at line {} gates `{next}`, not a `mod` — \
+                     this scan would swallow production code up to the next \
+                     column-0 brace",
+                    i + 1
+                );
+                i += 1;
+                while i < lines.len() && lines[i] != "}" {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            production.push_str(lines[i]);
+            production.push('\n');
+            i += 1;
+        }
+        // Anchor on known production symbols rather than a line-count ratio:
+        // the ratio flips to a spurious failure the day the test modules
+        // exceed half the file, which is a property of test volume, not of
+        // what this is guarding.
+        for anchor in [
+            "async fn health(",
+            ".route(\"/health\", get(health))",
+            "let api_state = Arc::new(ApiState {",
+        ] {
+            assert!(
+                production.contains(anchor),
+                "the test-span skip removed production code: `{anchor}` is gone"
+            );
+        }
+        let built = production.matches("RelayBinding::new(").count();
+        assert_eq!(
+            built, 1,
+            "production must construct ONE RelayBinding (found {built}); every \
+             reader — the relays through RelayState's FromRef, and /health — \
+             has to share that one Arc, or the counters an operator reads are \
+             not the counters the rules increment"
+        );
+        assert!(
+            production.contains("relay_binding: crate::mcp::relay_binding::RelayBinding::new("),
+            "the one instance must be the field on ApiState"
         );
     }
 }

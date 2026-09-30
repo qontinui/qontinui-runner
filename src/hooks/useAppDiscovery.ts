@@ -73,7 +73,7 @@ export interface RegisterAppPayload {
   appType: string;
   framework?: string;
   transport?: string;
-  /** Absolute URL to the app's UI Bridge base, e.g. "http://127.0.0.1:9875/supervisor-bridge". */
+  /** Absolute URL to the app's UI Bridge base, e.g. "http://127.0.0.1:1420/ui-bridge". */
   baseUrl?: string;
   /** Legacy — falls back to this when `baseUrl` is absent. */
   url?: string;

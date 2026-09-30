@@ -284,6 +284,23 @@ pub(crate) struct NonceBinding {
     /// because every subsequent snapshot persists a real time for every
     /// binding minted since.
     minted_at: std::time::SystemTime,
+    /// What an answer to THIS session is expected to come from: the tenant of
+    /// the repo in the session's spawn workdir, and whether the session's
+    /// tenant was caller-named instead (plan
+    /// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+    /// Phase 2). The coord-mcp proxy compares every `tools/call` answer's
+    /// `answered_by` stamp with it ([`crate::coord_mcp_tenant::tenant_verdict`]).
+    ///
+    /// Resolved from the binding's workdir (F2: a session's tenant is fixed at
+    /// spawn): [`mint_and_register_nonce`] starts the resolution in the
+    /// background OUTSIDE the registry lock — it may run a bounded `git` probe
+    /// and a cached coord read — and the proxy's first call awaits the same
+    /// shared state. A PERMANENT answer is frozen; a transient unknown is
+    /// retried in the background at most once a minute (see
+    /// [`crate::coord_mcp_tenant::SessionExpectation`]). Only a settled answer
+    /// is persisted (re-persisted the moment it settles); a store entry
+    /// without one restores pending and is re-resolved, never guessed.
+    expected: crate::coord_mcp_tenant::SessionExpectation,
 }
 
 #[cfg(test)]
@@ -353,6 +370,84 @@ impl MintPin {
     pub(crate) fn from_chosen(session_tenant: Option<Uuid>) -> Self {
         session_tenant.map_or(MintPin::MachineNow, MintPin::Explicit)
     }
+}
+
+/// Was this session's tenant NAMED — by the spawn (`spawn_tenant`: the picker,
+/// `--tenant`, `provision-session {tenant}`) or by a workspace declaration
+/// (tiers 1a/1b/1c of [`decide_session_tenant`])? Such a session's expected
+/// tenant is the named one, not its repo's
+/// ([`crate::coord_mcp_tenant::CallerNamed`]).
+///
+/// Mirrors the authority order exactly: a `Pinned` binding is row 1 and the
+/// declaration tiers are never consulted for it, so a MACHINE-sampled pin names
+/// nothing, and a declaration counts only for a binding whose pin is not
+/// `Pinned`. Agent principals present their own JWT and are never declared.
+/// Reads the declaration files, so callers keep it off the registry lock.
+fn caller_named_tenant(
+    session_pin: crate::session::tenant_pin::TenantPin,
+    pin_origin: PinOrigin,
+    principal: &ProxyPrincipal,
+    workdir: &str,
+) -> Option<crate::coord_mcp_tenant::CallerNamed> {
+    use crate::session::tenant_pin::TenantPin;
+    use crate::session::workspace_tenant::WorkspaceDeclaration;
+    if *principal != ProxyPrincipal::Device {
+        return None;
+    }
+    match session_pin {
+        TenantPin::Pinned(t) => {
+            (pin_origin == PinOrigin::Explicit).then(|| crate::coord_mcp_tenant::CallerNamed {
+                tenant_id: t,
+                source: "spawn_tenant".to_string(),
+            })
+        }
+        TenantPin::Unpinned | TenantPin::Unresolvable => {
+            match crate::session::workspace_tenant::read_workspace_declaration(expectation_workdir(
+                workdir,
+            )) {
+                WorkspaceDeclaration::Declared { tenant, source } => {
+                    Some(crate::coord_mcp_tenant::CallerNamed {
+                        tenant_id: tenant,
+                        source: format!("declared: {source}"),
+                    })
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The hook every PERSISTABLE binding's expectation carries: when its
+/// expectation settles, mirror the live set to the store (debounced and
+/// persistence-gated like every other write), so a settled answer is never
+/// lost to a restart just because it landed after the mint's own write.
+fn persist_on_settle() -> crate::coord_mcp_tenant::SettleHook {
+    crate::coord_mcp_tenant::SettleHook::new(|| {
+        let live = proxy_nonces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        persist_proxy_nonces(&live);
+    })
+}
+
+/// The workdir an expectation resolves from: `None` for the "no workdir"
+/// sentinel, which must read as UNKNOWN rather than be probed as a path.
+fn expectation_workdir(workdir: &str) -> Option<&str> {
+    let w = workdir.trim();
+    (!w.is_empty() && w != ROTATION_UNKNOWN).then_some(w)
+}
+
+/// The expectation a live binding carries, and the workdir it resolves from.
+/// `None` when the nonce is not a live binding (unregistered, expired, or a
+/// graced superseded key, which carries no binding).
+pub(crate) fn session_expectation_for_nonce(
+    nonce: &str,
+) -> Option<(crate::coord_mcp_tenant::SessionExpectation, Option<String>)> {
+    live_binding(nonce).map(|b| {
+        let workdir = expectation_workdir(&b.workdir).map(str::to_string);
+        (b.expected, workdir)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3194,6 +3289,14 @@ fn device_nonce_snapshot(
                     session_tenant: b.session_pin.pinned(),
                     // W-C: the pin's provenance, only beside a pin.
                     session_tenant_origin: b.session_pin.pinned().map(|_| b.pin_origin.into()),
+                    // Phase 2 of plan 2026-09-20-a-sessions-tenant-follows-its-
+                    // repo…: the SETTLED expectation only, so a restart keeps
+                    // comparing against the spawn-time answer. `None` while it
+                    // is unresolved or only a transient unknown is known — a
+                    // transient is never persisted, so a restart re-resolves
+                    // instead of freezing it. The binding's settle hook
+                    // re-persists the set the moment an answer settles.
+                    expected_tenant: b.expected.settled(),
                 },
             )
         })
@@ -4470,10 +4573,60 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
     // Sampled ONCE for the whole restore (a filesystem read), and held across
     // the registry lock below rather than taken under it.
     let restore_time_pin = crate::session::tenant_pin::resolve_tenant_pin();
+    // Each binding's expectation (plan 2026-09-20-a-sessions-tenant-follows-
+    // its-repo… Phase 2), built BEFORE the registry lock: the caller-named half
+    // reads the workspace declaration files. The cwd half is restored VERBATIM
+    // — the spawn-time expectation, never re-resolved (F2) — and an entry
+    // persisted without one says so rather than guessing.
+    let persisted: Vec<_> = persisted
+        .into_iter()
+        .map(|(nonce, binding)| {
+            let session_pin = binding
+                .session_tenant
+                .map(crate::session::tenant_pin::TenantPin::Pinned)
+                .unwrap_or(restore_time_pin);
+            // NOT `PinOrigin::restored`: that reads a tenant with no stored
+            // origin as `Explicit`, the conservative arm for a CREDENTIAL. For
+            // the expectation it is the unsafe arm — it would turn a possibly
+            // machine-sampled pin into a caller-named one and silence every
+            // mismatch. Only a STORED `explicit` names the tenant here.
+            let named_origin = match binding.session_tenant_origin {
+                Some(crate::secure_storage::StoredPinOrigin::Explicit) => PinOrigin::Explicit,
+                _ => PinOrigin::MachineSampled,
+            };
+            let caller_named = caller_named_tenant(
+                session_pin,
+                named_origin,
+                &ProxyPrincipal::Device,
+                &normalize_binding_workdir(&binding.workdir),
+            );
+            // A record without a settled expectation (written before the
+            // field, before its resolution landed, or holding one this build
+            // cannot read) restores PENDING: the first proxied call
+            // re-resolves it from the persisted workdir, rather than
+            // freezing a standing unknown for the life of the key.
+            let expected = match binding.expected_tenant.clone() {
+                Some(cwd) => crate::coord_mcp_tenant::SessionExpectation::known(cwd, caller_named),
+                None => crate::coord_mcp_tenant::SessionExpectation::pending(caller_named),
+            }
+            .with_settle_hook(persist_on_settle());
+            (nonce, binding, expected)
+        })
+        .collect();
+    // Restored bindings whose expectation is unsettled: resolved in the
+    // background once the lock is released, so a restored session's first
+    // tools/call does not wait out the resolver budget.
+    let mut to_resolve: Vec<(crate::coord_mcp_tenant::SessionExpectation, String)> = Vec::new();
     let live_map_len = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        for (nonce, binding) in persisted {
+        for (nonce, binding, expected) in persisted {
             let vacant = !map.contains_key(&nonce);
+            if vacant && expected.settled().is_none() {
+                to_resolve.push((
+                    expected.clone(),
+                    normalize_binding_workdir(&binding.workdir),
+                ));
+            }
             // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
             // is unconditionally a Device principal. An agent nonce can never be
             // restored — its slot is process-global and gone after a restart, so
@@ -4549,6 +4702,7 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 // `UNIX_EPOCH` and sorts OLDEST. See
                 // [`minted_at_from_unix`] and [`NonceBinding::minted_at`].
                 minted_at: minted_at_from_unix(binding.minted_at_unix),
+                expected,
             });
             if vacant {
                 inserted += 1;
@@ -4556,6 +4710,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
         }
         map.len()
     };
+    for (expected, workdir) in &to_resolve {
+        expected.spawn_resolution(expectation_workdir(workdir));
+    }
     // Honest counts: `inserted` is what the restore actually recovered,
     // `skipped` is the persisted entries a live mint already occupied (the
     // `or_insert` no-op), and `live_map_len` is the map size afterwards — a
@@ -4851,6 +5008,21 @@ fn mint_and_register_nonce_with(
             PinOrigin::MachineSampled,
         ),
     };
+    // The session's expectation (plan 2026-09-20-a-sessions-tenant-follows-
+    // its-repo… Phase 2): the caller-named half is read NOW (declaration files,
+    // outside the lock); the cwd half resolves in the background below, after
+    // the lock is released, into a cell every clone of this binding shares.
+    let mut expected = crate::coord_mcp_tenant::SessionExpectation::pending(caller_named_tenant(
+        session_pin,
+        pin_origin,
+        &principal,
+        workdir,
+    ));
+    // Only a binding that is ever persisted re-persists on settling.
+    if principal == ProxyPrincipal::Device && !ephemeral {
+        expected = expected.with_settle_hook(persist_on_settle());
+    }
+    let expected_for_resolution = expected.clone();
     // Forensics cause resolved BEFORE `principal` is moved into the map.
     let mint_cause = match (&principal, ephemeral) {
         (ProxyPrincipal::Device, false) => "persistent device mint (runner-spawn/re-provision)",
@@ -4926,6 +5098,7 @@ fn mint_and_register_nonce_with(
                 // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
                 terminal_id: terminal_id.map(str::to_string),
                 minted_at: std::time::SystemTime::now(),
+                expected,
             },
         );
         grace_evicted_device_nonces(&evicted_graceable);
@@ -4991,6 +5164,11 @@ fn mint_and_register_nonce_with(
         mint_cause,
         &[("terminal_id", serde_json::Value::from(terminal_id))],
     );
+    // Off the lock and off the caller: a bounded `git` probe plus a cached
+    // coord read, whose answer lands in the binding's shared state (and, via
+    // the settle hook, in the store). Without a runtime (a sync caller) the
+    // proxy's first call resolves it instead.
+    expected_for_resolution.spawn_resolution(expectation_workdir(workdir));
     (nonce, snapshot)
 }
 
@@ -6853,6 +7031,7 @@ pub(crate) mod teardown_poison_tests {
             pin_origin: PinOrigin::MachineSampled,
             terminal_id: None,
             minted_at: std::time::SystemTime::now(),
+            expected: Default::default(),
         }
     }
 
@@ -8197,11 +8376,31 @@ fn coord_mcp_proxy_config_json(
     proxy_config_json_for(bound_port, nonce, identity, false)
 }
 
-/// The http-transport document — today's shape, byte-for-byte — with the
-/// AGENT principal marker added to `headers` when `agent_marked`. This is the
-/// `{url, headers}` contract; the stdio arm carries exactly this object into
-/// the credential file rather than inline.
-fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> serde_json::Value {
+/// The http-transport document, with the AGENT principal marker added to
+/// `headers` when `agent_marked`. This is the `{url, headers}` contract; the
+/// stdio arm carries exactly this object into the credential file rather than
+/// inline.
+///
+/// ## The transport-rung declaration (plan 2026-09-20 first-rung, Phase 1)
+///
+/// `headers` also carries `x-qontinui-transport: native_mcp` and
+/// `x-qontinui-reporter: mcp-client`. The MCP client sends its static headers
+/// on every call, so a native coord tool call through this arm lands at the
+/// runner's `/coord-mcp` proxy tagged as the first rung — made by
+/// fleet-provisioned config the session never touches (Design decision D1),
+/// where before every such row read `transport: unknown`. The proxy strips both
+/// before the upstream forward (`DECLARATION_HEADERS`), so coord never sees the
+/// claim.
+///
+/// Under the stdio arm these two keys ride into the credential file too, and
+/// go no further: the shim's `load_credential` copies only its three
+/// allowlisted auth headers and declares its own rung in code.
+pub(crate) fn http_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    agent_marked: bool,
+) -> serde_json::Value {
+    use crate::session::coord_transport_rung as rung;
     let mut doc = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
@@ -8210,6 +8409,8 @@ fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> s
                 "headers": {
                     (PROXY_AUTHORIZATION_HEADER_JSON): format!("{PROXY_BEARER_PREFIX}{nonce}"),
                     (COORD_MCP_PROXY_KEY_HEADER_JSON): nonce,
+                    (rung::TRANSPORT_HEADER): rung::TRANSPORT_NATIVE_MCP,
+                    (rung::REPORTER_HEADER): rung::REPORTER_MCP_CLIENT,
                 }
             }
         }
@@ -10299,6 +10500,44 @@ pub(crate) fn session_credential_tenant(
     terminal_id: &str,
     workdir: Option<&str>,
 ) -> CredentialTenantRead {
+    credential_from_session_nonce(&session_nonce(terminal_id, workdir))
+}
+
+fn credential_from_session_nonce(nonce: &SessionNonce) -> CredentialTenantRead {
+    match nonce {
+        SessionNonce::Nonce(nonce) => credential_tenant_for_nonce(nonce.as_deref()),
+        SessionNonce::NoNonce => CredentialTenantRead::NoNonce,
+        SessionNonce::DeliveryUnrecorded => CredentialTenantRead::DeliveryUnrecorded,
+    }
+}
+
+/// The credential leg AND the repo-expected leg of one session, from ONE
+/// resolution of its nonce — so the census's two legs always describe the
+/// same key, even if a re-provision lands between them.
+pub(crate) fn session_tenancy_reads(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> (CredentialTenantRead, RepoExpectationRead) {
+    let nonce = session_nonce(terminal_id, workdir);
+    (
+        credential_from_session_nonce(&nonce),
+        repo_expectation_from_session_nonce(&nonce),
+    )
+}
+
+/// Which nonce is the session in `terminal_id`'s credential — the lookup
+/// [`session_credential_tenant`] and [`session_tenancy_reads`] share, so the
+/// two tenancy legs always describe the SAME key.
+enum SessionNonce {
+    /// This nonce (`None`: the cwd's `.mcp.json` held no runner nonce).
+    Nonce(Option<String>),
+    /// The seam delivered no nonce to this terminal.
+    NoNonce,
+    /// This process never recorded a delivery for the terminal.
+    DeliveryUnrecorded,
+}
+
+fn session_nonce(terminal_id: &str, workdir: Option<&str>) -> SessionNonce {
     let terminal_nonce = {
         let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         map.iter()
@@ -10310,7 +10549,7 @@ pub(crate) fn session_credential_tenant(
             .map(|(n, _)| n.clone())
     };
     if let Some(nonce) = terminal_nonce {
-        return credential_tenant_for_nonce(Some(&nonce));
+        return SessionNonce::Nonce(Some(nonce));
     }
     let delivery = terminal_coord_mcp_deliveries()
         .lock()
@@ -10318,11 +10557,52 @@ pub(crate) fn session_credential_tenant(
         .get(terminal_id)
         .map(|r| r.delivery);
     match (delivery, workdir) {
-        (Some(CoordMcpDelivery::WorkdirDeclared), Some(wd)) => credential_tenant_for_nonce(
-            read_proxy_nonce(&Path::new(wd).join(".mcp.json")).as_deref(),
-        ),
-        (Some(_), _) => CredentialTenantRead::NoNonce,
-        (None, _) => CredentialTenantRead::DeliveryUnrecorded,
+        (Some(CoordMcpDelivery::WorkdirDeclared), Some(wd)) => {
+            SessionNonce::Nonce(read_proxy_nonce(&Path::new(wd).join(".mcp.json")))
+        }
+        (Some(_), _) => SessionNonce::NoNonce,
+        (None, _) => SessionNonce::DeliveryUnrecorded,
+    }
+}
+
+/// What the session in `terminal_id` expects its coord answers to come from,
+/// and the latest verdict its answers reached — the fourth tenancy leg
+/// (`SessionTenancy.repoExpected`, plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 2). Read-only: never starts a resolution.
+// A transient per-census read, built and consumed in one call and never stored
+// in bulk, so the size gap between the arms costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoExpectationRead {
+    /// The key's expectation. `cwd: None` while its resolution is in flight.
+    Known {
+        cwd: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
+        caller_named: Option<crate::coord_mcp_tenant::CallerNamed>,
+        latest: Option<crate::coord_mcp_tenant::VerdictRecord>,
+    },
+    /// No key could be named, or it is not a live binding: `reason` says which
+    /// (the same vocabulary as the credential leg).
+    Unknown(&'static str),
+}
+
+fn repo_expectation_from_session_nonce(nonce: &SessionNonce) -> RepoExpectationRead {
+    let nonce = match nonce {
+        SessionNonce::Nonce(Some(n)) => n,
+        SessionNonce::Nonce(None) | SessionNonce::NoNonce => {
+            return RepoExpectationRead::Unknown("no_session_nonce")
+        }
+        SessionNonce::DeliveryUnrecorded => {
+            return RepoExpectationRead::Unknown("coord_mcp_delivery_unrecorded")
+        }
+    };
+    match live_binding(nonce) {
+        Some(b) => RepoExpectationRead::Known {
+            cwd: b.expected.current(),
+            caller_named: b.expected.caller_named().cloned(),
+            latest: crate::coord_mcp_tenant::latest_verdict(nonce),
+        },
+        None => RepoExpectationRead::Unknown("nonce_not_live"),
     }
 }
 
@@ -11316,6 +11596,20 @@ fn adopt_on_disk_nonce(
     file_rewritten: bool,
     minted_at: std::time::SystemTime,
 ) {
+    // Read OUTSIDE the registry lock (both are file reads): the machine pin the
+    // binding records, and — from it — whether a workspace declaration names
+    // the session's tenant. The adopted binding's cwd expectation is resolved in the
+    // background once it is registered; a `.mcp.json` carries none to adopt.
+    let adopt_pin = crate::session::tenant_pin::resolve_tenant_pin();
+    let expected = crate::coord_mcp_tenant::SessionExpectation::pending(caller_named_tenant(
+        adopt_pin,
+        PinOrigin::MachineSampled,
+        &ProxyPrincipal::Device,
+        workdir,
+    ));
+    // No settle hook: this function deliberately never persists (see its
+    // tail). The expectation is re-derived with the binding on the next boot.
+    let expected_for_resolution = expected.clone();
     let evicted = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent AND terminal-less only — an adopted nonce came from a
@@ -11356,7 +11650,7 @@ fn adopt_on_disk_nonce(
                 // must stay that way — `58414a05d` hardened the emitter side so
                 // an agent-scoped config is not adoptable as Device, and this
                 // field is the consumer half of that pair.
-                session_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+                session_pin: adopt_pin,
                 pin_origin: PinOrigin::MachineSampled,
                 // Same reason for the terminal: a `.mcp.json` carries only URL
                 // + nonce, so the terminal the file was originally provisioned
@@ -11369,6 +11663,7 @@ fn adopt_on_disk_nonce(
                 // binding never outranks a genuinely newer one in the persisted
                 // set's newest-first cut.
                 minted_at,
+                expected,
             },
         );
         evicted
@@ -11397,6 +11692,10 @@ fn adopt_on_disk_nonce(
     // binding is re-derived from the same `.mcp.json` on the next boot; putting
     // it in the encrypted store would only make a credential of unattestable
     // provenance outlive the file that justified it.
+    //
+    // Resolve the expectation now, off the lock, so the adopted session's
+    // first tools/call does not wait out the resolver budget.
+    expected_for_resolution.spawn_resolution(expectation_workdir(workdir));
 }
 
 /// Read the root `.mcp.json` ONCE and resolve both the self-heal action and the
@@ -12738,6 +13037,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
+                    expected: Default::default(),
                 },
             );
             map.insert(
@@ -12753,6 +13053,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
+                    expected: Default::default(),
                 },
             );
         }
@@ -12798,6 +13099,7 @@ mod tests {
                 pin_origin: PinOrigin::MachineSampled,
                 terminal_id: None,
                 minted_at: std::time::SystemTime::now(),
+                expected: Default::default(),
             },
         );
         assert!(
@@ -12994,6 +13296,39 @@ mod tests {
             !crate::coord_mcp_config::looks_like_jwt("abc123"),
             "the proxy shape must never bake a static bearer TOKEN"
         );
+        // Plan 2026-09-20 first-rung, Phase 1: the http arm declares the native
+        // rung in its static headers, spelled from the rung vocabulary's own
+        // constants so the two cannot drift.
+        use crate::session::coord_transport_rung as rung;
+        assert_eq!(server["headers"][rung::TRANSPORT_HEADER], "native_mcp");
+        assert_eq!(server["headers"][rung::REPORTER_HEADER], "mcp-client");
+        assert_eq!(
+            server["headers"]["x-qontinui-transport"], "native_mcp",
+            "the wire header name is the one the proxy reads"
+        );
+        assert_eq!(server["headers"]["x-qontinui-reporter"], "mcp-client");
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 1: the AGENT-marked twin carries the
+    /// same rung declaration as the device document — the marker is additive,
+    /// it does not replace the declaration.
+    #[test]
+    fn agent_marked_http_document_also_declares_the_native_rung() {
+        use crate::session::coord_transport_rung as rung;
+        let v = http_proxy_config_json(9877, "abc123", true);
+        let headers = &v["mcpServers"]["coord-mcp"]["headers"];
+        assert_eq!(
+            headers[COORD_MCP_PRINCIPAL_HEADER_JSON],
+            COORD_MCP_PRINCIPAL_AGENT
+        );
+        assert_eq!(headers[rung::TRANSPORT_HEADER], rung::TRANSPORT_NATIVE_MCP);
+        assert_eq!(headers[rung::REPORTER_HEADER], rung::REPORTER_MCP_CLIENT);
+        // The nonce is still readable through the one resolver every
+        // runner-side reader uses — the new keys did not disturb it.
+        assert_eq!(
+            crate::coord_mcp_config::proxy_nonce_from_header_object(headers).as_deref(),
+            Some("abc123")
+        );
     }
 
     /// §2 — the mint route inherits the seam's fail-closed port check because it
@@ -13152,6 +13487,7 @@ mod tests {
             minted_at_unix,
             session_tenant: None,
             session_tenant_origin: None,
+            expected_tenant: None,
         }
     }
 
@@ -15357,6 +15693,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
+                    expected: Default::default(),
                 },
             );
         sweep_stale_breadcrumbs_once(1); // :1 — nothing listens there
@@ -15868,6 +16205,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// Plan 2026-09-20-a-sessions-tenant-follows-its-repo… Phase 2: a binding
+    /// persisted WITH its resolved expectation restores it verbatim (the
+    /// spawn-time one, never re-resolved), and one persisted WITHOUT the field —
+    /// every store written before it — still loads, reading as unknown rather
+    /// than as a guess.
+    #[test]
+    fn a_persisted_expectation_restores_and_an_old_record_reads_unknown() {
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        let _amb = crate::test_env::isolated_ambient();
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("expectation");
+        let wd = store_dir.join("wd").to_string_lossy().to_string();
+        let owner = uuid::Uuid::from_bytes([0xB2; 16]);
+        let (with, without) = (
+            format!("exp-{}", uuid::Uuid::new_v4().simple()),
+            format!("old-{}", uuid::Uuid::new_v4().simple()),
+        );
+        let (legacy_pin, named_pin) = (
+            format!("legacy-{}", uuid::Uuid::new_v4().simple()),
+            format!("named-{}", uuid::Uuid::new_v4().simple()),
+        );
+        let resolved = CwdTenant::Resolved {
+            tenant_id: owner,
+            repo: "acme/pizzeria".into(),
+            source: "canonical_repos".into(),
+            observed_at: "2026-09-27T00:00:00Z".into(),
+        };
+        store
+            .store_coord_mcp_nonce_sets(
+                &HashMap::from([
+                    (
+                        with.clone(),
+                        crate::secure_storage::StoredNonceBinding {
+                            workdir: wd.clone(),
+                            expected_tenant: Some(resolved.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        without.clone(),
+                        crate::secure_storage::StoredNonceBinding {
+                            workdir: wd.clone(),
+                            ..Default::default()
+                        },
+                    ),
+                    // A tenant with no stored origin (a pre-W-C store): the
+                    // credential reads it as explicit, the expectation must NOT.
+                    (
+                        legacy_pin.clone(),
+                        crate::secure_storage::StoredNonceBinding {
+                            workdir: wd.clone(),
+                            session_tenant: Some(owner),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        named_pin.clone(),
+                        crate::secure_storage::StoredNonceBinding {
+                            workdir: wd.clone(),
+                            session_tenant: Some(owner),
+                            session_tenant_origin: Some(
+                                crate::secure_storage::StoredPinOrigin::Explicit,
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                &HashMap::new(),
+            )
+            .unwrap();
+        // The pre-field on-disk shape carries no `expected_tenant` key at all.
+        let raw = serde_json::to_value(crate::secure_storage::StoredNonceBinding {
+            workdir: wd.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(raw.get("expected_tenant").is_none(), "{raw}");
+
+        restore_proxy_nonces_from(&store);
+        let (exp, _) = session_expectation_for_nonce(&with).expect("restored");
+        assert_eq!(exp.settled(), Some(resolved.clone()));
+        let (old, _) = session_expectation_for_nonce(&without).expect("old record restored");
+        assert_eq!(
+            old.settled(),
+            None,
+            "an old record restores PENDING — re-resolved on first use, not frozen"
+        );
+        let (legacy, _) = session_expectation_for_nonce(&legacy_pin).expect("restored");
+        assert_eq!(
+            legacy.caller_named(),
+            None,
+            "an origin-less pin names nothing"
+        );
+        let (named, _) = session_expectation_for_nonce(&named_pin).expect("restored");
+        assert_eq!(named.caller_named().map(|c| c.tenant_id), Some(owner));
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            for n in [&with, &without, &legacy_pin, &named_pin] {
+                map.remove(n);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// The mint snapshot persists the expectation once it has resolved, and
+    /// an explicit spawn tenant is recorded as caller-named.
+    #[tokio::test]
+    async fn a_minted_binding_carries_a_caller_named_expectation_and_persists_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let named = uuid::Uuid::from_bytes([0xC3; 16]);
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().to_string_lossy().to_string();
+        let (nonce, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+            Some(named),
+        );
+        let (exp, workdir) = session_expectation_for_nonce(&nonce).expect("live");
+        assert_eq!(
+            exp.caller_named().map(|c| (c.tenant_id, c.source.as_str())),
+            Some((named, "spawn_tenant"))
+        );
+        // A tempdir is inside no checkout.
+        assert_eq!(
+            exp.resolve(workdir.as_deref()).await,
+            qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo
+        );
+        let snap = device_nonce_snapshot(&proxy_nonces().lock().unwrap().clone());
+        assert_eq!(
+            snap.get(&nonce).and_then(|b| b.expected_tenant.clone()),
+            Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo)
+        );
+        proxy_nonces().lock().unwrap().remove(&nonce);
+    }
+
     /// OQ3 — an AGENT nonce is NEVER mirrored to the persisted store, while a
     /// DEVICE nonce in the same snapshot still is. A restarted runner thus has
     /// no live agent session AND no restored agent nonce, so an agent nonce
@@ -16188,6 +16662,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: Some(format!("term-{i}")),
                     minted_at: base + std::time::Duration::from_secs(i as u64),
+                    expected: Default::default(),
                 },
             );
         }
@@ -16277,6 +16752,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: Some(format!("term-{secs}")),
                     minted_at: minted_at_from_unix(Some(secs)),
+                    expected: Default::default(),
                 },
             );
         }
@@ -16381,6 +16857,7 @@ mod tests {
             pin_origin: PinOrigin::MachineSampled,
             terminal_id: Some(format!("term-{i}")),
             minted_at,
+            expected: Default::default(),
         };
         // The undated pool: a legacy store's restore, all at the sentinel.
         let undated_nonce = |i: usize| format!("undated-{i:06}");
@@ -18394,6 +18871,7 @@ mod tests {
                     pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
+                    expected: Default::default(),
                 },
             );
         }
@@ -19213,6 +19691,7 @@ mod agent_binding_census_tests {
             terminal_id: terminal_id.map(str::to_owned),
             minted_at: std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(1_700_000_000),
+            expected: Default::default(),
         }
     }
 

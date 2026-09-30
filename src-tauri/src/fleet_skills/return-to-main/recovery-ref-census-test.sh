@@ -99,11 +99,11 @@ claim() { # the bearer's tenant_id claim, read from the -H @file
   t="$(sed -n 's/^Authorization: Bearer //p' "$hdr" | tr -d '\r\n')"
   seg="$(printf '%s' "$t" | cut -d. -f2 | tr '_-' '/+')"
   case $(( ${#seg} % 4 )) in 2) seg="$seg==" ;; 3) seg="$seg=" ;; esac
-  printf '%s' "$seg" | base64 -d 2>/dev/null | sed -n 's/.*"tenant_id":"\([^"]*\)".*/\1/p'
+  printf '%s' "$seg" | base64 -d 2>/dev/null | sed -n 's/.*"tenant_id": *"\([^"]*\)".*/\1/p'
 }
 case "$url" in
   */agents/credential)
-    t="$(printf '%s' "$body" | sed -n 's/.*"tenant_id":"\([^"]*\)".*/\1/p')"
+    t="$(printf '%s' "$body" | sed -n 's/.*"tenant_id": *"\([^"]*\)".*/\1/p')"
     { [ "${STUB_MINT:-honour}" = honour ] && [ -n "$t" ]; } || t="$TP"
     printf '{"token":"%s"}' "$(jwt "$t")" >"$out"; printf 200; exit 0 ;;
   */mcp)
