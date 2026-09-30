@@ -12,7 +12,10 @@
 import { describe, it, expect, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
+  // Default pane probe: a plain shell with no claude, so the typing paths run.
+  invoke: vi.fn(async (cmd: string) =>
+    cmd === "terminal_probe_claude" ? { data: { state: "absent", sessionIds: [] } } : undefined,
+  ),
 }));
 
 import {
@@ -25,6 +28,7 @@ import {
   buildPickerAnswer,
   waitForClaudeHandshake,
   typeResumeAndVerify,
+  probeClaudeInPane,
 } from "./resumeVerification";
 import { claudeDescriptor } from "./providerAdapter";
 import { buildResumeCmd } from "./useTerminalInitialization";
@@ -595,5 +599,125 @@ describe("descriptor-driven detection unions the regexes (item 3)", () => {
     const gemini = { success: ["gemini ready"], failure: ["no such chat"] };
     expect(detectClaudeHandshake(FRAME_ONLY, gemini)).toBe(false);
     expect(detectClaudeHandshake("Gemini ready", gemini)).toBe(true);
+  });
+});
+
+describe("typeResumeAndVerify (does not type into a live claude)", () => {
+  const SID = "5c46c390-037d-4b8e-9d7a-1f2e3d4c5b6a";
+  const CMD = `claude --permission-mode bypassPermissions --resume ${SID}\r`;
+  const base = { settleMs: 1, timeoutMs: 10, intervalMs: 1, sessionId: SID };
+  const recorder = () => {
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    return { writes, write: write as never };
+  };
+
+  it("operator retry against a pane already running THIS session: types nothing, verifies", async () => {
+    // Case-insensitive: the command line's spelling of the id is what it is.
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      // A live session whose frame the scrape does not recognise.
+      readTail: async () => "some redraw the patterns miss",
+      probeClaude: async () => ({ state: "live", sessionIds: [SID.toUpperCase()] }),
+    });
+    expect(out).toBe("verified");
+    expect(writes).toEqual([]);
+  });
+
+  it("a claude running some OTHER (or unparseable) session: types nothing, fails", async () => {
+    for (const sessionIds of [["00000000-0000-4000-8000-000000000000"], []]) {
+      const { writes, write } = recorder();
+      const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+        ...base,
+        write,
+        readTail: async () => "",
+        probeClaude: async () => ({ state: "live", sessionIds }),
+      });
+      expect(out).toBe("failed");
+      expect(writes).toEqual([]);
+    }
+  });
+
+  it("skips the retype (and its ESC) once the first attempt brought claude up unseen by the scrape", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "",
+      probeClaude: async () =>
+        writes.includes(CMD)
+          ? { state: "live", sessionIds: [SID] }
+          : { state: "absent", sessionIds: [] },
+    });
+    expect(out).toBe("verified");
+    expect(writes).toEqual([CMD]);
+  });
+
+  it("an UNREADABLE process table fails closed — nothing typed", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "",
+      probeClaude: async () => ({ state: "unknown", sessionIds: [] }),
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([]);
+  });
+
+  it("a REMOTE pane (unprobeable) types exactly as before", async () => {
+    const { writes, write } = recorder();
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      readTail: async () => "$ ",
+      probeClaude: async () => ({ state: "remote", sessionIds: [] }),
+    });
+    expect(out).toBe("failed");
+    expect(writes).toEqual([CMD, "\x1b", CMD]);
+  });
+
+  it("skipFirstProbe (fresh boot-restore pane) probes only before the retype", async () => {
+    const { write } = recorder();
+    let probes = 0;
+    await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      ...base,
+      write,
+      skipFirstProbe: true,
+      readTail: async () => "$ ",
+      probeClaude: async () => {
+        probes++;
+        return { state: "absent", sessionIds: [] };
+      },
+    });
+    expect(probes).toBe(1);
+  });
+});
+
+describe("probeClaudeInPane", () => {
+  it("passes readings through and maps anything else to unknown", async () => {
+    expect(
+      await probeClaudeInPane("t", async () => ({ data: { state: "live", sessionIds: ["a", 3] } })),
+    ).toEqual({ state: "live", sessionIds: ["a"] });
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "absent" } }))).toEqual({
+      state: "absent",
+      sessionIds: [],
+    });
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "remote" } }))).toEqual({
+      state: "remote",
+      sessionIds: [],
+    });
+    const unknown = { state: "unknown", sessionIds: [] };
+    expect(await probeClaudeInPane("t", async () => ({ data: { state: "unknown" } }))).toEqual(
+      unknown,
+    );
+    expect(await probeClaudeInPane("t", async () => undefined)).toEqual(unknown);
+    expect(
+      await probeClaudeInPane("t", async () => {
+        throw new Error("Terminal not found");
+      }),
+    ).toEqual(unknown);
   });
 });
