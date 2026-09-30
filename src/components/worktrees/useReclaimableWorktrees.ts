@@ -43,8 +43,7 @@ export type SkipReason =
   | "undeclared-not-removable"
   /** Landed, clean and idle — coord offers only a rejunction, never a removal. */
   | "landed-idle-not-removable"
-  /** coord withheld a rejunction with no real target/node_modules copy to re-link. */
-  /** coord gave no verdict — it never evaluated the path, or sent an unknown token. */
+  /** coord gave no reason — it serves no blocked list, never evaluated the path, or sent an unknown token. */
   | "not-cleared"
   | "coord-unreachable"
   | "absent"
