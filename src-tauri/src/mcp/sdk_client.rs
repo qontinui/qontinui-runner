@@ -8399,7 +8399,10 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nasync fn ").next())
             .expect("handle_ct_execute_with_diff present");
-        assert!(body.contains("Ok(data) => Json(guard_execute_with_diff(data)),"));
+        // The journey choke point reads the guarded value before replying,
+        // so the Ok arm binds it and the handler returns that same value.
+        assert!(body.contains("Ok(data) => guard_execute_with_diff(data),"));
+        assert!(body.contains("\n    Json(response)\n}"));
     }
 
     #[test]
