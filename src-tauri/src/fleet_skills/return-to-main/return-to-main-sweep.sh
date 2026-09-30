@@ -85,8 +85,20 @@
 #      flag. The complete set of mutating commands this script runs is:
 #        * `git update-ref` (into refs/wip/, never over an existing ref name it
 #          did not just compute);
-#        * `git checkout <branch>` / `git checkout -b <branch> origin/<branch>`;
-#        * `git merge --ff-only <upstream>`;
+#        * `git checkout --no-overwrite-ignore <branch>` /
+#          `git checkout --no-overwrite-ignore -b <branch> origin/<branch>`;
+#        * `git merge --ff-only --no-overwrite-ignore <upstream>`;
+#      and before the switch the sweep abstains `ignored_path_overwrite: <p>`
+#      when a path the switch or the fast-forward ADDS is already occupied on
+#      disk by something untracked -- an ignored file or symlink, a directory
+#      holding any untracked or ignored entry (a tracked directory upstream
+#      turns into a file), or an untracked file / symlink at a leading
+#      component -- git overwrites ignored files by default, and no snapshot
+#      holds them. "Tracked" is decided case-insensitively when
+#      core.ignorecase is true (an upstream case-only rename on NTFS/APFS is
+#      git's to handle). Under --restore-residue the same check runs BEFORE
+#      anything is restored. `--no-overwrite-ignore` is the backstop: git then
+#      refuses instead, and the row is FAILED with git's message.
 #        * ONLY under --fetch: `git fetch --prune --refmap= origin
 #          '+refs/heads/*:refs/remotes/origin/*'` — an EXPLICIT refspec AND an
 #          EMPTY refmap, so it writes refs/remotes/origin/* and FETCH_HEAD and
@@ -97,14 +109,19 @@
 #          FORCE-overwritten (unpushed commits lost) or the fetch aborted when
 #          the checked-out branch exists upstream; `--refmap=` makes git ignore
 #          the configured refspecs entirely (see 1b);
-#        * ONLY under --restore-residue, and only after the snapshot:
-#          `git --literal-pathspecs checkout --pathspec-from-file=- ...` over
-#          EXACTLY the files proven residue — literal, because a glob pathspec
-#          like `f[1].txt` also matches `f1.txt` and would revert a file nobody
-#          proved anything about (measured 2026-09-13).
-#      Each of those REFUSES rather than discards. `git stash create` appears,
-#      as a snapshot WRITER of a dangling commit that touches neither the tree
-#      nor the index — see below.
+#        * ONLY under --restore-residue, and only after the snapshot ref is
+#          written: `git --literal-pathspecs restore --source=HEAD --staged
+#          --worktree --pathspec-from-file=- ...` over EXACTLY the tracked
+#          files proven restorable — literal, because a glob pathspec like
+#          `f[1].txt` also matches `f1.txt` and would revert a file nobody
+#          proved anything about (measured 2026-09-13) — and then `rm -f --`
+#          of EXACTLY the untracked files proven byte-identical to the
+#          upstream tip, one path at a time (never `git clean`).
+#      Each of those REFUSES rather than discards. `git stash create`,
+#      `commit-tree`, and `update-index`/`write-tree` on a SCRATCH index
+#      (`GIT_INDEX_FILE` in the run's temp dir, never the checkout's) appear
+#      as snapshot WRITERS of dangling objects that touch neither the tree nor
+#      the index — see 1e.
 #   6. EVERY action AND EVERY abstention is logged. An abstention that leaves no
 #      trace is indistinguishable from a sweeper that never ran, which is §2.4's
 #      finding about `nightly-pull-all.ps1` reproduced one layer up.
@@ -250,24 +267,114 @@
 #      "landed" from "superseded" will eventually be used to prove something
 #      false. Naming the same repo BOTH ways is refused as incoherent.
 #      (plan 2026-09-16-land-evidence-has-no-superseded-arm, D1.)
-#   1e --restore-residue REPO (repeatable). A tree dirtied only by provisioner
-#      residue (files whose content is historical upstream, a runner bundle
-#      copy, or an EOL-only change, INSIDE the runner provisioner's footprint
-#      `.claude/commands/**` / `.claude/skills/**`) is restored — but ONLY when
-#      `dirty-provenance.sh --json <checkout>` exits 0 (every modified tracked
-#      file proven `restorable`: a residue class AND inside that footprint, so
-#      a deliberate revert or CRLF change anywhere else is never touched),
-#      every file in its payload carries `"restorable":true`, and that
-#      restorable set equals this script's own census of
-#      modified tracked files EXACTLY, every one of them is an UNSTAGED
-#      modification, and no untracked file is present (an untracked file would
-#      still force UNIQUE_WIP, so restoring would change the tree for nothing).
-#      Order: census + blob hashes, provenance, re-census + re-hash (unchanged),
-#      `git stash create`, verify the snapshot holds exactly those blobs,
-#      `update-ref` the snapshot, re-hash once more, then restore exactly those
-#      files, then classify as normal. Exit 1 (a UNIQUE file), 3 (UNKNOWN), a
-#      timeout or anything else is an abstention with the reason logged.
-#      Untracked files are never touched.
+#   1e --restore-residue REPO (repeatable). A tree dirtied only by content
+#      ALREADY ON the upstream default branch, or by provisioner residue, is
+#      restored to HEAD and then classified as normal. `dirty-provenance.sh`
+#      decides it by exact blob: UPSTREAM_CURRENT (every version equals the
+#      upstream TIP's blob and mode — restoring and fast-forwarding reproduces
+#      the same bytes) and UPSTREAM_HISTORICAL (the blob is in upstream
+#      history) are restorable ANYWHERE; EOL_ONLY and RUNNER_BUNDLE only inside
+#      the runner provisioner's footprint `.claude/commands/**` /
+#      `.claude/skills/**` (plan 2026-09-29, the sweep never clears WIP that is
+#      already on main). It acts ONLY when `dirty-provenance.sh --json
+#      <checkout>` exits 0, every file in its payload is a restorable class
+#      carrying `"restorable":true`, that set equals this script's own census
+#      of changed TRACKED entries EXACTLY (staged and unstaged: index side
+#      `.`/`M`/`A`/`D` with worktree side `.`/`M`/`D`; a type change, rename,
+#      copy, conflict or submodule still refuses), its `untracked_on_upstream`
+#      list (untracked files byte-identical to the tip) equals this script's
+#      census of UNTRACKED files EXACTLY (any other untracked file keeps the
+#      repo abstaining, `untracked_present`), and a path HEAD lacks (a staged
+#      add) is admitted only as UPSTREAM_CURRENT — its removal is undone by
+#      the fast-forward, byte for byte.
+#      THREE RULES THIS SCRIPT HOLDS ITSELF, whatever the prover says (defence
+#      in depth -- a prover bug must not be enough to lose bytes):
+#        * RAW BYTES. Every working-tree file (tracked and untracked) is hashed
+#          twice, as git stores it (clean filters, eol conversion) and with
+#          `--no-filters`. If the two differ, OR any conversion is in effect
+#          for the path (`check-attr` text/eol/filter/ident/
+#          working-tree-encoding set, the legacy `crlf` attribute in any
+#          state, or core.autocrlf `input` or any boolean true (yes/on/1; a
+#          malformed value fails closed) -- equal
+#          hashes do not prove the checkout writes the same bytes: an LF file
+#          under `eol=crlf` comes back CRLF), the stored blob is checked back
+#          out at that path (`cat-file --filters`); if that does not reproduce
+#          the raw bytes -- a lossy `filter=` driver, a mixed-EOL file, that LF
+#          file -- neither the proof nor the snapshot can give them back:
+#          abstain `filtered_content: <path>`. A pure CRLF<->LF conversion
+#          round-trips and is restored. Checked at every look.
+#        * STABLE ATTRIBUTES. That round trip is only meaningful under the
+#          attributes the restore and the fast-forward will use. So when a
+#          `.gitattributes` is itself dirty, or `git diff --name-only HEAD
+#          <upstream> -- '**/.gitattributes'` is non-empty (or unreadable),
+#          and ANY file the restore would write or unlink (deletions exempt:
+#          the fast-forward re-deletes them) has a conversion in effect under
+#          the current attributes OR the tip's (`check-attr --source`), abstain
+#          `attributes_unstable`. A repo whose attributes change upstream is
+#          thereby held only for converted files, not for good.
+#        * OCCUPIED PARENTS. A leading component of ANY path the restore
+#          touches that is a non-directory or a symlink on disk (an ignored
+#          file `a` where git has `a/b`) would be replaced by the restore, and
+#          no snapshot holds it: abstain `parent_path_occupied: <path>`.
+#        * OCCUPIED DELETIONS. A deletion (`?D`, `D?`) is a deletion only when
+#          nothing is at the path: an ignored file, or a directory holding only
+#          ignored files, is invisible to status and would be overwritten or
+#          removed by the restore -- abstain `deleted_path_occupied: <path>`.
+#        * THE DEFAULT BRANCH. "Restorable anywhere" presumes that a
+#          fast-forward reproducing the bytes CAN follow. That holds only on
+#          the upstream default branch: on a feature branch a deliberate
+#          `git checkout <old> -- file` revert would be discarded and, 14 days
+#          later, reaped. So when ANY file to be restored or unlinked lies
+#          outside the provisioner footprint (.claude/commands/**,
+#          .claude/skills/**), the checkout must be ON the default branch
+#          (origin/HEAD, else origin/main, else origin/master -- the
+#          classifier's order) -- else abstain `not_on_default_branch` -- AND
+#          HEAD must be an ancestor of origin/<default> (`merge-base
+#          --is-ancestor`), since a local default branch carrying commits
+#          upstream lacks gets no fast-forward either -- else abstain
+#          `no_fast_forward_follows`. That makes a fast-forward POSSIBLE, not
+#          certain: the classifier runs after the restore and may still
+#          abstain (or the fast-forward may be refused). A row whose restore
+#          ran but which did not end FAST_FORWARDED, RETURNED or NO_CHANGE
+#          (level with upstream: the restored bytes are the tip's) carries
+#          `residue_restored_no_ff: true`, and its reason names the snapshot
+#          ref that holds the pre-restore bytes.
+#        * SYMLINKS. A tracked entry whose index or working-tree mode is a
+#          symlink (120000), or an untracked symlink, abstains
+#          `symlink_entry: <path>`: the residue reaper refuses every symlink
+#          entry, so a restored one would sit in a snapshot nothing can
+#          retire. (The fingerprint hashes a symlink as its LINK TEXT, as
+#          `stash create` and `update-index` store it, should one appear
+#          between looks.)
+#      Each restored file's pre-restore working-tree blob id is logged
+#      (`residue_blobs`, "<blob> <path>", "deleted <path>" for a deletion), so
+#      the working state can be rebuilt from the object store even after the
+#      snapshot ref is reaped (while the objects survive gc).
+#      Order: census + fingerprint (every tracked record with its INDEX blob,
+#      every working-tree and untracked blob), provenance, re-census +
+#      re-fingerprint (unchanged), snapshot = `git stash create` (HEAD ^1,
+#      index ^2) plus, when untracked files are to be removed, an untracked
+#      parent ^3 built in a scratch index — the `git stash push -u` shape —
+#      verified to hold exactly the proven working-tree, index and untracked
+#      blobs, `update-ref` the snapshot, re-census + re-fingerprint once more,
+#      then ONE `git restore --source=HEAD --staged --worktree` over exactly the
+#      tracked paths and an explicit unlink of exactly the untracked ones.
+#      The fingerprint covers the untracked NAMES (sorted) as well as their
+#      blob ids, so a rename a -> b between two looks is a changed tree.
+#      THE WINDOWS THE SNAPSHOT CANNOT CLOSE, both guarded ONLY by the
+#      caller's QUIET quiesce gate (/return-to-main runs this under
+#      machine-quiesce-check.sh's QUIET verdict, or the per-repo override's idle
+#      test) -- no check inside this script can reach either:
+#        * anything written between the last look (the final re-census +
+#          re-fingerprint) and the restore/unlink is NOT in the snapshot, and
+#          the restore overwrites it;
+#        * an ABA change DURING the prover run -- a file changed and changed
+#          back between the first look and the second -- leaves h1 == h2, so
+#          the proof may have read content the fingerprints never saw. The
+#          proof then describes bytes that are no longer there, but the
+#          restore still acts only on bytes the fingerprints DID see.
+#      No ref, no restore. Exit 1 (a UNIQUE file), 3 (UNKNOWN), a timeout or
+#      anything else is an abstention with the reason logged.
 #
 # ---------------------------------------------------------------------------
 # THE DECISION TABLE — the interface, and the whole of the behaviour
@@ -296,7 +403,7 @@
 #   3 INCOMPLETE (adjudication or not)          nothing       ABSTAINED
 #   4 usage error from the classifier           nothing       ABSTAINED
 #   --restore-residue: provenance exit != 0,    no restore;   (then classified;
-#     list != census, staged/untracked/...      logged        dirty => ABSTAINED)
+#     list != census, unproven untracked/...    logged        dirty => ABSTAINED)
 #   --restore-residue: the restore itself       nothing more  FAILED
 #     errored after the snapshot
 #   `.git` is a FILE, or absent                 nothing       (not a candidate)
@@ -374,6 +481,8 @@
 #    "residue_outcome":"not_requested"|"nothing_to_restore"|"abstained"|
 #                      "would_restore"|"restored"|"failed",
 #    "residue_reason":…,"residue_provenance_exit":N,"residue_files":[…],
+#    "residue_untracked":[…],"residue_blobs":["<blob> <path>"|"deleted <path>",…],
+#    "residue_restored_no_ff":bool,
 #    "residue_wip_ref":…,"residue_wip_commit":…,
 #    "retention_gate":"pending"|null}
 #   `retention_gate` is "pending" exactly when the row names a snapshot that
@@ -422,8 +531,10 @@
 #                      `land-evidence.sh` output). Must be a readable file; its
 #                      path and sha256 are logged with every adjudicated row.
 #   --restore-residue REPO
-#                      restore REPO's modified tracked files when
-#                      `dirty-provenance.sh` proves every one of them residue.
+#                      restore REPO's changed tracked files (staged or not)
+#                      and remove its untracked files when
+#                      `dirty-provenance.sh` proves every one of them already
+#                      on the upstream default branch, or residue.
 #                      Repeatable. See 1e.
 #   --root DIR         workspace root (default: resolved; $QONTINUI_ROOT wins).
 #   --log FILE         JSONL log path (default <root>/.dev-logs/
@@ -942,7 +1053,7 @@ gw() { git -C "$NATIVE" "$@"; }
 # One decision record, from the current candidate's variables. Called exactly
 # once per candidate, on every path.
 emit_decision() {
-  log_line "{\"ts\":$(js "$(now_iso)"),\"event\":\"decision\",\"checkout\":$(js "$CO"),\"repo\":$(js "$REPO"),\"branch\":$(jsn "$BRANCH"),\"verdict\":$(jsn "$VERDICT"),\"verdict_source\":$(js "$VERDICT_SOURCE"),\"classifier_exit\":$(jn "$CRC"),\"action\":$(js "$ACTION"),\"reason\":$(js "$REASON"),\"default_branch\":$(jsn "$DEFAULT_BRANCH"),\"upstream_ref\":$(jsn "$UPSTREAM"),\"upstream_tip_age\":$(jsn "$UP_TIP_AGE"),\"upstream_fetched_at\":$(jsn "$UP_FETCHED_AT"),\"upstream_fetched_at_source\":$(jsn "$UP_FETCHED_SRC"),\"upstream_tip\":$(jsn "$UP_TIP"),\"ahead\":$(jn "$AHEAD"),\"behind\":$(jn "$BEHIND"),\"head_before\":$(jsn "$HEAD_BEFORE"),\"head_after\":$(jsn "$HEAD_AFTER"),\"wip_ref\":$(jsn "$WIP_REF"),\"wip_commit\":$(jsn "$WIP_COMMIT"),\"floor\":true,\"fetch_requested\":$(jb "$FETCH"),\"fetched\":$(jb "$FETCHED"),\"fetch_error\":$(jsn "$FETCH_ERR"),\"adjudicated_sha\":$(jsn "$ADJ_SHA"),\"adjudicated_kind\":$(jsn "$ADJ_KIND"),\"evidence\":$(jsn "$ADJ_EVIDENCE"),\"evidence_sha256\":$(jsn "$ADJ_EVIDENCE_SHA"),\"residue_outcome\":$(js "$RES_OUTCOME"),\"residue_reason\":$(jsn "$RES_REASON"),\"residue_provenance_exit\":$(jn "$RES_PROV_RC"),\"residue_files\":$(ja ${RES_FILES[@]+"${RES_FILES[@]}"}),\"residue_wip_ref\":$(jsn "$RES_WIP_REF"),\"residue_wip_commit\":$(jsn "$RES_WIP_COMMIT"),\"retention_gate\":$( { [ -n "$WIP_REF" ] || [ -n "$RES_WIP_REF" ]; } && js pending || printf 'null')}"
+  log_line "{\"ts\":$(js "$(now_iso)"),\"event\":\"decision\",\"checkout\":$(js "$CO"),\"repo\":$(js "$REPO"),\"branch\":$(jsn "$BRANCH"),\"verdict\":$(jsn "$VERDICT"),\"verdict_source\":$(js "$VERDICT_SOURCE"),\"classifier_exit\":$(jn "$CRC"),\"action\":$(js "$ACTION"),\"reason\":$(js "$REASON"),\"default_branch\":$(jsn "$DEFAULT_BRANCH"),\"upstream_ref\":$(jsn "$UPSTREAM"),\"upstream_tip_age\":$(jsn "$UP_TIP_AGE"),\"upstream_fetched_at\":$(jsn "$UP_FETCHED_AT"),\"upstream_fetched_at_source\":$(jsn "$UP_FETCHED_SRC"),\"upstream_tip\":$(jsn "$UP_TIP"),\"ahead\":$(jn "$AHEAD"),\"behind\":$(jn "$BEHIND"),\"head_before\":$(jsn "$HEAD_BEFORE"),\"head_after\":$(jsn "$HEAD_AFTER"),\"wip_ref\":$(jsn "$WIP_REF"),\"wip_commit\":$(jsn "$WIP_COMMIT"),\"floor\":true,\"fetch_requested\":$(jb "$FETCH"),\"fetched\":$(jb "$FETCHED"),\"fetch_error\":$(jsn "$FETCH_ERR"),\"adjudicated_sha\":$(jsn "$ADJ_SHA"),\"adjudicated_kind\":$(jsn "$ADJ_KIND"),\"evidence\":$(jsn "$ADJ_EVIDENCE"),\"evidence_sha256\":$(jsn "$ADJ_EVIDENCE_SHA"),\"residue_outcome\":$(js "$RES_OUTCOME"),\"residue_reason\":$(jsn "$RES_REASON"),\"residue_provenance_exit\":$(jn "$RES_PROV_RC"),\"residue_files\":$(ja ${RES_FILES[@]+"${RES_FILES[@]}"}),\"residue_untracked\":$(ja ${RES_UNTRACKED[@]+"${RES_UNTRACKED[@]}"}),\"residue_blobs\":$(ja ${RES_BLOBS[@]+"${RES_BLOBS[@]}"}),\"residue_restored_no_ff\":$(jb "$RES_NO_FF"),\"residue_wip_ref\":$(jsn "$RES_WIP_REF"),\"residue_wip_commit\":$(jsn "$RES_WIP_COMMIT"),\"retention_gate\":$( { [ -n "$WIP_REF" ] || [ -n "$RES_WIP_REF" ]; } && js pending || printf 'null')}"
 }
 
 # -- 1b: fetch ---------------------------------------------------------------
@@ -981,16 +1092,21 @@ _rtm_fetch() {
 }
 
 # -- 1e: residue restore -----------------------------------------------------
-# The census of modified TRACKED files, from `status --porcelain=v2 -z`, into
-# _RES_MOD. Returns 1 with _RES_WHY on any entry a residue restore does not
-# handle: only an UNSTAGED content modification (`.M`) of a regular tracked
-# file qualifies. A staged change, a deletion, a type change, a rename, an
-# unmerged entry or a submodule is refused -- a blob-provenance proof does not
-# cover it, and `git checkout -- <path>` restores from the INDEX, so a staged
-# change would survive the restore anyway.
+# The census of the dirty tree, from `status --porcelain=v2 -z -uall`:
+#   _RES_MOD   every changed TRACKED path (index side, worktree side or both);
+#   _RES_XY    its two-character XY, parallel to _RES_MOD;
+#   _RES_WT    the _RES_MOD paths that still have a working-tree file;
+#   _RES_UNTR  every untracked path;
+#   _RES_SIG   the tracked records themselves (XY, modes, HEAD and INDEX blob
+#              ids, path) -- so a staged blob that moves is a changed census.
+# Returns 1 with _RES_WHY on any entry a residue restore does not handle. The
+# admitted XY shapes are the ones dirty-provenance.sh classifies by blob: an
+# index side of `.` `M` `A` `D` combined with a worktree side of `.` `M` `D`.
+# A type change, a rename or copy, an unmerged entry, a submodule or a path
+# carrying a newline or a carriage return is refused -- no blob proof covers it.
 _res_census() {
-  _RES_MOD=(); _RES_UNTRACKED=0; _RES_WHY=""
-  local st="$RTM_SCRATCH/status" rec expect_orig=0 xy sub path
+  _RES_MOD=(); _RES_XY=(); _RES_WT=(); _RES_UNTR=(); _RES_SIG=""; _RES_WHY=""
+  local st="$RTM_SCRATCH/status" rec expect_orig=0 xy sub path _mi _mw
   if ! gr status --porcelain=v2 -z -uall > "$st"; then
     _RES_WHY="status_failed: git status failed in this checkout"; return 1
   fi
@@ -998,20 +1114,55 @@ _res_census() {
     if [ "$expect_orig" = 1 ]; then expect_orig=0; continue; fi
     case "$rec" in
       '# '*|'! '*) ;;
-      '? '*) _RES_UNTRACKED=$((_RES_UNTRACKED + 1)) ;;
+      '? '*)
+        path="${rec#? }"
+        # A newline or a CR: the snapshot check's `cat-file --batch-check`
+        # reads line-wise and strips a trailing CR, so neither can be verified.
+        case "$path" in *$'\n'*|*$'\r'*) _RES_WHY="unsupported_path: an untracked path contains a newline or a carriage return"; return 1 ;; esac
+        if _res_parent_blocked "$path"; then
+          _RES_WHY="parent_path_occupied: $path -- $_RES_BLOCKED is a file or symlink on disk where the path needs a directory"; return 1
+        fi
+        if [ -L "$CO/$path" ]; then
+          _RES_WHY="symlink_entry: $path is an untracked symlink; a symlink is never restored as residue (the reaper refuses every symlink entry)"; return 1
+        fi
+        _RES_UNTR+=("$path") ;;
       '1 '*)
         xy="${rec:2:2}"; sub="${rec:5:4}"
         # `1 XY sub mH mI mW hH hI <path>`: strip the eight leading fields
         # rather than split, because a path may contain spaces.
         path="${rec#* * * * * * * * }"
-        case "$path" in *$'\n'*) _RES_WHY="unsupported_path: a modified path contains a newline"; return 1 ;; esac
+        case "$path" in *$'\n'*|*$'\r'*) _RES_WHY="unsupported_path: a modified path contains a newline or a carriage return"; return 1 ;; esac
         case "$sub" in N*) ;; *) _RES_WHY="submodule_entry: $path is a submodule, which a residue restore never touches"; return 1 ;; esac
         case "$xy" in
-          .M) _RES_MOD+=("$path") ;;
-          .D) _RES_WHY="deleted_tracked_file: $path is deleted in the working tree; a blob-provenance proof cannot cover a deletion"; return 1 ;;
-          .T) _RES_WHY="type_changed: $path changed type (file/symlink); not a content modification"; return 1 ;;
-          *)  _RES_WHY="staged_change: $path has index status '$xy'; a residue restore replaces only UNSTAGED working-tree modifications and never touches the index"; return 1 ;;
-        esac ;;
+          .M|.D|M.|MM|MD|A.|AM|AD|D.) ;;
+          *T*) _RES_WHY="type_changed: $path changed type (file/symlink, status '$xy'); not a content modification"; return 1 ;;
+          *)   _RES_WHY="unsupported_status: $path has status '$xy', which no blob-provenance proof covers"; return 1 ;;
+        esac
+        # A leading component that is a non-directory or a symlink (an ignored
+        # file `a` where git has `a/b`) would be replaced by the restore, and
+        # no snapshot holds it -- for a deletion and for every other entry.
+        if _res_parent_blocked "$path"; then
+          _RES_WHY="parent_path_occupied: $path -- $_RES_BLOCKED is a file or symlink on disk where git has a directory, which a restore would replace"; return 1
+        fi
+        read -r _ _ _ _ _mi _mw _ <<< "${rec%%$'\n'*}"
+        case " $_mi $_mw " in *" 120000 "*)
+          _RES_WHY="symlink_entry: $path is a symlink in the index or the working tree; a symlink is never restored as residue (the reaper refuses every symlink entry)"; return 1 ;;
+        esac
+        [ -L "$CO/$path" ] && { _RES_WHY="symlink_entry: $path is a symlink on disk; a symlink is never restored as residue"; return 1; }
+        _RES_MOD+=("$path"); _RES_XY+=("$xy")
+        # No working-tree file when the worktree side deletes it (`?D`) or the
+        # index side does and the worktree agrees (`D.`) -- and a deletion is a
+        # deletion only when NOTHING is at the path. An ignored file (a `D.`
+        # whose file is back) or a directory of ignored files (`.D`) is
+        # invisible to status; the restore would overwrite or remove it.
+        case "$xy" in
+          ?D|D?)
+            if [ -e "$CO/$path" ] || [ -L "$CO/$path" ]; then
+              _RES_WHY="deleted_path_occupied: $path is deleted in git but something (an ignored file or a directory) occupies the path on disk, which a restore would overwrite or remove"; return 1
+            fi ;;
+          *) _RES_WT+=("$path") ;;
+        esac
+        _RES_SIG+="$rec"$'\n' ;;
       '2 '*) _RES_WHY="rename_or_copy: a renamed or copied entry is not a blob modification"; return 1 ;;
       'u '*) _RES_WHY="unmerged_entry: the index holds a conflict"; return 1 ;;
       *) _RES_WHY="unrecognised_status_record: '${rec:0:40}'"; return 1 ;;
@@ -1020,10 +1171,198 @@ _res_census() {
   return 0
 }
 
-# Working-tree blob ids for _RES_MOD, one per line in the same order (clean
-# filters applied, exactly as `git stash create` stores them).
+# _res_parent_blocked <path> -> 0 (_RES_BLOCKED set) when a leading component
+# of <path> is a non-directory or a symlink on disk.
+_res_parent_blocked() {
+  local rest="$1" pre=""
+  _RES_BLOCKED=""
+  while [ "${rest#*/}" != "$rest" ]; do
+    pre="${pre:+$pre/}${rest%%/*}"; rest="${rest#*/}"
+    if [ -L "$CO/$pre" ] || { [ -e "$CO/$pre" ] && [ ! -d "$CO/$pre" ]; }; then
+      _RES_BLOCKED="$pre"; return 0
+    fi
+  done
+  return 1
+}
+# _res_conv_read <source rev or ""> <path>... -> _RC[path]=1 for every path with
+# a conversion in effect (text, eol, filter, ident or working-tree-encoding set
+# to anything but unspecified/unset), under the working tree's attributes or,
+# given a rev, under that tree's (`check-attr --source`). _RC_ALL=1 when
+# core.autocrlf is true/input (every text file converts) or the read failed
+# (fail closed).
+declare -A _RC=()
+_RC_ALL=0
+# _res_autocrlf_converts -> 0 when core.autocrlf makes every text file convert:
+# `input`, or ANY boolean true git accepts (true/yes/on/1). Unset -> 1; a read
+# that errors (a malformed value) -> 0, fail closed.
+_res_autocrlf_converts() {
+  local raw rc b
+  raw="$(gr config --get core.autocrlf)"; rc=$?
+  [ "$rc" = 1 ] && return 1
+  [ "$rc" = 0 ] || return 0
+  case "$raw" in [Ii][Nn][Pp][Uu][Tt]) return 0 ;; esac
+  b="$(gr config --type=bool --get core.autocrlf)" || return 0
+  [ "$b" = true ]
+}
+_res_conv_read() {
+  local src="$1" p a v f="$RTM_SCRATCH/checkattr"
+  shift
+  _RC=(); _RC_ALL=0
+  if _res_autocrlf_converts; then _RC_ALL=1; return 0; fi
+  [ $# -gt 0 ] || return 0
+  if [ -n "$src" ]; then
+    printf '%s\0' "$@" | git --no-optional-locks -C "$NATIVE" check-attr -z --stdin --source="$src" text eol crlf filter ident working-tree-encoding > "$f" 2>/dev/null \
+      || { _RC_ALL=1; return 0; }
+  else
+    printf '%s\0' "$@" | git --no-optional-locks -C "$NATIVE" check-attr -z --stdin text eol crlf filter ident working-tree-encoding > "$f" 2>/dev/null \
+      || { _RC_ALL=1; return 0; }
+  fi
+  while IFS= read -r -d '' p && IFS= read -r -d '' a && IFS= read -r -d '' v; do
+    # The legacy `crlf` attribute counts in ANY state but unspecified
+    # (`-crlf` included: conservative).
+    case "$a:$v" in *:unspecified) continue ;; crlf:*) ;; *:unset) continue ;; esac
+    _RC["$p"]=1
+  done < "$f"
+}
+# _res_attrs_stable -> 1 (with _RES_WHY) when the attributes the round trip
+# was judged under are not the ones the restore / fast-forward will use (a
+# dirty .gitattributes, or one HEAD and origin/<default> disagree on) AND a
+# file the restore writes or unlinks has a conversion under either.
+_res_attrs_stable() {
+  local why="" defb up d p
+  local -a paths
+  _RES_WHY=""
+  for p in ${_RES_MOD[@]+"${_RES_MOD[@]}"} ${_RES_UNTR[@]+"${_RES_UNTR[@]}"}; do
+    case "$p" in .gitattributes|*/.gitattributes) why="$p is itself dirty"; break ;; esac
+  done
+  defb="$(_res_default_branch)"; up=""
+  [ -n "$defb" ] && up="refs/remotes/origin/$defb"
+  if [ -z "$why" ] && [ -n "$up" ]; then
+    d="$(gr diff --name-only HEAD "$up" -- ':(glob)**/.gitattributes')" || d="<diff failed>"
+    [ -z "$d" ] || why="a .gitattributes differs between HEAD and origin/$defb (${d%%$'\n'*})"
+  fi
+  [ -n "$why" ] || return 0
+  paths=(${_RES_WT[@]+"${_RES_WT[@]}"} ${_RES_UNTR[@]+"${_RES_UNTR[@]}"})
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  _res_conv_read "" "${paths[@]}"
+  for p in "${paths[@]}"; do
+    if [ "$_RC_ALL" = 1 ] || [ -n "${_RC[$p]+s}" ]; then
+      _RES_WHY="attributes_unstable: $why, and $p has a conversion in effect under the current attributes, so whether its bytes round-trip was decided under attributes the restore / fast-forward will not use"; return 1
+    fi
+  done
+  if [ -z "$up" ]; then
+    _RES_WHY="attributes_unstable: $why, and no origin/<default> resolves to read the tip's attributes"; return 1
+  fi
+  _res_conv_read "$up" "${paths[@]}"
+  for p in "${paths[@]}"; do
+    if [ "$_RC_ALL" = 1 ] || [ -n "${_RC[$p]+s}" ]; then
+      _RES_WHY="attributes_unstable: $why, and $p has a conversion in effect under origin/$defb's attributes, so the fast-forward may write it differently from what the round trip was judged under"; return 1
+    fi
+  done
+  return 0
+}
+
+# The fingerprint every race check compares: the tracked census records (which
+# carry each INDEX blob id and path), then the untracked NAMES sorted (so a
+# rename a -> b between looks changes it), then the blob id of every
+# working-tree file the census names -- tracked ones still on disk, then
+# untracked ones -- one per line, clean filters applied exactly as
+# `git stash create` / `update-index --add` store them. The blob ids are LAST:
+# the snapshot check reads them with `tail`.
+# Every file is ALSO hashed with `--no-filters`. Where the raw hash differs
+# from the stored one (a clean filter, eol conversion), OR a conversion is in
+# effect for the path (_res_conv_read -- equal hashes do not prove the checkout
+# writes the same bytes: an LF file under eol=crlf comes back CRLF), the stored
+# blob is
+# checked back out at that path (_res_smudge_reproduces: what the restore, the
+# fast-forward and a snapshot apply all write); only when THAT does not
+# reproduce the raw bytes -- a lossy filter, a mixed-EOL file -- does it return
+# 2 with the path in $RTM_SCRATCH/filtered: neither the proof nor the snapshot
+# could give those bytes back. A pure CRLF<->LF conversion round-trips and
+# passes, so a core.autocrlf box stays restorable. Returns 1 (and no usable
+# fingerprint) on a failed hash.
 _res_hashes() {
-  printf '%s\n' "${_RES_MOD[@]}" | git --no-optional-locks -C "$NATIVE" hash-object --stdin-paths 2>/dev/null
+  local out raw n i
+  local -a ol rl al
+  printf '%s' "$_RES_SIG"
+  [ ${#_RES_UNTR[@]} -eq 0 ] || printf 'untracked-name %s\n' "${_RES_UNTR[@]}" | LC_ALL=C sort
+  n=$(( ${#_RES_WT[@]} + ${#_RES_UNTR[@]} ))
+  [ "$n" -eq 0 ] && return 0
+  al=(${_RES_WT[@]+"${_RES_WT[@]}"} ${_RES_UNTR[@]+"${_RES_UNTR[@]}"})
+  # `--stdin-paths` C-unquotes a line starting with `"` (so `"a"` would hash
+  # the file `a`) and follows a symlink, while `stash create` / `update-index`
+  # store its LINK TEXT; it also strips a trailing CR from each line. Those
+  # paths are hashed one at a time: a quote- or backslash-leading name, or one
+  # holding a CR, on argv; a symlink as its link text.
+  local -a bl=() bi=()
+  for i in "${!al[@]}"; do
+    if [ -L "$CO/${al[$i]}" ]; then ol[$i]="L"
+    else case "${al[$i]}" in '"'*|'\'*|*$'\r'*) ol[$i]="A" ;; *) bl+=("${al[$i]}"); bi+=("$i") ;; esac; fi
+  done
+  if [ "${#bl[@]}" -gt 0 ]; then
+    local -a bo br
+    mapfile -t bo < <(printf '%s\n' "${bl[@]}" | git --no-optional-locks -C "$NATIVE" hash-object --stdin-paths 2>/dev/null)
+    mapfile -t br < <(printf '%s\n' "${bl[@]}" | git --no-optional-locks -C "$NATIVE" hash-object --no-filters --stdin-paths 2>/dev/null)
+    [ "${#bo[@]}" = "${#bl[@]}" ] && [ "${#br[@]}" = "${#bl[@]}" ] || return 1
+    for i in "${!bi[@]}"; do ol[${bi[$i]}]="${bo[$i]}"; rl[${bi[$i]}]="${br[$i]}"; done
+  fi
+  local lt
+  for i in "${!al[@]}"; do
+    case "${ol[$i]:-}" in
+      L) lt="$(readlink -- "$CO/${al[$i]}")" || return 1
+         ol[$i]="$(printf '%s' "$lt" | git --no-optional-locks -C "$NATIVE" hash-object --stdin 2>/dev/null)" || return 1
+         rl[$i]="${ol[$i]}" ;;
+      A) ol[$i]="$(git --no-optional-locks -C "$NATIVE" hash-object -- "${al[$i]}" 2>/dev/null)" || return 1
+         rl[$i]="$(git --no-optional-locks -C "$NATIVE" hash-object --no-filters -- "${al[$i]}" 2>/dev/null)" || return 1 ;;
+    esac
+  done
+  out="$(printf '%s\n' "${ol[@]}")"
+  _res_conv_read "" "${al[@]}"
+  for i in "${!al[@]}"; do
+    [ -n "${ol[$i]}" ] || return 1
+    [ -L "$CO/${al[$i]}" ] && continue
+    if { [ "${ol[$i]}" != "${rl[$i]}" ] || [ "$_RC_ALL" = 1 ] || [ -n "${_RC[${al[$i]}]+s}" ]; } && ! _res_smudge_reproduces "${al[$i]}" "${ol[$i]}" "${rl[$i]}"; then
+      printf '%s' "${al[$i]}" > "$RTM_SCRATCH/filtered" 2>/dev/null
+      return 2
+    fi
+  done
+  printf '%s\n' "$out"
+}
+# _res_smudge_reproduces <path> <stored blob> <raw hash> -> 0 when git's
+# checkout of <blob> at <path> (`cat-file --filters`: smudge + eol conversion)
+# is byte-identical to the raw bytes. Per file, and only for files whose two
+# hashes differ or that have a conversion in effect: `cat-file --batch --filters` frames its output with the
+# PRE-filter size, so it cannot be parsed. A blob the object store lacks fails
+# closed (it is never written here).
+_res_smudge_reproduces() {
+  local sm
+  [ -n "$2" ] && [ -n "$3" ] || return 1
+  git --no-optional-locks -C "$NATIVE" cat-file -e "$2" 2>/dev/null || return 1
+  sm="$(set -o pipefail; git --no-optional-locks -C "$NATIVE" cat-file --filters --path="$1" "$2" 2>/dev/null \
+        | git --no-optional-locks -C "$NATIVE" hash-object --no-filters --stdin 2>/dev/null)" || return 1
+  [ -n "$sm" ] && [ "$sm" = "$3" ]
+}
+# _res_hash_why <rc> -> the abstention reason for a failed/filtered fingerprint
+_res_hash_why() {
+  if [ "$1" = 2 ]; then
+    printf 'filtered_content: %s: checking the stored blob back out (clean filter / eol conversion) does not reproduce the on-disk bytes, so a restore would lose bytes that neither the proof nor the snapshot can give back' "$(cat "$RTM_SCRATCH/filtered" 2>/dev/null)"
+  else
+    printf 'hash_failed: could not read the blob id of every changed or untracked file'
+  fi
+}
+# The upstream default branch, resolved as the classifier resolves it:
+# refs/remotes/origin/HEAD, else origin/main, else origin/master. Empty when
+# none resolves.
+_res_default_branch() {
+  local r
+  r="$(gr symbolic-ref -q --short refs/remotes/origin/HEAD)"
+  if [ -n "$r" ] && gr rev-parse -q --verify "$r^{commit}" >/dev/null; then
+    case "$r" in origin/*) printf '%s' "${r#origin/}"; return 0 ;; esac
+  fi
+  for r in main master; do
+    gr rev-parse -q --verify "refs/remotes/origin/$r^{commit}" >/dev/null && { printf '%s' "$r"; return 0; }
+  done
+  return 0
 }
 
 # JSON string unescape for a dirty-provenance path: only \\ \" and \/ are
@@ -1039,9 +1378,99 @@ _json_unescape_path() {
   printf '%s' "${s//$'\x01'/\\}"
 }
 
+# `"untracked_on_upstream": ["p", ...]` from the provenance payload, into
+# _RES_UOU. Returns 2 when the key is absent (a prover predating it, which
+# therefore proves no untracked file), 1 when the array cannot be read -- a
+# string at a time, anchored, so a `]` or `,` inside a path is not a delimiter.
+_res_parse_untracked_on_upstream() {
+  _RES_UOU=()
+  local rest re_key re_str re_end p
+  re_key='"untracked_on_upstream"[[:space:]]*:[[:space:]]*\['
+  [[ "$1" =~ $re_key ]] || return 2
+  rest="${1#*"${BASH_REMATCH[0]}"}"
+  re_end='^[[:space:]]*\]'
+  re_str='^[[:space:]]*"(([^"\\]|\\.)*)"[[:space:]]*(,|\])'
+  [[ "$rest" =~ $re_end ]] && return 0
+  while [[ "$rest" =~ $re_str ]]; do
+    p="$(_json_unescape_path "${BASH_REMATCH[1]}")" || return 1
+    _RES_UOU+=("$p")
+    [ "${BASH_REMATCH[3]}" = "]" ] && return 0
+    rest="${rest:${#BASH_REMATCH[0]}}"
+  done
+  return 1
+}
+
+# _rtm_ignored_collision <branch> <default branch> <upstream ref> [detached]
+#   -> 0 (IGN_HIT set) when a path the branch switch or the fast-forward would
+# ADD is already occupied on disk by something untracked -- an ignored file or
+# symlink, a DIRECTORY holding any untracked or ignored entry (a tracked
+# directory that upstream turns into a file), or an untracked file / symlink at
+# one of its leading components. git overwrites ignored files on checkout and
+# merge by default, and no snapshot holds them. A diff that cannot be read
+# counts as a collision (fail closed).
+# "Tracked" is decided case-INsensitively when core.ignorecase is true: on
+# NTFS/APFS an upstream case-only rename (readme.md -> README.md) makes the
+# tracked readme.md answer `-e README.md`, and it is git's to replace.
+# Paths in IGN_EXCLUDE (the untracked files a residue restore is about to
+# unlink) are not occupants.
+declare -A IGN_EXCLUDE=()
+_rtm_ignored_collision() {
+  local br="$1" defb="$2" up="$3" det="${4:-false}" t p rest pre magic="literal" u
+  local -a targets=("$up")
+  IGN_HIT=""
+  [ "$(gr config --type=bool --get core.ignorecase)" = true ] && magic="literal,icase"
+  if [ "$br" != "$defb" ] || [ "$det" = true ]; then
+    gr rev-parse --verify --quiet "refs/heads/$defb" >/dev/null && targets+=("refs/heads/$defb")
+  fi
+  [ -n "$RTM_SCRATCH" ] && [ -d "$RTM_SCRATCH" ] || { IGN_HIT="<no scratch dir to read the incoming paths into>"; return 0; }
+  for t in "${targets[@]}"; do
+    if ! gr diff --name-only -z --no-renames --diff-filter=A HEAD "$t" > "$RTM_SCRATCH/incoming"; then
+      IGN_HIT="<git diff HEAD $t failed>"; return 0
+    fi
+    while IFS= read -r -d '' p; do
+      if [ -d "$CO/$p" ] && [ ! -L "$CO/$p" ]; then
+        # A directory where the target has a file: anything untracked or
+        # ignored inside it is removed with it.
+        gr ls-files -z --others -- ":($magic)$p/" > "$RTM_SCRATCH/occupants" || { IGN_HIT="<git ls-files --others $p failed>"; return 0; }
+        while IFS= read -r -d '' u; do
+          [ -n "${IGN_EXCLUDE[$u]+s}" ] && continue
+          IGN_HIT="$p (a directory holding the untracked or ignored $u)"; return 0
+        done < "$RTM_SCRATCH/occupants"
+      elif { [ -e "$CO/$p" ] || [ -L "$CO/$p" ]; } && [ -z "${IGN_EXCLUDE[$p]+s}" ] \
+           && [ -z "$(gr ls-files -- ":($magic)$p")" ]; then
+        IGN_HIT="$p"; return 0
+      fi
+      rest="$p"; pre=""
+      while [ "${rest#*/}" != "$rest" ]; do
+        pre="${pre:+$pre/}${rest%%/*}"; rest="${rest#*/}"
+        if { [ -L "$CO/$pre" ] || { [ -e "$CO/$pre" ] && [ ! -d "$CO/$pre" ]; }; } \
+           && [ -z "${IGN_EXCLUDE[$pre]+s}" ] && [ -z "$(gr ls-files -- ":($magic)$pre")" ]; then
+          IGN_HIT="$pre (a leading component of the incoming $p)"; return 0
+        fi
+      done
+    done < "$RTM_SCRATCH/incoming"
+  done
+  return 1
+}
+
+# _res_same_list <array name> <array name> -> 0 when the two IN-MEMORY arrays
+# hold the same elements in the same order. Element by element, so it never
+# compares two command substitutions (check #73).
+_res_same_list() {
+  local -n _sl_a="$1" _sl_b="$2"
+  local i
+  [ "${#_sl_a[@]}" -eq "${#_sl_b[@]}" ] || return 1
+  for i in "${!_sl_a[@]}"; do
+    [ -n "${_sl_b[$i]+s}" ] && [ "${_sl_a[$i]}" = "${_sl_b[$i]}" ] || return 1
+  done
+  return 0
+}
+
 _rtm_restore_residue() {
-  local gd pj prc h1 h2 h3 stash n i p b msg ref err re_p re_c re_r rest
-  local -a pp cc rr census_sorted prov_sorted
+  local gd pj prc h1 h2 h3 hrc stash n nu i p b msg ref err re_p re_c re_r rest uou_rc outside defb
+  local base_tree base_head base_index utree ucommit uidx snap chk expect got rec xy hidx wi
+  local -a pp cc rr census_sorted prov_sorted untr_sorted uou_sorted absent wth rb
+  local -A class_of=()
   RES_OUTCOME="abstained"
   if [ -z "$DIRTY_PROV" ]; then
     RES_REASON="dirty_provenance_unavailable: no dirty-provenance.sh beside this sweep (or at \$QONTINUI_DIRTY_PROVENANCE_BIN), so no file can be PROVEN residue"
@@ -1064,28 +1493,36 @@ _rtm_restore_residue() {
 
   # -- census #1 and the blob ids the proof must be about --------------------
   if ! _res_census; then RES_REASON="$_RES_WHY"; return 0; fi
-  n=${#_RES_MOD[@]}
-  if [ "$n" -eq 0 ]; then
+  n=${#_RES_MOD[@]}; nu=${#_RES_UNTR[@]}
+  if [ "$n" -eq 0 ] && [ "$nu" -eq 0 ]; then
     RES_OUTCOME="nothing_to_restore"
-    RES_REASON="no tracked file is modified$([ "$_RES_UNTRACKED" -gt 0 ] && printf ' (%s untracked file(s) are present and are never touched)' "$_RES_UNTRACKED")"
+    RES_REASON="no tracked file is changed and no untracked file is present"
     return 0
   fi
-  if [ "$_RES_UNTRACKED" -gt 0 ]; then
-    RES_REASON="untracked_present: $_RES_UNTRACKED untracked file(s) are present. They are never removed, and they force UNIQUE_WIP on their own, so restoring the $n residue file(s) would change the tree without enabling a return"
+  mapfile -t census_sorted < <(printf '%s\n' ${_RES_MOD[@]+"${_RES_MOD[@]}"} | LC_ALL=C sort -u)
+  mapfile -t untr_sorted < <(printf '%s\n' ${_RES_UNTR[@]+"${_RES_UNTR[@]}"} | LC_ALL=C sort -u)
+  [ "$n" -eq 0 ] && census_sorted=()
+  [ "$nu" -eq 0 ] && untr_sorted=()
+  # A path both changed-tracked and untracked (a staged deletion re-created on
+  # disk) would be restored from HEAD and then unlinked: refuse the shape.
+  if [ "$n" -gt 0 ] && [ "$nu" -gt 0 ] \
+     && [ -n "$(LC_ALL=C comm -12 <(printf '%s\n' "${census_sorted[@]}") <(printf '%s\n' "${untr_sorted[@]}"))" ]; then
+    RES_REASON="path_collision: a path is both a changed tracked entry and an untracked file"
     return 0
   fi
-  h1="$(_res_hashes)"
-  if [ "$(printf '%s\n' "$h1" | grep -c .)" != "$n" ]; then
-    RES_REASON="hash_failed: could not read the blob id of every modified file"
+  h1="$(_res_hashes)"; hrc=$?
+  if [ "$hrc" != 0 ]; then
+    RES_REASON="$(_res_hash_why "$hrc")"
     return 0
   fi
+  if ! _res_attrs_stable; then RES_REASON="$_RES_WHY"; return 0; fi
 
   # -- the proof -------------------------------------------------------------
   pj="$(_rtm_timeout "$PROV_TIMEOUT" bash "$DIRTY_PROV" --json "$CO" 2>/dev/null)"; prc=$?
   RES_PROV_RC="$prc"
   case "$prc" in
     0) ;;
-    1) RES_REASON="residue_unique: dirty-provenance.sh exited 1 -- $(jget_n "$pj" unique_count) modified tracked file(s) are UNIQUE content and $(jget_n "$pj" outside_footprint_count) residue-class file(s) are outside the provisioner footprint (.claude/commands/**, .claude/skills/**); neither is ever restored (run \`dirty-provenance.sh --json $CO\` for the list)"; return 0 ;;
+    1) RES_REASON="residue_unique: dirty-provenance.sh exited 1 -- $(jget_n "$pj" unique_count) changed tracked file(s) are UNIQUE content (never on the upstream default branch) and $(jget_n "$pj" outside_footprint_count) EOL-only/runner-bundle file(s) are outside the provisioner footprint (.claude/commands/**, .claude/skills/**); none of those is ever restored, and one of them keeps the whole repo as it is (run \`dirty-provenance.sh --summary $CO\` for the list)"; return 0 ;;
     3) RES_REASON="residue_unknown: dirty-provenance.sh exited 3 -- a probe could not decide (UNKNOWN/INCOMPLETE), and an undecided file is never restored"; return 0 ;;
     4) RES_REASON="residue_usage: dirty-provenance.sh reported a usage error on this checkout"; return 0 ;;
     124) RES_REASON="residue_timeout: dirty-provenance.sh did not finish within ${PROV_TIMEOUT}s"; return 0 ;;
@@ -1097,6 +1534,13 @@ _rtm_restore_residue() {
   # disagreement -- including a payload this parser cannot read -- abstains.
   if [ "$(jget_n "$pj" all_residue)" != true ] || [ "$(jget_n "$pj" unique_count)" != 0 ]; then
     RES_REASON="provenance_inconsistent: exit 0 but all_residue=$(jget_n "$pj" all_residue) unique_count=$(jget_n "$pj" unique_count)"
+    return 0
+  fi
+  # The untracked list comes first and is cut out of the payload, so the
+  # files[] walk below never reads into it.
+  _res_parse_untracked_on_upstream "$pj"; uou_rc=$?
+  if [ "$uou_rc" = 1 ]; then
+    RES_REASON="provenance_unparseable: the payload's untracked_on_upstream array could not be read"
     return 0
   fi
   re_p='"path"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
@@ -1127,79 +1571,227 @@ _rtm_restore_residue() {
   fi
   for i in ${cc[@]+"${!cc[@]}"}; do
     case "${cc[$i]}" in
-      UPSTREAM_HISTORICAL|RUNNER_BUNDLE|EOL_ONLY) ;;
-      *) RES_REASON="provenance_not_residue: ${pp[$i]:-a file} is classed '${cc[$i]}', which is not a residue class"; return 0 ;;
+      UPSTREAM_CURRENT|UPSTREAM_HISTORICAL|RUNNER_BUNDLE|EOL_ONLY) ;;
+      *) RES_REASON="provenance_not_residue: ${pp[$i]:-a file} is classed '${cc[$i]}', which is neither already-on-main nor a residue class"; return 0 ;;
     esac
     # The restore list must be EXACTLY the restorable set: one non-restorable
-    # file (a residue class outside the provisioner footprint) stops it all.
+    # file stops it all.
     if [ "${rr[$i]}" != true ]; then
-      RES_REASON="provenance_not_restorable: ${pp[$i]:-a file} is '${cc[$i]}' but restorable=${rr[$i]} (outside the provisioner footprint), so nothing is restored"; return 0
+      RES_REASON="provenance_not_restorable: ${pp[$i]:-a file} is '${cc[$i]}' but restorable=${rr[$i]}, so nothing is restored"; return 0
     fi
+    class_of["${pp[$i]}"]="${cc[$i]}"
   done
-  mapfile -t census_sorted < <(printf '%s\n' "${_RES_MOD[@]}" | LC_ALL=C sort -u)
   mapfile -t prov_sorted < <(printf '%s\n' ${pp[@]+"${pp[@]}"} | LC_ALL=C sort -u)
+  [ "${#pp[@]}" -eq 0 ] && prov_sorted=()
   if [ "${#pp[@]}" != "$n" ] || [ "${#prov_sorted[@]}" != "$n" ] \
-     || [ "$(printf '%s\n' "${census_sorted[@]}")" != "$(printf '%s\n' ${prov_sorted[@]+"${prov_sorted[@]}"})" ]; then
-    RES_REASON="provenance_census_mismatch: dirty-provenance.sh proved ${#pp[@]} file(s) residue but this checkout has $n modified tracked file(s), and the two lists are not identical; only an exact match is restored"
+     || ! _res_same_list census_sorted prov_sorted; then
+    RES_REASON="provenance_census_mismatch: dirty-provenance.sh proved ${#pp[@]} tracked file(s) restorable but this checkout has $n changed tracked file(s), and the two lists are not identical; only an exact match is restored"
     return 0
   fi
+  # Untracked: the prover's tip-equal list must be EXACTLY this census's
+  # untracked list. Any other untracked file is content nothing upstream has
+  # at that path; it is never removed, and it forces UNIQUE_WIP on its own.
+  mapfile -t uou_sorted < <(printf '%s\n' ${_RES_UOU[@]+"${_RES_UOU[@]}"} | LC_ALL=C sort -u)
+  [ "${#_RES_UOU[@]}" -eq 0 ] && uou_sorted=()
+  if [ "${#_RES_UOU[@]}" != "$nu" ] || [ "${#uou_sorted[@]}" != "$nu" ] \
+     || ! _res_same_list untr_sorted uou_sorted; then
+    RES_REASON="untracked_present: $nu untracked file(s) are present and dirty-provenance.sh proved ${#_RES_UOU[@]} of them byte-identical to the upstream tip$([ "$uou_rc" = 2 ] && printf ' (its payload carries no untracked_on_upstream list at all)'); an untracked file is removed only when EVERY one is proven, since any other forces UNIQUE_WIP on its own and the restore would change the tree without enabling a return"
+    return 0
+  fi
+  # A path HEAD does not have (a staged add) is admitted ONLY when it is
+  # UPSTREAM_CURRENT: restoring it deletes it, and only a tip-equal file is
+  # guaranteed to come back, byte for byte, with the fast-forward.
+  absent=()
+  if [ "$n" -gt 0 ]; then
+    while IFS= read -r chk; do
+      case "$chk" in *' missing') p="${chk#HEAD:}"; absent+=("${p% missing}") ;; esac
+    done < <(printf 'HEAD:%s\n' "${_RES_MOD[@]}" | gr cat-file --batch-check='%(objectname)')
+    for p in ${absent[@]+"${absent[@]}"}; do
+      if [ "${class_of[$p]:-}" != UPSTREAM_CURRENT ]; then
+        RES_REASON="absent_from_head_not_current: $p is not in HEAD and is classed '${class_of[$p]:-?}'; a path HEAD lacks is removed only when it is byte-identical to the upstream tip"
+        return 0
+      fi
+    done
+  fi
 
-  RES_FILES=("${_RES_MOD[@]}")
+  # "Restorable anywhere" presumes a fast-forward that reproduces the bytes,
+  # which only the default branch gets. Outside the provisioner footprint a
+  # restore is therefore allowed only there (see 1e in the header).
+  # The switch / fast-forward that may follow must not overwrite an ignored
+  # file either -- checked HERE, before anything is restored, so a collision
+  # abstains with the tree untouched (the classifier's arm checks again). The
+  # untracked files this restore unlinks are not occupants.
+  defb="$(_res_default_branch)"
+  if [ -n "$defb" ]; then
+    IGN_EXCLUDE=()
+    for p in ${_RES_UNTR[@]+"${_RES_UNTR[@]}"}; do IGN_EXCLUDE["$p"]=1; done
+    if _rtm_ignored_collision "${BRANCH_PRE:-HEAD}" "$defb" "refs/remotes/origin/$defb" "$([ "${BRANCH_PRE:-HEAD}" = HEAD ] && echo true || echo false)"; then
+      RES_REASON="ignored_path_overwrite: $IGN_HIT -- the switch to $defb or the fast-forward to origin/$defb that would follow this restore adds a tracked path where an ignored (or untracked) file sits on disk; nothing restored"
+      IGN_EXCLUDE=(); return 0
+    fi
+    IGN_EXCLUDE=()
+  fi
+  outside=""
+  for p in ${_RES_MOD[@]+"${_RES_MOD[@]}"} ${_RES_UNTR[@]+"${_RES_UNTR[@]}"}; do
+    case "$p" in .claude/commands/?*|.claude/skills/?*) ;; *) outside="$p"; break ;; esac
+  done
+  if [ -n "$outside" ]; then
+    if [ -z "$defb" ] || [ "${BRANCH_PRE:-}" != "$defb" ]; then
+      RES_REASON="not_on_default_branch: residue outside the provisioner footprint is restored only on ${defb:-<the default branch, which does not resolve>}, where the fast-forward reproduces it ($outside is outside .claude/commands/** and .claude/skills/**; this checkout is on ${BRANCH_PRE:-<unknown>})"
+      return 0
+    fi
+    # On the default branch by NAME is not enough: a local default carrying
+    # commits upstream lacks gets no fast-forward either.
+    if ! gr merge-base --is-ancestor HEAD "refs/remotes/origin/$defb"; then
+      RES_REASON="no_fast_forward_follows: HEAD is not an ancestor of origin/$defb (local $defb carries commits upstream lacks, or the check failed), so no fast-forward would reproduce residue outside the provisioner footprint ($outside)"
+      return 0
+    fi
+  fi
+
+  RES_FILES=(${_RES_MOD[@]+"${_RES_MOD[@]}"})
+  RES_UNTRACKED=(${_RES_UNTR[@]+"${_RES_UNTR[@]}"})
   if [ "$DRY_RUN" = 1 ]; then
     RES_OUTCOME="would_restore"
-    RES_REASON="all $n modified tracked file(s) proven residue by dirty-provenance.sh; a live run would snapshot them to refs/wip/return-to-main/<stamp>-<repo>-residue and restore them"
+    RES_REASON="all $n changed tracked file(s) and $nu untracked file(s) proven already on the upstream default branch or residue by dirty-provenance.sh; a live run would snapshot them to refs/wip/return-to-main/<stamp>-<repo>-residue, restore the tracked ones to HEAD (index and working tree) and unlink the untracked ones"
     return 0
   fi
 
   # -- the tree must not have moved while the proof ran ----------------------
-  if ! _res_census || [ "$(printf '%s\n' "${_RES_MOD[@]}" | LC_ALL=C sort -u)" != "$(printf '%s\n' "${census_sorted[@]}")" ] \
-     || [ "$_RES_UNTRACKED" -gt 0 ]; then
-    RES_REASON="raced_dirty: the set of modified files changed while dirty-provenance.sh ran${_RES_WHY:+ ($_RES_WHY)}"
+  # Re-census (its status checked), then compare the in-memory lists element by
+  # element -- no probe output is compared, so two failed reads cannot agree.
+  local -a mod_now=() untr_now=()
+  local census_ok=0
+  if _res_census; then
+    census_ok=1
+    mapfile -t mod_now < <(printf '%s\n' ${_RES_MOD[@]+"${_RES_MOD[@]}"} | LC_ALL=C sort -u)
+    mapfile -t untr_now < <(printf '%s\n' ${_RES_UNTR[@]+"${_RES_UNTR[@]}"} | LC_ALL=C sort -u)
+    [ "${#_RES_MOD[@]}" -eq 0 ] && mod_now=()
+    [ "${#_RES_UNTR[@]}" -eq 0 ] && untr_now=()
+  fi
+  if [ "$census_ok" != 1 ] || [ "${#mod_now[@]}" != "$n" ] || [ "${#untr_now[@]}" != "$nu" ] \
+     || ! _res_same_list mod_now census_sorted || ! _res_same_list untr_now untr_sorted; then
+    RES_REASON="raced_dirty: the set of changed or untracked files changed while dirty-provenance.sh ran${_RES_WHY:+ ($_RES_WHY)}"
     return 0
   fi
-  h2="$(_res_hashes)"
-  if [ "$h2" != "$h1" ]; then
-    RES_REASON="raced_dirty: a modified file's content changed while dirty-provenance.sh ran, so the proof is about content that is no longer there"
+  h2="$(_res_hashes)"; hrc=$?
+  if [ "$hrc" = 2 ]; then RES_REASON="$(_res_hash_why 2)"; return 0; fi
+  if [ "$hrc" != 0 ] || [ "$h2" != "$h1" ]; then
+    RES_REASON="raced_dirty: a changed file's index or working-tree content, or an untracked file's content, changed while dirty-provenance.sh ran, so the proof is about content that is no longer there"
     return 0
   fi
 
   # -- the snapshot, verified, BEFORE anything is restored ---------------------
-  stash="$(gr stash create "return-to-main-sweep residue snapshot: $REPO")"; stash="${stash//[$'\r'$'\n']/}"
-  if [ -z "$stash" ]; then
-    RES_REASON="snapshot_failed: \`git stash create\` produced nothing although $n tracked file(s) are modified"
-    return 0
+  # `git stash create` records HEAD (^1), the index (^2) and the tracked
+  # working tree (its own tree), and writes nothing but objects. It omits
+  # untracked files, so when there are any the snapshot gains the untracked
+  # parent `git stash push -u` writes (^3): a parentless commit whose tree is
+  # exactly those files, built in a scratch index that is never the checkout's.
+  base_head="$(gr rev-parse --verify --quiet 'HEAD^{commit}')"
+  if [ -z "$base_head" ]; then
+    RES_REASON="snapshot_failed: HEAD does not resolve to a commit"; return 0
   fi
-  i=0
-  while IFS= read -r p; do
-    b="$(MSYS_NO_PATHCONV=1 gr rev-parse --verify --quiet "$stash:${_RES_MOD[$i]}")"
-    if [ -z "$b" ] || [ "$b" != "$p" ]; then
-      RES_REASON="snapshot_mismatch: the snapshot $stash does not hold the proven blob of ${_RES_MOD[$i]}; nothing restored"
+  stash=""
+  if [ "$n" -gt 0 ]; then
+    stash="$(gr stash create "return-to-main-sweep residue snapshot: $REPO")"; stash="${stash//[$'\r'$'\n']/}"
+    if [ -z "$stash" ]; then
+      RES_REASON="snapshot_failed: \`git stash create\` produced nothing although $n tracked file(s) are changed"
       return 0
     fi
-    i=$((i + 1))
-  done <<< "$h1"
+  fi
+  snap="$stash"
+  if [ "$nu" -gt 0 ]; then
+    if [ -n "$stash" ]; then
+      base_tree="$stash^{tree}"; base_index="$stash^2"
+    else
+      base_tree="$base_head^{tree}"
+      base_index="$(gw commit-tree -p "$base_head" -m "index on ${BRANCH_PRE:-HEAD}: return-to-main-sweep residue snapshot" "$base_head^{tree}" 2>/dev/null)"
+      [ -n "$base_index" ] || { RES_REASON="snapshot_failed: could not write the index commit of the untracked snapshot"; return 0; }
+    fi
+    uidx="$(native_path_w "$RTM_SCRATCH/untracked.index")"
+    rm -f "$RTM_SCRATCH/untracked.index"
+    if ! printf '%s\0' "${_RES_UNTR[@]}" | GIT_INDEX_FILE="$uidx" gw update-index --add -z --stdin 2>/dev/null \
+       || ! utree="$(GIT_INDEX_FILE="$uidx" gw write-tree 2>/dev/null)" || [ -z "$utree" ] \
+       || ! ucommit="$(gw commit-tree -m "untracked files on ${BRANCH_PRE:-HEAD}: return-to-main-sweep residue snapshot" "$utree" 2>/dev/null)" || [ -z "$ucommit" ] \
+       || ! snap="$(gw commit-tree -p "$base_head" -p "$base_index" -p "$ucommit" \
+                     -m "On ${BRANCH_PRE:-HEAD}: return-to-main-sweep residue snapshot: $REPO" "$base_tree" 2>/dev/null)" \
+       || [ -z "$snap" ]; then
+      rm -f "$RTM_SCRATCH/untracked.index"
+      RES_REASON="snapshot_failed: could not write the untracked parent of the snapshot, and an untracked file is never removed without one"
+      return 0
+    fi
+    rm -f "$RTM_SCRATCH/untracked.index"
+  fi
+  # Verify, in one batch, that the snapshot holds exactly the proven content:
+  # every working-tree file (and every working-tree deletion) in its tree, every
+  # index blob (and every staged deletion) in ^2, every untracked blob in ^3.
+  expect=""; chk=""; wi=0; rb=()
+  mapfile -t wth < <(printf '%s' "$h1" | tail -n "$(( ${#_RES_WT[@]} + nu ))")
+  [ $(( ${#_RES_WT[@]} + nu )) -eq 0 ] && wth=()
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    xy="${rec:2:2}"; p="${rec#* * * * * * * * }"
+    read -r _ _ _ _ _ _ _ hidx _ <<< "$rec"
+    case "$xy" in
+      ?D|D?) chk+="$snap:$p"$'\n'; expect+="$snap:$p missing"$'\n'; rb+=("deleted $p") ;;
+      *)  chk+="$snap:$p"$'\n'; expect+="${wth[$wi]}"$'\n'; rb+=("${wth[$wi]} $p"); wi=$((wi + 1)) ;;
+    esac
+    case "$xy" in
+      D?) chk+="$snap^2:$p"$'\n'; expect+="$snap^2:$p missing"$'\n' ;;
+      *)  chk+="$snap^2:$p"$'\n'; expect+="$hidx"$'\n' ;;
+    esac
+  done <<< "$_RES_SIG"
+  for p in ${_RES_UNTR[@]+"${_RES_UNTR[@]}"}; do
+    chk+="$snap^3:$p"$'\n'; expect+="${wth[$wi]}"$'\n'; rb+=("${wth[$wi]} $p"); wi=$((wi + 1))
+  done
+  if [ -n "$chk" ]; then
+    got="$(printf '%s' "$chk" | gr cat-file --batch-check='%(objectname)')"
+    if [ "$got"$'\n' != "$expect" ]; then
+      RES_REASON="snapshot_mismatch: the snapshot $snap does not hold exactly the proven working-tree, index and untracked content; nothing restored"
+      return 0
+    fi
+  fi
   ref="refs/wip/return-to-main/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || printf 'nostamp')-$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9._-' '_')-residue"
-  msg="return-to-main-sweep: $REPO residue restore on ${BRANCH_PRE:-<unknown branch>} -- $n file(s) proven residue by dirty-provenance.sh (exit 0); undo with: git stash apply $stash"
-  if ! gw update-ref --create-reflog -m "$msg" "$ref" "$stash" 2>/dev/null \
-     && ! gw update-ref -m "$msg" "$ref" "$stash" 2>/dev/null; then
-    RES_REASON="snapshot_failed: could not write $ref -> $stash, and residue is never restored without a recoverable ref"
+  msg="return-to-main-sweep: $REPO residue restore on ${BRANCH_PRE:-<unknown branch>} -- $n tracked + $nu untracked file(s) proven on-main/residue by dirty-provenance.sh (exit 0); undo with: git stash apply --index $snap"
+  if ! gw update-ref --create-reflog -m "$msg" "$ref" "$snap" 2>/dev/null \
+     && ! gw update-ref -m "$msg" "$ref" "$snap" 2>/dev/null; then
+    RES_REASON="snapshot_failed: could not write $ref -> $snap, and nothing is restored without a recoverable ref"
     return 0
   fi
-  RES_WIP_REF="$ref"; RES_WIP_COMMIT="$stash"
+  RES_WIP_REF="$ref"; RES_WIP_COMMIT="$snap"
+  RES_BLOBS=(${rb[@]+"${rb[@]}"})
 
   # -- last look, then restore EXACTLY those files -----------------------------
-  h3="$(_res_hashes)"
-  if [ "$h3" != "$h1" ]; then
-    RES_REASON="raced_dirty: a proven file changed after the snapshot was written; nothing restored (the snapshot $ref is kept)"
+  # The fingerprint carries the untracked NAMES, so a rename between the
+  # snapshot and here (a -> b) fails this check rather than unlinking b.
+  if ! _res_census; then
+    RES_REASON="raced_dirty: the tree changed shape after the snapshot was written${_RES_WHY:+ ($_RES_WHY)}; nothing restored (the snapshot $ref is kept)"
     return 0
   fi
-  if ! err="$(printf '%s\0' "${_RES_MOD[@]}" | gw --literal-pathspecs checkout --pathspec-from-file=- --pathspec-file-nul 2>&1)"; then
+  h3="$(_res_hashes)"; hrc=$?
+  if [ "$hrc" = 2 ]; then RES_REASON="$(_res_hash_why 2); nothing restored (the snapshot $ref is kept)"; return 0; fi
+  if [ "$hrc" != 0 ] || [ "$h3" != "$h1" ]; then
+    RES_REASON="raced_dirty: a proven file changed (or an untracked file was renamed) after the snapshot was written; nothing restored (the snapshot $ref is kept)"
+    return 0
+  fi
+  # ONE mutation for every tracked path, staged or not: HEAD's version into the
+  # index AND the working tree. A staged add (absent from HEAD, admitted above
+  # only as UPSTREAM_CURRENT) leaves both; a deletion comes back from HEAD.
+  if [ "$n" -gt 0 ] \
+     && ! err="$(printf '%s\0' "${_RES_MOD[@]}" | gw --literal-pathspecs restore --source=HEAD --staged --worktree --pathspec-from-file=- --pathspec-file-nul 2>&1)"; then
     RES_OUTCOME="failed"
-    RES_REASON="restore_failed: git checkout of the $n proven file(s) errored: ${err:0:300} (nothing forced or retried; $ref holds the pre-restore content)"
+    RES_REASON="restore_failed: git restore of the $n proven tracked file(s) errored: ${err:0:300} (nothing forced or retried; $ref holds the pre-restore content)"
     return 0
   fi
+  # Untracked: an explicit unlink of exactly the proven paths, never `git clean`.
+  for p in ${_RES_UNTR[@]+"${_RES_UNTR[@]}"}; do
+    if ! err="$(rm -f -- "$CO/$p" 2>&1)"; then
+      RES_OUTCOME="failed"
+      RES_REASON="restore_failed: could not unlink the proven untracked file $p: ${err:0:300} ($ref holds its content at ^3)"
+      return 0
+    fi
+  done
   RES_OUTCOME="restored"
-  RES_REASON="restored $n file(s) proven residue by dirty-provenance.sh; snapshot $ref -> $stash"
+  RES_REASON="restored $n tracked file(s) to HEAD and unlinked $nu untracked file(s), all proven already on the upstream default branch or residue by dirty-provenance.sh; snapshot $ref -> $snap"
   N_RES_RESTORED=$((N_RES_RESTORED + 1))
   return 0
 }
@@ -1214,7 +1806,7 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
   UP_TIP_AGE=""; UP_FETCHED_AT=""; UP_FETCHED_SRC=""; UP_TIP=""; AHEAD=""; BEHIND=""
   FETCHED=false; FETCH_ERR=""
   VERDICT_SOURCE="classifier"; ADJ_SHA=""; ADJ_REASON=""; ADJ_EVIDENCE=""; ADJ_EVIDENCE_SHA=""; ADJ_KIND=""
-  RES_OUTCOME="not_requested"; RES_REASON=""; RES_WIP_REF=""; RES_WIP_COMMIT=""; RES_FILES=(); RES_PROV_RC=""
+  RES_OUTCOME="not_requested"; RES_REASON=""; RES_WIP_REF=""; RES_WIP_COMMIT=""; RES_FILES=(); RES_UNTRACKED=(); RES_BLOBS=(); RES_PROV_RC=""; RES_NO_FF=false
   PRE_ACTION=""; PRE_REASON=""
 
   # An EMPTY conversion must never reach git: `git -C ""` is a documented NO-OP
@@ -1413,6 +2005,12 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
         REASON="already on $DEFAULT_BRANCH and level with $UPSTREAM ($AGES)"
         N_NOCHANGE=$((N_NOCHANGE + 1))
         HEAD_AFTER="$HEAD_NOW"
+      elif IGN_EXCLUDE=(); _rtm_ignored_collision "$BRANCH" "$DEFAULT_BRANCH" "$UPSTREAM" "${DETACHED:-false}"; then
+        # git overwrites IGNORED files on checkout and merge; nothing snapshots
+        # them. Refused before any ref is written.
+        ACTION="ABSTAINED"
+        REASON="ignored_path_overwrite: $IGN_HIT -- the switch to $DEFAULT_BRANCH or the fast-forward to $UPSTREAM adds a tracked path where an ignored (or untracked) file sits on disk, and git would overwrite it with nothing holding its bytes"
+        N_ABSTAIN=$((N_ABSTAIN + 1))
       else
         # -- THE SNAPSHOT, before anything mutates ------------------------------
         # `git stash create` runs first as a READ and as the third race check:
@@ -1478,9 +2076,9 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
             elif gr rev-parse --verify --quiet "refs/heads/$DEFAULT_BRANCH" >/dev/null; then
               # Plain `checkout`: no -f, no -B. It REFUSES on a tree it would
               # have to discard rather than discarding it.
-              _switch_err="$(gw checkout --quiet "$DEFAULT_BRANCH" 2>&1)" || _switched=-1
+              _switch_err="$(gw checkout --quiet --no-overwrite-ignore "$DEFAULT_BRANCH" 2>&1)" || _switched=-1
             else
-              _switch_err="$(gw checkout --quiet -b "$DEFAULT_BRANCH" "$UPSTREAM" 2>&1)" || _switched=-1
+              _switch_err="$(gw checkout --quiet --no-overwrite-ignore -b "$DEFAULT_BRANCH" "$UPSTREAM" 2>&1)" || _switched=-1
             fi
 
             if [ "$_switched" = -1 ]; then
@@ -1509,7 +2107,7 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
               # changed or the count is non-zero or UNKNOWN, and `--ff-only`
               # against an already-level upstream is a documented no-op success.
               _ff_err=""
-              if _ff_err="$(gw merge --ff-only "$UPSTREAM" 2>&1)"; then
+              if _ff_err="$(gw merge --ff-only --no-overwrite-ignore "$UPSTREAM" 2>&1)"; then
                 if [ "$_switched" = 0 ]; then
                   ACTION="FAST_FORWARDED"
                   REASON="on $DEFAULT_BRANCH, fast-forwarded to $UPSTREAM ($AGES)$ADJ_NOTE"
@@ -1526,7 +2124,11 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
                 # default branch and still behind -- a state a reader must not
                 # have to infer.
                 ACTION="FAILED"
-                REASON="switched to $DEFAULT_BRANCH but the fast-forward to $UPSTREAM was refused: $_ff_err (no merge was created; snapshot $WIP_REF -> $HEAD_NOW)"
+                if [ "$_switched" = 0 ]; then
+                  REASON="on $DEFAULT_BRANCH, but the fast-forward to $UPSTREAM was refused: $_ff_err (no merge was created; snapshot $WIP_REF -> $HEAD_NOW)"
+                else
+                  REASON="switched to $DEFAULT_BRANCH but the fast-forward to $UPSTREAM was refused: $_ff_err (no merge was created; snapshot $WIP_REF -> $HEAD_NOW)"
+                fi
                 N_FAILED=$((N_FAILED + 1))
               fi
             fi
@@ -1542,6 +2144,15 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
     esac
   fi
 
+  # A restore that ran but was not followed by a fast-forward: the restored
+  # files hold HEAD's bytes, and only the snapshot holds what was there.
+  if [ "$RES_OUTCOME" = restored ]; then
+    case "$ACTION" in
+      FAST_FORWARDED|RETURNED|NO_CHANGE) ;;
+      *) RES_NO_FF=true
+         REASON="$REASON; residue_restored_no_ff: the residue restore ran but no fast-forward followed (action $ACTION), so the pre-restore bytes are held only by the snapshot ${RES_WIP_REF:-<none>}" ;;
+    esac
+  fi
   [ -n "$HEAD_AFTER" ] || HEAD_AFTER="$(gr rev-parse HEAD)"
   _vcol="$VERDICT"
   case "$VERDICT_SOURCE" in
