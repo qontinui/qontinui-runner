@@ -45,6 +45,10 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     // exactly as the Fleet view does, and carries no input byte by
     // construction (`ProbeFrameSink`).
     "remote_interactivity_probe",
+    // END a session on another device under an attach grant (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3) — the
+    // door a headless harness / UI Bridge drives.
+    "remote_session_end",
 ];
 
 // ============================================================================
@@ -418,6 +422,42 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .clone();
             let terminals = tm.list();
             TauriInvokeResponse::ok(serde_json::json!({ "terminals": terminals }))
+        }
+
+        "remote_session_end" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                device_id: String,
+                session_id: String,
+                #[serde(default)]
+                force: bool,
+            }
+            let a = match serde_json::from_value::<Args>(req.args) {
+                Ok(v) => v,
+                Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
+            };
+            let tm: Arc<TerminalManager> = state
+                .app_handle
+                .state::<Arc<TerminalManager>>()
+                .inner()
+                .clone();
+            let base = crate::commands::remote_attach::coord_base_for(&state.app_handle);
+            match crate::commands::remote_end::end_remote_session(
+                &tm,
+                &base,
+                &a.device_id,
+                &a.session_id,
+                a.force,
+            )
+            .await
+            {
+                Ok(result) => match serde_json::to_value(&result) {
+                    Ok(v) => TauriInvokeResponse::ok(v),
+                    Err(e) => TauriInvokeResponse::err(format!("serialize: {}", e)),
+                },
+                Err(e) => TauriInvokeResponse::err(e),
+            }
         }
 
         // ── config / accounts ────────────────────────────────────────────────

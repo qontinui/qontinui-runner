@@ -1962,7 +1962,7 @@ async fn handle_inbound<S>(
                     // closes the remote terminal it announced
                     // (`deliver_create_reply`), and a full reply lane ends the
                     // connection through `end_connection`.
-                    if msg_type == "terminal_create" {
+                    if runs_off_read_loop(msg_type) {
                         let api_state = api_state.clone();
                         let writer = writer.clone();
                         let end_connection = end_connection.clone();
@@ -2644,6 +2644,13 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_flow",
     "remote_terminal_flow",
     "terminal_create",
+    // Plan `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 1:
+    // END the grant's session (graceful `/exit`, or a hard close on `force`).
+    // No new capability — an attach grant already admits `terminal_input`, so
+    // its holder can type `/exit` today (D3). The handler resolves the
+    // terminal from the grant ROW's session and binds nothing
+    // (`remote_terminal::admit_terminal_end`).
+    "terminal_end",
 ];
 
 /// SOURCE role — the RETURN path for panes THIS runner opened on another
@@ -2673,6 +2680,11 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
     // Listed anyway, so a relay that ever echoes the block does not reopen it.
     "remote_terminal_created",
     "remote_terminal_attached",
+    // The answer to a `remote_terminal_end` (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3). The
+    // relay rebuilds it from the target's `terminal_ended`; listed for the
+    // same hedge reason as `remote_terminal_created` above.
+    "remote_terminal_ended",
     "remote_terminal_output",
     "remote_terminal_exit",
     "remote_terminal_buffer",
@@ -2944,6 +2956,9 @@ async fn handle_relay_command(
         // `remote_terminal_attach` that way, correlated by `request_id`.
         // --------------------------------------------------------------
         "terminal_attach" => handle_terminal_attach(api_state, data).await,
+        // Runs OFF the read loop (`runs_off_read_loop`): a graceful end waits
+        // up to `graceful_exit::DEFAULT_DEADLINE` (60 s), past the keepalive.
+        "terminal_end" => handle_terminal_end(api_state, data).await,
         "terminal_detach" => handle_terminal_detach(data),
         // A source's `set_paused` toggle, applied to this target's per-grant
         // `EmissionGate` (Phase 5). Both spellings route here on purpose: the
@@ -2963,8 +2978,12 @@ async fn handle_relay_command(
         // and replied correctly, leaving it running there unattached.
         // Observed on merytshost 2026-09-18; coord finding a5f08a4d.
         // `a_relay_shaped_created_reply_passes_admission` pins the relay's shape.
+        // `remote_terminal_ended` is listed from its first day for exactly that
+        // reason — the answer to a `remote_terminal_end` (plan
+        // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3).
         "remote_terminal_created"
         | "remote_terminal_attached"
+        | "remote_terminal_ended"
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
@@ -4637,6 +4656,25 @@ fn terminal_gone_after_confirm(
 /// succeed against.
 const REMOTE_CREATE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Frame types whose handler runs in its OWN task rather than on the relay's
+/// serial read loop, replying through the writer.
+///
+/// - `terminal_create` — see the comment at the spawn site.
+/// - `terminal_end` — a graceful end waits up to
+///   `graceful_exit::DEFAULT_DEADLINE` (60 s) for `claude` to leave, which is
+///   longer than the keepalive tolerates (`STALE_INBOUND_TIMEOUT`): awaited
+///   inline it would drop the relay socket and stall every other terminal's
+///   frames for the whole wait (plan
+///   `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 1).
+///
+/// Their replies go through [`deliver_create_reply`], which closes an orphaned
+/// remote create and otherwise only sends.
+const SPAWNED_OFF_READ_LOOP: &[&str] = &["terminal_create", "terminal_end"];
+
+fn runs_off_read_loop(msg_type: &str) -> bool {
+    SPAWNED_OFF_READ_LOOP.contains(&msg_type)
+}
+
 /// Send a spawned `terminal_create`'s reply, and deal with a reply that cannot
 /// be sent. Returns `true` when the caller must END the connection.
 ///
@@ -4680,7 +4718,7 @@ where
             );
             close_terminal(terminal_id).await;
         }
-        None => warn!("Failed to send terminal_create reply: {}", e),
+        None => warn!("Failed to send a spawned relay reply: {}", e),
     }
     matches!(e, RelayWriteError::ReplyLaneFull)
 }
@@ -5420,6 +5458,157 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
         "ring_start_offset": ring_start_offset,
         "total_bytes_produced": total_bytes,
     }))
+}
+
+/// TARGET role: a SOURCE device asks to END one of our sessions under its
+/// attach grant (plan `2026-09-30-close-remote-sessions-from-the-local-runner`,
+/// Phase 1). Runs in its own task (`runs_off_read_loop`).
+///
+/// Admission is `admit_terminal_end`: the terminal comes from the grant ROW's
+/// session, a named terminal is only compared, a missing `remote` block is
+/// refused, and the grant is never bound. `force: false` runs
+/// `TerminalManager::graceful_exit` (types `/exit` only at an empty prompt,
+/// never kills a `claude` that outlives the deadline); `force: true` is the
+/// hard `tm.close`. Either close funnels through `close_with_deadline` /
+/// `close_inner`, which emits the pane's ordinary `terminal-exit` — the path
+/// that retires an OPEN tab on the source (relay `terminal_exit` →
+/// `remote_terminal_exit`), and that this handler does not duplicate.
+async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    use crate::mcp::remote_terminal::{
+        admit_terminal_end, execute_terminal_end, grants, now_epoch_secs, terminal_ended_frame,
+        AdmittedEnd, EndOutcome, EndVerdict,
+    };
+    let Some(tm) = api_state
+        .app_handle
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|s| s.inner().clone())
+    else {
+        return Some(serde_json::json!({
+            "type": "error",
+            "message": "TerminalManager not available",
+            "request_id": data.get("request_id"),
+            "remote": crate::mcp::remote_terminal::remote_echo(data),
+        }));
+    };
+    let force = data.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let gate = || {
+        admit_terminal_end(
+            grants(),
+            crate::settings::get_remote_attach_preference,
+            data,
+            now_epoch_secs(),
+            |session_id| resolve_local_terminal(tm.as_ref(), session_id),
+        )
+    };
+    let admitted = match gate() {
+        Ok(admitted) => admitted,
+        Err(frame) => {
+            // The ONE refusal worth a coord re-read, exactly as
+            // `handle_terminal_attach` carries it: the source mints a FRESH
+            // grant to end an unattached session and presents it at once, so
+            // the frame can beat the `attach_request` directive here (finding
+            // a5f08a4d). Same family, same throttle; this runs in its own task,
+            // so the bounded wait stalls no other frame.
+            let Some(jti) = crate::mcp::remote_terminal::reread_decision(
+                &frame,
+                crate::mcp::remote_terminal::GrantFamily::Attach,
+                now_epoch_secs(),
+            ) else {
+                return Some(frame);
+            };
+            let Some(registry) = api_state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone())
+            else {
+                return Some(frame);
+            };
+            crate::session::attach::catch_up_now_within(
+                &registry,
+                crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT,
+            )
+            .await;
+            crate::mcp::remote_terminal::finish_grant_reread(now_epoch_secs());
+            match gate() {
+                Ok(admitted) => {
+                    crate::mcp::remote_terminal::clear_grant_reread(
+                        crate::mcp::remote_terminal::GrantFamily::Attach,
+                        &jti,
+                    );
+                    admitted
+                }
+                Err(frame) => return Some(frame),
+            }
+        }
+    };
+
+    let (grant, terminal_id) = match admitted {
+        AdmittedEnd::NotLocal { grant, .. } => {
+            let verdict = EndVerdict {
+                outcome: EndOutcome::NotFound,
+                via: None,
+                reason: Some(
+                    "session_not_local: no local terminal hosts that coord session".to_string(),
+                ),
+            };
+            return Some(terminal_ended_frame(
+                data,
+                Some(grant.session_id),
+                None,
+                &verdict,
+            ));
+        }
+        AdmittedEnd::Terminal {
+            grant, terminal_id, ..
+        } => (grant, terminal_id),
+    };
+
+    info!(
+        grant_jti = %grant.grant_jti,
+        source_device = %grant.source_device_id,
+        session = %grant.session_id,
+        terminal_id = %terminal_id,
+        force,
+        "remote end: admitted — ending the grant's session"
+    );
+    let graceful_tm = tm.clone();
+    let graceful_id = terminal_id.clone();
+    let close_tm = tm.clone();
+    let close_id = terminal_id.clone();
+    let verdict = execute_terminal_end(
+        force,
+        move || async move {
+            graceful_tm
+                .graceful_exit(
+                    &graceful_id,
+                    crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+                )
+                .await
+        },
+        move || async move {
+            match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
+                Ok(result) => result,
+                Err(e) => Err(format!("close task failed: {e}")),
+            }
+        },
+    )
+    .await;
+    info!(
+        grant_jti = %grant.grant_jti,
+        session = %grant.session_id,
+        terminal_id = %terminal_id,
+        outcome = verdict.outcome.as_str(),
+        via = ?verdict.via,
+        reason = ?verdict.reason,
+        "remote end: answered"
+    );
+    Some(terminal_ended_frame(
+        data,
+        Some(grant.session_id),
+        Some(&terminal_id),
+        &verdict,
+    ))
 }
 
 /// TARGET role, Phase 5: the SOURCE's `EmissionGate` (relayed as
@@ -7689,6 +7878,7 @@ mod remote_admission_tests {
             "terminal_detach",
             "terminal_flow",
             "remote_terminal_flow",
+            "terminal_end",
         ] {
             assert!(
                 remote_frame_admitted(t, &with_grant(json!({ "type": t }))),
@@ -7708,6 +7898,7 @@ mod remote_admission_tests {
         for t in [
             "remote_terminal_created",
             "remote_terminal_attached",
+            "remote_terminal_ended",
             "remote_terminal_output",
             "remote_terminal_exit",
             "remote_terminal_buffer",
@@ -8067,6 +8258,78 @@ mod relay_routing_tests {
         let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
         assert_eq!(msg_type, "terminal_create");
         assert_eq!(data, frame);
+    }
+
+    /// `terminal_end` ends a session: admitted under an ATTACH grant (D3 — its
+    /// holder can already type `/exit`), never under a CREATE grant, which
+    /// buys exactly one spawn.
+    #[test]
+    fn terminal_end_is_admitted_under_an_attach_grant_only() {
+        let mut attach = json!({ "type": "terminal_end", "force": false });
+        attach["remote"] = attach_block();
+        assert!(super::remote_frame_admitted("terminal_end", &attach));
+        let mut create = json!({ "type": "terminal_end", "force": true });
+        create["remote"] = create_block();
+        assert!(
+            !super::remote_frame_admitted("terminal_end", &create),
+            "a create grant must not end a session"
+        );
+    }
+
+    /// A graceful end waits up to 60 s for `claude` to leave — longer than the
+    /// keepalive tolerates. It must run in its own task like `terminal_create`,
+    /// or one slow `/exit` drops the relay socket and stalls every other
+    /// terminal's frames for the whole wait. Pinned on the predicate the read
+    /// loop consults AND on the read loop consulting it.
+    #[test]
+    fn a_graceful_end_never_runs_on_the_serial_read_loop() {
+        assert!(super::runs_off_read_loop("terminal_end"));
+        assert!(super::runs_off_read_loop("terminal_create"));
+        for inline in [
+            "terminal_input",
+            "terminal_attach",
+            "terminal_close",
+            "heartbeat",
+        ] {
+            assert!(!super::runs_off_read_loop(inline), "{inline}");
+        }
+        const SRC: &str = include_str!("backend_relay.rs");
+        let read_loop = SRC
+            .find("async fn handle_inbound<S>(")
+            .expect("read loop not found");
+        let body = SRC.get(read_loop..).expect("char boundary");
+        let spawn_site = body
+            .find("if runs_off_read_loop(msg_type) {")
+            .expect("the read loop must consult runs_off_read_loop");
+        let inline_site = body
+            .find("let response = handle_relay_command(&api_state, msg_type, &data).await;")
+            .expect("inline dispatch not found");
+        assert!(
+            spawn_site < inline_site,
+            "the spawn branch must be decided BEFORE the inline dispatch"
+        );
+    }
+
+    /// The relay's `remote_terminal_ended` — rebuilt from the target's
+    /// `terminal_ended` with no `remote` block — must reach the dispatch arm
+    /// unchanged, and with an echoed block must not be refused one gate early.
+    #[test]
+    fn a_relay_shaped_ended_reply_passes_admission() {
+        let relay_shaped = json!({
+            "type": "remote_terminal_ended",
+            "request_id": "rid-e1",
+            "session_id": "00000000-0000-0000-0000-000000000007",
+            "terminal_id": null,
+            "outcome": "not_found",
+        });
+        let (msg_type, data) =
+            dispatched(route_relay_frame("remote_terminal_ended", &relay_shaped));
+        assert_eq!(msg_type, "remote_terminal_ended");
+        assert_eq!(data, relay_shaped, "routing must not reshape the frame");
+        let mut echoed = relay_shaped.clone();
+        echoed["remote"] = attach_block();
+        let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_ended", &echoed));
+        assert_eq!(msg_type, "remote_terminal_ended");
     }
 }
 
