@@ -129,14 +129,24 @@ pub mod env_agent;
 // declaring the whole `util` directory here would not compile.
 pub mod util {
     pub mod error_chain;
-    // The EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` is
-    // compiled into both crates, and both copies must stamp the SAME static
-    // the bin's heartbeat reads — so every caller spells it
-    // `qontinui_runner_lib::util::fd_exhaustion`, and the bin's own
+    // The spawn-failure classifier (fd / commit / no_system_resources /
+    // task_limit), its per-episode event, the cached memory reading and the
+    // EMFILE/ENFILE stamp. LIB-only on purpose: `process_helpers` is compiled
+    // into both crates, and both copies must stamp the SAME statics the bin's
+    // heartbeat and the allocator breadcrumb read — so every caller spells it
+    // `qontinui_runner_lib::util::resource_exhaustion`, and the bin's own
     // `util/mod.rs` must NOT declare it (a second declaration is a second,
     // half-blind static).
-    pub mod fd_exhaustion;
+    pub mod resource_exhaustion;
 }
+
+// The allocation-failure breadcrumb (plan
+// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+// Phase 0): the `GlobalAlloc` wrapper the runner bin registers in `main.rs`,
+// and the pre-opened `wedge-incidents.log` handle its failure arm writes
+// through. In the LIB so the wrapper and `util::resource_exhaustion` share ONE
+// handle; only the runner bin registers the allocator.
+pub mod alloc_breadcrumb;
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI

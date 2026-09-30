@@ -1132,6 +1132,12 @@ const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// to keep from being clobbered. They answer TRUE: skip provisioning, leave
 /// the tree alone. `Status` and `SpawnError` keep FALSE, so the behaviour of
 /// every case reachable before this change is unchanged.
+///
+/// [`DegradeReason::CommitExhaustionSuspected`] joins the TRUE side: it used
+/// to arrive here as `Status`, but it is not git's answer — git never listed
+/// anything, its own child launch failed for want of commit (plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+/// Phase 0). It is evidence of nothing, so it withholds the clearance.
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     use crate::process_helpers::{run_probe_quiet, DegradeReason, ProbeOutcome};
 
@@ -1148,10 +1154,11 @@ fn claude_tree_is_repo_authored(workdir: &str) -> bool {
         ProbeOutcome::Captured(stdout) => !stdout.is_empty(),
         // Evidence of absence — keep the provisioning arm.
         ProbeOutcome::Degraded(DegradeReason::Status)
-        | ProbeOutcome::Degraded(DegradeReason::SpawnError) => false,
+        | ProbeOutcome::Degraded(DegradeReason::SpawnError(_)) => false,
         // Evidence of nothing — withhold the clearance.
         ProbeOutcome::Degraded(DegradeReason::TimedOut { .. })
-        | ProbeOutcome::Degraded(DegradeReason::Truncated(_)) => {
+        | ProbeOutcome::Degraded(DegradeReason::Truncated(_))
+        | ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { .. }) => {
             warn!(
                 workdir = %workdir,
                 "fleet provisioning: the .claude tracked-file probe did not answer inside \

@@ -925,9 +925,15 @@ pub fn start_detached(
 
     // A spawn that fails with EMFILE/ENFILE is positive evidence the process
     // is out of descriptors — the second authority the UI-death gate reads.
+    // Any classified exhaustion (commit, no_system_resources, task_limit, fd)
+    // also joins its episode — one structured record per episode, not a WARN
+    // per failure (plan `2026-09-23-resource-guard-floors-are-constants-and-
+    // the-runners-own-git-spawns-are-ungated` Phase 0).
     let mut child = cmd.spawn().inspect_err(|e| {
-        qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(e);
+        qontinui_runner_lib::util::resource_exhaustion::note_fd_exhaustion(e);
+        report_classified_exhaustion(e, label);
     })?;
+    qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
 
     let deadline = Instant::now() + budget;
@@ -1060,10 +1066,17 @@ pub fn run_with_timeout_detailed(
     // Three pipes plus the exec'd child: this is where descriptor exhaustion
     // surfaces first (`could not spawn: Too many open files`, 5,841 times from
     // `fleet::tree_publisher` alone on 2026-09-02). Stamp it for the UI-death
-    // gate — see `util::fd_exhaustion`.
+    // gate — see `util::resource_exhaustion`.
+    //
+    // The episode book hears the success too: a spawn that works after a
+    // quiet interval is what closes an exhaustion episode. One relaxed load
+    // when none is open. The FAILURE half of the episode is reported by the
+    // labelled callers ([`run_probe`], [`output_with_timeout_labeled`]), which
+    // know which subsystem failed; this function only knows the program.
     let mut child = cmd.spawn().inspect_err(|e| {
-        qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(e);
+        qontinui_runner_lib::util::resource_exhaustion::note_fd_exhaustion(e);
     })?;
+    qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
 
@@ -1240,18 +1253,54 @@ pub fn output_with_timeout_labeled(
                 ),
             ))
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            report_classified_exhaustion(&e, label);
+            Err(e)
+        }
     }
+}
+
+/// Report `e` to its exhaustion episode when it is one; a no-op for every
+/// ordinary error. Returns the classification so a caller that also logs can
+/// skip its own per-failure line for a classified exhaustion.
+fn report_classified_exhaustion(
+    e: &std::io::Error,
+    label: &str,
+) -> qontinui_runner_lib::util::resource_exhaustion::SpawnFailure {
+    use qontinui_runner_lib::util::resource_exhaustion::{
+        report_exhaustion, Evidence, SpawnFailure,
+    };
+    let failure = SpawnFailure::classify(e);
+    if let Some(kind) = failure.exhaustion {
+        report_exhaustion(kind, Evidence::OsCode, failure.os_code, label);
+    }
+    failure
 }
 
 /// Why a [`run_probe`] call degraded — carried so a caller (or a test) can
 /// tell a real timeout apart from an ordinary non-zero exit.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DegradeReason {
-    /// The child exited non-zero inside the budget.
+    /// The child exited non-zero inside the budget — git's (or the tool's)
+    /// own answer.
     Status,
-    /// The child could not be spawned at all.
-    SpawnError,
+    /// The child exited non-zero AND its stderr carries the text of a
+    /// commit-exhaustion error: the child ran, but ITS child launch failed
+    /// (`git.exe` → `error launching git: <paging file is too small>`).
+    ///
+    /// Distinct from [`Status`](Self::Status) on purpose (plan
+    /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-
+    /// git-spawns-are-ungated` Phase 0 item 2): this is NOT the tool's answer.
+    /// A caller that reads `Status` as a definite negative ("the ref does not
+    /// exist", "the file is untracked") must read this as evidence of nothing.
+    /// Suspected, not asserted — the evidence is text, and `os_code` is the
+    /// code whose OS rendering matched (see
+    /// `resource_exhaustion::commit_exhaustion_in_stderr`).
+    CommitExhaustionSuspected { os_code: i32 },
+    /// The child could not be spawned at all. Carries the classified OS error,
+    /// so `ERROR_COMMITMENT_LIMIT` (the machine is out of commit) is no longer
+    /// indistinguishable from `ENOENT` (git is not on PATH).
+    SpawnError(qontinui_runner_lib::util::resource_exhaustion::SpawnFailure),
     /// The child overran the budget and was killed. `reaped` says whether the
     /// follow-up `wait()` succeeded, so a leaked zombie is observable.
     TimedOut { pid: u32, reaped: bool },
@@ -1361,6 +1410,28 @@ fn run_probe_inner(
             outcome: TimedOutput::Completed(o),
             ..
         }) => {
+            // The second exhaustion shape: the child ran and its OWN launch
+            // failed. Checked in the quiet variant too — exhaustion is never an
+            // expected negative answer — and reported through the episode
+            // instead of the per-failure line below.
+            if let Some(os_code) =
+                qontinui_runner_lib::util::resource_exhaustion::commit_exhaustion_in_stderr(
+                    &o.stderr,
+                )
+            {
+                use qontinui_runner_lib::util::resource_exhaustion::{
+                    report_exhaustion, Evidence, ExhaustionKind,
+                };
+                report_exhaustion(
+                    ExhaustionKind::Commit,
+                    Evidence::ChildStderr,
+                    Some(os_code),
+                    label,
+                );
+                return ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected {
+                    os_code,
+                });
+            }
             if warn_on_expected_failure {
                 tracing::warn!(
                     "{label} failed (status={:?}, stderr={})",
@@ -1392,12 +1463,19 @@ fn run_probe_inner(
             ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped })
         }
         Err(e) => {
-            if warn_on_expected_failure {
-                tracing::warn!("{label} spawn error: {e}");
-            } else {
-                tracing::debug!("{label} is not available here: {e}");
+            // A classified exhaustion goes to its episode (one record, then a
+            // count) instead of a WARN per failure — 29 identical
+            // `os error 1455` lines in one rotation told the operator nothing
+            // the first one had not. Everything else logs exactly as before.
+            let failure = report_classified_exhaustion(&e, label);
+            if failure.exhaustion.is_none() {
+                if warn_on_expected_failure {
+                    tracing::warn!("{label} spawn error: {e}");
+                } else {
+                    tracing::debug!("{label} is not available here: {e}");
+                }
             }
-            ProbeOutcome::Degraded(DegradeReason::SpawnError)
+            ProbeOutcome::Degraded(DegradeReason::SpawnError(failure))
         }
     }
 }
@@ -1525,16 +1603,58 @@ mod timeout_tests {
             ProbeOutcome::Degraded(DegradeReason::Status)
         ));
 
-        // A binary that does not exist is a SpawnError, still a degrade.
+        // A binary that does not exist is a SpawnError, still a degrade — and
+        // it is NOT classified as exhaustion: "git is not on PATH" must stay
+        // distinguishable from "the machine is out of commit".
         let missing = no_window("qontinui-no-such-binary-9f2a1c");
-        assert!(matches!(
-            run_probe_quiet(
-                missing,
-                Duration::from_secs(5),
-                "test: quiet missing binary"
-            ),
-            ProbeOutcome::Degraded(DegradeReason::SpawnError)
-        ));
+        match run_probe_quiet(
+            missing,
+            Duration::from_secs(5),
+            "test: quiet missing binary",
+        ) {
+            ProbeOutcome::Degraded(DegradeReason::SpawnError(failure)) => {
+                assert_eq!(failure.exhaustion, None, "{failure:?}");
+                assert!(failure.os_code.is_some(), "ENOENT carries its code");
+            }
+            other => panic!("expected a SpawnError degrade, got {other:?}"),
+        }
+    }
+
+    /// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-
+    /// own-git-spawns-are-ungated` Phase 0 verification (b): a child that exits
+    /// 1 with a commit-exhaustion error in its stderr is
+    /// `CommitExhaustionSuspected`, NOT `Status` — so no consumer reads the
+    /// machine running out of commit as "git said no". The stderr is the shape
+    /// a Rust child prints (`… (os error N)`), which is locale-independent.
+    #[test]
+    fn a_failing_child_reporting_commit_exhaustion_is_suspected_not_status() {
+        #[cfg(target_os = "windows")]
+        let (cmd, code) = {
+            let mut c = no_window("cmd.exe");
+            c.args([
+                "/C",
+                "echo error launching git: spawn failed (os error 1455) 1>&2 & exit 1",
+            ]);
+            (c, 1455)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (cmd, code) = {
+            let mut c = no_window("sh");
+            c.args([
+                "-c",
+                &format!(
+                    "echo 'error launching git: spawn failed (os error {})' >&2; exit 1",
+                    libc::ENOMEM
+                ),
+            ]);
+            (c, libc::ENOMEM)
+        };
+        match run_probe_quiet(cmd, Duration::from_secs(20), "test: exhausted child") {
+            ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code }) => {
+                assert_eq!(os_code, code);
+            }
+            other => panic!("expected CommitExhaustionSuspected, got {other:?}"),
+        }
     }
 
     /// `output_with_timeout` must surface a hang as `ErrorKind::TimedOut`, so

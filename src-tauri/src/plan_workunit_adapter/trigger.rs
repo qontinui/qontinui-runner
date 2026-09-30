@@ -1260,7 +1260,25 @@ impl ProcessGit {
         use crate::process_helpers::DegradeReason;
         let why = match reason {
             DegradeReason::Status => "it exited non-zero".to_string(),
-            DegradeReason::SpawnError => "it could not be spawned (SpawnError)".to_string(),
+            // The classification is part of the text on purpose: "out of
+            // commit" and "git is not installed" have different remedies. It
+            // is also stable per fault (a kind and an OS code, never a pid),
+            // so `is_same_reading` still sees one unchanging fault as one.
+            DegradeReason::SpawnError(f) => match (f.exhaustion, f.os_code) {
+                (Some(kind), code) => format!(
+                    "it could not be spawned (SpawnError: {} exhaustion, os error {})",
+                    kind.as_str(),
+                    code.map_or_else(|| "none".to_string(), |c| c.to_string())
+                ),
+                (None, Some(code)) => {
+                    format!("it could not be spawned (SpawnError, os error {code})")
+                }
+                (None, None) => "it could not be spawned (SpawnError)".to_string(),
+            },
+            DegradeReason::CommitExhaustionSuspected { os_code } => format!(
+                "it exited non-zero because its own child launch failed \
+                 (commit_exhaustion_suspected, os error {os_code})"
+            ),
             DegradeReason::TimedOut { reaped, .. } => format!(
                 "it overran its {}s budget and was killed (TimedOut{})",
                 budget.as_secs(),
