@@ -182,6 +182,29 @@ pub(crate) fn record_sdk_result(
     );
 }
 
+/// `failure_origin` of a request the RUNNER rejected before touching any UI
+/// on an SDK route's IPC fallback (e1).
+pub(crate) const RUNNER_REJECTION_ORIGIN: &str = "runner";
+
+/// Tag an IPC-fallback answer the runner produced with a 4xx as a runner
+/// rejection (`failure_origin: "runner"`), so [`sdk_refusal`] records nothing
+/// for it — exactly the control routes' 4xx rule. A 5xx (the action was
+/// attempted and failed) and any 2xx are returned unchanged.
+pub(crate) fn tag_runner_rejection(
+    mut response: serde_json::Value,
+    status: axum::http::StatusCode,
+) -> serde_json::Value {
+    if status.is_client_error() {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "failure_origin".to_string(),
+                serde_json::Value::String(RUNNER_REJECTION_ORIGIN.to_string()),
+            );
+        }
+    }
+    response
+}
+
 /// The relay tab an SDK request is pinned to: `?tabId=` / `?targetTabId=`,
 /// else the body's `tabId` / `targetTabId`.
 pub(crate) fn sdk_request_scope(
@@ -234,6 +257,9 @@ pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
 /// "transport"`, from `ipc_fallback_refusal`): neither reached any UI, so,
 /// like the control surface's 4xx rule, neither records. An APP-origin
 /// failure (`failure_origin: "app"`) did reach the app and is an `error` edge.
+/// A RUNNER-side request rejection on an IPC-fallback route
+/// (`failure_origin: "runner"`, see [`tag_runner_rejection`]) never touched
+/// the UI either and records nothing — the control routes' 4xx rule (e1).
 pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
     let code_in = |v: Option<&serde_json::Value>| {
         v.into_iter().any(|v| {
@@ -244,9 +270,11 @@ pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
             })
         })
     };
-    let transport_refusal =
-        response.get("failure_origin").and_then(|v| v.as_str()) == Some("transport");
-    transport_refusal
+    let refused_before_ui = matches!(
+        response.get("failure_origin").and_then(|v| v.as_str()),
+        Some(RUNNER_REJECTION_ORIGIN | "transport")
+    );
+    refused_before_ui
         || code_in(Some(response))
         || code_in(response.get("error"))
         || code_in(response.get("data"))
@@ -1167,6 +1195,34 @@ mod tests {
             sdk_action_target(Some(("a".into(), None)), None, false, &app).is_some(),
             "an app-origin failure reached the app: an error edge"
         );
+    }
+
+    #[test]
+    fn a_runner_rejection_on_a_fallback_route_records_nothing() {
+        use axum::http::StatusCode;
+        // e1, send-keys fallback: the keyboard handler's 4xx is a rejection…
+        let rejected = tag_runner_rejection(
+            json!({"success": false, "error": "unknown target"}),
+            StatusCode::BAD_REQUEST,
+        );
+        assert!(sdk_refusal(&rejected));
+        assert!(sdk_action_target(None, None, true, &rejected).is_none());
+        // …while a 5xx was an attempt that failed: an error edge.
+        let failed = tag_runner_rejection(
+            json!({"success": false, "error": "ipc timeout"}),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(!sdk_refusal(&failed));
+        assert!(sdk_action_target(None, None, true, &failed).is_some());
+        // e1, navigate fallback: a NotNavigable / UnroutedPage rejection
+        // carries the runner origin, so it records nothing either.
+        let not_navigable = json!({
+            "success": false,
+            "error": "not navigable",
+            "failure_origin": RUNNER_REJECTION_ORIGIN,
+            "error_detail": {"code": "INVALID_REQUEST"}
+        });
+        assert!(sdk_action_target(None, None, true, &not_navigable).is_none());
     }
 
     #[test]

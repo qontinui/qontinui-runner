@@ -2909,6 +2909,10 @@ async fn handle_page_navigate_dispatch(
                         return Json(serde_json::json!({
                             "success": false,
                             "error": message,
+                            // Rejected by the runner before any UI was
+                            // touched: the journey ledger records nothing
+                            // (the control routes' 4xx rule, e1).
+                            "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
                             "error_detail": {
                                 "code": "INVALID_REQUEST",
                                 "message": message,
@@ -7304,8 +7308,13 @@ async fn handle_send_keys_to_page_dispatch(
                 Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(
                     |e| serde_json::json!({ "success": false, "error": e.to_string() }),
                 )),
-                Err((_status, Json(err))) => Json(serde_json::to_value(err).unwrap_or_else(
-                    |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                // A 4xx is the runner rejecting the request before any key
+                // was sent: tagged so the journey ledger records nothing (e1).
+                Err((status, Json(err))) => Json(crate::journey::capture::tag_runner_rejection(
+                    serde_json::to_value(err).unwrap_or_else(
+                        |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                    ),
+                    status,
                 )),
             }
         }
@@ -8194,7 +8203,14 @@ mod tests {
             "handle_find_by_text",
             "handle_navigate_by_adapter",
         ] {
-            let needle = format!("\nasync fn {handler}(");
+            // A handler the journey ledger wraps keeps its original body in
+            // `<handler>_dispatch`; the wrapper itself only records.
+            let wrapped = format!("\nasync fn {handler}_dispatch(");
+            let needle = if src.contains(wrapped.as_str()) {
+                wrapped
+            } else {
+                format!("\nasync fn {handler}(")
+            };
             let body = src
                 .split(needle.as_str())
                 .nth(1)
@@ -8217,7 +8233,7 @@ mod tests {
             // canonical `/control/page/send-keys` handler instead.
             let fallback = body
                 .find("ui_bridge_request_sync(")
-                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler("))
+                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler_dispatch("))
                 .unwrap_or_else(|| panic!("{handler} has no IPC fallback any more"));
             assert!(
                 gate < fallback,
@@ -8276,7 +8292,8 @@ mod tests {
             .iter()
             .any(|d| chunk.contains(d));
             let falls_back = chunk.contains("ui_bridge_request_sync(")
-                || (chunk.contains("crate::mcp::ui_bridge::") && chunk.contains("_handler("));
+                || (chunk.contains("crate::mcp::ui_bridge::")
+                    && (chunk.contains("_handler(") || chunk.contains("_handler_dispatch(")));
             if !(dispatches && falls_back) {
                 continue;
             }
