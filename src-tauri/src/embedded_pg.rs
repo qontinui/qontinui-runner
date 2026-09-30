@@ -960,6 +960,12 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     })
 }
 
+/// The bundled canonical schema dump (`schema.pg.sql.generated`), embedded
+/// once at compile time. [`apply_canonical_schema`] applies all of it to a
+/// fresh cluster; `database::pg::atlas_managed_provision` reads only its
+/// `atlas_managed` objects to create a table an older cluster lacks.
+pub const CANONICAL_SCHEMA_SQL: &str = include_str!("../schema.pg.sql.generated");
+
 /// Apply the bundled canonical schema to a freshly-created embedded database.
 ///
 /// The schema (`schema.pg.sql.generated`, a `pg_dump`-style dump of the full
@@ -981,9 +987,8 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 ///
 /// Applied whenever [`schema_applied`] reports the schema missing (fresh
 /// database, or a prior apply that crashed/rolled back).
-async fn apply_canonical_schema(url: &str) -> Result<(), String> {
-    const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
-    let body: String = SCHEMA
+pub async fn apply_canonical_schema(url: &str) -> Result<(), String> {
+    let body: String = CANONICAL_SCHEMA_SQL
         .replace("public.vector(384)", "bytea")
         .replace("public.vector(512)", "bytea")
         // The dump emits `CREATE SCHEMA public;`, which errors on a fresh

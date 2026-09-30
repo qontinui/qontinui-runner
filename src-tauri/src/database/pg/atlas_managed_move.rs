@@ -84,7 +84,7 @@ const LEGACY_COLUMN_FILLS: &[(&str, &str, &str)] =
     &[("proposal_events", "app_id", "'qontinui-runner'")];
 
 /// `pg_advisory_xact_lock` key for the move ("atlasmv" in ASCII).
-const MOVE_LOCK_KEY: i64 = 0x0061_746c_6173_6d76;
+pub(crate) const MOVE_LOCK_KEY: i64 = 0x0061_746c_6173_6d76;
 
 /// How long the pass waits for any single lock (the advisory lock, or a table
 /// lock for `SET SCHEMA` / `DROP`) before giving up for this boot.
@@ -92,7 +92,7 @@ pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on any single statement of the pass (the merge copy of a large
 /// table is the long one).
-const STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What happened to one table.
 #[derive(Debug, Clone, PartialEq, Eq)]

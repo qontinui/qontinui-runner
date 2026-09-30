@@ -11,6 +11,7 @@ pub mod app_deploy_state;
 pub mod approval_gates;
 pub mod apps;
 pub mod atlas_managed_move;
+pub mod atlas_managed_provision;
 pub mod breakpoints;
 pub mod cached_specs;
 pub mod canary;
@@ -695,6 +696,54 @@ impl PgDb {
             .await
             .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
 
+        // Every step below is idempotent DDL, but `CREATE … IF NOT EXISTS` is
+        // not concurrency-safe in Postgres: two sessions creating the same
+        // table at once can both pass the existence check and one then fails
+        // on the catalog's unique index. A primary and a temp runner share
+        // one embedded cluster and boot together, so the steps run under a
+        // session-level advisory lock ([`ProvisionLock`]) and serialize. The
+        // lock is bounded and always released, including when a step fails.
+        let lock = ProvisionLock::acquire(&conn).await;
+        let provisioned = Self::provision_schema(&mut conn).await;
+        if lock.release(&conn).await {
+            drop(conn);
+        } else {
+            // An unlock that did not answer leaves the lock with this
+            // session. Detach the connection from the pool so it closes and
+            // the server drops the lock, instead of pooling a session that
+            // would block every later boot.
+            drop(deadpool_postgres::Object::take(conn));
+        }
+        provisioned?;
+
+        // spec-multi-app / F1: register THIS runner in `project.apps`.
+        //
+        // Unconditional, and deliberately not the dev bootstrap: capture's
+        // observation INSERT validates `app_id` with a subquery against this
+        // table, so a runner with no row of its own writes every observation
+        // un-attributed forever — silently, since there is no FK. The row was
+        // previously created only by `apps::bootstrap_dev_apps`, which is gated
+        // on `QONTINUI_DEV_BOOTSTRAP=1` (set only by `dev-start.ps1`), so
+        // production installs, supervisor-spawned temp runners and CI runners
+        // had none. Registering the runner's own identity in a table the runner
+        // already self-heals two blocks up is the same class of self-heal.
+        //
+        // Runs here rather than in `main.rs` so the degraded-boot reconnect path
+        // (`spawn_reconnect_probe` → `verify_and_provision`) gets it too. Never
+        // fatal: `ensure_self_registered` logs and returns on every failure.
+        //
+        // `conn` was released above — `ensure_self_registered` checks out its
+        // own pooled connection and there is no reason to hold two.
+        apps::ensure_self_registered(self).await;
+
+        info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
+
+        Ok(())
+    }
+
+    /// The self-provision DDL of [`verify_and_provision`](Self::verify_and_provision),
+    /// run while that method holds the [`ProvisionLock`].
+    async fn provision_schema(conn: &mut deadpool_postgres::Object) -> Result<(), String> {
         // Self-bootstrap: ensure prerequisites exist regardless of which
         // deployment substrate the runner is talking to. Two responsibilities
         // remain in this hot path:
@@ -710,9 +759,11 @@ impl PgDb {
         // as CREATE TABLE IF NOT EXISTS self-heal. That set is now
         // Atlas-managed in `atlas_managed` out of
         // `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot, Wave
-        // 1.4; schema move per plan `2026-05-14-atlas-wave-6-triage`). Atlas is invoked out-of-process (CI / migrator container)
-        // against the canonical PG; this hot path no longer enforces the
-        // table shape. The historical alembic migration
+        // 1.4; schema move per plan `2026-05-14-atlas-wave-6-triage`). Atlas
+        // is invoked out-of-process (CI / migrator container) against the
+        // canonical PG; this hot path no longer enforces the table shape
+        // (except for creating a table a database lacks entirely, below).
+        // The historical alembic migration
         // `f9d3e8a4c1b6_add_regression_tables.py` remains in
         // `qontinui-web/backend/alembic/versions/` as frozen history.
         conn.batch_execute("CREATE SCHEMA IF NOT EXISTS runner;")
@@ -1003,20 +1054,29 @@ impl PgDb {
         // continues. `atlas_managed` is deliberately NOT on the search_path,
         // so a query against a table left behind fails loudly on its own
         // instead of binding the leftover copy.
-        let _moved = atlas_managed_move::migrate_atlas_managed_tables(&mut conn).await;
+        let _moved = atlas_managed_move::migrate_atlas_managed_tables(conn).await;
+
+        // Then create any of the six a database lacks entirely — an embedded
+        // cluster built from a dump older than `spec_proposals` /
+        // `proposal_events` never gets them from `apply_canonical_schema`,
+        // which runs only on a fresh cluster. The DDL is Atlas's own, read
+        // from the bundled dump; a legacy copy the move left behind is never
+        // shadowed by an empty twin. Never fatal, like the move.
+        let _created = atlas_managed_provision::create_missing_atlas_managed_tables(conn).await;
 
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // atlas_managed.proposal_events. The table predates the multi-tenant
         // model, so existing rows are migrated under the bootstrap app_id
         // `qontinui-runner` (matching Stream F's bootstrap registration).
         //
-        // Gated on table existence — on a database where Atlas hasn't created
-        // atlas_managed.proposal_events (e.g. a fresh alembic-only PG, or an
-        // embedded cluster built from a bundled schema that predates it), this
-        // whole block is a no-op. Embedded clusters built from the current
-        // schema.pg.sql.generated DO have it, already with app_id. Atlas
-        // owns the CREATE TABLE; the self-heal owns the app_id column
-        // migration once the table exists. Wrapped in a PL/pgSQL DO block so
+        // Gated on table existence — on a database where
+        // atlas_managed.proposal_events is still missing (the create step
+        // above failed), this whole block is a no-op. The gate reads
+        // `pg_class` for an ordinary or partitioned table, the same check the
+        // move uses: `information_schema.tables` also lists views. Embedded
+        // clusters built from the current schema.pg.sql.generated DO have it,
+        // already with app_id. Atlas owns the CREATE TABLE; the self-heal
+        // owns the app_id column migration once the table exists. Wrapped in a PL/pgSQL DO block so
         // the table-existence check + locking + ALTER run in one round-trip
         // and skip cleanly when the table isn't present. ACCESS EXCLUSIVE
         // prevents any concurrent writer from inserting a NULL row between the
@@ -1027,8 +1087,10 @@ impl PgDb {
             "DO $$
              BEGIN
                IF EXISTS (
-                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'atlas_managed' AND table_name = 'proposal_events'
+                 SELECT 1 FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'atlas_managed' AND c.relname = 'proposal_events'
+                   AND c.relkind IN ('r', 'p')
                ) THEN
                  LOCK TABLE atlas_managed.proposal_events IN ACCESS EXCLUSIVE MODE;
                  ALTER TABLE atlas_managed.proposal_events
@@ -1132,29 +1194,6 @@ impl PgDb {
         conn.batch_execute(MACHINE_LOCAL_TABLES_DDL)
             .await
             .map_err(|e| format!("P3 machine-local project.* self-heal failed: {}", e))?;
-
-        // spec-multi-app / F1: register THIS runner in `project.apps`.
-        //
-        // Unconditional, and deliberately not the dev bootstrap: capture's
-        // observation INSERT validates `app_id` with a subquery against this
-        // table, so a runner with no row of its own writes every observation
-        // un-attributed forever — silently, since there is no FK. The row was
-        // previously created only by `apps::bootstrap_dev_apps`, which is gated
-        // on `QONTINUI_DEV_BOOTSTRAP=1` (set only by `dev-start.ps1`), so
-        // production installs, supervisor-spawned temp runners and CI runners
-        // had none. Registering the runner's own identity in a table the runner
-        // already self-heals two blocks up is the same class of self-heal.
-        //
-        // Runs here rather than in `main.rs` so the degraded-boot reconnect path
-        // (`spawn_reconnect_probe` → `verify_and_provision`) gets it too. Never
-        // fatal: `ensure_self_registered` logs and returns on every failure.
-        //
-        // `conn` is released first — `ensure_self_registered` checks out its own
-        // pooled connection and there is no reason to hold two.
-        drop(conn);
-        apps::ensure_self_registered(self).await;
-
-        info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
         Ok(())
     }
@@ -1361,6 +1400,174 @@ impl PgDb {
             .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
             .expect("noop pool creation should not fail (no connection attempted)");
         std::sync::Arc::new(Self { pool })
+    }
+}
+
+/// Session-level advisory-lock key serializing
+/// [`PgDb::verify_and_provision`]'s DDL across every runner booting against
+/// one database ("qprovisn" in ASCII).
+const PROVISION_LOCK_KEY: i64 = 0x7170_726f_7669_736e;
+
+/// How long a boot waits for another runner's provisioning to finish before
+/// provisioning unserialized, as every boot did before the lock existed. A
+/// normal pass takes well under a second; the bound only stops a holder that
+/// never finishes from stalling boot.
+const PROVISION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The provisioning lock as [`PgDb::verify_and_provision`] took it: held, or
+/// not held because it could not be taken in time (logged at WARN).
+///
+/// Session-level rather than transaction-scoped because the steps are
+/// separate statements and the `atlas_managed` move runs its own transaction
+/// in between. The caller must pass the result to [`Self::release`] on every
+/// path, and discard the connection when that returns `false`.
+struct ProvisionLock {
+    held: bool,
+}
+
+impl ProvisionLock {
+    async fn acquire(conn: &tokio_postgres::Client) -> Self {
+        let deadline = std::time::Instant::now() + PROVISION_LOCK_WAIT;
+        loop {
+            let taken = conn
+                .query_one("SELECT pg_try_advisory_lock($1)", &[&PROVISION_LOCK_KEY])
+                .await
+                .and_then(|row| row.try_get::<_, bool>(0));
+            match taken {
+                Ok(true) => return Self { held: true },
+                Ok(false) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Ok(false) => {
+                    warn!(
+                        "another runner held the schema-provisioning lock for {:?}; \
+                         provisioning without it",
+                        PROVISION_LOCK_WAIT
+                    );
+                    return Self { held: false };
+                }
+                Err(e) => {
+                    warn!(
+                        "could not take the schema-provisioning lock ({e}); \
+                         provisioning without it"
+                    );
+                    return Self { held: false };
+                }
+            }
+        }
+    }
+
+    /// Release the lock. `false` means a held lock may still be held by this
+    /// session, so the connection must not go back to the pool.
+    async fn release(self, conn: &tokio_postgres::Client) -> bool {
+        if !self.held {
+            return true;
+        }
+        match conn
+            .query_one("SELECT pg_advisory_unlock($1)", &[&PROVISION_LOCK_KEY])
+            .await
+            .and_then(|row| row.try_get::<_, bool>(0))
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("schema-provisioning lock was not held at release");
+                false
+            }
+            Err(e) => {
+                warn!("releasing the schema-provisioning lock failed: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// Throwaway databases for Postgres-backed tests that must boot `PgDb::new`
+/// against a database of their own rather than the shared `DATABASE_URL` one.
+#[cfg(all(test, feature = "pg_integration_tests"))]
+pub(crate) mod test_support {
+    use super::PgDb;
+
+    /// A new database beside `DATABASE_URL`'s, holding the bundled canonical
+    /// schema — what a fresh embedded cluster holds before its first boot.
+    /// Call [`Self::drop`] to remove it.
+    pub(crate) struct FreshTestDatabase {
+        admin: tokio_postgres::Client,
+        name: String,
+        pub url: String,
+    }
+
+    impl FreshTestDatabase {
+        pub(crate) async fn create(prefix: &str) -> Self {
+            let admin_url = PgDb::test_database_url();
+            let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+                .await
+                .expect("connect to DATABASE_URL");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let tag: String = uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(12)
+                .collect();
+            let name = format!("{prefix}_{tag}");
+            admin
+                .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+                .await
+                .expect("CREATE DATABASE");
+            let mut url = url::Url::parse(&admin_url).expect("DATABASE_URL is a URL");
+            url.set_path(&name);
+            let url = url.to_string();
+            crate::embedded_pg::apply_canonical_schema(&url)
+                .await
+                .expect("apply the bundled canonical schema");
+            Self { admin, name, url }
+        }
+
+        /// Drop the database, disconnecting anything still attached to it.
+        pub(crate) async fn drop(self) {
+            let _ = self
+                .admin
+                .batch_execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name))
+                .await;
+        }
+    }
+}
+
+/// Postgres-backed: concurrent first boots against one brand-new database all
+/// provision cleanly. Before [`ProvisionLock`], three `PgDb::new` racing on a
+/// fresh database intermittently failed a `CREATE TABLE IF NOT EXISTS` step
+/// on the catalog's unique index (plan
+/// `2026-09-28-atlas-managed-follow-ups-embedded-provisioning-ci-and-script-hardening`,
+/// item 5).
+///
+/// Run: `cargo test --features pg_integration_tests -- provision_lock_tests`
+#[cfg(all(test, feature = "pg_integration_tests"))]
+mod provision_lock_tests {
+    use super::{test_support::FreshTestDatabase, PgDb};
+
+    /// Three boots at once, on each of three fresh databases: the race was
+    /// intermittent, so one round proves little.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_boots_all_provision() {
+        for round in 0..3 {
+            let db = FreshTestDatabase::create("provision_race").await;
+            let boots: Vec<_> = (0..3)
+                .map(|_| {
+                    let url = db.url.clone();
+                    tokio::spawn(async move { PgDb::new(&url).await.map(|_| ()) })
+                })
+                .collect();
+            let mut failures = Vec::new();
+            for boot in boots {
+                if let Err(e) = boot.await.expect("boot task") {
+                    failures.push(e);
+                }
+            }
+            db.drop().await;
+            assert!(failures.is_empty(), "round {round}: {failures:?}");
+        }
     }
 }
 
