@@ -1026,6 +1026,15 @@ static WINDOW_SWAP_LATCH: InFlightLatch = InFlightLatch::new();
 /// incident and gets its own line.
 static RECOVERY_WEDGE_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a `recovery_wedged` incident is open right now: its line has been
+/// written and the run in flight has not yet returned. The live predicate
+/// `fleet::wedge_report` closes that incident against — the flag is set by
+/// exactly the write and cleared by exactly the release, so it is the
+/// condition itself, not an estimate of it.
+pub fn recovery_wedged() -> bool {
+    RECOVERY_WEDGE_REPORTED.load(Ordering::SeqCst)
+}
+
 /// [`classify_latch`] over the live recovery latch.
 pub fn recovery_latch_report() -> LatchReport {
     classify_latch(RECOVERY_LATCH.in_flight_age_ms(latch_now_ms()))

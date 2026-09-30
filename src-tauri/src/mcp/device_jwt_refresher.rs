@@ -717,6 +717,41 @@ fn slot_jwt_is_expired_or_absent(auth_manager: &crate::auth::AuthManager) -> boo
     }
 }
 
+/// The runner-observed `details` keys (G2 `wedge_incidents`, G4 `capability`;
+/// plan `2026-09-20-the-second-ratchet-domain-is-operations-and-its-cost-is-compared-to-the-first`
+/// Phase 5), read off the async runtime because both are file reads.
+///
+/// A panicked read is reported as an `*_error` for BOTH keys rather than as
+/// their absence: coord reads an absent key as "this build predates it", which
+/// would be false here.
+async fn observed_details() -> serde_json::Map<String, serde_json::Value> {
+    match tokio::task::spawn_blocking(crate::fleet::observed_status_details).await {
+        Ok(d) => d,
+        Err(e) => {
+            let why = format!("the runner's read of this key failed: {e}");
+            let mut d = serde_json::Map::new();
+            d.insert("wedge_incidents_error".into(), serde_json::json!(why));
+            d.insert("capability_error".into(), serde_json::json!(why));
+            d
+        }
+    }
+}
+
+/// The whole `details` object this publisher owns: `coord_credential` plus the
+/// observed keys. Coord merges `details` per top-level key, so each key here is
+/// this publisher's alone and no other `/coord/status` poster erases it.
+fn status_details(
+    bag: CoordCredentialBag,
+    observed: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut details = observed;
+    details.insert(
+        "coord_credential".to_string(),
+        serde_json::to_value(bag).unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(details)
+}
+
 /// Best-effort publish of the coord-credential health into the runner's
 /// `coord.device_status.details.coord_credential` via the existing
 /// `POST {coord}/coord/status` upsert path (the same endpoint
@@ -778,9 +813,10 @@ async fn publish_coord_credential_status(
     // `ok` from it, so coord's dark scan and qontinui-web's console finally see
     // what `/health` sees.
     let bag = coord_credential_bag(health, coord_credential_posture().as_ref());
+    let details = status_details(bag, observed_details().await);
     let mut body = serde_json::json!({
         "device_id": device_uuid,
-        "details": { "coord_credential": bag },
+        "details": details,
     });
     if let Some(t) = tenant_id {
         body["tenant_id"] = serde_json::json!(t);
@@ -10507,6 +10543,29 @@ mod tenant_slot_refresh_tests {
         assert!(unknown.ok, "UNKNOWN keeps the decision-derived answer");
         let bad = coord_credential_health(Decision::IdleWrongTier, None);
         assert!(!coord_credential_bag(&bad, None).ok);
+    }
+
+    /// Plan `2026-09-20-the-second-ratchet-domain-...` Phase 5: the status
+    /// `details` carries the observed keys BESIDE `coord_credential`, each at
+    /// the top level (coord merges per top-level key), and an `*_error` key
+    /// stands in for a key the runner could not look at — never an absence.
+    #[test]
+    fn status_details_carry_the_observed_keys_beside_the_credential_bag() {
+        let fallback = coord_credential_health(Decision::IdleWrongTier, None);
+        let bag = coord_credential_bag(&fallback, None);
+        let mut observed = serde_json::Map::new();
+        observed.insert("wedge_incidents".into(), serde_json::json!([]));
+        observed.insert("capability_error".into(), serde_json::json!("no home"));
+        let d = status_details(bag.clone(), observed);
+        let obj = d.as_object().expect("details is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["capability_error", "coord_credential", "wedge_incidents"]
+        );
+        assert_eq!(d["coord_credential"], serde_json::to_value(bag).unwrap());
+        assert_eq!(d["wedge_incidents"], serde_json::json!([]));
     }
 
     /// **M8.** `slot_seen` records the exp the slot held BEFORE the pass acted,
