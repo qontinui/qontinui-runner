@@ -65,8 +65,8 @@
 # What the guard covers: text or directory embeds (`include_str!`,
 # `include_bytes!`, `include_dir!`) beside `JsonSchema` or a `schemars(`
 # attribute in the same file; a `#[doc = include_*!(..)]` attribute anywhere;
-# a single-line `schemars(..)` attribute whose value is anything but a string
-# or numeric literal (`description`, `title`, `example`, `default`,
+# a single-line `schemars(..)` attribute whose value does not BEGIN with a
+# string or numeric literal (`description`, `title`, `example`, `default`,
 # `extend("key" = EXPR)` — schemars 1 takes expressions for all of them); and
 # a build script that names a markdown path at all; and markdown compiled AS
 # RUST — `include!("x.md")` or `#[path = "x.md"] mod m;` — which is not data at
@@ -89,7 +89,17 @@
 #    const defined in another file;
 #  - a runtime read of markdown by the exporter itself —
 #    `src-tauri/src/bin/export_schemas.rs` or `generate_types.sh` reading a
-#    `.md` with `fs::read` — since only build scripts are checked for that.
+#    `.md` with `fs::read` — since only build scripts are checked for that;
+#  - a schemars value that BEGINS with a literal and continues into an
+#    expression (`description = "x".to_owned() + BODY`): arm 6 reads only the
+#    first character after the `=`.
+#
+# Reach: the premise probe reads the working tree including untracked AND
+# gitignored files, since the compiler reads an ignored `.rs` as readily as a
+# tracked one. The attribution list itself (`ls-files --others
+# --exclude-standard`) still skips ignored inputs, so an edit to an ignored
+# source file is never blamed — a limitation that predates the markdown
+# exclusion and is not changed by it.
 # It errs the other way on purpose elsewhere: a raw-string literal
 # (`title = r"x"`) or a `true` value reads as a violation and merely costs the
 # exclusion.
@@ -207,8 +217,9 @@ GEN_EVENTS_PREMISE_BUILD_SCRIPTS=(
     ":(glob)crates/spec-check/**/build.rs"
 )
 
-# `git grep` in the WORKING TREE of $1, untracked files included — the
-# regeneration compiles the working tree, so that is what the premise is about.
+# `git grep` in the WORKING TREE of $1, untracked and gitignored files included
+# (`--no-exclude-standard`) — the regeneration compiles the working tree,
+# ignored or not, so that is what the premise is about.
 # $2 names how many pathspecs follow; the rest are grep arguments. Prints
 # matches; exit 1 from git grep is "no match" and is success here. Anything
 # above 1 is a broken probe: printed as an `ERROR` line and returned as 2, so a
@@ -217,7 +228,7 @@ _gen_events_grep_in() {
     local dir="$1" n="$2"; shift 2
     local paths=("${@:1:$n}"); shift "$n"
     local out rc=0
-    out="$(git -C "$dir" grep --untracked "$@" -- "${paths[@]}" 2>&1)" || rc=$?
+    out="$(git -C "$dir" grep --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>&1)" || rc=$?
     if [ "$rc" -gt 1 ]; then
         printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${out%%$'\n'*}"
         return 2
@@ -280,14 +291,14 @@ gen_events_markdown_premise_violations() {
         probe_failed=1
     fi
 
-    # Arm 1: text-embeds something, names a `.md"` literal, mentions JsonSchema.
-    # Wider than `include_str!("x.md")` on one line, so it also covers
-    # `concat!`/multi-line forms.
+    # Arm 1: text-embeds anything in a file that mentions JsonSchema. No `.md"`
+    # conjunct: a path assembled as `concat!(.., "/x.", "md")` names no `.md"`
+    # literal, and the real tree has no such co-occurrence to spare.
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        printf '%s: include_str!/include_bytes! of markdown in a file that mentions JsonSchema\n' "$line"
+        printf '%s: include_str!/include_bytes! in a file that mentions JsonSchema\n' "$line"
         found=1
-    done < <(_gen_events_both "$(_gen_events_both "$inc_text" "$md_lit")" "$schema")
+    done < <(_gen_events_both "$inc_text" "$schema")
     # Arm 2: `include_dir!` embeds whole trees (fleet_skills.rs, fleet_agents.rs
     # ship markdown this way) and never names a `.md` literal, so any use of it
     # beside JsonSchema is a violation on its own.
@@ -321,8 +332,9 @@ gen_events_markdown_premise_violations() {
     if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
     # Arm 6: schemars 1 takes EXPRESSIONS for description, title, example,
     # default and `extend("key" = EXPR)`, so any `=` in a schemars attribute
-    # whose value is not a string or numeric literal may be an embedded const
-    # from another file. `[^=!<>]=` so `==`/`!=`/`<=` in an expression are not
+    # whose value does not BEGIN with a string or numeric literal may be an
+    # embedded const from another file (a literal followed by `+ CONST` is
+    # past its reach — see the header). `[^=!<>]=` so `==`/`!=`/`<=` in an expression are not
     # read as the assignment; `extend("key" = ..)` matches through the `" =`.
     line="$(gen_events_premise_grep "$dir" -n -E 'schemars\(.*[^=!<>]=[[:space:]]*[^"[:space:][:digit:]-]')" || probe_failed=1
     if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
@@ -431,7 +443,11 @@ gen_events_attribution() {
     elif [ "$premise_rc" -eq 1 ]; then
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
     else
-        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed ($(printf '%s\n' "$premise" | grep -m1 '^ERROR' || echo 'no ERROR line'))"
+        # `sed` rather than `grep -m1 || echo`: under pipefail that form can
+        # print a real line AND the fallback.
+        local first_error
+        first_error="$(printf '%s\n' "$premise" | sed -n '/^ERROR/{p;q;}')"
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${first_error:-no ERROR line})"
     fi
 
     # Each call's status is checked, not swallowed: an empty list from a git
@@ -532,8 +548,9 @@ gen_events_render_mine() {
     fi
     if [ "$has_local" = "1" ]; then
         echo "Inputs marked 'not part of this push' are local working-tree state that the"
-        echo "regeneration read. If they are unintended, commit or discard them yourself and"
-        echo "push again; if the drift disappears, it came from them, not from this push."
+        echo "regeneration read. If they are unintended, set them aside so the working tree"
+        echo "matches HEAD and push again; if the drift then disappears, it came from them,"
+        echo "not from this push."
     fi
     echo "Part of the diff may still be pre-existing — the baseline is a build"
     echo "artifact in a shared checkout and may have been behind before you began."
