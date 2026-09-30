@@ -196,6 +196,22 @@ export function describeEndResult(r: RemoteSessionEndResult, wasForce = false): 
         toneClass: "text-[#9ece6a]",
       };
     case "refused":
+      if (reason?.startsWith("end_already_running")) {
+        // Another end (a tab, a Fleet row, a bulk close, or another device)
+        // is already driving this terminal's graceful exit. Not a refusal of
+        // the END — the session is mid-exit, so neither Force nor a retry helps
+        // until that end settles.
+        return {
+          outcome,
+          isEnded: false,
+          hidesRow: false,
+          offerForce: false,
+          label: "already ending",
+          headline: "Another end of this session is already in progress on the remote.",
+          detail: reason,
+          toneClass: "text-[#e0af68]",
+        };
+      }
       return {
         outcome,
         isEnded: false,
