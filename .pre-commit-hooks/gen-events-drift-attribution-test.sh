@@ -46,15 +46,19 @@ gen_events_clear_inherited_git_env
 # from none of it, and never reads git's stdin: it neither needs it nor may
 # consume it. Cases that want a push stage set it themselves.
 #
-# Command-line git config too. Under `git -c k=v <cmd>` git exports
-# GIT_CONFIG_PARAMETERS (and GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n /
-# GIT_CONFIG_VALUE_n for `--config-env`) to every hook, and it overrides the
-# fixtures' local config: `-c core.hooksPath=…` meant no fixture hook ran
-# (11 failures), `-c commit.gpgsign=true` failed ~92 fixture commits. The
-# LIBRARY deliberately keeps the user's `-c` settings for the hook's own git
-# calls — they are the user's intent for this repo, and the attribution's
-# calls pin what matters (`-z`, `--no-renames`) explicitly — so only this
-# suite, whose fixtures are not the user's repo, drops them.
+# Command-line git config too. Under `git -c k=v <cmd>` or `git --config-env
+# k=ENV <cmd>` git exports GIT_CONFIG_PARAMETERS to every hook, and it
+# overrides the fixtures' local config: `-c core.hooksPath=…` meant no fixture
+# hook ran (11 failures), `-c commit.gpgsign=true` failed ~92 fixture
+# commits. The suite also drops any user-set GIT_CONFIG_COUNT / KEY_n /
+# VALUE_n, which inject config the same way. The LIBRARY deliberately keeps
+# GIT_CONFIG_PARAMETERS for the hook's own git calls — the user's `-c`
+# settings are their intent for this repo, and the attribution's calls pin
+# what matters (`-z`, `--no-renames`) explicitly. What the library DOES clear
+# (GIT_CONFIG, GIT_CONFIG_COUNT, GIT_CONFIG_GLOBAL/SYSTEM) are env-set
+# redirections of which config git reads, cleared with the rest of the
+# inherited git environment rather than as `-c` settings. Only this suite,
+# whose fixtures are not the user's repo, drops all of it.
 sanitize_hook_stage_env() {
     local v
     for v in $(compgen -v PRE_COMMIT_) $(compgen -v GIT_CONFIG); do unset "$v"; done
@@ -139,6 +143,9 @@ fixture() {
     # CONTENT — so pin the line-ending translation off rather than let a
     # Windows checkout print a CRLF warning per file per case.
     git -C "$UPSTREAM" config core.autocrlf false
+    # A user's global `commit.gpgsign = true` would otherwise make every
+    # fixture commit ask for a key; fixtures are throwaway, never signed.
+    git -C "$UPSTREAM" config commit.gpgsign false
     # Fixture commits must not run the developer machine's git hooks. A global
     # `core.hooksPath` would otherwise aim these throwaway repos at this repo's
     # pre-commit install, and a hook failing on a two-line fixture would read
@@ -163,6 +170,7 @@ fixture() {
     git clone --quiet --config core.autocrlf=false "$UPSTREAM" "$WORK"
     git -C "$WORK" config user.email t@example.com
     git -C "$WORK" config user.name t
+    git -C "$WORK" config commit.gpgsign false
     git -C "$WORK" config core.hooksPath "$WORK/.git/no-hooks"
 
     # The fixture is only a fixture if git agrees. `GIT_DIR` and friends
@@ -438,6 +446,7 @@ DECOY="$(dirname "$WORK")/decoy"
 git init --quiet --initial-branch=main "$DECOY"
 git -C "$DECOY" config user.email t@example.com
 git -C "$DECOY" config user.name t
+git -C "$DECOY" config commit.gpgsign false
 git -C "$DECOY" config core.hooksPath "$DECOY/.git/no-hooks"
 git -C "$DECOY" commit --quiet --allow-empty -m "decoy tip"
 DECOY_TIP_BEFORE="$(git -C "$DECOY" rev-parse HEAD)"
@@ -1179,19 +1188,28 @@ check "a plain commit with an intent-to-add input: MINE, not in this commit" \
 # `git`, placed first on the HOOK's PATH, records every call the hook makes.
 # Committed through a SYMLINK to the fixture: the hook's $PWD — and so the
 # recorded index — then names the link while git reports the real path, and
-# only canonicalising both makes them the same file.
+# only canonicalising both makes them the same file. Where `ln -s` makes a
+# copy instead (Git for Windows by default) the case would prove nothing, so
+# it is skipped rather than passed; and it asserts its own premise, that the
+# recorded index really names the link.
 index_hook_fixture
 WORK_LINK="$(dirname "$WORK")/work-link"
-ln -s "$WORK" "$WORK_LINK"
+ln -s "$WORK" "$WORK_LINK" 2>/dev/null
 GIT_LOG_SHIM="$(dirname "$WORK")/shim-gitlog"
 mkdir -p "$GIT_LOG_SHIM"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$WORK/.git-calls" "$(command -v git)" > "$GIT_LOG_SHIM/git"
 chmod +x "$GIT_LOG_SHIM/git"
 printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add src-tauri/src/lib.rs
-( cd "$WORK_LINK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
-check "a plain commit, via a symlinked path, never runs the staged-later read" "yes|0" \
-    "$(grep -qF -- '--cached HEAD' "$WORK/.git-calls" 2>/dev/null && echo yes || echo no)|$(grep -cF -- '--ita-visible-in-index' "$WORK/.git-calls" 2>/dev/null || true)"
+if [ -L "$WORK_LINK" ]; then
+    ( cd "$WORK_LINK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
+    check "a plain commit, via a symlinked path, never runs the staged-later read" "yes|0" \
+        "$(grep -qF -- '--cached HEAD' "$WORK/.git-calls" 2>/dev/null && echo yes || echo no)|$(grep -cF -- '--ita-visible-in-index' "$WORK/.git-calls" 2>/dev/null || true)"
+    check "  and the recorded index really named the link" yes \
+        "$(case "$(cat "$WORK/.hook-index" 2>/dev/null)" in "$WORK_LINK"/*) echo yes ;; *) echo no ;; esac)"
+else
+    skip_note "symlinked-path canonicalisation: \`ln -s\` made no symlink here (a copy, or refused)"
+fi
 
 # The staged-later read fails closed like every other source: a failure is
 # UNAVAILABLE, never an empty list that could clear the committer.

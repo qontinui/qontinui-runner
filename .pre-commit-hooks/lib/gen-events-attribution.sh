@@ -841,10 +841,15 @@ gen_events_attribution() {
 #
 # Stage-aware. The hook runs at pre-commit AND pre-push, and "this push" is
 # false at pre-commit: there the staged input IS the change being made.
-# `gen_events_stage` decides which. One case it cannot word right: `git commit
-# --amend` at pre-commit. The commit being replaced is already in HEAD, so its
-# inputs read `already committed on this branch` although they are part of
-# the commit being made; the verdict is unaffected, only that label is.
+# `gen_events_stage` decides which. Two cases it cannot word right, both
+# label-only — the verdict stays on the widening side:
+#  - `git commit --amend` at pre-commit. The commit being replaced is already
+#    in HEAD, so its inputs read `already committed on this branch` although
+#    they are part of the commit being made.
+#  - `git commit -a` over an edit that was staged and then reverted in the
+#    working tree. The real index still holds the staged edit, so it reads
+#    `staged for a later commit`, though `-a` will discard it: there is no
+#    later commit it belongs to.
 #
 # It prints no commands. Earlier versions printed a set-aside recipe (a
 # tag-found stash, then a clean-worktree route), and each revision still had a
