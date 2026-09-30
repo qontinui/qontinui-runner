@@ -115,7 +115,8 @@ pub(crate) struct MachineCapability {
     pub(crate) cores: Option<u32>,
     /// Bytes currently allocated to pagefiles on disk (the sum of the LIVE
     /// files' sizes — what `Win32_PageFileUsage.AllocatedBaseSize` reports).
-    /// `Some(0)` is a real reading: a box configured with no pagefile.
+    /// `Some(0)` is a real reading: a box with no live pagefile (and none
+    /// configured — see [`assess_pagefile`] for why both must agree).
     pub(crate) pagefile_allocated: Option<u64>,
     /// The configured maximum pagefile size in bytes, summed over every file.
     /// UNKNOWN for a system-managed pagefile, which has no configured maximum —
@@ -166,7 +167,7 @@ pub(crate) struct LivePagefile {
 /// and must never be conflated:
 ///
 /// - `configured` is `PagingFiles` — the **NEXT-BOOT** configuration. System
-///   Properties writes it the instant the operator clicks OK, and it takes
+///   Properties writes it the instant the operator clicks OK, and it may take
 ///   effect only after a reboot.
 /// - `live` is `ExistingPageFiles` plus each file's size — what is in effect
 ///   THIS boot.
@@ -177,7 +178,157 @@ pub(crate) struct LivePagefile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PagefileReading {
     pub(crate) configured: Result<Vec<PagefileEntry>, String>,
-    pub(crate) live: Result<Vec<LivePagefile>, String>,
+    /// `Ok(None)` = the `ExistingPageFiles` value is ABSENT (distinct from
+    /// unreadable) — see [`assess_pagefile`] for the one case that may read it.
+    pub(crate) live: Result<Option<Vec<LivePagefile>>, String>,
+    /// When the `Memory Management` key was last written, unix seconds.
+    pub(crate) config_written_at: Result<i64, String>,
+    /// When the system booted, unix seconds.
+    pub(crate) booted_at: Result<i64, String>,
+}
+
+/// Writes to the `Memory Management` key within this many seconds of boot are
+/// the boot's OWN writes, not a pending change (300 s).
+///
+/// The session manager rewrites `ExistingPageFiles` — a value in this very key
+/// — at every boot, so the key's last-write time is ALWAYS a little after boot.
+/// Without a grace window every machine would read as "changed since boot".
+/// 300 s is generous for that early-boot write and short enough that an
+/// operator is unlikely to have opened System Properties and changed the
+/// pagefile inside it. That residual — a change made within 5 minutes of boot
+/// — is one of the limits [`assess_pagefile`]'s doc names.
+pub(crate) const BOOT_WRITE_GRACE_SECS: i64 = 300;
+
+/// Was the pagefile configuration written after this boot (beyond the boot's
+/// own writes)? PURE.
+pub(crate) fn written_since_boot(written_at: i64, booted_at: i64) -> bool {
+    written_at > booted_at.saturating_add(BOOT_WRITE_GRACE_SECS)
+}
+
+/// A Windows `FILETIME` (100 ns ticks since 1601-01-01 UTC) as unix seconds.
+/// `None` for a zero (never-set) time. PURE.
+pub(crate) fn filetime_to_unix_secs(high: u32, low: u32) -> Option<i64> {
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let ticks = (u64::from(high) << 32) | u64::from(low);
+    if ticks == 0 {
+        return None;
+    }
+    i64::try_from(ticks / TICKS_PER_SEC)
+        .ok()
+        .map(|secs| secs - EPOCH_DIFF_SECS)
+}
+
+/// What the pagefile reading establishes: the bytes allocated now, and the
+/// configuration in effect this boot (or why neither can be said). PURE.
+///
+/// ## Allocation
+///
+/// Always the LIVE files. The one case with no live list that still answers is
+/// a genuinely pagefile-less box: `ExistingPageFiles` absent AND `PagingFiles`
+/// empty — both halves agreeing — which is a real `0`. Any other absence is
+/// UNKNOWN: nothing here can tell "no pagefile" from "a value that did not
+/// answer" on one half alone.
+///
+/// ## Configuration in effect — three disqualifiers, any one is enough
+///
+/// 1. **Written since boot.** `PagingFiles` may take effect only after a
+///    reboot, and a same-path change (fixed 40960/40960 → system-managed, or →
+///    16384/65536 while the live file still sits inside the new band) is
+///    invisible to a path/size comparison. The registry CAN answer "was this
+///    key written after this boot?" honestly, so a write past
+///    [`BOOT_WRITE_GRACE_SECS`] after boot is "configuration changed since boot
+///    (pending reboot)". An unreadable write time or boot time is UNKNOWN, not
+///    live.
+/// 2. **Paths** and 3. **sizes** disagree with the live files —
+///    [`configuration_is_live`].
+///
+/// ## Residual limits, stated rather than hidden
+///
+/// - The write time is per KEY, not per value: any post-boot write to another
+///   `Memory Management` value (some security-mitigation tooling writes there)
+///   also reads as "changed since boot". That errs toward UNKNOWN, never toward
+///   a wrong answer.
+/// - A change made within [`BOOT_WRITE_GRACE_SECS`] of boot that also keeps the
+///   same paths and a live size inside the new band is not detected.
+/// - The boot time comes from the tick count (`sysinfo::System::boot_time`);
+///   with Fast Startup a "shutdown" is a hibernation that does not reset it.
+pub(crate) fn assess_pagefile(
+    reading: PagefileReading,
+) -> (Result<u64, String>, Result<Vec<PagefileEntry>, String>) {
+    let PagefileReading {
+        configured,
+        live,
+        config_written_at,
+        booted_at,
+    } = reading;
+    match live {
+        Err(reason) => {
+            let in_effect = configured.and_then(|_| {
+                Err(format!(
+                    "the live pagefile list is unreadable ({reason}), so whether PagingFiles \
+                     (the next-boot configuration) is the one in effect cannot be established"
+                ))
+            });
+            (Err(reason), in_effect)
+        }
+        Ok(None) => match configured {
+            Ok(entries) if entries.is_empty() => (Ok(0), Ok(entries)),
+            Ok(entries) => {
+                let reason = format!(
+                    "ExistingPageFiles is absent while PagingFiles names {:?} — the live \
+                     pagefiles cannot be established",
+                    entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>()
+                );
+                (Err(reason.clone()), Err(reason))
+            }
+            Err(reason) => (
+                Err(format!(
+                    "ExistingPageFiles is absent and PagingFiles is unreadable ({reason})"
+                )),
+                Err(reason),
+            ),
+        },
+        Ok(Some(live)) => {
+            let allocated = live.iter().try_fold(0u64, |acc, l| match &l.size {
+                Ok(bytes) => Ok(acc.saturating_add(*bytes)),
+                Err(reason) => Err(reason.clone()),
+            });
+            let in_effect = configured.and_then(|configured| {
+                let (written_at, booted_at) = match (config_written_at, booted_at) {
+                    (Ok(w), Ok(b)) => (w, b),
+                    (Err(r), _) | (_, Err(r)) => {
+                        return Err(format!(
+                            "whether the pagefile configuration changed since boot cannot be \
+                             established ({r})"
+                        ))
+                    }
+                };
+                if written_since_boot(written_at, booted_at) {
+                    return Err(format!(
+                        "configuration changed since boot (pending reboot): the Memory \
+                         Management key was written {}s after boot",
+                        written_at - booted_at
+                    ));
+                }
+                if !configuration_is_live(&configured, &live) {
+                    return Err(format!(
+                        "configuration pending reboot: PagingFiles (applied at the next boot) \
+                         names {:?}, which does not match the live pagefiles {:?}",
+                        configured
+                            .iter()
+                            .map(|e| e.path.as_str())
+                            .collect::<Vec<_>>(),
+                        live.iter()
+                            .map(|l| (l.path.as_str(), l.size.as_ref().ok()))
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                Ok(configured)
+            });
+            (allocated, in_effect)
+        }
+    }
 }
 
 /// Everything [`assemble`] needs, each input either a value or the reason it
@@ -422,42 +573,13 @@ pub(crate) fn assemble(inputs: CapabilityInputs) -> MachineCapability {
 
     let (pagefile_allocated, pagefile_max_bytes, pagefile_fixed_flag) = match inputs.pagefile {
         Ok(reading) => {
-            // ALWAYS the live files — never zero because the next-boot
-            // configuration happens to be empty.
-            let allocated = match &reading.live {
-                Ok(live) => live.iter().try_fold(0u64, |acc, l| match &l.size {
-                    Ok(bytes) => Ok(acc.saturating_add(*bytes)),
-                    Err(reason) => Err(reason.clone()),
-                }),
-                Err(reason) => Err(reason.clone()),
-            };
+            let (allocated, in_effect) = assess_pagefile(reading);
             let allocated = match allocated {
                 Ok(v) => Some(v),
                 Err(reason) => {
                     unknown.insert("pagefileAllocated", reason);
                     None
                 }
-            };
-            let in_effect = match (reading.configured, &reading.live) {
-                (Err(reason), _) => Err(reason),
-                (Ok(_), Err(reason)) => Err(format!(
-                    "the live pagefile list is unreadable ({reason}), so whether PagingFiles \
-                     (the next-boot configuration) is the one in effect cannot be established"
-                )),
-                (Ok(configured), Ok(live)) if !configuration_is_live(&configured, live) => {
-                    Err(format!(
-                        "configuration pending reboot: PagingFiles (applied at the next boot) \
-                         names {:?}, which does not match the live pagefiles {:?}",
-                        configured
-                            .iter()
-                            .map(|e| e.path.as_str())
-                            .collect::<Vec<_>>(),
-                        live.iter()
-                            .map(|l| (l.path.as_str(), l.size.as_ref().ok()))
-                            .collect::<Vec<_>>(),
-                    ))
-                }
-                (Ok(configured), Ok(_)) => Ok(configured),
             };
             match in_effect {
                 Ok(entries) => {
@@ -636,7 +758,7 @@ fn non_windows_phys_total(
 /// Both WMI classes are views over the same two `Memory Management` registry
 /// values read here — `PagingFiles` (the configuration) and `ExistingPageFiles`
 /// (the live files) — so the registry is the source, not an approximation of
-/// it. Reading it directly costs microseconds, needs no COM apartment on the
+/// it. Reading it directly is a handful of registry calls, needs no COM apartment on the
 /// calling thread and forks nothing. WMI costs hundreds of milliseconds, needs
 /// COM initialised, and — measured in this very plan's incident — is one of the
 /// things that FAILS under commit exhaustion: a .NET assembly load for the WMI
@@ -647,12 +769,12 @@ fn non_windows_phys_total(
 /// ## Read fresh every time, and never trusted as live on its own
 ///
 /// `PagingFiles` is the **next-boot** configuration: System Properties writes it
-/// immediately and it takes effect only after a reboot. So it is NOT cached for
+/// immediately and may take effect only after a reboot. So it is NOT cached for
 /// the process lifetime (a change made mid-run would otherwise be published as
 /// the live state until the runner restarted), and it describes growability
 /// only once [`configuration_is_live`] has matched it against
 /// `ExistingPageFiles` — the files actually live this boot — and their sizes.
-/// Both values and the sizes are re-read on every call: microseconds, only ever
+/// Both values and the sizes are re-read on every call — cheap, and only ever
 /// from the ~30 s fleet sampler or `/health`'s blocking task (never the async
 /// runtime, never the spawn path), and a system-managed pagefile GROWS under
 /// load, so a cached size would publish the one number most likely to have
@@ -665,7 +787,10 @@ mod windows_pagefile {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
-    use super::{normalize_pagefile_path, parse_paging_files, LivePagefile, PagefileReading};
+    use super::{
+        filetime_to_unix_secs, normalize_pagefile_path, parse_paging_files, LivePagefile,
+        PagefileReading,
+    };
 
     const MEMORY_MANAGEMENT: &str =
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
@@ -679,21 +804,45 @@ mod windows_pagefile {
     /// The live pagefiles, each with its size. `ExistingPageFiles` lists them
     /// in NT form (`\??\C:\pagefile.sys`); `std::fs::metadata` reads an in-use
     /// `pagefile.sys` through its `FindFirstFileW` fallback.
-    fn live(key: &RegKey) -> Result<Vec<LivePagefile>, String> {
-        let raw: Vec<String> = key
-            .get_value("ExistingPageFiles")
-            .map_err(|e| format!("ExistingPageFiles registry value unreadable: {e}"))?;
-        Ok(raw
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| {
-                let path = normalize_pagefile_path(s);
-                let size = std::fs::metadata(&path)
-                    .map(|m| m.len())
-                    .map_err(|e| format!("pagefile {path} could not be stat'ed: {e}"));
-                LivePagefile { path, size }
-            })
-            .collect())
+    fn live(key: &RegKey) -> Result<Option<Vec<LivePagefile>>, String> {
+        let raw: Vec<String> = match key.get_value("ExistingPageFiles") {
+            Ok(raw) => raw,
+            // ABSENT is not unreadable — `assess_pagefile` may read it as a
+            // pagefile-less box when `PagingFiles` agrees.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("ExistingPageFiles registry value unreadable: {e}")),
+        };
+        Ok(Some(
+            raw.iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    let path = normalize_pagefile_path(s);
+                    let size = std::fs::metadata(&path)
+                        .map(|m| m.len())
+                        .map_err(|e| format!("pagefile {path} could not be stat'ed: {e}"));
+                    LivePagefile { path, size }
+                })
+                .collect(),
+        ))
+    }
+
+    /// When the `Memory Management` key was last written, unix seconds.
+    fn config_written_at(key: &RegKey) -> Result<i64, String> {
+        let info = key
+            .query_info()
+            .map_err(|e| format!("Memory Management key metadata unreadable: {e}"))?;
+        let ft = &info.last_write_time;
+        filetime_to_unix_secs(ft.dwHighDateTime, ft.dwLowDateTime)
+            .ok_or_else(|| "Memory Management key reports no last-write time".to_string())
+    }
+
+    /// When this boot started, unix seconds (`sysinfo` derives it from the
+    /// tick count on Windows).
+    fn booted_at() -> Result<i64, String> {
+        match i64::try_from(sysinfo::System::boot_time()) {
+            Ok(0) | Err(_) => Err("system boot time unavailable".to_string()),
+            Ok(t) => Ok(t),
+        }
     }
 
     pub(super) fn reading() -> Result<PagefileReading, String> {
@@ -705,6 +854,8 @@ mod windows_pagefile {
         Ok(PagefileReading {
             configured,
             live: live(&key),
+            config_written_at: config_written_at(&key),
+            booted_at: booted_at(),
         })
     }
 }
@@ -851,6 +1002,19 @@ Committed_AS:   98765432 kB
         }
     }
 
+    /// Boot at a fixed instant, and the key's last write 10 s later — the
+    /// session manager's own boot-time write, inside the grace window.
+    const BOOT: i64 = 1_790_000_000;
+
+    fn at_boot() -> PagefileReading {
+        PagefileReading {
+            configured: Ok(vec![]),
+            live: Ok(Some(vec![])),
+            config_written_at: Ok(BOOT + 10),
+            booted_at: Ok(BOOT),
+        }
+    }
+
     fn live(path: &str, size: Result<u64, String>) -> LivePagefile {
         LivePagefile {
             path: normalize_pagefile_path(path),
@@ -863,7 +1027,8 @@ Committed_AS:   98765432 kB
     fn msi_pagefile(size: Result<u64, String>) -> PagefileReading {
         PagefileReading {
             configured: Ok(vec![custom(r"C:\pagefile.sys", 40960, 40960)]),
-            live: Ok(vec![live(r"\??\C:\pagefile.sys", size)]),
+            live: Ok(Some(vec![live(r"\??\C:\pagefile.sys", size)])),
+            ..at_boot()
         }
     }
 
@@ -931,7 +1096,8 @@ Committed_AS:   98765432 kB
         let cap = assemble(CapabilityInputs {
             pagefile: Ok(PagefileReading {
                 configured: Ok(vec![custom(r"D:\pagefile.sys", 8192, 8192)]),
-                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+                live: Ok(Some(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))])),
+                ..at_boot()
             }),
             ..msi_inputs()
         });
@@ -948,7 +1114,8 @@ Committed_AS:   98765432 kB
         let cap = assemble(CapabilityInputs {
             pagefile: Ok(PagefileReading {
                 configured: Ok(vec![custom(r"C:\pagefile.sys", 16384, 16384)]),
-                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+                live: Ok(Some(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))])),
+                ..at_boot()
             }),
             ..msi_inputs()
         });
@@ -963,7 +1130,8 @@ Committed_AS:   98765432 kB
         let cap = assemble(CapabilityInputs {
             pagefile: Ok(PagefileReading {
                 configured: Ok(vec![]),
-                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+                live: Ok(Some(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))])),
+                ..at_boot()
             }),
             ..msi_inputs()
         });
@@ -977,7 +1145,8 @@ Committed_AS:   98765432 kB
         let cap = assemble(CapabilityInputs {
             pagefile: Ok(PagefileReading {
                 configured: Ok(vec![]),
-                live: Ok(vec![]),
+                live: Ok(Some(vec![])),
+                ..at_boot()
             }),
             ..msi_inputs()
         });
@@ -993,6 +1162,7 @@ Committed_AS:   98765432 kB
             pagefile: Ok(PagefileReading {
                 configured: Ok(vec![custom(r"C:\pagefile.sys", 40960, 40960)]),
                 live: Err("ExistingPageFiles registry value unreadable".into()),
+                ..at_boot()
             }),
             ..msi_inputs()
         });
@@ -1025,6 +1195,146 @@ Committed_AS:   98765432 kB
             &managed,
             &[live(r"\??\C:\pagefile.sys", Err("stat failed".into()))]
         ));
+    }
+
+    /// Round 2 #1 — a same-path change (fixed → system-managed, or a resize
+    /// whose band still contains the live file) is invisible to the path/size
+    /// check; the key's post-boot write time is what disqualifies it.
+    #[test]
+    fn a_write_after_boot_is_pending_even_on_the_same_path() {
+        // 40960/40960 → 16384/65536: the live 40 GiB file sits INSIDE the new
+        // band, so only the write time can tell.
+        let resized = PagefileReading {
+            configured: Ok(vec![custom(r"C:\pagefile.sys", 16384, 65536)]),
+            live: Ok(Some(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))])),
+            config_written_at: Ok(BOOT + 3600),
+            ..at_boot()
+        };
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(resized.clone()),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_fixed, None);
+        assert!(cap.capability_unknown["pagefileFixed"].contains("changed since boot"));
+        assert_eq!(
+            cap.pagefile_allocated,
+            Some(40 * GIB),
+            "allocation stays live"
+        );
+        // The same reading, written only at boot, IS live (and growable).
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                config_written_at: Ok(BOOT + 10),
+                ..resized
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_fixed, Some(false));
+    }
+
+    #[test]
+    fn an_unreadable_write_or_boot_time_is_unknown_not_live() {
+        for reading in [
+            PagefileReading {
+                config_written_at: Err("metadata unreadable".into()),
+                ..msi_pagefile(Ok(40 * GIB))
+            },
+            PagefileReading {
+                booted_at: Err("boot time unavailable".into()),
+                ..msi_pagefile(Ok(40 * GIB))
+            },
+        ] {
+            let cap = assemble(CapabilityInputs {
+                pagefile: Ok(reading),
+                ..msi_inputs()
+            });
+            assert_eq!(cap.pagefile_fixed, None);
+            assert!(cap.capability_unknown["pagefileFixed"].contains("cannot be established"));
+        }
+    }
+
+    #[test]
+    fn the_boot_grace_window_and_filetime_conversion() {
+        assert!(!written_since_boot(BOOT + BOOT_WRITE_GRACE_SECS, BOOT));
+        assert!(written_since_boot(BOOT + BOOT_WRITE_GRACE_SECS + 1, BOOT));
+        assert!(!written_since_boot(BOOT - 100, BOOT));
+        // 1970-01-01T00:00:00Z is 116444736000000000 ticks after 1601.
+        let epoch: u64 = 116_444_736_000_000_000;
+        assert_eq!(
+            filetime_to_unix_secs((epoch >> 32) as u32, epoch as u32),
+            Some(0)
+        );
+        let later = epoch + 1_790_000_000 * 10_000_000;
+        assert_eq!(
+            filetime_to_unix_secs((later >> 32) as u32, later as u32),
+            Some(1_790_000_000)
+        );
+        assert_eq!(filetime_to_unix_secs(0, 0), None);
+    }
+
+    /// Round 2 #2 — a genuinely pagefile-less box: `ExistingPageFiles` absent
+    /// AND `PagingFiles` empty is a real, fixed zero. Absent with a non-empty
+    /// configuration stays UNKNOWN.
+    #[test]
+    fn absent_live_list_is_zero_only_when_the_configuration_agrees() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                live: Ok(None),
+                ..at_boot()
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, Some(0));
+        assert_eq!(cap.pagefile_fixed, Some(true));
+        assert_eq!(cap.pagefile_max, Some(0));
+
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Ok(vec![custom(r"C:\pagefile.sys", 40960, 40960)]),
+                live: Ok(None),
+                ..at_boot()
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, None);
+        assert_eq!(cap.pagefile_fixed, None);
+        assert_eq!(cap.pagefile_max, None);
+
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Err("PagingFiles unreadable".into()),
+                live: Ok(None),
+                ..at_boot()
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, None);
+        assert_eq!(cap.pagefile_fixed, None);
+    }
+
+    /// Round 2 #5 — physical RAM off Windows: the reading wins, `MemTotal` is
+    /// the fallback when `memory_status` withheld its reading, and a double
+    /// failure names both sources.
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_phys_total_falls_back_to_memtotal() {
+        let reading = super::super::resource_sample::MemoryStatus {
+            commit_total: 8 * GIB,
+            commit_available: GIB,
+            phys_total: 8 * GIB,
+            phys_available: GIB,
+        };
+        let meminfo = "MemTotal:       8388608 kB\n".to_string();
+        assert_eq!(
+            non_windows_phys_total(Some(reading), Ok(&meminfo)),
+            Ok(8 * GIB)
+        );
+        assert_eq!(non_windows_phys_total(None, Ok(&meminfo)), Ok(8 * GIB));
+        let no_line = non_windows_phys_total(None, Ok("MemFree: 1 kB\n")).unwrap_err();
+        assert!(no_line.contains("MemAvailable = 0") && no_line.contains("MemTotal"));
+        let unreadable = "/proc/meminfo unreadable: denied".to_string();
+        let both = non_windows_phys_total(None, Err(&unreadable)).unwrap_err();
+        assert!(both.contains("MemAvailable = 0") && both.contains("denied"));
     }
 
     /// W3 — a probe that never ran is null everywhere, with the reason under
