@@ -485,6 +485,14 @@ impl TerminalManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
+    /// Test seam: hold `session` under `id` without spawning a PTY.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, id: &str, session: Arc<TerminalSession>) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(id.to_string(), session);
+        }
+    }
+
     /// Update the title of a terminal session and emit a
     /// `terminal-title-changed` Tauri event so other webview windows
     /// (and the backend relay's WS subscribers) stay in sync.

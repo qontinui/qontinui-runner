@@ -95,11 +95,18 @@ pub enum CloseOutcome {
     AlreadyGone,
 }
 
+/// One row of the table: an armed remote create, or an attach that arrived
+/// before its terminal was armed.
 #[derive(Debug, Clone)]
 struct Armed {
+    /// When the create was armed — or, for a not-yet-armed attach marker, when
+    /// the attach was seen (used only to age the marker out).
     created_at: Instant,
     coord_session_id: Option<String>,
     ever_attached: bool,
+    /// `false` for an attach marker whose `arm` has not arrived yet. Only
+    /// armed rows are ever reaped.
+    armed: bool,
 }
 
 /// One terminal the sweep decided to close.
@@ -131,39 +138,68 @@ impl RemoteCreateReaper {
     }
 
     /// Record a freshly admitted remote create.
+    ///
+    /// `terminal_create` runs off the relay's read loop and arms only after
+    /// coord confirms the session, so an attach can bind in between. An
+    /// attach already recorded for this id (see [`Self::mark_attached`]) is
+    /// PRESERVED — a terminal that was attached before it was armed is owned,
+    /// and must not be reaped.
     pub fn arm(&self, terminal_id: &str, coord_session_id: Option<String>, now: Instant) {
-        self.table().insert(
+        let mut table = self.table();
+        let attached_already = table.get(terminal_id).is_some_and(|row| row.ever_attached);
+        table.insert(
             terminal_id.to_string(),
             Armed {
                 created_at: now,
                 coord_session_id,
-                ever_attached: false,
+                ever_attached: attached_already,
+                armed: true,
             },
         );
     }
 
     /// Record that an attach grant was bound to `terminal_id`. Sticky: a later
-    /// detach does not clear it. A terminal this reaper never armed (a local or
-    /// web-created one) is a no-op.
-    pub fn mark_attached(&self, terminal_id: &str) {
-        if let Some(armed) = self.table().get_mut(terminal_id) {
-            armed.ever_attached = true;
-        }
+    /// detach does not clear it.
+    ///
+    /// For an id not armed yet, a sticky attached MARKER is recorded, which a
+    /// later [`Self::arm`] honors (the attach-before-arm ordering). Every
+    /// attach of a terminal that is never armed — a local or web-created one —
+    /// also leaves a marker, so markers older than the deadline are pruned
+    /// here: an arm that races its own attach arrives within seconds, not
+    /// minutes.
+    pub fn mark_attached(&self, terminal_id: &str, now: Instant) {
+        let deadline = self.deadline;
+        let mut table = self.table();
+        table
+            .retain(|_, row| row.armed || now.saturating_duration_since(row.created_at) < deadline);
+        table
+            .entry(terminal_id.to_string())
+            .and_modify(|row| row.ever_attached = true)
+            .or_insert(Armed {
+                created_at: now,
+                coord_session_id: None,
+                ever_attached: true,
+                armed: false,
+            });
     }
 
     /// Apply [`decide`] to every armed terminal: `Reap` rows are removed and
     /// returned, `Keep` rows are removed (owned — nothing left to watch),
-    /// `Wait` rows stay.
+    /// `Wait` rows stay. Unarmed attach markers are kept until they age out.
     pub fn take_due(&self, now: Instant) -> Vec<Reaped> {
         let mut due = Vec::new();
-        self.table().retain(|terminal_id, armed| {
-            match decide(armed.created_at, armed.ever_attached, now, self.deadline) {
+        let deadline = self.deadline;
+        self.table().retain(|terminal_id, row| {
+            if !row.armed {
+                return now.saturating_duration_since(row.created_at) < deadline;
+            }
+            match decide(row.created_at, row.ever_attached, now, deadline) {
                 ReapDecision::Wait => true,
                 ReapDecision::Keep => false,
                 ReapDecision::Reap => {
                     due.push(Reaped {
                         terminal_id: terminal_id.clone(),
-                        coord_session_id: armed.coord_session_id.clone(),
+                        coord_session_id: row.coord_session_id.clone(),
                     });
                     false
                 }
@@ -174,6 +210,11 @@ impl RemoteCreateReaper {
 
     #[cfg(test)]
     fn is_armed(&self, terminal_id: &str) -> bool {
+        self.table().get(terminal_id).is_some_and(|row| row.armed)
+    }
+
+    #[cfg(test)]
+    fn has_row(&self, terminal_id: &str) -> bool {
         self.table().contains_key(terminal_id)
     }
 }
@@ -249,38 +290,74 @@ pub fn reaper() -> Arc<RemoteCreateReaper> {
         .clone()
 }
 
-/// Production arm: the process-wide reaper and a close through
-/// `TerminalManager::close` on the blocking pool — the same close
-/// `deliver_create_reply`'s caller runs for an undeliverable reply.
+/// What the reaper closes a terminal through. The production implementor is
+/// [`crate::terminal::TerminalManager`]; the trait is the seam that lets the
+/// production close path be tested without a Tauri `AppHandle` or a PTY.
+pub trait ReapTarget: Send + Sync + 'static {
+    /// Close `terminal_id`. `Ok(AlreadyGone)` when there was no such terminal —
+    /// it exited, or another close got there first.
+    fn close_terminal(&self, terminal_id: &str) -> Result<CloseOutcome, String>;
+}
+
+/// The prefix of `TerminalManager::close`'s error for an id it does not hold
+/// (`terminal/manager.rs`). Pinned by
+/// `a_real_manager_maps_an_unknown_terminal_to_already_gone`.
+const TERMINAL_NOT_FOUND: &str = "Terminal session not found";
+
+impl ReapTarget for crate::terminal::TerminalManager {
+    /// No `get`-then-`close` check: the close itself answers whether the
+    /// terminal was there, so a terminal that exits between a check and the
+    /// close cannot be misreported as a failed reap.
+    fn close_terminal(&self, terminal_id: &str) -> Result<CloseOutcome, String> {
+        match self.close(terminal_id) {
+            Ok(()) => Ok(CloseOutcome::Closed),
+            Err(e) if e.starts_with(TERMINAL_NOT_FOUND) => Ok(CloseOutcome::AlreadyGone),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Close `terminal_id` through `target` on the blocking pool — the same
+/// `TerminalManager::close` on the blocking pool that `deliver_create_reply`'s
+/// caller runs for an undeliverable reply. Killing the PTY child is what fires
+/// the terminal's exit hook, which closes its confirmed coord session.
+pub async fn close_through<T: ReapTarget + ?Sized>(
+    target: Arc<T>,
+    terminal_id: String,
+) -> Result<CloseOutcome, String> {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        target.close_terminal(&terminal_id)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Arm `terminal_id` on `reaper` with `target` as the close. What
+/// [`arm_remote_created`] runs, with the reaper and target injectable.
+pub fn arm_with_target<T: ReapTarget + ?Sized>(
+    reaper: Arc<RemoteCreateReaper>,
+    target: Arc<T>,
+    terminal_id: &str,
+    coord_session_id: Option<String>,
+) -> tokio::task::JoinHandle<Vec<Reaped>> {
+    arm_and_schedule(reaper, terminal_id, coord_session_id, move |id: String| {
+        close_through(target.clone(), id)
+    })
+}
+
+/// Production arm: the process-wide reaper, closing through the
+/// `TerminalManager`.
 pub fn arm_remote_created(
     tm: Arc<crate::terminal::TerminalManager>,
     terminal_id: &str,
     coord_session_id: Option<String>,
 ) {
-    arm_and_schedule(
-        reaper(),
-        terminal_id,
-        coord_session_id,
-        move |id: String| {
-            let tm = tm.clone();
-            async move {
-                if tm.get(&id).is_none() {
-                    return Ok(CloseOutcome::AlreadyGone);
-                }
-                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                    tm.close(&id)
-                })
-                .await
-                .map_err(|e| format!("join error: {e}"))?
-                .map(|()| CloseOutcome::Closed)
-            }
-        },
-    );
+    arm_with_target(reaper(), tm, terminal_id, coord_session_id);
 }
 
 /// Record that an attach grant was bound to `terminal_id` (process-wide).
 pub fn mark_attached(terminal_id: &str) {
-    reaper().mark_attached(terminal_id);
+    reaper().mark_attached(terminal_id, Instant::now());
 }
 
 #[cfg(test)]
@@ -366,7 +443,7 @@ mod tests {
         let t0 = Instant::now();
         let reaper = RemoteCreateReaper::new(N);
         reaper.arm("term-owned", Some("coord-2".into()), t0);
-        reaper.mark_attached("term-owned");
+        reaper.mark_attached("term-owned", t0);
         let (closed, close) = recorder();
 
         assert!(sweep(&reaper, t0 + N + SEC, &close).await.is_empty());
@@ -383,9 +460,9 @@ mod tests {
         reaper.arm("orphan", None, t0);
         reaper.arm("owned", None, t0);
         reaper.arm("young", None, t0 + N);
-        reaper.mark_attached("owned");
+        reaper.mark_attached("owned", t0);
         // Marking a terminal the reaper never armed is a no-op.
-        reaper.mark_attached("local-terminal");
+        reaper.mark_attached("local-terminal", t0);
         let (closed, close) = recorder();
 
         let reaped = sweep(&reaper, t0 + N + SEC, &close).await;
@@ -436,9 +513,152 @@ mod tests {
         let (closed, close) = recorder();
         let handle = arm_and_schedule(reaper.clone(), "term-attached", None, close);
         tokio::time::sleep(Duration::from_secs(250)).await;
-        reaper.mark_attached("term-attached");
+        reaper.mark_attached("term-attached", Instant::now());
         assert!(handle.await.unwrap().is_empty());
         assert!(closed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_attach_that_lands_before_the_arm_is_honored() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        // The attach binds while `terminal_create` is still awaiting coord's
+        // confirmation, i.e. before the row exists.
+        reaper.mark_attached("term-raced", t0);
+        assert!(!reaper.is_armed("term-raced"));
+        reaper.arm("term-raced", Some("coord-3".into()), t0 + SEC);
+        assert!(reaper.is_armed("term-raced"));
+        let (closed, close) = recorder();
+
+        assert!(sweep(&reaper, t0 + 2 * N, &close).await.is_empty());
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "an owned terminal was reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_arming_an_attached_terminal_keeps_it_attached() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.arm("term-a", None, t0);
+        reaper.mark_attached("term-a", t0);
+        reaper.arm("term-a", None, t0);
+        let (closed, close) = recorder();
+        assert!(sweep(&reaper, t0 + 2 * N, &close).await.is_empty());
+        assert!(closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unarmed_attach_markers_age_out() {
+        let t0 = Instant::now();
+        let reaper = RemoteCreateReaper::new(N);
+        reaper.mark_attached("local-1", t0);
+        // A later attach prunes markers older than the deadline.
+        reaper.mark_attached("local-2", t0 + N + SEC);
+        assert!(!reaper.has_row("local-1"));
+        assert!(reaper.has_row("local-2"));
+        // So does a sweep.
+        assert!(reaper.take_due(t0 + 3 * N).is_empty());
+        assert!(!reaper.has_row("local-2"));
+    }
+
+    /// A test `ReapTarget` that behaves like a manager whose terminal carries
+    /// an exit hook: closing a live terminal fires the hook with its coord id.
+    struct HookedTarget {
+        live: Mutex<HashMap<String, String>>,
+        exit_hook_fired: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl ReapTarget for HookedTarget {
+        fn close_terminal(&self, terminal_id: &str) -> Result<CloseOutcome, String> {
+            if self.fail {
+                return Err("pty close failed".into());
+            }
+            match self.live.lock().unwrap().remove(terminal_id) {
+                Some(coord) => {
+                    self.exit_hook_fired.lock().unwrap().push(coord);
+                    Ok(CloseOutcome::Closed)
+                }
+                None => Ok(CloseOutcome::AlreadyGone),
+            }
+        }
+    }
+
+    /// The production arm path (`arm_with_target` → `close_through` on the
+    /// blocking pool) closes through its target at the deadline, and the
+    /// target's close — here standing in for the exit hook — fires once.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_arm_path_closes_through_its_target() {
+        let target = Arc::new(HookedTarget {
+            live: Mutex::new(HashMap::from([(
+                "term-p".to_string(),
+                "coord-p".to_string(),
+            )])),
+            exit_hook_fired: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let reaper = Arc::new(RemoteCreateReaper::new(N));
+        let handle = arm_with_target(reaper, target.clone(), "term-p", Some("coord-p".into()));
+        let reaped = handle.await.unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert!(target.live.lock().unwrap().is_empty());
+        assert_eq!(
+            *target.exit_hook_fired.lock().unwrap(),
+            vec!["coord-p".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn close_through_passes_the_target_outcome_and_error_up() {
+        let target = Arc::new(HookedTarget {
+            live: Mutex::new(HashMap::new()),
+            exit_hook_fired: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        assert_eq!(
+            close_through(target, "t".into()).await,
+            Err("pty close failed".to_string())
+        );
+    }
+
+    /// The REAL manager: an id it does not hold — a terminal that exited, or
+    /// closed between any check and the reap — is `AlreadyGone`, not a failed
+    /// reap. This also pins `TERMINAL_NOT_FOUND` to the manager's wording.
+    #[tokio::test]
+    async fn a_real_manager_maps_an_unknown_terminal_to_already_gone() {
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        assert_eq!(
+            close_through(tm, "no-such-terminal".into()).await,
+            Ok(CloseOutcome::AlreadyGone)
+        );
+    }
+
+    /// The REAL manager holding a (PTY-less) session: the reap removes it
+    /// through `TerminalManager::close`, and a second close is `AlreadyGone`.
+    #[tokio::test]
+    async fn a_real_manager_closes_a_live_terminal_on_reap() {
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        let session =
+            crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())));
+        tm.insert_for_test("term-real", Arc::new(session));
+        assert!(tm.get("term-real").is_some());
+
+        let reaper = RemoteCreateReaper::new(N);
+        let t0 = Instant::now();
+        reaper.arm("term-real", None, t0);
+        let target = tm.clone();
+        let reaped = sweep(&reaper, t0 + N, move |id| close_through(target.clone(), id)).await;
+        assert_eq!(reaped.len(), 1);
+        assert!(
+            tm.get("term-real").is_none(),
+            "the reap must close the terminal"
+        );
+        assert_eq!(
+            close_through(tm, "term-real".into()).await,
+            Ok(CloseOutcome::AlreadyGone)
+        );
     }
 
     /// Wiring guard: the reaper does nothing unless `backend_relay.rs` ARMS an
