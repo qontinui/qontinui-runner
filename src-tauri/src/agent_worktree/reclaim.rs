@@ -1,7 +1,7 @@
 //! Ξ_Worktree reclaim executor (Phase 4, runner side).
 //!
 //! coord can decide that an on-disk worktree is reclaimable (orphaned, or
-//! its junctions drifted) but it has no host filesystem access — only the
+//! landed and idle) but it has no host filesystem access — only the
 //! runner can act on the operator's Windows disk. coord therefore exposes
 //! pending reclaim *instructions* per device; this module periodically
 //! pulls them and executes the **INV-W4 safe path**.
@@ -34,21 +34,35 @@
 //! env `QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS`). Best-effort: a failing
 //! tick `warn!`s and retries; the loop never panics.
 //!
-//! ## Arming (per-action, fail-safe)
+//! ## Arming (fail-safe)
 //!
-//! Arming is **per-action**, so the recoverable `rejunction` path can
-//! graduate to default-on while destructive `remove` stays behind the
-//! hardest gate (Phase 6.4 / Q1). coord ships two booleans in the pull:
-//! `rejunction_armed` and `remove_armed`. Both default `false` runner-side
-//! (`#[serde(default)]`), so a missing field — or an older coord that only
-//! sends `dry_run` — fails SAFE: the action is advisory-only and every
-//! instruction is merely LOGGED ("would do X"), nothing destructive
-//! happens. This is exactly the posture the single `dry_run=true` default
-//! used to give, now split per action.
+//! The only action this executor carries out is the destructive `remove`,
+//! behind coord's `remove_armed` pull flag (<- `COORD_WORKTREE_RECLAIM_ENABLED`).
+//! It defaults `false` runner-side (`#[serde(default)]`), so a missing field —
+//! or an older coord that only sends `dry_run` — fails SAFE: every instruction
+//! is merely LOGGED ("would do X") and nothing destructive happens.
 //!
-//! * `remove_armed`     ← coord's `COORD_WORKTREE_RECLAIM_ENABLED`.
-//! * `rejunction_armed` ← graduates to default-on server-side once G6 is
-//!   proven (rejunction never touches source, so it's recoverable).
+//! There is no `rejunction` executor any more. Coord's rejunction instructions
+//! only ever targeted a real-copy sink, which the old junction-creating step
+//! refused by design on Windows (never clobber a real dir) and no-op'd on
+//! Linux, so they reclaimed zero bytes on every OS; coord stopped serving them
+//! and `cargo-sweep-all.ps1` owns real-copy reclaim. A `"rejunction"` from an
+//! older coord deserializes to [`ReclaimAction::Unknown`] and plans a `Skip`.
+//! Plan `2026-09-30-rejunction-sinks-follow-the-cargo-workspace-and-coord-stops-emitting-refused-rejunctions`,
+//! D2/D3.
+//!
+//! ## Coord liveness is "a pull was answered", never an armed flag
+//!
+//! The Phase 4 local backstop ([`backstop_sweep`], which deletes clean session
+//! worktrees idle past 14 days) runs only while coord has NEVER been live this
+//! poller session. "Live" means a pull was answered and its body parsed
+//! ([`TickOutcome::Pulled`]); it deliberately reads no arming flag. It used to
+//! OR the rejunction and remove arming flags, so an operator disarming remove
+//! fleet-wide (the kill switch) could switch the LOCAL deletion path ON on
+//! every runner that booted once rejunction was gone. The kill switch means
+//! "stop destructive removal" and must never switch a second deletion path
+//! on: a disarmed but answering coord still owns reclaim, so the backstop
+//! stays suppressed.
 //!
 //! Defense in depth: even when armed, the runner NEVER acts on an
 //! `is_dirty` worktree (coord also filters these), and G6 (below) SKIPS any
@@ -81,8 +95,6 @@
 //! unexpected IO error is treated AS building (skip, retry next tick).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::process_helpers::{run_probe, ProbeOutcome};
@@ -90,10 +102,9 @@ use crate::process_helpers::{run_probe, ProbeOutcome};
 /// Budget for every external command in the reclaim tick.
 ///
 /// All of them are local: `git worktree remove/prune`, `git status
-/// --porcelain`, `mklink /J`. A healthy call is milliseconds; the hang class
-/// is an `index.lock` held by a concurrent git, or a `mklink` against a
-/// wedged filesystem. The reclaim loop ticks every 300s on a single
-/// blocking-pool thread, so an unbounded hang here removed that thread from
+/// --porcelain`. A healthy call is milliseconds; the hang class is an
+/// `index.lock` held by a concurrent git. The reclaim loop ticks every 300s
+/// on a single blocking-pool thread, so an unbounded hang here removed that thread from
 /// the pool permanently — the 2026-08-30 defect class. 30s absorbs a busy
 /// tree without ever letting the tick outlive its own interval.
 const RECLAIM_CMD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -228,17 +239,12 @@ fn note_poll_failure(err: &str) {
 
 /// The pull-endpoint body: `GET {coord}/coord/worktree-reclaim/{device_id}`.
 ///
-/// Per-action arming (Q1): `remove` and `rejunction` are armed
-/// independently. BOTH flags default `false` (`#[serde(default)]`), so a
-/// missing field — or an older coord that only sends the legacy `dry_run` —
-/// fails SAFE: the action is advisory-only (logged "would do X"), never
-/// destructive. This replaces the single global `dry_run` bool.
+/// `remove_armed` defaults `false` (`#[serde(default)]`), so a missing field
+/// — or an older coord that only sends the legacy `dry_run` — fails SAFE: a
+/// `Remove` is advisory-only (logged "would do X"), never destructive. An
+/// older coord's extra rejunction arming key is an unknown field and ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReclaimPull {
-    /// Arms the non-destructive `rejunction` action. Defaults `false`
-    /// (fail-safe). coord graduates this to default-on once G6 is proven.
-    #[serde(default)]
-    pub rejunction_armed: bool,
     /// Arms the destructive `remove` action. Defaults `false` (fail-safe).
     /// coord drives this from `COORD_WORKTREE_RECLAIM_ENABLED`.
     #[serde(default)]
@@ -277,10 +283,9 @@ pub struct BlockedWorktree {
 pub enum ReclaimAction {
     /// Unlink junctions, then remove the worktree.
     Remove,
-    /// Re-create the junction(s) from the worktree's sink to main.
-    Rejunction,
-    /// Forward-compatibility: an action this runner build doesn't know.
-    /// Treated as a no-op (logged), never destructive.
+    /// Forward-compatibility: an action this runner build doesn't know —
+    /// including `"rejunction"`, which coord no longer serves and this runner
+    /// no longer executes. Treated as a no-op (logged), never destructive.
     Unknown(String),
 }
 
@@ -292,7 +297,6 @@ impl<'de> Deserialize<'de> for ReclaimAction {
         let s = String::deserialize(d)?;
         Ok(match s.as_str() {
             "remove" => ReclaimAction::Remove,
-            "rejunction" => ReclaimAction::Rejunction,
             other => ReclaimAction::Unknown(other.to_string()),
         })
     }
@@ -339,8 +343,6 @@ pub enum ReclaimStep {
     /// remove --force, falling back to a dir remove). Only emitted AFTER
     /// all `UnlinkJunction` steps.
     RemoveWorktree(PathBuf),
-    /// (Re)create a junction at `link` pointing at `target`.
-    CreateJunction { link: PathBuf, target: PathBuf },
     /// Explicitly do nothing (dirty / unknown action / dry-run). Carries a
     /// human-readable reason for the log.
     Skip(String),
@@ -354,28 +356,17 @@ pub enum ReclaimStep {
 /// an UNARMED action yields only `Skip`s, and that an instruction whose
 /// worktree root is ABSENT on disk yields only a `Skip`.
 ///
-/// Arming is per-action (Q1): a `Remove` is destructive only when
-/// `remove_armed`; a `Rejunction` creates junctions only when
-/// `rejunction_armed`. An unarmed action logs "would do X" exactly like the
-/// old global dry-run path.
-///
-/// `canonical_path` is the repo's canonical checkout — the junction target
-/// root for a `rejunction`. `None` when the runner couldn't resolve it
-/// (then a rejunction degrades to a `Skip`).
+/// A `Remove` is destructive only when `remove_armed`; unarmed, it logs
+/// "would do X" exactly like the old global dry-run path.
 ///
 /// `root_exists` is the caller's dispatch-time `worktree_path` existence
 /// probe. `false` means coord's instruction is built on a stale census (the
-/// worktree was deleted out-of-band): executing a `Rejunction` against it
-/// would re-materialize the root as an empty husk (the 2026-06-12 incident),
-/// so the ENTIRE instruction is skipped — for `Remove` too, uniformly. The
-/// invariant this pins: a reclaim execution must never create a filesystem
-/// path, except junction reparse points inside an already-existing worktree
-/// root.
+/// worktree was deleted out-of-band), so the ENTIRE instruction is skipped.
+/// The invariant this pins: a reclaim execution must never create a
+/// filesystem path.
 pub fn plan_reclaim(
     instr: &ReclaimInstruction,
-    rejunction_armed: bool,
     remove_armed: bool,
-    canonical_path: Option<&Path>,
     root_exists: bool,
 ) -> Vec<ReclaimStep> {
     // Absent-root guard — a stale instruction for a worktree that no longer
@@ -395,11 +386,10 @@ pub fn plan_reclaim(
         ))];
     }
 
-    // Per-action arming — an unarmed action is advisory-only. We still emit
-    // a Skip so the caller logs "would do X".
+    // Arming — an unarmed Remove is advisory-only. We still emit a Skip so
+    // the caller logs "would do X".
     let armed = match &instr.action {
         ReclaimAction::Remove => remove_armed,
-        ReclaimAction::Rejunction => rejunction_armed,
         // Unknown actions are never "armed" — they always no-op below.
         ReclaimAction::Unknown(_) => true,
     };
@@ -428,43 +418,6 @@ pub fn plan_reclaim(
             steps.push(ReclaimStep::RemoveWorktree(worktree));
             steps
         }
-        ReclaimAction::Rejunction => {
-            let Some(canonical) = canonical_path else {
-                return vec![ReclaimStep::Skip(format!(
-                    "rejunction {} — no canonical path resolved for repo {}",
-                    instr.worktree_path, instr.repo
-                ))];
-            };
-            if instr.junctioned_paths.is_empty() {
-                return vec![ReclaimStep::Skip(format!(
-                    "rejunction {} — no junctioned_paths to recreate",
-                    instr.worktree_path
-                ))];
-            }
-            // `rel` is a sink KIND, resolved per checkout — both ends (see
-            // [`sink_path`]). The two resolutions must land at the same
-            // relative location; a worktree and canonical that disagree on
-            // layout are skipped rather than cross-joined.
-            instr
-                .junctioned_paths
-                .iter()
-                .map(|rel| {
-                    let link = sink_path(&worktree, rel);
-                    let target = sink_path(canonical, rel);
-                    let link_suffix = link.strip_prefix(&worktree).unwrap_or(&link);
-                    let target_suffix = target.strip_prefix(canonical).unwrap_or(&target);
-                    if link_suffix != target_suffix {
-                        return ReclaimStep::Skip(format!(
-                            "rejunction {} — layout mismatch: link {} vs canonical {}",
-                            instr.worktree_path,
-                            link_suffix.display(),
-                            target_suffix.display()
-                        ));
-                    }
-                    ReclaimStep::CreateJunction { link, target }
-                })
-                .collect()
-        }
         ReclaimAction::Unknown(a) => vec![ReclaimStep::Skip(format!(
             "unknown reclaim action {a:?} for {} — ignoring",
             instr.worktree_path
@@ -472,35 +425,12 @@ pub fn plan_reclaim(
     }
 }
 
-/// Resolve a coord-issued sink name against a checkout root.
-///
-/// Coord's vocabulary is a sink KIND (`"target"`, `"node_modules"`), not a
-/// layout-aware relative path: for the Tauri runner the cargo sink is
-/// `src-tauri/target`, and `<root>/target` does not exist on either end. So
-/// `"target"` resolves through [`super::census::target_dir_for`] — the same
-/// resolver the census MEASURES with, so the instruction acts on the dir
-/// whose bytes coord was shown — and every other kind is a literal join,
-/// exactly as before. Applied to BOTH the worktree (link) and the canonical
-/// checkout (target): a link-only fix would trade the `mklink` failure for
-/// `create_junction`'s "target does not exist" refusal. Plan
-/// `2026-08-26-disk-reclaim-is-disabled-three-independent-ways` §4 L1.
-///
-/// Reads the filesystem (`is_dir` / `exists`) but never mutates it, so
-/// [`plan_reclaim`] stays side-effect free.
-fn sink_path(root: &Path, rel: &str) -> PathBuf {
-    if rel == "target" {
-        super::census::target_dir_for(root)
-    } else {
-        root.join(rel)
-    }
-}
-
 /// Every path a Remove must unlink for sink kind `rel`, BEFORE the removal.
 ///
 /// `"target"` yields BOTH `src-tauri/target` and `target`, as the backstop
-/// sweep does, instead of the one [`sink_path`] picks: that choice rests on
-/// `exists()` at execution time, and a dangling junction can flip it away
-/// from the path the census saw. The extra step is free —
+/// sweep does, rather than only the one [`super::census::target_dir_for`]
+/// measures: a junction may sit at either path whatever the manifests say, and
+/// missing one would let the removal recurse through it. The extra step is free —
 /// [`unlink_junction`] is a no-op on an absent path or a real directory —
 /// and cannot widen what is deleted. Other kinds are a literal join.
 fn remove_unlink_paths(worktree: &Path, rel: &str) -> Vec<PathBuf> {
@@ -528,7 +458,6 @@ pub(super) fn execute_step(step: &ReclaimStep) -> Result<(), String> {
         }
         ReclaimStep::UnlinkJunction(path) => unlink_junction(path),
         ReclaimStep::RemoveWorktree(path) => remove_worktree(path),
-        ReclaimStep::CreateJunction { link, target } => create_junction(link, target),
     }
 }
 
@@ -730,109 +659,6 @@ fn is_session_uuid_dir(path: &Path) -> bool {
         .is_some_and(|n| Uuid::parse_str(n).is_ok())
 }
 
-/// Render a path as a `cmd.exe` argument: every `/` becomes `\`.
-///
-/// Worktree paths arrive from coord with forward slashes and get sink names
-/// joined on with the platform separator, so `mklink` was handed
-/// `D:/qontinui-root/…/qontinui-runner\target` — and `cmd` parses a
-/// `/`-led token as a switch (`Invalid switch`; pre-state counts in the
-/// plan's §5).
-/// Normalised HERE, at the `cmd` boundary only: `on_demand::norm_path` keys
-/// comparisons on forward slashes, so rewriting paths on ingest would
-/// silently re-key the cleared-set map. Pure and compiled on every platform
-/// so its test runs on Linux too; only the Windows `create_junction` calls
-/// it. Same plan as [`sink_path`], §4 L3.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn cmd_path_arg(p: &Path) -> String {
-    p.to_string_lossy().replace('/', "\\")
-}
-
-/// Create (or recreate) a junction at `link` pointing at `target`
-/// (`mklink /J` semantics). Idempotent: if `link` is already a junction
-/// we leave it; if it's a stale dir we remove the link first.
-#[cfg(windows)]
-fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
-    if !target.exists() {
-        return Err(format!(
-            "rejunction: target {} does not exist",
-            target.display()
-        ));
-    }
-    // If a junction is already there, treat as done (idempotent).
-    if is_junction(link) {
-        debug!(
-            "worktree_reclaim: junction {} already present — no-op",
-            link.display()
-        );
-        return Ok(());
-    }
-    // A real dir/file in the way (not a junction) — refuse, to avoid
-    // clobbering operator data.
-    if link.exists() {
-        return Err(format!(
-            "rejunction: {} exists and is not a junction — refusing to clobber",
-            link.display()
-        ));
-    }
-    // A missing parent means the worktree root itself is gone (for the sink
-    // links `<wt>/node_modules` / `<wt>/target`, `link.parent()` IS the
-    // worktree root). The only legitimate parents are created by
-    // `git worktree add`, never by reclaim — creating them here would
-    // re-materialize a deleted worktree as an empty husk.
-    if let Some(parent) = link.parent() {
-        if !parent.exists() {
-            return Err(format!(
-                "rejunction: link parent {} missing — refusing to create directories",
-                parent.display()
-            ));
-        }
-    }
-    // `cmd /C mklink /J <link> <target>` — /J = directory junction. Both
-    // paths go through [`cmd_path_arg`]: a forward slash reaches `cmd` as a
-    // switch (`Invalid switch`).
-    let mut cmd = crate::process_helpers::no_window("cmd");
-    cmd.args([
-        "/C",
-        "mklink",
-        "/J",
-        &cmd_path_arg(link),
-        &cmd_path_arg(target),
-    ]);
-    // `output_with_timeout`, not `run_probe`: the failure arm below needs the
-    // child's stderr verbatim, and a timeout surfaces here as an io error whose
-    // Display already names the pid + budget.
-    let out = crate::process_helpers::output_with_timeout(cmd, RECLAIM_CMD_TIMEOUT)
-        .map_err(|e| format!("rejunction: spawn mklink: {e}"))?;
-    if out.status.success() {
-        info!(
-            "worktree_reclaim: rejunctioned {} -> {}",
-            link.display(),
-            target.display()
-        );
-        Ok(())
-    } else {
-        Err(format!(
-            "rejunction: mklink /J {} {} failed: {}",
-            link.display(),
-            target.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
-}
-
-/// Non-Windows: rejunction is a no-op that reports success. The runner
-/// does run on Linux, but recreating a drifted `node_modules` / `target`
-/// link as a symlink there is not implemented — this arm logs and returns
-/// `Ok(())` without creating anything.
-#[cfg(not(windows))]
-fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
-    debug!(
-        "worktree_reclaim: rejunction {} skipped (non-windows)",
-        link.display()
-    );
-    Ok(())
-}
-
 /// Re-verify dirtiness at execution time (defense in depth — the pull may
 /// be stale). Reclaim-scoped: `git status --porcelain` MINUS the runner's own
 /// untracked scaffolding, via [`super::dirty::porcelain_is_dirty`] — the same
@@ -1003,9 +829,8 @@ fn execute_pull(pull: &ReclaimPull) {
         return;
     }
     info!(
-        "worktree_reclaim: {} instruction(s), rejunction_armed={} remove_armed={}",
+        "worktree_reclaim: {} instruction(s), remove_armed={}",
         pull.instructions.len(),
-        pull.rejunction_armed,
         pull.remove_armed
     );
     let window = Duration::from_secs(activity_window_secs());
@@ -1031,7 +856,6 @@ fn execute_pull(pull: &ReclaimPull) {
         // "would do X" Skip still logs.
         let armed = match &instr.action {
             ReclaimAction::Remove => pull.remove_armed,
-            ReclaimAction::Rejunction => pull.rejunction_armed,
             ReclaimAction::Unknown(_) => false,
         };
 
@@ -1071,13 +895,7 @@ fn execute_pull(pull: &ReclaimPull) {
         }
 
         let canonical = super::canonical_paths::default_canonical_path(&instr.repo).ok();
-        let steps = plan_reclaim(
-            instr,
-            pull.rejunction_armed,
-            pull.remove_armed,
-            canonical.as_deref(),
-            root_exists,
-        );
+        let steps = plan_reclaim(instr, pull.remove_armed, root_exists);
         let removed = execute_steps(&instr.worktree_path, &steps).is_ok()
             && steps
                 .iter()
@@ -1100,131 +918,6 @@ fn execute_pull(pull: &ReclaimPull) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step-failure reporting — aggregate throttle for the high-volume classes
-// (same plan as [`sink_path`], Phase 2b).
-//
-// Coord re-sends every refused Rejunction each tick, so the per-step `warn!`
-// wrote "refusing to clobber" and `mklink` lines in a volume that buried the
-// rate it was meant to show (2026-08-26 pre-state counts: plan
-// `2026-08-26-disk-reclaim-is-disabled-three-independent-ways` §5). The two known classes are counted
-// every time and surfaced as ONE aggregate WARN per class per window — count
-// since the last emit plus one example. Anything else keeps its per-instance
-// WARN: an unknown failure is exactly what must not be hidden. A log line,
-// not a coord finding, because the clobber refusal is the designed steady
-// state of a real-copy Rejunction (§4 L2) — a finding would page for it.
-// ---------------------------------------------------------------------------
-
-/// Aggregate window per failure class — 10 minutes, two poll ticks.
-const STEP_FAILURE_AGGREGATE_SECS: u64 = 600;
-
-/// Failure class of one step error, keyed on the messages
-/// [`create_junction`] writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepFailureClass {
-    RefusingToClobber,
-    MklinkFailed,
-    Other,
-}
-
-impl StepFailureClass {
-    fn classify(err: &str) -> Self {
-        if err.contains("refusing to clobber") {
-            Self::RefusingToClobber
-        } else if err.contains("mklink /J") && err.contains("failed") {
-            Self::MklinkFailed
-        } else {
-            Self::Other
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::RefusingToClobber => "refusing_to_clobber",
-            Self::MklinkFailed => "mklink_failed",
-            Self::Other => "other",
-        }
-    }
-}
-
-/// Count + last-emit stamp + one example for one aggregated class.
-/// Process-global via the statics below; tests drive a local instance.
-struct StepFailureAggregate {
-    last_emit: AtomicU64,
-    count: AtomicU64,
-    example: Mutex<Option<String>>,
-}
-
-impl StepFailureAggregate {
-    const fn new() -> Self {
-        Self {
-            last_emit: AtomicU64::new(super::census::THROTTLE_NEVER),
-            count: AtomicU64::new(0),
-            example: Mutex::new(None),
-        }
-    }
-
-    /// Record one occurrence at `now`. Returns `Some((count, example))` when
-    /// the window lets an aggregate through — `count` is every occurrence
-    /// since the previous emit, this one included — and resets the tally.
-    fn note(&self, now: u64, window_secs: u64, example: &str) -> Option<(u64, String)> {
-        self.count.fetch_add(1, Ordering::AcqRel);
-        if let Ok(mut slot) = self.example.lock() {
-            if slot.is_none() {
-                *slot = Some(example.to_string());
-            }
-        }
-        let mut out = None;
-        super::census::emit_throttled(&self.last_emit, now, window_secs, || {
-            let n = self.count.swap(0, Ordering::AcqRel);
-            let ex = self
-                .example
-                .lock()
-                .ok()
-                .and_then(|mut s| s.take())
-                .unwrap_or_else(|| example.to_string());
-            out = Some((n, ex));
-            true
-        });
-        out
-    }
-}
-
-static CLOBBER_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
-static MKLINK_FAILURES: StepFailureAggregate = StepFailureAggregate::new();
-
-/// The aggregate a class reports through, or `None` for a class that must
-/// keep its per-instance WARN.
-fn aggregate_for(class: StepFailureClass) -> Option<&'static StepFailureAggregate> {
-    match class {
-        StepFailureClass::RefusingToClobber => Some(&CLOBBER_FAILURES),
-        StepFailureClass::MklinkFailed => Some(&MKLINK_FAILURES),
-        StepFailureClass::Other => None,
-    }
-}
-
-/// Log one failed step: per-instance for [`StepFailureClass::Other`],
-/// aggregated per window for the two high-volume classes.
-fn report_step_failure(step: &ReclaimStep, err: &str) {
-    let class = StepFailureClass::classify(err);
-    let Some(agg) = aggregate_for(class) else {
-        warn!("worktree_reclaim: step {step:?} failed: {err}");
-        return;
-    };
-    let example = format!("step {step:?} failed: {err}");
-    if let Some((count, example)) = agg.note(
-        super::census::now_epoch_secs(),
-        STEP_FAILURE_AGGREGATE_SECS,
-        &example,
-    ) {
-        warn!(
-            "worktree_reclaim: {count} step failure(s) of class {} since the last report \
-             (aggregated per {STEP_FAILURE_AGGREGATE_SECS}s); example: {example}",
-            class.label()
-        );
-    }
-}
-
 /// Execute an ordered [`ReclaimStep`] plan, honoring the INV-W4 abort rule:
 /// a FAILED `UnlinkJunction` stops the plan immediately, because the
 /// remaining `RemoveWorktree` would then recurse through a still-live
@@ -1242,7 +935,7 @@ pub(super) fn execute_steps(worktree_path: &str, steps: &[ReclaimStep]) -> Resul
     let mut first_err: Option<String> = None;
     for step in steps {
         if let Err(e) = execute_step(step) {
-            report_step_failure(step, &e);
+            warn!("worktree_reclaim: step {step:?} failed: {e}");
             if first_err.is_none() {
                 first_err = Some(e);
             }
@@ -1501,9 +1194,10 @@ fn prune_all_canonical_checkouts() {
 // sweep is the machine-local defense-in-depth for exactly that state: it
 // deletes a session-worktree dir only when BOTH
 //   (a) its mtime age exceeds a generous ceiling (default 14 days), AND
-//   (b) coord has been unreachable-or-unarmed for this poller's ENTIRE
-//       session (a monotonic boolean that flips permanently to "coord was
-//       live" on the first successful pull with any arming flag on).
+//   (b) coord has been unreachable for this poller's ENTIRE session (a
+//       monotonic boolean that flips permanently to "coord was live" on the
+//       first answered-and-parsed pull, whatever its arming flags say — see
+//       the module doc).
 // (b) guarantees the backstop can never race a coord-issued instruction:
 // the moment coord's lifecycle is live, the backstop is suppressed for the
 // rest of the process lifetime. Dirty trees are never touched, and deletion
@@ -1512,7 +1206,7 @@ fn prune_all_canonical_checkouts() {
 // ---------------------------------------------------------------------------
 
 /// Pure eligibility for one backstop deletion. `true` only when the dir's
-/// age STRICTLY exceeds the ceiling, coord was never seen live+armed this
+/// age STRICTLY exceeds the ceiling, coord was never seen live this
 /// session, and the tree is clean. This is the function the unit tests pin.
 pub(super) fn backstop_eligible(
     age_secs: u64,
@@ -1593,7 +1287,7 @@ fn session_worktree_root() -> Option<PathBuf> {
 /// failure logs and moves on; the sweep never propagates an error.
 fn backstop_sweep(coord_ever_live: bool) {
     if coord_ever_live {
-        debug!("worktree_backstop: coord seen live+armed this session — sweep suppressed");
+        debug!("worktree_backstop: coord seen live this session — sweep suppressed");
         return;
     }
     let ceiling = backstop_max_age_secs();
@@ -1697,7 +1391,7 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
     match execute_steps(&wt_str, &steps) {
         Ok(()) => {
             warn!(
-                "worktree_backstop: DELETED {} (age={}d > ceiling {}d; coord absent/unarmed \
+                "worktree_backstop: DELETED {} (age={}d > ceiling {}d; coord never answered \
                  for entire poller session — last-resort local backstop)",
                 repo_dir.display(),
                 age / 86_400,
@@ -1734,8 +1428,8 @@ fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
 /// eligibility for BOTH triggers: the background poller ([`tick_once`]) and
 /// the on-demand endpoint ([`super::on_demand`]). Note the instruction list
 /// is computed by coord's G1–G5 gate **regardless of arming** — the
-/// `remove_armed` / `rejunction_armed` booleans only tell the *silent
-/// background* path whether it may act. The consented on-demand path reads
+/// `remove_armed` boolean only tells the *silent background* path whether it
+/// may act. The consented on-demand path reads
 /// the same cleared set without needing the silent path armed.
 pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> {
     let device_id = match super::census::load_device_id_pub() {
@@ -1794,7 +1488,7 @@ use crate::util::error_chain::error_chain;
 
 /// What one reclaim cycle actually did.
 ///
-/// This used to be a bare `bool` meaning `live_armed`, which made a SUCCESSFUL
+/// This used to be a bare `bool` meaning "live and armed", which made a SUCCESSFUL
 /// pull with arming off (the default posture) indistinguishable from "no
 /// device_id configured — did nothing". Any health signal built on that bool
 /// would report a perfectly healthy unarmed poller as never having succeeded.
@@ -1804,10 +1498,16 @@ pub enum TickOutcome {
     /// No device_id / no coord_url — nothing was attempted. Not a success and
     /// not a failure.
     Skipped,
-    /// coord answered. `live_armed` is true iff at least one arming flag was
-    /// on — the signal that flips the poller's monotonic `coord_ever_live` and
-    /// permanently suppresses the Phase 4 backstop.
-    Pulled { live_armed: bool },
+    /// coord answered and the body parsed. This alone — never an arming flag
+    /// — flips the poller's monotonic `coord_ever_live` and permanently
+    /// suppresses the Phase 4 backstop (see the module doc for why).
+    Pulled,
+}
+
+/// The poller's monotonic coord-liveness latch: once any tick is
+/// [`TickOutcome::Pulled`], coord stays live for the rest of the process.
+fn latch_coord_live(coord_ever_live: bool, outcome: &TickOutcome) -> bool {
+    coord_ever_live || matches!(outcome, TickOutcome::Pulled)
 }
 
 /// One reclaim cycle: pull + execute. `Err` only on a transport / non-2xx
@@ -1816,8 +1516,6 @@ pub async fn tick_once() -> Result<TickOutcome, String> {
     let Some((_device_id, pull)) = fetch_pull().await? else {
         return Ok(TickOutcome::Skipped);
     };
-    let live_armed = pull.rejunction_armed || pull.remove_armed;
-
     // execute_pull runs synchronous git/cmd subprocesses and filesystem
     // removals — potentially long (junction unlinks + worktree deletes).
     // Run it on the blocking pool so the shared fleet-publishers runtime's
@@ -1826,7 +1524,7 @@ pub async fn tick_once() -> Result<TickOutcome, String> {
     spawn_blocking_tracked(move || execute_pull(&pull))
         .await
         .map_err(|e| format!("reclaim execution panicked: {e}"))?;
-    Ok(TickOutcome::Pulled { live_armed })
+    Ok(TickOutcome::Pulled)
 }
 
 /// Spawn the periodic reclaim poller. Interval from
@@ -1867,7 +1565,7 @@ pub fn spawn_reclaim() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Phase 4: monotonic coord-liveness. Flips to `true` on the FIRST
-        // successful pull with any arming flag on, and never back — from
+        // answered pull (arming flags are irrelevant), and never back — from
         // that moment the local backstop sweep is suppressed for the rest
         // of the process lifetime (coord's lifecycle owns reclaim).
         let mut coord_ever_live = false;
@@ -1880,17 +1578,17 @@ pub fn spawn_reclaim() {
         loop {
             tick.tick().await;
             match tick_once().await {
-                Ok(TickOutcome::Pulled { live_armed }) => {
+                Ok(outcome @ TickOutcome::Pulled) => {
                     // coord answered: a success for health purposes whether or
                     // not anything was armed.
                     note_poll_success();
-                    if live_armed && !coord_ever_live {
+                    if !coord_ever_live {
                         info!(
-                            "worktree_reclaim: coord live+armed — local backstop permanently \
+                            "worktree_reclaim: coord live — local backstop permanently \
                              suppressed for this poller session"
                         );
                     }
-                    coord_ever_live |= live_armed;
+                    coord_ever_live = latch_coord_live(coord_ever_live, &outcome);
                 }
                 // Nothing attempted (unconfigured). Not a success — it must not
                 // reset a failure streak — and not a failure either.
@@ -1908,7 +1606,7 @@ pub fn spawn_reclaim() {
                     // Unconditional (unlike the backstop below): removing an
                     // ALREADY-empty dir destroys nothing, and the backstop —
                     // the only other sweeper — is suppressed whenever coord
-                    // is live, i.e. always in the armed steady state.
+                    // has answered a pull, i.e. always in the steady state.
                     prune_empty_session_dirs();
                     backstop_sweep(ever_live);
                 })
@@ -2338,7 +2036,7 @@ mod tests {
     fn remove_unlinks_every_junction_before_removing_worktree() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
         // remove_armed=true.
-        let steps = plan_reclaim(&i, false, true, None, true);
+        let steps = plan_reclaim(&i, true, true);
 
         // Exactly: both `target` candidates, then node_modules, then
         // RemoveWorktree(path) — junctions first, in coord's order.
@@ -2372,7 +2070,7 @@ mod tests {
             &["a", "b", "c", "node_modules", "target"],
             false,
         );
-        let steps = plan_reclaim(&i, false, true, None, true);
+        let steps = plan_reclaim(&i, true, true);
         let remove_idx = steps
             .iter()
             .position(|s| matches!(s, ReclaimStep::RemoveWorktree(_)))
@@ -2392,7 +2090,7 @@ mod tests {
     #[test]
     fn remove_with_no_junctions_is_just_a_removal() {
         let i = instr(ReclaimAction::Remove, &[], false);
-        let steps = plan_reclaim(&i, false, true, None, true);
+        let steps = plan_reclaim(&i, true, true);
         assert_eq!(
             steps,
             vec![ReclaimStep::RemoveWorktree(PathBuf::from(
@@ -2404,16 +2102,14 @@ mod tests {
     #[test]
     fn dirty_instruction_yields_no_destructive_steps() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], true);
-        // Even fully armed, a dirty worktree yields only a Skip.
-        let steps = plan_reclaim(&i, true, true, None, true);
+        // Even armed, a dirty worktree yields only a Skip.
+        let steps = plan_reclaim(&i, true, true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
-        // No unlink / remove / create anywhere.
+        // No unlink / remove anywhere.
         assert!(!steps.iter().any(|s| matches!(
             s,
-            ReclaimStep::UnlinkJunction(_)
-                | ReclaimStep::RemoveWorktree(_)
-                | ReclaimStep::CreateJunction { .. }
+            ReclaimStep::UnlinkJunction(_) | ReclaimStep::RemoveWorktree(_)
         )));
     }
 
@@ -2421,169 +2117,51 @@ mod tests {
     fn unarmed_remove_yields_no_destructive_steps() {
         // remove_armed=false → advisory-only Skip even though it's clean.
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
-        let steps = plan_reclaim(
-            &i, /* rejunction */ false, /* remove */ false, None, true,
-        );
-        assert_eq!(steps.len(), 1);
-        assert!(matches!(steps[0], ReclaimStep::Skip(_)));
-        assert!(!steps.iter().any(|s| matches!(
-            s,
-            ReclaimStep::UnlinkJunction(_)
-                | ReclaimStep::RemoveWorktree(_)
-                | ReclaimStep::CreateJunction { .. }
-        )));
-    }
-
-    #[test]
-    fn unarmed_rejunction_skips_even_with_canonical() {
-        // rejunction_armed=false → advisory-only Skip.
-        let i = instr(ReclaimAction::Rejunction, &["target"], false);
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
-        assert_eq!(steps.len(), 1);
-        assert!(matches!(steps[0], ReclaimStep::Skip(_)));
-    }
-
-    #[test]
-    fn rejunction_armed_but_remove_unarmed_skips_removes() {
-        // The graduated state: rejunction default-on, remove still gated.
-        // A Remove instruction is advisory-only...
-        let rm = instr(ReclaimAction::Remove, &["target"], false);
-        let steps = plan_reclaim(
-            &rm, /* rejunction */ true, /* remove */ false, None, true,
-        );
+        let steps = plan_reclaim(&i, /* remove */ false, true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
         assert!(!steps.iter().any(|s| matches!(
             s,
             ReclaimStep::UnlinkJunction(_) | ReclaimStep::RemoveWorktree(_)
         )));
-
-        // ...while a Rejunction in the SAME tick actually executes.
-        let rj = instr(ReclaimAction::Rejunction, &["target"], false);
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let rj_steps = plan_reclaim(&rj, true, false, Some(&canonical), true);
-        assert_eq!(
-            rj_steps,
-            vec![ReclaimStep::CreateJunction {
-                link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/target"),
-                target: PathBuf::from("D:/qontinui-root/qontinui-runner/target"),
-            }]
-        );
-    }
-
-    #[test]
-    fn both_unarmed_yields_nothing_destructive() {
-        // Defaults-absent equivalent: neither action armed → only Skips,
-        // nothing destructive, for either action kind.
-        for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
-            let i = instr(action, &["target", "node_modules"], false);
-            let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-            let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
-            assert_eq!(steps.len(), 1);
-            assert!(matches!(steps[0], ReclaimStep::Skip(_)));
-            assert!(!steps.iter().any(|s| matches!(
-                s,
-                ReclaimStep::UnlinkJunction(_)
-                    | ReclaimStep::RemoveWorktree(_)
-                    | ReclaimStep::CreateJunction { .. }
-            )));
-        }
-    }
-
-    #[test]
-    fn rejunction_creates_junctions_to_canonical() {
-        let i = instr(
-            ReclaimAction::Rejunction,
-            &["target", "node_modules"],
-            false,
-        );
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        // rejunction_armed=true.
-        let steps = plan_reclaim(&i, true, false, Some(&canonical), true);
-        assert_eq!(
-            steps,
-            vec![
-                ReclaimStep::CreateJunction {
-                    link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/target"),
-                    target: PathBuf::from("D:/qontinui-root/qontinui-runner/target"),
-                },
-                ReclaimStep::CreateJunction {
-                    link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/node_modules"),
-                    target: PathBuf::from("D:/qontinui-root/qontinui-runner/node_modules"),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn rejunction_without_canonical_path_skips() {
-        let i = instr(ReclaimAction::Rejunction, &["target"], false);
-        // Armed, but no canonical path → degrades to Skip.
-        let steps = plan_reclaim(&i, true, false, None, true);
-        assert_eq!(steps.len(), 1);
-        assert!(matches!(steps[0], ReclaimStep::Skip(_)));
     }
 
     #[test]
     fn unknown_action_is_a_skip_not_a_destructive_step() {
-        let i = instr(
+        // `"rejunction"` from an older coord lands here too (it deserializes
+        // to `Unknown`): armed or not, only a Skip.
+        for action in [
             ReclaimAction::Unknown("nuke".to_string()),
-            &["target"],
-            false,
-        );
-        // Even with both flags armed, an unknown action is a no-op Skip.
-        let steps = plan_reclaim(&i, true, true, None, true);
-        assert_eq!(steps.len(), 1);
-        assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+            ReclaimAction::Unknown("rejunction".to_string()),
+        ] {
+            let i = instr(action, &["target"], false);
+            for armed in [false, true] {
+                let steps = plan_reclaim(&i, armed, true);
+                assert_eq!(steps.len(), 1);
+                assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+            }
+        }
     }
 
     #[test]
-    fn absent_root_skips_entire_instruction_for_both_actions() {
+    fn absent_root_skips_entire_instruction_for_every_action() {
         // The stale-census husk-guard (R1): a worktree missing on disk must
-        // yield ONLY a Skip — for both actions, armed and unarmed — never a
+        // yield ONLY a Skip — for every action, armed and unarmed — never a
         // step that could create a filesystem path.
-        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
-            for (rj_armed, rm_armed) in [(false, false), (true, true)] {
+        for action in [
+            ReclaimAction::Remove,
+            ReclaimAction::Unknown("rejunction".to_string()),
+        ] {
+            for rm_armed in [false, true] {
                 let i = instr(action.clone(), &["target", "node_modules"], false);
-                let steps = plan_reclaim(
-                    &i,
-                    rj_armed,
-                    rm_armed,
-                    Some(&canonical),
-                    /* root */ false,
-                );
-                assert_eq!(steps.len(), 1, "{action:?} armed=({rj_armed},{rm_armed})");
+                let steps = plan_reclaim(&i, rm_armed, /* root */ false);
+                assert_eq!(steps.len(), 1, "{action:?} armed={rm_armed}");
                 assert!(
                     matches!(&steps[0], ReclaimStep::Skip(r) if r.contains("absent on disk")),
                     "absent root must be a Skip carrying the absent-on-disk reason"
                 );
             }
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn create_junction_refuses_to_create_missing_parent() {
-        // R2: a rejunction whose link parent (the worktree root) is missing
-        // must Err and create NOTHING — never re-materialize a husk.
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("canonical-node_modules");
-        std::fs::create_dir(&target).unwrap();
-        let missing_parent = dir.path().join("gone-wt");
-        let link = missing_parent.join("node_modules");
-
-        let res = create_junction(&link, &target);
-        assert!(res.is_err(), "missing parent must be an error");
-        assert!(
-            res.unwrap_err().contains("refusing to create directories"),
-            "error must name the refusal"
-        );
-        assert!(
-            !missing_parent.exists(),
-            "the missing parent must NOT be created"
-        );
     }
 
     #[test]
@@ -2698,9 +2276,11 @@ mod tests {
         assert!(!i.is_dirty);
         assert!(i.junctioned_paths.is_empty());
 
+        // An older coord's `"rejunction"` is no longer a known action: it
+        // lands in `Unknown` and plans a Skip.
         let j2 = r#"{"worktree_path":"p","repo":"r","action":"rejunction"}"#;
         let i2: ReclaimInstruction = serde_json::from_str(j2).unwrap();
-        assert_eq!(i2.action, ReclaimAction::Rejunction);
+        assert_eq!(i2.action, ReclaimAction::Unknown("rejunction".to_string()));
 
         let j3 = r#"{"worktree_path":"p","repo":"r","action":"frobnicate"}"#;
         let i3: ReclaimInstruction = serde_json::from_str(j3).unwrap();
@@ -2709,28 +2289,21 @@ mod tests {
 
     #[test]
     fn pull_arming_defaults_off_when_absent() {
-        // A pull body missing both arming flags must fail SAFE: neither
-        // action armed (advisory-only). Also covers an OLD coord that only
-        // ships the legacy `dry_run` field — unknown fields are ignored and
-        // arming stays off.
+        // A pull body missing `remove_armed` must fail SAFE (advisory-only).
+        // Also covers an OLD coord that only ships the legacy `dry_run`
+        // field — unknown fields are ignored and arming stays off.
         let j = r#"{"instructions":[]}"#;
         let p: ReclaimPull = serde_json::from_str(j).unwrap();
-        assert!(
-            !p.rejunction_armed,
-            "missing rejunction_armed → false (safe)"
-        );
         assert!(!p.remove_armed, "missing remove_armed → false (safe)");
 
         let legacy = r#"{"dry_run": false, "instructions": []}"#;
         let lp: ReclaimPull = serde_json::from_str(legacy).unwrap();
-        assert!(!lp.rejunction_armed, "old-coord dry_run ignored → unarmed");
         assert!(!lp.remove_armed, "old-coord dry_run ignored → unarmed");
     }
 
     #[test]
     fn pull_parses_full_shape() {
         let j = r#"{
-            "rejunction_armed": true,
             "remove_armed": false,
             "instructions": [
                 {
@@ -2744,7 +2317,6 @@ mod tests {
             ]
         }"#;
         let p: ReclaimPull = serde_json::from_str(j).unwrap();
-        assert!(p.rejunction_armed);
         assert!(!p.remove_armed);
         assert_eq!(p.instructions.len(), 1);
         assert_eq!(p.instructions[0].action, ReclaimAction::Remove);
@@ -2752,6 +2324,30 @@ mod tests {
             p.instructions[0].junctioned_paths,
             vec!["target".to_string(), "node_modules".to_string()]
         );
+    }
+
+    /// D2's backstop decision: coord liveness is "a pull was answered and
+    /// parsed", never an arming flag. A coord that answers with remove
+    /// DISARMED (the fleet kill switch) and no rejunction flag at all must
+    /// still latch `coord_ever_live`, so the local 14-day backstop stays
+    /// suppressed — the kill switch must never switch a second deletion path
+    /// on.
+    #[test]
+    fn a_disarmed_answered_pull_still_latches_coord_live() {
+        let body = r#"{"remove_armed": false, "instructions": []}"#;
+        let pull: ReclaimPull = serde_json::from_str(body).unwrap();
+        assert!(!pull.remove_armed);
+
+        // `tick_once` maps any parsed pull to `Pulled`, whatever its flags.
+        let live = latch_coord_live(false, &TickOutcome::Pulled);
+        assert!(live, "an answered pull must latch coord live");
+        // ...and a latched coord suppresses even an ancient, clean dir.
+        assert!(!backstop_eligible(u64::MAX, 14 * 86_400, live, false));
+
+        // Monotonic: a later unconfigured tick never un-latches it.
+        assert!(latch_coord_live(live, &TickOutcome::Skipped));
+        // Never-answered stays unlatched.
+        assert!(!latch_coord_live(false, &TickOutcome::Skipped));
     }
 
     // -----------------------------------------------------------------
@@ -2910,7 +2506,7 @@ mod tests {
 
     #[test]
     fn backstop_suppressed_once_coord_seen_live() {
-        // The monotonic boolean: coord seen live+armed ONCE suppresses the
+        // The monotonic boolean: coord seen live ONCE suppresses the
         // backstop for the whole session, regardless of age.
         let ceiling = DEFAULT_BACKSTOP_MAX_AGE_SECS;
         assert!(!backstop_eligible(ceiling * 10, ceiling, true, false));
@@ -3036,93 +2632,7 @@ mod tests {
         assert!(!DirtyVerdict::Unknown.permits_removal());
     }
 
-    // --- §4 L1: a sink KIND resolves per checkout, on both ends -----------
-
-    fn rejunction_steps_for(
-        worktree: &Path,
-        canonical: &Path,
-        junctioned: &[&str],
-    ) -> Vec<ReclaimStep> {
-        let mut i = instr(ReclaimAction::Rejunction, junctioned, false);
-        i.worktree_path = worktree.to_string_lossy().into_owned();
-        plan_reclaim(&i, true, false, Some(canonical), true)
-    }
-
-    /// The Tauri layout: `<root>/target` is absent on BOTH ends and the real
-    /// cargo sink is `src-tauri/target`. Link and target must both land
-    /// there — a link-only fix would point a junction at a missing target.
-    #[test]
-    fn rejunction_resolves_tauri_target_on_both_ends() {
-        let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt");
-        let canonical = dir.path().join("canonical");
-        for root in [&wt, &canonical] {
-            std::fs::create_dir_all(root.join("src-tauri/target")).unwrap();
-        }
-        let steps = rejunction_steps_for(&wt, &canonical, &["target"]);
-        assert_eq!(
-            steps,
-            vec![ReclaimStep::CreateJunction {
-                link: wt.join("src-tauri").join("target"),
-                target: canonical.join("src-tauri").join("target"),
-            }]
-        );
-    }
-
-    /// Worktree side of the Tauri layout has no build yet (`src-tauri/`
-    /// without a `target`): `target_dir_for` still picks `src-tauri/target`,
-    /// which is where the junction belongs.
-    #[test]
-    fn rejunction_tauri_link_resolves_before_first_build() {
-        let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt");
-        let canonical = dir.path().join("canonical");
-        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
-        std::fs::create_dir_all(canonical.join("src-tauri/target")).unwrap();
-        let steps = rejunction_steps_for(&wt, &canonical, &["target"]);
-        assert_eq!(
-            steps,
-            vec![ReclaimStep::CreateJunction {
-                link: wt.join("src-tauri").join("target"),
-                target: canonical.join("src-tauri").join("target"),
-            }]
-        );
-    }
-
-    /// A plain repo (no `src-tauri/`) keeps the literal `target`, and a
-    /// non-`target` kind is a literal join in every layout.
-    #[test]
-    fn rejunction_plain_repo_and_node_modules_are_literal_joins() {
-        let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt");
-        let canonical = dir.path().join("canonical");
-        for root in [&wt, &canonical] {
-            std::fs::create_dir_all(root.join("target")).unwrap();
-        }
-        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
-        assert_eq!(
-            steps,
-            vec![
-                ReclaimStep::CreateJunction {
-                    link: wt.join("target"),
-                    target: canonical.join("target"),
-                },
-                ReclaimStep::CreateJunction {
-                    link: wt.join("node_modules"),
-                    target: canonical.join("node_modules"),
-                },
-            ]
-        );
-
-        // node_modules stays a literal join in a Tauri layout too.
-        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
-        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
-        assert_eq!(sink_path(&wt, "node_modules"), wt.join("node_modules"));
-        assert_eq!(
-            sink_path(&canonical, "node_modules"),
-            canonical.join("node_modules")
-        );
-    }
+    // --- INV-W4: a `target` sink unlinks every candidate path ------------
 
     /// INV-W4 on a Tauri worktree: `"target"` unlinks BOTH candidate paths
     /// (so an `exists()` flip between census and execution cannot miss the
@@ -3140,156 +2650,11 @@ mod tests {
             ReclaimStep::UnlinkJunction(wt.join("node_modules")),
             ReclaimStep::RemoveWorktree(wt.clone()),
         ];
-        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
+        assert_eq!(plan_reclaim(&i, true, true), expected);
 
         // Both paths present: the plan is identical — it does not depend on
         // which one `target_dir_for` would pick.
         std::fs::create_dir_all(wt.join("target")).unwrap();
-        assert_eq!(plan_reclaim(&i, false, true, None, true), expected);
-    }
-
-    /// The worktree resolves `src-tauri/target` (Tauri, no build yet) while
-    /// the canonical, holding a top-level `target` and no `src-tauri/target`,
-    /// resolves `target`. Joining them would cross layouts: skip instead.
-    #[test]
-    fn rejunction_layout_mismatch_is_a_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt");
-        let canonical = dir.path().join("canonical");
-        std::fs::create_dir_all(wt.join("src-tauri")).unwrap();
-        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
-        std::fs::create_dir_all(canonical.join("target")).unwrap();
-        let steps = rejunction_steps_for(&wt, &canonical, &["target", "node_modules"]);
-        assert_eq!(steps.len(), 2);
-        match &steps[0] {
-            ReclaimStep::Skip(msg) => assert!(
-                msg.contains("layout mismatch"),
-                "unexpected skip reason: {msg}"
-            ),
-            other => panic!("expected a layout-mismatch Skip, got {other:?}"),
-        }
-        // The other sink is unaffected.
-        assert_eq!(
-            steps[1],
-            ReclaimStep::CreateJunction {
-                link: wt.join("node_modules"),
-                target: canonical.join("node_modules"),
-            }
-        );
-    }
-
-    // --- §4 L3: the `cmd` boundary gets backslashes only -------------------
-
-    #[test]
-    fn cmd_path_arg_normalises_mixed_separators() {
-        let p = Path::new("D:/qontinui-root/x/qontinui-runner\\target");
-        assert_eq!(
-            cmd_path_arg(p),
-            "D:\\qontinui-root\\x\\qontinui-runner\\target"
-        );
-        assert!(!cmd_path_arg(p).contains('/'));
-        // Already-native input is unchanged.
-        assert_eq!(cmd_path_arg(Path::new("C:\\a\\b")), "C:\\a\\b");
-    }
-
-    // --- Phase 2b: step-failure classification and aggregate throttle -----
-
-    #[test]
-    fn step_failure_classes() {
-        assert_eq!(
-            StepFailureClass::classify(
-                "rejunction: D:/wt/target exists and is not a junction — refusing to clobber"
-            ),
-            StepFailureClass::RefusingToClobber
-        );
-        assert_eq!(
-            StepFailureClass::classify(
-                "rejunction: mklink /J D:/wt\\target D:/c\\target failed: Invalid switch - \"wt\""
-            ),
-            StepFailureClass::MklinkFailed
-        );
-        // A spawn error mentions mklink but is not an `mklink /J … failed`.
-        assert_eq!(
-            StepFailureClass::classify("rejunction: spawn mklink: timed out"),
-            StepFailureClass::Other
-        );
-        assert_eq!(
-            StepFailureClass::classify("remove worktree dir D:/wt: access denied"),
-            StepFailureClass::Other
-        );
-    }
-
-    /// Classification against the exact messages `create_junction` builds
-    /// (its `format!` literals, copied — that fn compiles only on Windows).
-    #[test]
-    fn step_failure_classes_match_create_junction_messages() {
-        let link = Path::new("D:/wt/src-tauri/target");
-        let target = Path::new("D:/canonical/src-tauri/target");
-        let clobber = format!(
-            "rejunction: {} exists and is not a junction — refusing to clobber",
-            link.display()
-        );
-        let mklink = format!(
-            "rejunction: mklink /J {} {} failed: {}",
-            link.display(),
-            target.display(),
-            "Invalid switch - \"wt\"."
-        );
-        assert_eq!(
-            StepFailureClass::classify(&clobber),
-            StepFailureClass::RefusingToClobber
-        );
-        assert_eq!(
-            StepFailureClass::classify(&mklink),
-            StepFailureClass::MklinkFailed
-        );
-    }
-
-    /// Routing: each high-volume class has its OWN aggregate, and `Other`
-    /// is never aggregated (an unknown failure keeps its per-instance WARN).
-    #[test]
-    fn step_failure_routing_picks_the_class_aggregate() {
-        assert!(std::ptr::eq(
-            aggregate_for(StepFailureClass::RefusingToClobber).unwrap(),
-            &CLOBBER_FAILURES
-        ));
-        assert!(std::ptr::eq(
-            aggregate_for(StepFailureClass::MklinkFailed).unwrap(),
-            &MKLINK_FAILURES
-        ));
-        assert!(aggregate_for(StepFailureClass::Other).is_none());
-    }
-
-    /// 1 000 refusals at one logical instant emit exactly one aggregate; once
-    /// the window has passed, the next occurrence reports everything that
-    /// accumulated in between. Driven on a local instance with an injected
-    /// clock, never the process-global statics.
-    #[test]
-    fn step_failure_aggregate_emits_once_per_window_with_the_count() {
-        let agg = StepFailureAggregate::new();
-        let window = STEP_FAILURE_AGGREGATE_SECS;
-        let mut emits = Vec::new();
-        for i in 0..1000 {
-            if let Some(e) = agg.note(0, window, &format!("refusal #{i}")) {
-                emits.push(e);
-            }
-        }
-        assert_eq!(emits.len(), 1, "one aggregate per window");
-        assert_eq!(emits[0], (1, "refusal #0".to_string()));
-
-        // Inside the window: counted, not emitted.
-        assert!(agg.note(window - 1, window, "late").is_none());
-
-        // Window elapsed: the 999 suppressed at t=0, the one at window-1, and
-        // this one — with the first suppressed occurrence as the example.
-        let (count, example) = agg
-            .note(window, window, "after")
-            .expect("the window has elapsed");
-        assert_eq!(count, 1001);
-        assert_eq!(example, "refusal #1");
-
-        // The tally reset on emit.
-        let (count, _) = agg.note(2 * window, window, "next").unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(plan_reclaim(&i, true, true), expected);
     }
 }
