@@ -90,13 +90,15 @@ pub struct LivePty {
     pub title: String,
     /// The claude-image descendant pid that anchors this PTY's correlation (its
     /// `--session-id` cmdline + its process start). `None` when no claude image
-    /// is present in the subtree — the shell `pid` above stays the fallback
-    /// start anchor. Callers may leave this `None`: [`run_reconcile_pass`]
-    /// resolves it from that pass's process snapshot.
+    /// is present in the subtree — [`run_reconcile`] then leaves the pane alone
+    /// (a shell with no claude is never bound to a transcript). Callers may
+    /// leave this `None`: [`run_reconcile_pass`] resolves it from that pass's
+    /// process snapshot.
     pub ai_pid: Option<u32>,
     /// The anchor process's creation time (epoch seconds). `None` (or `<= 0`)
-    /// disables the start filter — the correlation then degrades to the shell
-    /// anchor, and failing that to the uniqueness gate alone.
+    /// with `ai_pid` resolved means the claude's own start is unknown — the
+    /// correlation then degrades to the shell `pid`'s start, and failing that
+    /// to the uniqueness gate alone.
     pub ai_start_unix: Option<i64>,
 }
 
@@ -448,8 +450,25 @@ pub fn run_reconcile<I: TranscriptIndex>(
             continue;
         }
 
-        // Anchor on the CLAUDE descendant's start when resolved; fall back to
-        // the shell pid's start (weaker, but better than no anchor at all).
+        // A pane with NO claude image in its subtree is never bound. Without
+        // this, the shell's start time became the anchor and ANY same-cwd
+        // transcript started after the shell qualified — a bare shell pane got
+        // a confirmed `observed` row for an unrelated session (2026-09-30:
+        // shell d8d6a412 bound to 01bcee5d), and the next restore typed
+        // `claude --resume` into a fresh pane. A claude that is present but
+        // not detected by image name is confirmed by its pinned id + the
+        // SessionStart hook instead.
+        if pty.ai_pid.is_none() {
+            actions.push(ReconcileAction::LeaveAlone {
+                terminal_id: pty.terminal_id.clone(),
+            });
+            continue;
+        }
+
+        // Anchor on the CLAUDE descendant's start when resolved. The shell
+        // pid's start is a fallback ONLY for a present claude whose own start
+        // is unknown — dropping it would downgrade a real session from
+        // `Observed` (auto-resume) to `Reconciled`.
         let anchor_start = pty.ai_start_unix.filter(|s| *s > 0).unwrap_or_else(|| {
             pty.pid
                 .and_then(|pid| snapshot.creation_times.get(&pid).copied())
@@ -1020,11 +1039,12 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
 }
 
 /// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
-/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The shell pid
-/// is only a fallback: the correlation must anchor on when CLAUDE started, not on
-/// when its shell did (a foreign same-cwd session started after the shell but
-/// before claude would otherwise qualify). A PTY whose subtree hosts no claude
-/// image keeps `ai_pid: None` and degrades to the shell anchor.
+/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
+/// correlation must anchor on when CLAUDE started, not on when its shell did (a
+/// foreign same-cwd session started after the shell but before claude would
+/// otherwise qualify); the shell pid's start is only a fallback for a found
+/// claude whose own start is unknown. A PTY whose subtree hosts no claude image
+/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it.
 fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty> {
     let mut out = live.to_vec();
     for pty in out.iter_mut() {
@@ -1961,11 +1981,11 @@ mod tests {
         };
         store.record_open(phantom);
 
-        // One live PTY with no record — a shim-bypassed claude. Its child
-        // process start = 1000; a post-start transcript exists.
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        // One live PTY with no record — a shim-bypassed claude, anchored on
+        // its claude descendant (pid 4242, start = 1000); a post-start
+        // transcript exists.
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
 
         let mut by_wd = HashMap::new();
         by_wd.insert(
@@ -2016,9 +2036,8 @@ mod tests {
     fn run_reconcile_is_idempotent_on_second_pass() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2128,9 +2147,8 @@ mod tests {
             spawn_device_default: None,
         });
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2216,9 +2234,8 @@ mod tests {
             spawn_device_default: None,
         });
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2261,9 +2278,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2283,6 +2299,55 @@ mod tests {
                 .zone_index,
             UNZONED_ZONE_INDEX,
             "nothing known about the grid ⇒ the sentinel, not a fabricated zone 0"
+        );
+    }
+
+    /// A pane with a shell and NO claude (`ai_pid: None`) is never bound, even
+    /// when exactly one same-cwd transcript started after the shell did. The
+    /// shell-start fallback once turned that into a confirmed `observed` row
+    /// (2026-09-30: bare shell d8d6a412 bound to unrelated session 01bcee5d),
+    /// which a restore then auto-resumed into a fresh pane.
+    #[test]
+    fn run_reconcile_never_binds_a_shell_with_no_claude() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // Shell pid 4242 started at 1000; no claude image resolved.
+        let live = vec![pty("shell-term", Some(4242), "C:/repo")];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("foreign-sess", "C:/cfg", Some(1_500))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["foreign-sess".to_string()].into_iter().collect(),
+        };
+
+        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                ReconcileAction::LeaveAlone { terminal_id } if terminal_id == "shell-term"
+            )),
+            "a shell with no claude is left alone, got {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { .. })),
+            "no bind for a shell with no claude, got {actions:?}"
+        );
+        assert!(
+            store.get("foreign-sess").is_none(),
+            "no row written for the unrelated transcript"
+        );
+        assert!(
+            store.find_open_by_terminal("shell-term").is_none(),
+            "no row written for the shell pane"
         );
     }
 }
