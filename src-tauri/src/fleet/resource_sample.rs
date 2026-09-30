@@ -205,8 +205,16 @@ pub(crate) struct ResourceSample {
     pub(crate) mem_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_available_bytes: Option<u64>,
-    /// Windows commit limit / free commit. `None` off Windows, where the
-    /// concept does not exist.
+    /// Windows commit limit / free commit.
+    ///
+    /// **Off Windows this pair is `MemTotal` / `MemAvailable`**, not a commit
+    /// pair — `memory_status` writes the one physical reading into both slots
+    /// there (this doc used to say "`None` off Windows", which the code has not
+    /// done since the pair was added). The Linux kernel's real `CommitLimit` is
+    /// published on `/health` → `machineCapability.commitLimit` by
+    /// [`super::machine_capability`]; it is not added to this wire until
+    /// `coord.device_resource_samples` has a column for it, for the reason
+    /// [`Self::thread_count`]'s doc gives.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) commit_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -718,22 +726,28 @@ pub(crate) fn available_phys_bytes() -> Option<u64> {
 /// not, so carrying the physical pair alongside the commit pair costs **zero**
 /// extra syscalls — which is the whole reason Phase 1 of plan
 /// `2026-08-08-memory-floors-watch-commit-and-physical` is behaviour-neutral.
+///
+/// `pub(super)` so [`super::machine_capability`] can build the capability
+/// block out of a reading the fleet sampler already took, rather than paying a
+/// second call for the same four numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MemoryStatus {
-    /// `ullTotalPageFile` — the commit limit.
-    commit_total: u64,
+pub(super) struct MemoryStatus {
+    /// `ullTotalPageFile` — the commit limit. **Off Windows this is
+    /// `MemTotal`, NOT the kernel's `CommitLimit`** — see the non-Windows arm
+    /// of [`memory_status`]; the capability block reads the real one.
+    pub(super) commit_total: u64,
     /// `ullAvailPageFile` — free commit. Plan §A3's converged number.
-    commit_available: u64,
+    pub(super) commit_available: u64,
     /// `ullTotalPhys` — installed physical RAM visible to the OS.
-    phys_total: u64,
+    pub(super) phys_total: u64,
     /// `ullAvailPhys` — "Available" physical (free + zero + standby), NOT the
     /// `FreeAndZeroPageList` "Free" counter. See [`available_phys_bytes`].
-    phys_available: u64,
+    pub(super) phys_available: u64,
 }
 
 /// Both memory pairs in bytes, from ONE OS call. `None` when the call fails —
 /// callers fail OPEN.
-fn memory_status() -> Option<MemoryStatus> {
+pub(super) fn memory_status() -> Option<MemoryStatus> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -765,6 +779,23 @@ fn memory_status() -> Option<MemoryStatus> {
         // `MemAvailable` is the honest physical equivalent AND the closest
         // honest commit equivalent — exactly the argument
         // `available_commit_bytes`'s own doc already makes for this fallback.
+        //
+        // ⚠️ So `commit_total` here is `MemTotal`, NOT the kernel's commit
+        // limit (`/proc/meminfo` `CommitLimit`), and nothing may read it as
+        // one. The machine's real commit limit is published by
+        // `fleet::machine_capability` (plan
+        // `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+        // Phase 1), which reads `CommitLimit` itself — and which is the input
+        // the ladder scale divides, so it never divides by `MemTotal`.
+        //
+        // This arm is deliberately NOT rewired to `CommitLimit` /
+        // `CommitLimit − Committed_AS` in that phase: the pair is the reading
+        // the spawn gate, `ci_node`'s reject/defer floors and coord's CI
+        // ranking (`1 − available/total`) all decide on, so changing either
+        // half would move a verdict in a phase that promised to move none.
+        // Doing it is a follow-up with its own evidence — and it would also add
+        // a `/proc/meminfo` read to the spawn path, which this one call is
+        // argued (in `spawn_gate_reading`'s doc) not to pay.
         (avail > 0).then_some(MemoryStatus {
             commit_total: total,
             commit_available: avail,
@@ -816,7 +847,8 @@ fn collect_host_lane() -> ResourceSample {
     // already returned, and the spawn gate and the fleet dashboard are now
     // literally the same reading rather than two probes of the same quantity —
     // `spawn_gate_reading` calls this identical function.
-    if let Some(m) = memory_status() {
+    let reading = memory_status();
+    if let Some(m) = reading {
         if m.phys_total > 0 {
             s.mem_total_bytes = Some(m.phys_total);
             s.mem_available_bytes = Some(m.phys_available);
@@ -824,6 +856,27 @@ fn collect_host_lane() -> ResourceSample {
         s.commit_total_bytes = Some(m.commit_total);
         s.commit_available_bytes = Some(m.commit_available);
     }
+
+    // The machine's capability, built around the SAME reading (no second
+    // `GlobalMemoryStatusEx`), and the Phase 2 shadow ladder derived from it
+    // (plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`).
+    //
+    // Nothing new goes on the wire here: the capability figures coord has
+    // columns for (`cpu_cores`, `mem_total_bytes`, and on Windows
+    // `commit_total_bytes`) are already filled above, and the rest is served
+    // on `/health` → `machineCapability` — see `machine_capability`'s module
+    // doc for why the pagefile trio waits for a coord column.
+    //
+    // The shadow runs HERE because this is the one periodic, off-runtime,
+    // off-spawn-path loop that already holds a fresh free-commit reading: it
+    // costs the shadow no memory syscall of its own and adds nothing to any
+    // spawn. It changes no verdict — it logs, edge-triggered, what the scaled
+    // ladder WOULD decide beside what the shipped one does.
+    let capability = super::machine_capability::probe_from(reading);
+    crate::resource_guard::note_commit_ladder_shadow(
+        &capability,
+        reading.map(|m| m.commit_available),
+    );
 
     // Windows has no load average; sysinfo returns zeros there, and a
     // fabricated 0.0 would render as "idle" on a saturated box.
@@ -1324,18 +1377,25 @@ fn wsl_base_path_probe_root(base_path: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(p))
 }
 
+/// One `/proc/meminfo` value in BYTES, or `None` when the key is absent or its
+/// value unparseable. `key` includes the colon (`"MemTotal:"`); the file quotes
+/// kB. Shared by the `wsl` lane's [`parse_meminfo`] and the Linux capability
+/// probe (`machine_capability::parse_commit_meminfo`), so the two cannot
+/// disagree about how a line is read.
+pub(super) fn meminfo_kb(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.trim().strip_suffix("kB"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.saturating_mul(1024))
+}
+
 /// Parse `/proc/meminfo` into a `wsl`-lane sample. Values are kB.
 ///
 /// Swap is reported as total + **used** (`SwapTotal - SwapFree`) because a bare
 /// swap byte count cannot be read as pressure — the ceiling differs per host,
 /// so pressure only means something against it.
 fn parse_meminfo(text: &str, lane_instance: String) -> Option<ResourceSample> {
-    let kb = |key: &str| -> Option<u64> {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.trim().strip_suffix("kB"))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|v| v.saturating_mul(1024))
-    };
+    let kb = |key: &str| meminfo_kb(text, key);
 
     let mem_total = kb("MemTotal:")?;
     let mut s = ResourceSample::empty(Lane::Wsl, Some(lane_instance));
