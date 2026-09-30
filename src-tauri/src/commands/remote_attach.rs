@@ -245,8 +245,8 @@ impl SourceRelay {
 /// reply, which is indistinguishable from a wedged target on the wire; coord's
 /// `target_runner` block is the only evidence that separates them. `what` is
 /// the reply that never came (`remote_terminal_attached` /
-/// `remote_terminal_created` / `remote_terminal_buffer`). Pure, so every arm is
-/// a unit test.
+/// `remote_terminal_created`; a history request has its own
+/// [`explain_history_timeout`]). Pure, so every arm is a unit test.
 pub(crate) fn explain_relay_timeout(
     what: &str,
     target_device_id: &str,
@@ -1277,13 +1277,9 @@ mod relay_timeout_tests {
         }
     }
 
-    /// The three replies a relay request can wait for — attach, create and
-    /// history — each explained by the same pure fn.
-    const WHATS: [&str; 3] = [
-        "remote_terminal_attached",
-        "remote_terminal_created",
-        "remote_terminal_buffer",
-    ];
+    /// The two replies whose timeout [`explain_relay_timeout`] explains —
+    /// attach and create. History has its own explainer and its own test.
+    const WHATS: [&str; 2] = ["remote_terminal_attached", "remote_terminal_created"];
 
     const REJECTED: &str = "registration rejected: code=1008, reason=Device token has expired";
 

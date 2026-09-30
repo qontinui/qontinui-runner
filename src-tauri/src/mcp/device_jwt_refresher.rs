@@ -7100,8 +7100,10 @@ mod tenant_slot_refresh_tests {
     /// Cognito `dark:false` cannot clear a posture-sourced banner rests on
     /// `emit_credential_dark` sending `source: "cognito"` and on the frontend
     /// reducer (`src/components/web-integration-banner-logic.ts`, M5) clearing
-    /// only the sending source's entry — covered by that reducer's own tests,
-    /// not here.
+    /// only the sending source's entry. The reducer half is covered by its own
+    /// tests (`WebIntegrationAuthBanner.test.ts`); the Rust half — the emitted
+    /// `source` value — is NOT tested anywhere, because emitting needs an
+    /// `AppHandle`.
     #[test]
     fn cognito_recovery_after_hard_notifies_recovered_and_leaves_the_posture_state_alone() {
         let _serialised = health_lock();
