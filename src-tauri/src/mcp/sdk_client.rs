@@ -2060,6 +2060,7 @@ async fn handle_ai_execute(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -2246,6 +2247,7 @@ async fn handle_fill_form(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -2701,7 +2703,6 @@ async fn handle_wait_for_route_change(
 /// GET /ui-bridge/sdk/windows — List capturable windows
 async fn handle_windows(
     State(state): State<Arc<ApiState>>,
-    Query(journey_query): Query<HashMap<String, String>>,
 ) -> Json<ApiResponse<Vec<super::ui_bridge::WindowInfo>>> {
     super::ui_bridge::ui_bridge_list_windows_handler(axum::extract::State(state)).await
 }
@@ -2749,6 +2750,7 @@ async fn handle_tabs(
 /// `/sdk/page/refresh` is a `navigation` edge: a reload is an `initial` load.
 async fn handle_page_refresh(
     State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
     let active_app = active_app_identity(&state).await;
@@ -2759,6 +2761,7 @@ async fn handle_page_refresh(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         crate::journey::cursor::ActionSpec::navigation(
             "refresh",
@@ -2827,6 +2830,7 @@ async fn handle_page_navigate(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -2944,6 +2948,7 @@ async fn handle_page_go_back(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         crate::journey::cursor::ActionSpec::navigation(
             "back",
@@ -2992,6 +2997,7 @@ async fn handle_page_go_forward(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         crate::journey::cursor::ActionSpec::navigation(
             "forward",
@@ -3040,6 +3046,7 @@ async fn handle_page_scroll(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -4182,9 +4189,10 @@ async fn handle_ct_execute_with_diff(
     };
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
     // users-path-and-the-passage-of-time, D3); `sdk_action_target` decides
-    // where it landed (a refusal: nowhere; no SDK app: the runner, N2).
+    // where it landed (a refusal: nowhere; no SDK app: nowhere — this route has no IPC
+    // fallback, C1).
     if let Some((key, app_version)) =
-        crate::journey::capture::sdk_action_target(active_app, None, &response)
+        crate::journey::capture::sdk_action_target(active_app, None, false, &response)
     {
         let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
         crate::journey::capture::record_diff(
@@ -4514,6 +4522,7 @@ async fn handle_undo(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         crate::journey::cursor::ActionSpec::untargeted_element("undo"),
     );
@@ -4552,6 +4561,7 @@ async fn handle_redo(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         crate::journey::cursor::ActionSpec::untargeted_element("redo"),
     );
@@ -4772,9 +4782,8 @@ async fn handle_component_action(
         Ok(data) => data,
         Err(e) => serde_json::json!({ "success": false, "error": e }),
     };
-    // With no active SDK app the dispatch reached nothing: no app, no edge.
-    // No active SDK app: `sdk_action_target` attributes the attempt to the
-    // runner's own surface (N2).
+    // With no active SDK app the dispatch reached nothing (this route has no
+    // IPC fallback), so `sdk_action_target` records no edge (C1).
     record_sdk_component_action(&state, active_app, &id, &action_id, &response);
     Json(response)
 }
@@ -4800,7 +4809,7 @@ fn record_sdk_component_action(
     response: &serde_json::Value,
 ) {
     let Some((key, app_version)) =
-        crate::journey::capture::sdk_action_target(target_app, None, response)
+        crate::journey::capture::sdk_action_target(target_app, None, false, response)
     else {
         return;
     };
@@ -4825,7 +4834,8 @@ fn record_sdk_component_action(
 /// batch is ONE trigger (`batch:<n>` on its first target) opening one pending
 /// edge. `action_steps` are the steps that act on an element; an empty batch
 /// acted on nothing and records nothing; `sdk_action_target` decides where
-/// the rest landed (a refusal: nowhere; no SDK app: the runner, N2).
+/// the rest landed (a refusal or no SDK app: nowhere — this route has no
+/// IPC fallback, C1).
 fn record_sdk_batch(
     state: &Arc<ApiState>,
     active_app: Option<(String, Option<String>)>,
@@ -4833,7 +4843,7 @@ fn record_sdk_batch(
     response: &serde_json::Value,
 ) {
     let (Some((key, app_version)), Some(action)) = (
-        crate::journey::capture::sdk_action_target(active_app, None, response),
+        crate::journey::capture::sdk_action_target(active_app, None, false, response),
         crate::journey::cursor::ActionSpec::batch(action_steps),
     ) else {
         return;
@@ -5048,6 +5058,7 @@ async fn handle_workflow_run(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -5339,6 +5350,7 @@ async fn handle_navigate_to(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -5550,6 +5562,7 @@ async fn handle_execute_transition(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -5625,6 +5638,7 @@ async fn handle_execute_intent(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -5708,6 +5722,7 @@ async fn handle_execute_intent_from_query(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         action,
     );
@@ -5775,6 +5790,7 @@ async fn handle_recovery_attempt(
         &state,
         active_app,
         scope.as_deref(),
+        false,
         &response.0,
         crate::journey::cursor::ActionSpec::batch_kind("recovery_attempt", None),
     );
@@ -7027,6 +7043,7 @@ async fn handle_click_by_text(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -7082,6 +7099,7 @@ async fn handle_click_by_selector(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -7137,6 +7155,7 @@ async fn handle_type_into(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -7225,6 +7244,7 @@ async fn handle_send_keys_to_page(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );
@@ -7275,7 +7295,7 @@ async fn handle_send_keys_to_page_dispatch(
             // message type the webview relay actually handles. Re-emitting a
             // `send_keys_to_page` message here would be silently dropped.
             // Same delegation pattern as `handle_list_windows` above.
-            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler(
+            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler_dispatch(
                 State(state.clone()),
                 Json(body),
             )
@@ -7388,6 +7408,7 @@ async fn handle_navigate_by_adapter(
         &state,
         active_app,
         scope.as_deref(),
+        true,
         &response.0,
         action,
     );

@@ -595,7 +595,7 @@ pub async fn ui_bridge_send_keys_to_page_handler(
 ///
 /// ⚠ `target: "activeElement"` can type into whatever is focused — see the
 /// module docs. It is opt-in only here too.
-async fn ui_bridge_send_keys_to_page_handler_dispatch(
+pub(crate) async fn ui_bridge_send_keys_to_page_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

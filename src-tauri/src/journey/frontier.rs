@@ -52,7 +52,7 @@ pub(crate) const FROM_NODE_KEY_SQL: &str = from_node_key_sql!();
 ///   fingerprints before the node-key expression is computed (m7);
 /// - each row's `reason` follows plan D4 ([`d4_reason`]);
 /// - `ON CONFLICT` refreshes `last_seen_*` and the role / effect, and moves
-///   the reason only between the D4 OBSERVATION reasons ([`OBSERVATION_REASONS`]):
+///   the reason only between the four D4 OBSERVATION reasons:
 ///   a reason another fact set — `activation_failed` (an edge from here
 ///   errored) or `budget_exhausted` (the explorer ran out) — is never
 ///   overwritten by merely seeing the affordance again (N5).
@@ -90,6 +90,7 @@ pub(crate) const FRONTIER_UPSERT_SQL: &str = concat!(
 
 /// The reasons an OBSERVATION sets (plan D4) and may therefore replace on
 /// conflict. Every other reason records a fact an observation cannot undo.
+#[cfg(test)]
 pub(crate) const OBSERVATION_REASONS: [FrontierReason; 4] = [
     FrontierReason::NotYetActivated,
     FrontierReason::EffectWrite,
@@ -116,6 +117,7 @@ pub(crate) fn d4_reason(declared_effect: Option<IrEffect>, navigation: bool) -> 
 }
 
 /// Whether `reason` is one an observation sets (and may replace).
+#[cfg(test)]
 pub(crate) fn d4_reason_is_observation(reason: FrontierReason) -> bool {
     OBSERVATION_REASONS.contains(&reason)
 }

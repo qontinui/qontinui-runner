@@ -123,45 +123,51 @@ pub(crate) fn record_control_result<T: serde::Serialize, E: serde::Serialize>(
     }
 }
 
-/// Where an SDK-route action landed (N2), or `None` when it landed nowhere.
+/// Where an SDK-route action landed (N2, C1), or `None` when it landed
+/// nowhere.
 ///
 /// - a refusal ([`sdk_refusal`]) reached no UI → `None`;
 /// - an active SDK app was connected → that app, with its reported version
 ///   and the request's relay `scope` (`tabId`);
-/// - no SDK app was connected → the route fell back to the runner's own
-///   webview (the `NotConnected` IPC fallback), so the action is the runner
-///   app's, in its main-window cursor. A route with no fallback answers
-///   `success:false`, which lands as an `error` edge there — it was an attempt
-///   against the runner's UI surface that failed.
+/// - no SDK app was connected:
+///   - on a route WITH an IPC fallback (`ipc_fallback`), the route acted on
+///     the runner's own webview instead, so the action is the runner app's,
+///     in its main-window cursor;
+///   - on a route WITHOUT one, the dispatch reached nothing → `None`.
 pub(crate) fn sdk_action_target(
     active_app: Option<(String, Option<String>)>,
     scope: Option<&str>,
+    ipc_fallback: bool,
     response: &serde_json::Value,
 ) -> Option<(CursorKey, Option<String>)> {
     if sdk_refusal(response) {
         return None;
     }
-    Some(match active_app {
-        Some((app_id, version)) => (CursorKey::new(app_id, scope), version),
-        None => (
+    match active_app {
+        Some((app_id, version)) => Some((CursorKey::new(app_id, scope), version)),
+        None if ipc_fallback => Some((
             CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
             None,
-        ),
-    })
+        )),
+        None => None,
+    }
 }
 
 /// Record an SDK-route action from its JSON answer (M3). `active_app` is the
-/// active SDK connection read BEFORE dispatch and `scope` the request's
-/// `tabId`; [`sdk_action_target`] decides where it landed. An explicit
-/// `success: false` is an `error` edge.
+/// active SDK connection read BEFORE dispatch, `scope` the request's `tabId`,
+/// and `ipc_fallback` whether this route falls back to the runner's own
+/// webview when no SDK app is connected; [`sdk_action_target`] decides where
+/// it landed. An explicit `success: false` is an `error` edge.
 pub(crate) fn record_sdk_result(
     state: &Arc<crate::mcp::types::ApiState>,
     active_app: Option<(String, Option<String>)>,
     scope: Option<&str>,
+    ipc_fallback: bool,
     response: &serde_json::Value,
     action: ActionSpec,
 ) {
-    let Some((key, app_version)) = sdk_action_target(active_app, scope, response) else {
+    let Some((key, app_version)) = sdk_action_target(active_app, scope, ipc_fallback, response)
+    else {
         return;
     };
     record_action(
@@ -1114,8 +1120,9 @@ mod tests {
     // ---- N2 / N3: where an SDK action landed ---------------------------------
 
     #[test]
-    fn an_sdk_action_with_no_app_connected_lands_on_the_runner() {
-        let (key, version) = sdk_action_target(None, Some("t1"), &json!({"success": true}))
+    fn with_no_app_connected_only_a_fallback_route_lands_on_the_runner() {
+        let ok = json!({"success": true});
+        let (key, version) = sdk_action_target(None, Some("t1"), true, &ok)
             .expect("the IPC fallback acted on the runner webview");
         assert_eq!(key.app_id, crate::spec_api::storage::RUNNER_APP_ID);
         assert_eq!(
@@ -1123,17 +1130,30 @@ mod tests {
             "the runner's main window, not the relay tab"
         );
         assert_eq!(version, None);
-        let (key, version) = sdk_action_target(
-            Some(("qontinui-web".into(), Some("1.0".into()))),
-            Some("t1"),
-            &json!({"success": false, "error": "boom"}),
-        )
-        .unwrap();
-        assert_eq!(
-            (key.app_id.as_str(), key.scope.as_deref()),
-            ("qontinui-web", Some("t1"))
+        let failed = json!({"success": false, "error": "No active SDK app connection"});
+        assert!(
+            sdk_action_target(None, Some("t1"), false, &failed).is_none(),
+            "a route with no fallback reached nothing: no edge"
         );
-        assert_eq!(version.as_deref(), Some("1.0"));
+        assert!(sdk_action_target(None, None, false, &ok).is_none());
+    }
+
+    #[test]
+    fn with_an_app_connected_the_fallback_flag_is_irrelevant() {
+        for ipc_fallback in [true, false] {
+            let (key, version) = sdk_action_target(
+                Some(("qontinui-web".into(), Some("1.0".into()))),
+                Some("t1"),
+                ipc_fallback,
+                &json!({"success": false, "error": "boom"}),
+            )
+            .unwrap();
+            assert_eq!(
+                (key.app_id.as_str(), key.scope.as_deref()),
+                ("qontinui-web", Some("t1"))
+            );
+            assert_eq!(version.as_deref(), Some("1.0"));
+        }
     }
 
     #[test]
@@ -1141,10 +1161,10 @@ mod tests {
         let transport =
             json!({"success": false, "code": "SDK_DISPATCH_FAILED", "failure_origin": "transport"});
         let app = json!({"success": false, "code": "ELEMENT_DISABLED", "failure_origin": "app"});
-        assert!(sdk_action_target(None, None, &transport).is_none());
-        assert!(sdk_action_target(Some(("a".into(), None)), None, &transport).is_none());
+        assert!(sdk_action_target(None, None, true, &transport).is_none());
+        assert!(sdk_action_target(Some(("a".into(), None)), None, false, &transport).is_none());
         assert!(
-            sdk_action_target(Some(("a".into(), None)), None, &app).is_some(),
+            sdk_action_target(Some(("a".into(), None)), None, false, &app).is_some(),
             "an app-origin failure reached the app: an error edge"
         );
     }
