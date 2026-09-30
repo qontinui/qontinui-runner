@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 
 use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
+use qontinui_runner_lib::agent_truth::StateCapabilities;
 
 /// Declared restore capability of a provider (plan §4 `restore_tier`). Drives
 /// the honest-UX surface in Phase 5: `Full` adapters restore the conversation;
@@ -180,6 +181,16 @@ pub trait SessionProviderAdapter: Send + Sync {
 
     /// Declared restore capability for honest UX (plan §4).
     fn restore_tier(&self) -> RestoreTier;
+
+    /// Which agent states each observation source can express for this
+    /// provider (plan `2026-09-20-terminal-session-state-comes-from-events-
+    /// not-screen-scraping` Phase 2). The `agent_truth` reducer lets a lower
+    /// source fill a state only when no higher source has reported it, or when
+    /// this matrix says the higher source cannot express it — so a provider
+    /// with no "waiting" event gets `NeedsYou` from the fallbacks, labelled as
+    /// such. Required (no default): a new provider must declare its hook
+    /// surface rather than inherit Claude's.
+    fn state_capabilities(&self) -> StateCapabilities;
 }
 
 /// The Claude reference adapter — Phase 1 PLACEHOLDER. The trait surface
@@ -276,6 +287,13 @@ impl SessionProviderAdapter for ClaudeAdapter {
     fn restore_tier(&self) -> RestoreTier {
         RestoreTier::Full
     }
+
+    fn state_capabilities(&self) -> StateCapabilities {
+        // The runner's carrier delivers SessionStart / UserPromptSubmit /
+        // PermissionRequest / Notification / Stop / StopFailure / SessionEnd,
+        // plus statusline and transcript liveness, on top of the fallbacks.
+        StateCapabilities::claude()
+    }
 }
 
 /// Registry seam (plan §4): resolve the adapter for `provider`. Phase 1 knows
@@ -317,6 +335,16 @@ mod tests {
         assert_eq!(RestoreTier::from_frontend_str("terminal_only"), None);
         assert_eq!(RestoreTier::from_wire_str(""), None);
         assert_eq!(RestoreTier::from_wire_str("FULL"), None);
+    }
+
+    #[test]
+    fn claude_state_capabilities_have_a_hook_for_every_state_class() {
+        use qontinui_runner_lib::agent_truth::{Source, StateClass};
+        let caps = adapter_for("claude").state_capabilities();
+        assert_eq!(caps, StateCapabilities::claude());
+        for class in StateClass::ALL {
+            assert!(caps.can_express(Source::Hook, class), "{class:?}");
+        }
     }
 
     #[test]
