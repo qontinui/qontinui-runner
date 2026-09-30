@@ -375,6 +375,7 @@ const READ_TOOLS: &[&str] = &[
     "coord_pr_status",
     "coord_reevaluate_dry",
     "coord_session_worktrees",
+    "coord_verification_queue",
     "coord_who_is_working_on",
 ];
 
