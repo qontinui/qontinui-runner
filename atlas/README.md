@@ -114,8 +114,8 @@ Refuse any preview that contains a `DROP` you did not intend.
 
 ## Relationship to the runner's boot-time self-heal
 
-`database/pg/mod.rs::verify_and_provision` does two things that touch these
-schemas, and both must stay consistent with `schema.hcl`:
+`database/pg/mod.rs::verify_and_provision` does three things that touch these
+schemas, and all three must stay consistent with `schema.hcl`:
 
 - it imperatively creates `orchestration.runs` / `orchestration.subtasks` so a
   fresh database without Atlas applied still boots the conductor;
@@ -125,6 +125,29 @@ schemas, and both must stay consistent with `schema.hcl`:
   table in both schemas is merged, and the old copy is dropped only when every
   legacy row is present and identical in the target. Anything else is left in
   place and logged at ERROR; the pass never fails boot.
+- then it creates any of the six a database lacks entirely —
+  `atlas_managed_provision::create_missing_atlas_managed_tables`. An embedded
+  cluster built from a dump older than `spec_proposals` / `proposal_events`
+  never gets them otherwise, because the canonical schema is applied only to a
+  fresh cluster. The DDL is not a second copy of `schema.hcl`: it is the
+  `atlas_managed` objects of the bundled `schema.pg.sql.generated`, picked out
+  by pg_dump's `-- Name: …; Schema: atlas_managed` headers. A table with a
+  legacy `project` copy still in place is not created, so a leftover the move
+  could not carry is never hidden behind an empty twin (and a child created
+  beside such a leftover parent is created without that one FK). It runs in
+  one transaction under the move's own advisory lock.
+
+All of that DDL runs under one session-level provisioning advisory lock, so
+runners booting against one database at once (a primary and a temp runner on
+a shared embedded cluster) provision one after another instead of racing on
+`CREATE … IF NOT EXISTS`.
+
+The move looks in `project` only. A dev Docker volume initialised before
+qontinui-web#1546 may also hold four orphaned `public.regression_*` tables:
+the old `init-scripts/01-create-runner-schema.sql` created them unqualified at
+initdb time. Nothing reads them, and `public` is outside both the runner's and
+Atlas's authority, so they are deliberately left alone; recreating the volume
+removes them.
 
 pgvector and pgcrypto stay imperatively bootstrapped there too: Atlas
 Community cannot own extensions.
