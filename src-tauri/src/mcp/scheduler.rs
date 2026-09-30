@@ -88,6 +88,18 @@ where
     Option::<String>::deserialize(d).map(Some)
 }
 
+/// A failed scheduler read. It is answered as a 500 rather than as an empty
+/// list or default settings, so a caller can tell "none" from "unknown".
+type ReadError = (StatusCode, Json<ApiResponse<()>>);
+
+fn read_failed(what: &str, e: impl std::fmt::Display) -> ReadError {
+    tracing::error!("Failed to read {}: {}", what, e);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(api_error(format!("Failed to read {}: {}", what, e))),
+    )
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -102,18 +114,6 @@ pub async fn list_scheduled_tasks(
         .await
         .map_err(|e| read_failed("scheduled tasks", e))?;
     Ok(Json(ApiResponse::success(tasks)))
-}
-
-/// A failed scheduler read. It is answered as a 500 rather than as an empty
-/// list or default settings, so a caller can tell "none" from "unknown".
-type ReadError = (StatusCode, Json<ApiResponse<()>>);
-
-fn read_failed(what: &str, e: impl std::fmt::Display) -> ReadError {
-    tracing::error!("Failed to read {}: {}", what, e);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(api_error(format!("Failed to read {}: {}", what, e))),
-    )
 }
 
 /// Create a new scheduled task
