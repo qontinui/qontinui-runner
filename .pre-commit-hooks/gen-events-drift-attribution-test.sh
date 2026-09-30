@@ -509,25 +509,33 @@ else
     else
         fail_note "  premise guard saw no include_str!'d markdown at all — the query is broken"
     fi
+    # Arms 1-2 intersect with the JsonSchema file list; an empty list would
+    # make them unfalsifiable while still printing "no violation".
+    SCHEMA_FILES="$(gen_events_premise_grep "$REPO_ROOT" -l -F 'JsonSchema' | grep -c '\.rs$' || true)"
+    if [ "${SCHEMA_FILES:-0}" -gt 0 ]; then
+        pass_note "  and it saw the $SCHEMA_FILES files that mention JsonSchema"
+    else
+        fail_note "  premise guard saw no JsonSchema file at all — arms 1-2 are neutered"
+    fi
 fi
 
 # Non-vacuity on fixtures: each arm must fire on a tree that violates it, and
 # the `let doc = include_str!` shape the real tree carries must not.
 premise_fixture() {
-    local root
+    local root rel="${2:-src-tauri/src/m.rs}"
     if ! root="$(mktemp -d -t gen-events-premise-XXXXXX)" || [ ! -d "$root" ]; then
         printf '  FATAL could not create a fixture directory\n' >&2
         exit 1
     fi
     FIXTURE_ROOTS+=("$root")
     git init --quiet --initial-branch=main "$root"
-    mkdir -p "$root/src-tauri/src"
-    printf '%s\n' "$1" > "$root/src-tauri/src/m.rs"
+    mkdir -p "$root/$(dirname "$rel")"
+    printf '%s\n' "$1" > "$root/$rel"
     PREMISE_FIXTURE="$root"
 }
 premise_case() {
-    local label="$1" want="$2" body="$3" got rc
-    premise_fixture "$body"
+    local label="$1" want="$2" body="$3" rel="${4:-}" got rc
+    premise_fixture "$body" $rel
     gen_events_markdown_premise_violations "$PREMISE_FIXTURE" >/dev/null && rc=0 || rc=$?
     case "$rc" in 0) got="clean" ;; 1) got="violation" ;; *) got="probe-failed($rc)" ;; esac
     check "$label" "$want" "$got"
@@ -546,6 +554,18 @@ premise_case "guard fires: a rustfmt-wrapped schemars attribute with an embed" v
     "$(printf '#[schemars(\n    description = include_str!(\n        "b.md"\n    )\n)]\nstruct S;')"
 premise_case "guard is quiet on let doc = include_str!(..) with no JsonSchema" clean \
     'fn t() { let doc = include_str!("b.md"); }'
+premise_case "guard fires: schemars(example = CONST)" violation \
+    '#[schemars(example = BODY)] struct S;'
+premise_case "guard fires: schemars(extend(\"description\" = CONST))" violation \
+    '#[schemars(extend("description" = BODY))] struct S;'
+premise_case "guard is quiet on literal schemars values (string and number)" clean \
+    '#[schemars(title = "S", range(min = 1))] struct S;'
+premise_case "guard fires: a build script reading markdown" violation \
+    'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
+premise_case "guard fires: a build script filtering on the md extension" violation \
+    'fn main() { if p.extension() == Some("md".as_ref()) {} }' src-tauri/build.rs
+premise_case "guard is quiet on a build script that only mentions a .md in prose" clean \
+    'fn main() { println!("See src-tauri/docs/tokio-console.md.\\n"); }' src-tauri/build.rs
 
 echo "  -- the premise gates the exclusion at decision time --"
 
@@ -570,32 +590,40 @@ check "with the premise intact, the exclusion applies and no reason is set" \
 
 echo "  -- a git failure is UNAVAILABLE, never a cleared pusher --"
 
-# A `git` on PATH that fails exactly one subcommand and passes the rest to the
-# real one. Before the fix, `$(git ... || true)` turned such a failure into an
-# empty list, i.e. "touched nothing", i.e. PRE-EXISTING.
+# A `git` on PATH that fails any invocation whose argument string matches a
+# glob, and passes the rest to the real one. Before the fix,
+# `$(git ... || true)` turned such a failure into an empty list, i.e.
+# "touched nothing", i.e. PRE-EXISTING. One case per call, because each is its
+# own way to lose the signal.
 REAL_GIT="$(command -v git)"
 git_shim_failing() {
-    local sub="$1" dir
-    dir="$(dirname "$WORK")/shim-$sub"
+    local name="$1" glob="$2" dir
+    dir="$(dirname "$WORK")/shim-$name"
     mkdir -p "$dir"
-    printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = "%s" ] && { echo "shim: %s fails" >&2; exit 128; }; done\nexec "%s" "$@"\n' \
-        "$sub" "$sub" "$REAL_GIT" > "$dir/git"
+    printf '#!/usr/bin/env bash\ncase "$*" in %s) echo "shim: %s fails" >&2; exit 128 ;; esac\nexec "%s" "$@"\n' \
+        "$glob" "$name" "$REAL_GIT" > "$dir/git"
     chmod +x "$dir/git"
     printf '%s' "$dir"
 }
-fixture
-commit_change "src/app.ts" "// ui"
-SHIM="$(git_shim_failing ls-files)"
-( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.state" )
-check "a failing git ls-files is UNAVAILABLE, not PRE-EXISTING" \
-    "unavailable" "$(cut -d'|' -f1 < "$WORK/.state")"
-check "  and the reason names the call" "yes" \
-    "$(grep -q 'ls-files' "$WORK/.state" && echo yes || echo no)"
+shim_case() {
+    local name="$1" glob="$2" want_reason="$3"
+    fixture
+    commit_change "src/app.ts" "// ui"
+    SHIM="$(git_shim_failing "$name" "$glob")"
+    ( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.state" )
+    check "a failing $name is UNAVAILABLE, not PRE-EXISTING" \
+        "unavailable" "$(cut -d'|' -f1 < "$WORK/.state")"
+    check "  and the reason names the call" "yes" \
+        "$(grep -qF -- "$want_reason" "$WORK/.state" && echo yes || echo no)"
+}
+shim_case "git diff base..HEAD" '*" diff --name-only -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so this push's commits"
+shim_case "git diff HEAD"       '*" diff --name-only -z HEAD -- "*'          "git diff HEAD failed"
+shim_case "git ls-files"        '*" ls-files "*'                              "ls-files --others failed"
 
 # The premise probe failing is treated as a violation: exclusion dropped.
 fixture
 commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
-SHIM="$(git_shim_failing grep)"
+SHIM="$(git_shim_failing grep '*" grep "*')"
 ( PATH="$SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
 check "a failing premise probe drops the exclusion, so the .md is MINE" \
     "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
@@ -628,27 +656,73 @@ check "  the file is labelled as not in the push" \
     yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
 check "  the advice stashes exactly that path, untracked included" \
     yes "$(has 'git stash push --include-untracked -m "gen-events-drift-')"
-check "  and names it" yes "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- Cargo.lock$' && echo yes || echo no)"
+check "  and names it, top-level anchored" yes "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/Cargo.lock$' && echo yes || echo no)"
 check "  restores by sha, never pop, never checkout" \
-    "yes|no" "$(has 'git stash apply <that sha>')|$(has 'git checkout --')"
+    "yes|no" "$(has 'git stash apply --index <that sha>')|$(has 'git checkout --')"
+check "  and drops the entry by re-finding it by tag" yes "$(has "git stash drop 'stash@{n}'")"
 
 render_with "$(detail_line src-tauri/src/new.rs untracked)"
 check "untracked: labelled as not in the push" \
     yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
 check "  and included in the stash command" yes \
-    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- src-tauri/src/new.rs$' && echo yes || echo no)"
+    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/src-tauri/src/new.rs$' && echo yes || echo no)"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)"
 check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
 check "  both labels are printed" "yes|yes" \
     "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
 check "  and the dirty half gets set-aside advice" yes \
-    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- src-tauri/src/lib.rs$' && echo yes || echo no)"
+    "$(printf '%s\n' "$RENDERED" | grep -q 'git stash push.* -- :/src-tauri/src/lib.rs$' && echo yes || echo no)"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
 RENDERED="$(gen_events_render_mine)"
 check "a dropped exclusion is stated in one line" yes "$(has 'Markdown was counted as a codegen input this time')"
+
+echo "  -- odd file names: real paths, and a set-aside command that runs --"
+
+# git C-quotes non-ASCII, `"` and `\` without `-z`; the labels and the stash
+# command then name files that do not exist. Here the printed command is
+# EXECUTED, from a subdirectory, inside the throwaway fixture — its stash is
+# the fixture's own, never the real repo's.
+fixture
+ODD_E='src-tauri/src/é b.rs'
+ODD_Q='src-tauri/src/q"t.rs'
+printf '// e\n' > "$WORK/$ODD_E"
+printf '// q\n' > "$WORK/$ODD_Q"
+ODD_T=""
+if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null; then
+    ODD_T="src-tauri/src/a"$'\t'"b.rs"
+fi
+decide
+check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
+check "  é b.rs is labelled by its real name" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_E"$'\t'"untracked" && echo yes || echo no)"
+check "  q\"t.rs is labelled by its real name" yes \
+    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"untracked" && echo yes || echo no)"
+if [ -n "$ODD_T" ]; then
+    ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
+    check "  a tab-named file is kept, shell-escaped, with the escaped flag" yes \
+        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked"$'\t'"escaped" && echo yes || echo no)"
+    check "  and counted in the flat list" yes \
+        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
+else
+    skip_note "tab-named file: this filesystem refuses a tab in a file name"
+fi
+RENDERED="$(gen_events_render_mine)"
+check "  the message shows é b.rs raw" yes \
+    "$(printf '%s\n' "$RENDERED" | grep -qF "    $ODD_E  (untracked" && echo yes || echo no)"
+STASH_CMD="$(printf '%s\n' "$RENDERED" | sed -n 's/^    \(git stash push .*\)$/\1/p')"
+STASH_TAG="$(printf '%s\n' "$STASH_CMD" | sed -n 's/.*-m "\([^"]*\)".*/\1/p')"
+( cd "$WORK/src-tauri" && eval "$STASH_CMD" ) >/dev/null 2>&1
+check "  the printed stash command, run from a subdirectory, sets them all aside" "no|no|no" \
+    "$([ -e "$WORK/$ODD_E" ] && echo yes || echo no)|$([ -e "$WORK/$ODD_Q" ] && echo yes || echo no)|$([ -n "$ODD_T" ] && [ -e "$WORK/$ODD_T" ] && echo yes || echo no)"
+STASH_SHA="$(git -C "$WORK" stash list --format='%H %gs' | grep -F "$STASH_TAG" | cut -d' ' -f1)"
+git -C "$WORK" stash apply --index "$STASH_SHA" >/dev/null 2>&1
+STASH_REF="$(git -C "$WORK" stash list --format='%gd %gs' | grep -F "$STASH_TAG" | cut -d' ' -f1)"
+git -C "$WORK" stash drop "$STASH_REF" >/dev/null 2>&1
+check "  and apply-by-sha then drop-by-tag restores them and empties the stack" "yes|yes|0" \
+    "$([ -e "$WORK/$ODD_E" ] && echo yes || echo no)|$([ -e "$WORK/$ODD_Q" ] && echo yes || echo no)|$(git -C "$WORK" stash list | wc -l | tr -d ' ')"
 
 echo
 if [ "$SKIP" -gt 0 ]; then

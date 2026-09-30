@@ -62,15 +62,24 @@
 # ATTRIBUTION_EXCLUDES_DROPPED_REASON. The attribution self-test runs the same
 # function against the real tree, so a violation is also loud at test time.
 #
-# What the guard does NOT see, stated so nobody mistakes it for a proof: a
-# const embedded in a file that neither mentions JsonSchema nor carries a
-# schemars attribute, then used by a JsonSchema type in ANOTHER file through a
-# path the single-line arms cannot read (a rustfmt-wrapped
-# `#[doc = ..]`/`#[schemars(..)]` whose value is on its own line, or a
-# `macro_rules!` that builds the attribute). Rust has no non-literal `#[doc]`
-# except a macro call, so the realistic hole is a hand-written schemars
-# `description` spread across lines — which the file-level `schemars(` arm
-# catches whenever the embed is in the same file.
+# What the guard covers: text or directory embeds (`include_str!`,
+# `include_bytes!`, `include_dir!`) beside `JsonSchema` or a `schemars(`
+# attribute in the same file; a `#[doc = include_*!(..)]` attribute anywhere;
+# a single-line `schemars(..)` attribute whose value is anything but a string
+# or numeric literal (`description`, `title`, `example`, `default`,
+# `extend("key" = EXPR)` — schemars 1 takes expressions for all of them); and
+# a build script that names a markdown path at all.
+#
+# What it does NOT see, stated so nobody mistakes it for a proof:
+#  - an embed in a file with neither `JsonSchema` nor `schemars(`, used by a
+#    JsonSchema type in ANOTHER file through a rustfmt-wrapped attribute whose
+#    value sits on its own line, or through a `macro_rules!` that builds the
+#    attribute;
+#  - a build script that reaches markdown through a path it assembles without
+#    ever writing a `.md"` or `"md"` literal (a glob over a directory, say).
+# It errs the other way on purpose elsewhere: a raw-string literal
+# (`title = r"x"`) or a `true` value reads as a violation and merely costs the
+# exclusion.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -176,21 +185,38 @@ GEN_EVENTS_PREMISE_PATHS=(
     "crates/spec-check"
 )
 
-# `git grep` over the premise paths in the WORKING TREE of $1, untracked files
-# included — the regeneration compiles the working tree, so that is what the
-# premise is about. Prints matches; exit 1 from git grep is "no match" and is
-# success here. Anything above 1 is a broken probe: printed as an `ERROR` line
-# and returned as 2, so a caller can never read a failed query as a clean tree.
-gen_events_premise_grep() {
-    local dir="$1"; shift
+# Build scripts the export build runs. A build script can read a markdown file
+# and GENERATE a JsonSchema type or doc from it, which no embed arm would see.
+GEN_EVENTS_PREMISE_BUILD_SCRIPTS=(
+    "src-tauri/build.rs"
+    ":(glob)src-tauri/src/**/build.rs"
+    ":(glob)src-tauri/clorinde/**/build.rs"
+    ":(glob)crates/spec-check/**/build.rs"
+)
+
+# `git grep` in the WORKING TREE of $1, untracked files included — the
+# regeneration compiles the working tree, so that is what the premise is about.
+# $2 names how many pathspecs follow; the rest are grep arguments. Prints
+# matches; exit 1 from git grep is "no match" and is success here. Anything
+# above 1 is a broken probe: printed as an `ERROR` line and returned as 2, so a
+# caller can never read a failed query as a clean tree.
+_gen_events_grep_in() {
+    local dir="$1" n="$2"; shift 2
+    local paths=("${@:1:$n}"); shift "$n"
     local out rc=0
-    out="$(git -C "$dir" grep --untracked "$@" -- "${GEN_EVENTS_PREMISE_PATHS[@]}" 2>&1)" || rc=$?
+    out="$(git -C "$dir" grep --untracked "$@" -- "${paths[@]}" 2>&1)" || rc=$?
     if [ "$rc" -gt 1 ]; then
         printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${out%%$'\n'*}"
         return 2
     fi
     [ "$rc" -eq 0 ] && printf '%s\n' "$out"
     return 0
+}
+
+# The same over the premise paths — what every embed arm reads.
+gen_events_premise_grep() {
+    local dir="$1"; shift
+    _gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_PATHS[@]}" "${GEN_EVENTS_PREMISE_PATHS[@]}" "$@"
 }
 
 # Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
@@ -250,13 +276,41 @@ gen_events_markdown_premise_violations() {
     # Anchored to attribute syntax so `let doc = include_str!(..)` is not one.
     line="$(gen_events_premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*include_(str|bytes)!')" || probe_failed=1
     if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
-    # Arm 5: schemars 1 takes EXPRESSIONS for description/title, so anything but
-    # a string literal there may be an embedded const from another file.
-    line="$(gen_events_premise_grep "$dir" -n -E 'schemars\(.*(description|title)[[:space:]]*=[[:space:]]*[^"[:space:]]')" || probe_failed=1
+    # Arm 5: schemars 1 takes EXPRESSIONS for description, title, example,
+    # default and `extend("key" = EXPR)`, so any `=` in a schemars attribute
+    # whose value is not a string or numeric literal may be an embedded const
+    # from another file. `[^=!<>]=` so `==`/`!=`/`<=` in an expression are not
+    # read as the assignment; `extend("key" = ..)` matches through the `" =`.
+    line="$(gen_events_premise_grep "$dir" -n -E 'schemars\(.*[^=!<>]=[[:space:]]*[^"[:space:][:digit:]-]')" || probe_failed=1
     if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
+    # Arm 6: a build script that names a markdown path at all — a `.md"`
+    # literal or an `"md"` extension check. Deliberately not "a read call on a
+    # .md path": build.rs mentions `tokio-console.md` in a message string, and
+    # a read through a const path would slip a read-call pattern anyway.
+    line="$(_gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" \
+        "${GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" -n -E '\.md"|"md"')" || probe_failed=1
+    if [ -n "$line" ]; then
+        printf '%s\n' "$line" | sed 's/$/  (a build script naming markdown)/'
+        found=1
+    fi
 
     [ "$probe_failed" = "1" ] && return 2
     [ "$found" = "1" ] && return 1
+    return 0
+}
+
+# Read NUL-delimited records from stdin into the global array _GEA_RECS. The
+# producer appends its own exit status as one final `rc=N` record, because a
+# process substitution's status is otherwise lost; anything but `rc=0` last —
+# including a truncated stream whose final path swallowed the sentinel — is
+# a failure. Global rather than a nameref so it runs on bash older than 4.3.
+_gen_events_read_z() {
+    _GEA_RECS=()
+    local rec recs=() n
+    while IFS= read -r -d '' rec; do recs+=("$rec"); done
+    n="${#recs[@]}"
+    [ "$n" -gt 0 ] && [ "${recs[$((n - 1))]}" = "rc=0" ] || return 1
+    [ "$n" -gt 1 ] && _GEA_RECS=("${recs[@]:0:$((n - 1))}")
     return 0
 }
 
@@ -269,7 +323,9 @@ gen_events_markdown_premise_violations() {
 #                       source one of `committed` (in merge-base..HEAD),
 #                       `uncommitted` (staged or unstaged, `git diff HEAD`) or
 #                       `untracked`. A path in several sources gets one line
-#                       per source — see the computation for why.
+#                       per source — see the computation for why. A path
+#                       holding a tab or newline appears shell-escaped, with a
+#                       third field `escaped`. Paths are raw, never C-quoted.
 #   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
 #                       applied; otherwise why this decision ran on the full,
 #                       unexcluded list (premise violated, or its probe failed)
@@ -338,40 +394,52 @@ gen_events_attribution() {
     # Each call's status is checked, not swallowed: an empty list from a git
     # that FAILED would read as "touched nothing" and clear the pusher — the
     # one direction this library must never err in.
-    local committed uncommitted untracked
-    if ! committed="$(git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
-            -- "${pathspec[@]}" 2>/dev/null)"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so this push's commits could not be read"
-        return 0
-    fi
-    if ! uncommitted="$(git -C "$repo" diff --name-only HEAD \
-            -- "${pathspec[@]}" 2>/dev/null)"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="git diff HEAD failed, so the working tree could not be read"
-        return 0
-    fi
-    if ! untracked="$(git -C "$repo" ls-files --others --exclude-standard \
-            -- "${pathspec[@]}" 2>/dev/null)"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"
-        return 0
-    fi
+    #
+    # `-z` throughout. Without it git C-quotes any path with non-ASCII, `"`,
+    # `\` or a control character (`"src-tauri/src/\303\251 b.rs"`), and the
+    # labels and the set-aside command then name a file that does not exist.
+    local touched_lines="" detail_lines="" src
+    for src in committed uncommitted untracked; do
+        case "$src" in
+            committed)
+                _gen_events_read_z < <(git -C "$repo" diff --name-only -z "$ATTRIBUTION_BASE_SHA" HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so this push's commits could not be read"; return 0; } ;;
+            uncommitted)
+                _gen_events_read_z < <(git -C "$repo" diff --name-only -z HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff HEAD failed, so the working tree could not be read"; return 0; } ;;
+            untracked)
+                _gen_events_read_z < <(git -C "$repo" ls-files --others --exclude-standard -z \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"; return 0; } ;;
+        esac
+        # A path containing a tab or newline cannot sit in a line-and-tab
+        # format, so it is carried shell-escaped (printf %q, which emits no
+        # raw tab or newline) with a third `escaped` field. It still counts:
+        # dropping it would clear a pusher over a file name.
+        local p shown
+        for p in ${_GEA_RECS[@]+"${_GEA_RECS[@]}"}; do
+            case "$p" in
+                *$'\t'*|*$'\n'*)
+                    shown="$(printf '%q' "$p")"
+                    detail_lines+="$shown"$'\t'"$src"$'\t'"escaped"$'\n' ;;
+                *)
+                    shown="$p"
+                    detail_lines+="$p"$'\t'"$src"$'\n' ;;
+            esac
+            touched_lines+="$shown"$'\n'
+        done
+    done
 
-    ATTRIBUTION_TOUCHED="$(
-        printf '%s\n' "$committed" "$uncommitted" "$untracked" | sort -u | sed '/^$/d'
-    )"
+    ATTRIBUTION_TOUCHED="$(printf '%s' "$touched_lines" | sort -u | sed '/^$/d')"
 
     # One line per (path, source), not one per path with a precedence rule.
     # A path both committed AND dirty is two facts the reader needs: it is in
     # the push, and the working tree the regen read differs from what is being
     # pushed. Collapsing to `committed` would hide the second. LC_ALL=C so TAB
-    # sorts below every path character and a path's lines stay adjacent; awk
-    # rather than `sed 's/$/\t/'`, which BSD sed reads as a literal `t`.
-    ATTRIBUTION_TOUCHED_DETAIL="$(
-        {
-            printf '%s\n' "$committed"   | awk -v s=committed   'length { print $0 "\t" s }'
-            printf '%s\n' "$uncommitted" | awk -v s=uncommitted 'length { print $0 "\t" s }'
-            printf '%s\n' "$untracked"   | awk -v s=untracked   'length { print $0 "\t" s }'
-        } | LC_ALL=C sort -u
-    )"
+    # sorts below every path character and a path's lines stay adjacent.
+    ATTRIBUTION_TOUCHED_DETAIL="$(printf '%s' "$detail_lines" | LC_ALL=C sort -u | sed '/^$/d')"
 
     if [ -n "$ATTRIBUTION_TOUCHED" ]; then
         ATTRIBUTION_STATE="mine"
@@ -384,12 +452,12 @@ gen_events_attribution() {
 # The MINE arm's explanation, on stdout, one line per message line, for the
 # hook to prefix and send to stderr. Lives here rather than in the hook so the
 # self-test can pin it: which lead line, which labels, and that the set-aside
-# advice names the right paths. Reads the ATTRIBUTION_* variables a `mine`
-# decision set.
+# advice is a command that actually runs. Reads the ATTRIBUTION_* variables a
+# `mine` decision set.
 gen_events_render_mine() {
-    local p src label has_committed=0
+    local p src flag label has_committed=0 escaped_seen=0
     local not_pushed=()
-    while IFS=$'\t' read -r p src; do
+    while IFS=$'\t' read -r p src flag; do
         [ -n "$p" ] || continue
         [ "$src" = "committed" ] && has_committed=1
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
@@ -404,7 +472,7 @@ gen_events_render_mine() {
         echo "so the diff below is yours to check."
     fi
     echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
-    while IFS=$'\t' read -r p src; do
+    while IFS=$'\t' read -r p src flag; do
         [ -n "$p" ] || continue
         case "$src" in
             committed)   label="committed in this push" ;;
@@ -412,9 +480,19 @@ gen_events_render_mine() {
             untracked)   label="untracked — not part of this push" ;;
             *)           label="source unknown: '$src'" ;;
         esac
-        [ "$src" = "committed" ] || not_pushed+=("$p")
+        [ "$flag" = "escaped" ] && { label+="; name shell-escaped"; escaped_seen=1; }
+        # The stash word, built here while the escaped flag is in hand. `:/`
+        # (top-level pathspec magic) so it works from any subdirectory; %q so
+        # a space, quote or non-ASCII byte survives the shell. An escaped path
+        # is already a shell word — `:/` concatenates onto it unquoted.
+        if [ "$src" != "committed" ]; then
+            if [ "$flag" = "escaped" ]; then not_pushed+=(":/$p"); else not_pushed+=("$(printf '%q' ":/$p")"); fi
+        fi
         echo "    $p  ($label)"
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+    if [ "$escaped_seen" = "1" ]; then
+        echo "(A name marked shell-escaped contains a tab or newline and is shown as \$'...'.)"
+    fi
 
     if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
@@ -422,18 +500,22 @@ gen_events_render_mine() {
 
     # The set-aside advice. Not plain `git stash` (misses untracked files) and
     # not `git checkout -- <path>` (fails on untracked, destroys tracked work).
-    # And never `git stash pop`: the stash stack is shared by every worktree of
-    # the repo, so a pop can take another session's entry. Restore by sha.
+    # And never `git stash pop` or a positional stash@{n} remembered from
+    # earlier: the stash stack is shared by every worktree of the repo and
+    # other sessions push to it, so the entry is found by its unique message.
     if [ "${#not_pushed[@]}" -gt 0 ]; then
-        local quoted="" tag
-        for p in "${not_pushed[@]}"; do quoted+=" $(printf '%q' "$p")"; done
+        local tag
         tag="gen-events-drift-$(date +%Y%m%d%H%M%S)-$$"
         echo "Entries marked 'not part of this push' come from your working tree, which the"
         echo "regeneration reads. To see whether the drift is yours, set them aside and"
-        echo "re-run — with a temporary WIP commit, or a stash entry restored BY SHA:"
-        echo "    git stash push --include-untracked -m \"$tag\" --$quoted"
-        echo "    git stash list --format='%H %gs'   # your entry is the one named $tag"
-        echo "    git stash apply <that sha>         # never \`git stash pop\`: the stack is shared"
+        echo "re-run — with a temporary WIP commit, or a stash entry found BY ITS TAG:"
+        echo "    git stash push --include-untracked -m \"$tag\" -- ${not_pushed[*]}"
+        echo "    git stash list --format='%H %gs' | grep $tag    # note that sha"
+        echo "  then re-run the push, and restore:"
+        echo "    git stash apply --index <that sha>"
+        echo "    git stash list --format='%gd %gs' | grep $tag   # its CURRENT stash@{n}"
+        echo "    git stash drop 'stash@{n}'"
+        echo "  Never \`git stash pop\`: the stack is shared, and a pop can take another session's entry."
     fi
     echo "Part of the diff may still be pre-existing — the baseline is a build"
     echo "artifact in a shared checkout and may have been behind before you began."
