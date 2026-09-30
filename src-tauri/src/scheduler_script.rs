@@ -78,27 +78,79 @@ pub(crate) fn classify_script_exit(
     }
 }
 
-/// The shells to try, in order, for `command`. Unix: `sh -c`. Windows: `bash
-/// -c` (Git Bash — the fleet's scripts are bash), then `cmd /C` as the
-/// fallback when no bash is on PATH.
-fn shell_candidates(command: &str) -> Vec<(&'static str, Vec<String>)> {
+/// True for the Windows WSL launcher (`System32\bash.exe`, `SysWOW64`, the
+/// `WindowsApps` alias): a bare `bash` on PATH can resolve to it, and it runs
+/// the command inside a Linux distro (or fails when none is installed) instead
+/// of Git Bash. Pure, so it is testable off Windows.
+pub(crate) fn is_wsl_launcher(path: &str) -> bool {
+    let p = path.replace('/', "\\").to_ascii_lowercase();
+    p.contains("\\windows\\system32\\")
+        || p.contains("\\windows\\syswow64\\")
+        || p.contains("\\windowsapps\\")
+}
+
+/// Explicit Git Bash locations first, then any PATH `bash.exe` that is not the
+/// WSL launcher. Pure over its inputs.
+pub(crate) fn windows_bash_paths(
+    program_files: &[String],
+    local_app_data: Option<&str>,
+    path_dirs: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pf in program_files {
+        out.push(format!("{pf}\\Git\\bin\\bash.exe"));
+    }
+    if let Some(l) = local_app_data {
+        out.push(format!("{l}\\Programs\\Git\\bin\\bash.exe"));
+    }
+    for d in path_dirs {
+        out.push(format!("{}\\bash.exe", d.trim_end_matches(['\\', '/'])));
+    }
+    out.retain(|c| !is_wsl_launcher(c));
+    out
+}
+
+/// The shells to try, in order, for `command`. Unix: `sh -c`. Windows: an
+/// explicit Git Bash (never the WSL launcher), then `cmd /C` as the fallback.
+fn shell_candidates(command: &str) -> Vec<(String, Vec<String>)> {
     #[cfg(windows)]
     {
-        vec![
-            ("bash", vec!["-c".to_string(), command.to_string()]),
-            ("cmd", vec!["/C".to_string(), command.to_string()]),
-        ]
+        let env_var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let pfs: Vec<String> = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+            .iter()
+            .filter_map(|k| env_var(k))
+            .collect();
+        let path_dirs: Vec<String> = std::env::var("PATH")
+            .map(|p| {
+                p.split(';')
+                    .filter(|d| !d.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let local = env_var("LOCALAPPDATA");
+        let mut v: Vec<(String, Vec<String>)> =
+            windows_bash_paths(&pfs, local.as_deref(), &path_dirs)
+                .into_iter()
+                .filter(|p| std::path::Path::new(p).is_file())
+                .map(|p| (p, vec!["-c".to_string(), command.to_string()]))
+                .collect();
+        v.push((
+            "cmd".to_string(),
+            vec!["/C".to_string(), command.to_string()],
+        ));
+        v
     }
     #[cfg(not(windows))]
     {
-        vec![("sh", vec!["-c".to_string(), command.to_string()])]
+        vec![("sh".to_string(), vec!["-c".to_string(), command.to_string()])]
     }
 }
 
 fn spawn_shell(command: &str, workdir: &std::path::Path) -> Result<tokio::process::Child, String> {
     let mut last_err = String::from("no shell candidates");
     for (program, args) in shell_candidates(command) {
-        let mut cmd = crate::process_helpers::tokio_no_window(program);
+        let mut cmd = crate::process_helpers::tokio_no_window(&program);
         cmd.args(&args)
             .current_dir(workdir)
             .stdin(std::process::Stdio::null())
@@ -116,6 +168,16 @@ fn spawn_shell(command: &str, workdir: &std::path::Path) -> Result<tokio::proces
         }
     }
     Err(format!("no usable shell found ({last_err})"))
+}
+
+/// The wall-clock bound for a task: unset OR zero is the default, never an
+/// immediate kill.
+pub(crate) fn effective_timeout(timeout_seconds: Option<u64>) -> Duration {
+    Duration::from_secs(
+        timeout_seconds
+            .filter(|t| *t > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    )
 }
 
 /// Launch the command. A missing working directory or an unspawnable shell is
@@ -255,6 +317,41 @@ mod tests {
         assert!(json.contains(r#""task_type":"Script""#));
         let back: ScheduledTaskType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn zero_or_unset_timeout_is_the_default_not_an_instant_kill() {
+        assert_eq!(
+            effective_timeout(None),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            effective_timeout(Some(0)),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(effective_timeout(Some(7)), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn the_wsl_launcher_is_never_a_bash_candidate() {
+        assert!(is_wsl_launcher(r"C:\Windows\System32\bash.exe"));
+        assert!(is_wsl_launcher("C:/Windows/system32/bash.exe"));
+        assert!(is_wsl_launcher(
+            r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        ));
+        let got = windows_bash_paths(
+            &[r"C:\Program Files".to_string()],
+            Some(r"C:\Users\u\AppData\Local"),
+            &[r"C:\Windows\System32".to_string(), r"D:\tools\bin\".to_string()],
+        );
+        assert_eq!(
+            got,
+            vec![
+                r"C:\Program Files\Git\bin\bash.exe".to_string(),
+                r"C:\Users\u\AppData\Local\Programs\Git\bin\bash.exe".to_string(),
+                r"D:\tools\bin\bash.exe".to_string(),
+            ]
+        );
     }
 
     #[test]

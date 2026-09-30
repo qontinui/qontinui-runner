@@ -190,7 +190,16 @@ rs_build_bodies() {
     fi
     if [ "${DISABLED:-0}" = 1 ]; then WANT_ENABLED=false; else WANT_ENABLED=true; fi
     SCHEDULE_JSON="{\"type\":\"Cron\",\"value\":\"$CRON\"}"
-    TASK_JSON="{\"task_type\":\"RemoteAgent\",\"prompt\":\"$(jesc "$PROMPT")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"max_turns\":$MAX_TURNS,\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        # Script task (plan 2026-09-28-ccfg-bundle-parity-bound-outruns-runner-
+        # train-latency, Phase 4): the runner runs COMMAND in-binary, no Claude
+        # session, and records success = exit code 0 (a timeout is a failure).
+        # PROMPT is the caller's mode-word source for prompt_mode; it is not
+        # sent. max_turns does not exist on this shape.
+        TASK_JSON="{\"task_type\":\"Script\",\"command\":\"$(jesc "$RS_COMMAND")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    else
+        TASK_JSON="{\"task_type\":\"RemoteAgent\",\"prompt\":\"$(jesc "$PROMPT")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"max_turns\":$MAX_TURNS,\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    fi
     COMMON_JSON="\"schedule\":$SCHEDULE_JSON,\"task\":$TASK_JSON,\"skipIfCompleted\":false,\"autoFixOnFailure\":false,\"catchUpPolicy\":\"run_once\""
     CREATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",$COMMON_JSON}"
     UPDATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",\"enabled\":$WANT_ENABLED,$COMMON_JSON}"
@@ -290,18 +299,32 @@ compute_drift() { # <task json>
         drift_add "schedule is not a Cron string (intended Cron '$CRON')"
     fi
     v="$(jstr "$c" task_type)" || v="<absent>"
-    [ "$v" = RemoteAgent ] || drift_add "task_type is $v, intended RemoteAgent"
-    v="$(jstr "$c" prompt)" || v="<absent>"
-    [ "$v" = "$(jesc "$PROMPT")" ] || drift_add "prompt is '$(junesc "$v")', intended '$PROMPT'"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        [ "$v" = Script ] || drift_add "task_type is $v, intended Script"
+        v="$(jstr "$c" command)" || v="<absent>"
+        [ "$v" = "$(jesc "$RS_COMMAND")" ] || drift_add "command is '$(junesc "$v")', intended '$RS_COMMAND'"
+    else
+        [ "$v" = RemoteAgent ] || drift_add "task_type is $v, intended RemoteAgent"
+        v="$(jstr "$c" prompt)" || v="<absent>"
+        [ "$v" = "$(jesc "$PROMPT")" ] || drift_add "prompt is '$(junesc "$v")', intended '$PROMPT'"
+    fi
     v="$(jstr "$c" working_directory)" || v="<absent>"
     [ "$v" = "$(jesc "$WORKDIR")" ] || drift_add "working_directory is '$(junesc "$v")', intended '$WORKDIR'"
-    v="$(jscalar "$c" max_turns)" || v="<absent>"
-    [ "$v" = "$MAX_TURNS" ] || drift_add "max_turns is $v, intended $MAX_TURNS"
+    if [ -z "${RS_COMMAND:-}" ]; then
+        v="$(jscalar "$c" max_turns)" || v="<absent>"
+        [ "$v" = "$MAX_TURNS" ] || drift_add "max_turns is $v, intended $MAX_TURNS"
+    fi
     v="$(jscalar "$c" timeout_seconds)" || v="<absent>"
     [ "$v" = "$TIMEOUT_SECONDS" ] || drift_add "timeout_seconds is $v, intended $TIMEOUT_SECONDS"
-    for want in model allowed_tools mcp_connections; do
-        case "$c" in *"\"$want\":"*) drift_add "task carries $want, which the intended body leaves unset" ;; esac
-    done
+    if [ -n "${RS_COMMAND:-}" ]; then
+        for want in prompt max_turns model allowed_tools mcp_connections; do
+            case "$c" in *"\"$want\":"*) drift_add "task carries $want, which a Script task never has" ;; esac
+        done
+    else
+        for want in model allowed_tools mcp_connections; do
+            case "$c" in *"\"$want\":"*) drift_add "task carries $want, which the intended body leaves unset" ;; esac
+        done
+    fi
     v="$(jscalar "$c" skipIfCompleted)" || v="<absent>"
     [ "$v" = false ] || drift_add "skipIfCompleted is $v, intended false"
     v="$(jscalar "$c" autoFixOnFailure)" || v="<absent>"
@@ -335,7 +358,11 @@ report_task() {
     local c="$1" id en prompt cron wd mt ts cp next lhm chm tz
     id="$(task_id "$c")" || id="$(jstr "$c" id)" || id="?"
     en="$(jscalar "$c" enabled)" || en="UNREADABLE"
-    prompt="$(jstr "$c" prompt)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        prompt="$(jstr "$c" command)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    else
+        prompt="$(jstr "$c" prompt)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    fi
     cron=""
     [[ $c =~ $RE_SCHED ]] && cron="$(junesc "${BASH_REMATCH[2]}")"
     wd="$(jstr "$c" working_directory)" && wd="$(junesc "$wd")" || wd="<absent>"
@@ -346,7 +373,7 @@ report_task() {
     printf '  id:                %s\n' "$id"
     printf '  enabled:           %s\n' "$en"
     printf '  mode:              %s\n' "$(prompt_mode "$prompt")"
-    printf '  prompt:            %s\n' "$prompt"
+    printf '  %s            %s\n' "$([ -n "${RS_COMMAND:-}" ] && printf 'command:' || printf 'prompt: ')" "$prompt"
     printf '  cron:              %s\n' "${cron:-<not a Cron schedule>}"
     printf '  working_directory: %s\n' "$wd"
     printf '  max_turns:         %s   timeout_seconds: %s   catch_up_policy: %s\n' "$mt" "$ts" "$cp"

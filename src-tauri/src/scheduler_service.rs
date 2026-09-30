@@ -587,9 +587,7 @@ impl SchedulerService {
                     execution_id: String::new(), // stamped by launch_and_await_script
                     command: command.clone(),
                     working_directory: working_directory.clone(),
-                    timeout: std::time::Duration::from_secs(
-                        timeout_seconds.unwrap_or(crate::scheduler_script::DEFAULT_TIMEOUT_SECS),
-                    ),
+                    timeout: crate::scheduler_script::effective_timeout(*timeout_seconds),
                 };
                 self.clone()
                     .launch_and_await_script(
