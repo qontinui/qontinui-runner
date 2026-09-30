@@ -49,16 +49,28 @@
 # narrowing, made on evidence rather than to make a case pass: qontinui-runner
 # #1667 pushed three `.md` files under src-tauri/src/fleet_commands/ and was
 # blamed for the bindings, because `src-tauri/src` is a directory prefix and
-# ~100 markdown files live under it. Markdown reaches the binary only through
-# `include_str!` into string consts, which schemars never reads.
+# ~100 markdown files live under it. Markdown reaches the binary only as
+# embedded data — `include_str!`/`include_bytes!` into consts, `include_dir!`
+# into directory trees — none of which schemars reads.
 #
-# The narrowing is safe only while that stays true, so it is not left to this
-# comment: `gen-events-drift-attribution-test.sh` carries a premise guard that
-# runs against the REAL tree and fails the moment markdown could reach
-# `schemas.json` (an `include_str!` of a `.md` in a file that mentions
-# `JsonSchema`, a `#[doc = include_str!(..)]` attribute, or a schemars
-# attribute fed by anything but a literal). When it fails, the exclusion goes —
-# not the guard.
+# The narrowing is safe only while that stays true, so it is re-checked on
+# EVERY attribution decision, against the working tree being attributed:
+# `gen_events_markdown_premise_violations` below. If it finds a way markdown
+# could reach `schemas.json`, or cannot run its probe at all, the decision
+# drops the exclusion and attributes against the full list — the wider,
+# never-clears-a-guilty-pusher direction — and says why in
+# ATTRIBUTION_EXCLUDES_DROPPED_REASON. The attribution self-test runs the same
+# function against the real tree, so a violation is also loud at test time.
+#
+# What the guard does NOT see, stated so nobody mistakes it for a proof: a
+# const embedded in a file that neither mentions JsonSchema nor carries a
+# schemars attribute, then used by a JsonSchema type in ANOTHER file through a
+# path the single-line arms cannot read (a rustfmt-wrapped
+# `#[doc = ..]`/`#[schemars(..)]` whose value is on its own line, or a
+# `macro_rules!` that builds the attribute). Rust has no non-literal `#[doc]`
+# except a macro call, so the realistic hole is a hand-written schemars
+# `description` spread across lines — which the file-level `schemars(` arm
+# catches whenever the embed is in the same file.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -156,6 +168,98 @@ GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
     ':(exclude)*.md'
 )
 
+# Where the premise guard looks: the directory-prefix inputs above, the only
+# ones under which a `.md` could be a sibling of Rust that embeds it.
+GEN_EVENTS_PREMISE_PATHS=(
+    "src-tauri/src"
+    "src-tauri/clorinde"
+    "crates/spec-check"
+)
+
+# `git grep` over the premise paths in the WORKING TREE of $1, untracked files
+# included — the regeneration compiles the working tree, so that is what the
+# premise is about. Prints matches; exit 1 from git grep is "no match" and is
+# success here. Anything above 1 is a broken probe: printed as an `ERROR` line
+# and returned as 2, so a caller can never read a failed query as a clean tree.
+gen_events_premise_grep() {
+    local dir="$1"; shift
+    local out rc=0
+    out="$(git -C "$dir" grep --untracked "$@" -- "${GEN_EVENTS_PREMISE_PATHS[@]}" 2>&1)" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${out%%$'\n'*}"
+        return 2
+    fi
+    [ "$rc" -eq 0 ] && printf '%s\n' "$out"
+    return 0
+}
+
+# Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
+# way it could. Exit 0: premise holds. Exit 1: violated. Exit 2: the probe
+# itself failed (its ERROR lines are printed too) — which a caller must treat
+# exactly like a violation.
+#
+# File-level arms deliberately over-approximate — co-occurrence in one file,
+# not proof of a data path — because a false alarm only costs a wider list,
+# while a miss clears a guilty pusher.
+gen_events_markdown_premise_violations() {
+    local dir="$1" probe_failed=0 found=0
+    local inc_text md_lit schema inc_dir schemars_attr inc_any line
+    inc_text="$(gen_events_premise_grep "$dir" -l -E 'include_(str|bytes)!' | LC_ALL=C sort)" || probe_failed=1
+    md_lit="$(gen_events_premise_grep "$dir" -l -E '\.md"' | LC_ALL=C sort)" || probe_failed=1
+    schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
+    inc_dir="$(gen_events_premise_grep "$dir" -l -F 'include_dir!' | LC_ALL=C sort)" || probe_failed=1
+    schemars_attr="$(gen_events_premise_grep "$dir" -l -F 'schemars(' | LC_ALL=C sort)" || probe_failed=1
+    inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | sed '/^$/d' | LC_ALL=C sort -u)"
+    # A failed probe prints its ERROR line into whichever list it fed, and
+    # `sort` returns 0 over it — so the lists are scanned, not just the flags.
+    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" | grep -q '^ERROR'; then
+        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" | grep '^ERROR'
+        probe_failed=1
+    fi
+
+    # `comm` over sorted lists rather than a `for f in $list` loop, which would
+    # word-split a path containing a space.
+    _premise_both() { LC_ALL=C comm -12 <(printf '%s\n' "$1" | sed '/^$/d') <(printf '%s\n' "$2" | sed '/^$/d'); }
+
+    # Arm 1: text-embeds something, names a `.md"` literal, mentions JsonSchema.
+    # Wider than `include_str!("x.md")` on one line, so it also covers
+    # `concat!`/multi-line forms.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s: include_str!/include_bytes! of markdown in a file that mentions JsonSchema\n' "$line"
+        found=1
+    done < <(_premise_both "$(_premise_both "$inc_text" "$md_lit")" "$schema")
+    # Arm 2: `include_dir!` embeds whole trees (fleet_skills.rs, fleet_agents.rs
+    # ship markdown this way) and never names a `.md` literal, so any use of it
+    # beside JsonSchema is a violation on its own.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s: include_dir! in a file that mentions JsonSchema\n' "$line"
+        found=1
+    done < <(_premise_both "$inc_dir" "$schema")
+    # Arm 3: any embed in a file that carries a schemars attribute. File-level,
+    # so a rustfmt-wrapped `#[schemars(description = include_str!(..))]` is
+    # caught though no single line holds both halves.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s: include_*! in a file with a schemars( attribute\n' "$line"
+        found=1
+    done < <(_premise_both "$inc_any" "$schemars_attr")
+    unset -f _premise_both
+    # Arm 4: a doc attribute fed from a file becomes the schema's `description`.
+    # Anchored to attribute syntax so `let doc = include_str!(..)` is not one.
+    line="$(gen_events_premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*include_(str|bytes)!')" || probe_failed=1
+    if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
+    # Arm 5: schemars 1 takes EXPRESSIONS for description/title, so anything but
+    # a string literal there may be an embedded const from another file.
+    line="$(gen_events_premise_grep "$dir" -n -E 'schemars\(.*(description|title)[[:space:]]*=[[:space:]]*[^"[:space:]]')" || probe_failed=1
+    if [ -n "$line" ]; then printf '%s\n' "$line"; found=1; fi
+
+    [ "$probe_failed" = "1" ] && return 2
+    [ "$found" = "1" ] && return 1
+    return 0
+}
+
 # Decide attribution for the repo at $1. Sets, in the caller's shell:
 #
 #   ATTRIBUTION_STATE   mine | pre-existing | unavailable
@@ -166,7 +270,12 @@ GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
 #                       `uncommitted` (staged or unstaged, `git diff HEAD`) or
 #                       `untracked`. A path in several sources gets one line
 #                       per source — see the computation for why.
-#   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable`
+#   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
+#                       applied; otherwise why this decision ran on the full,
+#                       unexcluded list (premise violated, or its probe failed)
+#   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable` — including a
+#                       git call that failed, which must never read as "touched
+#                       nothing" and clear the pusher
 #
 # `unavailable` is a distinct state, never folded into either verdict: a
 # shallow clone or a remote-less checkout cannot answer the question, and
@@ -179,6 +288,7 @@ gen_events_attribution() {
     ATTRIBUTION_BASE_SHA=""
     ATTRIBUTION_TOUCHED=""
     ATTRIBUTION_TOUCHED_DETAIL=""
+    ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
     ATTRIBUTION_UNAVAILABLE_REASON=""
 
     if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -211,14 +321,39 @@ gen_events_attribution() {
     # working tree, which the regeneration reads — so they still make the
     # verdict `mine` — but which the author may not realise is involved (#1667
     # was blamed for a dirty Cargo.lock it never pushed). The detail says which.
-    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" "${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+    # The markdown exclusion applies only while its premise holds for the tree
+    # being attributed. `&& rc=0 || rc=$?` rather than a bare assignment: the
+    # hook runs under `set -e`, and a non-zero here is an answer, not a crash.
+    local premise premise_rc
+    premise="$(gen_events_markdown_premise_violations "$repo")" && premise_rc=0 || premise_rc=$?
+    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]}")
+    if [ "$premise_rc" -eq 0 ]; then
+        pathspec+=("${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+    elif [ "$premise_rc" -eq 1 ]; then
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
+    else
+        ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${premise%%$'\n'*})"
+    fi
+
+    # Each call's status is checked, not swallowed: an empty list from a git
+    # that FAILED would read as "touched nothing" and clear the pusher — the
+    # one direction this library must never err in.
     local committed uncommitted untracked
-    committed="$(git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
-        -- "${pathspec[@]}" 2>/dev/null || true)"
-    uncommitted="$(git -C "$repo" diff --name-only HEAD \
-        -- "${pathspec[@]}" 2>/dev/null || true)"
-    untracked="$(git -C "$repo" ls-files --others --exclude-standard \
-        -- "${pathspec[@]}" 2>/dev/null || true)"
+    if ! committed="$(git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
+            -- "${pathspec[@]}" 2>/dev/null)"; then
+        ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so this push's commits could not be read"
+        return 0
+    fi
+    if ! uncommitted="$(git -C "$repo" diff --name-only HEAD \
+            -- "${pathspec[@]}" 2>/dev/null)"; then
+        ATTRIBUTION_UNAVAILABLE_REASON="git diff HEAD failed, so the working tree could not be read"
+        return 0
+    fi
+    if ! untracked="$(git -C "$repo" ls-files --others --exclude-standard \
+            -- "${pathspec[@]}" 2>/dev/null)"; then
+        ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"
+        return 0
+    fi
 
     ATTRIBUTION_TOUCHED="$(
         printf '%s\n' "$committed" "$uncommitted" "$untracked" | sort -u | sed '/^$/d'
@@ -244,4 +379,62 @@ gen_events_attribution() {
         ATTRIBUTION_STATE="pre-existing"
     fi
     return 0
+}
+
+# The MINE arm's explanation, on stdout, one line per message line, for the
+# hook to prefix and send to stderr. Lives here rather than in the hook so the
+# self-test can pin it: which lead line, which labels, and that the set-aside
+# advice names the right paths. Reads the ATTRIBUTION_* variables a `mine`
+# decision set.
+gen_events_render_mine() {
+    local p src label has_committed=0
+    local not_pushed=()
+    while IFS=$'\t' read -r p src; do
+        [ -n "$p" ] || continue
+        [ "$src" = "committed" ] && has_committed=1
+    done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+
+    # "This push" is only true of committed entries. With none, the drift is
+    # still the pusher's to look at — the regen read their working tree — but
+    # saying their PUSH changed the inputs would be the false claim #1667 met.
+    if [ "$has_committed" = "1" ]; then
+        echo "This push changes sources that feed them, so the diff below is yours."
+    else
+        echo "Your working tree (not this push's commits) changes sources that feed them,"
+        echo "so the diff below is yours to check."
+    fi
+    echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
+    while IFS=$'\t' read -r p src; do
+        [ -n "$p" ] || continue
+        case "$src" in
+            committed)   label="committed in this push" ;;
+            uncommitted) label="uncommitted changes — not part of this push" ;;
+            untracked)   label="untracked — not part of this push" ;;
+            *)           label="source unknown: '$src'" ;;
+        esac
+        [ "$src" = "committed" ] || not_pushed+=("$p")
+        echo "    $p  ($label)"
+    done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+
+    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+        echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
+    fi
+
+    # The set-aside advice. Not plain `git stash` (misses untracked files) and
+    # not `git checkout -- <path>` (fails on untracked, destroys tracked work).
+    # And never `git stash pop`: the stash stack is shared by every worktree of
+    # the repo, so a pop can take another session's entry. Restore by sha.
+    if [ "${#not_pushed[@]}" -gt 0 ]; then
+        local quoted="" tag
+        for p in "${not_pushed[@]}"; do quoted+=" $(printf '%q' "$p")"; done
+        tag="gen-events-drift-$(date +%Y%m%d%H%M%S)-$$"
+        echo "Entries marked 'not part of this push' come from your working tree, which the"
+        echo "regeneration reads. To see whether the drift is yours, set them aside and"
+        echo "re-run — with a temporary WIP commit, or a stash entry restored BY SHA:"
+        echo "    git stash push --include-untracked -m \"$tag\" --$quoted"
+        echo "    git stash list --format='%H %gs'   # your entry is the one named $tag"
+        echo "    git stash apply <that sha>         # never \`git stash pop\`: the stack is shared"
+    fi
+    echo "Part of the diff may still be pre-existing — the baseline is a build"
+    echo "artifact in a shared checkout and may have been behind before you began."
 }
