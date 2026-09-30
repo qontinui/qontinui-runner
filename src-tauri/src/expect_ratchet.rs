@@ -107,7 +107,10 @@ mod tests {
         Ratchet {
             lint: "clippy::string_slice",
             expect_needle: "#[expect(clippy::string_slice",
-            baseline: 435,
+            // 433: the vision/extract + vision/describe handlers were
+            // rewritten onto the Observation envelope (plan
+            // 2026-09-20-ui-bridge-observations-…, Phase 2) with no byte slice.
+            baseline: 433,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

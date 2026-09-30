@@ -20,6 +20,21 @@ const log = createLogger("useCommands");
 
 const MAX_COMMAND_HISTORY = 50;
 
+/**
+ * The error to report when a reply carries no explicit `success: true` and
+ * no `error` of its own: an absent body or an absent `success` key is a
+ * failure the caller can read, not a silent pass.
+ */
+function missingSuccessError(json: unknown): string | undefined {
+  if (json === null || typeof json !== "object") {
+    return "response carried no JSON body";
+  }
+  const success = (json as { success?: unknown }).success;
+  if (success === true) return undefined;
+  if (success === undefined) return "response carried no `success` key";
+  return undefined;
+}
+
 export interface UseCommandsReturn {
   lastCommandResult: CommandResult | null;
   commandHistory: CommandHistoryEntry[];
@@ -73,10 +88,12 @@ export function useCommands(
         );
 
         const json = await resp.json();
+        // Only an explicit `success: true` is success. A body with no
+        // `success` key (or no body) is a typed failure, never a pass.
         const result: CommandResult = {
-          success: json.success !== false,
-          data: json.data,
-          error: json.error,
+          success: json?.success === true,
+          data: json?.data,
+          error: json?.error ?? missingSuccessError(json),
           duration: Date.now() - startTime,
         };
 
@@ -227,9 +244,9 @@ export function useCommands(
         const json = await resp.json();
         const duration = Date.now() - startTime;
         const result: CommandResult<T> = {
-          success: json.success !== false,
-          data: (json.data ?? json) as T,
-          error: json.error,
+          success: json?.success === true,
+          data: (json?.data ?? json) as T,
+          error: json?.error ?? missingSuccessError(json),
           duration,
         };
 

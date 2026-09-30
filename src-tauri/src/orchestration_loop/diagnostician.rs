@@ -41,12 +41,10 @@ pub async fn run_diagnostic(
         vec![]
     };
 
-    // 3. Check if everything passed
-    let health_ok = page_health
-        .get("status")
-        .and_then(|v| v.as_str())
-        .map(|s| s == "healthy" || s == "ok")
-        .unwrap_or(false);
+    // 3. Check if everything passed. Page health is an Observation envelope:
+    // only a `measured` report whose worst severity is OK counts as healthy.
+    // An `unknown` (the runner could not see the page) is never a pass.
+    let health_ok = page_health_is_ok(&page_health);
 
     let all_assertions_passed = assertion_results
         .iter()
@@ -156,6 +154,18 @@ pub async fn run_diagnostic(
 }
 
 /// Build the AI triage prompt from diagnostic evidence.
+/// Whether a `/control/page-health` answer states a healthy page: a
+/// `measured` observation whose report's worst severity is `OK`. Any other
+/// status — `unknown` above all — is not evidence of health.
+fn page_health_is_ok(page_health: &serde_json::Value) -> bool {
+    page_health.get("status").and_then(|v| v.as_str()) == Some("measured")
+        && page_health
+            .get("value")
+            .and_then(|v| v.get("summary"))
+            .and_then(|v| v.as_str())
+            == Some("OK")
+}
+
 fn build_triage_prompt(
     page_health: &serde_json::Value,
     assertion_results: &[serde_json::Value],
@@ -386,6 +396,23 @@ mod tests {
     fn test_build_diagnostic_context_empty_history() {
         let ctx = build_diagnostic_context(&[], Some("Original context"));
         assert_eq!(ctx, "Original context\n\n");
+    }
+
+    #[test]
+    fn page_health_is_ok_only_for_a_measured_ok_report() {
+        let ok = serde_json::json!({"status": "measured", "value": {"summary": "OK"}});
+        let warn = serde_json::json!({"status": "measured", "value": {"summary": "WARNING"}});
+        let unknown = serde_json::json!({
+            "status": "unknown",
+            "unknown": {"code": "producer_not_run", "detail": "nothing registered"}
+        });
+        assert!(page_health_is_ok(&ok));
+        assert!(!page_health_is_ok(&warn));
+        assert!(
+            !page_health_is_ok(&unknown),
+            "could-not-see is never healthy"
+        );
+        assert!(!page_health_is_ok(&serde_json::json!({})));
     }
 
     #[test]

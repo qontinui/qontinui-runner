@@ -59,6 +59,24 @@ pub fn export_all_schemas() -> Value {
         };
     }
 
+    // ── qontinui-vision-core: the Observation envelope ──
+    // Plan 2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance
+    // (D2/D3). `Observation` is generic; it is registered over an opaque
+    // JSON value so the generated binding is the envelope itself, and each
+    // consumer narrows `value` to its own payload.
+    {
+        use qontinui_vision_core::observation as qob;
+        add!("Observation", qob::Observation<serde_json::Value>);
+        add!("ObservationStatus", qob::ObservationStatus);
+        add!("UnknownCode", qob::UnknownCode);
+        add!("UnknownInfo", qob::UnknownInfo);
+        add!("Provenance", qob::Provenance);
+        add!("Producer", qob::Producer);
+        add!("ObservationCoverage", qob::ObservationCoverage);
+        add!("UnmeasuredDimension", qob::UnmeasuredDimension);
+        add!("CacheProvenance", qob::CacheProvenance);
+    }
+
     // ── qontinui-types: worker_output ──
     add!("WorkerOutput", qwo::WorkerOutput);
     add!("StructuredSignal", qwo::StructuredSignal);
@@ -928,10 +946,29 @@ mod tests {
         // Phase 2) = 553
         // + the 1 component_action target (UiBridgeComponentActionTarget —
         // plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url
-        // Phase 3) = 554.
-        // Independently corroborated by the codegen, which reports
-        // "Processing 554 top-level types" and emits 554 .d.ts files.
-        assert_eq!(obj.len(), 554, "Expected 554 schema entries");
+        // Phase 3) = 554
+        // + the 9 Observation-envelope types (Observation, ObservationStatus,
+        // UnknownCode, UnknownInfo, Provenance, Producer, ObservationCoverage,
+        // UnmeasuredDimension, CacheProvenance — plan
+        // 2026-09-20-ui-bridge-observations-distinguish-cannot-see-from-not-present-and-carry-provenance
+        // Phase 2) = 563.
+        assert_eq!(obj.len(), 563, "Expected 563 schema entries");
+        for name in [
+            "Observation",
+            "ObservationStatus",
+            "UnknownCode",
+            "UnknownInfo",
+            "Provenance",
+            "Producer",
+            "ObservationCoverage",
+            "UnmeasuredDimension",
+            "CacheProvenance",
+        ] {
+            assert!(
+                obj.contains_key(name),
+                "Missing {name} schema (Observation envelope)"
+            );
+        }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

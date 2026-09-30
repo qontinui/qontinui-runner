@@ -66,7 +66,8 @@ function getBrowserCapture(): BrowserCaptureAPI | undefined {
  */
 function consoleEntryLevel(entry: unknown): string | undefined {
   if (typeof entry !== "object" || entry === null) return undefined;
-  const raw = (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
+  const raw =
+    (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
     (entry as { severity?: unknown }).severity ??
     (entry as { type?: unknown }).type;
   return typeof raw === "string" ? raw.toLowerCase() : undefined;
@@ -686,7 +687,9 @@ export function useDebugInspectEvents(
 
             try {
               const r = await currentBridge.executeAction(fieldId, { action, params });
-              const ok = !r || (r as { success?: boolean }).success !== false;
+              // Only an explicit `success: true` is success. An absent reply
+              // or a reply with no `success` key is a failure, never a fill.
+              const ok = !!r && (r as { success?: boolean }).success === true;
               if (ok) {
                 perField[fieldId] = { success: true, action };
                 filledCount++;
@@ -694,7 +697,12 @@ export function useDebugInspectEvents(
                 perField[fieldId] = {
                   success: false,
                   action,
-                  error: (r as { error?: string }).error ?? "action returned non-success",
+                  error: !r
+                    ? "action returned no reply"
+                    : ((r as { error?: string }).error ??
+                      ((r as { success?: unknown }).success === undefined
+                        ? "action reply carried no `success` key"
+                        : "action returned non-success")),
                 };
                 errorCount++;
               }
