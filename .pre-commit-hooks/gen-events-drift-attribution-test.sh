@@ -19,6 +19,10 @@
 #   * a push that touches a codegen input is never cleared   (no lost signal)
 #   * a push that touches none of them is never blamed       (no false blame)
 #   * a push whose attribution cannot be computed is never cleared (fail closed)
+#
+# Plus one section that reads the REAL tree rather than a fixture: the premise
+# guard for the library's markdown exclusion, which must fail the day markdown
+# can reach schemas.json.
 
 set -uo pipefail
 
@@ -169,6 +173,24 @@ decide() {
     gen_events_attribution "$WORK"
 }
 
+# Put a path into the fixture's BASE (the upstream `main` the work clone is
+# measured against), so a case can then edit it without the edit being the
+# push's own commit.
+seed_base() {
+    local path="$1" text="$2"
+    mkdir -p "$UPSTREAM/$(dirname "$path")"
+    printf '%s\n' "$text" >> "$UPSTREAM/$path"
+    git -C "$UPSTREAM" add -A >/dev/null
+    git -C "$UPSTREAM" commit --quiet -m "base: $path"
+    git -C "$WORK" fetch --quiet origin
+    git -C "$WORK" reset --hard --quiet origin/main
+}
+
+# The ATTRIBUTION_TOUCHED_DETAIL line for one path — `<path><TAB><source>`.
+detail_line() {
+    printf '%s\t%s' "$1" "$2"
+}
+
 echo "gen-events-drift attribution"
 echo "  -- pre-existing: this push cannot have moved the bindings --"
 
@@ -191,6 +213,29 @@ printf '// scratch\n' > "$WORK/src/scratch.ts"
 decide
 check "an untracked frontend file is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
 
+echo "  -- markdown under a codegen input directory feeds nothing (#1667) --"
+
+# The push that motivated the exclusion: markdown only, under src-tauri/src —
+# a directory-prefix input — so the pre-exclusion library blamed it.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a command body"
+decide
+check "a committed src-tauri/src/fleet_commands/x.md is PRE-EXISTING" \
+    "pre-existing" "$ATTRIBUTION_STATE"
+
+fixture
+mkdir -p "$WORK/src-tauri/src/fleet_skills/new"
+printf '# draft\n' > "$WORK/src-tauri/src/fleet_skills/new/SKILL.md"
+decide
+check "an UNTRACKED .md under src-tauri/src is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+
+fixture
+seed_base "src-tauri/src/context/builtins/guide.md" "# guide"
+printf '# edited\n' >> "$WORK/src-tauri/src/context/builtins/guide.md"
+decide
+check "an unstaged edit to a tracked .md under src-tauri/src is PRE-EXISTING" \
+    "pre-existing" "$ATTRIBUTION_STATE"
+
 echo "  -- mine: this push touches something that feeds schemas.json --"
 
 fixture
@@ -202,12 +247,16 @@ fixture
 printf '// dirty\n' >> "$WORK/src-tauri/src/lib.rs"
 decide
 check "an UNSTAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled uncommitted" \
+    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 printf '// staged\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add -A >/dev/null
 decide
 check "a STAGED src-tauri/src change is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled uncommitted" \
+    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 # A new module is invisible to `git diff`, which is why the library also
 # consults `ls-files --others`. Without that arm this case reads as innocent.
@@ -215,6 +264,8 @@ fixture
 printf '// new module\n' > "$WORK/src-tauri/src/brand_new.rs"
 decide
 check "a brand-new UNTRACKED .rs file is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and it is labelled untracked" \
+    "$(detail_line src-tauri/src/brand_new.rs untracked)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 fixture
 commit_change "Cargo.lock" "# bumped"
@@ -387,6 +438,147 @@ fixture
 commit_change "src/app.ts" "// ui"
 decide
 check "the PRE-EXISTING arm blames nothing" "" "$ATTRIBUTION_TOUCHED"
+check "  and its detail is empty too" "" "$ATTRIBUTION_TOUCHED_DETAIL"
+
+# Markdown in the same commit as real Rust neither clears the Rust nor gets
+# blamed beside it: the verdict is the Rust's, and so is the file list.
+fixture
+mkdir -p "$WORK/src-tauri/src/fleet_commands"
+printf '// changed\n' >> "$WORK/src-tauri/src/lib.rs"
+printf '# body\n' > "$WORK/src-tauri/src/fleet_commands/x.md"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "rust + markdown"
+decide
+check "a commit touching lib.rs AND an .md is MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and blames lib.rs alone" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+# The #1667 shape in its other half: the committed input is in the push, the
+# dirty lockfile is not — and the message must be able to say which is which.
+# The verdict does not move (the regen reads the working tree); only the label.
+fixture
+commit_change "src-tauri/src/lib.rs" "// committed"
+printf '# dirty\n' >> "$WORK/Cargo.lock"
+decide
+check "committed lib.rs + dirty Cargo.lock is still MINE" "mine" "$ATTRIBUTION_STATE"
+check "  and the detail tells the two sources apart" \
+    "$(detail_line Cargo.lock uncommitted)"$'\n'"$(detail_line src-tauri/src/lib.rs committed)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  while the flat list is unchanged" \
+    "Cargo.lock"$'\n'"src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+# A path in two sources is listed once per source, not collapsed by precedence.
+fixture
+commit_change "src-tauri/src/lib.rs" "// committed"
+printf '// and dirty\n' >> "$WORK/src-tauri/src/lib.rs"
+decide
+check "a committed AND dirty path is listed under both sources" \
+    "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+check "  but once in the flat list" "src-tauri/src/lib.rs" "$ATTRIBUTION_TOUCHED"
+
+echo "  -- premise guard: markdown still cannot reach schemas.json --"
+
+# The markdown exclusion is a NARROWING of the input list, which the library
+# header forbids except on evidence. The evidence is that markdown reaches the
+# binary only as `include_str!` string consts, which schemars never reads. This
+# section re-checks that against the REAL tree on every run, so the exclusion
+# cannot outlive its premise. It prints one line per violation; git grep's
+# exit 1 means "no match", anything above 1 is a broken query and is reported
+# as a violation rather than read as clean.
+PREMISE_PATHS=(src-tauri/src src-tauri/clorinde crates/spec-check)
+premise_grep() {
+    local dir="$1"; shift
+    local out rc
+    out="$(git -C "$dir" grep "$@" -- "${PREMISE_PATHS[@]}" 2>&1)"; rc=$?
+    if [ "$rc" -gt 1 ]; then
+        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "$out"
+    elif [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$out"
+    fi
+}
+markdown_premise_violations() {
+    local dir="$1" f
+    # A file that include_str!s something, names a `.md"` literal, and mentions
+    # JsonSchema. Deliberately wider than "include_str!(\"x.md\")" on one line:
+    # it also catches concat!/multi-line forms, and the price is only a
+    # possible false alarm, which is the safe direction for a guard.
+    local with_include with_md with_schema
+    with_include="$(premise_grep "$dir" -l -F 'include_str!' | sort)"
+    with_md="$(premise_grep "$dir" -l -E '\.md"' | sort)"
+    with_schema="$(premise_grep "$dir" -l -F 'JsonSchema' | sort)"
+    for f in $with_include; do
+        case "$f" in ERROR) printf '%s\n' "$with_include"; break ;; esac
+        if printf '%s\n' "$with_md" | grep -qxF "$f" \
+           && printf '%s\n' "$with_schema" | grep -qxF "$f"; then
+            printf '%s: include_str! of markdown in a file that mentions JsonSchema\n' "$f"
+        fi
+    done
+    printf '%s\n' "$with_md" "$with_schema" | grep '^ERROR' || true
+    # A doc attribute fed from a file becomes the schema's `description`.
+    # Anchored to attribute syntax so `let doc = include_str!(..)` does not match.
+    premise_grep "$dir" -n -E '(\[|,|\()[[:space:]]*doc[[:space:]]*=[[:space:]]*include_str!'
+    # schemars 1 takes expressions for description/title, so anything but a
+    # string literal there could be an include_str!'d const from another file.
+    premise_grep "$dir" -n -E 'schemars\(.*include_str!|schemars\(.*(description|title)[[:space:]]*=[[:space:]]*[^"[:space:]]'
+}
+
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+REPO_TOP="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$REPO_TOP" ] && REPO_TOP="$(cd "$REPO_TOP" && pwd -P)"
+if [ "$REPO_TOP" != "$REPO_ROOT" ]; then
+    skip_note "premise guard: $REPO_ROOT is not a git checkout, so the real tree cannot be read"
+else
+    VIOLATIONS="$(markdown_premise_violations "$REPO_ROOT")"
+    if [ -z "$VIOLATIONS" ]; then
+        pass_note "no markdown in the real tree can reach schemas.json"
+    else
+        fail_note "markdown may now reach schemas.json:"
+        printf '%s\n' "$VIOLATIONS" | sed 's/^/         /'
+        printf '       lib/gen-events-attribution.sh excludes *.md from attribution on the\n'
+        printf '       premise that it cannot. With that false, the exclusion would CLEAR a\n'
+        printf '       pusher whose markdown moved the bindings. Remove the exclusion, or\n'
+        printf '       restructure so the markdown stays out of any JsonSchema type.\n'
+    fi
+    # Non-vacuity on the real tree: the guard must actually be SEEING the
+    # include_str!'d markdown it reasons about. Zero would mean the query
+    # broke, not that the premise holds.
+    INCLUDED_MD="$(premise_grep "$REPO_ROOT" -l -E 'include_str!\([^)]*\.md"' | grep -vc '^ERROR' || true)"
+    if [ "${INCLUDED_MD:-0}" -gt 0 ]; then
+        pass_note "  and it saw the $INCLUDED_MD files that include_str! markdown"
+    else
+        fail_note "  premise guard saw no include_str!'d markdown at all — the query is broken"
+    fi
+fi
+
+# Non-vacuity on a fixture: each arm must fire on a tree that violates it, and
+# the `let doc = include_str!` shape the real tree carries must not.
+premise_fixture() {
+    local root
+    if ! root="$(mktemp -d -t gen-events-premise-XXXXXX)" || [ ! -d "$root" ]; then
+        printf '  FATAL could not create a fixture directory\n' >&2
+        exit 1
+    fi
+    FIXTURE_ROOTS+=("$root")
+    git init --quiet --initial-branch=main "$root"
+    mkdir -p "$root/src-tauri/src"
+    printf '%s\n' "$1" > "$root/src-tauri/src/m.rs"
+    git -C "$root" add -A >/dev/null
+    PREMISE_FIXTURE="$root"
+}
+premise_case() {
+    local label="$1" want="$2" body="$3" got
+    premise_fixture "$body"
+    if [ -n "$(markdown_premise_violations "$PREMISE_FIXTURE")" ]; then got="violation"; else got="clean"; fi
+    check "$label" "$want" "$got"
+}
+premise_case "guard fires: include_str! .md beside JsonSchema" violation \
+    '#[derive(JsonSchema)] struct S; const B: &str = include_str!("b.md");'
+premise_case "guard fires: #[doc = include_str!(..)]" violation \
+    '#[doc = include_str!("b.md")] struct S;'
+premise_case "guard fires: schemars(description = CONST)" violation \
+    '#[schemars(description = BODY)] struct S;'
+premise_case "guard is quiet on let doc = include_str!(..) with no JsonSchema" clean \
+    'fn t() { let doc = include_str!("b.md"); }'
 
 echo
 if [ "$SKIP" -gt 0 ]; then

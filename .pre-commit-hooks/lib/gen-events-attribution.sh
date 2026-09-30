@@ -42,6 +42,23 @@
 # clear an innocent pusher (they see today's message, no worse), while a
 # too-narrow one would clear a guilty one and lose the signal the hook exists
 # for. Widen freely; never narrow to make a case pass.
+#
+# ONE DELIBERATE NARROWING, AND ITS GUARD
+#
+# Markdown is excluded (GEN_EVENTS_ATTRIBUTION_EXCLUDES below). That is a
+# narrowing, made on evidence rather than to make a case pass: qontinui-runner
+# #1667 pushed three `.md` files under src-tauri/src/fleet_commands/ and was
+# blamed for the bindings, because `src-tauri/src` is a directory prefix and
+# ~100 markdown files live under it. Markdown reaches the binary only through
+# `include_str!` into string consts, which schemars never reads.
+#
+# The narrowing is safe only while that stays true, so it is not left to this
+# comment: `gen-events-drift-attribution-test.sh` carries a premise guard that
+# runs against the REAL tree and fails the moment markdown could reach
+# `schemas.json` (an `include_str!` of a `.md` in a file that mentions
+# `JsonSchema`, a `#[doc = include_str!(..)]` attribute, or a schemars
+# attribute fed by anything but a literal). When it fails, the exclusion goes —
+# not the guard.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -130,11 +147,25 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     "rust-toolchain.toml"
 )
 
+# Appended to every pathspec above. Non-glob pathspec magic lets `*` cross `/`,
+# so this one entry reaches every depth under every directory-prefix input.
+# The whole case for it — and the premise guard that keeps it honest — is in
+# the header's "ONE DELIBERATE NARROWING". Nothing else belongs here without a
+# guard of its own.
+GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
+    ':(exclude)*.md'
+)
+
 # Decide attribution for the repo at $1. Sets, in the caller's shell:
 #
 #   ATTRIBUTION_STATE   mine | pre-existing | unavailable
 #   ATTRIBUTION_BASE_REF / ATTRIBUTION_BASE_SHA   what "before this push" meant
 #   ATTRIBUTION_TOUCHED newline-separated codegen inputs this push touches
+#   ATTRIBUTION_TOUCHED_DETAIL  the same paths as `<path><TAB><source>` lines,
+#                       source one of `committed` (in merge-base..HEAD),
+#                       `uncommitted` (staged or unstaged, `git diff HEAD`) or
+#                       `untracked`. A path in several sources gets one line
+#                       per source — see the computation for why.
 #   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable`
 #
 # `unavailable` is a distinct state, never folded into either verdict: a
@@ -147,6 +178,7 @@ gen_events_attribution() {
     ATTRIBUTION_BASE_REF=""
     ATTRIBUTION_BASE_SHA=""
     ATTRIBUTION_TOUCHED=""
+    ATTRIBUTION_TOUCHED_DETAIL=""
     ATTRIBUTION_UNAVAILABLE_REASON=""
 
     if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -173,15 +205,37 @@ gen_events_attribution() {
     # Three sources, because a push carries all three: commits already made,
     # anything staged or unstaged (this hook also runs at pre-commit), and
     # brand-new untracked sources that a `git diff` cannot see.
+    #
+    # Kept apart rather than merged at once, because they are not equally the
+    # push's. Only `committed` is IN the push; the other two are the pusher's
+    # working tree, which the regeneration reads — so they still make the
+    # verdict `mine` — but which the author may not realise is involved (#1667
+    # was blamed for a dirty Cargo.lock it never pushed). The detail says which.
+    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" "${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+    local committed uncommitted untracked
+    committed="$(git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
+        -- "${pathspec[@]}" 2>/dev/null || true)"
+    uncommitted="$(git -C "$repo" diff --name-only HEAD \
+        -- "${pathspec[@]}" 2>/dev/null || true)"
+    untracked="$(git -C "$repo" ls-files --others --exclude-standard \
+        -- "${pathspec[@]}" 2>/dev/null || true)"
+
     ATTRIBUTION_TOUCHED="$(
+        printf '%s\n' "$committed" "$uncommitted" "$untracked" | sort -u | sed '/^$/d'
+    )"
+
+    # One line per (path, source), not one per path with a precedence rule.
+    # A path both committed AND dirty is two facts the reader needs: it is in
+    # the push, and the working tree the regen read differs from what is being
+    # pushed. Collapsing to `committed` would hide the second. LC_ALL=C so TAB
+    # sorts below every path character and a path's lines stay adjacent; awk
+    # rather than `sed 's/$/\t/'`, which BSD sed reads as a literal `t`.
+    ATTRIBUTION_TOUCHED_DETAIL="$(
         {
-            git -C "$repo" diff --name-only "$ATTRIBUTION_BASE_SHA" HEAD \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-            git -C "$repo" diff --name-only HEAD \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-            git -C "$repo" ls-files --others --exclude-standard \
-                -- "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}" 2>/dev/null || true
-        } | sort -u | sed '/^$/d'
+            printf '%s\n' "$committed"   | awk -v s=committed   'length { print $0 "\t" s }'
+            printf '%s\n' "$uncommitted" | awk -v s=uncommitted 'length { print $0 "\t" s }'
+            printf '%s\n' "$untracked"   | awk -v s=untracked   'length { print $0 "\t" s }'
+        } | LC_ALL=C sort -u
     )"
 
     if [ -n "$ATTRIBUTION_TOUCHED" ]; then

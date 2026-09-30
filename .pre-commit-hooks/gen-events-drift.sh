@@ -597,6 +597,7 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
     log "Rust generates. But this push changes NONE of the sources that feed"
     log "them — nothing under ${GEN_EVENTS_ATTRIBUTION_PATHS[*]}"
+    log "(markdown aside — it cannot reach schemas.json; see lib/gen-events-attribution.sh)"
     log "differs between HEAD and $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}),"
     log "and the working tree adds nothing either. The inputs behind the diff"
     log "below are therefore already upstream: the shared checkout's artifact is"
@@ -617,7 +618,27 @@ fail "ERROR: Generated Tauri event bindings are stale."
 if [ "$ATTRIBUTION_STATE" = "mine" ]; then
     fail "This push changes sources that feed them, so the diff below is yours."
     fail "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
-    printf '%s\n' "$ATTRIBUTION_TOUCHED" | sed 's/^/[gen-events-drift]     /' >&2
+    # Labelled by source, because "this push" is only true of the committed
+    # ones. The regen reads the working tree, so a dirty or untracked input
+    # still makes the drift the pusher's to look at — but #1667's author was
+    # shown a dirty Cargo.lock beside three pushed .md files, with nothing
+    # saying the lockfile was never in the push.
+    not_pushed=0
+    while IFS=$'\t' read -r touched_path touched_source; do
+        [ -n "$touched_path" ] || continue
+        case "$touched_source" in
+            committed)   label="committed in this push" ;;
+            uncommitted) label="uncommitted — not part of this push"; not_pushed=1 ;;
+            untracked)   label="untracked — not part of this push"; not_pushed=1 ;;
+            *)           label="source unknown: '$touched_source'"; not_pushed=1 ;;
+        esac
+        fail "    $touched_path  ($label)"
+    done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
+    if [ "$not_pushed" = "1" ]; then
+        fail "Inputs marked 'not part of this push' come from your working tree, which"
+        fail "the regeneration reads. \`git stash\` (or \`git checkout -- <path>\`) and"
+        fail "re-run to see whether the drift is yours."
+    fi
     fail "Part of the diff may still be pre-existing — the baseline is a build"
     fail "artifact in a shared checkout and may have been behind before you began."
 elif [ "$ATTRIBUTION_STATE" = "pre-existing" ]; then
