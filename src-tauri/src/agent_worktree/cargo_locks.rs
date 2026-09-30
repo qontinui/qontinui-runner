@@ -73,7 +73,7 @@ const MAX_ANCESTOR_DEPTH: usize = 16;
 /// Ceiling on `/proc/<pid>/fd/*` entries the open-file owner scan reads per
 /// tick — it bounds the one expensive fallback.
 #[cfg(target_os = "linux")]
-const MAX_FD_SCAN: usize = 400_000;
+const MAX_FD_SCAN: usize = 100_000;
 
 /// Sub-roots of a repo checkout that may host a cargo workspace's targets.
 /// `""` is the repo root itself; `src-tauri` is the runner's cargo workspace.
@@ -226,17 +226,25 @@ pub enum LockMatch {
 ///
 /// Exact `(major, minor, inode)` first. FALLBACK, hypothesis-driven and
 /// unmeasured here (this box is ext4): on btrfs subvolumes and overlayfs the
-/// `st_dev` that `stat` reports can differ from the superblock device
-/// `/proc/locks` prints, so an exact miss would read a held lock as idle. When
-/// the exact key misses but the inode appears under EXACTLY ONE key, that key
-/// is taken; an inode shared by two devices is ambiguous and matches nothing.
-/// The claude-config Phase 1 helper uses the same rule.
+/// `st_dev` that `stat` reports is an ANONYMOUS device (major `0`) that can
+/// differ from the superblock device `/proc/locks` prints, so an exact miss
+/// would read a held lock as idle. Only for such a file (`key.major == 0`),
+/// when the exact key misses but the inode appears under EXACTLY ONE key, that
+/// key is taken; an inode shared by two devices is ambiguous and matches
+/// nothing. A file on a real block device (major != 0 — every idle lock on
+/// ext4) never falls back: an idle lock is simply absent from `/proc/locks`,
+/// and an inode-only match there would borrow an unrelated file's lock on
+/// another filesystem. An [`LockMatch::InodeOnly`] match is still only a
+/// candidate — the caller must confirm it by path (see `lock_item`).
 pub fn lookup_lock(
     locks: &HashMap<LockKey, LockEntry>,
     key: LockKey,
 ) -> Option<(LockKey, &LockEntry, LockMatch)> {
     if let Some(e) = locks.get(&key) {
         return Some((key, e, LockMatch::Exact));
+    }
+    if key.major != 0 {
+        return None;
     }
     let mut same_ino = locks.iter().filter(|(k, _)| k.ino == key.ino);
     let (k, e) = same_ino.next()?;
@@ -513,24 +521,35 @@ pub fn probe_current() -> Option<Vec<CargoLockItem>> {
 static LAST_TRUNCATION_LOG_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// At most one truncation warning per hour.
+/// Epoch of the last fd-scan-truncation warning.
 #[cfg(target_os = "linux")]
-fn warn_truncated_throttled(cap: usize) {
+static LAST_FD_SCAN_LOG_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run `emit` at most once per hour per `cell`.
+#[cfg(target_os = "linux")]
+fn hourly(cell: &std::sync::atomic::AtomicU64, emit: impl FnOnce()) {
     use std::sync::atomic::Ordering;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let last = LAST_TRUNCATION_LOG_EPOCH.load(Ordering::Acquire);
+    let last = cell.load(Ordering::Acquire);
     if now.saturating_sub(last) >= 3600
-        && LAST_TRUNCATION_LOG_EPOCH
+        && cell
             .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     {
+        emit();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn warn_truncated_throttled(cap: usize) {
+    hourly(&LAST_TRUNCATION_LOG_EPOCH, || {
         tracing::warn!(
             "cargo_locks: more than {cap} shared-target lock files — the published list is \
              TRUNCATED to the first {cap} (sorted by repo/target)"
         );
-    }
+    });
 }
 
 /// Probe one workspace root. `None` when `/proc/locks` cannot be read.
@@ -569,15 +588,33 @@ fn lock_item(
         minor,
         ino: md.ino(),
     };
-    let matched = lookup_lock(locks, stat_key);
+    let mut matched = lookup_lock(locks, stat_key);
+    // An inode-only candidate is accepted ONLY when a process with THIS lock
+    // file open (by path) confirms it; otherwise it was someone else's file
+    // and this lock is reported idle.
+    let mut path_owner = None;
+    if let Some((key, e, LockMatch::InodeOnly)) = &matched {
+        path_owner = if e.holders.is_empty() {
+            None
+        } else {
+            procs.resolve_owner(*key, &[], &file.path, all_lock_paths)
+        };
+        if path_owner.is_none() {
+            matched = None;
+        }
+    }
     let (holders, waiters): (&[i32], &[i32]) = match &matched {
         Some((_, e, _)) => (e.holders.as_slice(), e.waiters.as_slice()),
         None => (&[], &[]),
     };
 
     let (holder_pid, holder_kind, holder_age_secs, holder_cmd) = match &matched {
-        Some((key, _, _)) if !holders.is_empty() => {
-            match procs.resolve_owner(*key, holders, waiters, &file.path, all_lock_paths) {
+        Some((key, _, how)) if !holders.is_empty() => {
+            let owner = match how {
+                LockMatch::InodeOnly => path_owner,
+                LockMatch::Exact => procs.resolve_owner(*key, holders, &file.path, all_lock_paths),
+            };
+            match owner {
                 Some(pid) => {
                     let argv = procs.argv(pid);
                     let kind = if argv.is_empty() {
@@ -698,14 +735,17 @@ impl ProcReader {
     ///
     /// 1. The first printed holder (in `/proc/locks` order) that is a real pid
     ///    AND confirmed via its own fdinfo.
-    /// 2. Otherwise the processes holding the lock file open, minus the
-    ///    waiters, each confirmed via the fdinfo of that fd; the topmost
-    ///    ([`pick_owner`]) wins.
+    /// 2. Otherwise the processes holding THIS lock file open (by path), each
+    ///    confirmed via the fdinfo of that fd; the topmost ([`pick_owner`])
+    ///    wins. Waiters need no exclusion: fdinfo lists only granted locks,
+    ///    and `/proc/locks` pids are tgids that need not match an fd owner.
+    ///
+    /// Pass no `holders` to use the path-confirmed arm alone (an inode-only
+    /// match, whose key may belong to another file).
     fn resolve_owner(
         &mut self,
         key: LockKey,
         holders: &[i32],
-        waiters: &[i32],
         lock_path: &Path,
         all_lock_paths: &[PathBuf],
     ) -> Option<u32> {
@@ -715,16 +755,9 @@ impl ProcReader {
             }
         }
         let canon = std::fs::canonicalize(lock_path).ok()?;
-        let waiting: HashSet<u32> = waiters
-            .iter()
-            .filter_map(|p| u32::try_from(*p).ok())
-            .collect();
         let openers = self.open_index(all_lock_paths).get(&canon).cloned()?;
         let mut cands: Vec<OwnerCandidate> = Vec::new();
         for (pid, fd) in openers {
-            if waiting.contains(&pid) {
-                continue;
-            }
             let held = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
                 .is_ok_and(|t| fdinfo_holds_lock(&t, key));
             if !held {
@@ -741,10 +774,13 @@ impl ProcReader {
     }
 
     /// Scan `/proc/*/fd/*` ONCE per tick for fds open on any of the lock
-    /// files, bounded by [`MAX_FD_SCAN`]. Other users' processes are
-    /// unreadable and skipped.
+    /// files, bounded by [`MAX_FD_SCAN`]. Processes owned by another uid are
+    /// skipped up front (their `fd/` is unreadable anyway).
     fn open_index(&mut self, lock_paths: &[PathBuf]) -> &HashMap<PathBuf, Vec<(u32, String)>> {
         self.open_index.get_or_insert_with(|| {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let my_uid = unsafe { libc::geteuid() };
             let wanted: HashSet<PathBuf> = lock_paths
                 .iter()
                 .filter_map(|p| std::fs::canonicalize(p).ok())
@@ -758,12 +794,21 @@ impl ProcReader {
                 let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
                     continue;
                 };
+                if !p.metadata().is_ok_and(|m| m.uid() == my_uid) {
+                    continue;
+                }
                 let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
                     continue;
                 };
                 for fd in fds.flatten() {
                     scanned += 1;
                     if scanned > MAX_FD_SCAN {
+                        hourly(&LAST_FD_SCAN_LOG_EPOCH, || {
+                            tracing::warn!(
+                                "cargo_locks: open-file owner scan stopped at {MAX_FD_SCAN} fds \
+                                 — an unconfirmed lock owner may be reported as null"
+                            );
+                        });
                         break 'pids;
                     }
                     let Ok(target) = std::fs::read_link(fd.path()) else {
@@ -784,10 +829,9 @@ impl ProcReader {
 mod tests {
     use super::*;
 
-    /// MODELED ON the real 2026-09-29 sample on merytshost (coord's
-    /// `target/debug/.cargo-lock`, inode 16669579, one holder and 17 blocked
-    /// waiters, interleaved with unrelated FLOCK and POSIX rows). The holder
-    /// pid and the unrelated rows are real; the waiter pids are synthetic.
+    /// Modeled on the 2026-09-29 sample on merytshost (coord's
+    /// `target/debug/.cargo-lock`, one holder and 17 blocked waiters,
+    /// interleaved with unrelated FLOCK and POSIX rows).
     const PROC_LOCKS_FIXTURE: &str = "\
 1: FLOCK  ADVISORY  READ 3941263 08:01:16019097 0 EOF
 2: POSIX  ADVISORY  READ 815964 08:01:16943815 124 124
@@ -895,6 +939,13 @@ garbage
         let map = parse_proc_locks(PROC_LOCKS_FIXTURE);
         let (k, _, how) = lookup_lock(&map, COORD_LOCK).expect("exact");
         assert_eq!((k, how), (COORD_LOCK, LockMatch::Exact));
+        // A real block device (major != 0) never falls back: an unrelated
+        // row with the same inode on another filesystem is NOT this file.
+        assert!(
+            lookup_lock(&map, key(8, 2, 16_669_579)).is_none(),
+            "same inode, different real device must not be attributed"
+        );
+        assert!(lookup_lock(&map, key(259, 0, 16_669_579)).is_none());
         // btrfs-style: stat reports an anonymous device 00:2f.
         let (k, e, how) = lookup_lock(&map, key(0, 0x2f, 16_669_579)).expect("inode fallback");
         assert_eq!((k, how), (COORD_LOCK, LockMatch::InodeOnly));

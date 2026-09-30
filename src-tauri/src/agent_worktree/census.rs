@@ -2992,24 +2992,58 @@ const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`CARGO_LOCK_PROBE_TIMEOUT`]. A failed or timed-out probe is UNKNOWN
 /// (`None` → the field is omitted), never an empty list.
 async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
-    match tokio::time::timeout(
-        CARGO_LOCK_PROBE_TIMEOUT,
-        spawn_blocking_tracked(super::cargo_locks::probe_current),
-    )
-    .await
+    // A timed-out probe keeps running on its blocking thread; while it does,
+    // later ticks skip instead of stacking one more blocked thread each.
+    if CARGO_LOCK_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
+        debug!("worktree_census: previous cargo lock probe still running — cargo_locks UNKNOWN this tick");
+        return None;
+    }
+    let task = spawn_blocking_tracked(|| {
+        let _in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+        super::cargo_locks::probe_current()
+    });
+    match tokio::time::timeout(CARGO_LOCK_PROBE_TIMEOUT, task).await {
         Ok(Ok(locks)) => locks,
         Ok(Err(e)) => {
             debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
             None
         }
         Err(_) => {
-            debug!(
-                "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN this tick",
-                CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+            emit_throttled(
+                &LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH,
+                now_epoch_secs(),
+                CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS,
+                || {
+                    warn!(
+                        "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN; \
+                         later ticks skip the probe until it finishes",
+                        CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+                    );
+                    true
+                },
             );
             None
         }
+    }
+}
+
+/// Set while a cargo lock probe runs on the blocking pool (cleared by
+/// [`ClearOnDrop`] when that thread finishes, even on panic).
+static CARGO_LOCK_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Throttle for the probe-timeout warning: one per 10 minutes.
+const CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS: u64 = 600;
+static LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Clears an in-flight flag when dropped.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
