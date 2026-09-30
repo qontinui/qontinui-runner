@@ -199,10 +199,13 @@ the way. The mechanical test is that a linked worktree's own git dir is not the
 repo's common one:
 
 ```bash
-# Skip 0b entirely unless this is the repo's canonical checkout.
-if [ "$(git rev-parse --absolute-git-dir)" \
-   = "$(git rev-parse --path-format=absolute --git-common-dir)" ]; then
-  REPO=$(basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")")
+# Skip 0b entirely unless this is the repo's canonical checkout. Each dir is read
+# ONCE with its status tested: outside a repo both reads print nothing, and two
+# empty strings compare equal -- "canonical" from a probe that never ran.
+if GIT_DIR_OWN=$(git rev-parse --absolute-git-dir) \
+   && GIT_DIR_COMMON=$(git rev-parse --path-format=absolute --git-common-dir) \
+   && [ "$GIT_DIR_OWN" = "$GIT_DIR_COMMON" ]; then
+  REPO=$(basename "$(dirname "$GIT_DIR_COMMON")")
   BRANCH=$(git rev-parse --abbrev-ref HEAD)
   DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
   [ -n "$DEFAULT" ] && [ "$BRANCH" != "$DEFAULT" ] && echo "0b applies: $REPO $BRANCH"

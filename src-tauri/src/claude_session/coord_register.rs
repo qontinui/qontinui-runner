@@ -2715,7 +2715,27 @@ mod tests {
     /// per-session prefix `agent-log-emit-` exists at all. That cannot be
     /// false-failed by a neighbouring test spawning threads of its own, and it
     /// is red against the old design by construction (50 `agent-log-emit-<uuid>`
-    /// threads). Elsewhere, where thread names are unreadable, the fallback is
+    /// threads).
+    ///
+    /// The reads are ORDERED, and the order is the point (coord finding
+    /// `186eca22`). Rust std applies `Builder::name` inside the child, before
+    /// its closure runs, so until the service thread is first scheduled its
+    /// `comm` is inherited and matches no prefix — under CPU contention a read
+    /// taken right after `spawn()` saw no `agent-log-emitt` thread at all. So
+    /// the test first proves THIS service's thread has run a pass: a sentinel
+    /// handle emits one line and the service's own gauge must reach 1. The
+    /// gauge is per-service while thread names are process-wide — a
+    /// neighbouring test's offline service also carries `agent-log-emitter`,
+    /// so a poll on the name would prove nothing about this one. The negative
+    /// checks are then read only after every handle has been closed AND the
+    /// service has absorbed those closes (the gauge back at 0) — the latest
+    /// point the test can observe before reading names.
+    /// They stay point-in-time, not a proof: a per-handle thread that exists
+    /// but has never been scheduled still carries an inherited `comm` that no
+    /// prefix here matches — the `family` read is a prefix match too, and on
+    /// Linux there is no count-based backstop behind it.
+    ///
+    /// Elsewhere, where thread names are unreadable, the fallback is
     /// the process thread count within `baseline + 2` — `+1` for this test's
     /// private `agent-log-emitter` thread and one of headroom for the reqwest
     /// runtime the production service builds lazily (this offline service never
@@ -2727,6 +2747,21 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             let (service, gauge) = offline_service();
+            // Sync on THIS service's gauge before reading any name: the gauge
+            // reaching 1 means the service thread has run a pass, and a thread
+            // that has run is already named.
+            let sentinel = AgentLogEmitter::with_service(&service, Uuid::new_v4(), None, None);
+            sentinel.emit("info", "stdout", Some(json!({ "text": "sentinel" })));
+            assert!(
+                wait_for_live_agents(gauge, 1),
+                "the service thread never ran a pass — the sentinel's queue did not open \
+                 within two flush intervals"
+            );
+            assert!(
+                threads_named("agent-log-emitt").is_some_and(|n| n >= 1),
+                "the service thread itself must exist while the service is alive"
+            );
+
             let handles: Vec<AgentLogEmitter> = (0..50)
                 .map(|_| AgentLogEmitter::with_service(&service, Uuid::new_v4(), None, None))
                 .collect();
@@ -2735,9 +2770,13 @@ mod tests {
                 handle.stream_line("one line");
                 handle.close();
             }
+            // Close the sentinel LAST and wait for 0: every send came from this
+            // thread, so the channel's FIFO order means the gauge cannot reach
+            // 0 until all 50 closes and the sentinel's have been absorbed.
+            sentinel.close();
             assert!(
                 wait_for_live_agents(gauge, 0),
-                "{} queue(s) still held after every handle closed",
+                "{} queue(s) still held after every handle and the sentinel closed",
                 gauge.load(std::sync::atomic::Ordering::Relaxed)
             );
             let per_session =
@@ -2747,19 +2786,16 @@ mod tests {
                 "{per_session} thread(s) carry the per-session prefix — the emitter is \
                  spawning per handle again"
             );
-            assert!(
-                threads_named("agent-log-emitt").is_some_and(|n| n >= 1),
-                "the service thread itself must exist while the service is alive"
-            );
-            // Name-agnostic backstop: whatever a per-handle thread might be
-            // called, 50 handles must not have produced anything like 50
-            // emitter-family threads. Other tests hold a handful of offline
-            // services at most.
+            // Family backstop: whatever suffix a per-handle thread might carry
+            // under the `agent-log` prefix, 50 handles must not have produced
+            // anything like 50 emitter-family threads. Other tests hold a
+            // handful of offline services at most.
             let family = threads_named("agent-log").expect("procfs readable");
             assert!(
                 family < 50,
                 "{family} agent-log* threads — one per handle again under a new name?"
             );
+            drop(sentinel);
             drop(handles);
             drop(service);
         }

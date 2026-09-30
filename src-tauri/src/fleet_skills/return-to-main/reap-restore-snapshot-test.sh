@@ -262,7 +262,11 @@ if want c04; then
   F1="$(branchcommit "$R" feat f.txt 'feature\n' f1)"
   put "$R" m.txt 'mainline\n'; cm "$R" m1 >/dev/null; gq "$R" push -q origin main
   gq "$R" checkout -q feat; gq "$R" rebase -q main; TIP="$(g "$R" rev-parse HEAD)"; gq "$R" checkout -q main
-  [ "$TIP" != "$F1" ] || bad "c04: FIXTURE the rebase did not rewrite F1"
+  # Both shas proven non-empty first (check #73): two failed rev-parses print
+  # nothing and compare EQUAL, one failed one reads as "rewritten". Guarded
+  # inline rather than through the typed-probe library, which the bundled
+  # skill does not carry (check #71).
+  { [ -n "$TIP" ] && [ -n "$F1" ] && [ "$TIP" != "$F1" ]; } || bad "c04: FIXTURE the rebase did not rewrite F1 (or a sha did not resolve)"
   push_to_main "$R" "$TIP"
   REF="$(snap "$R" "$TIP" "$(sweep_msg c04 feat)")"
   reap "$R" "$REF"

@@ -293,17 +293,33 @@ for repo in qontinui qontinui-web qontinui-runner qontinui-devtools \
             qontinui-inspect qontinui-workflow-ui qontinui-workflow-utils qontinui-setup-mcp; do
   if [ ! -d "$BASE/$repo/.git" ]; then continue; fi
   cd "$BASE/$repo"
-  if [ -n "$(git log @{u}.. 2>/dev/null)" ]; then
-    echo "$repo: HAS UNPUSHED COMMITS"
-  elif [ -n "$(git status --porcelain)" ]; then
-    echo "$repo: HAS UNCOMMITTED CHANGES (should have been committed in Step 2!)"
+  # Capture each read and test its STATUS first: an empty substitution is also
+  # what a failed read prints, so emptiness alone would call an unmeasured repo
+  # clean. The dirty check runs on EVERY repo -- including one whose unpushed
+  # count is UNKNOWN, since a repo with no upstream can still hold uncommitted
+  # work, and skipping the check there would hide exactly that.
+  if ! dirty="$(git status --porcelain)"; then
+    dirty_state=unknown
+  elif [ -n "$dirty" ]; then
+    dirty_state=dirty
   else
+    dirty_state=clean
+  fi
+  [ "$dirty_state" = dirty ] && echo "$repo: HAS UNCOMMITTED CHANGES (should have been committed in Step 2!)"
+  [ "$dirty_state" = unknown ] && echo "$repo: UNKNOWN -- git status failed, so uncommitted changes were not measured"
+  if ! unpushed="$(git log @{u}.. 2>/dev/null)"; then
+    echo "$repo: UNKNOWN -- no upstream (or git log failed), so unpushed commits were not measured"
+  elif [ -n "$unpushed" ]; then
+    echo "$repo: HAS UNPUSHED COMMITS"
+  elif [ "$dirty_state" = clean ]; then
     echo "$repo: clean (skip)"
   fi
 done
 ```
 
 If no repos have changes, report that all repos are clean and output `[TASK_COMPLETE]`.
+An `UNKNOWN` line is not clean: set the repo's upstream (or check it by hand)
+and re-run this step before reporting all repos clean.
 
 ### Step 5: Linting and Commit
 

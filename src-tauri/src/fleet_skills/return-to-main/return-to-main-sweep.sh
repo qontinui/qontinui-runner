@@ -1139,7 +1139,7 @@ _rtm_restore_residue() {
   mapfile -t census_sorted < <(printf '%s\n' "${_RES_MOD[@]}" | LC_ALL=C sort -u)
   mapfile -t prov_sorted < <(printf '%s\n' ${pp[@]+"${pp[@]}"} | LC_ALL=C sort -u)
   if [ "${#pp[@]}" != "$n" ] || [ "${#prov_sorted[@]}" != "$n" ] \
-     || [ "$(printf '%s\n' "${census_sorted[@]}")" != "$(printf '%s\n' ${prov_sorted[@]+"${prov_sorted[@]}"})" ]; then
+     || [ "$(printf '%s\n' "${census_sorted[@]}")" != "$(printf '%s\n' ${prov_sorted[@]+"${prov_sorted[@]}"})" ]; then  # [unconditional-verdict-lint: allow -- in-memory arrays re-printed, not probes; the counts beside it pin both sides to n]
     RES_REASON="provenance_census_mismatch: dirty-provenance.sh proved ${#pp[@]} file(s) residue but this checkout has $n modified tracked file(s), and the two lists are not identical; only an exact match is restored"
     return 0
   fi
@@ -1153,7 +1153,7 @@ _rtm_restore_residue() {
 
   # -- the tree must not have moved while the proof ran ----------------------
   if ! _res_census || [ "$(printf '%s\n' "${_RES_MOD[@]}" | LC_ALL=C sort -u)" != "$(printf '%s\n' "${census_sorted[@]}")" ] \
-     || [ "$_RES_UNTRACKED" -gt 0 ]; then
+     || [ "$_RES_UNTRACKED" -gt 0 ]; then  # [unconditional-verdict-lint: allow -- _res_census on this line re-measures _RES_MOD with its status checked, and census_sorted is the in-memory list from above]
     RES_REASON="raced_dirty: the set of modified files changed while dirty-provenance.sh ran${_RES_WHY:+ ($_RES_WHY)}"
     return 0
   fi

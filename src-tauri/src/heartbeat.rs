@@ -123,7 +123,9 @@ pub(crate) struct HeartbeatUiThread {
     event_pong_age_ms: Option<u64>,
     /// PING DELIVERABILITY (plan `2026-09-01-postmessage-storm-drives-false-ui-
     /// death-and-a-webview-recreate-loop`). `"ping_delivered" |
-    /// "ping_undeliverable" | "unknown"` — see `ui_error::PingDelivery`.
+    /// "ping_undeliverable" | "fd_starved" | "unknown"` — see
+    /// `ui_error::PingDelivery`. `"fd_starved"` (plan 2026-09-09 pong receive
+    /// path) means the runner had no descriptor to RECEIVE the pong on.
     ///
     /// These five fields landed on `/health` only, and `/health` is bound to
     /// loopback — so on an end user's machine nobody could read them, which is
@@ -145,6 +147,24 @@ pub(crate) struct HeartbeatUiThread {
     /// `errored` status is what tells an off-box reader the runner is
     /// deliberately declining to recover rather than failing to.
     false_death_suppressed: u64,
+    /// RECEIVE-SIDE descriptor pressure (plan `2026-09-09-the-pong-receive-
+    /// path-has-no-liveness-signal-so-fd-exhaustion-still-reads-as-ui-death`):
+    /// `"starved" | "ample" | "unknown"` — see `ui_error::FdPressure`.
+    fd_pressure: &'static str,
+    /// Open descriptors; `null` = not measured (non-Linux, or the census could
+    /// not open `/proc/self/fd`) — UNKNOWN, never 0.
+    fd_open: Option<u64>,
+    /// Soft `RLIMIT_NOFILE`; `null` = unreadable, unlimited, or none here.
+    fd_soft_limit: Option<u64>,
+    /// `fd_soft_limit - fd_open`; `null` unless both were measured.
+    fd_headroom: Option<u64>,
+    /// Monotonic count of EMFILE/ENFILE errors observed by wired sites.
+    fd_exhausted_errors: u64,
+    /// Age of the last EMFILE/ENFILE; `null` = none ever observed.
+    last_fd_exhausted_age_ms: Option<u64>,
+    /// Recreates NOT performed because the runner was out of descriptors — the
+    /// receive-side twin of `false_death_suppressed`.
+    fd_starved_suppressed: u64,
 }
 
 /// Relay state on the heartbeat wire (RT6 of plan
@@ -234,6 +254,13 @@ impl HeartbeatUiThread {
             last_ping_emit_ok_age_ms: ping.last_emit_ok_age_ms,
             last_ping_emit_fail_age_ms: ping.last_emit_fail_age_ms,
             false_death_suppressed: ping.false_death_suppressed,
+            fd_pressure: ping.fd_pressure.as_str(),
+            fd_open: ping.fd_open,
+            fd_soft_limit: ping.fd_soft_limit,
+            fd_headroom: ping.fd_headroom,
+            fd_exhausted_errors: ping.fd_exhausted_errors,
+            last_fd_exhausted_age_ms: ping.last_fd_exhausted_age_ms,
+            fd_starved_suppressed: ping.fd_starved_suppressed,
         }
     }
 }
@@ -307,7 +334,15 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         // re-evaluates every 15s, and an undeliverable ping can persist for
         // hours — logging each tick would rebuild, in the recovery path, the
         // same log storm this plan exists to remove.
-        let mut suppression_announced = false;
+        //
+        // One flag PER ARM, not one bool: an episode whose cause changes
+        // (undeliverable → fd starved) is a new fact and gets its own `warn!`
+        // rather than being folded into the first one. But each arm warns at
+        // most ONCE per episode — a mixed storm that flips cause every 15s
+        // tick must not rebuild the per-tick log storm this gate exists to
+        // remove, so later flips back to an already-announced arm are `debug!`.
+        let mut announced_undeliverable = false;
+        let mut announced_starved = false;
 
         loop {
             ticker.tick().await;
@@ -447,29 +482,69 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // microseconds apart can legitimately disagree, and that would put
             // a `ping_delivery` on the heartbeat that the `recover` decision
             // beside it was not computed from.
+            //
+            // RECEIVE SIDE (plan 2026-09-09 pong receive path). The same gate
+            // also suppresses on `Starved`: the ping may have been delivered,
+            // but the runner had no file descriptor to accept the pong's
+            // socket on (EMFILE inside the death window, or measured headroom
+            // under the threshold). Recreating a webview returns no
+            // descriptors — on `merytshost` that ladder ran to EXHAUSTED 240
+            // times and raised 7 native dialogs. Same rule: positive evidence
+            // only; an unmeasured headroom is `Unknown` and RECOVERS.
             let mut ping_report = crate::ui_error::ping_delivery_report_now();
-            let recover =
-                ui_dead && ping_report.delivery != crate::ui_error::PingDelivery::Undeliverable;
+            let recover = ui_dead && !ping_report.delivery.suppresses_recovery();
             if ui_dead && !recover {
-                crate::ui_error::record_false_death_suppressed();
-                // Re-read only the counter we just moved, so this tick's
-                // heartbeat carries THIS tick's suppression rather than the
-                // count as it stood one suppression ago.
+                crate::ui_error::record_suppression(ping_report.delivery);
+                // Re-read only the counters we may just have moved, so this
+                // tick's heartbeat carries THIS tick's suppression rather than
+                // the count as it stood one suppression ago.
                 ping_report.false_death_suppressed =
                     crate::ui_error::false_death_suppressed_count();
+                ping_report.fd_starved_suppressed = crate::ui_error::fd_starved_suppressed_count();
                 let emit_failures = ping_report.emit_failures;
-                if !suppression_announced {
-                    suppression_announced = true;
-                    warn!(
-                        ping_delivery = ping_report.delivery.as_str(),
-                        emit_failures,
-                        suppressed_total = ping_report.false_death_suppressed,
-                        "UI recovery SUPPRESSED — the pong is stale because the \
-                         ui-bridge-ping could not be delivered, not because the UI is \
-                         dead. Recreating the webview would change the window-handle set \
-                         and make the emit failures worse. Status still publishes \
-                         `errored`; see /health uiThread.pingDelivery. Logged once per \
-                         episode; the counter keeps rising"
+                let starved = ping_report.delivery == crate::ui_error::PingDelivery::Starved;
+                let announced = if starved {
+                    &mut announced_starved
+                } else {
+                    &mut announced_undeliverable
+                };
+                if !*announced {
+                    *announced = true;
+                    if starved {
+                        warn!(
+                            ping_delivery = ping_report.delivery.as_str(),
+                            fd_pressure = ping_report.fd_pressure.as_str(),
+                            fd_open = ?ping_report.fd_open,
+                            fd_soft_limit = ?ping_report.fd_soft_limit,
+                            fd_headroom = ?ping_report.fd_headroom,
+                            fd_exhausted_errors = ping_report.fd_exhausted_errors,
+                            last_fd_exhausted_age_ms = ?ping_report.last_fd_exhausted_age_ms,
+                            suppressed_total = ping_report.fd_starved_suppressed,
+                            "UI recovery SUPPRESSED — the pong is stale because this runner is \
+                             out of file descriptors and could not have RECEIVED it, not because \
+                             the UI is dead. Recreating the webview returns no descriptors. \
+                             Status still publishes `errored`; see /health \
+                             uiThread.pingDelivery = fd_starved. Logged once per episode; the \
+                             counter keeps rising"
+                        );
+                    } else {
+                        warn!(
+                            ping_delivery = ping_report.delivery.as_str(),
+                            emit_failures,
+                            suppressed_total = ping_report.false_death_suppressed,
+                            "UI recovery SUPPRESSED — the pong is stale because the \
+                             ui-bridge-ping could not be delivered, not because the UI is \
+                             dead. Recreating the webview would change the window-handle set \
+                             and make the emit failures worse. Status still publishes \
+                             `errored`; see /health uiThread.pingDelivery. Logged once per \
+                             episode; the counter keeps rising"
+                        );
+                    }
+                } else if starved {
+                    debug!(
+                        fd_headroom = ?ping_report.fd_headroom,
+                        suppressed_total = ping_report.fd_starved_suppressed,
+                        "UI recovery still suppressed (fd starved)"
                     );
                 } else {
                     debug!(
@@ -488,7 +563,8 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 // and then fails again is a NEW episode by any reading, but the
                 // flag was never cleared, so that episode announced itself at
                 // `debug!` and the operator saw nothing.
-                suppression_announced = false;
+                announced_undeliverable = false;
+                announced_starved = false;
             }
             if recover {
                 if let Some(handle) = crate::tauri_app_handle::current() {
@@ -847,9 +923,9 @@ mod tests {
                 last_emit_ok_ms: 0,
                 last_emit_fail_ms: 0,
                 now_ms: 1_800_000_000_000,
+                fd: crate::ui_error::FdPressureInputs::UNMEASURED,
             },
-            0,
-            0,
+            crate::ui_error::PingCounters::default(),
         )
     }
 
@@ -909,6 +985,13 @@ mod tests {
             "last_ping_emit_ok_age_ms",
             "last_ping_emit_fail_age_ms",
             "false_death_suppressed",
+            "fd_pressure",
+            "fd_open",
+            "fd_soft_limit",
+            "fd_headroom",
+            "fd_exhausted_errors",
+            "last_fd_exhausted_age_ms",
+            "fd_starved_suppressed",
         ] {
             assert!(ui_thread.contains_key(key), "missing key {key}");
         }
@@ -937,9 +1020,13 @@ mod tests {
                 last_emit_ok_ms: NOW - 600_000,
                 last_emit_fail_ms: NOW - 3_000,
                 now_ms: NOW,
+                fd: crate::ui_error::FdPressureInputs::UNMEASURED,
             },
-            119_012,
-            49,
+            crate::ui_error::PingCounters {
+                emit_failures: 119_012,
+                false_death_suppressed: 49,
+                ..Default::default()
+            },
         );
         let json = serde_json::to_value(HeartbeatUiThread::new(native, ping)).expect("serializes");
         assert_eq!(json["ping_delivery"], "ping_undeliverable");
@@ -971,6 +1058,60 @@ mod tests {
         );
         assert_eq!(json["last_ping_emit_fail_age_ms"], serde_json::Value::Null);
         assert_eq!(json["ping_emit_failures"], 0);
+        assert_eq!(json["false_death_suppressed"], 0);
+        // The fd half: unmeasured is null / "unknown", never a 0 that would
+        // read as "no descriptors open" or "no headroom".
+        assert_eq!(json["fd_pressure"], "unknown");
+        assert_eq!(json["fd_open"], serde_json::Value::Null);
+        assert_eq!(json["fd_soft_limit"], serde_json::Value::Null);
+        assert_eq!(json["fd_headroom"], serde_json::Value::Null);
+        assert_eq!(json["last_fd_exhausted_age_ms"], serde_json::Value::Null);
+        assert_eq!(json["fd_starved_suppressed"], 0);
+    }
+
+    /// The `merytshost` 2026-09-02 shape on the wire (plan 2026-09-09 pong
+    /// receive path): pings delivered fine, the runner out of descriptors, a
+    /// death verdict suppressed as `fd_starved`. An off-box reader must be able
+    /// to see all of it — the loopback-only mistake this block exists to
+    /// prevent.
+    #[test]
+    fn payload_carries_the_fd_starvation_half_off_box() {
+        let native = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: 1_700_000_000_000,
+            pong_age_ms: 600_000,
+            last_event_pong: 1_700_000_000_000,
+            event_pong_age_ms: 600_000,
+        });
+        const NOW: u64 = 1_800_000_000_000;
+        let ping = crate::ui_error::classify_ping_delivery_report(
+            crate::ui_error::PingDeliveryInputs {
+                last_emit_ok_ms: NOW - 3_000,
+                last_emit_fail_ms: 0,
+                now_ms: NOW,
+                fd: crate::ui_error::FdPressureInputs {
+                    open: Some(1_020),
+                    soft_limit: Some(1_024),
+                    last_exhausted_ms: NOW - 11_000,
+                },
+            },
+            crate::ui_error::PingCounters {
+                fd_exhausted_errors: 8_267,
+                fd_starved_suppressed: 42,
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_value(HeartbeatUiThread::new(native, ping)).expect("serializes");
+        assert_eq!(json["ping_delivery"], "fd_starved");
+        assert_eq!(json["fd_pressure"], "starved");
+        assert_eq!(json["fd_open"], 1_020);
+        assert_eq!(json["fd_soft_limit"], 1_024);
+        assert_eq!(json["fd_headroom"], 4);
+        assert_eq!(json["fd_exhausted_errors"], 8_267);
+        assert_eq!(json["last_fd_exhausted_age_ms"], 11_000);
+        assert_eq!(json["fd_starved_suppressed"], 42);
+        // The send-side counter keeps its undeliverable-only meaning.
         assert_eq!(json["false_death_suppressed"], 0);
     }
 

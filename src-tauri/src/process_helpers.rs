@@ -923,7 +923,11 @@ pub fn start_detached(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut child = cmd.spawn()?;
+    // A spawn that fails with EMFILE/ENFILE is positive evidence the process
+    // is out of descriptors — the second authority the UI-death gate reads.
+    let mut child = cmd.spawn().inspect_err(|e| {
+        qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(e);
+    })?;
     let pid = child.id();
 
     let deadline = Instant::now() + budget;
@@ -1053,7 +1057,13 @@ pub fn run_with_timeout_detailed(
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
     ChildTreeGuard::arm(&mut cmd);
 
-    let mut child = cmd.spawn()?;
+    // Three pipes plus the exec'd child: this is where descriptor exhaustion
+    // surfaces first (`could not spawn: Too many open files`, 5,841 times from
+    // `fleet::tree_publisher` alone on 2026-09-02). Stamp it for the UI-death
+    // gate — see `util::fd_exhaustion`.
+    let mut child = cmd.spawn().inspect_err(|e| {
+        qontinui_runner_lib::util::fd_exhaustion::note_fd_exhaustion(e);
+    })?;
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
 

@@ -409,7 +409,7 @@ if [ "$SHAPE" = residue ]; then
     check residue_shape fail "commit has $((_parents - 1)) parent(s), not 2"
     finish REFUSED "residue snapshot is not a two-parent stash commit"
   fi
-  if [ "$(g rev-parse "$SNAP_SHA^2^{tree}")" != "$(g rev-parse "$SNAP_SHA^1^{tree}")" ]; then
+  if [ "$(g rev-parse "$SNAP_SHA^2^{tree}")" != "$(g rev-parse "$SNAP_SHA^1^{tree}")" ]; then  # [unconditional-verdict-lint: allow -- the parent count above proves R^1 and R^2 both exist, so neither tree read is of a missing commit]
     check residue_shape fail "R^2^{tree} differs from R^1^{tree}: the stash carries staged changes"
     finish REFUSED "residue snapshot carries staged changes"
   fi
@@ -449,7 +449,7 @@ if [ "$SHAPE" = residue ]; then
     fi
     [ "$_lrc" -ne 0 ] && _undecided="history read on $DEFAULT_REF failed"
     if g cat-file -e "$SNAP_SHA^1:$p" 2>/dev/null \
-       && [ "$(g cat-file blob "$B" | hash_nocr)" = "$(g cat-file blob "$SNAP_SHA^1:$p" | hash_nocr)" ]; then
+       && [ "$(g cat-file blob "$B" | hash_nocr)" = "$(g cat-file blob "$SNAP_SHA^1:$p" | hash_nocr)" ]; then  # [unconditional-verdict-lint: allow -- cat-file -e on this line proves R^1:<path>, and B is proven non-empty where it is read]
       check "residue:$p" pass "EOL_ONLY: differs from R^1 only by carriage returns"; continue
     fi
     if bp="$(bundle_path_for "$p")"; then

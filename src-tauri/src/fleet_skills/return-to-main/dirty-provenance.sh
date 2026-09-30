@@ -328,7 +328,7 @@ classify_version() {
     fi
   fi
   if [ -n "$raw" ] && g cat-file -e "$BASE_SHA:$p" 2>/dev/null; then
-    if [ "$(hash_nocr < "$raw")" = "$(g cat-file blob "$BASE_SHA:$p" 2>/dev/null | hash_nocr)" ]; then
+    if [ "$(hash_nocr < "$raw")" = "$(g cat-file blob "$BASE_SHA:$p" 2>/dev/null | hash_nocr)" ]; then  # [unconditional-verdict-lint: allow -- both inputs are proven present on the line above (-n raw and cat-file -e), so neither hash is of a failed read]
       V_CLASS=EOL_ONLY; V_EVID="differs from ${BASE_SHA:0:12} only by carriage returns"; return
     fi
   fi
@@ -378,7 +378,7 @@ if [ -n "$STASH" ]; then
     if [ -n "$w" ]; then g cat-file blob "$REV_SHA:$p" > "$TMP/r$n.w" 2>/dev/null; specs+=("worktree=$(g rev-parse -q --verify "$REV_SHA:$p" 2>/dev/null)=$TMP/r$n.w"); fi
     if [ -n "$x" ]; then
       xb="$(g rev-parse -q --verify "$IDX_SHA:$p" 2>/dev/null)"
-      if [ -z "$w" ] || [ "$xb" != "$(g rev-parse -q --verify "$REV_SHA:$p" 2>/dev/null)" ]; then
+      if [ -z "$w" ] || [ "$xb" != "$(g rev-parse -q --verify "$REV_SHA:$p" 2>/dev/null)" ]; then  # [unconditional-verdict-lint: allow -- an empty rev-parse -q --verify is this code's ABSENT on both sides, and absent-equals-absent correctly adds no second spec]
         g cat-file blob "$IDX_SHA:$p" > "$TMP/r$n.i" 2>/dev/null; specs+=("index=$xb=$TMP/r$n.i")
       fi
     fi

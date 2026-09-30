@@ -197,6 +197,41 @@ pub struct StoredNonceBinding {
     /// conservative arm (`coord_mcp::PinOrigin::restored` says why).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant_origin: Option<StoredPinOrigin>,
+    /// The tenant of the repo in the binding's workdir, as resolved for it
+    /// (plan
+    /// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+    /// Phase 2) — what the coord-mcp proxy compares each coord answer with.
+    ///
+    /// Persisted so a restart keeps comparing against the SPAWN-time
+    /// expectation rather than re-resolving it. `#[serde(default)]` ⇒ `None`
+    /// for every entry written before the field (and for a binding persisted
+    /// before its resolution settled); the restore reads that as PENDING and
+    /// re-resolves it from the workdir on first use — never as a guess, and
+    /// never as a frozen unknown. A transient unknown is never written.
+    ///
+    /// Read LENIENTLY ([`lenient_expected_tenant`]): a value this build cannot
+    /// read (a variant from a newer build, after a rollback) becomes `None`,
+    /// never a failed store load — this record shares its file with the
+    /// device's access and refresh tokens.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
+}
+
+/// Deserialize [`StoredNonceBinding::expected_tenant`] without ever failing:
+/// take any JSON value, and keep it only if it reads as a `CwdTenant`. An
+/// unreadable one is `None`, which restores as pending (re-resolved).
+fn lenient_expected_tenant<'de, D>(
+    deserializer: D,
+) -> Result<Option<qontinui_runner_lib::repo_tenant::CwdTenant>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// On-disk spelling of `coord_mcp::PinOrigin`.
@@ -291,6 +326,8 @@ impl From<StoredNonceEntry> for StoredNonceBinding {
                 // Pre-Phase-4 entries predate the tenant too: restore-time pin.
                 session_tenant: None,
                 session_tenant_origin: None,
+                // …and the expectation: the restore reads it as unknown.
+                expected_tenant: None,
             },
             StoredNonceEntry::Modern(b) => b,
         }
@@ -2199,6 +2236,42 @@ mod tests {
         );
     }
 
+    /// An `expected_tenant` this build cannot read — a variant from a newer
+    /// build after a rollback, or a wrong shape — must never fail the store
+    /// load: the same file holds the device's access and refresh tokens.
+    #[test]
+    fn an_unreadable_expected_tenant_still_loads_the_store() {
+        let raw = serde_json::json!({
+            "access_token": "acc",
+            "refresh_token": "ref",
+            "coord_mcp_nonces": {
+                "future": {
+                    "workdir": "D:\\wd",
+                    "expected_tenant": { "state": "from_a_future_build", "x": 1 }
+                },
+                "wrong_shape": { "workdir": "D:\\wd2", "expected_tenant": 42 },
+                "good": {
+                    "workdir": "D:\\wd3",
+                    "expected_tenant": { "state": "no_repo" }
+                }
+            }
+        });
+        let tokens: StoredTokens = serde_json::from_value(raw).expect("the store must load");
+        assert_eq!(tokens.access_token.as_deref(), Some("acc"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("ref"));
+        let nonces: std::collections::HashMap<String, StoredNonceBinding> = tokens
+            .coord_mcp_nonces
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
+        assert_eq!(nonces["future"].expected_tenant, None);
+        assert_eq!(nonces["wrong_shape"].expected_tenant, None);
+        assert_eq!(
+            nonces["good"].expected_tenant,
+            Some(qontinui_runner_lib::repo_tenant::CwdTenant::NoRepo)
+        );
+    }
+
     /// The age round-trips as a bare integer (unix seconds), and `0` — the
     /// "unknown, therefore oldest" sentinel the restore leg re-emits — survives
     /// a rewrite as `0` rather than being dropped or laundered.
@@ -2210,6 +2283,7 @@ mod tests {
             minted_at_unix: Some(1_755_000_000),
             session_tenant: None,
             session_tenant_origin: None,
+            expected_tenant: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2228,6 +2302,7 @@ mod tests {
             minted_at_unix: Some(0),
             session_tenant: None,
             session_tenant_origin: None,
+            expected_tenant: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2262,6 +2337,7 @@ mod tests {
             minted_at_unix: None,
             session_tenant: None,
             session_tenant_origin: None,
+            expected_tenant: None,
         }))
         .unwrap();
         assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
@@ -2287,6 +2363,7 @@ mod tests {
                 minted_at_unix: Some(1_700_000_000),
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         )]);
         let graced = std::collections::HashMap::from([(
@@ -2324,6 +2401,7 @@ mod tests {
                 minted_at_unix: Some(1_700_000_123),
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         );
         map.insert(
@@ -2334,6 +2412,7 @@ mod tests {
                 minted_at_unix: None,
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         );
         storage.store_coord_mcp_nonces(&map).unwrap();

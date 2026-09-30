@@ -331,7 +331,28 @@ pub fn restore_pop_out_windows(
                 continue;
             }
         };
-        if let Some(g) = record.geometry.as_ref() {
+        // Apply the saved geometry only when it passes the same predicate
+        // capture enforces. A record that fails it (the minimized-window
+        // `(-32000, -32000, 0×0)` a pre-fix capture persisted) gets NOTHING
+        // applied: the builder's default size plus OS placement is the sane
+        // fallback, and is exactly the no-geometry path. The record is cleared
+        // too, so the next capture tick writes the real on-screen geometry
+        // instead of the sentinel surviving until the window moves — which
+        // makes the fix self-healing on boxes that already hit it.
+        let geometry = match record.geometry.as_ref() {
+            Some(g) if g.is_restorable() => Some(g),
+            Some(g) => {
+                tracing::warn!(
+                    window = %label,
+                    rejected_geometry = ?g,
+                    "restore_pop_out_windows: saved geometry is not restorable (minimized/zero-size) — using default placement and clearing it"
+                );
+                assignments.clear_geometry(&label);
+                None
+            }
+            None => None,
+        };
+        if let Some(g) = geometry {
             let _ = window.set_position(tauri::PhysicalPosition::new(g.x, g.y));
             if g.maximized {
                 let _ = window.maximize();
@@ -341,7 +362,7 @@ pub fn restore_pop_out_windows(
         }
         let _ = window.show();
         restored += 1;
-        tracing::info!(window = %label, has_geometry = record.geometry.is_some(), "Restored pop-out terminal window");
+        tracing::info!(window = %label, has_geometry = geometry.is_some(), "Restored pop-out terminal window");
     }
     if restored > 0 {
         tracing::info!(restored, "Restored pop-out terminal windows on boot");
@@ -533,29 +554,61 @@ pub fn auto_close_owner_window_if_empty(
     );
 }
 
+/// The geometry worth persisting for one window snapshot, or `None` to leave
+/// the previously persisted record untouched.
+///
+/// A minimized window's restorable geometry is whatever was captured before it
+/// was minimized; on Windows the live read is the iconic sentinel
+/// `(-32000, -32000)` at `0×0`, and persisting that verbatim is what parked
+/// restored pop-outs off-screen at zero size. So a minimized window is never
+/// snapshotted, and neither is anything else [`WindowGeometry::is_restorable`]
+/// rejects (a platform that reports a degenerate size without reporting
+/// minimized). Pure, so the decision is testable without a live `AppHandle`.
+fn snapshot_geometry(
+    minimized: bool,
+    maximized: bool,
+    pos: (i32, i32),
+    size: (u32, u32),
+) -> Option<WindowGeometry> {
+    if minimized {
+        return None;
+    }
+    let geom = WindowGeometry {
+        x: pos.0,
+        y: pos.1,
+        w: size.0,
+        h: size.1,
+        maximized,
+    };
+    geom.is_restorable().then_some(geom)
+}
+
 /// Snapshot every open pop-out window's current geometry into the registry
 /// (persist-on-change). Called periodically and at shutdown so a restart —
 /// including the operator's rebuild-and-kill path, which never runs the clean
 /// quit handler — restores windows at their last position/size. Best-effort:
-/// windows we can't read are skipped; `update_geometry` no-ops when unchanged.
+/// windows we can't read are skipped; `update_geometry` no-ops when unchanged;
+/// a minimized or otherwise unrestorable window keeps its prior record (see
+/// [`snapshot_geometry`]).
 pub fn capture_open_geometry(app: &tauri::AppHandle, assignments: &Arc<WindowAssignments>) {
     for record in assignments.pop_out_records() {
         let label = &record.label;
         let Some(window) = app.get_webview_window(label) else {
             continue;
         };
+        let minimized = window.is_minimized().unwrap_or(false);
         let maximized = window.is_maximized().unwrap_or(false);
         // Outer position (top-left incl. decorations) + inner (content) size —
         // mirrors what the placement path writes, so restore round-trips.
         if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
-            let geom = WindowGeometry {
-                x: pos.x,
-                y: pos.y,
-                w: size.width,
-                h: size.height,
+            if let Some(geom) = snapshot_geometry(
+                minimized,
                 maximized,
-            };
-            assignments.update_geometry(label, geom);
+                (pos.x, pos.y),
+                (size.width, size.height),
+            ) {
+                assignments.update_geometry(label, geom);
+            }
         }
     }
 }
@@ -1114,6 +1167,42 @@ mod tests {
         assert!(
             !should_close_owner_window(&wa, &w.label),
             "sess-B still renders here, so one tab's exit must not close it"
+        );
+    }
+
+    #[test]
+    fn snapshot_geometry_never_captures_a_minimized_window() {
+        // Whatever the OS reports for a minimized window — the Windows iconic
+        // sentinel, or a plausible-looking rect — the prior record must stand.
+        assert_eq!(
+            snapshot_geometry(true, false, (-32000, -32000), (0, 0)),
+            None
+        );
+        assert_eq!(snapshot_geometry(true, false, (100, 200), (800, 600)), None);
+        assert_eq!(snapshot_geometry(true, true, (0, 0), (1920, 1040)), None);
+    }
+
+    #[test]
+    fn snapshot_geometry_captures_a_normal_window() {
+        assert_eq!(
+            snapshot_geometry(false, false, (-1920, 40), (1000, 720)),
+            Some(WindowGeometry {
+                x: -1920,
+                y: 40,
+                w: 1000,
+                h: 720,
+                maximized: false,
+            })
+        );
+        assert!(snapshot_geometry(false, true, (0, 0), (1920, 1040)).is_some());
+    }
+
+    #[test]
+    fn snapshot_geometry_refuses_a_zero_size_window_not_reported_minimized() {
+        assert_eq!(snapshot_geometry(false, false, (100, 200), (0, 0)), None);
+        assert_eq!(
+            snapshot_geometry(false, false, (-32000, -32000), (0, 0)),
+            None
         );
     }
 }
