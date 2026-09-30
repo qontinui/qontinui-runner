@@ -117,8 +117,12 @@ fixture() {
     # pre-commit install, and a hook failing on a two-line fixture would read
     # as an attribution bug.
     git -C "$UPSTREAM" config core.hooksPath "$UPSTREAM/.git/no-hooks"
-    mkdir -p "$UPSTREAM/src-tauri/src" "$UPSTREAM/src-tauri/scripts" "$UPSTREAM/src"
+    mkdir -p "$UPSTREAM/src-tauri/src/bin" "$UPSTREAM/src-tauri/scripts" "$UPSTREAM/src"
     printf '// base\n' > "$UPSTREAM/src-tauri/src/lib.rs"
+    # The exporter, mentioning JsonSchema, beside the generator script: the
+    # shape the premise guard's decision-time vacuity check expects. Without
+    # it every fixture would read as an unverifiable premise.
+    printf '// exports every schemars::JsonSchema type\n' > "$UPSTREAM/src-tauri/src/bin/export_schemas.rs"
     printf '# gen\n'   > "$UPSTREAM/src-tauri/scripts/generate_types.sh"
     printf '// ui\n'   > "$UPSTREAM/src/app.ts"
     printf '[package]\n' > "$UPSTREAM/Cargo.toml"
@@ -570,6 +574,8 @@ premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) 
     "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
 premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \
     'fn main() {}' src-tauri/src/bin/export_schemas.rs
+premise_case "a generator script with no exporter beside it is UNVERIFIABLE" "probe-failed(2)" \
+    '# gen' src-tauri/scripts/generate_types.sh
 premise_case "guard fires: a build script reading markdown" violation \
     'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
 premise_case "guard fires: a build script filtering on the md extension" violation \
@@ -637,8 +643,8 @@ shim_case() {
     check "  and the reason names the call" "yes" \
         "$(grep -qF -- "$want_reason" "$WORK/.state" && echo yes || echo no)"
 }
-shim_case "git diff base..HEAD" '*" diff --name-only -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so this push's commits"
-shim_case "git diff HEAD"       '*" diff --name-only -z HEAD -- "*'          "git diff HEAD failed"
+shim_case "git diff base..HEAD" '*" diff --name-only --no-renames -z "[0-9a-f]*" HEAD -- "*' "HEAD failed, so this push's commits"
+shim_case "git diff HEAD"       '*" diff --name-only --no-renames -z HEAD -- "*'          "git diff HEAD failed"
 shim_case "git ls-files"        '*" ls-files "*'                              "ls-files --others failed"
 
 # The premise probe failing is treated as a violation: exclusion dropped.
@@ -664,10 +670,12 @@ render_with() {
 }
 has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
 
+LOCAL_NOTE="Inputs marked 'not part of this push' are local working-tree state"
+
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 check "all committed: the lead line says this push" yes "$(has 'This push changes sources')"
 check "  the file is labelled committed" yes "$(has 'src-tauri/src/lib.rs  (committed in this push)')"
-check "  no set-aside advice" no "$(has 'git stash push')"
+check "  no working-tree note" no "$(has "$LOCAL_NOTE")"
 check "  the pre-existing caveat is kept" yes "$(has 'Part of the diff may still be pre-existing')"
 
 render_with "$(detail_line Cargo.lock uncommitted)"
@@ -675,45 +683,35 @@ check "uncommitted only: the lead line blames the working tree, not the push" \
     "yes|no" "$(has 'Your working tree (not this push' )|$(has 'This push changes')"
 check "  the file is labelled as not in the push" \
     yes "$(has 'Cargo.lock  (uncommitted changes — not part of this push)')"
-check "  the advice stashes exactly that path, untracked included" \
-    yes "$(has 'git stash push --include-untracked -m "gen-events-drift-')"
-check "  and names it as a top-level literal pathspec" yes "$(has "-- ':(top,literal)'Cargo.lock")"
-check "  restores by sha, never pop, never checkout" \
-    "yes|no" "$(has 'git stash apply --index <that sha>')|$(has 'git checkout --')"
-check "  and drops the entry by re-finding it by tag" yes "$(has "git stash drop 'stash@{n}'")"
+check "  the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
+check "  and the message prints no commands" no \
+    "$(printf '%s\n' "$RENDERED" | grep -qE 'git (stash|checkout|worktree|reset)' && echo yes || echo no)"
 
 render_with "$(detail_line src-tauri/src/new.rs untracked)"
 check "untracked: labelled as not in the push" \
     yes "$(has 'src-tauri/src/new.rs  (untracked — not part of this push)')"
-check "  and included in the stash command" yes \
-    "$(has "-- ':(top,literal)'src-tauri/src/new.rs")"
+check "  and gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"$'\n'"$(detail_line src-tauri/src/lib.rs uncommitted)"
 check "committed AND dirty: the push is still named in the lead line" yes "$(has 'This push changes sources')"
 check "  both labels are printed" "yes|yes" \
     "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
-check "  and the dirty half gets set-aside advice" yes \
-    "$(has "-- ':(top,literal)'src-tauri/src/lib.rs")"
+check "  and the dirty half gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
 RENDERED="$(gen_events_render_mine)"
 check "a dropped exclusion is stated in one line" yes "$(has 'Markdown was counted as a codegen input this time')"
-render_with "$(detail_line Cargo.lock uncommitted)"
-check "the stash-free route comes first, with the WIP-commit trap named" "yes|yes|yes" \
-    "$(has 'stash-free: run this hook from a clean checkout of HEAD')|$(has 'A WIP commit does NOT work')|$(printf '%s\n' "$RENDERED" | grep -n -e 'stash-free' -e 'git stash push' | head -1 | grep -q 'stash-free' && echo yes || echo no)"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.
 check "gen-events-drift.sh renders its MINE arm through gen_events_render_mine" yes \
     "$(grep -qE '^[[:space:]]*gen_events_render_mine[[:space:]]*\|' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
 
-echo "  -- odd file names: real paths, and a set-aside command that runs --"
+echo "  -- odd file names are shown as themselves --"
 
-# git C-quotes non-ASCII, `"` and `\` without `-z`; the labels and the stash
-# command then name files that do not exist. Here the printed command is
-# EXECUTED, from a subdirectory, inside the throwaway fixture — its stash is
-# the fixture's own, never the real repo's.
+# git C-quotes non-ASCII, `"` and `\` without `-z`, and the label would then
+# name a file that does not exist.
 fixture
 ODD_E='src-tauri/src/é b.rs'
 ODD_Q='src-tauri/src/q"t.rs'
@@ -731,8 +729,8 @@ check "  q\"t.rs is labelled by its real name" yes \
     "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"untracked" && echo yes || echo no)"
 if [ -n "$ODD_T" ]; then
     ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
-    check "  a tab-named file is kept, shell-escaped, with the escaped flag" yes \
-        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked"$'\t'"escaped" && echo yes || echo no)"
+    check "  a tab-named file is kept, in its %q form" yes \
+        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" && echo yes || echo no)"
     check "  and counted in the flat list" yes \
         "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
 else
@@ -741,29 +739,32 @@ fi
 RENDERED="$(gen_events_render_mine)"
 check "  the message shows é b.rs raw" yes \
     "$(printf '%s\n' "$RENDERED" | grep -qF "    $ODD_E  (untracked" && echo yes || echo no)"
-STASH_CMD="$(printf '%s\n' "$RENDERED" | sed -n 's/^    \(git stash push .*\)$/\1/p')"
-STASH_TAG="$(printf '%s\n' "$STASH_CMD" | sed -n 's/.*-m "\([^"]*\)".*/\1/p')"
-( cd "$WORK/src-tauri" && eval "$STASH_CMD" ) >/dev/null 2>&1
-check "  the printed stash command, run from a subdirectory, sets them all aside" "no|no|no" \
-    "$([ -e "$WORK/$ODD_E" ] && echo yes || echo no)|$([ -e "$WORK/$ODD_Q" ] && echo yes || echo no)|$([ -n "$ODD_T" ] && [ -e "$WORK/$ODD_T" ] && echo yes || echo no)"
-STASH_SHA="$(git -C "$WORK" stash list --format='%H %gs' | grep -F "$STASH_TAG" | cut -d' ' -f1)"
-git -C "$WORK" stash apply --index "$STASH_SHA" >/dev/null 2>&1
-STASH_REF="$(git -C "$WORK" stash list --format='%gd %gs' | grep -F "$STASH_TAG" | cut -d' ' -f1)"
-git -C "$WORK" stash drop "$STASH_REF" >/dev/null 2>&1
-check "  and apply-by-sha then drop-by-tag restores them and empties the stack" "yes|yes|0" \
-    "$([ -e "$WORK/$ODD_E" ] && echo yes || echo no)|$([ -e "$WORK/$ODD_Q" ] && echo yes || echo no)|$(git -C "$WORK" stash list | wc -l | tr -d ' ')"
 
-# `literal` magic: without it `a[1].rs` is a glob and the stash also takes a
-# modified, tracked `a1.rs` that the message never named.
+echo "  -- renames and deletions: both halves are inputs --"
+
+# The old path's disappearance moves the bindings as surely as the new path's
+# arrival; with rename detection on, git would name only the new one.
 fixture
-seed_base "src-tauri/src/a1.rs" "// tracked"
-printf '// my edit\n' >> "$WORK/src-tauri/src/a1.rs"
-printf '// bracketed\n' > "$WORK/src-tauri/src/a[1].rs"
-render_with "$(detail_line 'src-tauri/src/a[1].rs' untracked)"
-STASH_CMD="$(printf '%s\n' "$RENDERED" | sed -n 's/^    \(git stash push .*\)$/\1/p')"
-( cd "$WORK" && eval "$STASH_CMD" ) >/dev/null 2>&1
-check "a stash of a[1].rs takes a[1].rs and leaves a modified a1.rs alone" "no|yes" \
-    "$([ -e "$WORK/src-tauri/src/a[1].rs" ] && echo yes || echo no)|$(grep -q 'my edit' "$WORK/src-tauri/src/a1.rs" && echo yes || echo no)"
+seed_base "src-tauri/src/a.rs" "// a module"
+git -C "$WORK" mv src-tauri/src/a.rs src-tauri/src/b.rs
+git -C "$WORK" commit --quiet -m "rename a -> b"
+decide
+check "a committed rename lists both halves" \
+    "src-tauri/src/a.rs"$'\n'"src-tauri/src/b.rs" "$ATTRIBUTION_TOUCHED"
+
+fixture
+seed_base "src-tauri/src/a.rs" "// a module"
+git -C "$WORK" mv src-tauri/src/a.rs src-tauri/src/b.rs
+decide
+check "a staged rename lists both halves as uncommitted" \
+    "$(detail_line src-tauri/src/a.rs uncommitted)"$'\n'"$(detail_line src-tauri/src/b.rs uncommitted)" \
+    "$ATTRIBUTION_TOUCHED_DETAIL"
+
+fixture
+git -C "$WORK" rm --quiet src-tauri/src/lib.rs
+decide
+check "a staged git rm is listed as uncommitted" \
+    "$(detail_line src-tauri/src/lib.rs uncommitted)" "$ATTRIBUTION_TOUCHED_DETAIL"
 
 echo
 if [ "$SKIP" -gt 0 ]; then
