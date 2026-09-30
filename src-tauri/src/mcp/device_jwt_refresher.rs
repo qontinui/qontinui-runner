@@ -9608,15 +9608,13 @@ mod tenant_slot_refresh_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_legacy_mint_in_this_file_retires_the_stale_rejection_streaks() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/mcp/device_jwt_refresher.rs");
-        let text = std::fs::read_to_string(&path).expect("read this file");
         // Production code only: every test module removed.
-        let production: String = crate::source_pin::ProdSource::of(&text)
-            .lines()
-            .map(|line| line.find("//").map_or(line, |i| &line[..i]))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let production: String =
+            crate::source_pin::ProdSource::read_own("mcp/device_jwt_refresher.rs")
+                .lines()
+                .map(|line| line.find("//").map_or(line, |i| &line[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
         let writes = production.matches(".store_tokens_expecting(").count();
         let retirements = production
             .matches("retire_rejection_streaks_after_legacy_mint(")

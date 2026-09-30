@@ -5930,9 +5930,7 @@ mod session_tenant_resolution_tests {
         // Wiring: the async door the four `mcp_api` sites call routes its join
         // result through the mapping. Comment lines are dropped first, so a
         // needle left in a comment cannot satisfy it.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let raw = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
-        let text = crate::source_pin::ProdSource::of(&raw);
+        let text = crate::source_pin::ProdSource::read_own("coord_mcp.rs");
         let code: String = text
             .item_of("async fn session_bearer_and_tenant_or_refuse(", 150..20_000)
             .lines()
@@ -22477,11 +22475,9 @@ mod runner_credential_tests {
     /// becomes two.
     #[test]
     fn the_two_credential_breadcrumb_sites_share_one_literal() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let raw = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
         // The production half: a copy of the literal in a test must neither
         // count toward nor hide a production call site.
-        let text = crate::source_pin::ProdSource::of(&raw);
+        let text = crate::source_pin::ProdSource::read_own("coord_mcp.rs");
         let occurrences = text.matches(RUNNER_CREDENTIAL_BREADCRUMB_REASON).count();
         assert_eq!(
             occurrences, 3,

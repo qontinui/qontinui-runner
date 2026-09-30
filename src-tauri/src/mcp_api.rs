@@ -16287,11 +16287,9 @@ mod coord_claims_proxy_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
-        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
-        // from anywhere.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let raw = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let text = crate::source_pin::ProdSource::of(&raw);
+        // From CARGO_MANIFEST_DIR (inside `read_own`), never the CWD: a test
+        // binary can be run from anywhere.
+        let text = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -16430,9 +16428,7 @@ mod coord_claims_proxy_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let raw = std::fs::read_to_string(&src).expect("read mcp_api.rs");
-        let text = crate::source_pin::ProdSource::of(&raw);
+        let text = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -19899,11 +19895,7 @@ mod supervised_workers_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
-        let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
-        let src = crate::source_pin::ProdSource::of(&raw);
+        let src = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()

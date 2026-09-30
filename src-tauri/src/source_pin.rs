@@ -117,6 +117,31 @@ impl<'a> ProdSource<'a> {
         }
     }
 
+    /// The production half of `CARGO_MANIFEST_DIR/src/<rel>`, read at RUN
+    /// time — the read and the cut in one call, so a pin cannot read the file
+    /// raw and then search the raw text beside a `ProdSource` it never uses.
+    /// This is the only spelling of a manifest-rooted self-read the meta-pin
+    /// accepts. `rel` uses `/` separators (`"mcp/device_jwt_refresher.rs"`).
+    #[track_caller]
+    pub(crate) fn read_own(rel: &str) -> ProdSource<'static> {
+        let text = read_src(rel);
+        ProdSource::of(&text).into_owned()
+    }
+
+    /// [`ProdSource::read_own`] of the WHOLE file — the greppable opt-out, with
+    /// a reason, exactly as [`ProdSource::whole`].
+    #[track_caller]
+    pub(crate) fn read_own_whole(rel: &str, reason: &'static str) -> ProdSource<'static> {
+        let text = read_src(rel);
+        ProdSource::whole(&text, reason).into_owned()
+    }
+
+    fn into_owned(self) -> ProdSource<'static> {
+        ProdSource {
+            text: Cow::Owned(self.text.into_owned()),
+        }
+    }
+
     /// The text as a plain `&str`.
     pub(crate) fn as_str(&self) -> &str {
         &self.text
@@ -232,6 +257,15 @@ pub(crate) fn squeeze(text: &str) -> String {
         .flat_map(str::chars)
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+#[track_caller]
+fn read_src(rel: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("ProdSource::read_own: cannot read {}: {e}", path.display()))
 }
 
 fn normalize(src: &str) -> Cow<'_, str> {
@@ -832,42 +866,53 @@ mod tests {
     /// `(wrapped, offenders)` where offenders are byte offsets of self-reads
     /// that do not go through `ProdSource`.
     ///
-    /// Two shapes:
+    /// Three shapes, each judged STRUCTURALLY — no proximity window:
     /// - `include_str!(<path>)` whose path RESOLVES to this file — a bare or
     ///   relative literal (`"x.rs"`, `"./x.rs"`, `"../dir/x.rs"`), or
     ///   `concat!(env!("CARGO_MANIFEST_DIR"), "/src/<own path>")`. Wrapped means
     ///   the text right before `include_str!` ends in `ProdSource::of(` or
     ///   `ProdSource::whole(`.
-    /// - a RUNTIME read: a `"src/<own path>"` / `"/src/<own path>"` literal
-    ///   with `CARGO_MANIFEST_DIR` in the 200 bytes before it. Wrapped means a
-    ///   `ProdSource::of(` / `ProdSource::whole(` call in the 800 bytes after
-    ///   it. That window is a heuristic — it binds the read to the wrapping
-    ///   by proximity, not by data flow — and is stated here rather than hidden.
+    /// - `ProdSource::read_own("<own path>")` / `read_own_whole(…)`: wrapped.
+    /// - any other `env!("CARGO_MANIFEST_DIR")` in code whose statement resolves
+    ///   to this file — through `.join("…")` literals in order
+    ///   (`.join("src/x.rs")`, `.join("src").join("x.rs")`) or a
+    ///   `concat!(env!(…), "/src/x.rs")` — is an offender, whatever wraps it
+    ///   later: the read and the cut belong in one call, `read_own`.
+    ///   Limitation: a path built with `format!` is not resolved.
     fn scan_self_reads(
         path: &std::path::Path,
         text: &str,
         manifest: &std::path::Path,
     ) -> (usize, Vec<usize>) {
         const INCLUDE: &str = concat!("include_str", "!(");
+        const ENV: &str = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
+        const READ_OWN: [&str; 2] = [
+            concat!("ProdSource::", "read_own(\""),
+            concat!("ProdSource::", "read_own_whole(\""),
+        ];
         const WRAPPERS: [&str; 2] = [
             concat!("ProdSource::", "of("),
             concat!("ProdSource::", "whole("),
         ];
         let me = lexical(path);
         let dir = path.parent().unwrap_or(path);
+        let mask = code_mask(text);
+        let is_code = |i: usize| mask.get(i).copied().unwrap_or(false);
         let mut wrapped = 0usize;
         let mut offenders = Vec::new();
+        let mut include_spans: Vec<Range<usize>> = Vec::new();
 
         for (at, _) in text.match_indices(INCLUDE) {
-            let args = text.get(at + INCLUDE.len()..).unwrap_or_default();
-            let args = args.trim_start();
+            if !is_code(at) {
+                continue;
+            }
+            let open = at + INCLUDE.len() - 1;
+            let close = matching(text, &mask, open, b'(', b')').unwrap_or(text.len());
+            include_spans.push(at..close);
+            let args = text.get(open + 1..close).unwrap_or_default().trim_start();
             let target = if args.starts_with('"') {
-                literals(args.split(')').next().unwrap_or_default())
-                    .first()
-                    .map(|lit| dir.join(lit))
+                literals(args).first().map(|lit| dir.join(lit))
             } else if let Some(inner) = args.strip_prefix("concat!(") {
-                let inner = inner.split(");").next().unwrap_or_default();
-                let inner = inner.split("))").next().unwrap_or_default();
                 if inner.contains("CARGO_MANIFEST_DIR") {
                     let joined: String = literals(inner)
                         .into_iter()
@@ -895,20 +940,47 @@ mod tests {
             return (wrapped, offenders);
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        for needle in [format!("\"src/{rel}\""), format!("\"/src/{rel}\"")] {
-            for (at, _) in text.match_indices(&needle) {
-                let lookback = text.get(at.saturating_sub(200)..at).unwrap_or_default();
-                if !lookback.contains("CARGO_MANIFEST_DIR") || lookback.contains(INCLUDE) {
-                    // Not a manifest-rooted read, or an include_str! already
-                    // judged above.
-                    continue;
-                }
-                let ahead = text.get(at..(at + 800).min(text.len())).unwrap_or_default();
-                if WRAPPERS.iter().any(|w| ahead.contains(w)) {
+        for needle in READ_OWN {
+            for (at, _) in text.match_indices(needle) {
+                let arg = text.get(at + needle.len()..).unwrap_or_default();
+                if is_code(at) && arg.split('"').next() == Some(rel.as_str()) {
                     wrapped += 1;
-                } else {
-                    offenders.push(at);
                 }
+            }
+        }
+
+        for (at, _) in text.match_indices(ENV) {
+            if !is_code(at) || include_spans.iter().any(|r| r.contains(&at)) {
+                continue;
+            }
+            let before = text.get(..at).unwrap_or_default().trim_end();
+            let target = if before.ends_with("concat!(") {
+                let open = before.len() - 1;
+                let close = matching(text, &mask, open, b'(', b')').unwrap_or(text.len());
+                let joined: String = literals(text.get(at + ENV.len()..close).unwrap_or_default())
+                    .into_iter()
+                    .collect();
+                manifest.join(joined.trim_start_matches('/'))
+            } else {
+                // The statement: up to the first `;` in code.
+                let end = (at..text.len())
+                    .find(|&i| is_code(i) && text.as_bytes()[i] == b';')
+                    .unwrap_or(text.len());
+                let stmt = text.get(at..end).unwrap_or_default();
+                let mut target = manifest.to_path_buf();
+                for piece in stmt.split(".join(").skip(1) {
+                    let piece = piece.trim_start();
+                    match piece.strip_prefix('"').and_then(|p| p.split_once('"')) {
+                        Some((lit, rest)) if rest.trim_start().starts_with(')') => {
+                            target.push(lit);
+                        }
+                        _ => break,
+                    }
+                }
+                target
+            };
+            if lexical(&target) == me {
+                offenders.push(at);
             }
         }
         (wrapped, offenders)
@@ -921,6 +993,7 @@ mod tests {
         let offenders = |text: &str| scan_self_reads(path, text, manifest).1.len();
         let wrapped = |text: &str| scan_self_reads(path, text, manifest).0;
         let inc = concat!("include_str", "!(");
+        let env = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
 
         // Raw self-includes, every spelling: flagged.
         assert_eq!(offenders(&format!("let s = {inc}\"x.rs\");")), 1);
@@ -928,31 +1001,67 @@ mod tests {
         assert_eq!(offenders(&format!("let s = {inc}\"../a/x.rs\");")), 1);
         assert_eq!(
             offenders(&format!(
-                "const S: &str = {inc}concat!(\n    env!(\"CARGO_MANIFEST_DIR\"),\n    \"/src/a/x.rs\"\n));"
+                "const S: &str = {inc}concat!(\n    {env},\n    \"/src/a/x.rs\"\n));"
             )),
             1
         );
         // A different file is not a self-read.
         assert_eq!(offenders(&format!("let s = {inc}\"y.rs\");")), 0);
         assert_eq!(offenders(&format!("let s = {inc}\"../b/x.rs\");")), 0);
-        // Wrapped: counted, not flagged.
-        let w =
-            format!("ProdSource::of({inc}\"x.rs\")); ProdSource::whole({inc}\"./x.rs\"), \"r\");");
-        assert_eq!((wrapped(&w), offenders(&w)), (2, 0));
+        // Wrapped: counted, not flagged — including the concat! form.
+        let w = format!(
+            "ProdSource::of({inc}\"x.rs\")); ProdSource::whole({inc}\"./x.rs\"), \"r\"); \
+             ProdSource::of({inc}concat!({env}, \"/src/a/x.rs\")));"
+        );
+        assert_eq!((wrapped(&w), offenders(&w)), (3, 0));
+    }
 
-        // Runtime reads rooted at the manifest dir.
-        let raw = "let p = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"src/a/x.rs\");\nlet t = read_to_string(&p).unwrap();\nt.find(\"x\");";
-        assert_eq!(offenders(raw), 1);
-        let ok = "let p = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"src/a/x.rs\");\nlet t = read_to_string(&p).unwrap();\nlet prod = ProdSource::of(&t);";
-        assert_eq!((wrapped(ok), offenders(ok)), (1, 0));
+    /// Runtime self-reads are judged by call shape, not by what sits nearby.
+    #[test]
+    fn a_runtime_self_read_passes_only_as_read_own() {
+        let manifest = std::path::Path::new("/m");
+        let env = concat!("env!(\"CARGO_", "MANIFEST_DIR\")");
+        let judge =
+            |path: &str, text: &str| scan_self_reads(std::path::Path::new(path), text, manifest);
+
+        // Read raw, wrap it, then search the RAW text anyway: the wrapper
+        // beside it does not launder the read.
+        let laundered = format!(
+            "let raw = std::fs::read_to_string(Path::new({env}).join(\"src/a/x.rs\")).unwrap();\n\
+             let prod = ProdSource::of(&raw);\n\
+             assert!(raw.contains(\"needle\"));"
+        );
+        assert_eq!(judge("/m/src/a/x.rs", &laundered).1.len(), 1);
+
+        // The one accepted spelling.
+        let ok =
+            "let prod = ProdSource::read_own(\"a/x.rs\");\nassert!(prod.contains(\"needle\"));";
+        assert_eq!(judge("/m/src/a/x.rs", ok), (1, vec![]));
+        let whole = "let all = ProdSource::read_own_whole(\"a/x.rs\", \"why\");";
+        assert_eq!(judge("/m/src/a/x.rs", whole), (1, vec![]));
+
+        // The path split across joins still resolves to this file.
+        let split = format!(
+            "let p = Path::new({env}).join(\"src\").join(\"x.rs\");\nlet t = read_to_string(&p);"
+        );
+        assert_eq!(judge("/m/src/x.rs", &split).1.len(), 1);
+        // …and a manifest-rooted read of ANOTHER file, or of a directory, is not
+        // a self-read.
+        assert_eq!(judge("/m/src/y.rs", &split).1.len(), 0);
+        let walk = format!("let root = Path::new({env}).join(\"src\");");
+        assert_eq!(judge("/m/src/x.rs", &walk).1.len(), 0);
+        // A concat!-built runtime path resolves too.
+        let concat = format!("let t = read_to_string(concat!({env}, \"/src/x.rs\"));");
+        assert_eq!(judge("/m/src/x.rs", &concat).1.len(), 1);
     }
 
     /// **Every self-including pin goes through `ProdSource`.**
     ///
     /// Walks `src/` and fails on any read of a file BY ITSELF — `include_str!`
-    /// of a path that resolves to the file, or a `CARGO_MANIFEST_DIR`-rooted
-    /// runtime read of it (see [`scan_self_reads`]) — that does not go through
-    /// `ProdSource::of(` or `ProdSource::whole(`. This file includes no source,
+    /// of a path that resolves to the file not wrapped as `ProdSource::of(` /
+    /// `ProdSource::whole(`, or a `CARGO_MANIFEST_DIR`-rooted runtime read of it
+    /// that is not `ProdSource::read_own(` / `read_own_whole(` (see
+    /// [`scan_self_reads`]). This file includes no source,
     /// so it cannot match itself, and its needles are assembled with `concat!`
     /// so it holds no contiguous forbidden literal.
     #[test]
@@ -983,15 +1092,17 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "a source pin reads its OWN file without `ProdSource`: {offenders:?}. \
-             Wrap it as `crate::source_pin::ProdSource::of(…)` so it scans the \
-             production half only, or `ProdSource::whole(…, \"<why>\")` if it must \
-             read its test half — a pin over its own raw text can match its own \
-             needles (occurrence 17)."
+             Wrap an include as `crate::source_pin::ProdSource::of(…)` and read at \
+             run time with `ProdSource::read_own(\"<path under src/>\")` so the pin \
+             scans the production half only — or `whole(…, \"<why>\")` / \
+             `read_own_whole(…, \"<why>\")` if it must read its test half. A pin \
+             over its own raw text can match its own needles (occurrence 17)."
         );
         // Floors, so a moved `src/` root or a broken needle cannot pass over
         // nothing. Baseline 2026-09-30 at qontinui-runner 514447a5f + review
         // fixes: 1,576 `.rs` files under src/; 71 own-basename includes, 1
-        // concat!(env!(..)) include and 7 runtime self-reads, all wrapped.
+        // concat!(env!(..)) include and 6 runtime self-reads (all `read_own`),
+        // 78 wrapped in all.
         assert!(
             files_scanned >= 1_400,
             "the meta-pin scanned only {files_scanned} .rs files — it is walking the \
