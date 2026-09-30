@@ -147,7 +147,8 @@ pub enum SkipReason {
     LandedIdleNotRemovable,
     /// coord's gate cleared this path for REMOVAL, but the per-device removal
     /// cap (`max_removals_per_tick`, `0` in shadow) withheld it this tick
-    /// (`DeferReason::RemovalCapped`). It is next in line, not refused.
+    /// (`DeferReason::RemovalCapped`). Next in line, not refused — unless the
+    /// cap is `0` (shadow), where a removal is never served.
     RemovalCapped,
     /// coord's selected trigger for this path is rejunction-only
     /// (`ttl_expired`, `agent_done`, `work_unit_shipped`,
@@ -234,7 +235,7 @@ impl SkipReason {
             }
             SkipReason::RemovalCapped => {
                 "coord cleared this worktree for removal, but its per-tick removal cap \
-                 held it back — it is queued, not refused."
+                 held it back — queued, not refused (never served while the cap is 0)."
             }
             SkipReason::TriggerNotRemovable => {
                 "coord's reason to look at this worktree only permits a non-destructive \

@@ -43,7 +43,7 @@ export type SkipReason =
   | "undeclared-not-removable"
   /** Landed, clean and idle — coord offers only a rejunction, never a removal. */
   | "landed-idle-not-removable"
-  /** Cleared for removal, held back by the per-tick removal cap. */
+  /** Cleared for removal, held back by the per-tick removal cap (never served while the cap is 0). */
   | "removal-capped"
   /** The trigger only permits a rejunction, never a removal. */
   | "trigger-not-removable"
