@@ -921,6 +921,14 @@ impl AgentTruth {
         self.levels[source.index()].map(|l| l.last_seen_ms)
     }
 
+    /// The state `source` last reported and when it last re-asserted it (unix
+    /// millis), if it ever reported. Raw per-source history, NOT the verdict:
+    /// for a consumer that must keep reading one source on its own (wind-down
+    /// reads the sideband this way until plan Phase 9 moves it to the verdict).
+    pub fn last_reported(&self, source: Source) -> Option<(AgentState, u64)> {
+        self.levels[source.index()].map(|l| (l.state, l.last_seen_ms))
+    }
+
     /// Offer one observation.
     pub fn observe(&mut self, obs: &Observation, now_ms: u64) -> ObserveOutcome {
         if obs.is_subagent {

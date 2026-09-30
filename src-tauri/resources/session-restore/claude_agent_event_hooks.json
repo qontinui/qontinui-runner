@@ -1,0 +1,95 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+            "timeout": 1,
+            "headers": { "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID" },
+            "allowedEnvVars": ["QONTINUI_TERMINAL_ID"]
+          }
+        ]
+      }
+    ]
+  }
+}

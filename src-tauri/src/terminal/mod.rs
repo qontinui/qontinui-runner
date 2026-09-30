@@ -9,6 +9,7 @@
 //! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
 
 pub mod account_migration;
+pub mod agent_state;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
