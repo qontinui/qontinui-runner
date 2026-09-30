@@ -229,6 +229,14 @@ pub mod looping_agent;
 // `mcp::restart_readiness`).
 pub mod wind_down;
 
+// Agent truth (plan `2026-09-20-terminal-session-state-comes-from-events-not-
+// screen-scraping`, Phase 2): the ONE pure, clock-injected reducer that merges
+// hook / sideband / statusline / transcript / screen / regex observations into
+// a per-terminal verdict. In the lib crate beside `wind_down` for the same
+// reason: the whole precedence decision is `--lib`-tested, while the impure
+// ingest glue lives in the bin and adapts into this module's projections.
+pub mod agent_truth;
+
 // "Did the server evaluate this request and refuse it, or did the transport
 // blip?" — the ONE structural-vs-transient HTTP classifier, plus the denial
 // tags a server names on the refusal. In the lib for the same reason as
