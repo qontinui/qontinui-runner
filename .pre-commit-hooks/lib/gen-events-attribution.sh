@@ -396,6 +396,15 @@ gen_events_uncovered_path_deps() {
     return 0
 }
 
+# The absolute, symlink-resolved form of the file path $1 (its directory must
+# exist); non-zero when it cannot be resolved.
+_gen_events_canon_file() {
+    local d
+    [ -n "$1" ] || return 1
+    d="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$d" "$(basename "$1")"
+}
+
 # Record whether git's pre-push protocol is on stdin, for `gen_events_stage`.
 # The fleet's direct pre-push shim runs each hook as `bash <hook> < <copy of
 # git's stdin>` and exports no PRE_COMMIT_* at all, so without this a real
@@ -632,7 +641,9 @@ _gen_events_read_z() {
 #   ATTRIBUTION_TOUCHED_DETAIL  the same paths as `<path><TAB><source>` lines,
 #                       source one of `committed` (in merge-base..HEAD),
 #                       `staged` (`git diff --cached HEAD`), `unstaged`
-#                       (working tree against the index) or `untracked`. A
+#                       (working tree against the index), `untracked`, or
+#                       `staged-later` (in the real index but not in the one
+#                       a `commit -a` / `commit <path>` is built from). A
 #                       path in several sources gets one line per source —
 #                       see the computation for why. Paths are
 #                       raw, never C-quoted; one holding a tab or newline
@@ -722,18 +733,37 @@ gen_events_attribution() {
     # everything `git diff HEAD` did, and slightly more (a path staged and
     # then reverted in the working tree) — the wider, safe direction.
     #
-    # Both read the index the commit is actually built from: the hook's own
-    # (see gen_events_clear_inherited_git_env) when this is the hook's repo,
-    # so `commit -a` and `commit <path>` label correctly. The untracked
-    # listing keeps the real index: under `commit <path>` the temporary one
-    # lacks files staged for later, which would then read as untracked.
-    local index_env=()
+    # Staged and unstaged read the index the commit is actually built from:
+    # the hook's own (see gen_events_clear_inherited_git_env) when this is
+    # the hook's repo, so `commit -a` and `commit <path>` label correctly.
+    #
+    # That alone would make the sources NARROWER than before, and could clear
+    # a committer: under `commit <path>` the temporary index lacks whatever
+    # the real index holds for a later commit — a newly added `.rs`, or a
+    # staged edit whose working copy was restored — and neither diff sees it,
+    # while the untracked listing (which keeps the REAL index, so that a file
+    # staged for later does not read as untracked) does not either. So when
+    # the hook's index is a different file from the real one, a fifth source,
+    # `staged-later`, reads `git diff --cached HEAD` against the REAL index,
+    # minus paths already labelled `staged`. The union is then at least what
+    # one `git diff HEAD` plus `ls-files --others` saw before the hook index
+    # was honoured, and the verdict cannot move toward clearing.
+    local index_env=() staged_later=0
     if [ -n "${GEN_EVENTS_HOOK_INDEX_FILE:-}" ] && [ -n "${GEN_EVENTS_HOOK_GIT_DIR:-}" ] \
        && [ "$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" = "$GEN_EVENTS_HOOK_GIT_DIR" ]; then
         index_env=(env "GIT_INDEX_FILE=$GEN_EVENTS_HOOK_INDEX_FILE")
+        local real_index hook_index_canon real_index_canon
+        real_index="$(git -C "$repo" rev-parse --path-format=absolute --git-path index 2>/dev/null || true)"
+        hook_index_canon="$(_gen_events_canon_file "$GEN_EVENTS_HOOK_INDEX_FILE" || true)"
+        real_index_canon="$(_gen_events_canon_file "$real_index" || true)"
+        # Unresolvable on either side counts as "different": the extra source
+        # only ever widens.
+        if [ -z "$hook_index_canon" ] || [ "$hook_index_canon" != "$real_index_canon" ]; then
+            staged_later=1
+        fi
     fi
-    local touched_lines="" detail_lines="" src
-    for src in committed staged unstaged untracked; do
+    local touched_lines="" detail_lines="" staged_set=$'\n' src
+    for src in committed staged unstaged untracked staged-later; do
         case "$src" in
             committed)
                 _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z "$ATTRIBUTION_BASE_SHA" HEAD \
@@ -751,6 +781,11 @@ gen_events_attribution() {
                 _gen_events_read_z < <(git -C "$repo" ls-files --others --exclude-standard -z \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git ls-files --others failed, so untracked sources could not be read"; return 0; } ;;
+            staged-later)
+                [ "$staged_later" = "1" ] || continue
+                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
+                    -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD against the real index failed, so inputs staged for a later commit could not be read"; return 0; } ;;
         esac
         # A path containing a tab or newline cannot sit in a line-and-tab
         # format, so it is carried in its `printf %q` form, which emits no raw
@@ -760,6 +795,12 @@ gen_events_attribution() {
         for p in ${_GEA_RECS[@]+"${_GEA_RECS[@]}"}; do
             case "$p" in *$'\t'*|*$'\n'*) p="$(printf '%q' "$p")" ;; esac
             touched_lines+="$p"$'\n'
+            # Staged for THIS commit already says it; "staged later" too would
+            # be the same fact twice (every `commit -a` path, for one).
+            if [ "$src" = "staged-later" ]; then
+                case "$staged_set" in *$'\n'"$p"$'\n'*) continue ;; esac
+            fi
+            [ "$src" = "staged" ] && staged_set+="$p"$'\n'
             detail_lines+="$p"$'\t'"$src"$'\n'
         done
     done
@@ -837,10 +878,12 @@ gen_events_render_mine() {
             push:staged)      label="staged, not committed — not part of this push" ;;
             push:unstaged)    label="uncommitted changes — not part of this push" ;;
             push:untracked)   label="untracked — not part of this push" ;;
+            push:staged-later) label="staged for a later commit — not part of this push" ;;
             commit:committed) label="already committed on this branch" ;;
             commit:staged)    label="staged for this commit" ;;
             commit:unstaged)  label="unstaged — not in this commit" ;;
             commit:untracked) label="untracked — not in this commit" ;;
+            commit:staged-later) label="staged for a later commit — not in this commit" ;;
             *)                label="source unknown: '$src'" ;;
         esac
         echo "    $p  ($label)"
