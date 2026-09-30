@@ -43,7 +43,6 @@
 //! | `backend_wedged`, `ui_thread_wedged`, `recovery_wedged` | this process's live predicate (`health_monitor::backend_wedged()` / `ui_thread_wedged()` / `webview_recovery::recovery_wedged()`) reads false | `cleared` | the first read that saw it false (an upper bound) |
 //! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`LatchSnapshot::latch` reads `Closed`) — the latch is set before the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
 //! | same four, while the observer has not folded a probe within its staleness bound (`max(180 s, 3 × effective probe period)`; the latch reads `Unknown`) | at once — a frozen latch vouches for nothing, so the row is never held open on it | `observer_silent` | the observer's last fold (the last instant it vouched), else that read |
-//!
 //! | `health_monitor_thread_stalled`, `health_metrics_thread_stalled` (watchdog, re-written every `WATCHDOG_REPEAT_SECS` while they hold) | no line for 2 × that cadence | `silent` | last line + one cadence (the latest instant the cadence allows it to have held) |
 //! | any other (unknown) reason token — its writer, cadence and predicate are unknown to this build | a newer onset of the same token | `superseded` | the newer onset |
 //! | same, with no newer onset | its onset is older than [`OPEN_WINDOW_SECS`] | `expired` | onset + that window — the runner stops vouching for it, which is NOT an observed end |
