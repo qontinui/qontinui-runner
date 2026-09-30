@@ -554,6 +554,8 @@ premise_case "guard fires: include_dir! beside JsonSchema, no .md literal needed
     '#[derive(JsonSchema)] struct S; static D: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");'
 premise_case "guard fires: #[doc = include_str!(..)]" violation \
     '#[doc = include_str!("b.md")] struct S;'
+premise_case "guard fires: #[doc = concat!(.., include_str!(..))]" violation \
+    '#[doc = concat!("Intro. ", include_str!("b.md"))] struct S;'
 premise_case "guard fires: schemars(description = CONST)" violation \
     '#[schemars(description = BODY)] struct S;'
 premise_case "guard fires: a rustfmt-wrapped schemars attribute with an embed" violation \
@@ -572,6 +574,18 @@ premise_case "guard fires: #[path = \"x.md\"] mod" violation \
     '#[path = "body.md"] mod body;'
 premise_case "guard fires: include!(concat!(..)) naming a .md" violation \
     "$(printf 'include!(concat!(\n    env!("CARGO_MANIFEST_DIR"),\n    "/body.md"\n));')"
+premise_case "guard fires: include![\"x.md\"]" violation \
+    'include!["body.md"];'
+premise_case "guard fires: include!{\"x.md\"}" violation \
+    'include!{"body.md"}'
+premise_case "guard fires: include! (\"x.md\") with a space" violation \
+    'include! ("body.md");'
+premise_case "guard fires: #[cfg_attr(unix, path = \"x.md\")] mod" violation \
+    '#[cfg_attr(unix, path = "body.md")] mod body;'
+premise_case "guard fires: a rustfmt-wrapped cfg_attr path" violation \
+    "$(printf '#[cfg_attr(\n    unix,\n    path = "body.md"\n)]\nmod body;')"
+premise_case "guard is quiet on tracing's path = %p beside a .md literal" clean \
+    'fn f() { debug!(path = %rel, "see notes.md"); }'
 premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) and #[path = x.rs]" clean \
     "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
 premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \
@@ -669,6 +683,34 @@ check "  and says the probe failed" "yes" \
     "$(grep -q 'probe failed' "$WORK/.state" && echo yes || echo no)"
 check "  quoting the first ERROR line, with no fallback text appended" "yes|no" \
     "$(grep -qF '(ERROR git grep' "$WORK/.state" && echo yes || echo no)|$(grep -qF 'no ERROR line' "$WORK/.state" && echo yes || echo no)"
+
+# A failing `comm` — the intersection behind arms 1-4 — must fail the probe,
+# not leave those arms silently empty.
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+COMM_SHIM="$(dirname "$WORK")/shim-comm"
+mkdir -p "$COMM_SHIM"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$COMM_SHIM/comm"
+chmod +x "$COMM_SHIM/comm"
+( PATH="$COMM_SHIM:$PATH"; decide; printf '%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a failing comm drops the exclusion, so the .md is MINE" \
+    "mine" "$(cut -d'|' -f1 < "$WORK/.state")"
+check "  and the reason names the failed intersection" yes \
+    "$(grep -qF 'intersecting the premise lists failed' "$WORK/.state" && echo yes || echo no)"
+
+echo "  -- the hook runs under set -e: the MINE path must survive it --"
+
+# The hook is `set -euo pipefail`. A non-zero status leaking out of the
+# decision or the renderer would abort it mid-message.
+fixture
+seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_commands/x.md");'
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ) && SETE_RC=0 || SETE_RC=$?
+check "set -e: a violated-premise MINE decision and render exit 0" "0" "$SETE_RC"
+fixture
+commit_change "src-tauri/src/lib.rs" "// mine"
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ) && SETE_RC=0 || SETE_RC=$?
+check "set -e: a normal MINE decision and render exit 0" "0" "$SETE_RC"
 
 echo "  -- the MINE message the hook prints --"
 

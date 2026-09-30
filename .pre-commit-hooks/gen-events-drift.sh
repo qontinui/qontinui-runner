@@ -64,7 +64,9 @@
 #                   diff are already upstream and the drift predates the push.
 #                   Reported in full, as an informational note, and not
 #                   blocking. STRICT mode still blocks.
-#   unavailable   — the base could not be resolved (shallow clone, no remote).
+#   unavailable   — the question could not be answered: the base could not be
+#                   resolved (shallow clone, no remote), or a git diff /
+#                   ls-files call that reads the touched paths failed.
 #                   Fails closed: today's hard failure, plus a line saying
 #                   attribution could not run.
 #
