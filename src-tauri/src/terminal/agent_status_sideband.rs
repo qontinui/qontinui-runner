@@ -233,31 +233,41 @@ impl ObservedAgentState {
     }
 }
 
-/// Latest-wins update of a terminal's last-state slot. A poisoned slot is left
-/// as is: its reader reports it as unreadable rather than stale.
+/// Offer a state-bearing payload to the terminal's agent-truth slot as a
+/// `Source::Sideband` observation (plan
+/// `2026-09-20-terminal-session-state-…` Phase 3 — the slot replaced the
+/// sideband's own `Option<ObservedAgentState>`; wind-down still reads the
+/// sideband's last report back through `AgentStateSlot::sideband_view`).
+/// Returns whether the reducer accepted it. A payload with no `state` does not
+/// touch the slot; a poisoned slot is left as is (its reader reports it as
+/// unreadable rather than stale).
 pub fn record_observed_state(
-    slot: &Mutex<Option<ObservedAgentState>>,
+    slot: &Mutex<crate::terminal::agent_state::AgentStateSlot>,
     status: &AgentStatus,
     now_ms: i64,
-) {
+) -> bool {
     let Some(state) = &status.state else {
-        return;
+        return false;
     };
-    if let Ok(mut guard) = slot.lock() {
-        *guard = Some(ObservedAgentState {
-            state: state.clone(),
-            set_at_ms: now_ms,
-        });
-    }
+    let at = u64::try_from(now_ms).unwrap_or(0);
+    let Some(obs) = crate::terminal::agent_state::sideband_observation(state, at) else {
+        return false;
+    };
+    slot.lock()
+        .map(|mut guard| {
+            guard.offer(&obs, at) == qontinui_runner_lib::agent_truth::ObserveOutcome::Accepted
+        })
+        .unwrap_or(false)
 }
 
 // ---- Rate limiting -------------------------------------------------------
 
-/// What the caller must do with an offered status.
+/// What the caller must do with an offered status (or, for the hook ingest,
+/// an offered `agent_truth::Observation`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LimiterDecision {
+pub enum LimiterDecision<T = AgentStatus> {
     /// Enqueue this now — the interval had elapsed.
-    EmitNow(AgentStatus),
+    EmitNow(T),
     /// Held as pending (superseding any earlier pending). The caller owes one
     /// [`SidebandRateLimiter::flush`] after `delay`; no flush is scheduled yet.
     Defer { delay: Duration },
@@ -272,25 +282,50 @@ pub enum LimiterDecision {
 /// useless if it is always 2s late); everything that arrives inside the window
 /// collapses into a single trailing flush carrying the LATEST value.
 ///
+/// Generic over the payload so the hook ingest (`terminal::agent_state`,
+/// plan `2026-09-20-terminal-session-state-…` Phase 3) reuses the SAME policy
+/// for agent events with its own, shorter interval — a level is a level
+/// whichever channel reported it, so latest-wins is right for both.
+///
 /// The clock is passed in rather than read internally so the whole policy is
 /// unit-testable with no sleeping.
-#[derive(Debug, Default)]
-pub struct SidebandRateLimiter {
+#[derive(Debug)]
+pub struct SidebandRateLimiter<T = AgentStatus> {
     last_emit: Option<Instant>,
-    pending: Option<AgentStatus>,
+    pending: Option<T>,
     flush_scheduled: bool,
+    interval: Duration,
 }
 
-impl SidebandRateLimiter {
+impl Default for SidebandRateLimiter<AgentStatus> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SidebandRateLimiter<AgentStatus> {
+    /// The sideband's own limiter: [`MIN_ENQUEUE_INTERVAL`].
     pub fn new() -> Self {
-        Self::default()
+        Self::with_interval(MIN_ENQUEUE_INTERVAL)
+    }
+}
+
+impl<T> SidebandRateLimiter<T> {
+    /// A limiter whose emits are at least `interval` apart.
+    pub fn with_interval(interval: Duration) -> Self {
+        Self {
+            last_emit: None,
+            pending: None,
+            flush_scheduled: false,
+            interval,
+        }
     }
 
     /// Offer a status at `now`.
-    pub fn offer(&mut self, status: AgentStatus, now: Instant) -> LimiterDecision {
+    pub fn offer(&mut self, status: T, now: Instant) -> LimiterDecision<T> {
         let elapsed_enough = self
             .last_emit
-            .is_none_or(|last| now.duration_since(last) >= MIN_ENQUEUE_INTERVAL);
+            .is_none_or(|last| now.duration_since(last) >= self.interval);
         if elapsed_enough && !self.flush_scheduled {
             self.last_emit = Some(now);
             self.pending = None;
@@ -304,15 +339,15 @@ impl SidebandRateLimiter {
         self.flush_scheduled = true;
         let delay = self
             .last_emit
-            .map(|last| MIN_ENQUEUE_INTERVAL.saturating_sub(now.duration_since(last)))
-            .unwrap_or(MIN_ENQUEUE_INTERVAL);
+            .map(|last| self.interval.saturating_sub(now.duration_since(last)))
+            .unwrap_or(self.interval);
         LimiterDecision::Defer { delay }
     }
 
     /// Redeem a scheduled flush at `now`. `Some` only when a payload is still
     /// pending; the scheduled-flush flag is cleared either way, so the next
     /// `offer` can arm a fresh timer.
-    pub fn flush(&mut self, now: Instant) -> Option<AgentStatus> {
+    pub fn flush(&mut self, now: Instant) -> Option<T> {
         self.flush_scheduled = false;
         let status = self.pending.take()?;
         self.last_emit = Some(now);
@@ -341,7 +376,7 @@ impl SidebandRateLimiter {
 pub fn dispatch(
     terminal_id: &str,
     coord_session_id: &Arc<Mutex<Option<Uuid>>>,
-    last_state: &Mutex<Option<ObservedAgentState>>,
+    last_state: &Mutex<crate::terminal::agent_state::AgentStateSlot>,
     limiter: &Arc<Mutex<SidebandRateLimiter>>,
     raw: String,
 ) {
@@ -353,7 +388,13 @@ pub fn dispatch(
         );
         return;
     };
-    record_observed_state(last_state, &status, chrono::Utc::now().timestamp_millis());
+    if record_observed_state(last_state, &status, chrono::Utc::now().timestamp_millis()) {
+        // Publish the (possibly) changed verdict off the PTY reader thread.
+        let terminal_id = terminal_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            crate::terminal::agent_state::publish_terminal(&terminal_id);
+        });
+    }
 
     let Some(coord_id) = coord_session_id.lock().ok().and_then(|slot| *slot) else {
         return;
@@ -447,27 +488,30 @@ mod tests {
 
     #[test]
     fn last_state_is_latest_wins_and_ignores_stateless_payloads() {
-        let slot = Mutex::new(None);
-        record_observed_state(&slot, &status("working"), 100);
+        use crate::terminal::agent_state::AgentStateSlot;
+        use qontinui_runner_lib::agent_truth::StateCapabilities;
+
+        let slot = Mutex::new(AgentStateSlot::new(StateCapabilities::claude()));
+        assert!(record_observed_state(&slot, &status("working"), 100));
         assert_eq!(
-            *slot.lock().unwrap(),
+            slot.lock().unwrap().sideband_view(),
             Some(ObservedAgentState {
                 state: "working".into(),
                 set_at_ms: 100
             })
         );
-        assert!(slot.lock().unwrap().as_ref().unwrap().is_working());
+        assert!(slot.lock().unwrap().sideband_view().unwrap().is_working());
 
         // A tool-name-only payload says nothing about working vs not.
         let stateless = AgentStatus {
             tool_name: Some("Bash".into()),
             ..Default::default()
         };
-        record_observed_state(&slot, &stateless, 200);
-        assert_eq!(slot.lock().unwrap().as_ref().unwrap().set_at_ms, 100);
+        assert!(!record_observed_state(&slot, &stateless, 200));
+        assert_eq!(slot.lock().unwrap().sideband_view().unwrap().set_at_ms, 100);
 
-        record_observed_state(&slot, &status("finished"), 300);
-        let last = slot.lock().unwrap().clone().unwrap();
+        assert!(record_observed_state(&slot, &status("finished"), 300));
+        let last = slot.lock().unwrap().sideband_view().unwrap();
         assert_eq!((last.state.as_str(), last.set_at_ms), ("finished", 300));
         assert!(!last.is_working());
     }

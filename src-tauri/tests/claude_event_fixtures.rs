@@ -260,6 +260,63 @@ mod claude_event_fixtures {
         }
     }
 
+    /// Phase 3: every recorded hook payload shape projects through the SAME
+    /// allowlist projection the `POST /terminals/agent-event` route runs, to
+    /// the event it names — and the projection reads nothing outside
+    /// `PROJECTED_FIELDS`, so a synthesized payload carrying only foreign keys
+    /// still projects, and one whose event is not ingested is refused.
+    #[test]
+    fn every_hook_variant_projects_through_the_agent_event_allowlist() {
+        use qontinui_runner_lib::agent_event::{project, INGESTED_EVENTS, PROJECTED_FIELDS};
+        for dir in version_dirs() {
+            for path in fixture_files(&dir) {
+                let event = file_stem(&path);
+                if event == "statusline" {
+                    continue;
+                }
+                let doc = load(&path);
+                for variant in doc["variants"].as_array().into_iter().flatten() {
+                    let mut payload = synthesize(variant);
+                    // `synthesize` leaves strings empty; the event name is the
+                    // one value a projection cannot do without.
+                    payload["hook_event_name"] = Value::from(event.as_str());
+                    let projected = project(&payload).unwrap_or_else(|e| {
+                        panic!("{}: {event} did not project: {e:?}", path.display())
+                    });
+                    assert_eq!(projected.hook_event_name, event);
+                    assert!(INGESTED_EVENTS.contains(&event.as_str()));
+                    // Every key the CLI sent for a projected field has the
+                    // TYPE the projection reads (a string), or is absent.
+                    for field in PROJECTED_FIELDS {
+                        if let Some(ty) = variant.get(field) {
+                            if field != "agent_id" {
+                                assert_eq!(
+                                    ty,
+                                    &Value::from("string"),
+                                    "{}: {event}.{field} is not a string",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `KNOWN_FIXTURE_CLI_VERSIONS` (what `HookDelivery::VersionMismatch`
+    /// compares against) is exactly the set of recorded fixture directories.
+    #[test]
+    fn known_fixture_versions_match_the_fixture_directories() {
+        let dirs: Vec<String> = version_dirs().iter().map(|d| dir_name(d)).collect();
+        let mut known: Vec<String> = qontinui_runner_lib::agent_event::KNOWN_FIXTURE_CLI_VERSIONS
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        known.sort();
+        assert_eq!(dirs, known);
+    }
+
     #[test]
     fn the_skeleton_checker_rejects_a_value() {
         let leaked = serde_json::json!({ "session_id": "3f1c-…", "cwd": "string" });

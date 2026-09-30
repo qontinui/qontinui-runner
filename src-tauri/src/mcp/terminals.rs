@@ -1018,6 +1018,80 @@ pub async fn get_coord_session_handler(
 }
 
 // ============================================================================
+// Agent events (plan 2026-09-20-terminal-session-state-comes-from-events-not-
+// screen-scraping, Phases 3-4)
+// ============================================================================
+
+/// Header the carrier's http hooks send the pane's terminal id in
+/// (`X-Qontinui-Terminal: $QONTINUI_TERMINAL_ID`).
+const TERMINAL_HEADER: &str = "x-qontinui-terminal";
+
+/// `POST /terminals/agent-event` — the landing pad of the runner carrier's
+/// `type: "http"` Claude Code hooks.
+///
+/// The body is the CLI's own hook payload, unprojected; it is read up to
+/// `MAX_BODY_BYTES + 1`, projected to the allowlist on parse and otherwise
+/// discarded ([`crate::terminal::agent_state::ingest`]). ALWAYS answers
+/// `200 {}` — a hook must never be slowed or failed by the runner, and `{}` is
+/// a valid no-decision hook output (PROBE.md Q5), so a `PermissionRequest`
+/// still shows its dialog. Under the `/terminals/*` credential door, so no
+/// browser origin can forge a state; the CLI sends no `Origin`.
+pub async fn agent_event_handler(
+    State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Json<serde_json::Value> {
+    use crate::terminal::agent_state;
+    use qontinui_runner_lib::agent_event::MAX_BODY_BYTES;
+
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let tm = get_terminal_manager(&state);
+    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES + 1).await {
+        Ok(b) => b,
+        // Over the cap (or a broken stream): fed to the ingest as an
+        // over-long body so it is dropped whole AND counted.
+        Err(_) => axum::body::Bytes::from(vec![b' '; MAX_BODY_BYTES + 1]),
+    };
+    let header = headers
+        .get(TERMINAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let outcome = agent_state::ingest(&*tm, header.as_deref(), &bytes, now_ms);
+    match outcome {
+        agent_state::IngestOutcome::Applied { terminal_id } => {
+            agent_state::publish_terminal(&terminal_id);
+        }
+        agent_state::IngestOutcome::Deferred { terminal_id, delay } => {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                if agent_state::flush_deferred(&*tm, &terminal_id, now_ms) {
+                    agent_state::publish_terminal(&terminal_id);
+                }
+            });
+        }
+        agent_state::IngestOutcome::Coalesced { .. } | agent_state::IngestOutcome::Dropped(_) => {}
+    }
+    Json(serde_json::json!({}))
+}
+
+/// `GET /terminals/agent-state` — one read for every live pane: the verdict,
+/// the hook delivery, and per-source last-seen ages, plus the ingest counters.
+/// A credential door like the rest of `/terminals/*`.
+pub async fn agent_state_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let tm = get_terminal_manager(&state);
+    let rows = spawn_blocking_tracked(move || crate::terminal::agent_state::read_all(&tm))
+        .await
+        .unwrap_or_default();
+    Json(ApiResponse::success(serde_json::json!({
+        "terminals": rows,
+        "ingest": crate::terminal::agent_state::ingest_counters(),
+    })))
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -1053,6 +1127,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/terminals/{id}/move", post(move_terminal_handler))
         .route("/terminals/{id}/ws", get(ws_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))
+        // Agent events + state (plan 2026-09-20-terminal-session-state-…).
+        // Static segments, so they win over `/terminals/{id}`.
+        .route("/terminals/agent-event", post(agent_event_handler))
+        .route("/terminals/agent-state", get(agent_state_handler))
 }
 
 /// Static `(method, path)` tuples for every route [`routes`] registers.
@@ -1078,6 +1156,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/terminals/{id}/move"),
         ("GET", "/terminals/{id}/ws"),
         ("DELETE", "/terminals/{id}"),
+        ("POST", "/terminals/agent-event"),
+        ("GET", "/terminals/agent-state"),
     ]
 }
 
