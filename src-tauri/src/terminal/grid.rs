@@ -6,6 +6,8 @@
 //! a single write — no byte-stream replay, no scroll-off ambiguity.
 //! See `plans/terminal-grid-snapshot.md` for the full design.
 
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
@@ -91,6 +93,10 @@ pub struct Grid {
     /// into one emit; `alt_screen` (DEC 1049) is surfaced in the snapshot for
     /// the bootstrap-paint guard.
     sync_output: bool,
+    /// When the currently-open DEC 2026 block opened (`None` while closed).
+    /// A block open longer than [`SYNC_OUTPUT_TIMEOUT`] is treated as closed:
+    /// see [`Grid::sync_output`].
+    sync_output_opened_at: Option<Instant>,
     alt_screen: bool,
     /// DEC private mode 2004 — bracketed paste. Tracked here because it is the
     /// only place in the runner that sees EVERY output byte of a session and
@@ -137,6 +143,18 @@ pub const OSC_AGENT_STATUS: &[u8] = b"9999";
 /// so this cap is the only one in the path once the sequence is dispatched.)
 pub const MAX_AGENT_STATUS_SIDEBAND_BYTES: usize = 8192;
 
+/// How long a DEC 2026 synchronized-output block may stay open before the grid
+/// stops reporting it.
+///
+/// A TUI that dies (or is killed) between `?2026h` and `?2026l` never sends
+/// the close, and nothing else clears the flag. Without an expiry the session
+/// reader's `SyncFrameCoalescer` then holds EVERY later chunk of that session
+/// to its 50 ms time cap, forever — a latency tax on a pane whose frame will
+/// never finish. 150 ms is alacritty/vte's value for the same timeout (idea
+/// only; alacritty/vte is Apache-2.0, no code taken): long enough for any
+/// real frame, which the coalescer already caps at 50 ms / 256 KiB anyway.
+pub const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
+
 impl Grid {
     pub fn new(cols: u16, rows: u16) -> Self {
         let cols = cols.max(1);
@@ -159,6 +177,7 @@ impl Grid {
             cur_bg: COLOR_DEFAULT,
             cur_attrs: 0,
             sync_output: false,
+            sync_output_opened_at: None,
             alt_screen: false,
             bracketed_paste: false,
             dirty: false,
@@ -187,8 +206,55 @@ impl Grid {
     /// frame atomically. The reader thread reads this at the emit boundary to
     /// coalesce a multi-read frame into a single `terminal-output` event,
     /// killing mid-frame overdraw. Observe-only in the grid itself.
+    ///
+    /// A block open for [`SYNC_OUTPUT_TIMEOUT`] or longer reads as closed, so a
+    /// TUI that died mid-frame stops holding later output. The stored flag is
+    /// cleared on the next parser advance ([`GridPerformer::new`]).
     pub fn sync_output(&self) -> bool {
-        self.sync_output
+        self.sync_output_at(Instant::now())
+    }
+
+    /// [`Self::sync_output`] evaluated at `now` — the clock is a parameter so
+    /// the expiry is testable without sleeping.
+    pub fn sync_output_at(&self, now: Instant) -> bool {
+        self.sync_output && !self.sync_output_expired_at(now)
+    }
+
+    fn sync_output_expired_at(&self, now: Instant) -> bool {
+        self.sync_output_opened_at
+            .is_some_and(|opened| now.saturating_duration_since(opened) >= SYNC_OUTPUT_TIMEOUT)
+    }
+
+    /// Clear a DEC 2026 block that has been open past [`SYNC_OUTPUT_TIMEOUT`].
+    /// Runs before every parser advance, so a later `?2026h` in the same chunk
+    /// opens a fresh block with a fresh clock.
+    fn expire_stale_sync_output(&mut self, now: Instant) {
+        if self.sync_output && self.sync_output_expired_at(now) {
+            self.close_sync_output();
+        }
+    }
+
+    fn open_sync_output(&mut self) {
+        // Only the closed→open transition starts the clock: a repeated
+        // `?2026h` inside an open block must not extend it, or a producer that
+        // keeps re-opening without ever closing would never expire.
+        if !self.sync_output {
+            self.sync_output = true;
+            self.sync_output_opened_at = Some(Instant::now());
+        }
+    }
+
+    fn close_sync_output(&mut self) {
+        self.sync_output = false;
+        self.sync_output_opened_at = None;
+    }
+
+    /// Test hook: pretend the open DEC 2026 block opened `by` earlier.
+    #[cfg(test)]
+    pub(crate) fn backdate_sync_output_open(&mut self, by: Duration) {
+        if let Some(opened) = self.sync_output_opened_at {
+            self.sync_output_opened_at = Some(opened.checked_sub(by).expect("backdate"));
+        }
     }
 
     /// Whether the foreground app has bracketed paste (DEC private mode 2004)
@@ -774,7 +840,10 @@ pub struct GridPerformer<'a> {
 }
 
 impl<'a> GridPerformer<'a> {
+    /// Every parser advance goes through here, so this is where a DEC 2026
+    /// block left open past [`SYNC_OUTPUT_TIMEOUT`] is cleared.
     pub fn new(grid: &'a mut Grid) -> Self {
+        grid.expire_stale_sync_output(Instant::now());
         Self { grid }
     }
 }
@@ -920,7 +989,7 @@ impl<'a> Perform for GridPerformer<'a> {
                         25 => self.grid.cursor.visible = true,
                         1049 => self.grid.alt_screen = true,
                         2004 => self.grid.bracketed_paste = true,
-                        2026 => self.grid.sync_output = true,
+                        2026 => self.grid.open_sync_output(),
                         _ => {}
                     }
                 }
@@ -931,7 +1000,7 @@ impl<'a> Perform for GridPerformer<'a> {
                         25 => self.grid.cursor.visible = false,
                         1049 => self.grid.alt_screen = false,
                         2004 => self.grid.bracketed_paste = false,
-                        2026 => self.grid.sync_output = false,
+                        2026 => self.grid.close_sync_output(),
                         _ => {}
                     }
                 }
@@ -1101,6 +1170,55 @@ mod tests {
         // Close it.
         feed(&mut grid, b"\x1b[?2026l");
         assert!(!grid.sync_output(), "closed after ?2026l");
+    }
+
+    /// Plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+    /// Phase 8: a `?2026h` with no `?2026l` stops reporting after
+    /// [`SYNC_OUTPUT_TIMEOUT`], and the stored flag is cleared on the next feed.
+    #[test]
+    fn never_closed_sync_block_expires_after_timeout() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b[?2026hHALF A FRAME");
+        let opened = grid.sync_output_opened_at.expect("clock started");
+        let just_before = opened + SYNC_OUTPUT_TIMEOUT - Duration::from_millis(1);
+        assert!(grid.sync_output_at(just_before), "still open inside the timeout");
+        assert!(
+            !grid.sync_output_at(opened + SYNC_OUTPUT_TIMEOUT),
+            "expired at the timeout"
+        );
+
+        // The stored flag is cleared by the next advance, even one carrying
+        // no DEC 2026 sequence at all.
+        grid.backdate_sync_output_open(SYNC_OUTPUT_TIMEOUT);
+        assert!(grid.sync_output, "flag is still stored until the next advance");
+        feed(&mut grid, b"later output");
+        assert!(!grid.sync_output, "cleared on the next advance");
+        assert!(grid.sync_output_opened_at.is_none());
+        assert!(!grid.sync_output());
+    }
+
+    /// A fresh `?2026h` after an expired block opens a NEW block with a new
+    /// clock — expiry must not disable sync output for the rest of the session.
+    #[test]
+    fn sync_block_reopens_after_expiry() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b[?2026h");
+        grid.backdate_sync_output_open(SYNC_OUTPUT_TIMEOUT * 2);
+        feed(&mut grid, b"\x1b[?2026hNEXT FRAME");
+        assert!(grid.sync_output(), "a new block is open");
+        feed(&mut grid, b"\x1b[?2026l");
+        assert!(!grid.sync_output());
+    }
+
+    /// A repeated `?2026h` inside an open block does not restart the clock,
+    /// so a producer re-opening without closing still expires.
+    #[test]
+    fn repeated_open_does_not_extend_sync_block() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b[?2026h");
+        let opened = grid.sync_output_opened_at;
+        feed(&mut grid, b"\x1b[?2026h");
+        assert_eq!(grid.sync_output_opened_at, opened);
     }
 
     /// Manual-test-loop iteration 24, item 6.
