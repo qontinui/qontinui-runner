@@ -5401,6 +5401,50 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
         .unwrap_or(TenantPin::Unpinned)
 }
 
+/// How this process's live DEVICE coord-mcp bindings hold their tenant — the
+/// population a machine-pin switch does or does not move.
+///
+/// Plan `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+/// Phase 4 (`PUT /tenant/active` reports it). [`decide_session_tenant`] row 1
+/// holds a `Pinned` binding to its tenant whatever the machine pin says; every
+/// other binding (`Unpinned`, or `Unresolvable` at mint/restore) falls to rows
+/// 1a–4 and re-reads the LIVE pin on each request — unless its workspace
+/// declares a tenant, which this census does not read (it would mean a file
+/// read per binding), so `follows_machine_pin` is an upper bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DeviceSessionPinCensus {
+    /// Bindings frozen `Pinned` at mint/restore: they keep that tenant.
+    pub(crate) pinned_at_creation: usize,
+    /// Bindings with no frozen tenant: they follow the machine pin on their
+    /// next coord-mcp request (upper bound — see the type docs).
+    pub(crate) follows_machine_pin: usize,
+}
+
+/// Count the live (non-expired) DEVICE bindings by [`DeviceSessionPinCensus`]
+/// class. Agent principals present their own JWT and are not counted; nor are
+/// graced (evicted) nonces, which age out within the grace TTL.
+pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
+    use crate::session::tenant_pin::TenantPin;
+    let now = std::time::Instant::now();
+    let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+    let mut census = DeviceSessionPinCensus::default();
+    for binding in map.values() {
+        if binding.principal != ProxyPrincipal::Device {
+            continue;
+        }
+        if let NonceLifetime::Ephemeral { expires_at } = binding.lifetime {
+            if expires_at <= now {
+                continue;
+            }
+        }
+        match binding.session_pin {
+            TenantPin::Pinned(_) => census.pinned_at_creation += 1,
+            TenantPin::Unpinned | TenantPin::Unresolvable => census.follows_machine_pin += 1,
+        }
+    }
+    census
+}
+
 /// A typed tenant/bearer-selection refusal: HTTP status, stable `code`, whether
 /// the client may retry, and the human message.
 ///

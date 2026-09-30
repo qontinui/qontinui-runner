@@ -85,10 +85,14 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// all (409 `NO_TENANT_BINDINGS`), and a `machine.json` with no identity to
 /// preserve (409 `MACHINE_JSON_WRITE_REFUSED`).
 ///
-/// On success `data.takes_effect` is `"live"` and `data.takes_effect_detail`
-/// says what that covers: new sessions and device-level surfaces on their next
-/// read; sessions that already exist keep their recorded tenant
-/// (`data.existing_sessions: "unchanged"`).
+/// A write failure after the checks passed is 500 `MACHINE_JSON_WRITE_FAILED`.
+///
+/// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
+/// consumer with `timing` `live` or `next_start` (the dual-write gate and the
+/// coord-mcp nonce restore read the pin once at startup).
+/// `data.existing_sessions` counts running coord-mcp bindings: those pinned at
+/// creation keep their tenant, and those that were unpinned follow the new pin
+/// on their next request.
 async fn put_active_tenant(
     Json(body): Json<PutActiveTenant>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, HandlerError> {
@@ -216,12 +220,8 @@ mod tests {
         let data = &body["data"];
         assert_eq!(data["active_tenant_id"], TENANT_B);
         assert_eq!(data["previous_active_tenant_id"], TENANT_A);
-        // The effect-timing field is present and says what it covers.
-        assert_eq!(data["takes_effect"], "live");
-        assert_eq!(data["existing_sessions"], "unchanged");
-        assert!(data["takes_effect_detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("NEW sessions")));
+        // The effect-timing field is present; its shape is pinned below.
+        assert_eq!(data["takes_effect"], "mixed");
 
         // The write landed in the fixture's machine.json, identity preserved.
         let on_disk: serde_json::Value =
@@ -293,6 +293,109 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "MACHINE_JSON_WRITE_REFUSED");
         assert_eq!(std::fs::read(&machine).unwrap(), before);
+    }
+
+    /// The per-surface effect report: every surface names a timing of `live`
+    /// or `next_start` and a non-empty evidence locator, both timings occur,
+    /// the two startup readers are the ones classified `next_start`, and the
+    /// running-session census carries both counts.
+    #[tokio::test]
+    async fn put_reports_per_surface_effect_timing_and_a_session_census() {
+        let (_amb, _machine) = fixture();
+        let (status, body) = call(put_req(TENANT_B)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let data = &body["data"];
+        assert_eq!(data["takes_effect"], "mixed");
+
+        let surfaces = data["surfaces"].as_array().expect("surfaces is a list");
+        assert!(!surfaces.is_empty());
+        let mut next_start = Vec::new();
+        let mut live = 0;
+        for s in surfaces {
+            let name = s["surface"].as_str().expect("surface name");
+            assert!(
+                s["evidence"].as_str().is_some_and(|e| !e.trim().is_empty()),
+                "{name}: evidence must be named"
+            );
+            assert!(s["detail"].as_str().is_some(), "{name}: detail");
+            match s["timing"].as_str() {
+                Some("live") => live += 1,
+                Some("next_start") => next_start.push(name.to_string()),
+                other => panic!("{name}: timing must be live|next_start, got {other:?}"),
+            }
+        }
+        assert!(live > 0, "some surfaces switch live");
+        next_start.sort();
+        assert_eq!(
+            next_start,
+            [
+                "coord_mcp_nonce_restore",
+                "session_coordination_dual_write_gate"
+            ],
+            "exactly the startup readers are next_start"
+        );
+
+        let existing = &data["existing_sessions"];
+        for group in ["pinned_at_creation", "follows_machine_pin"] {
+            assert!(existing[group]["count"].is_u64(), "{group}.count");
+            assert!(existing[group]["effect"].is_string(), "{group}.effect");
+        }
+        assert!(existing["scope"].is_string());
+    }
+
+    /// A write the checks allowed that then fails on I/O is a 500 with
+    /// `MACHINE_JSON_WRITE_FAILED`, not a 4xx: the caller did nothing wrong.
+    /// Forced by making the fixture directory read-only: the checks pass (both
+    /// files stay readable), then the atomic write cannot create its temp file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_maps_a_write_failure_to_500() {
+        use std::os::unix::fs::PermissionsExt;
+        let (amb, machine) = fixture();
+        let dir = amb.dir().to_path_buf();
+        let before = std::fs::read(&machine).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Running as root ignores directory modes; the lever does not exist
+        // there, so say so rather than pass vacuously.
+        let probe = dir.join(".write-probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("put_maps_a_write_failure_to_500: directory modes not enforced; skipped");
+            return;
+        }
+        let (status, body) = call(put_req(TENANT_B)).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["code"], "MACHINE_JSON_WRITE_FAILED");
+        assert_eq!(std::fs::read(&machine).unwrap(), before);
+    }
+
+    #[test]
+    fn status_mapping_covers_every_refusal() {
+        assert_eq!(
+            status_for(&SetActiveTenantError::WriteFailed("x".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status_for(&SetActiveTenantError::NoHome),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status_for(&SetActiveTenantError::WriteRefused("x".into())),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for(&SetActiveTenantError::NotBound {
+                tenant: "t".into(),
+                bound: vec![]
+            }),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_for(&SetActiveTenantError::Empty),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     /// The route is a credential door: no browser origin but the runner's own
