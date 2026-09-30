@@ -9,7 +9,7 @@
  *
  *  - `decodeNs.pane` / `decodeNs.tap` (+ `decodeCalls`, `decodeBytes`): wall
  *    time around the two base64 decodes a focused chunk pays in this window —
- *    the pane's inline `atob` loop in `TerminalInstance.tsx` and the page tap's
+ *    the pane's `base64ToBytes` call in `TerminalInstance.tsx` and the page tap's
  *    `base64ToBytes` in `TerminalSessionContext.tsx`. K1's "pane-decode +
  *    tap-decode" numerator.
  *  - `writeToRenderNs` (+ `writeToRenderCount`, `writeToRenderBytes`): from
