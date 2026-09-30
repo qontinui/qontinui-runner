@@ -22749,21 +22749,15 @@ mod runner_credential_tests {
     /// encrypted store, so this pins the call at the source (the technique
     /// `the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture` uses).
     #[test]
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
     fn the_empty_bearer_arm_consults_the_posture_before_degrading() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
         let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
-        let end = text[start..]
-            .find("\n/// ")
-            .map(|i| start + i)
-            .unwrap_or(text.len());
-        let code: String = text[start..end]
+        let tail = text.get(start..).expect("start is a char boundary");
+        let body = tail.split("\n/// ").next().unwrap_or(tail);
+        let code: String = body
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
