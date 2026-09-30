@@ -998,6 +998,7 @@ function TerminalPageInner({
         tabId,
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
+        provider: tab.sessionProvider,
         updateTab,
         // Re-assert payload for the verified branch — no origin, so the
         // backend preserves the record's existing origin.

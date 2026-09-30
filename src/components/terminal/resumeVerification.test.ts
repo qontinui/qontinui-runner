@@ -30,9 +30,19 @@ import {
   typeResumeAndVerify,
   probeClaudeInPane,
 } from "./resumeVerification";
-import { claudeDescriptor } from "./providerAdapter";
+import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profiles.json";
+import { descriptorFromProfile, setCliProfiles, type ServedCliProfile } from "./providerAdapter";
 import { buildResumeCmd } from "./useTerminalInitialization";
 import { TERMINAL_EXITED, TERMINAL_WRITE_FAILED } from "./terminalWriteResult";
+
+/**
+ * Claude's resume markers exactly as the runner serves them — the snapshot the
+ * Rust suite pins to the live manifest. There is no built-in marker set to
+ * fall back to any more, so every detection below names its patterns.
+ */
+const claudeProfile = (served as ServedCliProfile[]).find((p) => p.id === "claude");
+if (!claudeProfile) throw new Error("served_profiles.json has no claude profile");
+const CLAUDE = descriptorFromProfile(claudeProfile).handshakePatterns();
 
 const CLAUDE_UI =
   "╭──────────────────────────────╮\n│ > │\n╰──────────────────────────────╯\n  ? for shortcuts";
@@ -99,7 +109,12 @@ describe("lastOscTitle", () => {
 const V2_SESSION_ID = "230feb99-2dd7-42d7-92bc-6d36c1883089";
 // The exact line the restore types (env thresholds included), echoed by the
 // shell and repeated in the shell-integration OSC 633;E mark.
-const V2_TYPED = buildResumeCmd(V2_SESSION_ID, "/home/user/.claude", "full").replace(/\r$/, "");
+// buildResumeCmd resolves the program through the served-profile cache.
+setCliProfiles(served as ServedCliProfile[]);
+const V2_TYPED = (buildResumeCmd(V2_SESSION_ID, "/home/user/.claude", "full", "claude") ?? "").replace(
+  /\r$/,
+  "",
+);
 const V2_SHELL_ECHO =
   "\x1b]633;A\x07\x1b]0;user@host: ~/repo\x07\x1b[01;32muser@host\x1b[00m:\x1b[01;34m~/repo\x1b[00m$ \x1b]633;B\x07" +
   `${V2_TYPED}\r\n` +
@@ -115,7 +130,7 @@ const V2_FIRST_PAINT =
   "\x1b[39m";
 
 describe("Claude Code v2 handshake (no rounded box, cursor-addressed text)", () => {
-  const hp = claudeDescriptor.handshakePatterns();
+  const hp = CLAUDE;
 
   it("verifies the real v2 first paint of a resumed session", () => {
     expect(detectClaudeHandshake(V2_SHELL_ECHO + V2_FIRST_PAINT, hp)).toBe(true);
@@ -202,7 +217,7 @@ describe("detectClaudeHandshake", () => {
     ["rounded input-box frame", CLAUDE_UI],
     ["ANSI-wrapped UI", `\x1b[2m${CLAUDE_UI}\x1b[0m`],
   ])("recognizes the Claude UI: %s", (_name, text) => {
-    expect(detectClaudeHandshake(text)).toBe(true);
+    expect(detectClaudeHandshake(text, CLAUDE)).toBe(true);
   });
 
   it.each([
@@ -213,14 +228,14 @@ describe("detectClaudeHandshake", () => {
   ])("does NOT count non-Claude output: %s", (_name, text) => {
     // The verification must never pass on a pane that is still a bare shell —
     // that false positive is exactly the silent failure mode being fixed.
-    expect(detectClaudeHandshake(text)).toBe(false);
+    expect(detectClaudeHandshake(text, CLAUDE)).toBe(false);
   });
 
   it("counts the resume-size picker as a landed resume (it IS Claude UI)", () => {
     const picker =
       "╭──────────────────────────────╮\n" +
       "  Resume from summary (recommended)\n  Resume full session as-is\n  Don't ask me again";
-    expect(detectClaudeHandshake(picker)).toBe(true);
+    expect(detectClaudeHandshake(picker, CLAUDE)).toBe(true);
   });
 });
 
@@ -235,7 +250,7 @@ describe("detectResumeFailure", () => {
     ["interactive session picker", SESSION_PICKER],
     ["ANSI-wrapped error", `\x1b[31mNo conversation found\x1b[0m`],
   ])("recognizes a definitive resume failure: %s", (_name, text) => {
-    expect(detectResumeFailure(text)).toBe(true);
+    expect(detectResumeFailure(text, CLAUDE)).toBe(true);
   });
 
   it.each([
@@ -244,20 +259,19 @@ describe("detectResumeFailure", () => {
     ["resume-size picker (a LANDED resume)", "  Resume from summary (recommended)"],
     ["empty buffer", ""],
   ])("does NOT flag non-failure output: %s", (_name, text) => {
-    expect(detectResumeFailure(text)).toBe(false);
+    expect(detectResumeFailure(text, CLAUDE)).toBe(false);
   });
 
   it("the bogus-resume tail ALSO matches the positive handshake (why negative-first matters)", () => {
     // Documents the false positive: without the negative check, this tail
     // verifies. The wait loop must therefore evaluate failure first.
-    expect(detectClaudeHandshake(BOGUS_RESUME_ERROR)).toBe(true);
+    expect(detectClaudeHandshake(BOGUS_RESUME_ERROR, CLAUDE)).toBe(true);
   });
 });
 
-// Phase 4 (provider-agnostic verification): when per-adapter HandshakePatterns
-// are supplied, detection matches THOSE substrings (case-insensitive,
-// ANSI-stripped) instead of the built-in Claude regex sets — so a non-Claude
-// provider's resume verifies against its own banners.
+// Provider-agnostic verification: detection matches exactly the patterns it
+// is given (case-insensitive, ANSI-stripped), so a non-Claude provider's
+// resume verifies against its own banners and never against Claude's.
 describe("detectClaudeHandshake / detectResumeFailure (per-adapter patterns)", () => {
   const gemini = {
     success: ["gemini ready", "type your message"],
@@ -310,6 +324,7 @@ describe("waitForClaudeHandshake", () => {
     const tails = [PLAIN_SHELL, PLAIN_SHELL, CLAUDE_UI];
     const readTail = vi.fn(async () => tails.shift() ?? CLAUDE_UI);
     const out = await waitForClaudeHandshake("tab-1", {
+      handshakePatterns: CLAUDE,
       timeoutMs: 500,
       intervalMs: 1,
       readTail,
@@ -321,6 +336,7 @@ describe("waitForClaudeHandshake", () => {
   it("times out when the pane never shows the Claude UI", async () => {
     const readTail = vi.fn(async () => PLAIN_SHELL);
     const out = await waitForClaudeHandshake("tab-1", {
+      handshakePatterns: CLAUDE,
       timeoutMs: 10,
       intervalMs: 1,
       readTail,
@@ -331,6 +347,7 @@ describe("waitForClaudeHandshake", () => {
   it("treats an unreadable scrollback (null) as no-evidence, not success", async () => {
     const readTail = vi.fn(async () => null);
     const out = await waitForClaudeHandshake("tab-1", {
+      handshakePatterns: CLAUDE,
       timeoutMs: 10,
       intervalMs: 1,
       readTail,
@@ -341,6 +358,7 @@ describe("waitForClaudeHandshake", () => {
   it("returns 'failed' when failure frames show — even though TUI frames are in the same tail", async () => {
     const readTail = vi.fn(async () => BOGUS_RESUME_ERROR);
     const out = await waitForClaudeHandshake("tab-1", {
+      handshakePatterns: CLAUDE,
       timeoutMs: 500,
       intervalMs: 1,
       readTail,
@@ -351,6 +369,7 @@ describe("waitForClaudeHandshake", () => {
   it("returns 'failed' on the interactive session picker (resume fell through)", async () => {
     const readTail = vi.fn(async () => SESSION_PICKER);
     const out = await waitForClaudeHandshake("tab-1", {
+      handshakePatterns: CLAUDE,
       timeoutMs: 500,
       intervalMs: 1,
       readTail,
@@ -366,6 +385,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -385,6 +405,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const readTail = async () =>
       writes.filter((w) => w === CMD).length >= 2 ? CLAUDE_UI : PLAIN_SHELL;
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 10,
@@ -402,6 +423,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -419,6 +441,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
     await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -433,6 +456,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -451,6 +475,7 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      handshakePatterns: CLAUDE,
       write: write as never,
       settleMs: 1,
       timeoutMs: 5,
@@ -494,6 +519,7 @@ describe("typeResumeAndVerify — refused writes (item 2)", () => {
     const writes: string[] = [];
     const onWriteFailure = vi.fn();
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      handshakePatterns: CLAUDE,
       write: ((_r: never, _t: string, text: string) => {
         writes.push(text);
         return Promise.resolve(exited);
@@ -518,6 +544,7 @@ describe("typeResumeAndVerify — refused writes (item 2)", () => {
     let probes = 0;
     const writes: string[] = [];
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      handshakePatterns: CLAUDE,
       write: ((_r: never, _t: string, text: string) => {
         writes.push(text);
         return Promise.resolve(ipcFailed);
@@ -537,6 +564,7 @@ describe("typeResumeAndVerify — refused writes (item 2)", () => {
 
   it("an OK envelope behaves exactly as before — the happy path is untouched", async () => {
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      handshakePatterns: CLAUDE,
       write: (() => Promise.resolve({ success: true, bytes: 4 })) as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -548,6 +576,7 @@ describe("typeResumeAndVerify — refused writes (item 2)", () => {
 
   it("a writer that resolves NOTHING is 'no information', not a failure", async () => {
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD_2, {
+      handshakePatterns: CLAUDE,
       write: (() => undefined) as never,
       settleMs: 1,
       timeoutMs: 50,
@@ -567,7 +596,7 @@ describe("typeResumeAndVerify — refused writes (item 2)", () => {
 // therefore never consulted on the only path that runs in production.
 // ---------------------------------------------------------------------------
 describe("descriptor-driven detection unions the regexes (item 3)", () => {
-  const patterns = claudeDescriptor.handshakePatterns();
+  const patterns = CLAUDE;
   /** A restored pane that has painted ONLY the rounded input box. */
   const FRAME_ONLY =
     "╭────────────────────────────╮\n│ >                          │\n╰────────────────────────────╯";
@@ -605,7 +634,7 @@ describe("descriptor-driven detection unions the regexes (item 3)", () => {
 describe("typeResumeAndVerify (does not type into a live claude)", () => {
   const SID = "5c46c390-037d-4b8e-9d7a-1f2e3d4c5b6a";
   const CMD = `claude --permission-mode bypassPermissions --resume ${SID}\r`;
-  const base = { settleMs: 1, timeoutMs: 10, intervalMs: 1, sessionId: SID };
+  const base = { settleMs: 1, timeoutMs: 10, intervalMs: 1, sessionId: SID, handshakePatterns: CLAUDE };
   const recorder = () => {
     const writes: string[] = [];
     const write = (_refs: never, _tab: string, text: string) => void writes.push(text);

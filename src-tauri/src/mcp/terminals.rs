@@ -1042,6 +1042,17 @@ pub async fn reset_transport_stats_handler(
     ))
 }
 
+/// `GET /terminals/cli-profiles` — every AI-CLI profile the runner knows
+/// (plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 4). The same data the Tauri command `terminal_cli_profiles` returns,
+/// so a headless runner or a remote webview reads the manifest the local
+/// frontend does. Static, read-only, and carries no session or account data.
+pub async fn list_cli_profiles_handler(
+) -> Json<ApiResponse<&'static [qontinui_types::cli_session::CliProfile]>> {
+    Json(ApiResponse::success(qontinui_runner_lib::cli_profile::all()))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -1065,6 +1076,9 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/terminals/transport-stats",
             get(get_transport_stats_handler).post(reset_transport_stats_handler),
         )
+        // The per-CLI profile manifest. A static segment, so axum matches it
+        // ahead of `/terminals/{id}` (which registers DELETE only).
+        .route("/terminals/cli-profiles", get(list_cli_profiles_handler))
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         // Alias — the cheatsheet and intuition both reach for `/output`.
@@ -1104,6 +1118,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/terminal-pages"),
         ("GET", "/terminals/transport-stats"),
         ("POST", "/terminals/transport-stats"),
+        ("GET", "/terminals/cli-profiles"),
         ("POST", "/terminals/{id}/write"),
         ("GET", "/terminals/{id}/buffer"),
         ("GET", "/terminals/{id}/output"),

@@ -6,17 +6,20 @@
 //! correlation, the boot-restore orchestration, the reconcile backstop, and
 //! the local registration endpoint all work the same regardless of which AI
 //! CLI hosts the session. Everything PROVIDER-SPECIFIC sits behind the
-//! [`SessionProviderAdapter`] trait — one impl per provider (Claude is #1,
-//! Gemini #2). The runner is not a Claude client.
+//! [`SessionProviderAdapter`] trait — one impl per provider (Claude is #1).
+//! The runner is not a Claude client.
 //!
-//! ## What this phase ships
+//! ## Data vs behaviour
 //!
-//! Phase 1 ships the TRAIT + its supporting types + the registry seam
-//! ([`adapter_for`]) ONLY. The Claude reference adapter's resume/hook bodies
-//! are Phase 2 — the [`ClaudeAdapter`] here is a minimal placeholder that
-//! returns sensible defaults (NO `todo!()`/panics on any build- or test-
-//! exercised path), so the crate compiles and Phase 2 fills the bodies in
-//! without touching the registry seam.
+//! A provider's FACTS — its resume argv, account-isolation variable, restore
+//! tier, resume handshake markers — are data in its
+//! [`qontinui_runner_lib::cli_profile`] profile, looked up with
+//! `cli_profile::profile_for(provider)`. An unknown provider has no profile,
+//! so it has no resume either: nothing here degrades it to Claude. This trait
+//! keeps only BEHAVIOUR that cannot be data (materializing a capture hook,
+//! building a pinned launch) (plan
+//! `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+//! Phase 4).
 //!
 //! ## The key simplification (plan §4)
 //!
@@ -28,7 +31,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
+use qontinui_runner_lib::cli_profile::{self, claude};
+use qontinui_types::cli_session::{AutoApprove, IdentitySource, RestoreTier as ProfileRestoreTier};
 
 /// Declared restore capability of a provider (plan §4 `restore_tier`). Drives
 /// the honest-UX surface in Phase 5: `Full` adapters restore the conversation;
@@ -111,6 +115,18 @@ impl RestoreTier {
     }
 }
 
+/// A profile's declared tier in this module's vocabulary. The profile type
+/// (`qontinui_types::cli_session::RestoreTier`) is the served wire DTO; this
+/// enum is the one place the coord-wire and frontend spellings convert.
+impl From<ProfileRestoreTier> for RestoreTier {
+    fn from(tier: ProfileRestoreTier) -> Self {
+        match tier {
+            ProfileRestoreTier::Full => RestoreTier::Full,
+            ProfileRestoreTier::TerminalOnly => RestoreTier::TerminalOnly,
+        }
+    }
+}
+
 /// The spawn recipe an adapter produces so the runner can launch the provider
 /// with a KNOWN-up-front session id (plan §4 `launch_with_identity`). The
 /// runner injects `env` into the PTY child, runs `argv`, and records
@@ -154,8 +170,9 @@ pub enum DeliverySpec {
     None,
 }
 
-/// One provider's session-management contract. Implemented once per provider.
-/// Phase 1 ships the trait + the registry seam; Phase 2 fills the Claude impl.
+/// One provider's session-management BEHAVIOUR. Implemented once per provider.
+/// Its facts (resume argv, account isolation, restore tier) are profile data —
+/// see the module docs.
 pub trait SessionProviderAdapter: Send + Sync {
     /// The provider id this adapter handles (`"claude"`, `"gemini"`). Matches
     /// the stored [`crate::session::session_lifecycle_store::TerminalSessionRecord::provider`].
@@ -169,53 +186,38 @@ pub trait SessionProviderAdapter: Send + Sync {
     /// How to attach the runner's SessionStart capture hook without editing
     /// user config (plan §4).
     fn capture_hook_delivery(&self, cwd: &str) -> DeliverySpec;
-
-    /// The deterministic, non-interactive resume argv for `session_id` under
-    /// `account` (plan §4): Claude `["claude", "--resume", "<id>"]`.
-    fn resume_command(&self, session_id: &str, account: Option<&str>) -> Vec<String>;
-
-    /// Config/home isolation env for `account` (plan §4): Claude
-    /// `CLAUDE_CONFIG_DIR`; Gemini `HOME`/project separation.
-    fn account_isolation(&self, account: Option<&str>) -> BTreeMap<String, String>;
-
-    /// Declared restore capability for honest UX (plan §4).
-    fn restore_tier(&self) -> RestoreTier;
 }
 
-/// The Claude reference adapter — Phase 1 PLACEHOLDER. The trait surface
-/// compiles and returns sensible defaults; **Phase 2 fills the resume/hook
-/// bodies** (move `aiLaunchCommand.ts`'s `--session-id` logic behind
-/// `launch_with_identity`, ship the bundled `--settings` hook). No path here
-/// panics.
+/// The Claude reference adapter. Its launch argv reads the Claude profile's
+/// identity flag, auto-approve flags and account-isolation variable; only the
+/// hook materialization is code. No path here panics.
 ///
-/// Resume handshake/failure markers are deliberately NOT part of this trait:
-/// the only consumer is the frontend's `resumeVerification.ts`, and their
-/// single home is `src/components/terminal/providerAdapter.ts`. A Rust copy
-/// existed here with no production caller and was deleted (plan
-/// 2026-08-23-single-source-derived-facts item 9) — re-add one only with a
-/// real caller and a cross-language drift guard.
+/// Resume handshake/failure markers are profile data too
+/// (`cli_profile::claude`), served to the frontend's `resumeVerification.ts`
+/// and pinned across both languages by the shared screen fixtures under
+/// `src-tauri/tests/fixtures/cli_screens/`.
 pub struct ClaudeAdapter;
 
 impl SessionProviderAdapter for ClaudeAdapter {
     fn provider(&self) -> &'static str {
-        DEFAULT_PROVIDER // "claude"
+        claude::ID
     }
 
     fn launch_with_identity(&self, cwd: &str, account: Option<&str>) -> LaunchSpec {
-        // The Rust home for what `aiLaunchCommand.ts` does: a runner-generated
-        // uuid pinned via `--session-id` so identity is KNOWN at spawn (recorded
-        // synchronously, zero transcript race — plan §3b/§4). Autonomous mode
-        // (`--permission-mode bypassPermissions`) matches the operator's
-        // clg/clh/clp wrappers so a runner-spawned session never stalls on a
-        // permission prompt (mirrors `aiLaunchCommand.ts`).
+        // A runner-generated uuid pinned via the profile's identity flag, so
+        // identity is KNOWN at spawn (recorded synchronously, zero transcript
+        // race — plan §3b/§4), in the profile's auto-approve mode so a
+        // runner-spawned session never stalls on a permission prompt.
+        let profile = claude_profile();
         let pinned = uuid::Uuid::new_v4().to_string();
-        let mut argv = vec![
-            "claude".to_string(),
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
-            "--session-id".to_string(),
-            pinned.clone(),
-        ];
+        let mut argv: Vec<String> = profile.programs.iter().take(1).cloned().collect();
+        if let AutoApprove::Flags { argv: flags, .. } = &profile.auto_approve {
+            argv.extend(flags.iter().cloned());
+        }
+        if let IdentitySource::Pinned { flag } = &profile.identity {
+            argv.push(flag.clone());
+            argv.push(pinned.clone());
+        }
         // Attach the SessionStart capture hook ADDITIVELY via `--settings`
         // (never touches `~/.claude`). When the delivery resolves to a settings
         // file, it rides on the argv; otherwise identity still rides the pin.
@@ -225,7 +227,7 @@ impl SessionProviderAdapter for ClaudeAdapter {
         }
         LaunchSpec {
             argv,
-            env: self.account_isolation(account),
+            env: cli_profile::account_isolation_env(profile, account),
             pinned_session_id: pinned,
         }
     }
@@ -246,49 +248,12 @@ impl SessionProviderAdapter for ClaudeAdapter {
             None => DeliverySpec::None,
         }
     }
-
-    fn resume_command(&self, session_id: &str, _account: Option<&str>) -> Vec<String> {
-        // Claude resume is the deterministic, non-interactive `claude --resume
-        // <id>` (plan §4). Account isolation rides the ENV
-        // (`account_isolation`), not the argv — the resume must look identical
-        // across accounts so the typed-resume sniff + handshake stay stable.
-        vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            session_id.to_string(),
-        ]
-    }
-
-    fn account_isolation(&self, account: Option<&str>) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
-        if let Some(dir) = account {
-            // Claude config/home isolation is `CLAUDE_CONFIG_DIR` (plan §4) —
-            // the SAME var `terminal/session.rs` sets around line 501 from
-            // `ai_provider::get_effective_config_dir`. `account` here is the
-            // already-resolved per-account config dir; the adapter just names
-            // the env var. An absent account ⇒ empty (the runner's
-            // process-global resolved dir applies, set by the spawn path).
-            env.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string());
-        }
-        env
-    }
-
-    fn restore_tier(&self) -> RestoreTier {
-        RestoreTier::Full
-    }
 }
 
-/// Registry seam (plan §4): resolve the adapter for `provider`. Phase 1 knows
-/// only the future Claude adapter; Phase 2 fleshes out [`ClaudeAdapter`] and
-/// Phase 3 adds the Gemini arm here. An UNKNOWN provider degrades to the Claude
-/// adapter (the only shipped provider today) rather than failing — a record
-/// with an unexpected provider should still restore via the default path, never
-/// be dropped.
-pub fn adapter_for(provider: &str) -> Box<dyn SessionProviderAdapter> {
-    match provider {
-        // Phase 3 adds: "gemini" => Box::new(GeminiAdapter),
-        _ => Box::new(ClaudeAdapter),
-    }
+/// The Claude profile. It is compiled into the runner, so its absence is a
+/// build defect, not a runtime condition.
+fn claude_profile() -> &'static qontinui_types::cli_session::CliProfile {
+    cli_profile::profile_for(claude::ID).expect("the Claude profile is compiled in")
 }
 
 #[cfg(test)]
@@ -320,21 +285,25 @@ mod tests {
     }
 
     #[test]
-    fn adapter_for_resolves_claude_and_defaults_unknown() {
-        assert_eq!(adapter_for("claude").provider(), "claude");
-        // Unknown provider degrades to the Claude adapter (never drops).
-        assert_eq!(adapter_for("gemini").provider(), "claude");
-        assert_eq!(adapter_for("totally-new").provider(), "claude");
+    fn profile_tiers_convert_into_this_vocabulary() {
+        assert_eq!(
+            RestoreTier::from(ProfileRestoreTier::Full),
+            RestoreTier::Full
+        );
+        assert_eq!(
+            RestoreTier::from(ProfileRestoreTier::TerminalOnly),
+            RestoreTier::TerminalOnly
+        );
     }
 
     #[test]
     fn claude_adapter_surface_is_sane_and_panic_free() {
         let _amb = crate::test_env::isolated_ambient();
         let a = ClaudeAdapter;
-        assert_eq!(a.restore_tier(), RestoreTier::Full);
+        assert_eq!(a.provider(), "claude");
 
         // launch_with_identity pins a uuid into the argv + reports it, in
-        // autonomous (bypassPermissions) mode (mirrors aiLaunchCommand.ts).
+        // the profile's autonomous (bypassPermissions) mode.
         let spec = a.launch_with_identity("C:/repo", Some("C:/cfg"));
         assert_eq!(spec.argv.first().map(String::as_str), Some("claude"));
         assert!(spec.argv.contains(&"--permission-mode".to_string()));
@@ -345,23 +314,8 @@ mod tests {
             spec.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some("C:/cfg")
         );
-
-        // resume_command is the deterministic --resume form (account rides env).
-        assert_eq!(
-            a.resume_command("sess-1", None),
-            vec![
-                "claude".to_string(),
-                "--resume".to_string(),
-                "sess-1".to_string()
-            ]
-        );
-
-        // account_isolation maps the account to CLAUDE_CONFIG_DIR (or empty).
-        assert!(a.account_isolation(None).is_empty());
-        assert_eq!(
-            a.account_isolation(Some("C:/cfg")).get("CLAUDE_CONFIG_DIR"),
-            Some(&"C:/cfg".to_string())
-        );
+        // No account ⇒ no isolation env (the spawn path's resolution applies).
+        assert!(a.launch_with_identity("C:/repo", None).env.is_empty());
     }
 
     #[test]

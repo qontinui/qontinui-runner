@@ -1,0 +1,96 @@
+[
+  {
+    "accountIsolation": {
+      "kind": "env_var",
+      "name": "CLAUDE_CONFIG_DIR"
+    },
+    "auth": [],
+    "autoApprove": {
+      "argv": [
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "detect": [
+        "--dangerously-skip-permissions",
+        "--permission-mode bypassPermissions",
+        "--permission-mode=bypassPermissions"
+      ],
+      "kind": "flags"
+    },
+    "displayName": "Claude Code",
+    "gracefulExit": {
+      "kind": "typed_command",
+      "text": "/exit"
+    },
+    "handshake": {
+      "failure": [],
+      "failureRegex": [
+        "No conversation found",
+        "No conversations? (?:found|to resume)",
+        "Select a (?:session|conversation) to resume"
+      ],
+      "success": [],
+      "successRegex": [
+        "\\? for shortcuts",
+        "esc to interrupt",
+        "bypass permissions",
+        "Welcome (?:back )?to Claude",
+        "Claude Code v\\d",
+        "[╭╰]─{3,}",
+        "(?:^|\\n)[ \\t]*─{3,}[ \\t]*\\r?\\n[ \\t]*❯[^\\n]*\\n[ \\t]*─{3,}"
+      ],
+      "titleRegex": [
+        "^[✳✢✶✻✽·*]\\s*Claude Code$"
+      ]
+    },
+    "id": "claude",
+    "identity": {
+      "flag": "--session-id",
+      "kind": "pinned"
+    },
+    "install": {},
+    "notes": [
+      "verified_version covers the stream-json capabilities, probed on Linux against 2.1.285 (Phase 2). The handshake markers were last documented against the 2.1.175 resume-size picker; the v2 logo, rule-prompt-rule frame and window-title markers against 2.1.286's first paint of a resumed session (Linux, 51/53 live panes verified). Windows and macOS are unverified.",
+      "typed_permission: control_request{subtype:can_use_tool} arrives only without a bypass mode and with the hidden flag `--permission-prompt-tool stdio` (2.1.285 --help lists `--permission-prompts host|none` instead). The CLI accepts only the SDK's nested control_response shape.",
+      "turn_boundary_event: system/session_state_changed (idle|running|requires_action) is emitted only when the child env sets CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1. Without it the event never arrives, so a spawn that does not set it must treat the capability as Unknown.",
+      "rate_limit_event: arrives once per turn by default. Only status `allowed` was observed; the spelling of a limited status is unknown.",
+      "Agent teams under tmux: with TMUX set, the default `--teammate-mode auto` splits the caller's tmux window. `--teammate-mode in-process` (hidden flag, 2.1.285, Linux) keeps teammates in the session. A PTY launch should pass it and strip TMUX/TMUX_PANE. Not applicable on Windows (no tmux)."
+    ],
+    "programs": [
+      "claude"
+    ],
+    "rateLimitEvent": "supported",
+    "restoreTier": "full",
+    "resume": {
+      "kind": "by_id_argv",
+      "template": [
+        "claude",
+        "--resume",
+        "{id}"
+      ]
+    },
+    "structuredLane": {
+      "kind": "claude_stream_json"
+    },
+    "transcript": {
+      "kind": "jsonl_under_config_dir",
+      "subdir": "projects"
+    },
+    "trustDialog": {
+      "kind": "unknown"
+    },
+    "turnBoundaryEvent": "supported",
+    "typedPermission": "supported",
+    "usageLimitPhrases": [
+      "usage limit reached",
+      "5-hour limit reached",
+      "weekly limit reached",
+      "hit your usage limit",
+      "out of extra usage",
+      "session limit reached",
+      "limit reached",
+      "out of usage"
+    ],
+    "verifiedVersion": "2.1.285"
+  }
+]

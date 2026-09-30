@@ -225,6 +225,20 @@ pub fn spawn_grid_scan_loop() {
 mod tests {
     use super::*;
 
+    /// This scanner keeps its own copy of the phrases the Claude profile
+    /// declares (`cli_profile::claude` `usage_limit_phrases`). Pin the two
+    /// equal, order included — the order decides which phrase labels a hint.
+    #[test]
+    fn patterns_equal_the_claude_profile_phrases() {
+        let profile = qontinui_runner_lib::cli_profile::profile_for("claude").unwrap();
+        let declared: Vec<&str> = profile
+            .usage_limit_phrases
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(USAGE_LIMIT_PATTERNS, declared.as_slice());
+    }
+
     #[test]
     fn plain_limit_message_matches() {
         assert_eq!(
