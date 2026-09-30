@@ -170,7 +170,7 @@ pub(crate) fn derive_ledger_health(
             } else {
                 format!(
                     "missing table(s) {} in this database — apply qontinui-web migration \
-                     journey_01_edge_ledger, then restart the runner to re-probe",
+                     journey_01_edge_ledger",
                     missing.join(", ")
                 )
             },
@@ -178,8 +178,9 @@ pub(crate) fn derive_ledger_health(
         Some(SchemaProbe::Failed { error }) => JourneyLedgerHealth {
             state: LedgerState::WriteFailing,
             detail: format!(
-                "the journey schema probe failed ({error}); nothing is written for the life of \
-                 this process — fix the database, then restart the runner to re-probe"
+                "the journey schema probe failed ({error}); nothing is written until a probe \
+                 succeeds — it is retried automatically after {}s",
+                super::capture::PROBE_RETRY_BACKOFF.as_secs()
             ),
         },
         Some(SchemaProbe::Present) if recent_failures > 0 => JourneyLedgerHealth {
@@ -247,6 +248,7 @@ fn is_embedded() -> bool {
 /// Assemble the health body from the current counters.
 pub(crate) fn snapshot_health(app_id: String) -> JourneyHealthResponse {
     let probe = journey_schema_state();
+    let probe = probe.as_ref();
     let (recent_failures, counters) = {
         let r = recent().lock().unwrap_or_else(|p| p.into_inner());
         let failures = r.outcomes.iter().filter(|ok| !**ok).count();
@@ -286,19 +288,22 @@ pub(crate) fn snapshot_health(app_id: String) -> JourneyHealthResponse {
 
 /// `GET /apps/{app_id}/journey/health`.
 ///
-/// Runs the once-per-process schema probe itself when nothing has run it yet,
-/// so a runner that has not seen an agent action still answers `writing` /
-/// `schema_absent` from evidence. When the database cannot be asked (no
-/// pooled connection within the pool's own timeout), the probe is left
-/// un-run — so a later write can still run it — and the answer says
-/// `unknown`.
+/// Runs the schema probe itself when no settled answer is cached (never
+/// probed, or a failure older than the retry backoff), so a runner that has
+/// not seen an agent action still answers `writing` / `schema_absent` from
+/// evidence. When the database cannot be asked (no pooled connection within
+/// the pool's own timeout), the probe is left un-run and the answer says
+/// `unknown` (or the last failure).
 pub async fn get_journey_health(
     State(state): State<Arc<ApiState>>,
     Path(app_id): Path<String>,
 ) -> Json<JourneyHealthResponse> {
-    if journey_schema_state().is_none() {
+    if !matches!(
+        journey_schema_state(),
+        Some(SchemaProbe::Present | SchemaProbe::Absent { .. })
+    ) {
         if let Ok(conn) = state.app_state.pg_db.pool().get().await {
-            journey_schema_supported(&conn).await;
+            let _ = journey_schema_supported(&conn).await;
         }
     }
     Json(snapshot_health(app_id))

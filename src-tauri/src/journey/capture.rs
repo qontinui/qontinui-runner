@@ -45,7 +45,7 @@ use qontinui_types::journey::{
     ChokePoint, EdgeOutcome, JourneyEdgeObservation, JourneyNode, JourneyTrigger,
     NavigationTriggerKind, RunKind,
 };
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::database::pg::PgDb;
@@ -577,80 +577,144 @@ pub(crate) const JOURNEY_READ_PROBE_SQL: &str = r#"SELECT (SELECT e.id FROM proj
 /// itself, for the same stall reason as the co-occurrence probe.
 pub(crate) const JOURNEY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The once-per-process answer to "can the journey ledger be written here?".
+/// The answer to "can the journey ledger be written here?".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SchemaProbe {
     /// Both tables exist and are readable.
     Present,
     /// At least one table does not exist. The names are the missing ones.
     Absent { missing: Vec<&'static str> },
-    /// The probe itself failed (error or timeout). Writes are not attempted
-    /// for the life of the process; health reports it as a failure, never as
-    /// "absent" and never as "writing".
+    /// The probe itself failed (error or timeout). Writes are not attempted;
+    /// health reports it as a failure, never as "absent" and never as
+    /// "writing". NOT cached: the next call after [`PROBE_RETRY_BACKOFF`]
+    /// probes again, so a transient database fault heals by itself.
     Failed { error: String },
 }
 
-/// Process-wide cache of the probe. Keyed on nothing, like
-/// `OBSERVATION_APP_ID_SUPPORTED`: the runner constructs exactly one `PgDb`,
-/// and a migration is followed by a restart, which re-probes.
-static JOURNEY_SCHEMA: OnceCell<SchemaProbe> = OnceCell::const_new();
+/// How long a failed probe is reused before the next call probes again.
+pub(crate) const PROBE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The probe's answer if it has completed, without running it.
-pub(crate) fn journey_schema_state() -> Option<&'static SchemaProbe> {
-    JOURNEY_SCHEMA.get()
+/// What the process knows about the schema.
+///
+/// `Settled` holds only `Present` / `Absent` — the schema's shape, which does
+/// not change under a running process without a migration. A probe FAILURE is
+/// a fact about the database's health at one moment, so it is held only with
+/// its time and expires after [`PROBE_RETRY_BACKOFF`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeCache {
+    Unprobed,
+    Settled(SchemaProbe),
+    FailedAt {
+        error: String,
+        at: std::time::Instant,
+    },
 }
 
-/// Resolve — once per process — whether the journey tables are present,
-/// warning once when they are not.
-pub(crate) async fn journey_schema_supported(
-    client: &tokio_postgres::Client,
-) -> &'static SchemaProbe {
-    JOURNEY_SCHEMA
-        .get_or_init(|| async {
-            let probed = tokio::time::timeout(JOURNEY_PROBE_TIMEOUT, async {
-                let row = client.query_one(JOURNEY_SCHEMA_PROBE_SQL, &[]).await?;
-                let has_edges = row.try_get::<_, bool>(0).unwrap_or(false);
-                let has_frontier = row.try_get::<_, bool>(1).unwrap_or(false);
-                if has_edges && has_frontier {
-                    client.query_one(JOURNEY_READ_PROBE_SQL, &[]).await?;
-                }
-                Ok::<_, tokio_postgres::Error>((has_edges, has_frontier))
-            })
-            .await;
-            let answer = match probed {
-                Ok(Ok((true, true))) => SchemaProbe::Present,
-                Ok(Ok((has_edges, has_frontier))) => {
-                    let mut missing = Vec::new();
-                    if !has_edges {
-                        missing.push("project.journey_edge_observations");
-                    }
-                    if !has_frontier {
-                        missing.push("project.journey_frontier");
-                    }
-                    SchemaProbe::Absent { missing }
-                }
-                Ok(Err(e)) => SchemaProbe::Failed {
-                    error: crate::database::pg::pg_err("journey schema probe", &e),
-                },
-                Err(_) => SchemaProbe::Failed {
-                    error: format!(
-                        "journey schema probe did not answer within {JOURNEY_PROBE_TIMEOUT:?}"
-                    ),
-                },
-            };
-            if answer != SchemaProbe::Present {
-                warn!(
-                    "journey::capture: the journey ledger is NOT being written for this process \
-                     ({:?}). GET /apps/<app_id>/journey/health reports the cause. Remedy: apply \
-                     qontinui-web migration journey_01_edge_ledger (an existing embedded database \
-                     never receives new tables — plan Phase 0 decision 4), then restart the runner \
-                     to re-probe.",
-                    answer
-                );
+/// The answer the cache can give without probing, if any. Pure.
+pub(crate) fn cached_answer(cache: &ProbeCache, now: std::time::Instant) -> Option<SchemaProbe> {
+    match cache {
+        ProbeCache::Unprobed => None,
+        ProbeCache::Settled(answer) => Some(answer.clone()),
+        ProbeCache::FailedAt { error, at } => (now.saturating_duration_since(*at)
+            < PROBE_RETRY_BACKOFF)
+            .then(|| SchemaProbe::Failed {
+                error: error.clone(),
+            }),
+    }
+}
+
+/// What to remember after a probe answered `answer` at `now`. Pure.
+pub(crate) fn cache_after(answer: &SchemaProbe, now: std::time::Instant) -> ProbeCache {
+    match answer {
+        SchemaProbe::Failed { error } => ProbeCache::FailedAt {
+            error: error.clone(),
+            at: now,
+        },
+        settled => ProbeCache::Settled(settled.clone()),
+    }
+}
+
+/// Process-wide probe cache. Keyed on nothing, like
+/// `OBSERVATION_APP_ID_SUPPORTED`: the runner constructs exactly one `PgDb`.
+static JOURNEY_SCHEMA: std::sync::Mutex<ProbeCache> = std::sync::Mutex::new(ProbeCache::Unprobed);
+
+/// Serializes probing, so concurrent callers wait for one probe instead of
+/// each running their own.
+static PROBE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn probe_cache() -> std::sync::MutexGuard<'static, ProbeCache> {
+    JOURNEY_SCHEMA.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The probe's most recent answer, without probing. `None` until a probe has
+/// answered; a failure older than the backoff still reads as `Failed` here
+/// (health reports it until a probe replaces it).
+pub(crate) fn journey_schema_state() -> Option<SchemaProbe> {
+    match &*probe_cache() {
+        ProbeCache::Unprobed => None,
+        ProbeCache::Settled(answer) => Some(answer.clone()),
+        ProbeCache::FailedAt { error, .. } => Some(SchemaProbe::Failed {
+            error: error.clone(),
+        }),
+    }
+}
+
+/// Resolve whether the journey tables are present: `Present` / `Absent` are
+/// probed once per process; a `Failed` probe is retried after
+/// [`PROBE_RETRY_BACKOFF`]. Warns on every probe that does not find the
+/// tables — at most once per backoff window, since answers are cached.
+pub(crate) async fn journey_schema_supported(client: &tokio_postgres::Client) -> SchemaProbe {
+    // Each guard is a temporary of its own `let`, dropped before any await.
+    let cached = cached_answer(&probe_cache(), std::time::Instant::now());
+    if let Some(answer) = cached {
+        return answer;
+    }
+    let _gate = PROBE_GATE.lock().await;
+    let cached = cached_answer(&probe_cache(), std::time::Instant::now());
+    if let Some(answer) = cached {
+        return answer;
+    }
+    let probed = tokio::time::timeout(JOURNEY_PROBE_TIMEOUT, async {
+        let row = client.query_one(JOURNEY_SCHEMA_PROBE_SQL, &[]).await?;
+        let has_edges = row.try_get::<_, bool>(0).unwrap_or(false);
+        let has_frontier = row.try_get::<_, bool>(1).unwrap_or(false);
+        if has_edges && has_frontier {
+            client.query_one(JOURNEY_READ_PROBE_SQL, &[]).await?;
+        }
+        Ok::<_, tokio_postgres::Error>((has_edges, has_frontier))
+    })
+    .await;
+    let answer = match probed {
+        Ok(Ok((true, true))) => SchemaProbe::Present,
+        Ok(Ok((has_edges, has_frontier))) => {
+            let mut missing = Vec::new();
+            if !has_edges {
+                missing.push("project.journey_edge_observations");
             }
-            answer
-        })
-        .await
+            if !has_frontier {
+                missing.push("project.journey_frontier");
+            }
+            SchemaProbe::Absent { missing }
+        }
+        Ok(Err(e)) => SchemaProbe::Failed {
+            error: crate::database::pg::pg_err("journey schema probe", &e),
+        },
+        Err(_) => SchemaProbe::Failed {
+            error: format!("journey schema probe did not answer within {JOURNEY_PROBE_TIMEOUT:?}"),
+        },
+    };
+    *probe_cache() = cache_after(&answer, std::time::Instant::now());
+    if answer != SchemaProbe::Present {
+        warn!(
+            "journey::capture: the journey ledger is NOT being written ({:?}). \
+             GET /apps/<app_id>/journey/health reports the cause. A missing table needs \
+             qontinui-web migration journey_01_edge_ledger (an existing embedded database never \
+             receives new tables — plan Phase 0 decision 4); a failed probe is retried \
+             automatically after {:?}.",
+            answer, PROBE_RETRY_BACKOFF
+        );
+    }
+    answer
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,6 +1588,45 @@ mod tests {
         }
         assert!(item_body(&sdk, "record_journey_snapshot").contains("record_snapshot("));
         assert!(item_body(&sdk, "record_sdk_batch").contains("ActionSpec::batch("));
+    }
+
+    // ---- schema probe cache (M1) --------------------------------------------
+
+    #[test]
+    fn a_failed_probe_is_not_cached_past_the_backoff() {
+        let t0 = std::time::Instant::now();
+        let failed = SchemaProbe::Failed {
+            error: "connection reset".into(),
+        };
+        let cache = cache_after(&failed, t0);
+        assert_eq!(
+            cached_answer(&cache, t0 + std::time::Duration::from_secs(1)),
+            Some(failed.clone()),
+            "inside the backoff the failure is reused (no probe storm)"
+        );
+        assert_eq!(
+            cached_answer(&cache, t0 + PROBE_RETRY_BACKOFF),
+            None,
+            "after the backoff the next call probes again"
+        );
+    }
+
+    #[test]
+    fn present_and_absent_are_settled() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(86_400);
+        for answer in [
+            SchemaProbe::Present,
+            SchemaProbe::Absent {
+                missing: vec!["project.journey_frontier"],
+            },
+        ] {
+            assert_eq!(
+                cached_answer(&cache_after(&answer, t0), later),
+                Some(answer)
+            );
+        }
+        assert_eq!(cached_answer(&ProbeCache::Unprobed, t0), None);
     }
 
     // ---- request parsing ---------------------------------------------------
