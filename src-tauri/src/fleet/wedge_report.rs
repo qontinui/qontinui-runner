@@ -170,7 +170,9 @@ pub(crate) fn parse_line(line: &str) -> Option<Onset> {
             other => other.to_string(),
         };
         // "— pid {pid}, probe heartbeat …"
-        let pid = rest.find("pid ").and_then(|i| leading_u32(&rest[i + 4..]));
+        let pid = rest
+            .split_once("pid ")
+            .and_then(|(_, after)| leading_u32(after));
         Some(Onset {
             at,
             kind,
@@ -181,7 +183,8 @@ pub(crate) fn parse_line(line: &str) -> Option<Onset> {
         // "… (pid {pid})" at the very end.
         let pid = line
             .strip_suffix(')')
-            .and_then(|s| s.rfind("(pid ").map(|i| &s[i + 5..]))
+            .and_then(|s| s.rsplit_once("(pid "))
+            .map(|(_, digits)| digits)
             .and_then(|s| s.parse::<u32>().ok());
         Some(Onset {
             at,
