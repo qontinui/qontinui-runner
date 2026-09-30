@@ -16,9 +16,9 @@
 //! [`super::census::qontinui_root`]). Per repo root (and its `src-tauri/`
 //! sub-root, where the runner's own cargo workspace lives) the candidate
 //! target dirs are `target`, `target-agent` and each `target-pool/*` slot; the
-//! lock files are `<t>/*/.cargo-lock` and `<t>/*/*/.cargo-lock` (the second
-//! level is the `--target <triple>` layout). No deeper recursion, and at most
-//! [`MAX_CARGO_LOCK_ITEMS`] items.
+//! lock files are `<t>/*/.cargo-lock`, and `<t>/*/*/.cargo-lock` only under a
+//! level-1 dir that has no lock of its own (the `--target <triple>` layout).
+//! No deeper recursion, and at most [`MAX_CARGO_LOCK_ITEMS`] items.
 //!
 //! Idle locks are reported too (holder fields `null`, `waiters: 0`): the item
 //! set is the census of shared targets, not only the busy ones.
@@ -28,9 +28,26 @@
 //! Linux only. `/proc/locks` is read ONCE per tick and parsed by the pure
 //! [`parse_proc_locks`] into `(major, minor, inode) → holders + waiters`; a
 //! plain row is a granted lock, a `->` row is a process BLOCKED on that same
-//! lock. Lock files are matched by `st_dev` / `st_ino`. The holder is named
-//! from `/proc/<pid>/cmdline` (never `environ`) and aged from
-//! `/proc/<pid>/stat` `starttime` against `/proc/uptime`.
+//! lock. Lock files are matched by `st_dev` / `st_ino` (with an inode-only
+//! fallback, see [`lookup_lock`]).
+//!
+//! ### The pid in `/proc/locks` is the lock's TAKER, not its owner
+//!
+//! A flock belongs to an open file description, and `/proc/locks` prints the
+//! pid of the process that CALLED `flock(2)`. When that is a short-lived
+//! helper on an inherited fd — the claude-config sweeper does
+//! `exec {fd}<file; flock -x "$fd"`, so `flock(1)` exits and the bash that
+//! holds the fd owns the lock — the printed pid is dead, and after pid reuse it
+//! names an unrelated process. So a printed pid is published only when that
+//! process is CONFIRMED to hold the lock (a `lock:` line on the same file in
+//! its `/proc/<pid>/fdinfo/*`). Otherwise the owner is resolved by the
+//! processes that hold the lock file open (minus the waiters), confirmed the
+//! same way; and if nothing confirms, `holder_pid` is `null` with
+//! `holder_kind: "unknown"` — never an unconfirmed pid. That scan runs at most
+//! once per tick, and only on such a miss.
+//!
+//! The owner is named from `/proc/<pid>/cmdline` (never `environ`) and aged
+//! from `/proc/<pid>/stat` `starttime` against `/proc/uptime`.
 //!
 //! ## Wire contract (UNKNOWN is not empty)
 //!
@@ -40,7 +57,7 @@
 //! measurement: the probe ran and found no shared target lock files.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Ceiling on items per tick. The fleet's workspaces hold a few dozen shared
@@ -52,6 +69,11 @@ const HOLDER_CMD_MAX_CHARS: usize = 200;
 
 /// How far up the parent chain the `sweep` classification looks.
 const MAX_ANCESTOR_DEPTH: usize = 16;
+
+/// Ceiling on `/proc/<pid>/fd/*` entries the open-file owner scan reads per
+/// tick — it bounds the one expensive fallback.
+#[cfg(target_os = "linux")]
+const MAX_FD_SCAN: usize = 400_000;
 
 /// Sub-roots of a repo checkout that may host a cargo workspace's targets.
 /// `""` is the repo root itself; `src-tauri` is the runner's cargo workspace.
@@ -65,6 +87,9 @@ const TARGET_POOL: &str = "target-pool";
 
 const LOCK_FILE_NAME: &str = ".cargo-lock";
 
+/// The sweeper's script name, matched as an argv element's basename.
+const SWEEP_SCRIPT: &str = "cargo-target-liveness.sh";
+
 /// What kind of process holds a target lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,7 +99,9 @@ pub enum HolderKind {
     /// The claude-config sweeper (`cargo-target-liveness.sh run-locked`), or a
     /// descendant of it.
     Sweep,
-    /// Anything else, or a holder whose command line could not be read.
+    /// Anything else, a holder whose command line could not be read, or a
+    /// granted lock whose owner could not be confirmed (then `holder_pid` is
+    /// `null`).
     Unknown,
 }
 
@@ -86,14 +113,19 @@ pub struct CargoLockItem {
     /// `<repo>/<lock's parent dir relative to the repo root>`, `/`-separated,
     /// e.g. `qontinui-coord/target/debug`.
     pub target_key: String,
+    /// A CONFIRMED owner pid, or `null` (idle, or held by an unconfirmable owner).
     pub holder_pid: Option<u32>,
+    /// `null` iff the lock is not held.
     pub holder_kind: Option<HolderKind>,
     pub holder_age_secs: Option<u64>,
     pub holder_cmd: Option<String>,
-    /// Processes blocked on this lock (`->` rows in `/proc/locks`).
+    /// Blocked rows (`->`) in `/proc/locks` — including rows whose pid could
+    /// not be translated (`0`) or is an OFD lock (`-1`).
     pub waiters: u32,
-    /// Age of the oldest waiting PROCESS — an upper bound on how long it has
-    /// waited, since `/proc/locks` does not record when a wait began.
+    /// Age of the oldest waiting PROCESS — an upper bound on how long a
+    /// long-lived waiter (a cargo) has waited, since `/proc/locks` does not
+    /// record when a wait began. It is a LOWER bound for the sweeper, whose
+    /// wait is a loop of short `flock -w 5` draws, each a fresh process.
     pub oldest_wait_secs: Option<u64>,
 }
 
@@ -109,12 +141,14 @@ pub struct LockKey {
     pub ino: u64,
 }
 
-/// Every pid granted (`holders`) and blocked on (`waiters`) one lock,
-/// in `/proc/locks` order.
+/// Every pid granted (`holders`) and blocked on (`waiters`) one lock, in
+/// `/proc/locks` order. Pids are RAW: `0` (outside this pid namespace) and
+/// `-1` (an OFD lock) are kept, because the row still says the lock is held
+/// or waited on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockEntry {
-    pub holders: Vec<u32>,
-    pub waiters: Vec<u32>,
+    pub holders: Vec<i32>,
+    pub waiters: Vec<i32>,
 }
 
 /// Parse `/proc/locks` text. Rows look like
@@ -126,9 +160,8 @@ pub struct LockEntry {
 ///
 /// The device is `MAJOR:MINOR` in HEX, the inode in DECIMAL. Every lock type
 /// (FLOCK, POSIX, OFDLCK, …) is keyed the same way — the caller matches by
-/// inode, so unrelated rows are simply never looked up. A row whose pid is not
-/// a positive integer (an OFD lock prints `-1`) or that is otherwise malformed
-/// is skipped rather than guessed at.
+/// inode, so unrelated rows are simply never looked up. A malformed row is
+/// skipped rather than guessed at.
 pub fn parse_proc_locks(text: &str) -> HashMap<LockKey, LockEntry> {
     let mut map: HashMap<LockKey, LockEntry> = HashMap::new();
     for line in text.lines() {
@@ -145,8 +178,9 @@ pub fn parse_proc_locks(text: &str) -> HashMap<LockKey, LockEntry> {
     map
 }
 
-/// One row → `(key, pid, is_waiter)`, or `None` for anything malformed.
-fn parse_proc_locks_line(line: &str) -> Option<(LockKey, u32, bool)> {
+/// One row → `(key, raw pid, is_waiter)`, or `None` for anything malformed.
+/// Also parses the body of an fdinfo `lock:` line, which uses the same format.
+fn parse_proc_locks_line(line: &str) -> Option<(LockKey, i32, bool)> {
     let mut tokens = line.split_whitespace();
     let id = tokens.next()?;
     if !id.ends_with(':') {
@@ -162,7 +196,7 @@ fn parse_proc_locks_line(line: &str) -> Option<(LockKey, u32, bool)> {
         return None;
     }
     let pid: i64 = rest.get(3)?.parse().ok()?;
-    let pid = u32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let pid = i32::try_from(pid).ok()?;
     let key = parse_lock_key(rest.get(4)?)?;
     Some((key, pid, waiting))
 }
@@ -179,6 +213,39 @@ fn parse_lock_key(field: &str) -> Option<LockKey> {
     Some(LockKey { major, minor, ino })
 }
 
+/// How a lock file was matched to a `/proc/locks` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMatch {
+    /// Same device and inode.
+    Exact,
+    /// Inode only — see [`lookup_lock`].
+    InodeOnly,
+}
+
+/// Find the `/proc/locks` entry for a lock file.
+///
+/// Exact `(major, minor, inode)` first. FALLBACK, hypothesis-driven and
+/// unmeasured here (this box is ext4): on btrfs subvolumes and overlayfs the
+/// `st_dev` that `stat` reports can differ from the superblock device
+/// `/proc/locks` prints, so an exact miss would read a held lock as idle. When
+/// the exact key misses but the inode appears under EXACTLY ONE key, that key
+/// is taken; an inode shared by two devices is ambiguous and matches nothing.
+/// The claude-config Phase 1 helper uses the same rule.
+pub fn lookup_lock(
+    locks: &HashMap<LockKey, LockEntry>,
+    key: LockKey,
+) -> Option<(LockKey, &LockEntry, LockMatch)> {
+    if let Some(e) = locks.get(&key) {
+        return Some((key, e, LockMatch::Exact));
+    }
+    let mut same_ino = locks.iter().filter(|(k, _)| k.ino == key.ino);
+    let (k, e) = same_ino.next()?;
+    if same_ino.next().is_some() {
+        return None;
+    }
+    Some((*k, e, LockMatch::InodeOnly))
+}
+
 /// Split a Linux `st_dev` into `(major, minor)` — glibc's `gnu_dev_major` /
 /// `gnu_dev_minor` bit layout, which is what the kernel's `new_encode_dev`
 /// produces for `stat`.
@@ -190,6 +257,33 @@ pub fn dev_major_minor(dev: u64) -> (u32, u32) {
         u32::try_from(major).unwrap_or(u32::MAX),
         u32::try_from(minor).unwrap_or(u32::MAX),
     )
+}
+
+/// True iff `/proc/<pid>/fdinfo/<fd>` text carries a GRANTED `lock:` line on
+/// `key`. The kernel prints, per fd, the locks owned through that fd's open
+/// file description, in `/proc/locks` format after a `lock:` prefix.
+pub fn fdinfo_holds_lock(fdinfo: &str, key: LockKey) -> bool {
+    fdinfo.lines().any(|line| {
+        line.strip_prefix("lock:")
+            .and_then(parse_proc_locks_line)
+            .is_some_and(|(k, _, waiting)| k == key && !waiting)
+    })
+}
+
+/// A process confirmed to hold a lock: `(pid, ppid, starttime_ticks)`.
+pub type OwnerCandidate = (u32, u32, u64);
+
+/// Choose the owner among processes confirmed to hold one lock. Children
+/// inherit the fd (`sh -c 'exec 9<f; flock -x 9; cargo …'` shows the lock in
+/// both), so the TOPMOST candidate — one whose parent is not a candidate — is
+/// the owner; ties break by earliest start, then lowest pid.
+pub fn pick_owner(cands: &[OwnerCandidate]) -> Option<u32> {
+    let pids: HashSet<u32> = cands.iter().map(|c| c.0).collect();
+    cands
+        .iter()
+        .filter(|(_, ppid, _)| !pids.contains(ppid))
+        .min_by_key(|(pid, _, start)| (*start, *pid))
+        .map(|c| c.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,37 +316,61 @@ pub fn process_age_secs(starttime_ticks: u64, uptime_secs: f64, ticks_per_sec: u
     age as u64
 }
 
-/// `/proc/<pid>/cmdline` bytes → a printable, truncated command line
-/// (NUL-separated argv joined with spaces). `None` when empty (a kernel
-/// thread or a process that already exited).
-pub fn cmdline_to_string(raw: &[u8]) -> Option<String> {
-    let joined = raw
-        .split(|b| *b == 0)
+/// `/proc/<pid>/cmdline` bytes → the UNTRUNCATED argv. Empty for a kernel
+/// thread or an exited process.
+pub fn cmdline_argv(raw: &[u8]) -> Vec<String> {
+    raw.split(|b| *b == 0)
         .filter(|arg| !arg.is_empty())
-        .map(String::from_utf8_lossy)
-        .collect::<Vec<_>>()
-        .join(" ");
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
+/// argv → a printable, truncated command line. `None` when empty.
+pub fn argv_display(argv: &[String]) -> Option<String> {
+    let joined = argv.join(" ");
     if joined.is_empty() {
         return None;
     }
     Some(joined.chars().take(HOLDER_CMD_MAX_CHARS).collect())
 }
 
-/// Classify a holder from its own command line and its ancestors'
-/// (`chain[0]` is the holder). `sweep` wins over `build`: a cargo invoked BY
-/// the sweeper's `run-locked` is the sweep, not an agent build.
-pub fn classify_holder(chain: &[String]) -> HolderKind {
-    if chain
-        .iter()
-        .any(|c| c.contains("cargo-target-liveness.sh") && c.contains("run-locked"))
-    {
+fn basename(arg: &str) -> &str {
+    arg.rsplit(['/', '\\']).next().unwrap_or(arg)
+}
+
+/// True iff `argv` is `… <path>/cargo-target-liveness.sh [--exclude-pid N]… run-locked …`,
+/// matched on argv ELEMENTS (never a substring of a joined string).
+pub fn is_sweep_argv(argv: &[String]) -> bool {
+    let Some(script) = argv.iter().position(|a| basename(a) == SWEEP_SCRIPT) else {
+        return false;
+    };
+    let mut rest = argv.iter().skip(script + 1);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "run-locked" => return true,
+            "--exclude-pid" => {
+                if rest.next().is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Classify a holder from its own argv and its ancestors' (`chain[0]` is the
+/// holder). `sweep` wins over `build`: a cargo invoked BY the sweeper's
+/// `run-locked` is the sweep, not an agent build.
+pub fn classify_holder(chain: &[Vec<String>]) -> HolderKind {
+    if chain.iter().any(|argv| is_sweep_argv(argv)) {
         return HolderKind::Sweep;
     }
     let argv0 = chain
         .first()
-        .and_then(|c| c.split_whitespace().next())
-        .unwrap_or("");
-    let base = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+        .and_then(|a| a.first())
+        .map_or("", |s| s.as_str());
+    let base = basename(argv0);
     let base = base.strip_suffix(".exe").unwrap_or(base);
     const BUILD_TOOLS: &[&str] = &[
         "cargo",
@@ -331,7 +449,8 @@ fn rel_key(repo_name: &str, repo_root: &Path, dir: &Path) -> Option<String> {
 /// Every `.cargo-lock` of every shared target of every canonical repo
 /// checkout directly under `workspace_root`, capped at `cap`. Repos are the
 /// same set the census anchors on ([`super::census::is_canonical_repo_root`]).
-pub fn enumerate_shared_lock_files(workspace_root: &Path, cap: usize) -> Vec<LockFile> {
+/// The bool is `true` when the cap cut the list short.
+pub fn enumerate_shared_lock_files(workspace_root: &Path, cap: usize) -> (Vec<LockFile>, bool) {
     let mut out = Vec::new();
     for repo_root in child_dirs(workspace_root) {
         if !super::census::is_canonical_repo_root(&repo_root) {
@@ -342,8 +461,13 @@ pub fn enumerate_shared_lock_files(workspace_root: &Path, cap: usize) -> Vec<Loc
         };
         for target in shared_target_dirs(&repo_root) {
             for level1 in child_dirs(&target) {
-                let mut dirs = vec![level1.clone()];
-                dirs.extend(child_dirs(&level1));
+                // A profile dir (`debug`) has its own lock; only a dir without
+                // one (a `--target <triple>` dir) is descended into.
+                let dirs = if level1.join(LOCK_FILE_NAME).is_file() {
+                    vec![level1]
+                } else {
+                    child_dirs(&level1)
+                };
                 for dir in dirs {
                     let lock = dir.join(LOCK_FILE_NAME);
                     if !lock.is_file() {
@@ -352,18 +476,18 @@ pub fn enumerate_shared_lock_files(workspace_root: &Path, cap: usize) -> Vec<Loc
                     let Some(target_key) = rel_key(repo_name, &repo_root, &dir) else {
                         continue;
                     };
+                    if out.len() >= cap {
+                        return (out, true);
+                    }
                     out.push(LockFile {
                         target_key,
                         path: lock,
                     });
-                    if out.len() >= cap {
-                        return out;
-                    }
                 }
             }
         }
     }
-    out
+    (out, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -384,17 +508,46 @@ pub fn probe_current() -> Option<Vec<CargoLockItem>> {
     }
 }
 
+/// Epoch of the last cap-truncation warning.
+#[cfg(target_os = "linux")]
+static LAST_TRUNCATION_LOG_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// At most one truncation warning per hour.
+#[cfg(target_os = "linux")]
+fn warn_truncated_throttled(cap: usize) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST_TRUNCATION_LOG_EPOCH.load(Ordering::Acquire);
+    if now.saturating_sub(last) >= 3600
+        && LAST_TRUNCATION_LOG_EPOCH
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        tracing::warn!(
+            "cargo_locks: more than {cap} shared-target lock files — the published list is \
+             TRUNCATED to the first {cap} (sorted by repo/target)"
+        );
+    }
+}
+
 /// Probe one workspace root. `None` when `/proc/locks` cannot be read.
 #[cfg(target_os = "linux")]
 pub fn probe_workspace(workspace_root: &Path) -> Option<Vec<CargoLockItem>> {
     let locks_text = std::fs::read_to_string("/proc/locks").ok()?;
     let locks = parse_proc_locks(&locks_text);
-    let files = enumerate_shared_lock_files(workspace_root, MAX_CARGO_LOCK_ITEMS);
+    let (files, truncated) = enumerate_shared_lock_files(workspace_root, MAX_CARGO_LOCK_ITEMS);
+    if truncated {
+        warn_truncated_throttled(MAX_CARGO_LOCK_ITEMS);
+    }
     let mut procs = ProcReader::new();
+    let lock_paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
     Some(
         files
-            .into_iter()
-            .filter_map(|f| lock_item(&f, &locks, &mut procs))
+            .iter()
+            .filter_map(|f| lock_item(f, &locks, &mut procs, &lock_paths))
             .collect(),
     )
 }
@@ -404,37 +557,54 @@ fn lock_item(
     file: &LockFile,
     locks: &HashMap<LockKey, LockEntry>,
     procs: &mut ProcReader,
+    all_lock_paths: &[PathBuf],
 ) -> Option<CargoLockItem> {
     use std::os::unix::fs::MetadataExt;
     // A lock file that vanished between enumeration and stat is dropped, not
     // reported idle — an idle report would be a fabricated measurement.
     let md = std::fs::metadata(&file.path).ok()?;
     let (major, minor) = dev_major_minor(md.dev());
-    let key = LockKey {
+    let stat_key = LockKey {
         major,
         minor,
         ino: md.ino(),
     };
-    let entry = locks.get(&key);
-    let holder_pid = entry.and_then(|e| e.holders.first().copied());
-    let waiter_pids: &[u32] = entry.map(|e| e.waiters.as_slice()).unwrap_or(&[]);
-
-    let (holder_kind, holder_age_secs, holder_cmd) = match holder_pid {
-        Some(pid) => {
-            let cmd = procs.cmdline(pid);
-            let kind = match &cmd {
-                Some(c) => {
-                    let mut chain = vec![c.clone()];
-                    chain.extend(procs.ancestor_cmdlines(pid));
-                    classify_holder(&chain)
-                }
-                None => HolderKind::Unknown,
-            };
-            (Some(kind), procs.age_secs(pid), cmd)
-        }
-        None => (None, None, None),
+    let matched = lookup_lock(locks, stat_key);
+    let (holders, waiters): (&[i32], &[i32]) = match &matched {
+        Some((_, e, _)) => (e.holders.as_slice(), e.waiters.as_slice()),
+        None => (&[], &[]),
     };
-    let oldest_wait_secs = waiter_pids.iter().filter_map(|p| procs.age_secs(*p)).max();
+
+    let (holder_pid, holder_kind, holder_age_secs, holder_cmd) = match &matched {
+        Some((key, _, _)) if !holders.is_empty() => {
+            match procs.resolve_owner(*key, holders, waiters, &file.path, all_lock_paths) {
+                Some(pid) => {
+                    let argv = procs.argv(pid);
+                    let kind = if argv.is_empty() {
+                        HolderKind::Unknown
+                    } else {
+                        let mut chain = vec![argv.clone()];
+                        chain.extend(procs.ancestor_argvs(pid));
+                        classify_holder(&chain)
+                    };
+                    (
+                        Some(pid),
+                        Some(kind),
+                        procs.age_secs(pid),
+                        argv_display(&argv),
+                    )
+                }
+                // Held, but no owner could be CONFIRMED: never publish a pid.
+                None => (None, Some(HolderKind::Unknown), None, None),
+            }
+        }
+        _ => (None, None, None, None),
+    };
+    let oldest_wait_secs = waiters
+        .iter()
+        .filter_map(|p| u32::try_from(*p).ok().filter(|p| *p > 0))
+        .filter_map(|p| procs.age_secs(p))
+        .max();
 
     Some(CargoLockItem {
         target_key: file.target_key.clone(),
@@ -442,18 +612,20 @@ fn lock_item(
         holder_kind,
         holder_age_secs,
         holder_cmd,
-        waiters: u32::try_from(waiter_pids.len()).unwrap_or(u32::MAX),
+        waiters: u32::try_from(waiters.len()).unwrap_or(u32::MAX),
         oldest_wait_secs,
     })
 }
 
-/// Per-tick `/proc` reader: uptime and tick rate read once; `stat` memoized
-/// (17 waiters on one lock share ancestors).
+/// Per-tick `/proc` reader: uptime and tick rate read once; `stat` memoized;
+/// the open-file index built at most once, on the first unconfirmed holder.
 #[cfg(target_os = "linux")]
 struct ProcReader {
     uptime_secs: Option<f64>,
     ticks_per_sec: u64,
     stats: HashMap<u32, Option<String>>,
+    /// Canonical lock path → `(pid, fd)` pairs holding it open.
+    open_index: Option<HashMap<PathBuf, Vec<(u32, String)>>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -468,6 +640,7 @@ impl ProcReader {
             uptime_secs,
             ticks_per_sec: u64::try_from(ticks).ok().filter(|t| *t > 0).unwrap_or(100),
             stats: HashMap::new(),
+            open_index: None,
         }
     }
 
@@ -485,13 +658,14 @@ impl ProcReader {
         Some(process_age_secs(start, uptime, ticks))
     }
 
-    /// NEVER `environ` — only `cmdline`.
-    fn cmdline(&self, pid: u32) -> Option<String> {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        cmdline_to_string(&raw)
+    /// NEVER `environ` — only `cmdline`. Empty when unreadable.
+    fn argv(&self, pid: u32) -> Vec<String> {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| cmdline_argv(&raw))
+            .unwrap_or_default()
     }
 
-    fn ancestor_cmdlines(&mut self, pid: u32) -> Vec<String> {
+    fn ancestor_argvs(&mut self, pid: u32) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         let mut cur = pid;
         for _ in 0..MAX_ANCESTOR_DEPTH {
@@ -501,12 +675,108 @@ impl ProcReader {
             if ppid <= 1 || ppid == cur {
                 break;
             }
-            if let Some(c) = self.cmdline(ppid) {
-                out.push(c);
+            let argv = self.argv(ppid);
+            if !argv.is_empty() {
+                out.push(argv);
             }
             cur = ppid;
         }
         out
+    }
+
+    /// Does `pid` hold `key` through any of its fds?
+    fn pid_holds(pid: u32, key: LockKey) -> bool {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fdinfo")) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .any(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| fdinfo_holds_lock(&t, key)))
+    }
+
+    /// The confirmed owner of a granted lock, or `None`.
+    ///
+    /// 1. The first printed holder (in `/proc/locks` order) that is a real pid
+    ///    AND confirmed via its own fdinfo.
+    /// 2. Otherwise the processes holding the lock file open, minus the
+    ///    waiters, each confirmed via the fdinfo of that fd; the topmost
+    ///    ([`pick_owner`]) wins.
+    fn resolve_owner(
+        &mut self,
+        key: LockKey,
+        holders: &[i32],
+        waiters: &[i32],
+        lock_path: &Path,
+        all_lock_paths: &[PathBuf],
+    ) -> Option<u32> {
+        for pid in holders.iter().filter_map(|p| u32::try_from(*p).ok()) {
+            if pid > 0 && Self::pid_holds(pid, key) {
+                return Some(pid);
+            }
+        }
+        let canon = std::fs::canonicalize(lock_path).ok()?;
+        let waiting: HashSet<u32> = waiters
+            .iter()
+            .filter_map(|p| u32::try_from(*p).ok())
+            .collect();
+        let openers = self.open_index(all_lock_paths).get(&canon).cloned()?;
+        let mut cands: Vec<OwnerCandidate> = Vec::new();
+        for (pid, fd) in openers {
+            if waiting.contains(&pid) {
+                continue;
+            }
+            let held = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+                .is_ok_and(|t| fdinfo_holds_lock(&t, key));
+            if !held {
+                continue;
+            }
+            let Some(stat) = self.stat(pid) else {
+                continue;
+            };
+            let ppid = ppid_from_stat(stat).unwrap_or(0);
+            let start = starttime_ticks_from_stat(stat).unwrap_or(u64::MAX);
+            cands.push((pid, ppid, start));
+        }
+        pick_owner(&cands)
+    }
+
+    /// Scan `/proc/*/fd/*` ONCE per tick for fds open on any of the lock
+    /// files, bounded by [`MAX_FD_SCAN`]. Other users' processes are
+    /// unreadable and skipped.
+    fn open_index(&mut self, lock_paths: &[PathBuf]) -> &HashMap<PathBuf, Vec<(u32, String)>> {
+        self.open_index.get_or_insert_with(|| {
+            let wanted: HashSet<PathBuf> = lock_paths
+                .iter()
+                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .collect();
+            let mut index: HashMap<PathBuf, Vec<(u32, String)>> = HashMap::new();
+            let mut scanned = 0usize;
+            let Ok(procs) = std::fs::read_dir("/proc") else {
+                return index;
+            };
+            'pids: for p in procs.flatten() {
+                let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
+                    continue;
+                };
+                for fd in fds.flatten() {
+                    scanned += 1;
+                    if scanned > MAX_FD_SCAN {
+                        break 'pids;
+                    }
+                    let Ok(target) = std::fs::read_link(fd.path()) else {
+                        continue;
+                    };
+                    if wanted.contains(&target) {
+                        let fd_name = fd.file_name().to_string_lossy().into_owned();
+                        index.entry(target).or_default().push((pid, fd_name));
+                    }
+                }
+            }
+            index
+        })
     }
 }
 
@@ -514,9 +784,10 @@ impl ProcReader {
 mod tests {
     use super::*;
 
-    /// Built from the real 2026-09-29 sample on merytshost: coord's
-    /// `target/debug/.cargo-lock` (inode 16669579) with one holder and 17
-    /// blocked waiters, interleaved with unrelated FLOCK and POSIX rows.
+    /// MODELED ON the real 2026-09-29 sample on merytshost (coord's
+    /// `target/debug/.cargo-lock`, inode 16669579, one holder and 17 blocked
+    /// waiters, interleaved with unrelated FLOCK and POSIX rows). The holder
+    /// pid and the unrelated rows are real; the waiter pids are synthetic.
     const PROC_LOCKS_FIXTURE: &str = "\
 1: FLOCK  ADVISORY  READ 3941263 08:01:16019097 0 EOF
 2: POSIX  ADVISORY  READ 815964 08:01:16943815 124 124
@@ -547,6 +818,14 @@ mod tests {
         ino: 16_669_579,
     };
 
+    fn key(major: u32, minor: u32, ino: u64) -> LockKey {
+        LockKey { major, minor, ino }
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn parser_names_the_holder_and_every_waiter() {
         let map = parse_proc_locks(PROC_LOCKS_FIXTURE);
@@ -564,20 +843,12 @@ mod tests {
     fn parser_keeps_other_inodes_separate_and_handles_posix_rows() {
         let map = parse_proc_locks(PROC_LOCKS_FIXTURE);
         let shared = map
-            .get(&LockKey {
-                major: 8,
-                minor: 1,
-                ino: 16_019_097,
-            })
+            .get(&key(8, 1, 16_019_097))
             .expect("shared READ flock parsed");
         assert_eq!(shared.holders, vec![3_941_263, 2_391_387]);
         assert!(shared.waiters.is_empty());
         let posix = map
-            .get(&LockKey {
-                major: 8,
-                minor: 1,
-                ino: 16_943_815,
-            })
+            .get(&key(8, 1, 16_943_815))
             .expect("POSIX row parsed under its own key");
         assert_eq!(posix.holders, vec![815_964]);
         assert_eq!(map.len(), 3);
@@ -590,22 +861,71 @@ garbage
 1: FLOCK ADVISORY WRITE
 2: FLOCK  ADVISORY  WRITE notapid 08:01:5 0 EOF
 3: FLOCK  ADVISORY  WRITE 42 zz:01:5 0 EOF
-4: OFDLCK ADVISORY  WRITE -1 08:01:5 0 EOF
 5 FLOCK  ADVISORY  WRITE 42 08:01:5 0 EOF
 6: FLOCK  ADVISORY  WRITE 42 08:01:5:9 0 EOF
+8: FLOCK  ADVISORY  WRITE 99999999999 08:01:5 0 EOF
 
 7: FLOCK  ADVISORY  WRITE 7 00:1f:99 0 EOF
 ";
         let map = parse_proc_locks(text);
         assert_eq!(map.len(), 1, "only the well-formed row survives: {map:?}");
-        let e = map
-            .get(&LockKey {
-                major: 0,
-                minor: 0x1f,
-                ino: 99,
-            })
-            .expect("hex minor parsed");
+        let e = map.get(&key(0, 0x1f, 99)).expect("hex minor parsed");
         assert_eq!(e.holders, vec![7]);
+    }
+
+    /// W2: pid 0 (outside our pid namespace) and -1 (OFD) rows are KEPT — the
+    /// lock is still held / waited on.
+    #[test]
+    fn parser_keeps_untranslatable_and_ofd_pids() {
+        let text = "\
+1: OFDLCK ADVISORY  WRITE -1 08:01:5 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 0 08:01:5 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 44 08:01:5 0 EOF
+";
+        let map = parse_proc_locks(text);
+        let e = map.get(&key(8, 1, 5)).expect("parsed");
+        assert_eq!(e.holders, vec![-1]);
+        assert_eq!(e.waiters, vec![0, 44]);
+    }
+
+    /// W1: inode-only fallback when the device differs, but only when the
+    /// inode is unambiguous.
+    #[test]
+    fn lookup_falls_back_to_a_unique_inode_only() {
+        let map = parse_proc_locks(PROC_LOCKS_FIXTURE);
+        let (k, _, how) = lookup_lock(&map, COORD_LOCK).expect("exact");
+        assert_eq!((k, how), (COORD_LOCK, LockMatch::Exact));
+        // btrfs-style: stat reports an anonymous device 00:2f.
+        let (k, e, how) = lookup_lock(&map, key(0, 0x2f, 16_669_579)).expect("inode fallback");
+        assert_eq!((k, how), (COORD_LOCK, LockMatch::InodeOnly));
+        assert_eq!(e.waiters.len(), 17);
+        assert!(lookup_lock(&map, key(0, 0x2f, 1)).is_none());
+
+        let ambiguous =
+            parse_proc_locks("1: FLOCK  ADVISORY  WRITE 5 08:01:77 0 EOF\n2: FLOCK  ADVISORY  WRITE 6 00:22:77 0 EOF\n");
+        assert!(
+            lookup_lock(&ambiguous, key(0, 0x2f, 77)).is_none(),
+            "an inode on two devices must not match"
+        );
+    }
+
+    #[test]
+    fn fdinfo_lock_lines_confirm_only_the_granted_key() {
+        let fdinfo = "pos:\t0\nflags:\t0100000\nmnt_id:\t29\nino:\t16669579\n\
+lock:\t1: FLOCK  ADVISORY  WRITE 1351229 08:01:16669579 0 EOF\n";
+        assert!(fdinfo_holds_lock(fdinfo, COORD_LOCK));
+        assert!(!fdinfo_holds_lock(fdinfo, key(8, 1, 1)));
+        assert!(!fdinfo_holds_lock("pos:\t0\nflags:\t0\n", COORD_LOCK));
+    }
+
+    #[test]
+    fn owner_is_the_topmost_candidate() {
+        // sh (10) holds fd 9; its children flock-exited, cargo (12) inherited it.
+        assert_eq!(pick_owner(&[(12, 10, 500), (10, 1, 500)]), Some(10));
+        // Unrelated candidates: earliest start, then lowest pid.
+        assert_eq!(pick_owner(&[(30, 1, 900), (20, 1, 400)]), Some(20));
+        assert_eq!(pick_owner(&[(30, 1, 400), (20, 1, 400)]), Some(20));
+        assert_eq!(pick_owner(&[]), None);
     }
 
     #[test]
@@ -632,40 +952,96 @@ garbage
     }
 
     #[test]
-    fn cmdline_is_joined_and_truncated() {
+    fn cmdline_is_split_untruncated_and_displayed_truncated() {
+        let a = cmdline_argv(b"cargo\0test\0-p\0qontinui-coord\0");
+        assert_eq!(a, argv(&["cargo", "test", "-p", "qontinui-coord"]));
         assert_eq!(
-            cmdline_to_string(b"cargo\0test\0-p\0qontinui-coord\0").as_deref(),
+            argv_display(&a).as_deref(),
             Some("cargo test -p qontinui-coord")
         );
-        assert_eq!(cmdline_to_string(b""), None);
+        assert!(cmdline_argv(b"").is_empty());
+        assert_eq!(argv_display(&[]), None);
         let long = vec![b'x'; 500];
-        assert_eq!(
-            cmdline_to_string(&long).map(|s| s.chars().count()),
-            Some(200)
-        );
+        let a = cmdline_argv(&long);
+        assert_eq!(a.first().map(String::len), Some(500), "argv is untruncated");
+        assert_eq!(argv_display(&a).map(|s| s.chars().count()), Some(200));
+    }
+
+    #[test]
+    fn sweep_is_matched_on_argv_elements() {
+        let s = |v: &[&str]| is_sweep_argv(&argv(v));
+        assert!(s(&[
+            "bash",
+            "/x/scripts/cargo-target-liveness.sh",
+            "run-locked",
+            "/t",
+            "5",
+            "--",
+            "cargo",
+            "clean"
+        ]));
+        assert!(s(&[
+            "bash",
+            "cargo-target-liveness.sh",
+            "--exclude-pid",
+            "12",
+            "--exclude-pid",
+            "13",
+            "run-locked",
+            "/t"
+        ]));
+        assert!(!s(&["bash", "/x/cargo-target-liveness.sh", "check", "/t"]));
+        assert!(!s(&[
+            "bash",
+            "/x/cargo-target-liveness.sh",
+            "--exclude-pid"
+        ]));
+        // A substring in some other element is not the sweeper.
+        assert!(!s(&["grep", "cargo-target-liveness.sh run-locked", "log"]));
+        assert!(!s(&[
+            "bash",
+            "/x/not-cargo-target-liveness.sh.bak",
+            "run-locked"
+        ]));
+        // Beyond 200 chars of joined argv still matches (untruncated).
+        let pad = "p".repeat(300);
+        assert!(s(&[
+            "bash",
+            &pad,
+            "/x/cargo-target-liveness.sh",
+            "run-locked"
+        ]));
     }
 
     #[test]
     fn holder_classification() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            classify_holder(&s(&["/home/u/.cargo/bin/cargo test -p x"])),
+            classify_holder(&[argv(&["/home/u/.cargo/bin/cargo", "test", "-p", "x"])]),
             HolderKind::Build
         );
         assert_eq!(
-            classify_holder(&s(&["rustc --crate-name x"])),
+            classify_holder(&[argv(&["rustc", "--crate-name", "x"])]),
             HolderKind::Build
         );
         assert_eq!(
-            classify_holder(&s(&[
-                "cargo clean",
-                "bash /x/scripts/cargo-target-liveness.sh run-locked /t -- cargo clean"
-            ])),
+            classify_holder(&[
+                argv(&["cargo", "clean"]),
+                argv(&[
+                    "bash",
+                    "/x/scripts/cargo-target-liveness.sh",
+                    "run-locked",
+                    "/t",
+                    "5",
+                    "--",
+                    "cargo",
+                    "clean"
+                ]),
+            ]),
             HolderKind::Sweep,
             "an ancestor's run-locked marks the sweep even when the holder is cargo"
         );
         assert_eq!(
-            classify_holder(&s(&["python3 foo.py"])),
+            classify_holder(&[argv(&["python3", "foo.py"])]),
             HolderKind::Unknown
         );
         assert_eq!(classify_holder(&[]), HolderKind::Unknown);
@@ -685,7 +1061,9 @@ garbage
         touch(&root.join("qontinui-coord/target/release/.cargo-lock"));
         touch(&root.join("qontinui-coord/target-agent/debug/.cargo-lock"));
         touch(&root.join("qontinui-coord/target-agent/x86_64-unknown-linux-gnu/debug/.cargo-lock"));
-        // Not a lock: deeper than two levels, and a non-shared target name.
+        // Not locks: level 2 under a profile dir that has its own lock, deeper
+        // than two levels, and a non-shared target name.
+        touch(&root.join("qontinui-coord/target/debug/build/.cargo-lock"));
         touch(&root.join("qontinui-coord/target/debug/deps/x/.cargo-lock"));
         touch(&root.join("qontinui-coord/target-other/debug/.cargo-lock"));
 
@@ -706,10 +1084,9 @@ garbage
     #[test]
     fn enumeration_covers_shared_targets_of_primary_checkouts_only() {
         let tmp = make_workspace();
-        let keys: Vec<String> = enumerate_shared_lock_files(tmp.path(), MAX_CARGO_LOCK_ITEMS)
-            .into_iter()
-            .map(|f| f.target_key)
-            .collect();
+        let (files, truncated) = enumerate_shared_lock_files(tmp.path(), MAX_CARGO_LOCK_ITEMS);
+        assert!(!truncated);
+        let keys: Vec<String> = files.into_iter().map(|f| f.target_key).collect();
         assert_eq!(
             keys,
             vec![
@@ -725,9 +1102,14 @@ garbage
     }
 
     #[test]
-    fn enumeration_is_bounded() {
+    fn enumeration_is_bounded_and_reports_truncation() {
         let tmp = make_workspace();
-        assert_eq!(enumerate_shared_lock_files(tmp.path(), 3).len(), 3);
+        let (files, truncated) = enumerate_shared_lock_files(tmp.path(), 3);
+        assert_eq!(files.len(), 3);
+        assert!(truncated);
+        let (files, truncated) = enumerate_shared_lock_files(tmp.path(), 7);
+        assert_eq!(files.len(), 7);
+        assert!(!truncated, "exactly at the cap is not a truncation");
     }
 
     #[test]
@@ -747,7 +1129,7 @@ garbage
         let item = CargoLockItem {
             target_key: "qontinui-coord/target/debug".into(),
             holder_pid: None,
-            holder_kind: Some(HolderKind::Sweep),
+            holder_kind: Some(HolderKind::Unknown),
             holder_age_secs: None,
             holder_cmd: None,
             waiters: 0,
@@ -758,7 +1140,7 @@ garbage
             serde_json::json!({
                 "target_key": "qontinui-coord/target/debug",
                 "holder_pid": null,
-                "holder_kind": "sweep",
+                "holder_kind": "unknown",
                 "holder_age_secs": null,
                 "holder_cmd": null,
                 "waiters": 0,
@@ -805,5 +1187,67 @@ garbage
         assert_eq!(idle.waiters, 0);
         assert_eq!(idle.oldest_wait_secs, None);
         drop(f);
+    }
+
+    /// C1, live: the sweeper's shape. `sh` opens the lock on fd 9 and runs
+    /// `flock -x 9` — flock(1) takes the lock and EXITS, so `/proc/locks`
+    /// names a dead pid. The probe must name the `sh` that holds the fd, never
+    /// the dead taker. Skipped (with a note) where `flock(1)` is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_probe_resolves_an_inherited_fd_owner_when_the_taker_exited() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        if Command::new("flock").arg("--version").output().is_err() {
+            eprintln!("flock(1) not installed — skipping the inherited-fd owner test");
+            return;
+        }
+        let tmp = make_workspace();
+        let held = tmp.path().join("qontinui-coord/target/debug/.cargo-lock");
+        // `read` is a builtin, so sh itself (no child) waits on stdin.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 9<\"$1\"; flock -x 9 && echo ready; read _x")
+            .arg("sh")
+            .arg(&held)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read ready");
+        assert_eq!(line.trim(), "ready");
+
+        let locks = parse_proc_locks(&std::fs::read_to_string("/proc/locks").expect("locks"));
+        let items = probe_workspace(tmp.path()).expect("/proc/locks readable on Linux");
+        let busy = items
+            .iter()
+            .find(|i| i.target_key == "qontinui-coord/target/debug")
+            .expect("held lock reported");
+
+        // Release the lock and reap the child before asserting.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"\n");
+        }
+        let _ = child.wait();
+
+        let sh_pid = child.id();
+        assert_eq!(
+            busy.holder_pid,
+            Some(sh_pid),
+            "the owner is the sh holding fd 9, not the exited flock(1): {busy:?}"
+        );
+        assert_eq!(busy.holder_kind, Some(HolderKind::Unknown));
+        // And the printed taker really was a different (exited) pid.
+        let printed: Vec<i32> = locks
+            .values()
+            .flat_map(|e| e.holders.iter().copied())
+            .collect();
+        assert!(
+            !printed.contains(&i32::try_from(sh_pid).unwrap_or(-1)),
+            "/proc/locks should have printed flock(1)'s pid, not sh's"
+        );
     }
 }
