@@ -275,14 +275,25 @@ export function endInvokeFailure(
  * The sessions "Close all finished" acts on: REMOTE (not this device's — those
  * are local), finished by the row's OWN status (the client-side guard), not
  * already closed, addressable, and not already seen ending here.
+ *
+ * "Remote" is decided twice, and both must agree: coord's `isCallerDevice`
+ * AND a `deviceId` differing from `callerDeviceId` (the device coord
+ * authenticated this runner as). A bulk close that reached one of THIS
+ * machine's sessions would end local work through the remote path, so an
+ * unknown caller device yields NO candidates rather than a guess — the walk
+ * already reports that read as `unavailable`, this is the second lock.
  */
 export function closeAllFinishedCandidates(
   sessions: readonly FleetSession[],
   hiddenLocally: ReadonlySet<string>,
+  callerDeviceId: string | null | undefined,
 ): FleetSession[] {
+  const caller = callerDeviceId?.trim();
+  if (!caller) return [];
   return sessions.filter(
     (s) =>
       !s.isCallerDevice &&
+      s.deviceId?.trim() !== caller &&
       isFinishedSessionStatus(s.sessionStatus) &&
       !s.closedAt &&
       s.state?.trim() !== "closed" &&
@@ -294,7 +305,14 @@ export function closeAllFinishedCandidates(
 /** What the finished read came to. */
 export type FinishedFleetRead =
   | { kind: "loading" }
-  | { kind: "ok"; sessions: FleetSession[]; capped: boolean; pages: number }
+  | {
+      kind: "ok";
+      sessions: FleetSession[];
+      capped: boolean;
+      pages: number;
+      /** The device coord authenticated this runner as — never null on `ok`. */
+      callerDeviceId: string;
+    }
   | { kind: "unavailable"; message: string }
   | { kind: "error"; message: string; code: FleetErrorCode | null };
 
@@ -304,6 +322,21 @@ export type FinishedPageFetch = (args: {
   limit: number;
   cursor: string | null;
 }) => Promise<FleetSessionsResponse>;
+
+/** Why the bulk read is unavailable when coord did not name this runner's device. */
+export const CALLER_DEVICE_UNKNOWN_MESSAGE =
+  "Close all finished is unavailable: coord did not say which device this runner is, so its " +
+  "own sessions cannot be told apart from remote ones.";
+
+/** Why the bulk read is unavailable when coord could not read the device columns. */
+export const CALLER_DEVICE_COLUMNS_UNAVAILABLE_MESSAGE =
+  "Close all finished is unavailable: coord could not read the device identity columns, so " +
+  "this runner's own sessions cannot be told apart from remote ones.";
+
+/** Why the bulk read is unavailable when pages disagree about the caller device. */
+export const CALLER_DEVICE_CHANGED_MESSAGE =
+  "Close all finished is unavailable: coord named a different caller device part-way through " +
+  "the read.";
 
 /** Enough pages to be the whole set on any real tenant, bounded all the same. */
 export const FINISHED_WALK_MAX_PAGES = 10;
@@ -319,6 +352,12 @@ export const FINISHED_WALK_MAX_PAGES = 10;
  * - A page served with `workAxisColumnsPresent: false` is `unavailable` too —
  *   an older coord that ignored the filter and could not read the column would
  *   otherwise produce a guard-filtered zero with the same false meaning.
+ * - A page with no `callerDeviceId` (an operator principal, or a coord that
+ *   did not say), with `deviceIdentityColumnsPresent: false`, or whose caller
+ *   device disagrees with an earlier page's, is `unavailable`: without a known
+ *   caller device and readable device columns this runner cannot tell its own
+ *   sessions from remote ones, and the bulk action must never offer a local
+ *   session for a remote end.
  * - Hitting the page bound, or a cursor coord hands back unchanged, is
  *   `capped` — the count is then a floor ("N+").
  */
@@ -331,6 +370,7 @@ export async function walkFinishedFleetSessions(
   const byId = new Map<string, FleetSession>();
   let cursor: string | null = null;
   let pages = 0;
+  let callerDeviceId: string | null = null;
   for (;;) {
     let page: FleetSessionsResponse;
     try {
@@ -346,15 +386,26 @@ export async function walkFinishedFleetSessions(
     if (page.workAxisColumnsPresent === false) {
       return { kind: "unavailable", message: fleetErrorMessage("work_axis_columns_absent", null) };
     }
+    if (page.deviceIdentityColumnsPresent === false) {
+      return { kind: "unavailable", message: CALLER_DEVICE_COLUMNS_UNAVAILABLE_MESSAGE };
+    }
+    const pageCaller = page.callerDeviceId?.trim() || null;
+    if (pageCaller === null) {
+      return { kind: "unavailable", message: CALLER_DEVICE_UNKNOWN_MESSAGE };
+    }
+    if (callerDeviceId !== null && callerDeviceId !== pageCaller) {
+      return { kind: "unavailable", message: CALLER_DEVICE_CHANGED_MESSAGE };
+    }
+    callerDeviceId = pageCaller;
     for (const s of page.sessions ?? []) {
       if (isFinishedSessionStatus(s.sessionStatus)) byId.set(s.sessionId, s);
     }
     const next = normalizeFleetCursor(page.nextCursor);
     if (next === null) {
-      return { kind: "ok", sessions: [...byId.values()], capped: false, pages };
+      return { kind: "ok", sessions: [...byId.values()], capped: false, pages, callerDeviceId };
     }
     if (fleetCursorStalled(cursor, next) || pages >= maxPages) {
-      return { kind: "ok", sessions: [...byId.values()], capped: true, pages };
+      return { kind: "ok", sessions: [...byId.values()], capped: true, pages, callerDeviceId };
     }
     cursor = next;
   }

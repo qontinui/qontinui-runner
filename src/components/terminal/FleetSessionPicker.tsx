@@ -448,7 +448,11 @@ export function FleetSessionPicker() {
   const finishedCandidates = useMemo(
     () =>
       finished.read.kind === "ok"
-        ? closeAllFinishedCandidates(finished.read.sessions, endedHere)
+        ? closeAllFinishedCandidates(
+            finished.read.sessions,
+            endedHere,
+            finished.read.callerDeviceId,
+          )
         : [],
     [finished.read, endedHere],
   );
@@ -645,7 +649,7 @@ export function FleetSessionPicker() {
     try {
       const read = await refreshFinished();
       if (read.kind !== "ok") return;
-      const candidates = closeAllFinishedCandidates(read.sessions, endedHere);
+      const candidates = closeAllFinishedCandidates(read.sessions, endedHere, read.callerDeviceId);
       if (candidates.length === 0) return;
       setBulkItems({
         moreExist: read.capped,
