@@ -5579,8 +5579,8 @@ mod tests {
     }
 
     /// Plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
-    /// Phase 8. A TUI that died between `?2026h` and `?2026l` must not tax every
-    /// later chunk with the coalescer's 50 ms hold: once the block is older than
+    /// Phase 8. A TUI that died between `?2026h` and `?2026l` must not leave every
+    /// later chunk held until the next read (one read behind): once the block is older than
     /// `grid::SYNC_OUTPUT_TIMEOUT`, the next chunk is emitted in the read that
     /// carried it. Drives the same grid-advance → `sync_output()` → `feed`
     /// sequence the reader thread runs.
@@ -5616,7 +5616,7 @@ mod tests {
             .backdate_sync_output_open(super::super::grid::SYNC_OUTPUT_TIMEOUT);
 
         // A later chunk (a shell prompt after the TUI died) is emitted in the
-        // same read — not held for another 50 ms.
+        // same read — not held until the next read returns.
         read(b"$ ", 20, &mut coalescer);
         let events = emitted.lock().unwrap().clone();
         assert_eq!(events.len(), 2, "emitted immediately: {events:?}");
