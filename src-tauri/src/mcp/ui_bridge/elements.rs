@@ -3148,7 +3148,7 @@ pub async fn ui_bridge_get_snapshot_handler(
             // cursor is the main window (this route takes no windowLabel).
             // A FILTERED snapshot is not the page's configuration, so it is
             // not recorded (the co-occurrence capture keeps its behaviour).
-            if !(visible_only || current_route_only || with_disabled_only) {
+            if !crate::journey::capture::snapshot_query_is_filtered(&query) {
                 crate::journey::capture::record_snapshot(
                     state.app_state.pg_db.clone(),
                     crate::journey::cursor::CursorKey::new(

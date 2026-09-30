@@ -299,25 +299,38 @@ pub(crate) fn component_action_fingerprint(component_id: &str, action_id: &str) 
 /// a neighbour. A declared `write` / `destructive` always stands: knowing that
 /// one action is dangerous is enough to never treat the element as safe.
 pub(crate) fn element_declared_effect(element: &serde_json::Value) -> Option<IrEffect> {
+    let custom: Vec<(Option<&str>, Option<IrEffect>)> = element
+        .get("customActions")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|a| {
+                    (
+                        a.get("id").and_then(|v| v.as_str()),
+                        parse_effect(a.get("effect")),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // The runner folds each custom action's id INTO `actions`
+    // (`advertise_custom_actions_in_payload`), so a name in `actions` that is
+    // also a custom action id is not a standard (undeclared) action (n1).
     let standard = element
         .get("actions")
         .and_then(|a| a.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    let custom: Vec<Option<IrEffect>> = element
-        .get("customActions")
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().map(|a| parse_effect(a.get("effect"))).collect())
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.as_str())
+        .any(|name| !custom.iter().any(|(id, _)| *id == Some(name)));
 
     let max = custom
         .iter()
-        .flatten()
-        .copied()
+        .filter_map(|(_, e)| *e)
         .max_by_key(|e| severity(*e));
     match max {
         Some(e) if severity(e) > 0 => Some(e),
-        Some(e) if !standard && custom.iter().all(Option::is_some) => Some(e),
+        Some(e) if !standard && custom.iter().all(|(_, eff)| eff.is_some()) => Some(e),
         _ => None,
     }
 }
@@ -330,6 +343,56 @@ fn element_is_interactive(element: &serde_json::Value) -> bool {
             .is_some_and(|a| !a.is_empty())
     };
     non_empty("actions") || non_empty("customActions")
+}
+
+/// True for an element whose text is USER INPUT rather than an app-declared
+/// label: `input` / `textarea` (by `type` or `tagName`), a contenteditable
+/// element, or a `combobox` / `searchbox` / `textbox` role.
+pub(crate) fn is_input_like(element: &serde_json::Value) -> bool {
+    let lower = |key: &str| {
+        element
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+    };
+    let kind = |k: Option<String>| k.is_some_and(|t| matches!(t.as_str(), "input" | "textarea"));
+    let editable = ["contenteditable", "contentEditable", "isContentEditable"]
+        .iter()
+        .any(|k| {
+            element
+                .get(*k)
+                .or_else(|| element.get("attributes").and_then(|a| a.get(*k)))
+                .is_some_and(|v| v == &serde_json::Value::Bool(true) || v.as_str() == Some("true"))
+        });
+    let role = extract_role(element).map(|r| r.to_ascii_lowercase());
+    kind(lower("type"))
+        || kind(lower("tagName"))
+        || editable
+        || role.is_some_and(|r| matches!(r.as_str(), "combobox" | "searchbox" | "textbox"))
+}
+
+/// The JOURNEY fingerprint of an element (m5): the co-occurrence
+/// [`stable_element_fingerprint`], except that an input-like element's text
+/// and value are left out — they are what the user typed, so a fingerprint
+/// folding them in would both leak a hash of user input into
+/// `targetFingerprint` / `affordance_fingerprint` and split one field into a
+/// new affordance per keystroke. The co-occurrence fingerprint itself is
+/// unchanged.
+pub(crate) fn journey_element_fingerprint(element: &serde_json::Value) -> String {
+    if !is_input_like(element) {
+        return stable_element_fingerprint(element);
+    }
+    let mut redacted = element.clone();
+    if let Some(obj) = redacted.as_object_mut() {
+        for key in ["text", "text_content", "textContent", "value", "innerText"] {
+            obj.remove(key);
+        }
+        if let Some(state) = obj.get_mut("state").and_then(|s| s.as_object_mut()) {
+            state.remove("value");
+            state.remove("textContent");
+        }
+    }
+    stable_element_fingerprint(&redacted)
 }
 
 /// Index every interactive affordance of a snapshot: each element with at
@@ -363,7 +426,7 @@ pub(crate) fn extract_affordances(snapshot: &serde_json::Value) -> AffordanceInd
             id.to_string(),
             ElementAffordance {
                 affordance: Affordance {
-                    fingerprint: stable_element_fingerprint(element),
+                    fingerprint: journey_element_fingerprint(element),
                     navigation: is_navigation_affordance(
                         extract_role(element).as_deref(),
                         element
@@ -562,6 +625,61 @@ mod tests {
         assert_eq!(
             element_declared_effect(&json!({"actions": ["click"]})),
             None
+        );
+    }
+
+    #[test]
+    fn a_folded_custom_action_is_not_a_standard_action() {
+        // n1: the runner folds custom action ids into `actions`; an element
+        // whose only actions are declared-read custom ones still reads `read`.
+        let folded =
+            json!({"actions": ["peek"], "customActions": [{"id": "peek", "effect": "read"}]});
+        assert_eq!(element_declared_effect(&folded), Some(IrEffect::Read));
+        let mixed = json!({"actions": ["click", "peek"], "customActions": [{"id": "peek", "effect": "read"}]});
+        assert_eq!(
+            element_declared_effect(&mixed),
+            None,
+            "click is still undeclared"
+        );
+    }
+
+    #[test]
+    fn the_journey_fingerprint_ignores_what_was_typed() {
+        // m5: an input's value/text changes as the user types; its journey
+        // fingerprint must not.
+        let field = |v: &str| json!({"id": "q", "type": "input", "label": "Search", "value": v, "text": v, "actions": ["type"]});
+        assert_eq!(
+            journey_element_fingerprint(&field("")),
+            journey_element_fingerprint(&field("secret query"))
+        );
+        let searchbox =
+            |v: &str| json!({"id": "s", "role": "searchbox", "label": "Find", "text": v});
+        assert_eq!(
+            journey_element_fingerprint(&searchbox("a")),
+            journey_element_fingerprint(&searchbox("b"))
+        );
+        // A button's text is an app-declared label: it still counts, and the
+        // co-occurrence fingerprint is untouched.
+        let button = |t: &str| json!({"id": "b", "type": "button", "text": t});
+        assert_ne!(
+            journey_element_fingerprint(&button("Save")),
+            journey_element_fingerprint(&button("Delete"))
+        );
+        assert_eq!(
+            journey_element_fingerprint(&button("Save")),
+            stable_element_fingerprint(&button("Save"))
+        );
+        // An unlabelled input whose ONLY name source is its value: the
+        // co-occurrence fingerprint folds the value in (unchanged behaviour),
+        // the journey one does not.
+        let bare = |v: &str| json!({"id": "q", "type": "input", "text": v});
+        assert_ne!(
+            stable_element_fingerprint(&bare("a")),
+            stable_element_fingerprint(&bare("b"))
+        );
+        assert_eq!(
+            journey_element_fingerprint(&bare("a")),
+            journey_element_fingerprint(&bare("b"))
         );
     }
 

@@ -97,6 +97,50 @@ pub(crate) fn control_action_verdict<T: serde::Serialize>(
     }
 }
 
+/// Is a snapshot request FILTERED (M2)? `visibleOnly`, `currentRouteOnly`,
+/// `withDisabledOnly` (either spelling) set truthy, or any `recency`. A
+/// filtered snapshot is a view of the page, not its configuration, so it
+/// neither resolves a node nor closes a pending edge.
+pub(crate) fn snapshot_query_is_filtered(
+    query: &std::collections::HashMap<String, String>,
+) -> bool {
+    let truthy = |k: &str| {
+        query.get(k).is_some_and(|v| {
+            let s = v.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        })
+    };
+    [
+        "visibleOnly",
+        "currentRouteOnly",
+        "withDisabledOnly",
+        "with_disabled_only",
+    ]
+    .into_iter()
+    .any(truthy)
+        || query.contains_key("recency")
+}
+
+/// Relay/tab refusal codes: the SDK relay answered without reaching any UI.
+pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
+
+/// Did an SDK route's answer come from a REFUSAL rather than an attempted
+/// action (m3)? The relay's `TAB_NOT_FOUND` / `TAB_STALE` envelope — `code`
+/// or `errorCode` at the top level, under `error`, or under `data`. Like the
+/// control surface's 4xx rule, a refusal records nothing.
+pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
+    let code_in = |v: Option<&serde_json::Value>| {
+        v.into_iter().any(|v| {
+            ["code", "errorCode"].iter().any(|k| {
+                v.get(*k)
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| SDK_REFUSAL_CODES.contains(&c))
+            })
+        })
+    };
+    code_in(Some(response)) || code_in(response.get("error")) || code_in(response.get("data"))
+}
+
 /// `task_run_id` (the run the action routes already attribute events to) as
 /// the ledger's `run_id`.
 pub(crate) fn run_id_from_task_run(task_run_id: Option<i64>) -> Option<String> {
@@ -960,6 +1004,50 @@ mod tests {
         let ok: Result<_, (StatusCode, Json<ApiResponse<()>>)> =
             Ok(Json(ApiResponse::success(serde_json::json!({}))));
         assert_eq!(control_action_verdict(&ok), Some(false));
+    }
+
+    // ---- M2: filtered snapshots ----------------------------------------------
+
+    #[test]
+    fn a_filtered_snapshot_is_never_recorded() {
+        let q = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert!(!snapshot_query_is_filtered(&q(&[])));
+        assert!(!snapshot_query_is_filtered(&q(&[
+            ("visibleOnly", "false"),
+            ("tabId", "t1")
+        ])));
+        assert!(snapshot_query_is_filtered(&q(&[("visibleOnly", "1")])));
+        assert!(snapshot_query_is_filtered(&q(&[(
+            "currentRouteOnly",
+            "TRUE"
+        )])));
+        assert!(snapshot_query_is_filtered(&q(&[(
+            "with_disabled_only",
+            "true"
+        )])));
+        assert!(snapshot_query_is_filtered(&q(&[("recency", "5000")])));
+    }
+
+    // ---- m3: SDK refusals record nothing ------------------------------------
+
+    #[test]
+    fn a_relay_tab_refusal_is_not_an_action() {
+        assert!(sdk_refusal(
+            &json!({"success": false, "code": "TAB_NOT_FOUND"})
+        ));
+        assert!(sdk_refusal(
+            &json!({"success": false, "error": {"code": "TAB_STALE"}})
+        ));
+        assert!(sdk_refusal(&json!({"data": {"errorCode": "TAB_STALE"}})));
+        assert!(!sdk_refusal(
+            &json!({"success": false, "error": "click missed"})
+        ));
+        assert!(!sdk_refusal(&json!({"success": true})));
     }
 
     // ---- diff outcome hint (M5, m4) -----------------------------------------

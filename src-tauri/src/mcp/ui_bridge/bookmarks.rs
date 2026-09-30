@@ -140,29 +140,39 @@ pub async fn ui_bridge_with_diff_handler(
         let result = wrap_ipc_result(
             ui_bridge_request_sync(&state, "execute_batch_with_diff", body.clone()).await,
         );
-        // Each operation carries its OWN before/after snapshots, so each is
-        // its own observed edge (unlike `/control/batch-actions`, which has
-        // no snapshots and is one trigger).
-        if let Ok(Json(resp)) = &result {
-            let operations = body
-                .get("operations")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let results = resp
-                .data
-                .as_ref()
-                .and_then(|d| d.get("results"))
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for (op, op_result) in operations.iter().zip(results.iter()) {
-                let op_ok: Result<
-                    Json<ApiResponse<serde_json::Value>>,
-                    (StatusCode, Json<ApiResponse<()>>),
-                > = Ok(Json(ApiResponse::success(op_result.clone())));
-                record_diff_result(&state, &with_diff_single_payload(op.clone()), &op_ok);
+        // Each operation is its own action (its own pending edge), unlike
+        // `/control/batch-actions`, which is one trigger. A 2xx records each
+        // operation with its own result's outcome hint; a 5xx records every
+        // operation as an `error` edge like every other route (m4); a 4xx the
+        // runner answered itself acted on nothing.
+        let operations = body
+            .get("operations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        match &result {
+            Ok(Json(resp)) => {
+                let results = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("results"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for (op, op_result) in operations.iter().zip(results.iter()) {
+                    let op_ok: Result<
+                        Json<ApiResponse<serde_json::Value>>,
+                        (StatusCode, Json<ApiResponse<()>>),
+                    > = Ok(Json(ApiResponse::success(op_result.clone())));
+                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &op_ok);
+                }
             }
+            Err((status, _)) if status.is_server_error() => {
+                for op in &operations {
+                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &result);
+                }
+            }
+            Err(_) => {}
         }
         result
     } else {

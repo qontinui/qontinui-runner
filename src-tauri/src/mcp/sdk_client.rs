@@ -1451,6 +1451,7 @@ async fn handle_element_action(
     // or the runner's own webview when the IPC fallback below runs instead.
     let active_app = active_app_identity(&state).await;
     let mut acted_via_ipc = false;
+    let mut refused = false;
     let result = match dispatch_app_request_typed(
         &state,
         "executeElementAction",
@@ -1476,7 +1477,10 @@ async fn handle_element_action(
                     .get("error")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                // Recorded as a FAILED action_executed event below.
+                // Recorded as a FAILED action_executed event below. The
+                // journey ledger records nothing: the relay refused before any
+                // UI was touched (the control twin's 4xx rule, m3).
+                refused = true;
                 (Json(refusal), false, err)
             } else {
                 acted_via_ipc = true;
@@ -1534,24 +1538,32 @@ async fn handle_element_action(
     // users-path-and-the-passage-of-time, D3): open a pending edge for the app
     // acted on. Only the action NAME and the element id are read — never the
     // body's `params`, which carries typed text.
-    let (journey_app, app_version) = match (acted_via_ipc, active_app) {
-        (false, Some((app_id, version))) => (app_id, version),
-        _ => (crate::spec_api::storage::RUNNER_APP_ID.to_string(), None),
-    };
-    crate::journey::capture::record_action(
-        state.app_state.pg_db.clone(),
-        crate::journey::cursor::CursorKey::new(journey_app, tab_id),
-        crate::journey::cursor::ActionSpec::element(
-            &id,
-            &action_name,
-            qontinui_types::journey::ChokePoint::SdkElementAction,
+    // The IPC fallback acted on the runner's own webview (its main window),
+    // so the relay tab scope does not apply there.
+    let (journey_app, app_version, scope) = match (acted_via_ipc, active_app) {
+        (false, Some((app_id, version))) => (app_id, version, tab_id),
+        _ => (
+            crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+            None,
+            None,
         ),
-        crate::journey::cursor::Provenance {
-            app_version,
-            run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
-        },
-        !result.1,
-    );
+    };
+    if !refused && !crate::journey::capture::sdk_refusal(&result.0) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::journey::cursor::CursorKey::new(journey_app, scope),
+            crate::journey::cursor::ActionSpec::element(
+                &id,
+                &action_name,
+                qontinui_types::journey::ChokePoint::SdkElementAction,
+            ),
+            crate::journey::cursor::Provenance {
+                app_version,
+                run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
+            },
+            !result.1,
+        );
+    }
 
     // Persist the action event when task_run_id is provided (fire-and-forget)
     if let Some(tr_id) = query.task_run_id {
@@ -1622,7 +1634,7 @@ async fn handle_snapshot(
         || query.get("with_disabled_only").is_some_and(truthy);
     // A filtered snapshot is not the page's configuration: the journey ledger
     // records only unfiltered ones (M2).
-    let filtered = want_disabled_only || query.contains_key("recency");
+    let filtered = crate::journey::capture::snapshot_query_is_filtered(&query);
     // Per-tab routing (Item #4): pin the snapshot to a specific connected tab
     // when `?tabId=` (or `?targetTabId=`) is supplied. Lets a caller snapshot
     // tab A while tab B is the relay's primary, instead of always getting the
@@ -3998,7 +4010,9 @@ async fn handle_ct_execute_with_diff(
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
     // users-path-and-the-passage-of-time, D3). With no active SDK app the
     // dispatch reached nothing, so there is no app to attribute an edge to.
-    if let Some((app_id, app_version)) = active_app {
+    if let (Some((app_id, app_version)), false) =
+        (active_app, crate::journey::capture::sdk_refusal(&response))
+    {
         let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
         crate::journey::capture::record_diff(
             state.app_state.pg_db.clone(),
@@ -4567,6 +4581,9 @@ fn record_sdk_component_action(
     action_id: &str,
     response: &serde_json::Value,
 ) {
+    if crate::journey::capture::sdk_refusal(response) {
+        return;
+    }
     crate::journey::capture::record_action(
         state.app_state.pg_db.clone(),
         crate::journey::cursor::CursorKey::new(app_id, None),
@@ -4600,6 +4617,9 @@ fn record_sdk_batch(
     ) else {
         return;
     };
+    if crate::journey::capture::sdk_refusal(response) {
+        return;
+    }
     crate::journey::capture::record_action(
         state.app_state.pg_db.clone(),
         crate::journey::cursor::CursorKey::new(app_id, None),
