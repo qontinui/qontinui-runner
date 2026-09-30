@@ -610,6 +610,18 @@ pub async fn ui_bridge_batch_actions_handler(
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // Journey ledger choke point (D3): a batch is ONE trigger — `batch:<n>`
+    // on its first target — opening one pending edge, not one per step.
+    if let Some(action) = crate::journey::capture::ActionSpec::batch(&steps) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::spec_api::storage::RUNNER_APP_ID,
+            action,
+            crate::journey::capture::Provenance::default(),
+            failed > 0,
+        );
+    }
+
     Ok(Json(ApiResponse::success(serde_json::json!({
         "success": failed == 0,
         "results": results,
@@ -1123,6 +1135,53 @@ pub(crate) fn validate_type_action_params(
 }
 
 pub async fn ui_bridge_execute_action_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ActionQueryParams>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3): read the action NAME only —
+    // never `params`, which carries typed text — before the body is consumed.
+    let action_name = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .or_else(|| serde_json::from_str(&String::from_utf8_lossy(&body_bytes)).ok())
+        .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from));
+    let task_run_id = query.task_run_id;
+    let result = execute_action_dispatch(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        Query(query),
+        headers,
+        body_bytes,
+    )
+    .await;
+    if let (Some(failed), Some(action)) = (
+        crate::journey::capture::control_action_verdict(&result),
+        action_name,
+    ) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::spec_api::storage::RUNNER_APP_ID,
+            crate::journey::capture::ActionSpec::element(
+                &id,
+                &action,
+                qontinui_types::journey::ChokePoint::ElementAction,
+            ),
+            crate::journey::capture::Provenance {
+                app_version: None,
+                run_id: crate::journey::capture::run_id_from_task_run(task_run_id),
+            },
+            failed,
+        );
+    }
+    result
+}
+
+/// The body of [`ui_bridge_execute_action_handler`], split out so the journey
+/// capture sees EVERY exit of this long handler in one place.
+async fn execute_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<ActionQueryParams>,
@@ -2481,6 +2540,40 @@ pub async fn ui_bridge_get_component_handler(
 pub async fn ui_bridge_execute_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    request: UiBridgeJson<UIBridgeComponentActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Which app the action lands on: a WS wrapper registered under the
+    // component id owns it (see `component_action_dispatch`); otherwise the
+    // runner's own webview does. Read before dispatch, from the same registry
+    // lookup the dispatch makes.
+    let app_id = match state.app_registry.get(&id).await {
+        Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
+        _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+    };
+    let result = component_action_dispatch(
+        State(Arc::clone(&state)),
+        Path((id.clone(), action_id.clone())),
+        request,
+    )
+    .await;
+    // Journey ledger choke point (D3).
+    if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            &app_id,
+            crate::journey::capture::ActionSpec::component(&id, &action_id),
+            crate::journey::capture::Provenance::default(),
+            failed,
+        );
+    }
+    result
+}
+
+/// The body of [`ui_bridge_execute_component_action_handler`], split out so
+/// the journey capture sees every exit in one place.
+async fn component_action_dispatch(
+    State(state): State<Arc<ApiState>>,
+    Path((id, action_id)): Path<(String, String)>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
@@ -3020,10 +3113,19 @@ pub async fn ui_bridge_get_snapshot_handler(
             // snapshot's own `page.pageContext` / `page.pathname` — the caller
             // has no scope knowledge the snapshot doesn't already carry.
             let pg_db_for_obs = state.app_state.pg_db.clone();
-            let snapshot_for_obs = data.clone();
-            let runner_instance = std::env::var("QONTINUI_RUNNER_ROLE")
-                .ok()
-                .unwrap_or_else(|| "primary".to_string());
+            let snapshot_for_obs = Arc::new(data.clone());
+            let runner_instance = crate::journey::capture::runner_instance();
+            // Journey ledger (plan 2026-09-20-ui-bridge-represents-the-users-
+            // path-and-the-passage-of-time, D3): this snapshot closes the
+            // pending edge an earlier action opened. The control surface
+            // drives the runner's OWN webview, so the app is the runner's —
+            // a transport fact, the same key the action handlers use.
+            crate::journey::capture::record_snapshot(
+                state.app_state.pg_db.clone(),
+                crate::spec_api::storage::RUNNER_APP_ID,
+                None,
+                Arc::clone(&snapshot_for_obs),
+            );
             tokio::spawn(async move {
                 crate::state_discovery::enqueue_observation(
                     pg_db_for_obs,

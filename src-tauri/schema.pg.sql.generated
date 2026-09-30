@@ -777,6 +777,24 @@ CREATE TABLE agent.plan_scan_root_observations (
 
 
 --
+-- Name: plan_scan_root_refusals; Type: TABLE; Schema: agent; Owner: -
+--
+
+CREATE TABLE agent.plan_scan_root_refusals (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    organization_id uuid,
+    device_id uuid NOT NULL,
+    first_refused_at timestamp with time zone NOT NULL,
+    last_refused_at timestamp with time zone NOT NULL,
+    last_refused_reason text NOT NULL,
+    refused_count bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_plan_scan_root_refusals_count_positive CHECK ((refused_count >= 1)),
+    CONSTRAINT ck_plan_scan_root_refusals_reason_length CHECK ((char_length(last_refused_reason) <= 512))
+);
+
+
+--
 -- Name: session_artifacts; Type: TABLE; Schema: agent; Owner: -
 --
 
@@ -1849,8 +1867,42 @@ CREATE TABLE coord.ci_dispatches (
     completed_at timestamp with time zone,
     log_tail text,
     summary jsonb,
+    pr_head_sha text,
+    base_sha text,
+    priority_tier smallint,
+    priority_reason text,
+    CONSTRAINT ck_ci_dispatches_base_sha_hex40 CHECK (((base_sha IS NULL) OR (base_sha ~ '^[0-9a-f]{40}$'::text))),
+    CONSTRAINT ck_ci_dispatches_pr_head_sha_hex40 CHECK (((pr_head_sha IS NULL) OR (pr_head_sha ~ '^[0-9a-f]{40}$'::text))),
     CONSTRAINT ck_ci_dispatches_state CHECK ((state = ANY (ARRAY['queued'::text, 'dispatched'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'lost'::text, 'cancelled'::text])))
 );
+
+
+--
+-- Name: COLUMN ci_dispatches.pr_head_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.pr_head_sha IS 'PR branch head the dispatch was built from (40-hex). Stable across merge ticks, unlike the dry-rebased head_sha; with base_sha it identifies the candidate. NULL = not recorded.';
+
+
+--
+-- Name: COLUMN ci_dispatches.base_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.base_sha IS 'origin/<base> sha the PR head was rebased onto to produce head_sha (40-hex). NULL = not recorded.';
+
+
+--
+-- Name: COLUMN ci_dispatches.priority_tier; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.priority_tier IS 'Merge-scheduler tier coord computed at ci-node dispatch time (0 = priority class). NULL = not recorded (never "not priority").';
+
+
+--
+-- Name: COLUMN ci_dispatches.priority_reason; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_dispatches.priority_reason IS 'Why the dispatch got priority_tier (label | red_main_fix | aged | none | ...; vocabulary owned by coord). NULL = not recorded.';
 
 
 --
@@ -1886,7 +1938,8 @@ CREATE TABLE coord.ci_job_observations (
     min_disk_avail_mb integer,
     resource_sample_count integer,
     resource_span_secs integer,
-    resource_source text
+    resource_source text,
+    queued_at timestamp with time zone
 );
 
 
@@ -2021,6 +2074,13 @@ COMMENT ON COLUMN coord.ci_job_observations.resource_span_secs IS 'Seconds betwe
 --
 
 COMMENT ON COLUMN coord.ci_job_observations.resource_source IS 'Provenance of the resource numbers on this row: job_log (parsed out of the streamed GitHub Actions job log, which is the only artefact that survives an OOM-killed runner agent - nothing after an agent kill can be uploaded, so only lines already streamed exist) or step_summary (a producer-pushed reduction, plausible later). NULL = UNKNOWN: the provenance was not recorded, which is never an empty string and never a guessed label. Free text with NO CHECK, matching the outcome and duration_band columns this table already ships without CHECKs and device_resource_samples.saturation_source: the vocabulary is open, ingest is best-effort, and a CHECK violation would fail the whole UPSERT and discard the timing, conclusion and outcome of the job over a provenance label. Adding a class stays a Rust PR rather than a migration. The writer that will populate it is coord Phase 2 of plan 2026-09-20-ci-memory-headroom-in-the-dev-ops-console, which has not shipped as of this revision; validation of the label will be app-side at that door when it does. Until then this column is NULL on every row, which is UNKNOWN and not an empty vocabulary.';
+
+
+--
+-- Name: COLUMN ci_job_observations.queued_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.queued_at IS 'GitHub job created_at: when the job entered the queue. started_at - queued_at is the queue wait. NULL = not recorded (never a zero wait).';
 
 
 --
@@ -2327,6 +2387,7 @@ CREATE TABLE coord.client_telemetry_observations (
     credibility double precision DEFAULT 0.0 NOT NULL,
     carve_out jsonb DEFAULT '[]'::jsonb NOT NULL,
     components jsonb DEFAULT '{}'::jsonb NOT NULL,
+    tenant_id uuid,
     CONSTRAINT client_telemetry_observations_d3_chk CHECK ((d3_outcome = ANY (ARRAY['Confirmed'::text, 'Surprise'::text, 'Failure'::text, 'Contradiction'::text, 'Partial'::text]))),
     CONSTRAINT client_telemetry_observations_drift_class_chk CHECK ((drift_class = ANY (ARRAY['none'::text, 'benign_add'::text, 'pending'::text, 'in_place'::text, 'active_negation'::text, 'divergent'::text, 'unknown'::text]))),
     CONSTRAINT client_telemetry_observations_invariant_chk CHECK ((invariant = ANY (ARRAY['host_integrity'::text, 'cors_health'::text, 'auth_callback_health'::text, 'error_budget'::text])))
@@ -2782,6 +2843,63 @@ CREATE TABLE coord.create_grants (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     consumed_at timestamp with time zone
 );
+
+
+--
+-- Name: data_plane_write_auth_daily; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.data_plane_write_auth_daily (
+    day date NOT NULL,
+    route text NOT NULL,
+    outcome text NOT NULL,
+    device_id uuid NOT NULL,
+    served_git_sha text NOT NULL,
+    count bigint NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE data_plane_write_auth_daily; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.data_plane_write_auth_daily IS 'Per-day count of coord session data-plane writes (POST /sessions/{id}/output and /sessions/{id}/events) by auth outcome, keyed by the session row owning device and that device served_git_sha. Written by the coord module data_plane_observe (upsert that increments count); read by coord_query_data_plane_write_auth. Sentinels, not NULLs: device_id is the nil UUID when there is no session row, served_git_sha is the empty string when the device reported no sha. Plan 2026-09-28-anyone-holding-a-session-uuid-can-write-its-transcript-because-session-output-and-event-writes-are-anonymous, Phase 1.';
+
+
+--
+-- Name: COLUMN data_plane_write_auth_daily.route; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.data_plane_write_auth_daily.route IS 'The observed data-plane route, e.g. session_output | session_events. Text with no CHECK; the closed set lives in the Rust DataPlaneRoute enum that writes it.';
+
+
+--
+-- Name: COLUMN data_plane_write_auth_daily.outcome; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.data_plane_write_auth_daily.outcome IS 'owner | non_owner | not_paired | no_tenant_claim | invalid_token | anonymous. Text with no CHECK; the closed set lives in the Rust enum that writes it.';
+
+
+--
+-- Name: COLUMN data_plane_write_auth_daily.device_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.data_plane_write_auth_daily.device_id IS 'The owning device of the SESSION ROW (coord.sessions.device_id), not the caller. Sentinel: the nil UUID 00000000-0000-0000-0000-000000000000 means no session row exists for the id in the path. Never NULL, because it is part of the primary key.';
+
+
+--
+-- Name: COLUMN data_plane_write_auth_daily.served_git_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.data_plane_write_auth_daily.served_git_sha IS 'coord.devices.served_git_sha of that device at flush time. Sentinel: the empty string means the device reported no sha, or there is no device. A reader treats it as UNKNOWN, never as not containing a commit. Never NULL, because it is part of the primary key.';
+
+
+--
+-- Name: COLUMN data_plane_write_auth_daily.updated_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.data_plane_write_auth_daily.updated_at IS 'The default covers INSERT only; there is no trigger, so the upsert must set it explicitly.';
 
 
 --
@@ -4154,6 +4272,7 @@ CREATE TABLE coord.gates (
     cleared_under_rule uuid,
     agent_session_id uuid,
     continuation_spawn_attempts integer DEFAULT 0 NOT NULL,
+    clear_independence jsonb,
     CONSTRAINT ck_gates_anchor CHECK ((((claim_kind IS NOT NULL) AND (resource_key IS NOT NULL) AND (work_unit_id IS NULL) AND (phase_name IS NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (work_unit_id IS NOT NULL) AND (phase_name IS NOT NULL)))),
     CONSTRAINT coord_gates_clearance_audience_check CHECK ((clearance_audience = ANY (ARRAY['operator'::text, 'agent'::text]))),
     CONSTRAINT gates_verdict_check CHECK ((verdict = ANY (ARRAY['open'::text, 'cleared'::text, 'failed'::text, 'misconfigured'::text, 'withdrawn'::text])))
@@ -4165,6 +4284,13 @@ CREATE TABLE coord.gates (
 --
 
 COMMENT ON COLUMN coord.gates.agent_session_id IS 'Claude Code session UUID that registered this gate (the id space keying coord.agent_sessions, NOT coord.sessions.id). Nullable and DELIBERATELY NEVER BACKFILLED: every pre-capture row would have to be filled by the (device,tenant) -> most-recent-active-session heuristic that coord explicitly rejects as attributing the wrong parent under concurrency. NULL means unknown, not no-session.';
+
+
+--
+-- Name: COLUMN gates.clear_independence; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.gates.clear_independence IS 'Independence-declaration record for this gate''s decisions. Top level: the decision that set the CURRENT verdict (or, while the gate is open, the latest declared audience change) - the agent''s {verified, against, context} plus coord-stamped action, admitted_by, verdict, declared_by and timestamps, or a stub with admitted_by=none when that decision carried no declaration. Replaced records are kept under supersedes (newest first, bounded, declarations preferred, truncation counted). Required for, and the authorization of, a same-device agent_non_author decision (policy verification-and-evidence independence-is-context-not-credential); coord REFUSES such a decision if this column is missing. NULL: no record ever written (never backfilled). Exact shape: qontinui-coord gates.rs independence_transition_sql.';
 
 
 --
@@ -5240,6 +5366,26 @@ CREATE TABLE coord.operator_audit (
     resource_key text,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     occurred_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: operator_inputs; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.operator_inputs (
+    input_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    session_id uuid,
+    device_id uuid,
+    operator_id uuid,
+    channel text NOT NULL,
+    actor_class text NOT NULL,
+    session_state_at_input text DEFAULT 'unknown'::text NOT NULL,
+    resource_kind text,
+    occurred_at timestamp with time zone NOT NULL,
+    idempotency_key text NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -7298,6 +7444,34 @@ ALTER TABLE coord.test_credibility_priors ALTER COLUMN id ADD GENERATED BY DEFAU
 
 
 --
+-- Name: test_result_heads; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.test_result_heads (
+    id bigint NOT NULL,
+    repo text NOT NULL,
+    head_sha text NOT NULL,
+    first_observed_at timestamp with time zone NOT NULL,
+    last_observed_at timestamp with time zone NOT NULL,
+    row_count bigint DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: test_result_heads_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+ALTER TABLE coord.test_result_heads ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME coord.test_result_heads_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: test_results; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -7401,6 +7575,7 @@ CREATE TABLE coord.twin_targets (
     expected_tag text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    production_url text,
     CONSTRAINT twin_targets_surface_check CHECK ((surface = ANY (ARRAY['vercel'::text, 'ecs'::text, 'npm'::text])))
 );
 
@@ -10924,6 +11099,58 @@ CREATE TABLE project.iteration_logs (
 
 
 --
+-- Name: journey_edge_observations; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_edge_observations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    app_id text NOT NULL,
+    app_version text,
+    runner_build_id text NOT NULL,
+    runner_instance text NOT NULL,
+    run_id text,
+    run_kind text NOT NULL,
+    from_node jsonb NOT NULL,
+    to_node jsonb,
+    trigger jsonb NOT NULL,
+    outcome text NOT NULL,
+    timeline jsonb,
+    invalidated_at timestamp with time zone,
+    invalidated_reason text,
+    invalidated_by text,
+    invalidation_token text,
+    CONSTRAINT ck_journey_edge_observations_from_node_object CHECK ((jsonb_typeof(from_node) = 'object'::text)),
+    CONSTRAINT ck_journey_edge_observations_outcome CHECK ((outcome = ANY (ARRAY['changed'::text, 'no_change'::text, 'error'::text, 'settle_timeout'::text, 'to_node_unobserved'::text]))),
+    CONSTRAINT ck_journey_edge_observations_run_kind CHECK ((run_kind = ANY (ARRAY['agent_action'::text, 'explorer'::text, 'passive_session'::text]))),
+    CONSTRAINT ck_journey_edge_observations_to_node_iff_observed CHECK (((to_node IS NULL) = (outcome = 'to_node_unobserved'::text))),
+    CONSTRAINT ck_journey_edge_observations_to_node_object CHECK (((to_node IS NULL) OR (jsonb_typeof(to_node) = 'object'::text))),
+    CONSTRAINT ck_journey_edge_observations_trigger_object CHECK ((jsonb_typeof(trigger) = 'object'::text))
+);
+
+
+--
+-- Name: journey_frontier; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_frontier (
+    app_id text NOT NULL,
+    node_key text NOT NULL,
+    node jsonb NOT NULL,
+    affordance_fingerprint text NOT NULL,
+    affordance_role text,
+    declared_effect text,
+    reason text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_run_id text,
+    CONSTRAINT ck_journey_frontier_declared_effect CHECK ((declared_effect = ANY (ARRAY['read'::text, 'write'::text, 'destructive'::text]))),
+    CONSTRAINT ck_journey_frontier_node_object CHECK ((jsonb_typeof(node) = 'object'::text)),
+    CONSTRAINT ck_journey_frontier_reason CHECK ((reason = ANY (ARRAY['not_yet_activated'::text, 'effect_undeclared'::text, 'effect_write'::text, 'effect_destructive'::text, 'budget_exhausted'::text, 'activation_failed'::text])))
+);
+
+
+--
 -- Name: known_issues; Type: TABLE; Schema: project; Owner: -
 --
 
@@ -12995,7 +13222,8 @@ CREATE TABLE project.scheduled_tasks (
     catch_up_policy text DEFAULT 'run_once'::text NOT NULL,
     catch_up_grace_seconds integer DEFAULT 300 NOT NULL,
     consecutive_launch_failures integer DEFAULT 0 NOT NULL,
-    launch_failure_backoff_seconds integer DEFAULT 60 NOT NULL
+    launch_failure_backoff_seconds integer DEFAULT 60 NOT NULL,
+    conditions jsonb
 );
 
 
@@ -17548,6 +17776,14 @@ ALTER TABLE ONLY agent.plan_scan_root_observations
 
 
 --
+-- Name: plan_scan_root_refusals plan_scan_root_refusals_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.plan_scan_root_refusals
+    ADD CONSTRAINT plan_scan_root_refusals_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: session_artifacts session_artifacts_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
 --
 
@@ -18164,6 +18400,14 @@ ALTER TABLE ONLY coord.create_grants
 
 
 --
+-- Name: data_plane_write_auth_daily data_plane_write_auth_daily_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.data_plane_write_auth_daily
+    ADD CONSTRAINT data_plane_write_auth_daily_pkey PRIMARY KEY (day, route, outcome, device_id, served_git_sha);
+
+
+--
 -- Name: dependency_observations dependency_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -18713,6 +18957,14 @@ ALTER TABLE ONLY coord.onboarding_connect_states
 
 ALTER TABLE ONLY coord.operator_audit
     ADD CONSTRAINT operator_audit_pkey PRIMARY KEY (audit_id);
+
+
+--
+-- Name: operator_inputs operator_inputs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.operator_inputs
+    ADD CONSTRAINT operator_inputs_pkey PRIMARY KEY (input_id);
 
 
 --
@@ -19428,6 +19680,14 @@ ALTER TABLE ONLY coord.test_credibility_priors
 
 
 --
+-- Name: test_result_heads test_result_heads_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.test_result_heads
+    ADD CONSTRAINT test_result_heads_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: test_results test_results_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -19484,6 +19744,14 @@ ALTER TABLE ONLY coord.fleet_runtime_policy_versions
 
 
 --
+-- Name: operator_inputs uq_operator_inputs_idempotency_key; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.operator_inputs
+    ADD CONSTRAINT uq_operator_inputs_idempotency_key UNIQUE (idempotency_key);
+
+
+--
 -- Name: policy_clauses uq_policy_clauses_document_clause; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -19537,6 +19805,14 @@ ALTER TABLE ONLY coord.test_coverage_map
 
 ALTER TABLE ONLY coord.test_credibility_priors
     ADD CONSTRAINT uq_test_credibility_priors_repo_test UNIQUE (repo, test_id);
+
+
+--
+-- Name: test_result_heads uq_test_result_heads_repo_head; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.test_result_heads
+    ADD CONSTRAINT uq_test_result_heads_repo_head UNIQUE (repo, head_sha);
 
 
 --
@@ -20641,6 +20917,22 @@ ALTER TABLE ONLY project.issue_pattern_templates
 
 ALTER TABLE ONLY project.iteration_logs
     ADD CONSTRAINT iteration_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_edge_observations journey_edge_observations_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_edge_observations
+    ADD CONSTRAINT journey_edge_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_frontier journey_frontier_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_frontier
+    ADD CONSTRAINT journey_frontier_pkey PRIMARY KEY (app_id, node_key, affordance_fingerprint);
 
 
 --
@@ -22718,6 +23010,13 @@ CREATE UNIQUE INDEX uq_plan_scan_root_observations_identity ON agent.plan_scan_r
 
 
 --
+-- Name: uq_plan_scan_root_refusals_identity; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_plan_scan_root_refusals_identity ON agent.plan_scan_root_refusals USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id);
+
+
+--
 -- Name: uq_session_artifacts_identity; Type: INDEX; Schema: agent; Owner: -
 --
 
@@ -23804,6 +24103,13 @@ CREATE INDEX idx_ci_dispatches_device_state ON coord.ci_dispatches USING btree (
 
 
 --
+-- Name: idx_ci_dispatches_no_subscriber_device; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_dispatches_no_subscriber_device ON coord.ci_dispatches USING btree (device_id, completed_at) INCLUDE (tenant_id) WHERE ((state = 'cancelled'::text) AND ((summary ->> 'reason'::text) = 'no_subscriber'::text));
+
+
+--
 -- Name: idx_ci_dispatches_repo_head_sha; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -23857,6 +24163,13 @@ CREATE INDEX idx_client_telemetry_observations_observed_at ON coord.client_telem
 --
 
 CREATE INDEX idx_client_telemetry_observations_surface_origin_observed_at ON coord.client_telemetry_observations USING btree (surface, origin, observed_at DESC);
+
+
+--
+-- Name: idx_client_telemetry_observations_tenant_id; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_client_telemetry_observations_tenant_id ON coord.client_telemetry_observations USING btree (tenant_id) WHERE (tenant_id IS NOT NULL);
 
 
 --
@@ -25582,6 +25895,13 @@ CREATE INDEX idx_test_credibility_priors_updated_at ON coord.test_credibility_pr
 
 
 --
+-- Name: idx_test_result_heads_repo_last; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_test_result_heads_repo_last ON coord.test_result_heads USING btree (repo, last_observed_at DESC);
+
+
+--
 -- Name: idx_test_results_correlation; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -26090,6 +26410,20 @@ CREATE INDEX ix_notifications_tenant_keyset ON coord.notifications USING btree (
 --
 
 CREATE INDEX ix_notifications_tenant_kind ON coord.notifications USING btree (tenant_id, kind, occurred_at DESC, notification_id DESC);
+
+
+--
+-- Name: ix_operator_inputs_tenant_occurred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_operator_inputs_tenant_occurred_at ON coord.operator_inputs USING btree (tenant_id, occurred_at);
+
+
+--
+-- Name: ix_operator_inputs_tenant_session_occurred_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_operator_inputs_tenant_session_occurred_at ON coord.operator_inputs USING btree (tenant_id, session_id, occurred_at);
 
 
 --
@@ -31105,6 +31439,20 @@ CREATE INDEX ix_input_events_video_capture_session_id ON project.input_events US
 
 
 --
+-- Name: ix_journey_edge_observations_app_observed_at; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_observed_at ON project.journey_edge_observations USING btree (app_id, observed_at DESC) WHERE (invalidated_at IS NULL);
+
+
+--
+-- Name: ix_journey_edge_observations_app_run; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_run ON project.journey_edge_observations USING btree (app_id, run_id);
+
+
+--
 -- Name: ix_library_check_groups_created_by_user_id; Type: INDEX; Schema: project; Owner: -
 --
 
@@ -33292,6 +33640,14 @@ ALTER TABLE ONLY coord.devices
 
 ALTER TABLE ONLY coord.events
     ADD CONSTRAINT events_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.devices(device_id) ON DELETE SET NULL;
+
+
+--
+-- Name: client_telemetry_observations fk_client_telemetry_observations_tenant_id; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.client_telemetry_observations
+    ADD CONSTRAINT fk_client_telemetry_observations_tenant_id FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE SET NULL NOT VALID;
 
 
 --

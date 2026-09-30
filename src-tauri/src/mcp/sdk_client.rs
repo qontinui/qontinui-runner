@@ -1368,6 +1368,55 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
     }
 }
 
+/// The active SDK connection's `(app_id, version)`, if one is connected —
+/// the app `dispatch_active` will route to. Used by the journey ledger to
+/// attribute an action or snapshot to the app it actually reached.
+async fn active_app_identity(state: &Arc<ApiState>) -> Option<(String, Option<String>)> {
+    let guard = state.sdk_connection.lock().await;
+    guard
+        .active_connection()
+        .map(|c| (c.app_info.app_id.clone(), c.app_info.version.clone()))
+}
+
+/// The version a registered app reported, when it is the active connection.
+/// `None` = not reported (plan U4).
+async fn app_version_for(state: &Arc<ApiState>, app_id: &str) -> Option<String> {
+    let guard = state.sdk_connection.lock().await;
+    guard
+        .connections
+        .values()
+        .find(|c| c.app_info.app_id == app_id)
+        .and_then(|c| c.app_info.version.clone())
+}
+
+/// A snapshot body as the SDK answered it: the `{success, data}` envelope's
+/// `data` when present, else the body itself.
+fn snapshot_payload(body: &serde_json::Value) -> serde_json::Value {
+    match body.get("data") {
+        Some(inner) if inner.is_object() => inner.clone(),
+        _ => body.clone(),
+    }
+}
+
+/// Journey ledger (D3): a successful snapshot of `app_id` closes that app's
+/// pending edge.
+fn record_journey_snapshot(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    app_version: Option<String>,
+    body: &serde_json::Value,
+) {
+    if body.get("success") == Some(&serde_json::Value::Bool(false)) {
+        return;
+    }
+    crate::journey::capture::record_snapshot(
+        state.app_state.pg_db.clone(),
+        app_id,
+        app_version,
+        Arc::new(snapshot_payload(body)),
+    );
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
@@ -1400,6 +1449,11 @@ async fn handle_element_action(
         None => serde_json::json!({ "id": id, "request": body.clone() }),
     };
     let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
+    // The app this action lands on, for the journey ledger: the active SDK
+    // connection (read here, before dispatch, exactly as dispatch reads it),
+    // or the runner's own webview when the IPC fallback below runs instead.
+    let active_app = active_app_identity(&state).await;
+    let mut acted_via_ipc = false;
     let result = match dispatch_app_request_typed(
         &state,
         "executeElementAction",
@@ -1428,6 +1482,7 @@ async fn handle_element_action(
                 // Recorded as a FAILED action_executed event below.
                 (Json(refusal), false, err)
             } else {
+                acted_via_ipc = true;
                 // Fall back to IPC — wrap action in an object to match the format
                 // expected by the TypeScript handler (action.action, action.params, etc.)
                 let params = body
@@ -1477,6 +1532,29 @@ async fn handle_element_action(
             }
         }
     };
+
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3): open a pending edge for the app
+    // acted on. Only the action NAME and the element id are read — never the
+    // body's `params`, which carries typed text.
+    let (journey_app, app_version) = match (acted_via_ipc, active_app) {
+        (false, Some((app_id, version))) => (app_id, version),
+        _ => (crate::spec_api::storage::RUNNER_APP_ID.to_string(), None),
+    };
+    crate::journey::capture::record_action(
+        state.app_state.pg_db.clone(),
+        &journey_app,
+        crate::journey::capture::ActionSpec::element(
+            &id,
+            &action_name,
+            qontinui_types::journey::ChokePoint::SdkElementAction,
+        ),
+        crate::journey::capture::Provenance {
+            app_version,
+            run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
+        },
+        !result.1,
+    );
 
     // Persist the action event when task_run_id is provided (fire-and-forget)
     if let Some(tr_id) = query.task_run_id {
@@ -1597,7 +1675,11 @@ async fn handle_snapshot(
         )
         .await
         {
-            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+            Ok(data) => {
+                let version = app_version_for(&state, app_id).await;
+                record_journey_snapshot(&state, app_id, version, &data);
+                (StatusCode::OK, Json(data)).into_response()
+            }
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "success": false, "error": e })),
@@ -1606,6 +1688,7 @@ async fn handle_snapshot(
         };
     }
 
+    let active_app = active_app_identity(&state).await;
     match dispatch_app_request(
         &state,
         "getControlSnapshot",
@@ -1616,16 +1699,29 @@ async fn handle_snapshot(
     )
     .await
     {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Ok(data) => {
+            if let Some((app_id, version)) = active_app {
+                record_journey_snapshot(&state, &app_id, version, &data);
+            }
+            (StatusCode::OK, Json(data)).into_response()
+        }
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via control endpoint
             debug!("SDK snapshot unavailable, falling back to control endpoint");
             match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
-                Ok(data) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "data": data })),
-                )
-                    .into_response(),
+                Ok(data) => {
+                    record_journey_snapshot(
+                        &state,
+                        crate::spec_api::storage::RUNNER_APP_ID,
+                        None,
+                        &data,
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "data": data })),
+                    )
+                        .into_response()
+                }
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({ "success": false, "error": e })),
@@ -3882,19 +3978,38 @@ async fn handle_ct_execute_with_diff(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    let active_app = active_app_identity(&state).await;
+    let response = match dispatch_app_request(
         &state,
         "executeWithDiff",
         body.clone(),
         Method::POST,
         "/ai/execute-with-diff",
-        Some(body),
+        Some(body.clone()),
     )
     .await
     {
-        Ok(data) => Json(guard_execute_with_diff(data)),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(data) => guard_execute_with_diff(data),
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3). With no active SDK app the
+    // dispatch reached nothing, so there is no app to attribute an edge to.
+    if let Some((app_id, app_version)) = active_app {
+        let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
+        crate::journey::capture::record_diff(
+            state.app_state.pg_db.clone(),
+            &app_id,
+            &body,
+            &response,
+            crate::journey::capture::Provenance {
+                app_version,
+                run_id: None,
+            },
+            failed,
+        );
     }
+    Json(response)
 }
 
 /// Read an `execute_with_diff` result's `actionSuccess`, at the top level (the

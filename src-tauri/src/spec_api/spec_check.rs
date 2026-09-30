@@ -134,6 +134,84 @@ fn apply_thresholds_to_result(
     }
 }
 
+/// The evaluator core every entry point shares: the pure crate evaluation,
+/// then the app's configured thresholds applied to the overall and per-state
+/// classifications. `post_spec_check`, the batch [`evaluate_one`] and the
+/// in-process [`evaluate_page_in_process`] all go through here, so the three
+/// cannot disagree on what a classification means.
+fn evaluate_ir_classified(
+    snapshot: &UIBridgeSnapshot,
+    ir: &qontinui_types::ir::IrPageSpec,
+    fingerprint: qontinui_types::spec_check::BridgeFingerprint,
+    snapshot_id: String,
+    content_sha256: String,
+    app_option: Option<&qontinui_types::apps::App>,
+) -> SpecCheckResult {
+    let mut result =
+        spec_check::evaluate_with_identity(snapshot, ir, fingerprint, snapshot_id, content_sha256);
+    apply_thresholds_to_result(&mut result, app_option);
+    result
+}
+
+/// The app row whose thresholds classify a result; `None` (defaults apply)
+/// when the app is unknown or the lookup fails — the failure is logged.
+async fn fetch_app_for_thresholds(
+    pg: &crate::database::pg::PgDb,
+    app_id: &str,
+) -> Option<qontinui_types::apps::App> {
+    match pg.get_app(app_id).await {
+        Ok(app) => app,
+        Err(e) => {
+            warn!(
+                "failed to fetch app {} for threshold application: {}",
+                app_id, e
+            );
+            None
+        }
+    }
+}
+
+/// Evaluate ONE page spec against a snapshot the caller already holds, in
+/// process — no HTTP route, no snapshot fetch, no `spec.*` events, no helper
+/// spot-check. For callers that need the classification as an input rather
+/// than as a published check (the journey ledger resolves a node from it on
+/// a spawned task, never on a request path).
+///
+/// `Ok(None)` means there is no spec to evaluate: the app is not registered,
+/// the page id is not a valid spec id, or no IR document exists for it.
+/// `Err` means the question could not be answered (the specs root could not be
+/// resolved for a registered app, or the IR document is malformed) — distinct
+/// from "no spec", so a caller does not read a failure as an absence.
+pub(crate) async fn evaluate_page_in_process(
+    pg: &crate::database::pg::PgDb,
+    app_id: &str,
+    page_id: &str,
+    snapshot: &UIBridgeSnapshot,
+    fingerprint: qontinui_types::spec_check::BridgeFingerprint,
+) -> Result<Option<SpecCheckResult>, String> {
+    if invalid_page_id(page_id) {
+        return Ok(None);
+    }
+    let root = match storage::resolve_specs_root(pg, app_id).await {
+        Ok(root) => root,
+        Err(qontinui_types::apps::AppError::NotRegistered { .. }) => return Ok(None),
+        Err(e) => return Err(format!("specs root for app {app_id}: {e}")),
+    };
+    let ir = match storage::read_ir(&root, app_id, page_id)? {
+        Some(ir) => ir,
+        None => return Ok(None),
+    };
+    let app_option = fetch_app_for_thresholds(pg, app_id).await;
+    Ok(Some(evaluate_ir_classified(
+        snapshot,
+        &ir,
+        fingerprint,
+        format!("scs_inproc_{}", uuid::Uuid::now_v7()),
+        String::new(),
+        app_option.as_ref(),
+    )))
+}
+
 // ===========================================================================
 // Shared snapshot fetch + error mapping
 // ===========================================================================
@@ -518,29 +596,19 @@ pub async fn post_spec_check(
     invoke_emit(&req.app_id, &snapshot_id, vec![req.page_id.clone()], "http");
     let started_ms = events::now_ms();
 
-    // Evaluate — pure crate call, no logic here. Thread the real fingerprint
+    // Evaluate — pure crate call plus the app's thresholds, through the one
+    // core every evaluator entry point shares. Thread the real fingerprint
     // + snapshot identity (minted by fetch_fresh_snapshot or synthesized on
     // the supplied path) into the result instead of the in-process sentinels.
-    let mut result = spec_check::evaluate_with_identity(
+    let app_option = fetch_app_for_thresholds(&state.app_state.pg_db, &req.app_id).await;
+    let result = evaluate_ir_classified(
         &snapshot,
         &ir,
         fingerprint,
         snapshot_id.clone(),
         content_hash,
+        app_option.as_ref(),
     );
-
-    // Apply app-specific thresholds: fetch app config and update classification
-    let app_option = match state.app_state.pg_db.get_app(&req.app_id).await {
-        Ok(app) => app,
-        Err(e) => {
-            warn!(
-                "failed to fetch app {} for threshold application: {}",
-                req.app_id, e
-            );
-            None
-        }
-    };
-    apply_thresholds_to_result(&mut result, app_option.as_ref());
 
     info!(
         "spec_check page_id={} snapshot_id={} match_outcome={:?} match_rate={:.3} classification={}",
@@ -976,16 +1044,14 @@ async fn evaluate_one(
     // we run it inline on the spawned task (see Risks §"contention").
     // Thread the batch's shared fingerprint + snapshot identity through so
     // the per-element result carries real telemetry, not the sentinel.
-    let mut result = spec_check::evaluate_with_identity(
+    let result = evaluate_ir_classified(
         snapshot,
         &ir,
         fingerprint.clone(),
         snapshot_id.to_string(),
         content_sha256.to_string(),
+        app_option,
     );
-
-    // Apply app-specific thresholds to the evaluation result
-    apply_thresholds_to_result(&mut result, app_option);
 
     // Shared classification site for both batch paths (collected + NDJSON).
     // Runs AFTER threshold application so the Yellow-band check sees the
