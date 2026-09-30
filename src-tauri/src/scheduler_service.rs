@@ -3,6 +3,23 @@
 //! Background service that monitors scheduled tasks and executes them
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
+//!
+//! # Concurrency with user edits
+//!
+//! A tick works from a snapshot of each task. The writes it derives from that
+//! snapshot (`condition_status`, `next_run`, a condition-timeout record) are
+//! conditional on the snapshot's `modified_at`, which only a USER edit moves:
+//! when an edit lands in between, the tick writes nothing and re-evaluates on
+//! its next pass.
+//!
+//! Documented residual: the timezone-change recompute
+//! (`mcp::scheduler::update_scheduler_settings`) writes each task's
+//! `next_run` with the same conditional write, but against a list read once
+//! for the whole settings change. A task edited between that read and its
+//! write keeps the `next_run` its edit computed, which may be in the OLD zone
+//! if the edit's own zone read raced the settings write. The next edit, or a
+//! run of the task (which recomputes `next_run` in the current zone), corrects
+//! it. Accepted in review round 4 as not worth a per-task re-read loop.
 
 use crate::commands::AppState;
 use crate::database::pg::PgDb;
@@ -2025,8 +2042,33 @@ impl SchedulerService {
                 return;
             }
         };
-        let record = condition_timeout_record(task);
+        // Clear the wait state FIRST, conditional on the snapshot the timeout
+        // was judged on. If a user edit landed since (the row's modified_at
+        // moved), nothing is recorded: the verdict was about a task that no
+        // longer exists in that form, and the next tick re-reads and
+        // re-evaluates it. (An edit does NOT necessarily reset the wait — a
+        // PUT without `conditions` keeps `condition_status` — which is exactly
+        // why the lost race must not record a Skipped run on stale grounds.)
+        match pg
+            .update_task_condition_status(&task.id, None, &task.modified_at)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "Scheduler: task '{}' was edited since this tick judged its condition wait \
+                     timed out; recording nothing — re-evaluating next tick",
+                    task.name
+                );
+                return;
+            }
+            Err(e) => {
+                error!("Failed to clear condition status: {}", e);
+                return;
+            }
+        }
 
+        let record = condition_timeout_record(task);
         if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
             error!("Failed to record condition timeout: {}", e);
         }
@@ -2035,16 +2077,6 @@ impl SchedulerService {
             .await
         {
             error!("Failed to update task last_run: {}", e);
-        }
-
-        // Clear condition status (conditional on the snapshot: an edit since
-        // then already reset it, see `update_scheduled_task`).
-        match pg
-            .update_task_condition_status(&task.id, None, &task.modified_at)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => error!("Failed to clear condition status: {}", e),
         }
 
         // Update next_run
@@ -3976,5 +4008,29 @@ mod tests {
             .expect("launch section");
         assert!(head.contains("if !self.try_mark_running(&task_id).await {"));
         assert!(!head.contains("running.push("));
+    }
+
+    /// A condition timeout records its Skipped row and last_run ONLY after the
+    /// snapshot-conditional clear lands; a lost race records nothing.
+    #[test]
+    fn a_condition_timeout_records_only_after_the_conditional_clear_lands() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn record_condition_timeout(")
+            .expect("record_condition_timeout");
+        let (body, _) = body.split_once("\n    }\n").expect("fn ends");
+        let (before_insert, _) = body
+            .split_once("pg.insert_execution_record(")
+            .expect("records a history row");
+        assert!(before_insert
+            .contains(".update_task_condition_status(&task.id, None, &task.modified_at)"));
+        let (_, lost_race) = before_insert
+            .split_once("Ok(false) => {")
+            .expect("lost-race arm");
+        let (lost_race, _) = lost_race.split_once("Err(e) =>").expect("arm ends");
+        assert!(
+            lost_race.contains("return;"),
+            "a lost race must record nothing"
+        );
     }
 }
