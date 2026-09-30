@@ -7723,6 +7723,150 @@ mod tenant_slot_refresh_tests {
         assert!(!concluded.posture.can_answer());
     }
 
+    // ---- Phase 0 of plan 2026-09-25-runner-loses-its-relay-and-announces-it-
+    // under-a-false-cause-or-not-at-all: pin what the posture authority ALREADY
+    // reports for a legacy (slot-less) runner booting into a dead credential.
+    // These describe CURRENT behaviour; if one fails, the plan says fix the
+    // posture authority before its Phase 1 — never bend the test.
+
+    /// The LEGACY branch's observation, built through the SAME constructor
+    /// `refresher_loop` uses when no tenant slot exists
+    /// (`SlotObservation::observed(None, …)`), and derived through the same
+    /// `derive_and_publish_posture` call.
+    fn legacy_boot_publish(token: Option<&str>, now: i64) -> Option<PostureTransition> {
+        let obs = SlotObservation::observed(None, token);
+        assert_eq!(obs.tenant_id, None, "the legacy branch names no tenant");
+        assert_eq!(obs.outcome, None, "no pass outcome on the legacy branch");
+        derive_and_publish_posture(std::slice::from_ref(&obs), PosturePinInputs::UNPINNED, now)
+    }
+
+    /// (a) A slot-less runner booting on an EXPIRED legacy credential: the
+    /// first publish is a recorded `None -> Expired` transition, and it fires
+    /// the banner — boot is not exempt (DD2).
+    #[test]
+    fn posture_fires_on_legacy_dead_slot_boot_with_an_expired_jwt() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+
+        let transition = legacy_boot_publish(Some(dead.as_str()), now);
+        let expected = PostureTransition {
+            from: None,
+            to: CoordCredentialPosture::Expired,
+        };
+        assert_eq!(transition, Some(expected));
+        assert_eq!(recorded_posture_transitions(), vec![expected]);
+        assert!(!expected.to.can_answer());
+        assert!(
+            should_notify_posture(expected.from, expected.to),
+            "a legacy boot into an expired credential must fire the banner"
+        );
+        let published = coord_credential_posture().expect("the boot pass publishes");
+        assert_eq!(published.posture, CoordCredentialPosture::Expired);
+        assert_eq!(published.tenant_id, None);
+        reset_posture();
+    }
+
+    /// (a) The same boot with NO legacy credential at all reads `absent` and
+    /// fires — a never-paired runner is not silent.
+    #[test]
+    fn posture_fires_on_legacy_dead_slot_boot_with_no_token() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+
+        let transition = legacy_boot_publish(None, now);
+        let expected = PostureTransition {
+            from: None,
+            to: CoordCredentialPosture::Absent,
+        };
+        assert_eq!(transition, Some(expected));
+        assert_eq!(recorded_posture_transitions(), vec![expected]);
+        assert!(!expected.to.can_answer());
+        assert!(should_notify_posture(expected.from, expected.to));
+        reset_posture();
+    }
+
+    /// (b) Every refresher tick re-derives the legacy posture. Re-deriving the
+    /// SAME dead posture must not be a second transition, and even if it were
+    /// offered to the notifier it must not fire again — once per transition.
+    #[test]
+    fn posture_legacy_dead_slot_rederived_does_not_notify_twice() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+
+        for (token, dead_posture) in [
+            (Some(dead.as_str()), CoordCredentialPosture::Expired),
+            (None, CoordCredentialPosture::Absent),
+        ] {
+            reset_posture();
+            let first = legacy_boot_publish(token, now);
+            assert_eq!(first.map(|t| t.to), Some(dead_posture));
+            let second = legacy_boot_publish(token, now + 60);
+            assert_eq!(
+                second, None,
+                "an unchanged posture is not a transition: {second:?}"
+            );
+            assert_eq!(
+                recorded_posture_transitions().len(),
+                1,
+                "exactly one recorded transition for one dark episode"
+            );
+            assert!(
+                !should_notify_posture(Some(dead_posture), dead_posture),
+                "the same dark posture must not re-notify"
+            );
+            // Still dark and still published — dedup is not recovery.
+            let published = coord_credential_posture().expect("published");
+            assert_eq!(published.posture, dead_posture);
+        }
+        reset_posture();
+    }
+
+    /// (c) A Cognito refresh that recovers after a HARD failure yields
+    /// `notify_recovered` from `plan_refresh_wait` — and that is the COGNITO
+    /// source's signal only (`emit_credential_dark(.., false)` sends
+    /// `source: "cognito"`). It is not a posture event: the posture cell and
+    /// its transition log are untouched, so a still-dark posture stays dark.
+    ///
+    /// The frontend reducer (`src/components/web-integration-banner-logic.ts`,
+    /// M5) clears only the entry of the source that sent `dark: false`, so a
+    /// Cognito recovery cannot clear a posture-sourced banner.
+    #[test]
+    fn posture_is_not_cleared_by_a_cognito_recovery_after_hard() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+        let boot = legacy_boot_publish(Some(dead.as_str()), now);
+        assert_eq!(boot.map(|t| t.to), Some(CoordCredentialPosture::Expired));
+        let transitions_before = recorded_posture_transitions();
+
+        let mut backoff = RefreshBackoff::default();
+        let hard = plan_refresh_wait(&mut backoff, RefreshClass::Hard);
+        assert!(hard.notify_dark && !hard.notify_recovered);
+        let ok = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+        assert!(
+            ok.notify_recovered && !ok.notify_dark,
+            "Ok after Hard is the Cognito recovery: {ok:?}"
+        );
+
+        assert_eq!(
+            recorded_posture_transitions(),
+            transitions_before,
+            "a Cognito recovery must not publish a posture transition"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.posture, CoordCredentialPosture::Expired);
+        assert!(!published.posture.can_answer());
+        assert_eq!(DARK_SOURCE_COGNITO, "cognito");
+        assert_ne!(DARK_SOURCE_COGNITO, DARK_SOURCE_POSTURE);
+        reset_posture();
+    }
+
     /// A token whose own `exp` is comfortably in the FUTURE, that coord keeps
     /// refusing. `exp` alone calls this `live` — which is the silent case the
     /// upstream input exists to catch.
