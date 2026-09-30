@@ -230,8 +230,8 @@ pub mod rag;
 pub mod recap; // Session recap overview
 pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
 pub mod remote_attach; // Remote session tabs: accept_remote_attach preference + terminal_attach_remote (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
-pub mod remote_end; // END a session on another device under an attach grant: `remote_session_end` (plan 2026-09-30-close-remote-sessions-from-the-local-runner, Phase 3)
 pub mod remote_create; // Remote terminal CREATION: the accept_remote_create preference and the coord mirror that reconciles the runner-local dial with coord.devices.accept_remote_create (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
+pub mod remote_end; // END a session on another device under an attach grant: `remote_session_end` (plan 2026-09-30-close-remote-sessions-from-the-local-runner, Phase 3)
 pub mod remote_interactivity_probe; // The remote-interactivity probe sweep + its scheduler (plan 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold, A3)
 pub mod resource_guard_settings; // Settings > Resource Guard: session-protection floors + the ci_node floors (plan 2026-08-07-runner-resource-guard-and-session-protection Part B)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
