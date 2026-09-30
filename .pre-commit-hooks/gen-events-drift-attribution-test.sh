@@ -715,12 +715,20 @@ echo "  -- the hook runs under set -e: the MINE path must survive it --"
 fixture
 seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_commands/x.md");'
 commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
-( set -euo pipefail; decide; gen_events_render_mine >/dev/null ) && SETE_RC=0 || SETE_RC=$?
+# `( .. ); rc=$?`, never `( .. ) && rc=0 || rc=$?`: on the left of `&&`/`||`
+# errexit is suspended INSIDE the subshell too, so that form passes whatever
+# fails in it. This harness itself runs without -e, so the plain form is safe.
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
 check "set -e: a violated-premise MINE decision and render exit 0" "0" "$SETE_RC"
 fixture
 commit_change "src-tauri/src/lib.rs" "// mine"
-( set -euo pipefail; decide; gen_events_render_mine >/dev/null ) && SETE_RC=0 || SETE_RC=$?
+( set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
 check "set -e: a normal MINE decision and render exit 0" "0" "$SETE_RC"
+fixture
+commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
+SHIM="$(git_shim_failing grep '*" grep "*')"
+( PATH="$SHIM:$PATH"; set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
+check "set -e: a failed-probe MINE decision and render exit 0" "0" "$SETE_RC"
 
 echo "  -- the MINE message the hook prints --"
 
@@ -766,10 +774,18 @@ check "  both labels are printed" "yes|yes" \
     "$(has '(committed in this push)')|$(has '(uncommitted changes — not part of this push)')"
 check "  and the dirty half gets the working-tree note" yes "$(has "$LOCAL_NOTE")"
 
-render_with "$(detail_line src-tauri/src/lib.rs committed)"
+# The dropped-exclusion line is for a pusher who is being blamed FOR markdown;
+# with no `.md` among the blamed paths it would explain nothing.
+render_with "$(detail_line src-tauri/src/fleet_commands/x.md committed)"
+ATTRIBUTION_TOUCHED="src-tauri/src/fleet_commands/x.md"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
 RENDERED="$(gen_events_render_mine)"
-check "a dropped exclusion is stated in one line" yes "$(has 'Markdown was counted as a codegen input this time')"
+check "a dropped exclusion is stated when an .md is blamed" yes "$(has 'Markdown was counted as a codegen input this time')"
+render_with "$(detail_line src-tauri/src/lib.rs committed)"
+ATTRIBUTION_TOUCHED="src-tauri/src/lib.rs"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+RENDERED="$(gen_events_render_mine)"
+check "  and not when no .md is blamed" no "$(has 'Markdown was counted as a codegen input this time')"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.

@@ -95,7 +95,13 @@
 #    `.md` with `fs::read` — since only build scripts are checked for that;
 #  - a schemars value that BEGINS with a literal and continues into an
 #    expression (`description = "x".to_owned() + BODY`): arm 6 reads only the
-#    first character after the `=`.
+#    first character after the `=`;
+#  - a `#[schemars(schema_with = "f")]` function, or a `json_schema!` body,
+#    that embeds markdown from a file mentioning neither JsonSchema nor
+#    `schemars(`;
+#  - a Cargo `[lib]`/`[[bin]]` `path = "x.md"` — manifests are not probed;
+#  - a markdown file named with an upper-case extension (`include!("x.MD")`):
+#    every `.md"` match is case-sensitive, as is the `*.md` exclusion itself.
 #
 # Reach: the premise probe reads Rust sources only (`*.rs` under the
 # directory-prefix inputs, plus the build scripts), in the working tree
@@ -112,7 +118,11 @@
 # the exclusion: a raw-string literal (`title = r"x"`) or a `true` value in a
 # schemars attribute; and a Rust raw string holding TOML whose line begins
 # `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
-# as a wrapped cfg_attr the day that file also gains a `.md"` literal.
+# as a wrapped cfg_attr the day that file also gains a `.md"` literal; and a
+# crate doc `#![doc = include_str!("../README.md")]`, which arm 5 flags on
+# every push. That last is deliberately not carved out: a crate doc cannot
+# reach a schema today, but a carve-out is a narrowing, and the header's rule
+# for those is evidence plus a guard, not convenience.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -360,8 +370,9 @@ gen_events_markdown_premise_violations() {
     # source and a `path` attribute makes it a module — either can define a
     # JsonSchema type, so the file's extension says nothing. File-level (the
     # macro or attribute anywhere, plus any `.md"` literal anywhere) so a
-    # `concat!` or wrapped form is caught too; the real tree's six uses, in
-    # four files, name `.rs` files and OUT_DIR, and stay quiet.
+    # `concat!` or wrapped form is caught too. The real tree's six uses in four
+    # files, plus the TOML `path =` at restate/config.rs:145, name `.rs` files,
+    # OUT_DIR or a data dir, and stay quiet.
     _gen_events_premise_arm "include!/path attribute in a file that names a .md path" \
         "$as_rust" "$md_lit" && arm_rc=0 || arm_rc=$?
     case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
@@ -584,7 +595,11 @@ gen_events_render_mine() {
         echo "    $p  ($label)"
     done <<< "$ATTRIBUTION_TOUCHED_DETAIL"
 
-    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+    # Only when markdown is actually among the blamed paths: otherwise the
+    # dropped exclusion changed nothing this pusher sees, and the line would
+    # be noise. A `%q`-escaped name ends in `'`, hence the optional quote.
+    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ] \
+       && printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qE "\.md'?\$"; then
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
     fi
     if [ "$has_local" = "1" ]; then
