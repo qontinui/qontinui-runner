@@ -621,9 +621,9 @@ fi
 echo
 fail "ERROR: Generated Tauri event bindings are stale."
 if [ "$ATTRIBUTION_STATE" = "mine" ]; then
-    # The whole explanation — lead line, per-file source labels, the set-aside
-    # advice for inputs that are not in the push — is rendered by the library,
-    # where the attribution self-test pins it. Here it only gets the prefix and
+    # The whole explanation — lead line, per-file source labels, and the note
+    # on inputs that are not in the push — is rendered by the library, where
+    # the attribution self-test pins it. Here it only gets the prefix and
     # the stream.
     gen_events_render_mine | sed 's/^/[gen-events-drift] /' >&2
 elif [ "$ATTRIBUTION_STATE" = "pre-existing" ]; then
