@@ -328,6 +328,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "GET /hooks/{id}",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
+    // re-points which tenant this device's new sessions and device-level
+    // surfaces write into (`mcp::tenant`, plan
+    // `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
+    // Phase 4) — a credential-selection change, so every method is a door
+    "/tenant/active",
     // server-side request to a caller-chosen URL whose response is returned:
     // aimed at 127.0.0.1 it launders a browser request into a NonBrowser one
     "POST /api-request/test",
