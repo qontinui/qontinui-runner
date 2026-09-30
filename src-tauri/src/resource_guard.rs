@@ -1199,6 +1199,8 @@ pub(crate) fn ladder_verdicts(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CommitLadderShadow {
     pub(crate) scale: f64,
+    /// [`commit_ladder_scale_source`] — why the scale is what it is.
+    pub(crate) scale_source: &'static str,
     pub(crate) shipped: CommitLadder,
     pub(crate) scaled: CommitLadder,
     /// `None` when the free-commit reading is UNKNOWN — both ladders then fail
@@ -1221,6 +1223,7 @@ pub(crate) fn commit_ladder_shadow(
     let scaled = scaled_commit_ladder(effective, scale);
     CommitLadderShadow {
         scale,
+        scale_source: commit_ladder_scale_source(capability),
         shipped,
         scaled,
         verdicts: free_commit.map(|free| {
@@ -1244,6 +1247,9 @@ pub(crate) fn commit_ladder_shadow(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShadowKey {
     scale_centi: i64,
+    /// So `below_reference` ↔ `unknown_identity` — both 1.0 — still logs: a
+    /// capability that goes dark is news even when the factor does not move.
+    scale_source: &'static str,
     alternative_centi: Option<i64>,
     shipped: CommitLadder,
     verdicts: Option<(LadderVerdicts, LadderVerdicts)>,
@@ -1254,6 +1260,7 @@ impl CommitLadderShadow {
         let centi = |s: f64| (s * 100.0).round() as i64;
         ShadowKey {
             scale_centi: centi(self.scale),
+            scale_source: self.scale_source,
             alternative_centi: self.alternative_scale.map(centi),
             shipped: self.shipped,
             verdicts: self.verdicts,
@@ -1348,7 +1355,7 @@ pub(crate) fn note_commit_ladder_shadow(
     tracing::info!(
         target: "resource_guard::commit_ladder_shadow",
         scale = shadow.scale,
-        scale_source = commit_ladder_scale_source(capability),
+        scale_source = shadow.scale_source,
         commit_limit = ?capability.commit_limit,
         commit_limit_source = capability.commit_limit_source,
         free_commit = ?free_commit,
@@ -1703,6 +1710,12 @@ mod commit_ladder_scale_tests {
         );
         let crossed = commit_ladder_shadow(&cap, &effective, Some(5 * GIB_U), None).key();
         assert!(shadow_edge(&mut last, crossed));
+        // A source change at the SAME scale (1.0 either way) still logs.
+        let mut last = None;
+        let small = commit_ladder_shadow(&capability(Some(GIB_U)), &effective, None, None).key();
+        let dark = commit_ladder_shadow(&capability(None), &effective, None, None).key();
+        assert!(shadow_edge(&mut last, small));
+        assert!(shadow_edge(&mut last, dark));
     }
 }
 
