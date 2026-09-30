@@ -51,10 +51,11 @@ pub(crate) const FROM_NODE_KEY_SQL: &str = from_node_key_sql!();
 ///   nothing). The `= ANY($5)` pre-filter narrows the scan to this batch's
 ///   fingerprints before the node-key expression is computed (m7);
 /// - each row's `reason` follows plan D4 ([`d4_reason`]);
-/// - `ON CONFLICT` refreshes `last_seen_*`, the role / effect and the D4
-///   reason — except that an `activation_failed` reason (set when an edge
-///   from here errored) is kept: seeing the affordance again does not undo a
-///   failed activation.
+/// - `ON CONFLICT` refreshes `last_seen_*` and the role / effect, and moves
+///   the reason only between the D4 OBSERVATION reasons ([`OBSERVATION_REASONS`]):
+///   a reason another fact set — `activation_failed` (an edge from here
+///   errored) or `budget_exhausted` (the explorer ran out) — is never
+///   overwritten by merely seeing the affordance again (N5).
 ///
 /// The caller dedups fingerprints first ([`AffordanceIndex::distinct`]): a
 /// duplicate key in one statement makes `ON CONFLICT DO UPDATE` fail with
@@ -80,11 +81,21 @@ pub(crate) const FRONTIER_UPSERT_SQL: &str = concat!(
     "   SET node = EXCLUDED.node,\n",
     "       affordance_role = EXCLUDED.affordance_role,\n",
     "       declared_effect = EXCLUDED.declared_effect,\n",
-    "       reason = CASE WHEN journey_frontier.reason = 'activation_failed'\n",
-    "                     THEN journey_frontier.reason ELSE EXCLUDED.reason END,\n",
+    "       reason = CASE WHEN journey_frontier.reason IN ('not_yet_activated', 'effect_write',\n",
+    "                         'effect_destructive', 'effect_undeclared')\n",
+    "                     THEN EXCLUDED.reason ELSE journey_frontier.reason END,\n",
     "       last_seen_at = now(),\n",
     "       last_seen_run_id = EXCLUDED.last_seen_run_id"
 );
+
+/// The reasons an OBSERVATION sets (plan D4) and may therefore replace on
+/// conflict. Every other reason records a fact an observation cannot undo.
+pub(crate) const OBSERVATION_REASONS: [FrontierReason; 4] = [
+    FrontierReason::NotYetActivated,
+    FrontierReason::EffectWrite,
+    FrontierReason::EffectDestructive,
+    FrontierReason::EffectUndeclared,
+];
 
 /// Number of parameters [`FRONTIER_UPSERT_SQL`] binds.
 pub(crate) const FRONTIER_UPSERT_BINDS: usize = 8;
@@ -102,6 +113,11 @@ pub(crate) fn d4_reason(declared_effect: Option<IrEffect>, navigation: bool) -> 
         None if navigation => FrontierReason::NotYetActivated,
         None => FrontierReason::EffectUndeclared,
     }
+}
+
+/// Whether `reason` is one an observation sets (and may replace).
+pub(crate) fn d4_reason_is_observation(reason: FrontierReason) -> bool {
+    OBSERVATION_REASONS.contains(&reason)
 }
 
 pub(crate) fn effect_str(e: IrEffect) -> &'static str {
@@ -314,8 +330,25 @@ mod tests {
             !sql.contains("to_node_unobserved"),
             "unobserved touches no frontier row"
         );
-        // A later observation does not undo a failed activation.
-        assert!(FRONTIER_UPSERT_SQL.contains("WHEN journey_frontier.reason = 'activation_failed'"));
+        // N5: on conflict the reason moves only among the observation
+        // reasons; activation_failed / budget_exhausted are kept.
+        for reason in OBSERVATION_REASONS {
+            assert!(
+                FRONTIER_UPSERT_SQL.contains(&format!("'{}'", reason.as_str())),
+                "{} must be replaceable",
+                reason.as_str()
+            );
+            assert!(d4_reason_is_observation(reason));
+        }
+        assert!(
+            FRONTIER_UPSERT_SQL.contains("THEN EXCLUDED.reason ELSE journey_frontier.reason END")
+        );
+        for kept in ["activation_failed", "budget_exhausted"] {
+            assert!(
+                !FRONTIER_UPSERT_SQL.contains(&format!("'{kept}'")),
+                "{kept} must never be overwritten by an observation"
+            );
+        }
     }
 
     #[test]

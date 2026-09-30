@@ -456,7 +456,8 @@ fn batch_execute_bad_request(error: &str, detail: &str) -> (StatusCode, Json<Api
 
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
-/// `/control/batch-execute` is ONE `batch_action` (`batch:<n>`) on its first target.
+/// `/control/batch-execute` is ONE `batch_action` (`batch:<n>`) on its first target; an empty batch
+/// records nothing.
 pub async fn ui_bridge_control_batch_execute_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -467,12 +468,14 @@ pub async fn ui_bridge_control_batch_execute_handler(
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
             .unwrap_or_default(),
-    )
-    .unwrap_or_else(|| crate::journey::cursor::ActionSpec::batch_kind("batch:0", None));
+    );
     let result =
         ui_bridge_control_batch_execute_handler_dispatch(State(Arc::clone(&state)), Json(body))
             .await;
-    crate::journey::capture::record_control_result(&state, &result, action);
+    // An empty batch acted on nothing: no edge (N7).
+    if let Some(action) = action {
+        crate::journey::capture::record_control_result(&state, &result, action);
+    }
     result
 }
 
@@ -1442,7 +1445,8 @@ async fn ui_bridge_batch_handler_dispatch(
 
 /// Journey ledger choke point (plan
 /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
-/// `/control/batch` is ONE `batch_action` (`batch:<n>`) on its first target.
+/// `/control/batch` is ONE `batch_action` (`batch:<n>`) on its first target; an empty batch
+/// records nothing.
 pub async fn ui_bridge_control_batch_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -1452,11 +1456,13 @@ pub async fn ui_bridge_control_batch_handler(
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
             .unwrap_or_default(),
-    )
-    .unwrap_or_else(|| crate::journey::cursor::ActionSpec::batch_kind("batch:0", None));
+    );
     let result =
         ui_bridge_control_batch_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
-    crate::journey::capture::record_control_result(&state, &result, action);
+    // An empty batch acted on nothing: no edge (N7).
+    if let Some(action) = action {
+        crate::journey::capture::record_control_result(&state, &result, action);
+    }
     result
 }
 

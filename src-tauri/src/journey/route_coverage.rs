@@ -120,8 +120,8 @@ const R12: &str =
     "arbitrary script evaluation, not a declared affordance; the journey records UI actions only";
 const R13: &str = "generic command proxy carrying untyped commands; typed actions are recorded at their own routes (known gap: an action sent through this proxy is not recorded)";
 const R14: &str = "writes the system clipboard; not an app affordance";
-const R15: &str =
-    "exploration/discovery: the Phase 3 explorer records its own run_kind=explorer edges";
+const R15: &str = "starts/stops the existing Python crawler (exploration.rs), not a Phase 3 explorer, and is itself no UI action; its clicks go through the RECORDED control routes and so land as run_kind=agent_action (known gap: crawler edges are mislabelled agent_action)";
+const R15B: &str = "derives states from existing render logs (co-occurrence analysis, exploration.rs); acts on no page";
 const R16: &str = "window lifecycle; ends the session rather than moving within it";
 const R17: &str = "viewport configuration; not a UI affordance";
 const R18: &str = "clears browser storage; not a UI affordance";
@@ -263,7 +263,7 @@ const NOT_AN_ACTION: &[(&str, &str)] = &[
     ("/ui-bridge/devices/{id}/connect", R04),
     ("/ui-bridge/devices/{id}/disconnect", R04),
     ("/ui-bridge/devices/{id}/transport/prefer", R04),
-    ("/ui-bridge/discover-states", R15),
+    ("/ui-bridge/discover-states", R15B),
     ("/ui-bridge/explore", R15),
     ("/ui-bridge/explore/stop", R15),
     ("/ui-bridge/headless/close", R04),

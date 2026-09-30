@@ -1145,24 +1145,24 @@ pub async fn ui_bridge_execute_action_handler(
     body_bytes: axum::body::Bytes,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
-    // users-path-and-the-passage-of-time, D3): read the action NAME only —
-    // never `params`, which carries typed text — before the body is consumed.
-    let action_name = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+    // users-path-and-the-passage-of-time, D3): parse the body ONCE (the same
+    // lossy fallback the dispatch applies) and read only the action NAME and
+    // the `windowLabel` — never `params`, which carries typed text.
+    let peeked = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
-        .or_else(|| serde_json::from_str(&String::from_utf8_lossy(&body_bytes)).ok())
-        .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from));
+        .or_else(|| serde_json::from_str(&String::from_utf8_lossy(&body_bytes)).ok());
+    let field = |key: &str| {
+        peeked
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let action_name = field("action");
     let task_run_id = query.task_run_id;
     // The cursor scope: the pop-out window this action targets (query wins,
     // then the body field — the same precedence the dispatch applies).
-    let window_scope = query.window_label.clone().or_else(|| {
-        serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("windowLabel")
-                    .and_then(|w| w.as_str())
-                    .map(String::from)
-            })
-    });
+    let window_scope = query.window_label.clone().or_else(|| field("windowLabel"));
     let result = execute_action_dispatch(
         State(Arc::clone(&state)),
         Path(id.clone()),
