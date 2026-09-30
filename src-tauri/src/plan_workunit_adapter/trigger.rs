@@ -23,9 +23,10 @@
 //! `PathSettings::plans_dir` setting — the **Paths** section of the settings
 //! UI, or `paths.plans_dir` in `settings.json`. There is **no environment
 //! override**: the one that used to exist was a backward-compatibility shim
-//! that silently outranked the setting; the binary's `plans_dir_migration`
-//! persists its value into the setting once at boot, and the env read itself
-//! is gone. The markdown-plan carrier is the optional top coordination tier,
+//! that silently outranked the setting, and the resolver's env read is gone.
+//! The binary's `plans_dir_migration` seeds a BLANK setting at primary boot
+//! from that retired shim, else from `QONTINUI_PLANS_DIR` outside runner
+//! context — a write into the setting, never a resolver rung. The markdown-plan carrier is the optional top coordination tier,
 //! so a runner with nothing configured no-ops (it never scans, never pushes) —
 //! claims/intent and coord-native work-units are unaffected.
 //!
@@ -5357,8 +5358,10 @@ fn tenant_override(by_tenant: &BTreeMap<String, String>, tenant: Option<&str>) -
 /// that used to sit above this setting was a backward-compatibility shim for a
 /// pre-settings deployment, and it silently outranked the setting — the
 /// settings UI could show a directory that was not the one in effect. It was
-/// migrated into the setting once at boot (the binary's `plans_dir_migration`)
-/// and then deleted: one precedence chain, one source of truth.
+/// deleted: one precedence chain, one source of truth. (The binary's
+/// `plans_dir_migration` still SEEDS a blank setting at primary boot from that
+/// retired shim or, outside runner context, `QONTINUI_PLANS_DIR` — a write
+/// into the setting, not a rung here.)
 ///
 /// Kept as its own name rather than having callers spell the filter
 /// themselves because it is the documented seam every surface that needs

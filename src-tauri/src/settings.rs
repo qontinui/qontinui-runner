@@ -1044,9 +1044,12 @@ pub struct PathSettings {
     /// This setting is the **only** source: there is no environment override.
     /// The adapter re-reads it every scan interval and session launches re-read
     /// it per launch, so a change made in the Paths settings section takes
-    /// effect without a runner restart. (The pre-settings env shim that used to
-    /// outrank it is persisted into this field once at boot by
-    /// `plans_dir_migration` and is otherwise gone.)
+    /// effect without a runner restart. (At a primary boot where this field is
+    /// blank, the binary's `plans_dir_migration` seeds it from the retired
+    /// `QONTINUI_PLAN_ADAPTER_DIR` shim, else from `QONTINUI_PLANS_DIR` when
+    /// the runner is not itself inside runner context; no resolver reads
+    /// either. So turning the tier OFF durably means removing that export as
+    /// well as clearing this field.)
     ///
     /// Override example: `D:\qontinui-root\plans`
     #[serde(default, skip_serializing_if = "Option::is_none")]

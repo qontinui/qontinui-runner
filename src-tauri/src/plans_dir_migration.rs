@@ -1,5 +1,5 @@
-//! One-time migration of an operator-exported plans-directory env var into
-//! the `paths.plans_dir` setting.
+//! Boot-time seeding of the `paths.plans_dir` setting from an
+//! operator-exported plans-directory env var.
 //!
 //! Plan `2026-09-05-plans-dir-is-env-only-and-unreachable-in-the-product`,
 //! Phase 1. The env var used to be read FIRST by the plan adapter's resolver
@@ -9,8 +9,14 @@
 //! **unset = the markdown-plan tier is OFF with no fallback** — so deleting the
 //! read alone would have turned plan scanning off, silently, on every machine
 //! that relied on the shim. This migration is what makes that deletion safe:
-//! it records the env value into the setting once, after which the setting is
-//! the only source and the env var is inert.
+//! it records the env value into the setting, after which the setting is the
+//! only source the resolver reads.
+//!
+//! **It is a seed, not a one-shot.** There is no persisted "migrated" marker:
+//! it re-seeds on ANY primary boot where `paths.plans_dir` is blank and a
+//! source below is exported. So turning the tier OFF durably means removing
+//! the export as well as clearing the setting — clearing the setting alone
+//! re-arms the tier on the next primary boot.
 //!
 //! ## Two sources, in precedence order
 //!
@@ -37,8 +43,9 @@
 //! An existing non-blank setting outranks both — the operator's choice always
 //! wins — and a blank env value is unset. The decision is one pure function,
 //! [`migration_decision`], and every primary boot logs its outcome in one
-//! `info` line ([`outcome_message`]), so "ran and found nothing to seed" is
-//! distinguishable from "never ran".
+//! `info` line ([`outcome_message`]) — except when the seeding write itself
+//! fails, where the caller's `warn` is the one line instead — so "ran and
+//! found nothing to seed" is distinguishable from "never ran".
 //!
 //! It is a copy of [`crate::workspace_paths::persist_resolved_workspace_root`]
 //! in the three properties that are load-bearing there too:
@@ -71,8 +78,8 @@ use crate::config_facade::{get_setting, update_setting};
 use crate::settings::PathSettings;
 use tracing::info;
 
-/// The retired per-machine override. Read here, once, to seed the setting —
-/// and nowhere else.
+/// The retired per-machine override. Read here, once per primary boot, to
+/// seed a blank setting — and nowhere else.
 pub const PLAN_ADAPTER_DIR_ENV: &str = "QONTINUI_PLAN_ADAPTER_DIR";
 
 /// The fleet's "am I inside the runner?" identity marker, injected into every
@@ -118,8 +125,10 @@ enum MigrationOutcome {
 /// — and only when — the setting is unset and a source resolves (see
 /// [`migration_decision`] for the precedence). Idempotent: a second boot finds
 /// the setting present and writes nothing; an operator's own value is never
-/// overwritten. Every primary boot emits exactly one `info` line naming the
-/// outcome.
+/// overwritten. A setting cleared later is re-seeded on the next primary boot
+/// while the source stays exported. Every primary boot emits exactly one
+/// `info` line naming the outcome, unless the seeding write fails — then the
+/// `Err` returns first and the caller's `warn` is the one line.
 ///
 /// Failures are non-fatal: a runner that cannot write its settings still
 /// boots, and the tier is simply off until the operator sets the field.
@@ -129,11 +138,7 @@ pub fn persist_env_plans_dir() -> Result<(), String> {
     }
 
     let existing = get_setting::<PathSettings>().plans_dir;
-    let adapter_env = std::env::var(PLAN_ADAPTER_DIR_ENV).ok();
-    let plans_env = std::env::var(PLANS_DIR_ENV).ok();
-    let in_runner_context = std::env::var(RUNNER_CONTEXT_ENV)
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
+    let (adapter_env, plans_env, in_runner_context) = read_env_inputs();
 
     let outcome = migration_decision(
         existing.as_deref(),
@@ -146,6 +151,19 @@ pub fn persist_env_plans_dir() -> Result<(), String> {
     }
     info!("{}", outcome_message(&outcome));
     Ok(())
+}
+
+/// The three process-env inputs of [`migration_decision`], read once each:
+/// `$QONTINUI_PLAN_ADAPTER_DIR`, `$QONTINUI_PLANS_DIR`, and whether
+/// `$QONTINUI_RUNNER_CONTEXT` is non-blank (i.e. this process is inside a
+/// runner-spawned session).
+fn read_env_inputs() -> (Option<String>, Option<String>, bool) {
+    let adapter_env = std::env::var(PLAN_ADAPTER_DIR_ENV).ok();
+    let plans_env = std::env::var(PLANS_DIR_ENV).ok();
+    let in_runner_context = std::env::var(RUNNER_CONTEXT_ENV)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    (adapter_env, plans_env, in_runner_context)
 }
 
 /// Trim, and treat blank as unset — never a directory named `""`.
@@ -196,12 +214,13 @@ fn outcome_message(outcome: &MigrationOutcome) -> String {
     match outcome {
         MigrationOutcome::Seed { value, source } => format!(
             "plans_dir_migration: seeded from {var}: recorded paths.plans_dir = {value:?}. \
-             The setting is now the only source; the env var is no longer read for it.",
+             The resolver reads only the setting; the export stays a seed, so clearing \
+             the setting re-seeds it on the next primary boot unless {var} is also removed.",
             var = source.env_var(),
         ),
         MigrationOutcome::KeptExisting => {
-            "plans_dir_migration: kept existing setting: paths.plans_dir is already set; \
-             no env var was consulted."
+            "plans_dir_migration: kept existing setting: paths.plans_dir is already set, \
+             so the env vars were not used."
                 .to_string()
         }
         MigrationOutcome::NothingToSeed {
@@ -210,7 +229,7 @@ fn outcome_message(outcome: &MigrationOutcome) -> String {
             let ignored = if *plans_env_ignored_in_runner_context {
                 format!(
                     "; {PLANS_DIR_ENV} ignored inside runner context \
-                     ({RUNNER_CONTEXT_ENV} is set, so its value is runner-injected)"
+                     ({RUNNER_CONTEXT_ENV} is set, so its value may be runner-injected)"
                 )
             } else {
                 String::new()
@@ -290,6 +309,17 @@ mod tests {
     fn plans_env_only_writes_the_plans_value() {
         assert_eq!(
             migration_decision(None, None, Some("/fleet/plans"), false),
+            seed("/fleet/plans", SeedSource::PlansEnv)
+        );
+    }
+
+    /// A blank setting is unset, so the plans rung seeds it too — the
+    /// settings-reset case (a cleared field on a box that still exports the
+    /// fleet variable).
+    #[test]
+    fn blank_setting_with_plans_env_outside_context_seeds_from_plans_env() {
+        assert_eq!(
+            migration_decision(Some("  "), None, Some("/fleet/plans"), false),
             seed("/fleet/plans", SeedSource::PlansEnv)
         );
     }
@@ -378,18 +408,14 @@ mod tests {
         );
     }
 
-    /// The env readers are the process environment, read the same way the
-    /// boot-time call reads them — so the decision rule above IS what the
-    /// boot applies, including the runner-context guard.
+    /// The env readers are the process environment, read through the SAME
+    /// [`read_env_inputs`] the boot-time call uses — so the decision rule
+    /// above IS what the boot applies, including the runner-context guard.
     #[test]
     fn the_env_vars_are_read_from_the_process_environment() {
         let read = |adapter: Option<&str>, plans: Option<&str>, ctx: Option<&str>| {
             with_env(adapter, plans, ctx, || {
-                let adapter_env = std::env::var(PLAN_ADAPTER_DIR_ENV).ok();
-                let plans_env = std::env::var(PLANS_DIR_ENV).ok();
-                let in_ctx = std::env::var(RUNNER_CONTEXT_ENV)
-                    .ok()
-                    .is_some_and(|v| !v.trim().is_empty());
+                let (adapter_env, plans_env, in_ctx) = read_env_inputs();
                 migration_decision(None, adapter_env.as_deref(), plans_env.as_deref(), in_ctx)
             })
         };
@@ -433,6 +459,11 @@ mod tests {
 
         let kept = outcome_message(&MigrationOutcome::KeptExisting);
         assert!(kept.contains("kept existing setting"), "{kept}");
+        // All three vars ARE read every boot; the line may only say they were
+        // not USED, never that they were not read/consulted.
+        for false_claim in ["not read", "not consulted", "no env var was"] {
+            assert!(!kept.contains(false_claim), "{kept}");
+        }
 
         let nothing = outcome_message(&NOTHING);
         assert!(
