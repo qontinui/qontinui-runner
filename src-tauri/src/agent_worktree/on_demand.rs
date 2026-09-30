@@ -145,6 +145,15 @@ pub enum SkipReason {
     /// at most a non-destructive rejunction. Removal is deliberately NOT
     /// authorized for that signal, so this does not resolve with time either.
     LandedIdleNotRemovable,
+    /// coord's gate cleared this path for REMOVAL, but the per-device removal
+    /// cap (`max_removals_per_tick`, `0` in shadow) withheld it this tick
+    /// (`DeferReason::RemovalCapped`). It is next in line, not refused.
+    RemovalCapped,
+    /// coord's selected trigger for this path is rejunction-only
+    /// (`ttl_expired`, `agent_done`, `work_unit_shipped`,
+    /// `parent_sha_unresolvable`; `DeferReason::TriggerNotRemovable`), so it
+    /// earns at most a non-destructive rejunction and never a removal.
+    TriggerNotRemovable,
     /// coord did not clear this worktree and gave no typed reason — a coord
     /// that serves no `blocked` list (every coord before plan
     /// `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`
@@ -175,6 +184,8 @@ impl SkipReason {
             SkipReason::StaleCensus => "stale-census",
             SkipReason::UndeclaredNotRemovable => "undeclared-not-removable",
             SkipReason::LandedIdleNotRemovable => "landed-idle-not-removable",
+            SkipReason::RemovalCapped => "removal-capped",
+            SkipReason::TriggerNotRemovable => "trigger-not-removable",
             SkipReason::NotCleared => "not-cleared",
             SkipReason::CoordUnreachable => "coord-unreachable",
             SkipReason::Absent => "absent",
@@ -221,6 +232,14 @@ impl SkipReason {
                 "Landed, clean and idle — coord offers only a non-destructive rejunction \
                  for that and never authorizes removing it on that signal alone."
             }
+            SkipReason::RemovalCapped => {
+                "coord cleared this worktree for removal, but its per-tick removal cap \
+                 held it back — it is queued, not refused."
+            }
+            SkipReason::TriggerNotRemovable => {
+                "coord's reason to look at this worktree only permits a non-destructive \
+                 rejunction, never removing it."
+            }
             SkipReason::NotCleared => {
                 "coord has not cleared this worktree for removal and gave no reason for it."
             }
@@ -262,6 +281,9 @@ impl SkipReason {
 /// - `landed_idle_not_removable` — `DeferReason::LandedIdleNotRemovable`, added
 ///   by Phase 3 of plan
 ///   `2026-09-17-coord-worktree-nomination-is-event-only-so-landed-clean-unowned-trees-hold-slots-forever`;
+/// - `removal_capped` / `trigger_not_removable` — blocked-list-only
+///   `DeferReason`s the same plan's Phase 4 adds, so every evaluated path that
+///   was not removed carries a named reason.
 ///
 /// coord's `sinkless_rejunction` metrics label is deliberately absent: it
 /// describes a withheld REJUNCTION, not why removal was refused, so it can
@@ -289,6 +311,8 @@ pub const KNOWN_COORD_DEFER_TOKENS: &[(&str, SkipReason)] = &[
         "landed_idle_not_removable",
         SkipReason::LandedIdleNotRemovable,
     ),
+    ("removal_capped", SkipReason::RemovalCapped),
+    ("trigger_not_removable", SkipReason::TriggerNotRemovable),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2255,6 +2279,8 @@ mod tests {
                 "landed_idle_not_removable",
                 SkipReason::LandedIdleNotRemovable,
             ),
+            ("removal_capped", SkipReason::RemovalCapped),
+            ("trigger_not_removable", SkipReason::TriggerNotRemovable),
             ("something-new", SkipReason::NotCleared),
         ] {
             assert_eq!(SkipReason::from_coord_token(token), expected, "{token}");
@@ -3740,6 +3766,8 @@ mod tests {
             "stale_census",
             "undeclared_not_removable",
             "landed_idle_not_removable",
+            "removal_capped",
+            "trigger_not_removable",
         ];
         let tokens: Vec<&str> = KNOWN_COORD_DEFER_TOKENS.iter().map(|(t, _)| *t).collect();
         assert_eq!(
@@ -3796,7 +3824,7 @@ mod tests {
     }
 
     /// Every `SkipReason` variant — the list the per-variant tests iterate.
-    const ALL_SKIP_REASONS: [SkipReason; 16] = [
+    const ALL_SKIP_REASONS: [SkipReason; 18] = [
         SkipReason::Dirty,
         SkipReason::DirtinessUnknown,
         SkipReason::Pinned,
@@ -3809,6 +3837,8 @@ mod tests {
         SkipReason::StaleCensus,
         SkipReason::UndeclaredNotRemovable,
         SkipReason::LandedIdleNotRemovable,
+        SkipReason::RemovalCapped,
+        SkipReason::TriggerNotRemovable,
         SkipReason::NotCleared,
         SkipReason::CoordUnreachable,
         SkipReason::Absent,

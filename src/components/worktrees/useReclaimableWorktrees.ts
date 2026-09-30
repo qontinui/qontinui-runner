@@ -43,6 +43,10 @@ export type SkipReason =
   | "undeclared-not-removable"
   /** Landed, clean and idle — coord offers only a rejunction, never a removal. */
   | "landed-idle-not-removable"
+  /** Cleared for removal, held back by the per-tick removal cap. */
+  | "removal-capped"
+  /** The trigger only permits a rejunction, never a removal. */
+  | "trigger-not-removable"
   /** coord gave no reason — it serves no blocked list, never evaluated the path, or sent an unknown token. */
   | "not-cleared"
   | "coord-unreachable"
@@ -176,6 +180,8 @@ export const REASON_LABEL: Record<SkipReason, string> = {
   "stale-census": "census stale",
   "undeclared-not-removable": "undeclared",
   "landed-idle-not-removable": "idle, keep-only",
+  "removal-capped": "queued (cap)",
+  "trigger-not-removable": "keep-only trigger",
   "not-cleared": "not cleared",
   "coord-unreachable": "coord offline",
   absent: "gone",
