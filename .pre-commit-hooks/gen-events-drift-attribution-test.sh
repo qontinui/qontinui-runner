@@ -1044,6 +1044,63 @@ check "  and the suite itself started with no PRE_COMMIT_* or stage hint" "" \
 check "gen-events-drift.sh renders its MINE arm through gen_events_render_mine" yes \
     "$(grep -qE '^[[:space:]]*gen_events_render_mine[[:space:]]*\|' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
 
+echo "  -- at pre-commit, 'staged' means the index the commit is built from --"
+
+# `git commit -a` and `git commit <path>` build the commit from a TEMPORARY
+# index and hand its path to the hook in GIT_INDEX_FILE; the plain
+# .git/index is then not what is being committed. A real pre-commit hook in
+# a fixture runs the drift hook's own sequence — clear the git env, detect
+# the stage, attribute from the hook's cwd — records the detail, and fails
+# so the commit never lands.
+index_hook_fixture() {
+    fixture
+    local hooks="$(dirname "$WORK")/index-hooks"
+    mkdir -p "$hooks"
+    cat > "$hooks/pre-commit" <<HOOK
+#!/usr/bin/env bash
+. "$SCRIPT_DIR/lib/gen-events-attribution.sh"
+gen_events_clear_inherited_git_env
+gen_events_detect_stage_from_stdin
+gen_events_attribution "\$PWD"
+printf '%s\n' "\$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.hook-detail"
+exit 1
+HOOK
+    chmod +x "$hooks/pre-commit"
+    git -C "$WORK" config core.hooksPath "$hooks"
+}
+hook_detail() { cat "$WORK/.hook-detail" 2>/dev/null; }
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+( cd "$WORK" && git commit -qam "commit -a" ) >/dev/null 2>&1
+check "commit -a: the edited input is staged for this commit" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+printf '# bumped\n' >> "$WORK/Cargo.lock"
+git -C "$WORK" add Cargo.lock
+( cd "$WORK" && git commit -qm "partial" -- src-tauri/src/lib.rs ) >/dev/null 2>&1
+check "commit <path>: the named path is staged; a pre-staged other path is not in this commit" \
+    "$(detail_line Cargo.lock unstaged)"$'\n'"$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+index_hook_fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add src-tauri/src/lib.rs
+( cd "$WORK" && git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit (relative GIT_INDEX_FILE) still labels the staged path staged" \
+    "$(detail_line src-tauri/src/lib.rs staged)" "$(hook_detail)"
+
+# The hook's index is used only for the hook's repo: attribution of some
+# OTHER repo from inside a hook (a fixture here, the schemas checkout in the
+# drift hook) must read that repo's own index.
+fixture
+printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
+( GEN_EVENTS_HOOK_INDEX_FILE="$WORK/.git/does-not-exist" GEN_EVENTS_HOOK_GIT_DIR="/not/this/repo/.git"
+  decide; printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.state" )
+check "a recorded hook index is ignored for a repo with a different git dir" \
+    "$(detail_line src-tauri/src/lib.rs unstaged)" "$(cat "$WORK/.state")"
+
 echo "  -- odd file names are shown as themselves --"
 
 # git C-quotes non-ASCII, `"` and `\` without `-z`, and the label would then
