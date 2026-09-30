@@ -59,61 +59,81 @@ pub(crate) const AI_SESSION_SOURCE_MARKER: &str = concat!(
     "]"
 );
 
-/// Compiled-in FALLBACK for `session_briefing/ai-session-rules`, supervisor-up
-/// arm. NOT the source of truth — see [`runner_rules_prefix`].
-pub(crate) const AI_SESSION_RULES_SUPERVISOR_AVAILABLE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
+/// The dev-box supervisor addendum: appended AFTER the rules block, and only on
+/// the supervisor-AVAILABLE arm of [`runner_rules_prefix`].
+///
+/// Compiled in rather than served for the same reason the rules block's
+/// supervisor-DOWN arm always was: whether a development supervisor answers is
+/// a statement about THIS machine's live process table, not tenant policy. A
+/// tenant-wide document cannot make it true or false, so the served
+/// `session_briefing/ai-session-rules` stays fleet-neutral (no supervisor, no
+/// port, no shell dialect) and every dev box that DOES run one keeps its
+/// working restart route. Placeholders: `{{supervisor_base}}` is the runner's
+/// own configured supervisor URL ([`crate::api_config::get_supervisor_url`]),
+/// `{{runner_api_base}}` the session's runner API base; both are resolved
+/// before the text is emitted.
+pub(crate) const AI_SESSION_SUPERVISOR_RESTART_RECIPE: &str = r#"## Development supervisor observed on this machine
 
-You are being run BY the qontinui-runner. You are a child process of the runner.
+(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervisor_base}} when this session was spawned.)
 
-**CRITICAL RULES:**
-1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend and frontend without issues
-3. If the runner needs to be restarted, USE THE SUPERVISOR API
+The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop and restart the runner instead of the user restarting the application by hand. Nothing resumes this session afterwards - forcing the restart ends it, and the user continues after the restart. So commit, and tell the user what state you left, BEFORE sending the request. On this machine, carrying out a restart the user explicitly asked for, through this route, is the user's restart, not yours - so it does not break the rules above; it still ends this session.
 
-**Restarting Runner via Supervisor (SAFE):**
-```powershell
-# Simple restart (no rebuild)
-Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue": true}'
+Use it only when ALL of these hold:
+1. The user has explicitly asked, in this session, for the runner to be restarted. Needing to load your own change is not that request: tell the user, quote the readiness verdict, and offer this route.
+2. `GET {{runner_api_base}}/restart-readiness` reports no live session other than your own (the counts include you). A refusal, a timeout, an error status or an unreadable body means do not restart.
+3. Your work is committed.
 
-# Restart with REBUILD (use after modifying runner Rust code)
-Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trigger_auto_continue": true}'
+Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo check` / `cargo test`, or a temporary runner from `POST {{supervisor_base}}/runners/spawn-test`.
+
+**The supervisor will refuse (HTTP 409) without `"force": true`**, because it asks the same restart-readiness question and your own session always counts as live work, and its refusal text will suggest forcing. Send `"force": true` ONLY immediately after a gate-2 readiness read that shows your session as the sole live session. Never force on an UNKNOWN verdict (refused, timed out, error status, unreadable), and never force past any other refusal.
+
+**Restarting Runner via Supervisor** (only when all three conditions above hold, and the force condition just stated holds):
+```bash
+# Restart (no rebuild)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true}'
+
+# Restart with REBUILD (only if the user asked for a rebuild - see below)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true}'
 ```
+From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Post` with the same URL and body.
 
-**Supervisor API (port 9875):**
+**Supervisor API ({{supervisor_base}}):**
 - GET /health - Check if supervisor is running
-- POST /runner/stop - Stop the runner
-- POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
-- POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
+- POST /runner/restart - Restart runner (body: force, rebuild, from_working_tree, use_lkg; query: ?wait=)
 
-**IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
-
-**Workflow Loop Signal:** If you are running inside a supervisor workflow loop and you modify runner code, call:
-```powershell
-Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post
-```
-This tells the supervisor to restart the runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
+**About `"rebuild": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can take ~40 minutes); and the request returns 202 and runs detached, so a refusal shows up in `GET {{supervisor_base}}/builds`, not as a synchronous 409. To exercise an unmerged runner change, use a temporary runner from `POST {{supervisor_base}}/runners/spawn-test` instead of restarting the runner hosting you.
 
 ---
 
 "#;
 
-/// The supervisor-DOWN arm. Deliberately NOT sourced from coord: what it says
-/// is a statement about this machine's live process table ("the supervisor is
-/// NOT currently running"), not tenant policy, so an operator editing a
-/// tenant-wide document has no way to make it true or false. Keeping it
-/// compiled in is what stops an edit from telling a session the supervisor is
-/// available when it is not.
-pub(crate) const AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
+/// The fleet-neutral rules text — byte-identical to coord's seed of
+/// `session_briefing/ai-session-rules` (qontinui-coord
+/// `crates/coord/src/prompt_documents/session_briefing/ai-session-rules.md`), in
+/// its placeholder form. Rendered through [`builtin_rules_text`].
+///
+/// It is BOTH arms' compiled-in text:
+///
+/// - supervisor-AVAILABLE: the fallback when coord has no usable cached body.
+/// - supervisor-DOWN: the ONLY text, never sourced from coord. Existing tenants
+///   hold older versions of the served document that carried a dev-box
+///   supervisor recipe until the neutral version is published to them; a box
+///   with no supervisor (every external operator) must never render that. So
+///   this arm stays compiled in, and names the next action a session can
+///   actually take: read the runner's own restart verdict, never restart its
+///   host, commit, and hand the restart to the user.
+pub(crate) const AI_SESSION_RULES_TEMPLATE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
 
 You are being run BY the qontinui-runner. You are a child process of the runner.
 
 **CRITICAL RULES:**
-1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend and frontend without issues
-3. The supervisor is NOT currently running - if runner restart is needed, inform the user
+1. Do NOT restart the qontinui-runner directly - it will kill your session, and every other session the runner is hosting
+2. Never stop, kill, close or rebuild the runner that hosts you, by any route - its process, its window, or any tool that restarts it on your behalf
+3. You CAN restart the other services your task works on (your application's own backend, frontend or database) - only the runner that hosts you is special
 
-**If runner restart is needed:**
-Tell the user: "The qontinui-runner needs to be restarted manually to apply changes."
+**If the runner needs a restart** (for example, to load a change you made to it):
+1. Ask the runner itself whether a restart is safe: `GET {{runner_api_base}}/restart-readiness`. Only an explicit `"safe_to_restart": true` means a restart would lose no work. A refusal, a timeout, an error status or an unreadable body means NOT safe - it is unknown, not idle.
+2. Either way, do not restart it: a session cannot restart its own host and survive it. Finish and commit your work, then tell the user that the runner needs a restart to apply the change, quoting the readiness verdict you read (it counts your own session as live work). The user restarts the application.
 
 ---
 
@@ -134,6 +154,63 @@ pub(crate) struct RenderedRules {
     pub(crate) fetched_at: Option<String>,
 }
 
+/// [`AI_SESSION_RULES_TEMPLATE`] with its one placeholder resolved — the
+/// compiled-in rules text for a session whose runner API is `api_base`.
+pub(crate) fn builtin_rules_text(api_base: &str) -> String {
+    AI_SESSION_RULES_TEMPLATE.replace("{{runner_api_base}}", api_base)
+}
+
+/// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] with both placeholders resolved.
+/// `supervisor_base` is the runner's configured supervisor URL, never a
+/// literal port, so a box that moved its supervisor gets the right address.
+pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {
+    AI_SESSION_SUPERVISOR_RESTART_RECIPE
+        .replace("{{supervisor_base}}", supervisor_base.trim_end_matches('/'))
+        .replace("{{runner_api_base}}", api_base)
+}
+
+/// Markers of the LEGACY served `ai-session-rules` shape, which carried its own
+/// supervisor restart recipe. Existing tenants hold that version until the
+/// fleet-neutral one is published to them; rendering it beside
+/// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] would give a session two
+/// conflicting recipes, one of them ungated.
+const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &["/runner/restart", "USE THE SUPERVISOR API"];
+
+/// Refuse a served body with the legacy supervisor shape: the builtin renders
+/// instead, named as [`session_briefing::Provenance::BuiltinRejected`] with the
+/// refused version, exactly like a guard failure.
+///
+/// The needles are case-sensitive substrings. That is deliberately broad: a
+/// tenant body that merely MENTIONS `/runner/restart` is rejected too. It errs
+/// safe — the builtin still carries every required rule — and the provenance
+/// line names the refused version, so the rejection is visible, not silent.
+fn reject_legacy_supervisor_body(
+    served: crate::mcp::session_briefing::RenderedBlock,
+    builtin: &str,
+) -> crate::mcp::session_briefing::RenderedBlock {
+    use crate::mcp::session_briefing::{Provenance, RenderedBlock};
+    let version = match served.provenance {
+        Provenance::Coord { version, .. } | Provenance::Cached { version } => version,
+        Provenance::Builtin | Provenance::BuiltinRejected { .. } => return served,
+    };
+    let Some(marker) = LEGACY_SUPERVISOR_BODY_MARKERS
+        .iter()
+        .find(|m| served.text.contains(**m))
+    else {
+        return served;
+    };
+    warn!(
+        version,
+        marker = %marker,
+        "ai_session: served ai-session-rules carries the legacy supervisor recipe; rendering the builtin"
+    );
+    RenderedBlock {
+        text: builtin.to_string(),
+        provenance: Provenance::BuiltinRejected { version },
+        fetched_at: None,
+    }
+}
+
 /// Render the runner-triggered rules block from the coord document
 /// `session_briefing/ai-session-rules`, falling back to the compiled-in text.
 ///
@@ -145,8 +222,10 @@ pub(crate) struct RenderedRules {
 /// the briefing.
 ///
 /// Coord is consulted only on the supervisor-AVAILABLE arm; see
-/// [`AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE`] for why the other arm stays
-/// compiled in.
+/// [`AI_SESSION_RULES_TEMPLATE`] for why the other arm stays compiled in. That
+/// arm also, and only that arm, gets [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`]
+/// appended after the rules — after the SERVED text when coord supplied one,
+/// so no tenant edit can remove or forge the machine-local recipe.
 ///
 /// # The one thing an edit may not delete
 ///
@@ -166,18 +245,31 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
     let api_base = session_briefing::runner_api_base(api_port);
     let web_base = session_briefing::web_api_base();
 
+    let builtin = builtin_rules_text(&api_base);
+
     let block = if supervisor_available {
-        session_briefing::resolve_requiring(
-            BRIEFING_AI_SESSION_RULES,
-            AI_SESSION_RULES_SUPERVISOR_AVAILABLE,
-            &api_base,
-            &coord_url,
-            &web_base,
-            &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
-        )
+        let served = reject_legacy_supervisor_body(
+            session_briefing::resolve_requiring(
+                BRIEFING_AI_SESSION_RULES,
+                &builtin,
+                &api_base,
+                &coord_url,
+                &web_base,
+                &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
+            ),
+            &builtin,
+        );
+        let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);
+        session_briefing::RenderedBlock {
+            // `trim_end` + a blank line: an operator-edited body usually has
+            // its trailing blank lines stripped, and the addendum must start
+            // its own section rather than run into the served text.
+            text: format!("{}\n\n{recipe}", served.text.trim_end()),
+            ..served
+        }
     } else {
         session_briefing::RenderedBlock {
-            text: AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE.to_string(),
+            text: builtin,
             provenance: session_briefing::Provenance::Builtin,
             fetched_at: None,
         }
@@ -2775,16 +2867,19 @@ mod tests {
     };
 
     /// NO-REGRESSION ANCHOR for the SECOND runner-injected prompt: with nothing
-    /// cached, the block is byte-identical to the text this build shipped
-    /// before it became a coord document, under an unchanged marker line and a
-    /// provenance line that says where it came from.
+    /// cached, the supervisor-available block is exactly the compiled-in rules
+    /// text followed by the dev-box supervisor addendum, under an unchanged
+    /// marker line and a provenance line that says where it came from.
     #[test]
-    fn the_builtin_rules_block_is_byte_identical_under_marker_and_provenance() {
+    fn the_builtin_rules_block_renders_under_marker_and_provenance() {
         let _pin = pin_plan_capture_level_for_test("off");
 
         let rules = runner_rules_prefix(true, 9876);
+        let base = "http://127.0.0.1:9876";
         let expected = format!(
-            "{AI_SESSION_SOURCE_MARKER}\n[briefing: builtin-fallback]\n{AI_SESSION_RULES_SUPERVISOR_AVAILABLE}"
+            "{AI_SESSION_SOURCE_MARKER}\n[briefing: builtin-fallback]\n{}\n\n{}",
+            builtin_rules_text(base).trim_end(),
+            supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), base),
         );
         assert_eq!(rules.text, expected);
         assert_eq!(rules.text.lines().next(), Some(AI_SESSION_SOURCE_MARKER));
@@ -2820,31 +2915,199 @@ mod tests {
             lines.next(),
             Some("[briefing: coord session_briefing/ai-session-rules v6]")
         );
-        assert_eq!(
-            lines.next(),
-            Some("Edited rules. Do NOT restart the qontinui-runner directly. Runner API: http://127.0.0.1:9876.")
+        let rest = lines.next().unwrap();
+        assert!(
+            rest.starts_with(
+                "Edited rules. Do NOT restart the qontinui-runner directly. Runner API: http://127.0.0.1:9876.\n\n"
+            ),
+            "{rest}"
         );
     }
 
-    /// The supervisor-DOWN arm is a statement about THIS machine's live process
-    /// table, not tenant policy, so a coord edit must never be able to tell a
-    /// session the supervisor is available when it is not.
+    /// The supervisor-AVAILABLE arm: the SERVED text renders first, and the
+    /// compiled-in dev-box supervisor recipe follows it — after the served
+    /// body, never instead of it, and fully resolved.
     #[test]
-    fn a_coord_body_cannot_override_the_supervisor_down_notice() {
+    fn the_supervisor_recipe_follows_the_served_rules_only_when_a_supervisor_answered() {
         let pin = pin_plan_capture_level_for_test("off");
         pin.set_briefing(
             BRIEFING_AI_SESSION_RULES,
-            briefing_for_test("USE THE SUPERVISOR API", 6, BriefingProvenance::Coord),
+            briefing_for_test(
+                "Served rules. Do NOT restart the qontinui-runner directly.",
+                9,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let base = "http://127.0.0.1:9876";
+        let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), base);
+
+        let up = runner_rules_prefix(true, 9876);
+        let served_at = up.text.find("Served rules.").expect("served text renders");
+        let recipe_at = up
+            .text
+            .find("## Development supervisor observed on this machine")
+            .expect("recipe renders on the supervisor-available arm");
+        assert!(served_at < recipe_at, "{}", up.text);
+        assert!(up.text.ends_with(&recipe), "{}", up.text);
+        assert!(
+            !recipe.contains("{{"),
+            "no placeholder may survive: {recipe}"
+        );
+        assert!(recipe.contains(&format!("{base}/restart-readiness")));
+
+        let down = runner_rules_prefix(false, 9876);
+        assert!(
+            !down.text.contains("Development supervisor"),
+            "{}",
+            down.text
+        );
+        assert!(!down.text.contains("Served rules."), "{}", down.text);
+    }
+
+    /// The recipe addresses the runner's CONFIGURED supervisor, not a literal
+    /// port.
+    #[test]
+    fn the_supervisor_recipe_uses_the_configured_supervisor_base() {
+        let recipe = supervisor_restart_recipe("http://10.0.0.5:4242/", "http://127.0.0.1:9877");
+        assert!(recipe.contains(r#"curl -fsS -X POST "http://10.0.0.5:4242/runner/restart""#));
+        assert!(recipe.contains("answered at http://10.0.0.5:4242 when"));
+        assert!(recipe.contains("GET http://127.0.0.1:9877/restart-readiness"));
+        assert!(!recipe.contains("{{"));
+    }
+
+    /// The addendum changes HOW a user-requested restart happens, never
+    /// WHETHER a session may decide one (served policy `production-and-cost`
+    /// `runner-lifecycle`).
+    #[test]
+    fn the_supervisor_recipe_is_gated_on_an_explicit_user_request() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let up = runner_rules_prefix(true, 9876);
+        assert!(up.text.contains("explicitly asked"), "{}", up.text);
+        assert!(!up.text.contains("sanctioned exception"), "{}", up.text);
+        assert!(!up.text.contains("/runner/stop"), "{}", up.text);
+        // The supervisor refuses without force, and force is gated on a
+        // sole-live-session readiness read.
+        assert!(up.text.contains(r#""force": true"#), "{}", up.text);
+        assert!(up.text.contains("sole live session"), "{}", up.text);
+        assert!(
+            up.text.contains("Never force on an UNKNOWN verdict"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("is the user's restart, not yours"),
+            "{}",
+            up.text
+        );
+        // The workflow-loop signal route does not exist on the supervisor.
+        assert!(!up.text.contains("signal-restart"), "{}", up.text);
+        // No literal port: the rendered text carries only the CONFIGURED
+        // supervisor base, which on a default box does happen to be :9875.
+        assert!(!AI_SESSION_SUPERVISOR_RESTART_RECIPE.contains("9875"));
+        // Fields the supervisor's RestartRequest does not have.
+        assert!(!up.text.contains("trigger_auto_continue"), "{}", up.text);
+        assert!(!up.text.contains("wait_timeout_seconds"), "{}", up.text);
+        assert!(
+            !up.text.contains("from_working_tree\": true"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("Nothing resumes this session"),
+            "{}",
+            up.text
+        );
+    }
+
+    /// A served body with the LEGACY supervisor shape is refused on the
+    /// supervisor-up arm: the builtin renders, named as rejected, and the
+    /// gated recipe follows it — so a session never sees two recipes.
+    #[test]
+    fn a_legacy_supervisor_body_falls_back_to_the_builtin_on_the_up_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. USE THE SUPERVISOR API",
+                6,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let base = "http://127.0.0.1:9876";
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: builtin-fallback (rejected coord v6)]")
+        );
+        assert!(!up.text.contains("USE THE SUPERVISOR API"), "{}", up.text);
+        assert!(up.text.contains(builtin_rules_text(base).trim_end()));
+        assert!(up.text.ends_with(&supervisor_restart_recipe(
+            &crate::api_config::get_supervisor_url(),
+            base
+        )));
+    }
+
+    /// Lockstep pin with coord's seed of `session_briefing/ai-session-rules`:
+    /// coord's seed body must hash to this same value. A coord-side pin of the
+    /// digest does not exist yet; adding one is a follow-up.
+    #[test]
+    fn the_rules_template_digest_is_pinned() {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(AI_SESSION_RULES_TEMPLATE.as_bytes()));
+        assert_eq!(
+            digest,
+            "9a42163a9a4b8212e6ce092a23515cd7bd7bc0b4a2bdd6ced6d207956cb1fd66"
+        );
+    }
+
+    /// The text every external operator receives (no supervisor on the box)
+    /// names no supervisor, no dev port and no PowerShell, and names the next
+    /// action: the runner's own restart verdict.
+    #[test]
+    fn the_supervisor_down_arm_names_no_supervisor_and_a_next_action() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let rules = runner_rules_prefix(false, 9876);
+        let body = rules.text.splitn(3, '\n').nth(2).unwrap();
+        for banned in [
+            "supervisor",
+            "Supervisor",
+            "9875",
+            "Invoke-RestMethod",
+            "powershell",
+        ] {
+            assert!(!body.contains(banned), "`{banned}` in: {body}");
+        }
+        assert!(body.contains("GET http://127.0.0.1:9876/restart-readiness"));
+        assert!(body.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        assert!(body.contains("commit your work"));
+        assert!(body.contains("The user restarts the application."));
+        for banned in ["supervisor", "9875", "Invoke-RestMethod"] {
+            assert!(!AI_SESSION_RULES_TEMPLATE.contains(banned));
+        }
+    }
+
+    /// The supervisor-DOWN arm never reads coord: existing tenants hold served
+    /// versions that still carry a dev-box supervisor recipe, and a box with no
+    /// supervisor must never render one.
+    #[test]
+    fn a_coord_body_cannot_override_the_supervisor_down_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. USE THE SUPERVISOR API",
+                6,
+                BriefingProvenance::Coord,
+            ),
         );
 
         let rules = runner_rules_prefix(false, 9876);
         assert!(
-            rules
-                .text
-                .contains("The supervisor is NOT currently running"),
+            !rules.text.contains("USE THE SUPERVISOR API"),
             "{}",
             rules.text
         );
+        assert!(rules.text.contains("/restart-readiness"), "{}", rules.text);
         assert_eq!(
             rules.text.lines().nth(1),
             Some("[briefing: builtin-fallback]")
@@ -2898,12 +3161,12 @@ mod tests {
     /// on the box (served policy `production-and-cost` `runner-lifecycle`).
     #[test]
     fn the_required_prohibition_is_present_in_both_compiled_in_arms() {
-        assert!(
-            AI_SESSION_RULES_SUPERVISOR_AVAILABLE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION)
-        );
-        assert!(
-            AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION)
-        );
+        assert!(AI_SESSION_RULES_TEMPLATE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        for up in [true, false] {
+            assert!(runner_rules_prefix(up, 9876)
+                .text
+                .contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        }
     }
 
     /// …and an edit that drops it falls back to the builtin, which still
