@@ -165,7 +165,7 @@
 //! did not.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -2484,6 +2484,8 @@ impl CoordOutsideObserver {
             };
             let reports = guard.observe(&outcome);
             OPEN_FAULTS.store(guard.open_mask(), Ordering::SeqCst);
+            // Stamp AFTER the mask: a reader that sees this stamp sees that mask.
+            OPEN_FAULTS_FOLDED_AT.store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
             reports
         };
         for report in &reports {
@@ -2506,11 +2508,61 @@ impl CoordOutsideObserver {
 /// written only when a latch is set.
 static OPEN_FAULTS: AtomicU8 = AtomicU8::new(0);
 
-/// Whether `class`'s episode is open right now in this process — the live
-/// predicate `fleet::wedge_report` closes a `coord_*` incident against, the
-/// same way it uses `health_monitor::backend_wedged()`.
-pub fn fault_open(class: FaultClass) -> bool {
-    OPEN_FAULTS.load(Ordering::SeqCst) & class.bit() != 0
+/// Unix seconds of the fold that last stored [`OPEN_FAULTS`]; `0` = never.
+static OPEN_FAULTS_FOLDED_AT: AtomicI64 = AtomicI64::new(0);
+
+/// How old the last fold may be before the latches say nothing: three probe
+/// periods. A probe is single-flight and bounded, so an observer that has not
+/// folded in that long is stalled or gone — and a latch it can no longer
+/// re-arm must not be read as "still holds".
+pub const OPEN_FAULTS_STALE_AFTER_SECS: i64 = 3 * PROBE_PERIOD_SECS as i64;
+
+/// What the observer's latch for one class says right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultLatch {
+    /// The episode is open (reported, not yet re-armed).
+    Open,
+    /// No open episode.
+    Closed,
+    /// The observer has not folded within [`OPEN_FAULTS_STALE_AFTER_SECS`]
+    /// (or ever): the latch is frozen and vouches for nothing. `last_fold` is
+    /// when it last spoke, `None` if it never has.
+    Unknown {
+        last_fold: Option<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
+/// `class`'s latch in this process — the live predicate `fleet::wedge_report`
+/// closes a `coord_*` incident against, the way it uses
+/// `health_monitor::backend_wedged()`, except that it can be UNKNOWN.
+pub fn fault_latch(class: FaultClass) -> FaultLatch {
+    // Stamp first: the writer stores the mask before the stamp, so a stamp
+    // read here dates a mask at least as new as it.
+    let stamp = OPEN_FAULTS_FOLDED_AT.load(Ordering::SeqCst);
+    let mask = OPEN_FAULTS.load(Ordering::SeqCst);
+    fault_latch_at(mask, stamp, class, chrono::Utc::now())
+}
+
+/// Pure core of [`fault_latch`].
+pub fn fault_latch_at(
+    mask: u8,
+    folded_at: i64,
+    class: FaultClass,
+    now: chrono::DateTime<chrono::Utc>,
+) -> FaultLatch {
+    if folded_at <= 0 {
+        return FaultLatch::Unknown { last_fold: None };
+    }
+    if now.timestamp() - folded_at > OPEN_FAULTS_STALE_AFTER_SECS {
+        return FaultLatch::Unknown {
+            last_fold: chrono::DateTime::from_timestamp(folded_at, 0),
+        };
+    }
+    if mask & class.bit() != 0 {
+        FaultLatch::Open
+    } else {
+        FaultLatch::Closed
+    }
 }
 
 impl Default for CoordOutsideObserver {
@@ -3063,6 +3115,42 @@ mod tests {
             );
         }
         assert_eq!(FaultClass::from_breadcrumb_reason("backend_wedged"), None);
+    }
+
+    #[test]
+    fn a_frozen_fold_stamp_makes_every_latch_unknown() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let t = now.timestamp();
+        let open = FaultClass::NoLeader.bit();
+        assert_eq!(
+            fault_latch_at(open, t - 10, FaultClass::NoLeader, now),
+            FaultLatch::Open
+        );
+        assert_eq!(
+            fault_latch_at(open, t - 10, FaultClass::Unreachable, now),
+            FaultLatch::Closed
+        );
+        assert_eq!(
+            fault_latch_at(
+                open,
+                t - OPEN_FAULTS_STALE_AFTER_SECS,
+                FaultClass::NoLeader,
+                now
+            ),
+            FaultLatch::Open,
+            "exactly at the bound is still fresh"
+        );
+        let stale = t - OPEN_FAULTS_STALE_AFTER_SECS - 1;
+        assert_eq!(
+            fault_latch_at(open, stale, FaultClass::NoLeader, now),
+            FaultLatch::Unknown {
+                last_fold: chrono::DateTime::from_timestamp(stale, 0)
+            }
+        );
+        assert_eq!(
+            fault_latch_at(open, 0, FaultClass::NoLeader, now),
+            FaultLatch::Unknown { last_fold: None }
+        );
     }
 
     #[test]

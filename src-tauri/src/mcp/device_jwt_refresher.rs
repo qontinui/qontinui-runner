@@ -643,11 +643,14 @@ pub(crate) struct CoordCredentialBag {
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
     /// [`COORD_CREDENTIAL_STALE_AFTER_PASSES`] × [`REFRESH_CHECK_INTERVAL`], in
-    /// seconds. Coord's status upsert MERGES `details` per top-level key (a
-    /// writer owns only the keys it sends; a top-level `null` removes one; coord
-    /// stamps the reserved `details._coord_received_at`, which the runner never
-    /// sends), so the row's `updated_at` moves on ANY writer's post and no
-    /// longer dates this bag. What dates it is this runner's own cadence: every
+    /// seconds. Once coord's Phase 5 PR serves, coord's status upsert MERGES
+    /// `details` per top-level key (a writer owns only the keys it sends; a
+    /// top-level `null` removes one; coord stamps the reserved
+    /// `details._coord_received_at`, which the runner never sends), so the row's
+    /// `updated_at` moves on ANY writer's post and no longer dates this bag.
+    /// (Before it serves, coord replaces `details` wholesale, so any other
+    /// poster erases this bag until the runner's next post — which is why every
+    /// runner post carries it.) What dates it is this runner's own cadence: every
     /// refresher pass re-posts this bag together with the runner's other keys
     /// (`wedge_incidents`, `capability`) at least every
     /// [`REFRESH_CHECK_INTERVAL`] — see [`republish_device_status`] — and a
@@ -750,24 +753,24 @@ async fn observed_details() -> serde_json::Map<String, serde_json::Value> {
     }
 }
 
-/// The whole `details` object this publisher owns: `coord_credential` (when
-/// there is one to send) plus the observed keys. Coord merges `details` per
+/// The whole `details` object this publisher owns: `coord_credential` plus the
+/// observed keys. Once coord's Phase 5 PR serves, coord merges `details` per
 /// top-level key, so each key here is this publisher's alone and no other
-/// `/coord/status` poster erases it. Never sends coord's reserved
+/// `/coord/status` poster erases it; before that, coord replaces `details`
+/// wholesale, so the bag must ride in every post. Never sends coord's reserved
 /// `_coord_received_at`.
+///
+/// `None` when the bag cannot be serialised: the caller then does not post at
+/// all, because a `details` without the bag would erase coord's stored one
+/// under replace semantics (and a JSON `null` would delete it under merge).
 fn status_details(
-    bag: Option<CoordCredentialBag>,
+    bag: CoordCredentialBag,
     observed: serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Value {
+) -> Option<serde_json::Value> {
+    let bag = serde_json::to_value(bag).ok()?;
     let mut details = observed;
-    if let Some(bag) = bag {
-        // A serialisation failure omits the key (the merge keeps coord's
-        // stored bag) — sending JSON `null` would DELETE it.
-        if let Ok(v) = serde_json::to_value(bag) {
-            details.insert("coord_credential".to_string(), v);
-        }
-    }
-    serde_json::Value::Object(details)
+    details.insert("coord_credential".to_string(), bag);
+    Some(serde_json::Value::Object(details))
 }
 
 /// Best-effort publish of the coord-credential health into the runner's
@@ -793,7 +796,7 @@ async fn publish_coord_credential_status(
     *LAST_PUBLISHED_HEALTH
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(health.clone());
-    post_device_status(auth_manager, Some(health)).await;
+    post_device_status(auth_manager, health).await;
 }
 
 /// The last health [`publish_coord_credential_status`] posted in this process.
@@ -807,23 +810,42 @@ static LAST_PUBLISHED_HEALTH: std::sync::Mutex<Option<CoordCredentialHealth>> =
 /// the SAME post as `coord_credential`.
 ///
 /// The bag is re-derived from the CURRENT posture with the last published
-/// health as its fallback, i.e. exactly what a publish now would say. When no
-/// health has been published yet in this process the post carries the observed
-/// keys alone: coord's per-key merge then leaves any stored `coord_credential`
-/// untouched rather than being handed an invented one.
+/// health as its fallback, i.e. exactly what a publish now would say.
+///
+/// When no health has been published yet in this process there is NO post:
+/// every device-status post from this runner carries a `coord_credential` bag.
+/// Once coord's Phase 5 per-key `details` merge serves, an observed-keys-only
+/// post would be harmless; before it — and against any coord still replacing
+/// `details` wholesale — it would ERASE the stored bag, and with it a stored
+/// `ok: false`, auto-clearing a live `credentials_missing` alert. So the skip
+/// is unconditional, and logged once per process.
 async fn republish_device_status(auth_manager: &crate::auth::AuthManager) {
     let last = LAST_PUBLISHED_HEALTH
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    post_device_status(auth_manager, last.as_ref()).await;
+    let Some(health) = last else {
+        if !REPUBLISH_SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            info!(
+                "device_jwt_refresher: no coord_credential health published yet in this \
+                 process — skipping the device-status re-post rather than sending observed \
+                 keys without the credential bag"
+            );
+        }
+        return;
+    };
+    post_device_status(auth_manager, &health).await;
 }
 
-/// The `POST /coord/status` itself: `coord_credential` when a health is given,
-/// plus the runner-observed keys, always.
+/// Set once [`republish_device_status`] has logged its first skip.
+static REPUBLISH_SKIP_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `POST /coord/status` itself: `coord_credential` plus the
+/// runner-observed keys, always together.
 async fn post_device_status(
     auth_manager: &crate::auth::AuthManager,
-    health: Option<&CoordCredentialHealth>,
+    health: &CoordCredentialHealth,
 ) {
     // device_id: env override first (multi-instance / test), else machine.json.
     let device_id = std::env::var("QONTINUI_MACHINE_ID")
@@ -868,8 +890,14 @@ async fn post_device_status(
     // C4 — the cross-repo contract. The bag carries the POSTURE and derives
     // `ok` from it, so coord's dark scan and qontinui-web's console finally see
     // what `/health` sees.
-    let bag = health.map(|h| coord_credential_bag(h, coord_credential_posture().as_ref()));
-    let details = status_details(bag, observed_details().await);
+    let bag = coord_credential_bag(health, coord_credential_posture().as_ref());
+    let Some(details) = status_details(bag, observed_details().await) else {
+        warn!(
+            "device_jwt_refresher: coord_credential bag did not serialise — status publish \
+             skipped rather than posting details without it"
+        );
+        return;
+    };
     let mut body = serde_json::json!({
         "device_id": device_uuid,
         "details": details,
@@ -10636,7 +10664,7 @@ mod tenant_slot_refresh_tests {
             &mut observed,
             crate::fleet::capability_report::CapabilityRead::CouldNotLook("no home".into()),
         );
-        let d = status_details(Some(bag.clone()), observed.clone());
+        let d = status_details(bag.clone(), observed).expect("the bag serialises");
         let obj = d.as_object().expect("details is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -10663,13 +10691,6 @@ mod tenant_slot_refresh_tests {
             obj.keys().all(|k| k != "_coord_received_at"),
             "coord's reserved key"
         );
-
-        // No health published yet: the observed keys go alone, and the
-        // credential key is ABSENT (merge keeps coord's) — never `null`
-        // (which the merge reads as "delete it").
-        let d = status_details(None, observed);
-        assert!(d.get("coord_credential").is_none());
-        assert_eq!(d["wedge_incidents"], serde_json::json!([]));
     }
 
     /// **M8.** `slot_seen` records the exp the slot held BEFORE the pass acted,

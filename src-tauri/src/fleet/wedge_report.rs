@@ -41,7 +41,8 @@
 //! |---|---|---|---|
 //! | every known kind below, written by ANOTHER runner process (pid differs) | a later line from a different pid, or else the first read by this process — one runner instance writes a given log, and every writer runs in the process it reports on, so nothing it latched outlives the process | `process_exited` | that later line, else that read |
 //! | `backend_wedged`, `ui_thread_wedged`, `recovery_wedged` | this process's live predicate (`health_monitor::backend_wedged()` / `ui_thread_wedged()` / `webview_recovery::recovery_wedged()`) reads false | `cleared` | the first read that saw it false (an upper bound) |
-//! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`coord_outside_observer::fault_open` reads false) — the latch is set exactly when the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
+//! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`coord_outside_observer::fault_latch` reads `Closed`) — the latch is set before the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
+//! | same four, while the observer has not folded a probe within `OPEN_FAULTS_STALE_AFTER_SECS` (`fault_latch` reads `Unknown`) | at once — a frozen latch vouches for nothing, so the row is never held open on it | `observer_silent` | the observer's last fold (the last instant it vouched), else that read |
 //! | `health_monitor_thread_stalled`, `health_metrics_thread_stalled` (watchdog, re-written every `WATCHDOG_REPEAT_SECS` while they hold) | no line for 2 × that cadence | `silent` | last line + one cadence (the latest instant the cadence allows it to have held) |
 //! | any other (unknown) reason token — its writer, cadence and predicate are unknown to this build | a newer onset of the same token | `superseded` | the newer onset |
 //! | same, with no newer onset | its onset is older than [`OPEN_WINDOW_SECS`] | `expired` | onset + that window — the runner stops vouching for it, which is NOT an observed end |
@@ -95,7 +96,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::coord_outside_observer::FaultClass;
+use crate::coord_outside_observer::{FaultClass, FaultLatch};
 
 /// Most incidents published (and kept). See "The bound" above.
 pub(crate) const WEDGE_REPORT_BOUND: usize = 20;
@@ -130,6 +131,7 @@ pub(crate) enum EndedBy {
     Silent,
     Superseded,
     Expired,
+    ObserverSilent,
 }
 
 /// How a kind's end is established.
@@ -300,14 +302,26 @@ impl Default for WedgeReportState {
     }
 }
 
-/// This process's view, sampled once per pass: its pid, its build, and which
-/// live-predicate kinds hold right now.
+/// Whether the coord outside observer's latches can be believed right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObserverView {
+    /// It folded a probe recently; `holding` carries its open classes.
+    Fresh,
+    /// It has not folded within `OPEN_FAULTS_STALE_AFTER_SECS`; `since` is its
+    /// last fold, `None` if it never folded.
+    Silent { since: Option<DateTime<Utc>> },
+}
+
+/// This process's view, sampled once per pass AFTER the log tail is read: its
+/// pid, its build, which live-predicate kinds hold right now, and whether the
+/// coord observer's latches are current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveView {
     pub pid: u32,
     pub build_id: Option<&'static str>,
     /// The [`LIVE_PREDICATE_KINDS`] whose predicate reads true.
     pub holding: Vec<&'static str>,
+    pub observer: ObserverView,
 }
 
 impl LiveView {
@@ -322,16 +336,26 @@ impl LiveView {
         if crate::webview_recovery::recovery_wedged() {
             holding.push("recovery_wedged");
         }
+        let mut observer = ObserverView::Fresh;
         for class in FaultClass::ALL {
-            if crate::coord_outside_observer::fault_open(class) {
-                holding.push(class.breadcrumb_reason());
+            match crate::coord_outside_observer::fault_latch(class) {
+                FaultLatch::Open => holding.push(class.breadcrumb_reason()),
+                FaultLatch::Closed => {}
+                FaultLatch::Unknown { last_fold } => {
+                    observer = ObserverView::Silent { since: last_fold }
+                }
             }
         }
         Self {
             pid: std::process::id(),
             build_id: crate::fleet::served_git_sha(),
             holding,
+            observer,
         }
+    }
+
+    fn is_coord_kind(kind: &str) -> bool {
+        FaultClass::from_breadcrumb_reason(kind).is_some()
     }
 
     fn holds(&self, kind: &str) -> bool {
@@ -457,6 +481,12 @@ impl WedgeReportState {
             .iter_mut()
             .filter(|i| i.ended_at.is_none() && end_rule(&i.kind) == EndRule::LivePredicate)
         {
+            if LiveView::is_coord_kind(&inc.kind) {
+                if let ObserverView::Silent { since } = live.observer {
+                    inc.close(since.unwrap_or(now), EndedBy::ObserverSilent);
+                    continue;
+                }
+            }
             if !live.holds(&inc.kind) {
                 inc.close(now, EndedBy::Cleared);
             }
@@ -640,10 +670,15 @@ static STATE: Mutex<Option<Cached>> = Mutex::new(None);
 /// `Ok(array)` is the `details.wedge_incidents` value; `Err` means the log
 /// exists but could not be read. The error names the file, never its
 /// directory — it is published off-box.
+///
+/// `sample` yields `now` and the [`LiveView`], and is called only AFTER the log
+/// tail has been read: every writer sets its live predicate before it appends
+/// its line, so any line this pass folds had its predicate set before the view
+/// that settles it was taken — a view sampled first could see a predicate
+/// still unset and close as `cleared` an incident whose line it then read.
 pub(crate) fn report_from(
     log_path: &Path,
-    now: DateTime<Utc>,
-    live: &LiveView,
+    sample: impl FnOnce() -> (DateTime<Utc>, LiveView),
 ) -> Result<serde_json::Value, String> {
     let state_path = log_path.with_file_name(STATE_FILE_NAME);
     let mut guard = STATE.lock().unwrap_or_else(|p| p.into_inner());
@@ -659,13 +694,15 @@ pub(crate) fn report_from(
         }
     });
     let state = &mut cached.state;
-    state.register_build(live);
     let file_name = log_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "the wedge incident log".to_string());
     let tail = read_tail(log_path, state.cursor.as_ref())
         .map_err(|e| format!("reading {file_name} failed: {e}"))?;
+    let (now, live) = sample();
+    let live = &live;
+    state.register_build(live);
     match tail {
         TailRead::Absent => state.cursor = None,
         TailRead::Lines {
@@ -730,7 +767,7 @@ pub(crate) fn details_pair(
 /// `wedge_incidents` is `null`). Blocking IO.
 pub(crate) fn publish_into(details: &mut serde_json::Map<String, serde_json::Value>) {
     let log = crate::health_monitor::wedge_incidents_path(&crate::paths::get_dev_logs_dir());
-    for (k, v) in details_pair(report_from(&log, Utc::now(), &LiveView::sample())) {
+    for (k, v) in details_pair(report_from(&log, || (Utc::now(), LiveView::sample()))) {
         details.insert(k.to_string(), v);
     }
 }
@@ -756,6 +793,7 @@ mod tests {
             pid: ME,
             build_id: Some("abc123def456"),
             holding: kinds.to_vec(),
+            observer: ObserverView::Fresh,
         }
     }
 
@@ -943,6 +981,83 @@ mod tests {
     }
 
     #[test]
+    fn a_frozen_observer_closes_coord_rows_at_its_last_fold_and_a_fresh_one_holds() {
+        let line = format!("2026-09-30T10:00:00Z coord_unreachable x (pid {ME})");
+        let mut s = WedgeReportState::default();
+        s.fold(parse_line(&line).unwrap(), &live_holding(&[]));
+
+        // Fresh observer, latch open: held.
+        s.settle(
+            at("2026-09-30T10:30:00Z"),
+            &live_holding(&["coord_unreachable"]),
+        );
+        assert_eq!(s.incidents[0].ended_at, None);
+
+        // Frozen observer: its (frozen) latch is ignored and the row closes at
+        // the last instant the observer vouched.
+        let mut frozen = live_holding(&[]);
+        frozen.observer = ObserverView::Silent {
+            since: Some(at("2026-09-30T10:31:00Z")),
+        };
+        s.settle(at("2026-09-30T11:00:00Z"), &frozen);
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ObserverSilent));
+        assert_eq!(s.incidents[0].ended_at, Some(at("2026-09-30T10:31:00Z")));
+        assert_eq!(s.published()[0]["ended_by"], "observer_silent");
+
+        // An observer that never folded closes at the read; non-coord kinds
+        // are untouched by the observer's silence.
+        let mut s = WedgeReportState::default();
+        s.fold(parse_line(&line).unwrap(), &live_holding(&[]));
+        s.fold(
+            parse_line(&monitor_line("2026-09-30T10:01:00Z", "backend_wedged", ME)).unwrap(),
+            &live_holding(&[]),
+        );
+        let mut never = live_holding(&["backend_wedged"]);
+        never.observer = ObserverView::Silent { since: None };
+        s.settle(at("2026-09-30T10:02:00Z"), &never);
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ObserverSilent));
+        assert_eq!(s.incidents[0].ended_at, Some(at("2026-09-30T10:02:00Z")));
+        assert_eq!(s.incidents[1].ended_at, None, "backend_wedged still holds");
+    }
+
+    #[test]
+    fn the_live_view_is_sampled_after_the_tail_is_read() {
+        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        restart();
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("wedge-incidents.log");
+        let now = at("2026-09-30T12:00:00Z");
+        append(
+            &log,
+            &format!("2026-09-30T10:00:00Z coord_no_leader a (pid {ME})\n"),
+        );
+        // The sampler plays a writer racing the pass: it sets its predicate
+        // and appends its line. Had the view been sampled BEFORE the read, this
+        // pass would fold that line against a view that predates it.
+        let v = report_from(&log, || {
+            append(
+                &log,
+                &format!("2026-09-30T11:00:00Z coord_unreachable b (pid {ME})\n"),
+            );
+            (now, live_holding(&["coord_no_leader", "coord_unreachable"]))
+        })
+        .unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the line appended during sampling is NOT in this pass"
+        );
+        assert_eq!(rows[0]["ended_at"], serde_json::Value::Null);
+        let v = report_from(&log, || {
+            (now, live_holding(&["coord_no_leader", "coord_unreachable"]))
+        })
+        .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2, "and is read by the next");
+        restart();
+    }
+
+    #[test]
     fn unknown_tokens_are_superseded_by_a_newer_onset_and_expire_after_the_window() {
         let mut s = WedgeReportState::default();
         let lv = live(false);
@@ -1056,7 +1171,7 @@ mod tests {
             &log,
             &format!("2026-09-30T10:00:00Z coord_unreachable a (pid {ME})\n"),
         );
-        let v = report_from(&log, now, &lv).unwrap();
+        let v = report_from(&log, || (now, lv.clone())).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
 
         // Restart; append while "down"; the new line is read, the old one not
@@ -1066,7 +1181,7 @@ mod tests {
             &log,
             &format!("2026-09-30T11:00:00Z coord_worker_dead b (pid {ME})\n"),
         );
-        let v = report_from(&log, now, &lv).unwrap();
+        let v = report_from(&log, || (now, lv.clone())).unwrap();
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 2, "{v}");
         assert_eq!(rows[0]["kind"], "coord_worker_dead", "newest first");
@@ -1079,7 +1194,7 @@ mod tests {
         std::fs::write(&state_file, std::fs::read(&state_file).unwrap()).unwrap();
         let rewritten = std::fs::metadata(&state_file).unwrap().modified().unwrap();
         assert!(rewritten >= before);
-        assert_eq!(report_from(&log, now, &lv).unwrap(), v);
+        assert_eq!(report_from(&log, || (now, lv.clone())).unwrap(), v);
         assert_eq!(
             std::fs::metadata(&state_file).unwrap().modified().unwrap(),
             rewritten,
@@ -1089,7 +1204,7 @@ mod tests {
         // A partial line is left for the next pass, then read whole.
         append(&log, "2026-09-30T11:30:00Z coord_no_le");
         assert_eq!(
-            report_from(&log, now, &lv)
+            report_from(&log, || (now, lv.clone()))
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -1097,7 +1212,7 @@ mod tests {
             2
         );
         append(&log, &format!("ader c (pid {ME})\n"));
-        let v = report_from(&log, now, &lv).unwrap();
+        let v = report_from(&log, || (now, lv.clone())).unwrap();
         assert_eq!(v.as_array().unwrap()[0]["kind"], "coord_no_leader");
         restart();
     }
@@ -1118,7 +1233,7 @@ mod tests {
             &log,
             &format!("2026-09-30T08:10:00Z coord_no_leader b (pid {ME})\n"),
         );
-        report_from(&log, now, &lv).unwrap();
+        report_from(&log, || (now, lv.clone())).unwrap();
 
         // Truncated to shorter than the cursor: re-read from 0.
         std::fs::write(
@@ -1126,7 +1241,7 @@ mod tests {
             format!("2026-09-30T09:00:00Z coord_worker_dead c (pid {ME})\n"),
         )
         .unwrap();
-        let v = report_from(&log, now, &lv).unwrap();
+        let v = report_from(&log, || (now, lv.clone())).unwrap();
         let kinds: Vec<_> = v
             .as_array()
             .unwrap()
@@ -1147,7 +1262,7 @@ mod tests {
             ));
         }
         std::fs::write(&log, body).unwrap();
-        let v = report_from(&log, now, &lv).unwrap();
+        let v = report_from(&log, || (now, lv.clone())).unwrap();
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 3 + 5);
         assert_eq!(rows[0]["began_at"], "2026-09-30T10:04:00Z");
@@ -1156,7 +1271,7 @@ mod tests {
         // Removed: publishes what is known, and a recreated file starts fresh.
         std::fs::remove_file(&log).unwrap();
         assert_eq!(
-            report_from(&log, now, &lv)
+            report_from(&log, || (now, lv.clone()))
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -1173,13 +1288,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("wedge-incidents.log");
         assert_eq!(
-            report_from(&log, Utc::now(), &live(false)).unwrap(),
+            report_from(&log, || (Utc::now(), live(false))).unwrap(),
             serde_json::json!([])
         );
         restart();
         // A directory where the log should be cannot be read as one.
         std::fs::create_dir(&log).unwrap();
-        let err = report_from(&log, Utc::now(), &live(false)).unwrap_err();
+        let err = report_from(&log, || (Utc::now(), live(false))).unwrap_err();
         assert!(
             err.starts_with("reading wedge-incidents.log failed"),
             "{err}"
@@ -1244,7 +1359,7 @@ mod tests {
             &format!("2026-09-30T08:00:00Z coord_unreachable a (pid {ME})\n"),
         );
         std::fs::write(tmp.path().join(STATE_FILE_NAME), b"{garbage").unwrap();
-        let v = report_from(&log, at("2026-09-30T09:00:00Z"), &live(false)).unwrap();
+        let v = report_from(&log, || (at("2026-09-30T09:00:00Z"), live(false))).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         restart();
     }
