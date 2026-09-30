@@ -75,6 +75,9 @@ pub const RULE_R2: &str = "R2";
 pub const RULE_R3: &str = "R3";
 pub const RULE_R4: &str = "R4";
 pub const RULE_R5: &str = "R5";
+/// R9's unkeyed cross-origin tab re-attach: an unkeyed browser taking over an
+/// ENDED tab id from a different origin. Rides `active_binding`.
+pub const RULE_R9_UNKEYED: &str = "R9-unkeyed";
 /// R5's second arm, counted separately: a browser principal's `keepAliveSecs`
 /// capped back to `REGISTRATION_TTL_MS`. It is not a refusal — the
 /// registration is admitted — but Phase 4 reads these counters to decide
