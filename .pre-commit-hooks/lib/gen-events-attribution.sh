@@ -193,7 +193,30 @@ fi
 # hook — the test said "run me by hand" and the drift guard's own git calls
 # happen to name the repo whose hook is running. Both callers clear the
 # environment before their first `git`.
+#
+# One piece of that environment is kept, as a note rather than as an
+# override: the hook's INDEX. `git commit -a` and `git commit <path>` build
+# the commit from a temporary index (`.git/index.lock`,
+# `.git/next-index-*.lock`) and hand its path to the hook in GIT_INDEX_FILE;
+# the plain `.git/index` is then NOT what is being committed. So its absolute
+# path is recorded in GEN_EVENTS_HOOK_INDEX_FILE, beside the git dir it
+# belongs to (GEN_EVENTS_HOOK_GIT_DIR), and `gen_events_attribution` uses it
+# only for a repo with that same git dir — never for a fixture or the schemas
+# checkout. git exports it absolute for a temporary index and relative
+# (`.git/index`) otherwise, relative to the hook's cwd, which is where this
+# must therefore be called from: before any `cd`.
 gen_events_clear_inherited_git_env() {
+    GEN_EVENTS_HOOK_INDEX_FILE=""
+    GEN_EVENTS_HOOK_GIT_DIR=""
+    if [ -n "${GIT_INDEX_FILE:-}" ]; then
+        case "$GIT_INDEX_FILE" in
+            /*|[A-Za-z]:[/\\]*) GEN_EVENTS_HOOK_INDEX_FILE="$GIT_INDEX_FILE" ;;
+            *)                  GEN_EVENTS_HOOK_INDEX_FILE="$PWD/$GIT_INDEX_FILE" ;;
+        esac
+        # Asked while GIT_DIR (if any) still names the hook's repo.
+        GEN_EVENTS_HOOK_GIT_DIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+        [ -n "$GEN_EVENTS_HOOK_GIT_DIR" ] || GEN_EVENTS_HOOK_INDEX_FILE=""
+    fi
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX \
         GIT_INTERNAL_SUPER_PREFIX GIT_CONFIG GIT_CONFIG_COUNT \
@@ -698,6 +721,17 @@ gen_events_attribution() {
     # line IS the question "is it in this commit?". Their union covers
     # everything `git diff HEAD` did, and slightly more (a path staged and
     # then reverted in the working tree) — the wider, safe direction.
+    #
+    # Both read the index the commit is actually built from: the hook's own
+    # (see gen_events_clear_inherited_git_env) when this is the hook's repo,
+    # so `commit -a` and `commit <path>` label correctly. The untracked
+    # listing keeps the real index: under `commit <path>` the temporary one
+    # lacks files staged for later, which would then read as untracked.
+    local index_env=()
+    if [ -n "${GEN_EVENTS_HOOK_INDEX_FILE:-}" ] && [ -n "${GEN_EVENTS_HOOK_GIT_DIR:-}" ] \
+       && [ "$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" = "$GEN_EVENTS_HOOK_GIT_DIR" ]; then
+        index_env=(env "GIT_INDEX_FILE=$GEN_EVENTS_HOOK_INDEX_FILE")
+    fi
     local touched_lines="" detail_lines="" src
     for src in committed staged unstaged untracked; do
         case "$src" in
@@ -706,11 +740,11 @@ gen_events_attribution() {
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so the commits since the merge-base could not be read"; return 0; } ;;
             staged)
-                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
+                _gen_events_read_z < <(${index_env[@]+"${index_env[@]}"} git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git diff --cached HEAD failed, so the staged changes could not be read"; return 0; } ;;
             unstaged)
-                _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z \
+                _gen_events_read_z < <(${index_env[@]+"${index_env[@]}"} git -C "$repo" diff --name-only --no-renames -z \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
                 || { ATTRIBUTION_UNAVAILABLE_REASON="git diff (working tree) failed, so the unstaged changes could not be read"; return 0; } ;;
             untracked)

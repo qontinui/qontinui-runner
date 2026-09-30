@@ -152,8 +152,8 @@ TS_CODEGEN_DEPS_LIB="$SCRIPT_DIR/lib/ts-codegen-deps.sh"
 if [ ! -f "$TS_CODEGEN_DEPS_LIB" ]; then
     fail "ERROR: missing $TS_CODEGEN_DEPS_LIB"
     fail "The drift guard cannot run the TypeScript codegen without it. Restore"
-    fail "the file (it ships with this repo) or bypass this push with:"
-    fail "    SKIP=gen-events-drift git push"
+    fail "the file (it ships with this repo) or bypass this $STAGE with:"
+    fail "    SKIP=gen-events-drift $BYPASS_CMD"
     exit 1
 fi
 # shellcheck source=lib/ts-codegen-deps.sh

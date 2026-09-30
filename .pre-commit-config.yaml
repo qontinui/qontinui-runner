@@ -93,8 +93,9 @@ repos:
       # instead of after the PR does. Moving it into CI is a live option to be
       # judged on that trade, not a blocked one.
       #
-      # Triggered ONLY by edits to the decision, its test, or the drift hook
+      # Triggered ONLY by edits to the decision, its test, the drift hook
       # (whose MINE message the test now pins through the library's renderer),
+      # or gen-events-path-deps-check.sh (which the test runs on fixtures),
       # so a normal commit pays nothing. That is what lets it live at pre-commit
       # at all: it needs no Rust toolchain, no qontinui-schemas checkout and no
       # network, only throwaway git repos under $TMPDIR (which it now cleans up
