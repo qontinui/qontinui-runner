@@ -1877,7 +1877,11 @@ fn spawn_run_task(payload: LaunchPayload) {
         let slot = match admit_launch(
             agent_id,
             &live_terminal_predicate(),
-            &crate::resource_guard::thread_pressure,
+            // The seam's own composed verdict, as the continuation guard uses
+            // — so the launch and continuation paths cannot disagree about
+            // which lanes count (plan
+            // `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D1).
+            &crate::resource_guard::probe_for_spawn,
         ) {
             Ok(slot) => slot,
             Err(reason) => {
@@ -2112,8 +2116,10 @@ enum SpawnDecision {
     },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
-    /// Carries a human-readable cause for the WARN log.
-    SpawnDespiteClaimError { cause: String },
+    /// Carries a human-readable cause for the WARN log, and how far the claim
+    /// provably got — which decides what a seam refusal after this spawn
+    /// records (see [`failed_spawn_disposition`]).
+    SpawnDespiteClaimError { cause: String, claim_sent: ClaimSent },
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
     /// spawn; leave the row pending for the backstop poll, like `AtCap`.
@@ -2123,6 +2129,51 @@ enum SpawnDecision {
         reason: String,
         class: crate::coord_drain_state::DeferClass,
     },
+}
+
+/// How far a claim that ERRORED provably got. Structural, never string-matched
+/// (plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
+/// D5).
+///
+/// The distinction exists for one decision: whether a spawn that then fails
+/// at the seam with a retriable refusal may be deferred UNCLAIMED. That is
+/// only safe when coord cannot have recorded the claim — a claim that DID
+/// land leaves the row consumed, and deferring it would strand it
+/// consumed-with-no-outcome, invisible to coord's backstop and to #2674's
+/// re-drive, which is strictly worse than the `spawn_failed` it replaces. So
+/// anything short of proof is [`ClaimSent::Unknown`], and `Unknown` changes
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSent {
+    /// No request bytes left this host: a connect failure
+    /// (`reqwest::Error::is_connect`), or no shared coord client to send with.
+    NotSent,
+    /// The claim may have reached coord: a timeout, a send error after the
+    /// connection was made, or any HTTP status coord answered with.
+    Unknown,
+}
+
+/// Classify a claim POST's send error. `is_connect` is the one reqwest error
+/// class raised before any request bytes are written.
+fn claim_sent_for_send_error(e: &reqwest::Error) -> ClaimSent {
+    if e.is_connect() {
+        ClaimSent::NotSent
+    } else {
+        ClaimSent::Unknown
+    }
+}
+
+impl SpawnDecision {
+    /// How far an ERRORED claim got — `Some` only for
+    /// [`SpawnDecision::SpawnDespiteClaimError`], the one decision that spawns
+    /// without coord having accepted the claim.
+    fn errored_claim_sent(&self) -> Option<ClaimSent> {
+        match self {
+            SpawnDecision::SpawnDespiteClaimError { claim_sent, .. } => Some(*claim_sent),
+            _ => None,
+        }
+    }
 }
 
 /// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
@@ -2135,13 +2186,13 @@ fn apply_drain_to_claim(
     drain: &crate::coord_drain_state::CoordDrainState,
 ) -> SpawnDecision {
     match decision {
-        SpawnDecision::SpawnDespiteClaimError { cause } => {
+        SpawnDecision::SpawnDespiteClaimError { cause, claim_sent } => {
             match crate::coord_drain_state::gate_for(
                 drain,
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
             ) {
                 crate::coord_drain_state::DrainGate::Allow => {
-                    SpawnDecision::SpawnDespiteClaimError { cause }
+                    SpawnDecision::SpawnDespiteClaimError { cause, claim_sent }
                 }
                 crate::coord_drain_state::DrainGate::Defer { reason, class } => {
                     SpawnDecision::DeferClaimErrorByDrain {
@@ -2246,10 +2297,14 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
             cause: format!(
                 "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
             ),
+            // coord answered, so the claim reached it.
+            claim_sent: ClaimSent::Unknown,
         };
     }
     SpawnDecision::SpawnDespiteClaimError {
         cause: format!("claim returned status {status}"),
+        // Any status is an answer from coord: the claim may have landed.
+        claim_sent: ClaimSent::Unknown,
     }
 }
 
@@ -2571,7 +2626,10 @@ fn settle_claim_decision(
             }
             ClaimOutcome::Spawn
         }
-        SpawnDecision::SpawnDespiteClaimError { cause } => {
+        // NOT sealed: coord never accepted this claim, so the attempt stays
+        // `Held` and a step-4 unclaimed deferral (D5) can release it for the
+        // re-listed row to re-claim.
+        SpawnDecision::SpawnDespiteClaimError { cause, .. } => {
             warn!(
                 "agent_runtime: continuation claim error (proceeding, in-process dedupe \
                  guards): {cause} (gate_id={gate_id})"
@@ -2693,32 +2751,38 @@ fn settle_claim_decision(
 /// critical one. Nothing on this fleet has ever legitimately wanted more than 64
 /// concurrent continuations; the observed peak that broke the box was twice it.
 ///
-/// ## It is a steady-state bound, NOT a semaphore
+/// ## The count includes admitted continuations still in flight
 ///
-/// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
-/// [`register_continuation_session`] only runs after the coord consume-claim,
-/// the worktree acquire and `create_terminal_session_backend` have all
-/// completed — so every task dispatched in one `poll_pending_continuations`
-/// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
-/// number was chosen against, all 130 see `live.len() == 0` and this cap binds on
-/// none of them. It holds the line across successive polls, once the earlier
-/// dispatches have registered; it cannot hold it *within* one.
+/// The live registry row only exists once the coord consume-claim, the worktree
+/// acquire and `create_terminal_session_backend` have all completed, so a count
+/// of `registry.live` alone let every task of one `poll_pending_continuations`
+/// iteration observe the PRE-BURST registry: in the 130-concurrent shape this
+/// number was chosen against, all 130 saw `live.len() == 0`, and on 2026-09-20 a
+/// ~134-dispatch boot-replay wave passed a 64 cap the same way.
 ///
-/// That is the same check-to-register window
-/// [`crate::settings::SessionGuardSettings::critical_thread_count`]'s doc
-/// already sizes 400 around ("a burst of concurrent admissions can each pass the
-/// ceiling and only then create their threads"), stated here too because a
-/// number documented as a concurrency limit and enforced as a steady-state one
-/// is exactly the kind of misreading that sent the 2026-08-29 investigation to
-/// the wrong constant. Closing the window would mean a real permit held from the
-/// guard through the spawn — a design change, and not this cap's job.
+/// So every continuation [`evaluate_continuation_guard`] ADMITS now holds an
+/// [`InFlightContinuationSlot`] from the guard's critical section until its live
+/// row exists (or it gives up), and the count this cap is compared against is
+/// `live + in-flight + admitted launches`. The slot is counted under the SAME
+/// lock that reads `live`, so two evaluations racing for the last slot cannot
+/// both pass the count. Plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
+/// Phase 3.
 ///
-/// **The ANCHOR half of that permit has since shipped** as
-/// [`AnchorReservation`], taken inside this guard's own critical section, so a
-/// same-anchor twin can no longer pass within one burst. It deliberately does
-/// NOT count toward this cap: the COUNT stays the steady-state bound described
-/// above, while the ANCHOR is now held check-to-register. The paragraph above
-/// still describes the count.
+/// **What that does NOT close, stated rather than overstated: the THREAD lane
+/// is still a snapshot.** A burst admitted under the thread ceilings creates its
+/// threads only as each spawn lands, so the admissions can each pass a reading
+/// taken before any of them spawned — the check-to-register window
+/// [`crate::settings::SessionGuardSettings::critical_thread_count`]'s doc sizes
+/// 400 around. The residual that window lets through meets the spawn seam's own
+/// refusal: it is deferred unclaimed when its claim provably never reached coord
+/// ([`failed_spawn_disposition`]), and otherwise recorded `spawn_failed` with
+/// the seam's detail string unchanged, which coord's bounded re-drive
+/// (qontinui-coord #2674) is what recovers.
+///
+/// The ANCHOR half of the permit is [`AnchorReservation`], taken in the same
+/// critical section so a same-anchor twin cannot pass within one burst; the
+/// in-flight slot rides on that permit and shares its lifetime.
 ///
 /// `QONTINUI_CONTINUATION_SESSION_CAP` remains the operator override, unchanged
 /// and in both directions (a bigger number is as settable as a smaller one).
@@ -2776,8 +2840,10 @@ struct ContinuationRegistry {
     /// [`Self::take_live_reserving_anchor`] (the migration lift) — and removed
     /// only by that entry's owner: its drop on every non-spawn
     /// exit, or [`AnchorReservation::handed_to_registry`] when the live entry
-    /// replaces it. Never counted toward P4 — the cap bounds RUNNING sessions,
-    /// and a reservation is not one.
+    /// replaces it. The anchor entry itself is never counted toward P4: what
+    /// the cap counts for an admitted dispatch is the
+    /// [`InFlightContinuationSlot`] its permit carries, which an anchor-less
+    /// dispatch holds too.
     ///
     /// **The account-migration hop holds its anchor here for the whole
     /// respawn.** The hop lifts a continuation off its terminal
@@ -3131,10 +3197,10 @@ enum AnchorHolder {
     Reserved,
 }
 
-/// Outcome of the pre-spawn continuation guard (P3 + thread pressure + P4).
+/// Outcome of the pre-spawn continuation guard (P3 + load pressure + P4).
 #[derive(Debug, PartialEq, Eq)]
 enum ContinuationGuard {
-    /// Clear to spawn — no live duplicate, machine not under thread pressure,
+    /// Clear to spawn — no live duplicate, machine not under load pressure,
     /// under cap.
     Proceed,
     /// This `anchor_key` is already taken (P3): skip the spawn (re-cleared gate
@@ -3142,21 +3208,25 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is out of THREADS, not out of slots: the spawn gate's thread
-    /// lane ([`crate::resource_guard::thread_pressure`]) returned something
+    /// The machine is out of THREADS or COMMIT, not out of slots: the spawn
+    /// seam's own composed verdict ([`crate::resource_guard::probe_for_spawn`] —
+    /// the thread lane, and on Windows the free-commit lane) returned something
     /// other than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
     /// observation that produced it, so the log and the coord stamp can name the
-    /// REAL numbers — the thread count that was read and the ceiling it crossed.
+    /// REAL numbers — the reading that was taken, the limit it crossed, and
+    /// (through the observation's metric) WHICH lane: the stamp is
+    /// `thread_pressure:` for the thread lane and `commit_pressure:` for the
+    /// memory lane ([`load_pressure_stamp_reason`]).
     ///
     /// Deliberately NOT folded into [`ContinuationGuard::AtCap`]. A deferral
     /// reported as "cap reached" when the cap was never reached is a lie in the
     /// runner log, and the log is exactly what the next incident's forensics
     /// reads: the 2026-08-29 investigation spent its time on the cap because the
     /// cap is what the log talks about.
-    ThreadPressure {
-        /// `"warn"` or `"critical"` — which ceiling the reading crossed. Comes
+    LoadPressure {
+        /// `"warn"` or `"critical"` — which limit the reading crossed. Comes
         /// from [`crate::resource_guard::SpawnGate::tripped`], never re-derived
         /// here, so the word and the number can never disagree.
         severity: &'static str,
@@ -3167,9 +3237,13 @@ enum ContinuationGuard {
 }
 
 /// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup),
-/// machine thread pressure, and P4 (concurrency cap). Pure over (`anchor_key`,
-/// `is_live`, the injected thread verdict, env cap) so it is unit-testable
-/// without a live `TerminalManager` and without a live thread reading.
+/// machine load pressure, and P4 (concurrency cap). Pure over (`anchor_key`,
+/// `is_live`, the injected load verdict, env cap) so it is unit-testable
+/// without a live `TerminalManager` and without a live reading.
+///
+/// A `Proceed` also takes an [`InFlightContinuationSlot`], carried on the
+/// returned [`AnchorReservation`], so the admitted dispatch counts toward the
+/// cap until its live row exists (see [`DEFAULT_CONTINUATION_SESSION_CAP`]).
 ///
 /// Order matters, and it is now three-deep:
 ///
@@ -3178,11 +3252,11 @@ enum ContinuationGuard {
 ///    also the one verdict that is true regardless of machine state: spawning it
 ///    would be wrong on an idle box too.
 ///
-///    **First in COST as well as in verdict**, which is why the thread verdict
+///    **First in COST as well as in verdict**, which is why the load verdict
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `thread_pressure()` as an
+///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
@@ -3207,7 +3281,7 @@ enum ContinuationGuard {
 ///
 /// [`crate::resource_guard::admit_spawn`] refuses an operator's own spawn only
 /// at [`crate::resource_guard::SpawnGate::Critical`]. This guard defers at
-/// `Warn` as well, and the asymmetry is the whole reason `thread_pressure()`
+/// `Warn` as well, and the asymmetry is the whole reason `probe_for_spawn()`
 /// hands back the verdict instead of a bool.
 ///
 /// The two callers pay completely different prices for being wrong. A gate
@@ -3225,7 +3299,7 @@ enum ContinuationGuard {
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
 ) -> (ContinuationGuard, AnchorReservation) {
     // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3/P4
     // scan below then runs under a freshly-acquired lock.
@@ -3249,7 +3323,7 @@ fn evaluate_continuation_guard(
     //
     // Handed back to the caller only with a `Proceed`; every other exit drops
     // it — outside the lock — and dropping is what gives the anchor back.
-    let (live_count, reservation) = {
+    let (live_count, reservation, in_flight) = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
         let reservation = if let Some(anchor) = anchor_key {
@@ -3297,10 +3371,20 @@ fn evaluate_continuation_guard(
             // wherever it happens.
             AnchorReservation::none()
         };
-        // `live` only: the reservation just taken (and any other) is not a
-        // running session and does not count toward the cap. Moved out with
-        // the count, so the guard below drops on an empty local.
-        (registry.live.len(), reservation)
+        // Phase 3: this evaluation's in-flight slot, taken under the SAME lock
+        // that reads `live`, so racing evaluations serialize on the count — the
+        // N-th of a burst sees the N-1 before it. `others` excludes this
+        // evaluation's own slot. A refused evaluation holds its slot only until
+        // the verdict below, so a racing peer may transiently read one more
+        // than will stay admitted: the error is toward deferring, never toward
+        // over-admitting. Moved out with the count, so the lock guard below
+        // drops on an empty local.
+        let (in_flight, others_in_flight) = InFlightContinuationSlot::take();
+        (
+            registry.live.len() + others_in_flight,
+            reservation,
+            in_flight,
+        )
     };
     // The registry lock is RELEASED before the thread reading is taken. The
     // reading is a synchronous OS-table read (and, in the live wrapper, a
@@ -3314,21 +3398,22 @@ fn evaluate_continuation_guard(
     //
     // Admitted coord LAUNCHES count toward the same cap: both populations are
     // unattended coord-dispatched sessions spending the same machine, and a cap
-    // that one of them can walk past is not a bound on the box. So do terminal
-    // continuations still inside their start window: they register only once
-    // their session has started (`run_continuation_terminal`), up to
-    // CONTINUATION_START_WINDOW per attempt after this guard said Proceed.
-    let live_count = live_count + admitted_launch_count() + starting_continuation_count();
+    // that one of them can walk past is not a bound on the box. Terminal
+    // continuations still inside their start window (they register only once
+    // their session has started, up to CONTINUATION_START_WINDOW per attempt)
+    // are already in `live_count`: their in-flight slot is held from this
+    // guard's Proceed until that registration.
+    let live_count = live_count + admitted_launch_count();
 
-    // Thread pressure next, then the count cap — shared with the launch path
+    // Load pressure next, then the count cap — shared with the launch path
     // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
-    // its chance to return, so a deduped row never pays for a thread snapshot.
-    let verdict = match evaluate_load_guard(live_count, thread_pressure) {
+    // its chance to return, so a deduped row never pays for a reading.
+    let verdict = match evaluate_load_guard(live_count, load_pressure) {
         LoadGuard::Proceed => ContinuationGuard::Proceed,
-        LoadGuard::ThreadPressure {
+        LoadGuard::LoadPressure {
             severity,
             observation,
-        } => ContinuationGuard::ThreadPressure {
+        } => ContinuationGuard::LoadPressure {
             severity,
             observation,
         },
@@ -3339,11 +3424,13 @@ fn evaluate_continuation_guard(
     // a `Proceed` leaves the reservation behind, for the caller to carry.
     if verdict != ContinuationGuard::Proceed {
         // RAII rather than a release call: dropping the permit this evaluation
-        // minted gives that anchor back, and it can give back nothing else.
+        // minted gives that anchor back, and it can give back nothing else;
+        // dropping the slot gives its count back.
         drop(reservation);
+        drop(in_flight);
         return (verdict, AnchorReservation::none());
     }
-    (verdict, reservation)
+    (verdict, reservation.carrying(in_flight))
 }
 
 /// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
@@ -3356,9 +3443,9 @@ fn evaluate_continuation_guard(
 enum LoadGuard {
     /// Clear to spawn.
     Proceed,
-    /// The thread lane tripped (warn or critical). See
-    /// [`ContinuationGuard::ThreadPressure`].
-    ThreadPressure {
+    /// A load lane tripped (warn or critical). See
+    /// [`ContinuationGuard::LoadPressure`].
+    LoadPressure {
         severity: &'static str,
         observation: crate::resource_guard::GateObservation,
     },
@@ -3371,25 +3458,29 @@ enum LoadGuard {
     },
 }
 
-/// The load guard proper: thread pressure first, then the count cap. Pure over
-/// (`live_count`, the injected thread verdict, env cap).
+/// The load guard proper: load pressure first, then the count cap. Pure over
+/// (`live_count`, the injected load verdict, env cap).
 ///
-/// Thread pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
-/// argument on [`evaluate_continuation_guard`]). An unreadable thread sensor
-/// produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the fail-open
-/// doctrine this whole subsystem is built on — so a missing reading can never
-/// wedge the queue shut. The verdict is a closure so a caller that returns
-/// earlier (the continuation dedup arm) never pays for the reading.
+/// Load pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
+/// argument on [`evaluate_continuation_guard`]). An unreadable sensor produces
+/// `Proceed` inside `resource_guard` — UNKNOWN ⇒ spawn, the fail-open doctrine
+/// this whole subsystem is built on — so a missing reading can never wedge the
+/// queue shut. The verdict is a closure so a caller that returns earlier (the
+/// continuation dedup arm) never pays for the reading. Production injects
+/// [`crate::resource_guard::probe_for_spawn`] on BOTH paths — the seam's own
+/// composed verdict, so neither guard can disagree with the seam about which
+/// lanes count.
 ///
-/// A steady-state bound, not a semaphore — see
+/// The count is whatever the caller counted: live plus in-flight admitted
+/// continuations plus admitted launches — see
 /// [`DEFAULT_CONTINUATION_SESSION_CAP`].
 fn evaluate_load_guard(
     live_count: usize,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
 ) -> LoadGuard {
-    let verdict = thread_pressure();
+    let verdict = load_pressure();
     if let Some((severity, observation)) = verdict.tripped() {
-        return LoadGuard::ThreadPressure {
+        return LoadGuard::LoadPressure {
             severity,
             observation: observation.clone(),
         };
@@ -3460,14 +3551,15 @@ const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
 /// `<class>:<detail>` grammar this file's stamps follow (class = text before the
 /// first colon) still holds after coord strips the prefix:
 /// `deferred_load:thread_pressure:warn:300_over_256`,
-/// `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
+/// `deferred_load:commit_pressure:critical:<observed>_over_<limit>` (the
+/// Windows memory lane), `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
 fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
     let detail = match verdict {
         LoadGuard::Proceed => return None,
-        LoadGuard::ThreadPressure {
+        LoadGuard::LoadPressure {
             severity,
             observation,
-        } => thread_pressure_stamp_reason(severity, observation),
+        } => load_pressure_stamp_reason(severity, observation),
         LoadGuard::AtCap { cap, live } => format!("at_cap:{live}_of_{cap}"),
     };
     Some(format!("{DEFERRED_LOAD_REASON_PREFIX}{detail}"))
@@ -3513,20 +3605,23 @@ impl Drop for AdmittedLaunchSlot {
 fn admit_launch(
     agent_id: uuid::Uuid,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
 ) -> Result<AdmittedLaunchSlot, String> {
     prune_dead_continuations(is_live);
-    let reading = thread_pressure();
+    let reading = load_pressure();
     let mut launches = lock_recover(admitted_launches(), "admitted_launches");
     debug_assert!(
         !launches.contains_key(&agent_id),
         "register_launch_stop admits one live launch per agent_id"
     );
-    // `live` only: a pending anchor reservation is not a running session and
-    // never counts toward the cap (see `ContinuationRegistry`).
+    // Live continuations plus the ADMITTED ones still in flight — the same
+    // count the continuation guard compares, so the two paths share one bound.
+    // A pending anchor entry is not counted: the in-flight slot is what stands
+    // for an admitted dispatch (see `InFlightContinuationSlot`).
     let continuations = lock_recover(continuation_sessions(), "continuation_sessions")
         .live
-        .len();
+        .len()
+        + in_flight_continuation_count();
     let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
     if let Some(reason) = launch_deferral_reason(&verdict) {
         return Err(reason);
@@ -3536,8 +3631,15 @@ fn admit_launch(
     Ok(AdmittedLaunchSlot { agent_id, token })
 }
 
-/// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
-/// [`crate::resource_guard::thread_pressure`].
+/// [`evaluate_continuation_guard`] with the load verdict taken LIVE from
+/// [`crate::resource_guard::probe_for_spawn`] — the function
+/// [`crate::resource_guard::admit_spawn`] calls at the seam, so the queue and
+/// the seam cannot disagree about which lanes count (plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
+/// D1). Before it this injected `thread_pressure`, the thread lane alone, so on
+/// Windows the memory lane could refuse at the seam AFTER a claim that a check
+/// which never consulted it had let through. Behaviour change, named: on
+/// Windows a continuation now also defers at the free-commit WARN floor.
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
@@ -3545,22 +3647,24 @@ fn admit_launch(
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
-/// The function itself is passed, NOT called: `&crate::resource_guard::thread_pressure`
+/// The function itself is passed, NOT called: `&crate::resource_guard::probe_for_spawn`
 /// coerces the `fn` item to the guard's `&dyn Fn() -> SpawnGate` parameter, so
 /// the reading happens inside the guard, after the dedup arm — the whole point
-/// of the lazy parameter. Writing `&thread_pressure()` here would restore the
+/// of the lazy parameter. Writing `&probe_for_spawn()` here would restore the
 /// eager evaluation and nothing would fail to compile.
 ///
-/// `thread_pressure()` short-circuits on a disabled session guard before touching
-/// the sensor, and the reading behind it is memoized for
-/// [`crate::health_monitor::THREAD_READING_TTL`] — so a machine owner who turned
-/// the guard off pays nothing here, and a burst that reaches the sensor pays for
-/// one snapshot between them.
+/// `probe_for_spawn()` short-circuits on a disabled session guard before
+/// touching a sensor, its thread reading is memoized for
+/// [`crate::health_monitor::THREAD_READING_TTL`], and its memory reading is one
+/// `GlobalMemoryStatusEx` (nothing off Windows, where free commit is UNKNOWN and
+/// fails open). Its only side effects are logs: the shadowed-lane `warn!` and
+/// the edge-triggered graded-trip `warn!` — no webview notice, which only
+/// `admit_spawn` emits.
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
-    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::thread_pressure)
+    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::probe_for_spawn)
 }
 
 /// Insert a live continuation row for a caller that holds NO reservation. The
@@ -3661,12 +3765,68 @@ pub(crate) struct AnchorReservation {
     /// ownership. `None` holds nothing: an anchor-less continuation, or an
     /// evaluation that took no permit.
     held: Option<(String, AnchorReservationToken)>,
+    /// The admitted dispatch's count toward the cap (Phase 3), when this permit
+    /// came from a `Proceed`. Rides here so it has exactly the permit's
+    /// lifetime: released by the live hand-over, by the headless release, or
+    /// by drop on any early return. `None` on the migration lift, whose
+    /// session is not a new admission.
+    in_flight: Option<InFlightContinuationSlot>,
+}
+
+/// Continuations the load guard ADMITTED that have not yet become a live
+/// registry row (or given up). Phase 3 of plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`.
+static IN_FLIGHT_CONTINUATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many admitted continuations are between the guard and their live row.
+fn in_flight_continuation_count() -> usize {
+    IN_FLIGHT_CONTINUATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// RAII count of one admitted, not-yet-registered continuation — the
+/// continuation twin of [`AdmittedLaunchSlot`]. Minted only by
+/// [`evaluate_continuation_guard`], under the registry lock that reads `live`,
+/// and carried on the [`AnchorReservation`] it admitted. Dropping it gives the
+/// count back exactly once on every route, a task aborted at shutdown or a
+/// panic unwinding included.
+///
+/// A bare counter rather than a keyed map like [`admitted_launches`]: the slot
+/// owns one unit of the count and nothing else, so there is no foreign entry
+/// it could remove by mistake.
+#[derive(Debug)]
+struct InFlightContinuationSlot {
+    _private: (),
+}
+
+impl InFlightContinuationSlot {
+    /// Take a slot, returning it with the number of OTHER slots held at the
+    /// instant it was taken.
+    fn take() -> (Self, usize) {
+        let others = IN_FLIGHT_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (Self { _private: () }, others)
+    }
+}
+
+impl Drop for InFlightContinuationSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT_CONTINUATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl AnchorReservation {
     /// A permit over nothing — holds no anchor, releases nothing on drop.
     fn none() -> Self {
-        Self { held: None }
+        Self {
+            held: None,
+            in_flight: None,
+        }
+    }
+
+    /// Attach the admitted dispatch's in-flight slot (a `Proceed` only).
+    fn carrying(mut self, slot: InFlightContinuationSlot) -> Self {
+        self.in_flight = Some(slot);
+        self
     }
 
     /// Take custody of the `pending_anchors` entry the caller just inserted
@@ -3677,6 +3837,7 @@ impl AnchorReservation {
     fn owning(anchor_key: String, token: AnchorReservationToken) -> Self {
         Self {
             held: Some((anchor_key, token)),
+            in_flight: None,
         }
     }
 
@@ -3695,15 +3856,22 @@ impl AnchorReservation {
         // Taken out of `self` so this fn settles the entry and the drop below
         // is a no-op: one removal, not two.
         let held = self.held.take();
+        let in_flight = self.in_flight.take();
         let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
-        let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
-        registry.insert_live(terminal_id, anchor_key, gate_id);
-        if let Some((anchor, token)) = held {
-            // Owner-checked like every other removal, through the SAME
-            // comparison — `release_owned` is the only remover there is, so
-            // this path cannot drift away from the drop path.
-            registry.release_owned(&anchor, token);
+        {
+            let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+            registry.insert_live(terminal_id, anchor_key, gate_id);
+            if let Some((anchor, token)) = held {
+                // Owner-checked like every other removal, through the SAME
+                // comparison — `release_owned` is the only remover there is, so
+                // this path cannot drift away from the drop path.
+                registry.release_owned(&anchor, token);
+            }
         }
+        // The live row now stands for this dispatch in the count, so its
+        // in-flight slot goes back — AFTER the insert, so the count never dips
+        // below the truth in between (it is one high for an instant instead).
+        drop(in_flight);
     }
 }
 
@@ -4940,16 +5108,25 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
     let Some(client) = crate::coord_http::coord_client() else {
         return SpawnDecision::SpawnDespiteClaimError {
             cause: "no shared coord client".to_string(),
+            // Nothing was sent: there was nothing to send it with.
+            claim_sent: ClaimSent::NotSent,
         };
     };
     let body = ContinuationConsumedBody::claim(device_id);
-    // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
-    match crate::auth::attach_device_auth(client.post(&url))
-        .timeout(Duration::from_secs(5))
-        .json(&body)
-        .send()
-        .await
-    {
+    send_continuation_claim(
+        // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
+        crate::auth::attach_device_auth(client.post(&url))
+            .timeout(Duration::from_secs(5))
+            .json(&body),
+    )
+    .await
+}
+
+/// Send a built claim request and decode the answer. Split from
+/// [`claim_before_spawn`] so the send-error classification ([`ClaimSent`]) is
+/// driven by a test against a real local listener, not re-implemented.
+async fn send_continuation_claim(request: reqwest::RequestBuilder) -> SpawnDecision {
+    match request.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Body is needed only to distinguish the 409 cancelled / superseded
@@ -4959,6 +5136,7 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
         }
         Err(e) => SpawnDecision::SpawnDespiteClaimError {
             cause: format!("claim POST failed: {e:#}"),
+            claim_sent: claim_sent_for_send_error(&e),
         },
     }
 }
@@ -5159,6 +5337,61 @@ fn thread_pressure_stamp_reason(
     )
 }
 
+/// The stamp for a free-commit (memory-lane) load deferral:
+/// `commit_pressure:<severity>:<observed>_over_<limit>`, the same shape as
+/// [`thread_pressure_stamp_reason`] so the class parser and #2522's
+/// pressured-row reroute read both alike. The numbers are bytes; `_over_` is
+/// the grammar's fixed separator, not a claim that the reading exceeded the
+/// floor (on this lane it fell BELOW it).
+fn commit_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    format!(
+        "commit_pressure:{severity}:{}_over_{}",
+        observation.observed, observation.limit
+    )
+}
+
+/// The stamp for a load deferral, lane-correct: the thread lane keeps
+/// [`thread_pressure_stamp_reason`] (a wire class coord already groups on),
+/// the memory lane stamps [`commit_pressure_stamp_reason`]. The lane is read
+/// off the observation's METRIC, never re-derived from the severity.
+fn load_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    match observation.metric {
+        crate::resource_guard::LaneMetric::ThreadCount => {
+            thread_pressure_stamp_reason(severity, observation)
+        }
+        crate::resource_guard::LaneMetric::FreeCommitBytes => {
+            commit_pressure_stamp_reason(severity, observation)
+        }
+    }
+}
+
+/// Why the `claude` CLI a continuation would exec is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliFault {
+    /// Nothing on the runner's PATH resolved (unix only — a bare name there
+    /// means no real CLI was found; the shim dirs are skipped by
+    /// [`resolve_claude_bin`]).
+    NotOnPath,
+    /// The resolved absolute path failed the exec seam's predicate.
+    Exec(crate::terminal::pane_io::ExecFault),
+}
+
+/// The stamp for an unavailable `claude` CLI:
+/// `claude_cli_unavailable:<enoent|eacces|not_on_path|errno_N>`.
+fn claude_cli_unavailable_stamp_reason(fault: CliFault) -> String {
+    let detail = match fault {
+        CliFault::NotOnPath => "not_on_path".to_string(),
+        CliFault::Exec(exec) => exec.wire(),
+    };
+    format!("claude_cli_unavailable:{detail}")
+}
+
 /// When [`spawn_runtime`] started — the earliest instant a continuation can be
 /// delivered. Anchors [`presentation_boot_grace`]. Unset (a unit test, or a
 /// runner whose runtime never started) reads as age zero.
@@ -5341,10 +5574,13 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// |---|---|---|
 /// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
+/// | `commit_pressure:<severity>:<observed>_over_<limit>` | the machine is out of free commit (the Windows memory lane) | [`commit_pressure_stamp_reason`] |
+/// | `claude_cli_unavailable:<enoent\|eacces\|not_on_path\|errno_N>` | the `claude` binary the spawn would exec is missing or not executable (e.g. mid npm reinstall) | [`claude_cli_unavailable_stamp_reason`] |
 /// | `at_cap:<cap>` | the continuation concurrency cap | [`at_cap_stamp_reason`] |
+/// | `device_drain:<drained\|unknown>` | coord's device drain paused autonomous spawns | [`drain_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
 ///
-/// The first three follow `<class>:<detail>`; the fourth is delimited by `_` and
+/// All but the last follow `<class>:<detail>`; the last is delimited by `_` and
 /// predates the grammar — see [`spawn_authorization_stamp_reason`].
 ///
 /// This replaces the AtCap arm's old `report_spawn_failed` lifecycle post,
@@ -5512,6 +5748,284 @@ async fn defer_continuation_unclaimed(
         }
     }
     release_local_dispatch_claim(consume_target);
+}
+
+// =============================================================================
+// Spawn readiness before the claim, and seam refusals after an unsent one
+// (plan `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`)
+// =============================================================================
+
+/// Whether the `claude` binary a continuation will exec is launchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliReadiness {
+    /// The resolved absolute path passes the exec seam's predicate.
+    Ready,
+    /// The resolved absolute path fails it (`ENOENT` / `EACCES` / …).
+    Unlaunchable(crate::terminal::pane_io::ExecFault),
+    /// [`resolve_claude_bin`] fell back to a bare name. Unix defers on this;
+    /// Windows proceeds (the npm-only install shape `resolve_claude_bin`
+    /// documents as deliberately falling through — UNKNOWN fails open there).
+    Unresolved,
+}
+
+/// PURE over the injected exec predicate: is `resolved` launchable?
+///
+/// Production passes [`crate::terminal::pane_io::probe_launchable`] — the
+/// predicate the PTY seam itself applies — over the SAME string the spawn will
+/// exec, so the probe and the spawn name one file by construction.
+fn claude_cli_readiness(
+    resolved: &str,
+    probe: &dyn Fn(&std::path::Path) -> Result<(), crate::terminal::pane_io::ExecFault>,
+) -> CliReadiness {
+    let path = std::path::Path::new(resolved);
+    if !path.is_absolute() {
+        return CliReadiness::Unresolved;
+    }
+    match probe(path) {
+        Ok(()) => CliReadiness::Ready,
+        Err(fault) => CliReadiness::Unlaunchable(fault),
+    }
+}
+
+/// The two local conditions the spawn seam refuses on, read immediately
+/// before the consume claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnReadiness {
+    /// The seam's own composed load verdict
+    /// ([`crate::resource_guard::probe_for_spawn`] in production).
+    resource: crate::resource_guard::SpawnGate,
+    /// The resolved CLI's launchability ([`claude_cli_readiness`]).
+    cli: CliReadiness,
+}
+
+/// A readiness failure: the stamp coord groups on, and the sentence the log
+/// carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessDeferral {
+    stamp: String,
+    why: String,
+}
+
+/// PURE: does `readiness` defer this continuation? Load first (any tripped
+/// severity defers — the queue doctrine on [`evaluate_continuation_guard`]),
+/// then the CLI.
+fn spawn_readiness_deferral(
+    readiness: &SpawnReadiness,
+    claude_bin: &str,
+) -> Option<ReadinessDeferral> {
+    if let Some((severity, observation)) = readiness.resource.tripped() {
+        return Some(ReadinessDeferral {
+            stamp: load_pressure_stamp_reason(severity, observation),
+            why: observation.clause(severity),
+        });
+    }
+    match readiness.cli {
+        CliReadiness::Ready => None,
+        CliReadiness::Unlaunchable(fault) => Some(ReadinessDeferral {
+            stamp: claude_cli_unavailable_stamp_reason(CliFault::Exec(fault)),
+            why: format!(
+                "the claude CLI at {claude_bin} is not launchable ({})",
+                fault.wire()
+            ),
+        }),
+        CliReadiness::Unresolved => unresolved_cli_deferral(claude_bin),
+    }
+}
+
+/// Unix: a bare name means no real CLI resolved on the runner's PATH — defer.
+#[cfg(unix)]
+fn unresolved_cli_deferral(claude_bin: &str) -> Option<ReadinessDeferral> {
+    Some(ReadinessDeferral {
+        stamp: claude_cli_unavailable_stamp_reason(CliFault::NotOnPath),
+        why: format!("no claude CLI resolved on the runner's PATH (fell back to `{claude_bin}`)"),
+    })
+}
+
+/// Windows: a bare name is the npm-only install shape — proceed unchanged.
+#[cfg(not(unix))]
+fn unresolved_cli_deferral(_claude_bin: &str) -> Option<ReadinessDeferral> {
+    None
+}
+
+/// What [`claim_if_spawn_ready`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum PreClaim {
+    /// Not ready: deferred UNCLAIMED — the stamp is posted and the local
+    /// dispatch claim released. The caller returns without spawning.
+    Deferred { stamp: String },
+    /// Ready (or the legacy path, which is never checked). `decision` is
+    /// coord's answer to the consume claim for a [`ConsumeTarget::Gate`], and
+    /// `None` for the targets that post no claim.
+    Ready { decision: Option<SpawnDecision> },
+}
+
+/// The step-1b-to-step-2 transition of [`run_gate_continuation_inner`]: check
+/// spawn readiness, and only then post the consume CLAIM.
+///
+/// Why here: a gate continuation that is claimed and then refused at the spawn
+/// seam is recorded `spawn_failed` and never re-driven — the claim is what
+/// burns it (coord finding `baf7fd74`). The two seam refusals (the resource
+/// guard, an unlaunchable `claude`) are LOCAL conditions, so like every other
+/// local guard they are checked BEFORE the claim and defer UNCLAIMED, stamped,
+/// through [`defer_continuation_unclaimed`]. This is the latest point that is
+/// still before the claim, so the check-to-claim gap is as small as it can be
+/// — it narrows the race with the seam, it does not remove it (see
+/// [`failed_spawn_disposition`] for the residual).
+///
+/// Skipped for [`ConsumeTarget::None`]: the legacy path has no re-delivery,
+/// so a deferral there would be a silent drop.
+///
+/// `post_claim` is the claim poster; production passes
+/// [`post_continuation_claim`] in ONE statement, so a unit test drives this fn
+/// rather than a re-implementation of it.
+async fn claim_if_spawn_ready<C, Fut>(
+    consume_target: ConsumeTarget,
+    device_id: uuid::Uuid,
+    claude_bin: &str,
+    readiness: SpawnReadiness,
+    post_claim: C,
+) -> PreClaim
+where
+    C: FnOnce(uuid::Uuid) -> Fut,
+    Fut: std::future::Future<Output = SpawnDecision>,
+{
+    if !matches!(consume_target, ConsumeTarget::None) {
+        if let Some(deferral) = spawn_readiness_deferral(&readiness, claude_bin) {
+            warn!(
+                "agent_runtime: gate-continuation deferred before its claim: {} — row left \
+                 pending, re-delivered once it clears (stamp={}, claude_bin={claude_bin}, \
+                 consume_target={consume_target:?})",
+                deferral.why, deferral.stamp
+            );
+            defer_continuation_unclaimed(consume_target, device_id, deferral.stamp.clone()).await;
+            return PreClaim::Deferred {
+                stamp: deferral.stamp,
+            };
+        }
+    }
+    let decision = match consume_target {
+        ConsumeTarget::Gate(gate_id, _) => Some(post_claim(gate_id).await),
+        ConsumeTarget::Dispatch(_) | ConsumeTarget::None => None,
+    };
+    PreClaim::Ready { decision }
+}
+
+/// A spawn-seam refusal an unattended continuation may RETRY, carried through
+/// `anyhow` beside the seam's unchanged message and found with `downcast_ref`
+/// — never by grepping the detail string, which is a wire value coord's
+/// re-drive classifier reads (qontinui-coord #2674) and is not reworded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnRefusal {
+    /// `admit_spawn`'s CRITICAL refusal at the PTY seam.
+    ResourceGuard {
+        severity: &'static str,
+        observation: crate::resource_guard::GateObservation,
+    },
+    /// The `claude` binary failed the exec seam's predicate after the spawn
+    /// failed: `portable-pty`'s *"Unable to spawn … claude"*, or a headless
+    /// spawn of the claude binary.
+    ClaudeCliUnlaunchable {
+        path: String,
+        fault: crate::terminal::pane_io::ExecFault,
+    },
+}
+
+impl std::fmt::Display for SpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnRefusal::ResourceGuard {
+                severity,
+                observation,
+            } => write!(f, "resource guard refusal: {}", observation.clause(severity)),
+            SpawnRefusal::ClaudeCliUnlaunchable { path, fault } => {
+                write!(f, "claude CLI at {path} is not launchable ({})", fault.wire())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnRefusal {}
+
+impl SpawnRefusal {
+    /// The typed refusal behind a PTY seam cause. A program failure counts
+    /// only when the program IS the claude binary this spawn exec'd.
+    fn from_seam_cause(
+        cause: crate::terminal::session::SpawnSeamCause,
+        claude_bin: &str,
+    ) -> Option<Self> {
+        match cause {
+            crate::terminal::session::SpawnSeamCause::ResourceGuard {
+                severity,
+                observation,
+            } => Some(SpawnRefusal::ResourceGuard {
+                severity,
+                observation,
+            }),
+            crate::terminal::session::SpawnSeamCause::ProgramUnlaunchable { program, fault } => {
+                (program == claude_bin)
+                    .then_some(SpawnRefusal::ClaudeCliUnlaunchable { path: program, fault })
+            }
+        }
+    }
+
+    /// The deferred-stamp reason for this refusal (D3's vocabulary).
+    fn stamp_reason(&self) -> String {
+        match self {
+            SpawnRefusal::ResourceGuard {
+                severity,
+                observation,
+            } => load_pressure_stamp_reason(severity, observation),
+            SpawnRefusal::ClaudeCliUnlaunchable { fault, .. } => {
+                claude_cli_unavailable_stamp_reason(CliFault::Exec(*fault))
+            }
+        }
+    }
+}
+
+/// The spawn error an `Err` presentation returns: `message` verbatim (it is
+/// what `e.to_string()` yields, so the `spawn_failed` detail is unchanged),
+/// with the typed refusal attached underneath when there is one.
+fn seam_error(message: String, refusal: Option<SpawnRefusal>) -> anyhow::Error {
+    match refusal {
+        Some(refusal) => anyhow::Error::new(refusal).context(message),
+        None => anyhow::anyhow!(message),
+    }
+}
+
+/// What step 4 records for a gate continuation whose spawn failed.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedSpawnDisposition {
+    /// Defer UNCLAIMED with this stamp: the claim never reached coord and the
+    /// seam refused for a retriable, local reason.
+    DeferUnclaimed(String),
+    /// Post `spawn_failed` as ever.
+    PostSpawnFailed,
+}
+
+/// PURE: step 4's decision for a failed gate-continuation spawn (D5).
+///
+/// The measured population (finding `baf7fd74`) went stale AFTER the claim —
+/// 24 s to ~10 min of post-claim work — so a pre-claim check alone catches
+/// almost none of it. What those rows share is that their claim POST failed
+/// before reaching coord (`error sending request`), took
+/// `SpawnDespiteClaimError`, spawned, and met the seam's refusal; the burn was
+/// the `spawn_failed` OUTCOME post, not the claim. So when the claim provably
+/// never left this host ([`ClaimSent::NotSent`]) and the error carries a
+/// [`SpawnRefusal`], the row is deferred unclaimed instead. Every other
+/// combination — an accepted claim (`None`), a claim that may have landed
+/// ([`ClaimSent::Unknown`]), or an unrelated failure — keeps today's
+/// `spawn_failed`, which #2674 re-drives.
+fn failed_spawn_disposition(
+    errored_claim: Option<ClaimSent>,
+    error: &anyhow::Error,
+) -> FailedSpawnDisposition {
+    if errored_claim != Some(ClaimSent::NotSent) {
+        return FailedSpawnDisposition::PostSpawnFailed;
+    }
+    match error.downcast_ref::<SpawnRefusal>() {
+        Some(refusal) => FailedSpawnDisposition::DeferUnclaimed(refusal.stamp_reason()),
+        None => FailedSpawnDisposition::PostSpawnFailed,
+    }
 }
 
 /// Spawn the run task for a gate continuation WITHOUT the coord claim/outcome
@@ -5696,17 +6210,18 @@ async fn run_gate_continuation_inner(
             .await;
             return Ok(());
         }
-        ContinuationGuard::ThreadPressure {
+        ContinuationGuard::LoadPressure {
             severity,
             observation,
         } => {
-            // The machine is out of THREADS, not out of slots. The deferred
-            // continuation stays pending on coord and the periodic backstop poll
-            // (`spawn_continuation_backstop_poll`, always armed) re-fetches it
-            // within one interval — plus the capacity-freed exit hook fires the
-            // moment a live continuation's PTY exits, which is also the moment
-            // its ~3 threads go back to the pool. So this deferral self-heals on
-            // exactly the event that relieves the pressure.
+            // The machine is out of THREADS (or, on Windows, free COMMIT), not
+            // out of slots. The deferred continuation stays pending on coord
+            // and the periodic backstop poll (`spawn_continuation_backstop_poll`,
+            // always armed) re-fetches it within one interval — plus the
+            // capacity-freed exit hook fires the moment a live continuation's
+            // PTY exits, which is also the moment its ~3 threads and its memory
+            // go back. So this deferral self-heals on exactly the event that
+            // relieves the pressure.
             //
             // Both the WARN and the CRITICAL verdict land here, unlike
             // `resource_guard::admit_spawn`, which refuses only at CRITICAL —
@@ -5714,20 +6229,22 @@ async fn run_gate_continuation_inner(
             // gets back-pressured a band earlier than a human's own terminal.
             warn!(
                 "agent_runtime: gate-continuation deferred under machine load: {} \
-                 — re-delivered when threads free up (anchor_key={:?})",
+                 — re-delivered when the pressure clears (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
             );
-            // The stamp reason names the REAL numbers, in the same
+            // The stamp reason names the REAL numbers and the lane, in the same
             // `<class>:<detail>` shape as `at_cap:` / `duplicate_anchor:` so
             // coord-side grouping still works:
             // `thread_pressure:warn:300_over_256` (256/400 are the shipped
             // ceilings, so a warn stamp can only ever name 256; a reading past
-            // 400 stamps `critical` and names 400).
+            // 400 stamps `critical` and names 400), or
+            // `commit_pressure:<severity>:<free>_over_<floor>` for the memory
+            // lane.
             defer_continuation_unclaimed(
                 consume_target,
                 device_id,
-                thread_pressure_stamp_reason(severity, &observation),
+                load_pressure_stamp_reason(severity, &observation),
             )
             .await;
             return Ok(());
@@ -5795,11 +6312,49 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-    // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
-    // AFTER the #469 guards pass and AWAITED — its result decides whether to
-    // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
-    // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+
+    // Step 1c: the `claude` binary this continuation will exec, resolved ONCE
+    // and threaded to the spawn, so the readiness probe below and the spawn
+    // name the same file by construction. Resolved in the RUNNER's env, which
+    // has no per-terminal shim dir (see `resolve_claude_bin`). spawn_blocking:
+    // it stats PATH entries.
+    let claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+        .await
+        .unwrap_or_else(|_| claude_bin_path());
+
+    // Step 1c + 2: spawn readiness, then CLAIM-before-spawn (only with a
+    // gate_id / coord configured). The claim is posted AFTER every local guard
+    // passes and AWAITED — its result decides whether to spawn. This closes the
+    // poll→cancel→spawn race: if a cancel landed between the poll and now,
+    // coord returns 409 cancelled and we skip the spawn.
+    //
+    // ONE wiring statement for the readiness-then-claim transition, driven by
+    // its unit tests through the same fn. The resource verdict is the seam's
+    // own (`probe_for_spawn`, memoized, so this second reading milliseconds
+    // after step 1 is free) and the CLI verdict is the seam's own predicate
+    // over the exact string the spawn will exec.
+    let decision = match claim_if_spawn_ready(
+        consume_target,
+        device_id,
+        &claude_bin,
+        SpawnReadiness {
+            resource: crate::resource_guard::probe_for_spawn(),
+            cli: claude_cli_readiness(&claude_bin, &crate::terminal::pane_io::probe_launchable),
+        },
+        |gate_id| post_continuation_claim(gate_id, device_id),
+    )
+    .await
+    {
+        PreClaim::Deferred { .. } => return Ok(()),
+        PreClaim::Ready { decision } => decision,
+    };
+    // How far an ERRORED claim provably got — step 4 reads it (D5). `None` for
+    // an accepted claim and for the targets that post none.
+    let errored_claim = decision
+        .as_ref()
+        .and_then(SpawnDecision::errored_claim_sent);
+    if let (ConsumeTarget::Gate(gate_id, _), Some(decision)) = (consume_target, decision.as_ref())
+    {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -5812,8 +6367,7 @@ async fn run_gate_continuation_inner(
         // coord, while `settle_claim_decision` is pure-sync and unit-driven.
         // So the DECISION (log + whether the claim is settled here) stays
         // there and only the await lands at this call site.
-        let decision = post_continuation_claim(gate_id, device_id).await;
-        match settle_claim_decision(&decision, consume_target, gate_id) {
+        match settle_claim_decision(decision, consume_target, gate_id) {
             ClaimOutcome::Spawn => {}
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
@@ -5887,8 +6441,16 @@ async fn run_gate_continuation_inner(
     let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx, reservation)
-                .await
+            run_continuation_terminal(
+                agent_id,
+                &workdir,
+                &payload,
+                device_id,
+                ctx,
+                reservation,
+                claude_bin,
+            )
+            .await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5905,8 +6467,14 @@ async fn run_gate_continuation_inner(
                 &payload.initial_prompt,
                 payload.brief.as_ref(),
             );
-            let res =
-                run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
+            let res = run_continuation_headless(
+                agent_id,
+                &workdir,
+                &headless_prompt,
+                &claude_bin,
+                reservation,
+            )
+            .await;
             drop(ctx);
             res.map(|()| None)
         }
@@ -5918,15 +6486,37 @@ async fn run_gate_continuation_inner(
             Ok(_) => {
                 post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
             }
-            Err(e) => {
-                post_spawn_outcome(
-                    gate_id,
-                    device_id,
-                    ContinuationOutcome::SpawnFailed,
-                    Some(first_line(&e.to_string())),
-                )
-                .await
-            }
+            Err(e) => match failed_spawn_disposition(errored_claim, e) {
+                FailedSpawnDisposition::DeferUnclaimed(stamp) => {
+                    // D5: the claim never reached coord and the seam refused
+                    // for a retriable local reason, so the row is still
+                    // pending and unconsumed there — defer it UNCLAIMED rather
+                    // than post the `spawn_failed` that would burn it. The
+                    // cleanup matches the pre-claim deferral's: the worktree
+                    // claim heartbeat (`ctx`) and the anchor `reservation`
+                    // (with its in-flight slot) were moved into the
+                    // presentation fn and dropped on its `Err`, so a
+                    // re-delivery re-acquires both cleanly.
+                    warn!(
+                        "agent_runtime: gate-continuation refused at the spawn seam after a claim \
+                         that never reached coord — deferring UNCLAIMED instead of posting \
+                         spawn_failed, row left pending for re-delivery: {} (stamp={stamp}, \
+                         gate_id={gate_id})",
+                        first_line(&e.to_string())
+                    );
+                    defer_continuation_unclaimed(consume_target, device_id, stamp).await;
+                    return Ok(());
+                }
+                FailedSpawnDisposition::PostSpawnFailed => {
+                    post_spawn_outcome(
+                        gate_id,
+                        device_id,
+                        ContinuationOutcome::SpawnFailed,
+                        Some(first_line(&e.to_string())),
+                    )
+                    .await
+                }
+            },
         },
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
@@ -6141,6 +6731,12 @@ async fn run_continuation_terminal(
     // drops it, which releases the anchor; the `Ok` arm hands it to the
     // registry once the live entry exists.
     reservation: AnchorReservation,
+    // The `claude` binary resolved ONCE before the claim and probed there
+    // (`claim_if_spawn_ready`) — the argv[0] of the first start attempt, so the
+    // probe and that exec name the same file by construction. A local
+    // never-started retry below re-resolves it (the binary it named may be
+    // exactly what a reinstall moved).
+    mut claude_bin: String,
 ) -> anyhow::Result<Option<String>> {
     use std::sync::Arc;
 
@@ -6203,19 +6799,17 @@ async fn run_continuation_terminal(
         .clone()
         .unwrap_or_else(|| "Gate continuation".to_string());
 
-    // Resolve `claude` to an ABSOLUTE launchable path, same as the
-    // condition-check terminal and for the same reason: this spawns via the
-    // identical direct-PTY/CreateProcessW backend, so a bare "claude" would
-    // resolve to the extensionless identity-shim script and fail with os
-    // error 193 (see `resolve_claude_bin` doc comment). The prompt is the
-    // trailing positional arg — interactive form, NOT `--print` (see the fn
-    // doc: interactivity is required). Inject `--dangerously-skip-permissions`
-    // (same as the worker-tab spawn path) so the continuation /implement-plan
-    // session does not stall on interactive Bash permission prompts — an
-    // unattended gate continuation has no operator to answer them.
-    let mut claude_bin = spawn_blocking_tracked(resolve_claude_bin)
-        .await
-        .unwrap_or_else(|_| claude_bin_path());
+    // `claude_bin` is the ABSOLUTE launchable path the caller resolved before
+    // the claim, same as the condition-check terminal and for the same reason:
+    // this spawns via the identical direct-PTY/CreateProcessW backend, so a
+    // bare "claude" would resolve to the extensionless identity-shim script
+    // and fail with os error 193 (see `resolve_claude_bin` doc comment). The
+    // prompt is the trailing positional arg — interactive form, NOT `--print`
+    // (see the fn doc: interactivity is required). Inject
+    // `--dangerously-skip-permissions` (same as the worker-tab spawn path) so
+    // the continuation /implement-plan session does not stall on interactive
+    // Bash permission prompts — an unattended gate continuation has no
+    // operator to answer them.
     // Phase 2c — `--add-dir=<sibling>` (attached form — see the
     // build_continuation_claude_command doc) for each non-cwd worktree of this
     // continuation's context so the launched `claude` can edit sibling repos
@@ -6291,12 +6885,12 @@ async fn run_continuation_terminal(
     // once.
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
-    // Count this continuation toward the P4 cap for the whole start window:
-    // it is not in the live registry until its verdict, and a burst of
-    // dispatches must not all read the same low live count while theirs are
-    // still starting. Released when this fn returns (a started session is by
-    // then registered, so the overlap only ever over-counts).
-    let _starting = StartingContinuationSlot::acquire();
+    // This continuation already counts toward the P4 cap for the whole start
+    // window: the `InFlightContinuationSlot` riding on `reservation` was taken
+    // when the guard said Proceed and is released only by the hand-over at
+    // `Started` (or by drop on any `Err` return), which covers every
+    // never-started retry below. A second start-window counter here would
+    // count the same dispatch twice.
     loop {
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
@@ -6472,9 +7066,16 @@ async fn run_continuation_terminal(
                 // child, instead of `exited`, and carries the refusal verbatim
                 // (it names the failing conjuncts) rather than wrapped as a create
                 // failure.
-                let (reason, phase) = classify_pty_spawn_error(&e);
+                let (reason, phase) = classify_pty_spawn_error(&e.message);
                 report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-                return Err(anyhow::anyhow!(e));
+                // The seam's typed cause (resource guard / unlaunchable program),
+                // when it had one, rides underneath the unchanged text for step 4
+                // to classify (D5). Matched against THIS attempt's binary, which
+                // a never-started retry may have re-resolved.
+                let refusal = e
+                    .cause
+                    .and_then(|cause| SpawnRefusal::from_seam_cause(cause, &claude_bin));
+                return Err(seam_error(e.message, refusal));
             }
         };
 
@@ -6594,34 +7195,6 @@ async fn run_continuation_terminal(
     }
 }
 
-/// Process-wide count of terminal continuations inside their start window —
-/// counted toward the P4 cap beside the live registry (see
-/// [`StartingContinuationSlot`]).
-static STARTING_CONTINUATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Number of terminal continuations currently inside their start window.
-fn starting_continuation_count() -> usize {
-    STARTING_CONTINUATIONS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// RAII hold on one [`STARTING_CONTINUATIONS`] slot: taken before the first
-/// PTY of a continuation is created, released on every return of
-/// [`run_continuation_terminal`] (and on panic, by drop).
-struct StartingContinuationSlot;
-
-impl StartingContinuationSlot {
-    fn acquire() -> Self {
-        STARTING_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for StartingContinuationSlot {
-    fn drop(&mut self) {
-        STARTING_CONTINUATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 /// How many times a gate-continuation terminal is created before a session that
 /// never STARTS is given up on and reported `spawn_failed` (1 initial + 2
@@ -7425,7 +7998,10 @@ async fn run_condition_check_terminal(
         // pass, so a refusal here costs one deferred probe rather than a lost
         // session.
         false,
-    );
+    )
+    // Text only: a condition check has no claim to defer, so the seam's typed
+    // cause is not needed here.
+    .map_err(String::from);
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
@@ -7762,6 +8338,9 @@ async fn run_continuation_headless(
     agent_id: uuid::Uuid,
     workdir: &str,
     initial_prompt: &str,
+    // The `claude` binary resolved and probed before the claim — the file
+    // this child execs, so the probe and the spawn name the same file (D2).
+    claude_bin: &str,
     // The anchor reservation the guard left behind. This path never registers
     // in the continuation registry (headless sessions are outside P3/P4), so
     // it is released the moment the child exists; a spawn `Err` drops it.
@@ -7791,7 +8370,17 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
+    match spawn_claude_child(
+        workdir,
+        initial_prompt,
+        None,
+        coord_mcp,
+        &[],
+        false,
+        Some(claude_bin),
+    )
+    .await
+    {
         Ok((mut child, preconditions)) => {
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
@@ -8699,6 +9288,7 @@ async fn run_agent_subprocess(
             coord_mcp,
             &[],
             false,
+            None,
         )
         .await
         {
@@ -9371,8 +9961,17 @@ pub(crate) async fn spawn_claude_child(
     // on a timer and a separate group would take them out of the runner's own
     // signal delivery.
     own_process_group: bool,
+    // The exact binary to exec, when the caller resolved and probed one — the
+    // gate continuation's headless arm, so its pre-claim probe and this spawn
+    // name the same file (plan
+    // `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
+    // D2). `None` keeps the PATH-searched `claude_bin_path()`, unchanged for
+    // every other caller.
+    bin_override: Option<&str>,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
-    let bin = claude_bin_path();
+    let bin = bin_override
+        .map(str::to_string)
+        .unwrap_or_else(claude_bin_path);
 
     // ONE account resolution, feeding all three consumers below: the
     // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
@@ -9501,9 +10100,24 @@ pub(crate) async fn spawn_claude_child(
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn `{bin}` in {workdir}: {e}"))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // The text is unchanged. When the binary itself fails the exec
+            // seam's predicate (an absolute path only — `ENOENT` from a
+            // missing `workdir` must not read as a missing CLI), the typed
+            // refusal rides underneath it for the continuation's step 4 (D5).
+            let refusal = crate::terminal::session::exec_failure_cause(
+                Some(&bin),
+                &crate::terminal::pane_io::probe_launchable,
+            )
+            .and_then(|cause| SpawnRefusal::from_seam_cause(cause, &bin));
+            return Err(seam_error(
+                format!("spawn `{bin}` in {workdir}: {e}"),
+                refusal,
+            ));
+        }
+    };
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
         tokio::spawn(async move {
@@ -13261,6 +13875,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             None,
             AnchorReservation::none(),
+            claude_bin_path(),
         )
         .await;
         assert!(
@@ -13364,6 +13979,8 @@ mod tests {
             agent_id,
             &workdir,
             "echo gate-continuation-proof",
+            // The fake CLI set above, threaded as the production caller does.
+            &claude_bin_path(),
             AnchorReservation::none(),
         )
         .await;
@@ -13881,6 +14498,7 @@ mod tests {
         assert!(!skip_leaves_row_pending(
             &SpawnDecision::SpawnDespiteClaimError {
                 cause: "network".into(),
+                claim_sent: ClaimSent::NotSent,
             }
         ));
 
@@ -13981,6 +14599,11 @@ mod tests {
             SpawnDecision::Spawn,
             SpawnDecision::SpawnDespiteClaimError {
                 cause: "network".into(),
+                claim_sent: ClaimSent::NotSent,
+            },
+            SpawnDecision::SpawnDespiteClaimError {
+                cause: "claim returned status 503".into(),
+                claim_sent: ClaimSent::Unknown,
             },
         ] {
             let claimed = uuid::Uuid::now_v7();
@@ -14909,7 +15532,7 @@ mod tests {
 
         // A same-anchor dispatch arrives inside the window. It no longer finds
         // the anchor free: specifically `Reserved`, not merely "not Proceed"
-        // (AtCap and ThreadPressure are refusals too and would prove nothing
+        // (AtCap and LoadPressure are refusals too and would prove nothing
         // about the anchor).
         assert_eq!(
             guard_verdict(Some(anchor), &live_all, &calm),
@@ -15013,7 +15636,7 @@ mod tests {
         assert_eq!(carried.gate_id, Some(gate));
 
         // 2. A same-anchor continuation dispatched inside the window is
-        //    REFUSED — specifically `Reserved`. `AtCap` / `ThreadPressure` are
+        //    REFUSED — specifically `Reserved`. `AtCap` / `LoadPressure` are
         //    refusals too and would satisfy a weaker assertion while proving
         //    nothing about the anchor.
         assert_eq!(
@@ -15202,7 +15825,7 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// A load verdict (`ThreadPressure` / `AtCap`) leaves NO reservation
+    /// A load verdict (`LoadPressure` / `AtCap`) leaves NO reservation
     /// behind: the row is deferred for re-delivery, and the re-delivery must
     /// read the load verdict again — not `DuplicateAnchor` against a refused
     /// evaluation's own leftover.
@@ -15241,7 +15864,7 @@ mod tests {
         );
         drop(held);
 
-        // ThreadPressure: cap out of the way, a loaded reading twice.
+        // LoadPressure: cap out of the way, a loaded reading twice.
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         for _ in 0..2 {
             // Bound for the same reason as the AtCap half above.
@@ -15249,12 +15872,12 @@ mod tests {
                 thread_verdict(Some(540))
             });
             assert!(
-                matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
+                matches!(verdict, ContinuationGuard::LoadPressure { .. }),
                 "a loaded machine must defer on every evaluation, got {verdict:?}"
             );
             assert!(
                 !anchor_is_reserved("a-loaded"),
-                "a ThreadPressure verdict must remove the reservation it took under the lock"
+                "a LoadPressure verdict must remove the reservation it took under the lock"
             );
             drop(held);
         }
@@ -15262,37 +15885,615 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// The reservation is not a running session and must not count toward P4
-    /// — for the continuation guard's `live_count` and for the launch guard
-    /// that shares the cap. With cap 2, one live session and one reservation,
-    /// a second anchor and a coord launch both still proceed.
+    /// Phase 3 of plan
+    /// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`:
+    /// an ADMITTED continuation still in flight (guard passed, no live row yet)
+    /// counts toward P4 — for the continuation guard and for the launch guard
+    /// that shares the cap — so a burst evaluated on one pre-burst registry
+    /// can no longer all pass the count. With cap 2, one live session and one
+    /// held admission, the next evaluation is `AtCap(2)` and a coord launch is
+    /// refused; once the admission settles (dropped, or handed to the registry)
+    /// the count is exact again.
+    ///
+    /// Before this phase the same setup read `Proceed` — the test was named
+    /// `anchor_reservation_does_not_count_toward_the_cap`. Deleting the
+    /// in-flight term from the guard's count, or the slot from the permit,
+    /// fails it.
     #[test]
-    fn anchor_reservation_does_not_count_toward_the_cap() {
+    fn in_flight_admitted_continuation_counts_toward_the_cap() {
         let _env_lock = env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
         let live_all = |_id: &str| true;
+        let baseline = in_flight_continuation_count();
 
         register_continuation_session("t-live".into(), Some("a-live".into()), None);
-        // Bound, not dropped: this test is about what a HELD reservation costs.
-        let (verdict, _held) = evaluate_continuation_guard(Some("a-reserved"), &live_all, &calm);
+        // Bound, not dropped: this test is about what a HELD admission costs.
+        let (verdict, held) = evaluate_continuation_guard(Some("a-reserved"), &live_all, &calm);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(anchor_is_reserved("a-reserved"));
-        // 1 live + 1 reserved, cap 2: if the reservation counted this would be
-        // AtCap(2).
+        assert_eq!(in_flight_continuation_count(), baseline + 1);
+        // 1 live + 1 in flight, cap 2.
         assert_eq!(
             guard_verdict(Some("a-next"), &live_all, &calm),
-            ContinuationGuard::Proceed,
-            "a reservation must not consume a cap slot"
+            ContinuationGuard::AtCap(2),
+            "an admitted in-flight continuation must consume a cap slot"
+        );
+        // Anchor-less too: the slot is not the anchor.
+        assert_eq!(
+            guard_verdict(None, &live_all, &calm),
+            ContinuationGuard::AtCap(2)
         );
         assert!(
-            admit_launch(uuid::Uuid::now_v7(), &live_all, &calm).is_ok(),
-            "the launch guard shares the cap and must not count reservations either"
+            admit_launch(uuid::Uuid::now_v7(), &live_all, &calm).is_err(),
+            "the launch guard shares the cap and must count in-flight continuations too"
+        );
+        // A refused evaluation holds no slot afterwards.
+        assert_eq!(in_flight_continuation_count(), baseline + 1);
+
+        // The hand-over to the registry swaps the in-flight slot for a live
+        // row: the count stays 2 (now 2 live), and the slot is gone.
+        held.handed_to_registry("t-admitted".into(), None);
+        assert_eq!(in_flight_continuation_count(), baseline);
+        assert_eq!(
+            guard_verdict(Some("a-third"), &live_all, &calm),
+            ContinuationGuard::AtCap(2)
         );
 
+        // A dispatch that gives up (drop) gives its slot back.
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let (verdict, abandoned) = evaluate_continuation_guard(None, &live_all, &calm);
+        assert_eq!(verdict, ContinuationGuard::Proceed);
+        assert_eq!(in_flight_continuation_count(), baseline + 1);
+        drop(abandoned);
+        assert_eq!(in_flight_continuation_count(), baseline);
+
         clear_continuation_registry();
+    }
+
+    // -------------------------------------------------------------------------
+    // Plan `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-
+    // and-the-claude-cli-check`, Phase 4: spawn readiness before the claim (D1,
+    // D2, D4), the typed stamps (D3), and the unclaimed deferral of a seam
+    // refusal after an unsent claim (D5).
+    // -------------------------------------------------------------------------
+
+    /// A CRITICAL verdict from the thread lane, through the real evaluator.
+    fn threads_critical() -> crate::resource_guard::SpawnGate {
+        thread_verdict(Some(540))
+    }
+
+    /// A CRITICAL verdict from the memory (free-commit) lane, through the real
+    /// evaluator against the shipped floors: 1 byte free.
+    fn memory_critical() -> crate::resource_guard::SpawnGate {
+        crate::resource_guard::evaluate(
+            "host",
+            Some(1),
+            &crate::settings::SessionGuardSettings::default(),
+        )
+    }
+
+    /// The observation inside a tripped verdict.
+    fn observation_of(
+        gate: crate::resource_guard::SpawnGate,
+    ) -> crate::resource_guard::GateObservation {
+        gate.tripped()
+            .map(|(_, observation)| observation.clone())
+            .expect("a tripped verdict")
+    }
+
+    /// Readiness whose CLI half is fine, so only the resource half speaks.
+    fn resource_only(resource: crate::resource_guard::SpawnGate) -> SpawnReadiness {
+        SpawnReadiness {
+            resource,
+            cli: CliReadiness::Ready,
+        }
+    }
+
+    /// Readiness for a real file on disk, probed by the production predicate.
+    fn cli_only(bin: &str) -> SpawnReadiness {
+        SpawnReadiness {
+            resource: crate::resource_guard::SpawnGate::Proceed,
+            cli: claude_cli_readiness(bin, &crate::terminal::pane_io::probe_launchable),
+        }
+    }
+
+    /// Drive `claim_if_spawn_ready` for a Gate target with a counting claim
+    /// poster, and return (result, how many claims were posted). The local
+    /// dispatch claim for `gate` is taken first, as the dispatcher does.
+    async fn run_pre_claim(
+        gate: uuid::Uuid,
+        claude_bin: &str,
+        readiness: SpawnReadiness,
+    ) -> (PreClaim, usize) {
+        let calls = std::cell::Cell::new(0usize);
+        let result = claim_if_spawn_ready(
+            ConsumeTarget::Gate(gate, 0),
+            uuid::Uuid::now_v7(),
+            claude_bin,
+            readiness,
+            |_gate_id| {
+                calls.set(calls.get() + 1);
+                async { SpawnDecision::Spawn }
+            },
+        )
+        .await;
+        (result, calls.get())
+    }
+
+    /// A file at `dir/claude` with `mode` (unix).
+    #[cfg(unix)]
+    fn cli_file(dir: &std::path::Path, mode: u32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("claude");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fake cli");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod fake cli");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Test 1: a CRITICAL resource verdict defers BEFORE the claim — the claim
+    /// poster is never called, the stamp names the lane, and the in-process
+    /// dispatch claim is released so a re-delivery can dispatch. Both lanes.
+    #[tokio::test]
+    async fn pre_claim_critical_resource_defers_without_claiming() {
+        for (resource, class) in [
+            (threads_critical(), "thread_pressure:critical:"),
+            (memory_critical(), "commit_pressure:critical:"),
+        ] {
+            let gate = uuid::Uuid::now_v7();
+            assert!(claim_gate_dispatch(gate), "the dispatcher's claim");
+            let (result, calls) = run_pre_claim(gate, "/abs/claude", resource_only(resource)).await;
+            assert_eq!(calls, 0, "{class}: a refused readiness must not post the claim");
+            match result {
+                PreClaim::Deferred { stamp } => assert!(stamp.starts_with(class), "{stamp}"),
+                other => panic!("{class}: expected a deferral, got {other:?}"),
+            }
+            assert!(
+                claim_gate_dispatch(gate),
+                "{class}: the deferral must release the local dispatch claim"
+            );
+            release_gate_dispatch(gate);
+        }
+    }
+
+    /// Test 2: WARN defers too (the queue doctrine), without a claim.
+    #[tokio::test]
+    async fn pre_claim_warn_resource_defers_without_claiming() {
+        let gate = uuid::Uuid::now_v7();
+        let (result, calls) =
+            run_pre_claim(gate, "/abs/claude", resource_only(thread_verdict(Some(300)))).await;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            PreClaim::Deferred {
+                stamp: "thread_pressure:warn:300_over_256".to_string()
+            }
+        );
+    }
+
+    /// Test 3: a CLI that exists but is not executable (`0o644`, the
+    /// mid-reinstall shape) defers `claude_cli_unavailable:eacces`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_claim_non_executable_cli_defers_eacces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = cli_file(dir.path(), 0o644);
+        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), &bin, cli_only(&bin)).await;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            PreClaim::Deferred {
+                stamp: "claude_cli_unavailable:eacces".to_string()
+            }
+        );
+    }
+
+    /// Test 4: a dangling symlink (the nvm link whose target npm removed)
+    /// defers `claude_cli_unavailable:enoent`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_claim_dangling_symlink_cli_defers_enoent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("claude");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).expect("symlink");
+        let bin = link.to_string_lossy().into_owned();
+        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), &bin, cli_only(&bin)).await;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            PreClaim::Deferred {
+                stamp: "claude_cli_unavailable:enoent".to_string()
+            }
+        );
+    }
+
+    /// Test 5 (unix arm): a bare-name resolution means no real CLI on the
+    /// runner's PATH — defer `not_on_path`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_claim_unresolved_cli_defers_on_unix() {
+        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            PreClaim::Deferred {
+                stamp: "claude_cli_unavailable:not_on_path".to_string()
+            }
+        );
+    }
+
+    /// Test 5 (Windows arm): a bare name is the npm-only install shape —
+    /// proceed unchanged, so the claim is posted exactly once.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn pre_claim_unresolved_cli_proceeds_on_windows() {
+        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            PreClaim::Ready {
+                decision: Some(SpawnDecision::Spawn)
+            }
+        );
+    }
+
+    /// Test 6: both checks pass → the claim is posted EXACTLY once, and its
+    /// decision is handed back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_claim_ready_posts_the_claim_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = cli_file(dir.path(), 0o755);
+        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), &bin, cli_only(&bin)).await;
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            PreClaim::Ready {
+                decision: Some(SpawnDecision::Spawn)
+            }
+        );
+    }
+
+    /// Test 7: the legacy `ConsumeTarget::None` path is unchanged — a failing
+    /// CLI and a critical box defer nothing there (it has no re-delivery, so a
+    /// deferral would be a silent drop), and it posts no claim. A work-unit
+    /// `Dispatch` target IS checked, and posts no claim either.
+    #[tokio::test]
+    async fn pre_claim_legacy_target_is_never_deferred() {
+        let failing = SpawnReadiness {
+            resource: threads_critical(),
+            cli: CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::NotFound),
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let result = claim_if_spawn_ready(
+            ConsumeTarget::None,
+            uuid::Uuid::now_v7(),
+            "/abs/claude",
+            failing.clone(),
+            |_gate_id| {
+                calls.set(calls.get() + 1);
+                async { SpawnDecision::Spawn }
+            },
+        )
+        .await;
+        assert_eq!(result, PreClaim::Ready { decision: None });
+        assert_eq!(calls.get(), 0);
+
+        let dispatch = uuid::Uuid::now_v7();
+        assert!(claim_dispatch_dispatch(dispatch), "the dispatcher's claim");
+        let result = claim_if_spawn_ready(
+            ConsumeTarget::Dispatch(dispatch),
+            uuid::Uuid::now_v7(),
+            "/abs/claude",
+            failing,
+            |_gate_id| async { SpawnDecision::Spawn },
+        )
+        .await;
+        assert!(matches!(result, PreClaim::Deferred { .. }), "{result:?}");
+        assert!(
+            claim_dispatch_dispatch(dispatch),
+            "a Dispatch deferral must release its local claim too"
+        );
+        release_dispatch_dispatch(dispatch);
+    }
+
+    /// Test 8: the new stamp constructors pin their wire strings — the same
+    /// constructors the deferral arms call, never a mirrored `format!`.
+    #[test]
+    fn readiness_stamp_constructors_pin_the_wire_values() {
+        use crate::terminal::pane_io::ExecFault;
+        assert_eq!(
+            claude_cli_unavailable_stamp_reason(CliFault::Exec(ExecFault::NotFound)),
+            "claude_cli_unavailable:enoent"
+        );
+        assert_eq!(
+            claude_cli_unavailable_stamp_reason(CliFault::Exec(ExecFault::PermissionDenied)),
+            "claude_cli_unavailable:eacces"
+        );
+        assert_eq!(
+            claude_cli_unavailable_stamp_reason(CliFault::Exec(ExecFault::Errno(20))),
+            "claude_cli_unavailable:errno_20"
+        );
+        assert_eq!(
+            claude_cli_unavailable_stamp_reason(CliFault::NotOnPath),
+            "claude_cli_unavailable:not_on_path"
+        );
+        let memory = observation_of(memory_critical());
+        let floor = crate::settings::SessionGuardSettings::default().critical_free_commit_bytes;
+        assert_eq!(
+            commit_pressure_stamp_reason("critical", &memory),
+            format!("commit_pressure:critical:1_over_{floor}")
+        );
+        // The lane router: the memory lane stamps `commit_pressure:`, the
+        // thread lane keeps the class coord already groups on.
+        assert_eq!(
+            load_pressure_stamp_reason("critical", &memory),
+            commit_pressure_stamp_reason("critical", &memory)
+        );
+        let threads = observation_of(threads_critical());
+        assert_eq!(
+            load_pressure_stamp_reason("critical", &threads),
+            "thread_pressure:critical:540_over_400"
+        );
+    }
+
+    /// Test 9: the file the probe checked IS argv[0] of the spawn — one value
+    /// threaded through both, never a second resolution.
+    #[cfg(unix)]
+    #[test]
+    fn probed_cli_is_argv0_of_the_continuation_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = cli_file(dir.path(), 0o755);
+        assert_eq!(
+            claude_cli_readiness(&bin, &crate::terminal::pane_io::probe_launchable),
+            CliReadiness::Ready
+        );
+        let argv = build_continuation_claude_command(
+            bin.clone(),
+            "sid",
+            Vec::new(),
+            "do the thing".to_string(),
+            None,
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(argv.first(), Some(&bin));
+    }
+
+    /// Test 10 (D1): the guard consults the injected verdict for the MEMORY
+    /// lane too — a memory-lane Critical defers as `LoadPressure`, and its
+    /// stamp is `commit_pressure:`, not a thread class it never measured.
+    #[test]
+    fn continuation_guard_defers_on_a_memory_lane_verdict() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        match guard_verdict(Some("a-memory"), &live_all, &memory_critical) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "critical");
+                assert_eq!(
+                    observation.metric,
+                    crate::resource_guard::LaneMetric::FreeCommitBytes
+                );
+                assert!(load_pressure_stamp_reason(severity, &observation)
+                    .starts_with("commit_pressure:critical:"));
+            }
+            other => panic!("a memory-lane Critical must defer, got {other:?}"),
+        }
+        clear_continuation_registry();
+    }
+
+    /// Test 11 (D5): step 4's disposition, pinned for every combination. Only
+    /// an unsent claim plus a typed seam refusal defers; the error's TEXT —
+    /// the `spawn_failed` detail #2674 classifies — is the seam's own.
+    #[test]
+    fn failed_spawn_disposition_defers_only_an_unsent_claim_with_a_seam_refusal() {
+        use crate::terminal::pane_io::ExecFault;
+        let resource_text = "resource_guard:critical: Not starting a new terminal session: …";
+        let resource = seam_error(
+            resource_text.to_string(),
+            Some(SpawnRefusal::ResourceGuard {
+                severity: "critical",
+                observation: observation_of(threads_critical()),
+            }),
+        );
+        assert_eq!(resource.to_string(), resource_text, "the detail text is unchanged");
+        let memory = seam_error(
+            "resource_guard:critical: …".to_string(),
+            Some(SpawnRefusal::ResourceGuard {
+                severity: "critical",
+                observation: observation_of(memory_critical()),
+            }),
+        );
+        let cli_text = "Failed to spawn shell: Unable to spawn /x/claude because it doesn't \
+                        exist on the filesystem or is not executable (ENOENT: No such file or \
+                        directory)";
+        let cli = seam_error(
+            cli_text.to_string(),
+            Some(SpawnRefusal::ClaudeCliUnlaunchable {
+                path: "/x/claude".to_string(),
+                fault: ExecFault::NotFound,
+            }),
+        );
+        assert_eq!(cli.to_string(), cli_text);
+        let unrelated = anyhow::anyhow!("terminal session create failed: something else");
+
+        assert_eq!(
+            failed_spawn_disposition(Some(ClaimSent::NotSent), &resource),
+            FailedSpawnDisposition::DeferUnclaimed("thread_pressure:critical:540_over_400".into())
+        );
+        match failed_spawn_disposition(Some(ClaimSent::NotSent), &memory) {
+            FailedSpawnDisposition::DeferUnclaimed(stamp) => {
+                assert!(stamp.starts_with("commit_pressure:critical:"), "{stamp}")
+            }
+            other => panic!("expected a deferral, got {other:?}"),
+        }
+        assert_eq!(
+            failed_spawn_disposition(Some(ClaimSent::NotSent), &cli),
+            FailedSpawnDisposition::DeferUnclaimed("claude_cli_unavailable:enoent".into())
+        );
+        for refused in [&resource, &cli] {
+            assert_eq!(
+                failed_spawn_disposition(Some(ClaimSent::Unknown), refused),
+                FailedSpawnDisposition::PostSpawnFailed,
+                "a claim that may have landed keeps spawn_failed"
+            );
+            assert_eq!(
+                failed_spawn_disposition(None, refused),
+                FailedSpawnDisposition::PostSpawnFailed,
+                "an ACCEPTED claim keeps spawn_failed"
+            );
+        }
+        assert_eq!(
+            failed_spawn_disposition(Some(ClaimSent::NotSent), &unrelated),
+            FailedSpawnDisposition::PostSpawnFailed,
+            "an unrelated failure keeps spawn_failed"
+        );
+    }
+
+    /// The PTY seam's cause classification and its mapping to a
+    /// `SpawnRefusal`: only an ABSOLUTE program that fails the predicate is
+    /// classified, and only when it is the claude binary this spawn exec'd.
+    #[test]
+    fn seam_cause_classifies_only_the_absolute_claude_program() {
+        use crate::terminal::pane_io::ExecFault;
+        use crate::terminal::session::{exec_failure_cause, SpawnSeamCause};
+        let absolute = if cfg!(windows) {
+            "C:\\x\\claude.exe"
+        } else {
+            "/x/claude"
+        };
+        let missing = |_: &std::path::Path| Err(ExecFault::NotFound);
+        let present = |_: &std::path::Path| Ok(());
+        assert_eq!(exec_failure_cause(Some("claude"), &missing), None, "bare name");
+        assert_eq!(exec_failure_cause(None, &missing), None, "shell pane");
+        assert_eq!(
+            exec_failure_cause(Some(absolute), &present),
+            None,
+            "a probe that passes explains nothing"
+        );
+        let cause = exec_failure_cause(Some(absolute), &missing).expect("classified");
+        assert_eq!(
+            cause,
+            SpawnSeamCause::ProgramUnlaunchable {
+                program: absolute.to_string(),
+                fault: ExecFault::NotFound
+            }
+        );
+        assert_eq!(
+            SpawnRefusal::from_seam_cause(cause.clone(), absolute),
+            Some(SpawnRefusal::ClaudeCliUnlaunchable {
+                path: absolute.to_string(),
+                fault: ExecFault::NotFound
+            })
+        );
+        assert_eq!(
+            SpawnRefusal::from_seam_cause(cause, "/some/other/program"),
+            None,
+            "a program that is not the claude binary is not a CLI refusal"
+        );
+    }
+
+    /// A local HTTP listener that answers every connection with `response`
+    /// after reading the request head.
+    async fn one_shot_http(response: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    /// A proxy-free client, so a proxy in the test environment cannot turn a
+    /// refused loopback connect into an answered one.
+    fn loopback_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client")
+    }
+
+    /// Test 12 (D5): `ClaimSent` is classified structurally from the send.
+    /// A refused connect never sent the claim (`NotSent`); a 503 and a
+    /// timeout reached, or may have reached, coord (`Unknown`).
+    #[tokio::test]
+    async fn claim_send_classifies_connect_refused_vs_answered_vs_timeout() {
+        // Refused: a port that was bound and released has no listener.
+        let refused_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let refused = send_continuation_claim(
+            loopback_client()
+                .post(format!("http://127.0.0.1:{refused_port}/claim"))
+                .timeout(Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(
+            refused.errored_claim_sent(),
+            Some(ClaimSent::NotSent),
+            "{refused:?}"
+        );
+
+        // 503: coord answered, so the claim may have landed.
+        let addr = one_shot_http(
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let answered = send_continuation_claim(
+            loopback_client()
+                .post(format!("http://{addr}/claim"))
+                .timeout(Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(
+            answered,
+            SpawnDecision::SpawnDespiteClaimError {
+                cause: "claim returned status 503".into(),
+                claim_sent: ClaimSent::Unknown,
+            }
+        );
+
+        // Timeout: connected and sent, never answered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let silent = listener.local_addr().expect("addr");
+        let hold = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(accepted);
+        });
+        let timed_out = send_continuation_claim(
+            loopback_client()
+                .post(format!("http://{silent}/claim"))
+                .timeout(Duration::from_millis(300)),
+        )
+        .await;
+        assert_eq!(
+            timed_out.errored_claim_sent(),
+            Some(ClaimSent::Unknown),
+            "{timed_out:?}"
+        );
+        hold.abort();
     }
 
     /// P3: a continuation with NO anchor_key (legacy frame) never dedups by
@@ -15510,7 +16711,7 @@ mod tests {
 
         // WARN band (257..=400): defer, naming the warn ceiling.
         match guard_verdict(Some("a3"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -15528,7 +16729,7 @@ mod tests {
         // ceiling. The guard does not escalate past deferral — there is nothing
         // heavier for a queued row than leaving it queued.
         match guard_verdict(Some("a4"), &live_all, &|| thread_verdict(Some(540))) {
-            ContinuationGuard::ThreadPressure {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -15570,7 +16771,7 @@ mod tests {
             thread_verdict(Some(540))
         });
         assert!(
-            matches!(loaded, ContinuationGuard::ThreadPressure { .. }),
+            matches!(loaded, ContinuationGuard::LoadPressure { .. }),
             "a 540-thread machine must NOT admit another continuation; got {loaded:?}"
         );
         assert_ne!(
@@ -15624,7 +16825,7 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::thread_pressure`, whose body is
+    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
     /// a `settings.json` stat + parse, a `claude_accounts` load and — on Windows
     /// — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
@@ -15670,7 +16871,7 @@ mod tests {
         // or the assertion above would pass on a guard that never reads threads.
         assert!(matches!(
             guard_verdict(Some("some-other-anchor"), &live_all, &counted),
-            ContinuationGuard::ThreadPressure { .. }
+            ContinuationGuard::LoadPressure { .. }
         ));
         assert_eq!(
             readings.load(std::sync::atomic::Ordering::SeqCst),
@@ -15708,7 +16909,7 @@ mod tests {
 
         // Add thread pressure and the honest, earlier signal wins.
         match guard_verdict(Some("a-new"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -16119,22 +17320,6 @@ mod tests {
         assert_eq!(last_output_line("\r\n  \n"), None);
     }
 
-    /// A continuation inside its start window counts toward the P4 cap until
-    /// its run returns, however it returns.
-    #[test]
-    fn starting_continuation_slot_counts_while_held() {
-        // The slots feed the P4 cap count every guard test reads, so hold the
-        // same lock they do or a parallel cap test sees +2.
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before = starting_continuation_count();
-        let a = StartingContinuationSlot::acquire();
-        let b = StartingContinuationSlot::acquire();
-        assert!(starting_continuation_count() >= before + 2);
-        drop(a);
-        drop(b);
-        // Other tests never take a slot, so the count is back where it was.
-        assert_eq!(starting_continuation_count(), before);
-    }
 
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
     /// `dispatch_id` and has NO `coord.gates` row, so every producer must be
@@ -16721,8 +17906,20 @@ mod drain_claim_tests {
             assert_eq!(
                 apply_drain_to_claim(decide_spawn(503, ""), &state),
                 SpawnDecision::SpawnDespiteClaimError {
-                    cause: "claim returned status 503".into()
+                    cause: "claim returned status 503".into(),
+                    claim_sent: ClaimSent::Unknown,
                 }
+            );
+            // D5: the drain fold carries `claim_sent` through untouched — a
+            // NotSent that became Unknown here would silently disable the
+            // unclaimed deferral at step 4.
+            let unsent = SpawnDecision::SpawnDespiteClaimError {
+                cause: "claim POST failed: connect".into(),
+                claim_sent: ClaimSent::NotSent,
+            };
+            assert_eq!(
+                apply_drain_to_claim(unsent.clone(), &state).errored_claim_sent(),
+                Some(ClaimSent::NotSent)
             );
         }
         for state in states_that_pause() {

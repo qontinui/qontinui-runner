@@ -176,6 +176,93 @@ impl OpenedPty {
     }
 }
 
+/// Why a program cannot be exec'd, as the exec seam's own predicate reports it.
+///
+/// Typed rather than read back out of an error string: `portable-pty`'s
+/// spawn failure is an `anyhow` message with no errno to downcast, so the
+/// fault is taken from [`probe_launchable`] — the SAME predicate the seam
+/// applies — and carried beside the text every caller already reads (plan
+/// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`, D2/D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecFault {
+    /// `ENOENT` — the file (or a symlink's target) does not exist. On Windows,
+    /// any resolved path that is not a file.
+    NotFound,
+    /// `EACCES` — the file exists and is not executable (an npm reinstall
+    /// that has not yet set the mode bit).
+    PermissionDenied,
+    /// Any other errno, kept verbatim.
+    Errno(i32),
+}
+
+impl ExecFault {
+    /// The fault behind an `io::Error` from an exec attempt or an `access(2)`
+    /// probe. The raw errno wins on unix so `EPERM` is not relabelled `eacces`.
+    pub(crate) fn from_io(e: &std::io::Error) -> Self {
+        #[cfg(unix)]
+        if let Some(errno) = e.raw_os_error() {
+            return match errno {
+                libc::ENOENT => ExecFault::NotFound,
+                libc::EACCES => ExecFault::PermissionDenied,
+                other => ExecFault::Errno(other),
+            };
+        }
+        match e.kind() {
+            std::io::ErrorKind::NotFound => ExecFault::NotFound,
+            std::io::ErrorKind::PermissionDenied => ExecFault::PermissionDenied,
+            _ => ExecFault::Errno(e.raw_os_error().unwrap_or(-1)),
+        }
+    }
+
+    /// The stamp detail word: `enoent` | `eacces` | `errno_<n>`.
+    pub(crate) fn wire(&self) -> String {
+        match self {
+            ExecFault::NotFound => "enoent".to_string(),
+            ExecFault::PermissionDenied => "eacces".to_string(),
+            ExecFault::Errno(n) => format!("errno_{n}"),
+        }
+    }
+}
+
+/// Can `program` be exec'd directly? The exec seam's own predicate, so a
+/// pre-spawn check and the spawn cannot disagree about which file is launchable.
+///
+/// - **Unix:** `access(program, X_OK)` — exactly the call `portable-pty`
+///   0.8.1's `CommandBuilder::search_path` makes for an absolute program
+///   before it bails with *"Unable to spawn … because it doesn't exist on the
+///   filesystem or is not executable"*. It follows symlinks, so a dangling
+///   nvm symlink reads as [`ExecFault::NotFound`].
+/// - **Windows:** `Path::is_file()`. `CreateProcessW` is the seam there, and the
+///   callers only hand it `.exe`/`.com` candidates (`resolve_claude_bin`).
+///
+/// A relative program is probed relative to the process cwd, which is almost
+/// never what a caller means — callers probe ABSOLUTE paths only.
+pub(crate) fn probe_launchable(program: &std::path::Path) -> Result<(), ExecFault> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(program.as_os_str().as_bytes()) else {
+            // An interior NUL cannot name a file at all.
+            return Err(ExecFault::NotFound);
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives
+        // the call; `access` only reads it.
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0 {
+            Ok(())
+        } else {
+            Err(ExecFault::from_io(&std::io::Error::last_os_error()))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if program.is_file() {
+            Ok(())
+        } else {
+            Err(ExecFault::NotFound)
+        }
+    }
+}
+
 /// The local `portable_pty` implementation of [`PaneIo`].
 pub struct LocalPty {
     /// Terminal id, for tracing fields only.

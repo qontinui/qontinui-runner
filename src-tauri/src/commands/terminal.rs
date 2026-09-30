@@ -2087,7 +2087,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), crate::terminal::session::TerminalSpawnError> {
     create_terminal_session_backend(
         terminal_manager,
         session_registry,
@@ -2124,6 +2124,11 @@ pub(crate) fn create_tracked_terminal_session_backend(
 /// Option<_>` shape here exists only for a path that genuinely cannot know
 /// the session id at spawn time; a `None` trips the untracked-backend-spawn
 /// guardrail (WARN + counter, see [`warn_untracked_backend_spawn`]).
+///
+/// The error is the spawn seam's [`crate::terminal::session::TerminalSpawnError`]:
+/// its text is what this fn always returned, and its typed cause lets the
+/// gate-continuation caller tell a retriable seam refusal from a failure.
+/// Callers that want only the text convert with `String::from`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_terminal_session_backend(
     terminal_manager: &Arc<TerminalManager>,
@@ -2145,7 +2150,7 @@ pub(crate) fn create_terminal_session_backend(
     // while an account-migration respawn is the continuation of a session that
     // already existed a moment ago. See each call site.
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), crate::terminal::session::TerminalSpawnError> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
     // the pre-acquired context + the configured plan directories), derived
@@ -2211,7 +2216,7 @@ pub(crate) fn create_terminal_session_backend(
     // Keep a handle for the (optional) durable-record poller below, since the
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
-    let info = terminal_manager.create(
+    let info = terminal_manager.create_typed(
         Some(title.clone()),
         Some(working_dir.clone()),
         page_id.clone(),

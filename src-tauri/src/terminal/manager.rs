@@ -246,6 +246,41 @@ impl TerminalManager {
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
     ) -> Result<TerminalInfo, String> {
+        self.create_typed(
+            title,
+            working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            command,
+            extra_env,
+            resource_override,
+            trust,
+            spawn_tenant,
+        )
+        .map_err(String::from)
+    }
+
+    /// [`Self::create`] with the spawn seam's typed cause kept
+    /// ([`super::session::TerminalSpawnError`]). The error TEXT is identical;
+    /// only a caller that classifies a refusal (the gate-continuation path)
+    /// needs this form.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_typed(
+        &self,
+        title: Option<String>,
+        working_dir: Option<String>,
+        page_id: Option<String>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        app_handle: AppHandle,
+        command: Option<Vec<String>>,
+        extra_env: Option<Vec<(String, String)>>,
+        resource_override: bool,
+        trust: TrustArm,
+        spawn_tenant: Option<uuid::Uuid>,
+    ) -> Result<TerminalInfo, super::session::TerminalSpawnError> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir

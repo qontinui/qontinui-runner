@@ -1,7 +1,8 @@
 //! Runner spawn-site guard — `runner_spawn_sites.txt` (plan
 //! `2026-09-13-drained-runner-never-reaches-idle`, Phase 3).
 //!
-//! Every non-test fn that reaches a session spawn — `TerminalManager::create`,
+//! Every non-test fn that reaches a session spawn — `TerminalManager::create`
+//! (or its typed-error twin `create_typed`),
 //! `create_tracked_terminal_session_backend`, `ClaudeSession::spawn`, or a
 //! declared helper wrapping one of them — must be listed with its class. An
 //! `autonomous` site must pass coord's device drain gate on the way in; an
@@ -217,13 +218,15 @@ fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
     };
     vec![
         // TerminalManager::create, by receiver shape (see the module's limits).
+        // `create_typed` is the same spawn with the seam's typed refusal kept
+        // (`create` is a thin wrapper over it), so it is the same primitive.
         fam(
             "TerminalManager::create",
             &[
-                r"\b[A-Za-z_]*terminal_manager[A-Za-z0-9_]*\s*\.\s*create\s*\(",
-                r"\b(?:tm|mgr|manager|create_manager)\s*\.\s*create\s*\(",
-                r"\bget_terminal_manager\s*\([^)]*\)\s*\.\s*create\s*\(",
-                r"TerminalManager\s*>+\s*\(\s*\)\s*(?:\.\s*inner\s*\(\s*\)\s*)?\.\s*create\s*\(",
+                r"\b[A-Za-z_]*terminal_manager[A-Za-z0-9_]*\s*\.\s*create(?:_typed)?\s*\(",
+                r"\b(?:tm|mgr|manager|create_manager)\s*\.\s*create(?:_typed)?\s*\(",
+                r"\bget_terminal_manager\s*\([^)]*\)\s*\.\s*create(?:_typed)?\s*\(",
+                r"TerminalManager\s*>+\s*\(\s*\)\s*(?:\.\s*inner\s*\(\s*\)\s*)?\.\s*create(?:_typed)?\s*\(",
             ],
         ),
         fam(

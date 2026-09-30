@@ -299,7 +299,9 @@ pub(crate) async fn launch(
     );
 
     let (mut child, _preconditions) =
-        crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
+        crate::agent_runtime::spawn_claude_child(
+            &workdir_s, &prompt, None, coord_mcp, &args, true, None,
+        )
             .await
             .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
     // The whole tree, addressable by one kill (see the module doc).
