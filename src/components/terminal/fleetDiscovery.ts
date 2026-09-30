@@ -789,33 +789,125 @@ export function hasNarrowingServerFilter(server: FleetServerFilter): boolean {
 }
 
 /**
+ * Name the scope a fleet read actually covered.
+ *
+ * coord's route is TENANT-SCOPED (`WHERE s.tenant_id = $1`,
+ * `qontinui-coord/crates/coord/src/session_fleet.rs`), and a device may be
+ * bound to several tenants — so "what this read covered" is one tenant, not
+ * "the fleet". Rendered as the tenant id because that is what the wire carries;
+ * the response has no slug.
+ *
+ * `null` when the envelope carried no tenant. coord's own type is
+ * `tenant_id: Uuid` — not `Option` — so that does not happen against today's
+ * coord. It is handled anyway because `fleet_sessions_list` hands the body back
+ * as an untyped `serde_json::Value`: nothing between coord's struct and this
+ * function checks the field, so `tenantId: string` is a DECLARATION rather than
+ * a runtime guarantee, and an empty string is as reachable as a missing key.
+ * Cheap to state honestly; a wrong tenant printed confidently is what this
+ * whole function exists to stop.
+ */
+function fleetReadScope(tenantId: string | null): string | null {
+  const t = (tenantId ?? "").trim();
+  return t.length > 0 ? t : null;
+}
+
+/**
  * What to say when coord's read itself returned no rows.
  *
  * Three different facts, never merged: coord was asked with narrowing filters
- * and answered zero; coord was asked WITHOUT them and answered zero (a real
- * empty fleet, whatever the text box holds); or the text box is set and is
- * being wrongly suspected, which is worth saying out loud since it is on screen
- * and looks like a cause.
+ * and answered zero; coord was asked WITHOUT them and answered zero (an empty
+ * read, whatever the text box holds); or the text box is set and is being
+ * wrongly suspected, which is worth saying out loud since it is on screen and
+ * looks like a cause.
+ *
+ * SCOPE, added after a live false report (2026-09-28): the unfiltered branch
+ * used to say "No open sessions anywhere on the fleet." while coord held 200
+ * sessions across three devices. The read had simply authenticated under the
+ * device's DEFAULT tenant binding and covered a different tenant. The message
+ * is about a filter set; the read is about a tenant; conflating them turned a
+ * correct empty page into a false claim about the whole fleet — and the
+ * response already carried the `tenantId` that made it checkable.
+ *
+ * TWO axes, because narrowing only one leaves the same defect a notch down:
+ *
+ *  - TENANT. `tenantId` is REQUIRED, not optional, so omitting it is a `tsc`
+ *    failure rather than a silently unscoped sentence. That is the mistake this
+ *    function exists to prevent, and the compiler is a stronger guard than any
+ *    test of the call site.
+ *
+ *  - COMPLETENESS. `readIsComplete` is whether coord POSITIVELY said this was
+ *    the last page. Only then is "no open sessions in tenant X" a claim about
+ *    the tenant; otherwise it is a claim about the rows read so far, and the
+ *    head says exactly that. Defaulting to `false` puts an omitting caller on
+ *    the hedged sentence, which is the right way round for a function whose
+ *    failure mode is overclaiming.
+ *
+ *    ⚠️ The hedged arm is DEFENSIVE, not live: through the only caller today it
+ *    is unreachable, and its tests are defence in depth rather than coverage of
+ *    an observable bug. An empty accumulation means the last page was empty,
+ *    and an empty page can carry no cursor — coord's `finish_page` truncates to
+ *    `limit >= 1` rows before minting one — so the walk is always on its last
+ *    page wherever this message renders. It is written anyway because the
+ *    function is exported and independently testable, and because the arm
+ *    becomes live the moment a second caller has a partial read.
+ *
+ * SENTENCE ORDER is part of the contract. Each trailing clause sits next to
+ * what it qualifies: the unnamed-tenant note directly after the sentence
+ * carrying the scope, and the completeness note last because it qualifies the
+ * whole claim. An earlier draft appended the tenant note at the end, where in
+ * the filtered branch "that tenant" bound to `an empty tenant` in the sentence
+ * before it rather than to the scope — the message said the opposite of what
+ * it meant, which is the defect class this function exists to remove.
+ *
+ * The head is SCOPED rather than qualified afterwards. Appending a caveat to an
+ * unqualified claim ("No open sessions in tenant X. coord has not confirmed
+ * this is the whole list.") asserts and then retracts, and a reader who stops
+ * at the full stop has been told something false.
+ *
+ * When the envelope named no tenant the scope is stated as UNKNOWN rather than
+ * dropped: a bare "No open sessions." is read against a panel titled Fleet, so
+ * the reader supplies the widest scope available and reconstructs the very
+ * claim this function stopped printing.
  */
 export function fleetEmptyReadMessage(
   server: FleetServerFilter,
   text: string,
+  tenantId: string | null,
+  readIsComplete = false,
 ): { message: string; offerClear: boolean } {
+  const scope = fleetReadScope(tenantId);
+  // A short noun, because it is interpolated into three different sentence
+  // shapes and into `where` below. It no longer has to avoid ending in a verb:
+  // the filtered branch was rewritten verb-early, so the scope trails the verb
+  // and is closed by a full stop instead of sitting between a subject and its
+  // own verb. That sentence shape is the constraint, not the noun — see the
+  // filtered branch.
+  const scopeNoun = scope === null ? "an unnamed tenant" : `tenant ${scope}`;
+  const where = readIsComplete
+    ? `in ${scopeNoun}`
+    : `in what has been read so far from ${scopeNoun}`;
+  const unknownNote =
+    scope === null ? " coord's response did not name the tenant this read covered." : "";
+  const partialTail = readIsComplete ? "" : " coord has not confirmed this is the whole list.";
+
   if (hasNarrowingServerFilter(server)) {
+    // Verb-early, so the scope attaches to the SESSIONS rather than to the
+    // filters, without the long-modifier garden path that noun-first produced.
     return {
-      message:
-        "No session matches these filters. This is what coord returned for them — not necessarily an empty fleet.",
+      message: `These filters matched no session ${where}.${unknownNote} This is what coord returned for them — not necessarily an empty tenant.${partialTail}`,
       offerClear: true,
     };
   }
   if (fleetSearchTerms(text).length > 0) {
     return {
-      message:
-        "No open sessions anywhere on the fleet. Your text filter is not sent to coord, so it is not what emptied this list.",
+      message: `No open sessions ${where}.${unknownNote} Your text filter is not sent to coord, so it is not what emptied this list.${partialTail}`,
       offerClear: true,
     };
   }
-  return { message: "No open sessions anywhere on the fleet.", offerClear: false };
+  return {
+    message: `No open sessions ${where}.${unknownNote}${partialTail}`,
+    offerClear: false,
+  };
 }
 
 /**

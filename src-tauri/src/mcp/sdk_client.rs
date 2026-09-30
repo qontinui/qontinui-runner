@@ -306,7 +306,7 @@ async fn try_ws_dispatch(
         }
     };
 
-    let entry = match state.app_registry.get(&app_id).await {
+    let entry = match state.app_registry.get_live(&app_id).await {
         Some(e) => e,
         None => return Ok(None),
     };
@@ -373,7 +373,7 @@ async fn dispatch_app_request_typed(
         let app_id = guard.active_connection().map(|c| c.app_info.app_id.clone());
         drop(guard);
         match app_id {
-            Some(id) => match state.app_registry.get(&id).await.map(|e| e.transport) {
+            Some(id) => match state.app_registry.get_live(&id).await.map(|e| e.transport) {
                 Some(AppTransport::Websocket) => ws_payload,
                 _ => http_body.unwrap_or(serde_json::Value::Null),
             },
@@ -426,7 +426,9 @@ async fn select_app_payload(
     ws_payload: serde_json::Value,
     http_body: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    match registry.get(app_id).await.map(|e| e.transport) {
+    // `get_live`: this picks the payload SHAPE by transport, and must agree
+    // with what `dispatch` (which reads `get_live`) will actually do.
+    match registry.get_live(app_id).await.map(|e| e.transport) {
         Some(AppTransport::Websocket) => ws_payload,
         _ => http_body.unwrap_or(serde_json::Value::Null),
     }

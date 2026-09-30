@@ -37,7 +37,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::*;
+use crate::mcp::app_registry::REGISTRATION_TTL_MS;
 use crate::mcp::origin_guard::{self, NormOrigin, OriginGuard};
+use crate::mcp::relay_binding::BINDING_TOMBSTONE_MS;
 
 const GOOD: &str = "https://good.example";
 const EVIL: &str = "https://evil.example";
@@ -100,10 +102,12 @@ async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Serve
 /// The relay routes at their production patterns, over `RelayState`.
 ///
 /// `/test-health` is the HARNESS's own counter read — deliberately NOT spelled
-/// `/health`, because the production `/health` handler serves no
-/// `uiBridgeBinding` block yet. Wiring `RelayBinding::health_json` into it, and
-/// asserting the counters against the REAL handler, is Phase 1's job; until
-/// then nothing here is evidence that an operator can see a counter.
+/// `/health`, because the production handler needs an `ApiState` (and so a
+/// `tauri::AppHandle`) no test can build. Phase 1 DID wire
+/// `RelayBinding::health_json` into the production `/health`; what pins that
+/// is `mcp_api::ui_bridge_binding_health_tests`, which asserts the block's
+/// render through `health_json` and its wiring against the handler's own
+/// source. Nothing HERE is evidence an operator can see a counter.
 fn relay_router(relay: RelayState) -> Router {
     use crate::mcp::app_discovery::{
         deregister_app, dispatch_to_app, list_registered_apps, register_app,
@@ -441,8 +445,9 @@ impl Server {
         self.relay.sdk_connection.lock().await.active_url.clone()
     }
 
-    /// A rule's counters, read from the HARNESS stub — see `relay_router`:
-    /// the production `/health` does not serve this block until Phase 1.
+    /// A rule's counters, read from the HARNESS stub — see `relay_router`.
+    /// The production `/health` serves the same block from the ONE shared
+    /// `RelayBinding`; `mcp_api::ui_bridge_binding_health_tests` pins that.
     async fn rule(&self, rule: &str) -> Value {
         let (_, body) = self.get("/test-health", agent()).await;
         body["uiBridgeBinding"]["rules"][rule].clone()
@@ -549,10 +554,9 @@ fn enforce_all() -> BindingConfig {
 // Acceptance tests — SECURE behaviour, red until their phase
 // ===========================================================================
 
-/// Vector 1. Phase 1 un-ignores this minus the `active_url` assertion, which
+/// Vector 1. Un-ignored in Phase 1, minus the `active_url` assertion, which
 /// is R6 and lands in Phase 3.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn hijack_live_ws_connection_refused() {
     let s = spawn(BindingConfig::default()).await;
     let (mut good, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -581,7 +585,14 @@ async fn hijack_live_ws_connection_refused() {
     assert_eq!(body["data"]["from"], "holder");
 
     assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
-    assert_eq!(s.active_url().await, active_before, "active_url moved (R6)");
+    // This is NOT the R6 shadow caveat: R6 is about a DIFFERENT appId
+    // becoming active (`new_app_id_does_not_steal_active_connection`), and
+    // this attacker registers the SAME id, which R1 refuses inside
+    // `registry.claim` — BEFORE `install_ws_sdk_connection` runs. So the
+    // assertion pins a real Phase 1 property: a refused claim touches no
+    // state, and the SDK install is ordered AFTER the claim. It is the only
+    // test that would catch someone hoisting the install above the claim.
+    assert_eq!(s.active_url().await, active_before, "active_url moved (R1)");
     let entry = s.registered("app").await.expect("holder entry");
     assert_eq!(entry["verifiedOrigin"], GOOD);
 }
@@ -723,7 +734,6 @@ mod forged_command_completion_refused {
     }
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn ws_other_connection() {
         let s = spawn(BindingConfig::default()).await;
         let (mut holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -754,7 +764,6 @@ mod forged_command_completion_refused {
 
 /// Vector 5.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn http_register_cannot_redirect_or_flip_transport() {
     let s = spawn(BindingConfig::default()).await;
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -772,7 +781,12 @@ async fn http_register_cannot_redirect_or_flip_transport() {
         status, 409,
         "an HTTP register overwrote a live WS holder: {body}"
     );
-    let entry = s.relay.app_registry.get("app").await.expect("holder entry");
+    let entry = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .expect("holder entry");
     assert_eq!(
         entry.transport,
         crate::mcp::app_registry::AppTransport::Websocket
@@ -793,20 +807,62 @@ async fn http_register_cannot_redirect_or_flip_transport() {
     assert_eq!(code(&body), Some("UIB_ORIGIN_MISMATCH"), "{body}");
 }
 
-/// R2.
+/// R2, in BOTH of the halves its name promises.
+///
+/// m7: the FOREIGN half alone stopped covering the displaced case once R1
+/// went to enforce. A foreign register for a held id is now refused before it
+/// ever registers, so `evil` below is not a displaced connection at all — it
+/// is a connection that never took the slot, and its teardown proves only
+/// that a non-holder cannot delete. The DISPLACED case needs a connection
+/// that really did take the slot and then lost it, which under R1 only a
+/// SAME-ORIGIN second registration can be (`same_origin_last_tab_wins`).
+/// Without that arm, `release`'s `conn_guard` — the thing that stops a
+/// displaced socket's teardown deleting the connection that displaced it —
+/// had no test at all on this path.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn displaced_or_foreign_teardown_cannot_delete_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered");
 
-    // A foreign connection for the same id that closes must take nothing with it.
+    // THE DISPLACED HALF. A second SAME-ORIGIN connection legitimately takes
+    // the slot (today's semantics, pinned by `same_origin_last_tab_wins`);
+    // the first is now displaced. When the DISPLACED one closes, its teardown
+    // must not delete the row the displacer owns.
+    let (displaced_winner, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered", "the same-origin retake: {ack}");
+    let winner_conn = ack["connId"].as_u64();
+    assert!(winner_conn.is_some(), "no connId in the ack: {ack}");
+    // `_holder` is the displaced socket now; close it and let its teardown run.
+    drop(_holder);
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        s.relay.app_registry.get_live("app").await.is_some(),
+        "a DISPLACED connection's teardown deleted the displacer's live entry"
+    );
+    assert_eq!(
+        conn_for(&s, "app").await,
+        winner_conn,
+        "the displaced socket's teardown stole the routing slot back"
+    );
+    // The displacer is still the one that can use it.
+    drop(displaced_winner);
+
+    // THE FOREIGN HALF. A foreign connection for the same id that closes must
+    // take nothing with it. (Under R1 enforce it never registers in the first
+    // place, which is itself the point — its teardown has nothing to unwind.)
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
     let (evil, _) = s.ws_register(Some(EVIL), "app").await;
     evil.close().await;
     tokio::time::sleep(QUIET).await;
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "a foreign connection's teardown deleted the holder's entry"
     );
 
@@ -814,21 +870,28 @@ async fn displaced_or_foreign_teardown_cannot_delete_holder() {
         .delete("/ui-bridge/apps/register/app", browser(EVIL))
         .await;
     assert!(
-        s.relay.app_registry.get("app").await.is_some(),
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
         "a foreign DELETE removed the holder's entry: {body}"
     );
 }
 
 /// R5.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
-async fn reload_race_tombstone() {
+async fn reload_race_reservation() {
     let s = spawn(BindingConfig::default()).await;
     let (holder, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered");
     holder.close().await;
+    // Wait for the teardown to RELEASE the id, not to delete the row: a
+    // released row is retained as its holder's reservation, so it stops being
+    // live (and leaves `list_live` and every routing reader) while staying
+    // present for `claim` to refuse against.
     let deadline = tokio::time::Instant::now() + PROMPT;
-    while s.relay.app_registry.get("app").await.is_some() {
+    while s.relay.app_registry.get_live("app").await.is_some() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "holder teardown never ran"
@@ -840,7 +903,7 @@ async fn reload_race_tombstone() {
     assert_eq!(
         ack_refusal_code(&reply),
         Some("UIB_REGISTRATION_HELD"),
-        "a foreign principal claimed a tombstoned id: {reply}"
+        "a foreign principal claimed a reserved id: {reply}"
     );
 
     let (_again, reply) = s.ws_register(Some(GOOD), "app").await;
@@ -848,6 +911,742 @@ async fn reload_race_tombstone() {
         reply["type"], "registered",
         "the same principal re-registers: {reply}"
     );
+}
+
+/// R5: a registration that ends by EXPIRY stays reserved for its holder.
+///
+/// `beforeunload` is not the only way a browser registration ends — a tab
+/// crash, an OOM kill, a sleep, or Chrome throttling a backgrounded tab's
+/// 10 s phone-home past the 30 s TTL all end it by expiry instead. Without a
+/// reservation, R1 turns that into a PERMANENT lockout: an attacker claims
+/// the freed id and renews it every 10 s, and the returning tab is refused
+/// forever — strictly worse than main, where it simply re-took its slot. That
+/// is the "one more way to be locked out" cost the plan's ranking used to
+/// REJECT option A.
+#[tokio::test]
+async fn an_expired_registration_stays_reserved_for_its_holder() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The tab is backgrounded / crashed / throttled: no DELETE, no
+    // phone-home, and the entry ages past its TTL.
+    //
+    // NO `sweep()` HERE, deliberately. The sweeper runs every 15 s while
+    // `list_live` drops the row from `/ui-bridge/apps/registered` the instant
+    // it expires — which is the attacker's signal — so in production the
+    // attacker arrives in the skew, before any sweep. Calling `sweep()` on the
+    // next line (which the first version of this test did) collapses that
+    // window to zero and tests an ordering production never has.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
+        "precondition: the row is expired but NOT yet swept — the real window"
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .list_live()
+            .await
+            .iter()
+            .all(|e| e.app.app_id != "app"),
+        "precondition: and it has already vanished from /ui-bridge/apps/registered"
+    );
+
+    // The attacker polling /ui-bridge/apps/registered must not get the id.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a swept id was claimable by a foreign page: {body}"
+    );
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+    // …and the victim coming back to the foreground is admitted, exactly as
+    // it would have been on main.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "the returning holder was locked out: {body}");
+    assert_eq!(
+        s.registered("app").await.expect("entry")["verifiedOrigin"],
+        GOOD
+    );
+}
+
+/// Finding 2 / R1: the LIVE routing slot is a holder signal in its own right.
+///
+/// A wrapper whose send task is parked inside `sink.send().await` never
+/// reaches the `heartbeat.tick()` arm that calls `touch`, so its registry row
+/// ages out and is swept while the socket is wide open. R5 then reserves the
+/// id for 60 s — but the socket can be parked for much longer than that, and
+/// once the tombstone lapses NOTHING but the routing slot knows the holder is
+/// still there. `register_with_id` would displace it.
+///
+/// The row is dropped through a seam rather than aged: a WebSocket client
+/// auto-pongs the 20 s ping and every inbound frame refreshes `last_seen_ms`,
+/// so ageing races that refresh and the test would silently fall back to
+/// exercising plain R1 against a still-live row. (It did — the first version
+/// of this test survived deleting the very check it names.)
+#[tokio::test]
+async fn a_live_ws_holder_is_not_displaceable_once_its_registry_row_is_gone() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let holder_conn = ack["connId"].as_u64().unwrap();
+
+    // The row is gone and its R5 reservation has lapsed, so the live routing
+    // slot is the ONLY thing left that knows who holds this id.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
+        "precondition: no registry row"
+    );
+
+    let (_evil, reply) = s.ws_register(Some(EVIL), "app").await;
+    assert_eq!(
+        ack_refusal_code(&reply),
+        Some("UIB_REGISTRATION_HELD"),
+        "a foreign socket displaced a LIVE holder the registry had forgotten: {reply}"
+    );
+    assert_eq!(
+        conn_for(&s, "app").await,
+        Some(holder_conn),
+        "the routing slot moved"
+    );
+}
+
+/// Finding 2's second path: an HTTP phone-home for an id a WebSocket holds
+/// flips the row to `Http` / `websocket_conn_id: None`. The socket's `touch`
+/// must keep working after that, or the row ages out under a live socket.
+#[tokio::test]
+async fn ws_touch_keeps_refreshing_a_row_an_http_phone_home_took_over() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_ws, ack) = s.ws_register(Some(GOOD), "shared").await;
+    assert_eq!(ack["type"], "registered");
+    let conn_id = ack["connId"].as_u64().unwrap();
+
+    // Same principal, so R1 admits it; the row is now an HTTP entry.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "shared", "appName": "Same origin", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        s.relay
+            .app_registry
+            .get_including_reservations("shared")
+            .await
+            .unwrap()
+            .transport,
+        crate::mcp::app_registry::AppTransport::Http
+    );
+
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("shared", REGISTRATION_TTL_MS - 1_000)
+            .await
+    );
+    let good_principal = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    assert!(
+        s.relay
+            .app_registry
+            .touch("shared", Some(conn_id), &good_principal)
+            .await,
+        "the conn guard is meaningless for an HTTP entry, and the holder's own          principal must not be blocked from refreshing it"
+    );
+    assert_eq!(s.relay.app_registry.sweep().await, 0);
+}
+
+/// H2 / R1-slot on the HTTP door: `POST /ui-bridge/apps/register` must not
+/// displace a live WebSocket holder either.
+///
+/// This is the EASIER route to the same takeover — no handshake — and the one
+/// that decides where agent commands go, because `AppDispatcher::dispatch`
+/// reads the REGISTRY: an attacker that gets an `Http` row with its own
+/// `baseUrl` receives every subsequent agent command and payload, even while
+/// the victim's socket is still open. The check therefore lives inside
+/// `AppRegistry::claim`, which both doors go through, rather than on the WS
+/// handshake path alone.
+#[tokio::test]
+async fn an_http_register_cannot_displace_a_live_ws_holder_the_registry_forgot() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let holder_conn = ack["connId"].as_u64().unwrap();
+
+    // The row is gone and no reservation survives it, so the live routing
+    // slot is the only thing that still knows who holds this id.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    assert!(s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .is_none());
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Redirect", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "an HTTP register took the dispatch target from a live WS holder: {body}"
+    );
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
+        "the refused claim must have written nothing"
+    );
+    assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
+}
+
+/// M1: an attacker holding an open socket on an id it first-claimed must not
+/// refresh the VICTIM's row once the victim re-registers that id over HTTP.
+/// First-claim squatting of an unheld id is an accepted non-goal; keeping the
+/// squatted row alive against its real owner is not.
+#[tokio::test]
+async fn a_foreign_socket_cannot_refresh_an_http_row_it_does_not_hold() {
+    let s = spawn(BindingConfig::default()).await;
+    // EVIL squats the unheld id over WS and keeps the socket open.
+    let (_evil, ack) = s.ws_register(Some(EVIL), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let evil_conn = ack["connId"].as_u64().unwrap();
+
+    // The squat lapses and GOOD takes the id over HTTP.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Owner", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "keepAliveSecs": 30 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let evil_principal = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(EVIL).unwrap(),
+    };
+    assert!(
+        !s.relay
+            .app_registry
+            .touch("app", Some(evil_conn), &evil_principal)
+            .await,
+        "a foreign socket refreshed an HTTP row it does not hold"
+    );
+}
+
+/// H-1: the operator-trust carve-out on the ROW reservation.
+///
+/// `tombstone_until` has always exempted operator trust — an agent's id is
+/// free the moment its registration ends. When the reservation moved onto the
+/// row, that carve-out had to move with it, and did not. An agent registering
+/// with `keepAliveSecs: 3600` and then stopping would otherwise lock a
+/// legitimate browser page out of the id for 60 s past a ONE-HOUR TTL, and
+/// only when the sweeper had not yet run — the same timing dependence the row
+/// reservation exists to delete, sign flipped.
+///
+/// `agent_flow_unchanged` never covered this: it covers operator trust
+/// DISPLACING, never an expired operator-trust row being re-taken.
+#[tokio::test]
+async fn an_expired_operator_trust_row_does_not_reserve_the_id() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Synthetic", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535",
+                    "keepAliveSecs": 3600 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Past its (one hour) TTL, and deliberately NOT swept.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", 3_600_000 + 1_000)
+            .await
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
+        "precondition: the row is retained, which is what makes it a reservation"
+    );
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Page", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "an expired operator-trust row reserved the id against a browser: {body}"
+    );
+}
+
+/// H-1's other half: the row reservation must hold for a BROWSER holder with
+/// no sweep at all, which is the window the attacker actually polls.
+#[tokio::test]
+async fn an_expired_browser_row_reserves_the_id_with_no_sweep() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+
+    // No sweep. The row is retained through its reservation, so the id is
+    // held even though it has already left /ui-bridge/apps/registered.
+    assert!(s
+        .relay
+        .app_registry
+        .list_live()
+        .await
+        .iter()
+        .all(|e| e.app.app_id != "app"));
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+    // Once the reservation itself lapses, the id is free again — the accepted
+    // squatting non-goal, not a permanent lock.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", BINDING_TOMBSTONE_MS + 1_000)
+            .await
+    );
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 200, "the reservation never lapsed: {body}");
+}
+
+/// The structural fix itself: `sweep` retains a row through its RESERVATION,
+/// not merely its TTL, so a sweep landing inside that window leaves the id
+/// held — and writes no tombstone, because the ROW is the reservation.
+///
+/// This is what makes R5 independent of WHEN the sweeper runs. The previous
+/// shape (sweep at the TTL, then write a tombstone) left a gap the sweeper's
+/// 15 s tick could not cover, while `list_live` had already dropped the row
+/// from `/ui-bridge/apps/registered` — the attacker's signal — so polling at
+/// 1 Hz won it roughly 14 times in 15.
+#[tokio::test]
+async fn a_sweep_inside_the_reservation_window_leaves_the_id_held() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+
+    // The sweeper runs, inside the reservation window.
+    assert_eq!(
+        s.relay.app_registry.sweep().await,
+        0,
+        "a row inside its reservation window must be retained"
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
+        "the row IS the reservation"
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_some(),
+        "the row IS the reservation — nothing is written anywhere else"
+    );
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 409, "a swept row freed the id: {body}");
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+}
+
+/// H-1 / H-2: routing must NOT follow a row that is retained only as a
+/// reservation. Retention answers "who holds this id", not "is this app
+/// reachable", and conflating them would have extended the window in which a
+/// dispatch targets an app that stopped heartbeating.
+#[tokio::test]
+async fn a_reserved_but_expired_row_is_not_dispatchable() {
+    let s = spawn(BindingConfig::default()).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async { Json(json!({ "reached": true })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "stub", "appName": "Stub", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{stub_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = s.app_dispatch("stub").await.unwrap();
+    assert_eq!(status, 200, "precondition: a fresh row dispatches: {body}");
+
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("stub", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("stub")
+            .await
+            .is_some(),
+        "the row is retained as a reservation"
+    );
+    let (status, body) = s.app_dispatch("stub").await.unwrap();
+    assert_ne!(
+        status, 200,
+        "a reservation-only row was still routed to: {body}"
+    );
+}
+
+/// The structural completion: an EXPLICIT release keeps its reservation on the
+/// row, exactly like an expiry, so a well-behaved SDK is not punished for
+/// behaving well.
+///
+/// The shape this replaces kept expiry on the row but put an explicit release
+/// into a globally-bounded side map that unrelated principals could displace.
+/// That inverted the incentive — an app that sent its `beforeunload` DELETE
+/// moved its reservation from the unforgeable row into an attackable map and
+/// ended up LESS protected than an app that simply vanished. Here the two
+/// endings are pinned to behave identically.
+#[tokio::test]
+async fn an_explicit_release_reserves_the_id_exactly_like_an_expiry() {
+    for release_explicitly in [true, false] {
+        let s = spawn(BindingConfig::default()).await;
+        let (status, _) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(GOOD),
+                json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                        "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        if release_explicitly {
+            // The well-behaved path: `beforeunload` DELETE.
+            let (status, body) = s
+                .delete("/ui-bridge/apps/register/app", browser(GOOD))
+                .await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["data"], true);
+        } else {
+            // The vanish path: stop heartbeating.
+            assert!(
+                s.relay
+                    .app_registry
+                    .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+                    .await
+            );
+        }
+
+        // Either way it is gone from everything that routes or lists…
+        assert!(
+            s.relay
+                .app_registry
+                .list_live()
+                .await
+                .iter()
+                .all(|e| e.app.app_id != "app"),
+            "release_explicitly={release_explicitly}: still listed"
+        );
+        assert!(
+            s.relay.app_registry.get_live("app").await.is_none(),
+            "release_explicitly={release_explicitly}: still routable"
+        );
+        // …and either way the id is still RESERVED for its holder.
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(EVIL),
+                json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                        "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+            )
+            .await;
+        assert_eq!(
+            status, 409,
+            "release_explicitly={release_explicitly}: the id was not reserved: {body}"
+        );
+        assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+        // The holder itself gets it back at once.
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(GOOD),
+                json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                        "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "release_explicitly={release_explicitly}: holder locked out: {body}"
+        );
+    }
+}
+
+/// Critical 1, structurally: a reservation cannot be displaced by unrelated
+/// principals, however many of them there are and whatever their origins sort
+/// like.
+///
+/// The rule this replaces ranked candidates inside one globally-bounded map,
+/// and every ranking tried was steerable. `share = MAX / buckets` is integer
+/// division, so at ≥1024 buckets the share is 0 and "never evict at or under
+/// your share" became vacuous in exactly the saturated regime the ceiling
+/// existed for; and ties fell to the lexicographically greatest origin, which
+/// an attacker simply picks (`http://` sorts below every `https://`).
+///
+/// The fixture below is the one that exposed it: the earlier test used
+/// `s{i}.evil.example` and passed only because `'g' < 's'`. Here the attacker
+/// origins sort BOTH ABOVE AND BELOW the victim's, and `http://` is included,
+/// because the reservation no longer depends on any comparison at all.
+#[tokio::test]
+async fn a_reservation_is_not_displaceable_by_other_principals() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "victim-app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = s
+        .delete("/ui-bridge/apps/register/victim-app", browser(GOOD))
+        .await;
+    assert_eq!(status, 200);
+
+    // Sorting below the victim (`a…`, and `http://` below every `https://`),
+    // above it (`z…`), and at the old fixture's value (`s…`).
+    for (n, origin) in [
+        "https://a0.evil.example",
+        "https://a1.evil.example",
+        "http://a2.evil.example",
+        "https://s0.evil.example",
+        "https://z0.evil.example",
+        "http://localhost:3001",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (status, body) = s
+            .post(
+                "/ui-bridge/apps/register",
+                browser(origin),
+                json!({ "appId": format!("squat-{n}"), "appName": "S", "appType": "web",
+                        "transport": "http", "baseUrl": origin, "origin": origin }),
+            )
+            .await;
+        assert_eq!(status, 200, "{origin}: {body}");
+        let (status, _) = s
+            .delete(
+                &format!("/ui-bridge/apps/register/squat-{n}"),
+                browser(origin),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    // The victim's reservation is untouched by every one of them.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "victim-app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "the victim's reservation was displaced: {body}"
+    );
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "victim-app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "the holder lost its own reservation: {body}");
+}
+
+/// Operator trust frees its id the moment it releases it — the same carve-out
+/// the expiry arm has, on the release path.
+#[tokio::test]
+async fn an_operator_trust_release_frees_the_id_at_once() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Synthetic", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = s.delete("/ui-bridge/apps/register/app", agent()).await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay
+            .app_registry
+            .get_including_reservations("app")
+            .await
+            .is_none(),
+        "an agent's released row must not linger as a reservation"
+    );
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Page", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Major 4: the ceilings bound BYTES as well as rows.
+#[tokio::test]
+async fn an_oversized_app_id_is_refused_at_the_register_door() {
+    let s = spawn(BindingConfig::default()).await;
+    let huge = "x".repeat(crate::mcp::app_registry::MAX_APP_ID_LEN + 1);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": huge, "appName": "Big", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 400, "an unbounded appId was accepted: {body}");
+
+    let ok = "x".repeat(crate::mcp::app_registry::MAX_APP_ID_LEN);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": ok, "appName": "Big", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535" }),
+        )
+        .await;
+    assert_eq!(status, 200, "the cap is off by one: {body}");
 }
 
 /// R7.
@@ -882,7 +1681,6 @@ async fn sdk_switch_refused_to_foreign() {
 
 /// R1 is checked and written under one lock.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn concurrent_claims_single_winner() {
     let s = Arc::new(spawn(BindingConfig::default()).await);
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -915,7 +1713,6 @@ async fn concurrent_claims_single_winner() {
 
 /// R2's liveness arm.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn displaced_conn_touch_does_not_refresh_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (mut displaced, _) = s.ws_register(Some(GOOD), "app").await;
@@ -924,13 +1721,25 @@ async fn displaced_conn_touch_does_not_refresh_holder() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(s.relay.app_registry.test_age_entry("app", 20_000).await);
-    let aged = s.relay.app_registry.get("app").await.unwrap().last_seen_ms;
+    let aged = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .unwrap()
+        .last_seen_ms;
 
     displaced
         .send(json!({ "type": "changeEvent", "event": {} }))
         .await;
     tokio::time::sleep(QUIET).await;
-    let after = s.relay.app_registry.get("app").await.unwrap().last_seen_ms;
+    let after = s
+        .relay
+        .app_registry
+        .get_including_reservations("app")
+        .await
+        .unwrap()
+        .last_seen_ms;
     assert_eq!(
         after, aged,
         "a displaced socket's frame refreshed the holder's entry"
@@ -939,7 +1748,6 @@ async fn displaced_conn_touch_does_not_refresh_holder() {
 
 /// R4's transport arm.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn browser_http_register_cannot_declare_websocket() {
     let s = spawn(BindingConfig::default()).await;
     let (status, body) = s
@@ -1224,7 +2032,12 @@ async fn agent_flow_unchanged() {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        s.relay.app_registry.get("shared").await.unwrap().transport,
+        s.relay
+            .app_registry
+            .get_including_reservations("shared")
+            .await
+            .unwrap()
+            .transport,
         crate::mcp::app_registry::AppTransport::Http
     );
 
@@ -1446,7 +2259,12 @@ async fn kill_switch_off_restores_today() {
     let (_, _) = s
         .delete("/ui-bridge/apps/register/other", browser(EVIL))
         .await;
-    assert!(s.relay.app_registry.get("other").await.is_none());
+    assert!(s
+        .relay
+        .app_registry
+        .get_including_reservations("other")
+        .await
+        .is_none());
 }
 
 #[test]
@@ -1478,6 +2296,66 @@ fn binding_config_from_values_parses() {
     assert_eq!(c.active_binding, BindingMode::Enforce);
     let junk = BindingConfig::from_values(Some("yes"), Some(""));
     assert_eq!(junk, BindingConfig::default());
+}
+
+/// `Principal::same` is the ONE comparison every rule runs, and three of its
+/// arms are not reachable from the end-to-end tests above: the `Opaque`
+/// no-principal arm, the tab-key digest arm (Phase 2 consults it), and a
+/// loopback alias on a DIFFERENT port or scheme, which must NOT fold.
+#[test]
+fn principal_same_folds_loopback_aliases_and_nothing_else() {
+    let b = |o: &str| Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(o).expect("a parseable origin"),
+    };
+    let operator = Principal::OperatorTrust {
+        class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+    };
+
+    // The scheme's default port is made explicit on both sides.
+    assert!(b("https://a.example").same(&b("https://a.example:443")));
+    assert!(!b("https://a.example").same(&b("https://b.example")));
+    assert!(!b("https://a.example").same(&b("http://a.example")));
+
+    // Loopback aliases fold at the SAME scheme and port, and only there.
+    for other in ["http://127.0.0.1:9875", "http://[::1]:9875"] {
+        assert!(
+            b("http://localhost:9875").same(&b(other)),
+            "loopback alias {other} must be one principal"
+        );
+    }
+    assert!(!b("http://localhost:9875").same(&b("http://localhost:3001")));
+    assert!(!b("http://localhost:9875").same(&b("https://localhost:9875")));
+
+    // Operator trust is one principal, and is not any browser.
+    assert!(operator.same(&Principal::OperatorTrust {
+        class: crate::mcp::origin_guard::OriginClass::FirstParty,
+    }));
+    assert!(!operator.same(&b("https://a.example")));
+    // …but it may displace anything, which is the R1/R2 exemption.
+    assert!(operator.may_displace(&b("https://a.example")));
+    assert!(!b("https://a.example").may_displace(&operator));
+
+    // A key binds by digest alone, whatever the origin.
+    let k1 = Principal::TabKey {
+        digest: key_digest("K"),
+    };
+    assert!(k1.same(&Principal::TabKey {
+        digest: key_digest("K")
+    }));
+    assert!(!k1.same(&Principal::TabKey {
+        digest: key_digest("other")
+    }));
+    assert!(!k1.same(&b("https://a.example")));
+
+    // An opaque request has NO principal: it matches nothing, not even
+    // another opaque one. Two attacker pages with no origin must not share a
+    // claim.
+    let opaque = Principal::Opaque {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+    };
+    assert!(!opaque.same(&opaque));
+    assert!(!opaque.may_displace(&b("https://a.example")));
 }
 
 #[test]

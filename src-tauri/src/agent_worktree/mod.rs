@@ -72,6 +72,7 @@ pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
 pub mod session_env;
+pub(crate) mod sibling_store;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**
 /// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.
@@ -1490,6 +1491,15 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
 /// re-checks the canonical tree live and refuses a dirty one. A future caller
 /// that does NOT take that lease must not reuse this body as-is — give it a
 /// parameter and send `false` there. An older coord ignores the unknown key.
+///
+/// `materializes_sibling_store` is ALWAYS `true` for the same reason: the same
+/// sole caller materialises `.siblings/<repo>@<sha>/` for every declared
+/// sibling (see [`sibling_store`]) and writes coord's `cargo_config` `paths`
+/// override only once every entry it names exists. Coord emits that override
+/// ONLY to a caller declaring this (plan
+/// `2026-09-28-shared-cargo-target-holds-one-build-copy-per-sibling-checkout-path`
+/// Phase 2), because an override naming a store nobody filled fails every build
+/// in the allocation. An older coord ignores the unknown key.
 fn allocate_request_body(
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
@@ -1505,6 +1515,7 @@ fn allocate_request_body(
         "declared_overlap_paths": declared_overlap_paths,
         "agent_session_id": agent_session_id,
         "accepts_shared_branch": true,
+        "materializes_sibling_store": true,
     });
     if let Some(t) = tenant.declared_tenant() {
         body["tenant_id"] = serde_json::json!(t);
@@ -1909,6 +1920,11 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
+    // The declared build siblings this allocation materialised, captured before
+    // `planned` is consumed: the sibling store below is cut from the same
+    // checkout at the same coord-pinned sha.
+    let sibling_sources = sibling_store_sources(&planned);
+
     let mut materialized: Vec<MaterializedWorktree> = Vec::with_capacity(planned.len());
     for row in planned {
         // Concurrent sessions of one repo now materialize side by side, so the
@@ -1968,21 +1984,47 @@ pub async fn allocate_and_materialize_with_claim(
             }
         };
 
-        if let Some(parent) = std::path::Path::new(&write_path).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!(
-                    "phase5 cargo override: mkdir {} failed: {e}",
-                    parent.display()
-                );
+        // Plan 2026-09-28 Phase 2: coord's body is a relative `paths` override
+        // into the SHA-keyed sibling store. Fill the store first, then write the
+        // config only when every entry it names exists — an override naming a
+        // missing directory fails every build in the allocation, while an
+        // unwritten one only costs the old per-allocation rebuild.
+        // Off the async worker: `git archive` + unpack of a sibling is blocking
+        // I/O measured in seconds.
+        if let Some(worktree_root) = local_agent_root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .map(Path::to_path_buf)
+        {
+            let sources = sibling_sources;
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || fill_sibling_store(&worktree_root, &sources))
+                    .await
+            {
+                warn!("sibling store: fill task failed: {e}");
             }
         }
-        match std::fs::write(&write_path, &write_contents) {
-            Ok(()) => info!(
-                "phase5 cargo override written (re-rooted): {} ({} bytes)",
-                write_path,
-                write_contents.len()
-            ),
-            Err(e) => warn!("phase5 cargo override: write {write_path} failed: {e}"),
+        if cargo_override_is_backed(&write_path, &write_contents) {
+            if let Some(parent) = std::path::Path::new(&write_path).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    warn!(
+                        "phase5 cargo override: mkdir {} failed: {e}",
+                        parent.display()
+                    );
+                }
+            }
+            match std::fs::write(&write_path, &write_contents) {
+                Ok(()) => info!(
+                    "phase5 cargo override written (re-rooted): {} ({} bytes)",
+                    write_path,
+                    write_contents.len()
+                ),
+                Err(e) => warn!("phase5 cargo override: write {write_path} failed: {e}"),
+            }
+            // A store reaper may have taken an entry between the gate and the
+            // write. A config naming a vanished entry fails every build, so
+            // take it back rather than leave it.
+            withdraw_override_if_unbacked(&write_path, &write_contents);
         }
     }
 
@@ -2136,6 +2178,90 @@ fn plan_worktree_rows(
         });
     }
     Ok(planned)
+}
+
+/// One declared build sibling to cut into the SHA-keyed store: `(bare repo
+/// name, the checkout its worktree was cut from, coord's pinned sha)`.
+type SiblingSource = (String, PathBuf, String);
+
+/// The `declared_sibling` rows of a planned allocation, as store sources. Rows
+/// [`plan_worktree_rows`] skipped (no checkout on this device) are simply absent,
+/// so their store entry is never filled and the override gate below refuses.
+fn sibling_store_sources(planned: &[PlannedWorktreeRow]) -> Vec<SiblingSource> {
+    planned
+        .iter()
+        .filter(|p| p.row.origin.as_deref() == Some("declared_sibling"))
+        .filter_map(|p| {
+            let name = canonical_paths::canonical_segment(&p.row.repo).ok()?;
+            Some((name, p.canonical.clone(), p.row.parent_sha.clone()))
+        })
+        .collect()
+}
+
+/// Materialise `<worktree_root>/.siblings/<repo>@<sha>/` for every source.
+/// Never fails the allocation: a failure is logged, and the override gate then
+/// declines to write a config that would name the missing entry.
+fn fill_sibling_store(worktree_root: &Path, sources: &[SiblingSource]) {
+    let store = sibling_store::store_root(worktree_root);
+    for (name, canonical, sha) in sources {
+        if let Err(e) = sibling_store::materialize(&store, canonical, name, sha) {
+            warn!("sibling store: could not materialise {name}@{sha}: {e}");
+        }
+    }
+}
+
+/// Post-write re-check: remove the config just written when an entry it names
+/// has vanished since [`cargo_override_is_backed`] passed. Returns whether it
+/// was removed.
+fn withdraw_override_if_unbacked(write_path: &str, contents: &str) -> bool {
+    if !Path::new(write_path).exists() || cargo_override_is_backed(write_path, contents) {
+        return false;
+    }
+    match std::fs::remove_file(write_path) {
+        Ok(()) => {
+            warn!("phase5 cargo override withdrawn: a sibling store entry vanished after {write_path} was written");
+            true
+        }
+        Err(e) => {
+            warn!("phase5 cargo override: {write_path} names a vanished store entry and could not be removed: {e}");
+            false
+        }
+    }
+}
+
+/// The render gate for coord's cargo override: `true` only when every `paths`
+/// entry in `contents` exists, resolved against the directory that holds
+/// `.cargo/` (the grandparent of `write_path`), exactly as cargo resolves it.
+fn cargo_override_is_backed(write_path: &str, contents: &str) -> bool {
+    let Some(agent_root) = Path::new(write_path).parent().and_then(Path::parent) else {
+        warn!("phase5 cargo override: {write_path} has no agent root — not written");
+        return false;
+    };
+    match sibling_store::missing_override_entries(agent_root, contents) {
+        Ok(missing) if missing.is_empty() => true,
+        Ok(missing) => {
+            warn!(
+                "phase5 cargo override NOT written: {} `paths` entr{} missing ({}) — builds \
+                 in this allocation resolve the per-allocation sibling instead",
+                missing.len(),
+                if missing.len() == 1 {
+                    "y is"
+                } else {
+                    "ies are"
+                },
+                missing
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            false
+        }
+        Err(e) => {
+            warn!("phase5 cargo override NOT written: {e}");
+            false
+        }
+    }
 }
 
 /// The in-process lock serializing worktree materialization against one shared
@@ -2983,6 +3109,9 @@ mod tests {
         // The lease-holding materializer is the only production caller, so it
         // opts in to coord's `shared_branch` placement (qontinui-coord #2059).
         assert_eq!(body["accepts_shared_branch"], true);
+        // Plan 2026-09-28 Phase 2 — coord emits the `.siblings` `paths`
+        // override only to a caller that declares it fills the store.
+        assert_eq!(body["materializes_sibling_store"], true);
 
         // Session absent → the key is still present and explicitly null.
         let body2 = allocate_request_body(
@@ -3218,6 +3347,93 @@ mod tests {
             .collect();
         // A sibling is never switched; a row from an older coord (no origin) is.
         assert_eq!(placed, vec!["qontinui-runner", "qontinui-web"]);
+    }
+
+    #[test]
+    fn reroot_leaves_a_relative_sibling_store_override_untouched() {
+        // Plan 2026-09-28 Phase 2 contract: the body is relative to the agent
+        // root, so only the file location moves — never the `paths` entries.
+        let body = "paths = [\"../.siblings/qontinui-schemas@0123456789abcdef0123456789abcdef01234567/rust\"]\n";
+        let (path, contents) = reroot_cargo_override(
+            "/srv/coord/agent-worktrees/agent-a/.cargo/config.toml",
+            body,
+            Path::new("/home/u/agent-worktrees/agent-a"),
+            "agent-a",
+        );
+        assert_eq!(path, "/home/u/agent-worktrees/agent-a/.cargo/config.toml");
+        assert_eq!(contents, body);
+    }
+
+    #[test]
+    fn the_override_is_written_only_when_every_store_entry_exists() {
+        let ws = tempfile::tempdir().unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let agent_root = ws.path().join("agent-a");
+        let write_path = agent_root.join(".cargo").join("config.toml");
+        let write_path = write_path.to_string_lossy().to_string();
+        let body = format!("paths = [\"../.siblings/qontinui-schemas@{sha}/rust\"]\n");
+        // The agent root exists in the real flow (the worktrees live in it), and
+        // the OS resolves `agent-a/..` only through an existing `agent-a`.
+        std::fs::create_dir_all(&agent_root).unwrap();
+
+        assert!(!cargo_override_is_backed(&write_path, &body));
+        let crate_dir = ws
+            .path()
+            .join(".siblings")
+            .join(format!("qontinui-schemas@{sha}"))
+            .join("rust");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(
+            crate_dir
+                .parent()
+                .unwrap()
+                .join(sibling_store::COMPLETE_MARKER),
+            "",
+        )
+        .unwrap();
+        // A directory with no Cargo.toml is not a crate cargo can use.
+        assert!(!cargo_override_is_backed(&write_path, &body));
+        std::fs::write(crate_dir.join("Cargo.toml"), "").unwrap();
+        assert!(cargo_override_is_backed(&write_path, &body));
+        assert!(!cargo_override_is_backed(&write_path, "paths = ["));
+
+        // Written while backed, then the entry is reaped → the config is taken back.
+        std::fs::create_dir_all(agent_root.join(".cargo")).unwrap();
+        std::fs::write(&write_path, &body).unwrap();
+        assert!(!withdraw_override_if_unbacked(&write_path, &body));
+        assert!(Path::new(&write_path).exists());
+        std::fs::remove_dir_all(ws.path().join(".siblings")).unwrap();
+        assert!(withdraw_override_if_unbacked(&write_path, &body));
+        assert!(!Path::new(&write_path).exists());
+    }
+
+    #[test]
+    fn only_planned_declared_siblings_become_store_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = dir.path().join("qontinui-runner");
+        let schemas = dir.path().join("qontinui-schemas");
+        let canonical: std::collections::HashMap<String, PathBuf> =
+            [("qontinui-runner".to_string(), runner.clone())].into();
+        let rows = allocated_rows(serde_json::json!([
+            {"repo": "qontinui-runner", "branch": "b", "parent_sha": "r",
+             "worktree_path": "w", "status": "allocated", "origin": "requested"},
+            {"repo": "qontinui/qontinui-schemas", "branch": "b", "parent_sha": "s",
+             "worktree_path": "w", "status": "allocated", "origin": "declared_sibling"},
+            {"repo": "qontinui-web", "branch": "b", "parent_sha": "w",
+             "worktree_path": "w", "status": "allocated", "origin": "declared_sibling"}
+        ]));
+        let planned = plan_worktree_rows(rows, &canonical, "agent-a", |repo| {
+            (repo == "qontinui/qontinui-schemas").then(|| schemas.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            sibling_store_sources(&planned),
+            vec![(
+                "qontinui-schemas".to_string(),
+                schemas.clone(),
+                "s".to_string()
+            )]
+        );
     }
 
     fn allocated_rows(json: serde_json::Value) -> Vec<CoordAllocatedWorktree> {
