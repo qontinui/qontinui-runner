@@ -19,6 +19,7 @@ import { useHotField } from "./useTerminalHotStore";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 import { tabsForIds } from "./useZoneLayout";
 import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
+import { isNeedsInputState } from "./agentTruth";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -60,13 +61,14 @@ interface ZoneControlPanelProps {
   onCreateTerminal?: () => void;
 }
 
-type SessionState = "idle" | "working" | "needs-input" | "completed" | "error";
+type SessionState = "unknown" | "idle" | "working" | "needs-input" | "completed" | "error";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const STATE_COLORS: Record<SessionState, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -75,6 +77,7 @@ const STATE_COLORS: Record<SessionState, string> = {
 };
 
 const STATE_LABELS: Record<SessionState, string> = {
+  unknown: "Unknown",
   idle: "Idle",
   working: "Working",
   "needs-input": "Input",
@@ -82,7 +85,14 @@ const STATE_LABELS: Record<SessionState, string> = {
   error: "Error",
 };
 
-const ALL_STATES: SessionState[] = ["idle", "working", "needs-input", "completed", "error"];
+const ALL_STATES: SessionState[] = [
+  "unknown",
+  "idle",
+  "working",
+  "needs-input",
+  "completed",
+  "error",
+];
 
 const BASE_WORKSPACES_STORAGE_KEY = "qontinui-workspaces";
 const MAX_WORKSPACES = 10;
@@ -112,15 +122,16 @@ function truncate(text: string, max: number): string {
 
 function getState(raw: string | undefined): SessionState {
   if (
+    raw === "unknown" ||
     raw === "idle" ||
     raw === "working" ||
-    raw === "needs-input" ||
+    isNeedsInputState(raw) ||
     raw === "completed" ||
     raw === "error"
   ) {
-    return raw;
+    return raw as SessionState;
   }
-  return "idle";
+  return "unknown";
 }
 
 function loadWorkspaces(pageId: string = "default"): SavedWorkspace[] {
@@ -939,7 +950,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
     for (let i = 0; i < zoneCount; i++) {
       const tabId = assignments[i];
       const tab = tabId ? tabMap.get(tabId) : undefined;
-      const state = tabId ? getState(sessionStates[tabId]) : "idle";
+      const state = tabId ? getState(sessionStates[tabId]) : "unknown";
       const label = zoneLabels[i] ?? "";
       const notes = zoneNotes[i] ?? "";
       const labelColor = label ? labelColorMap[label] : undefined;
@@ -975,6 +986,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   // State counts for filter bar
   const stateCounts = useMemo(() => {
     const counts: Record<SessionState, number> = {
+      unknown: 0,
       idle: 0,
       working: 0,
       "needs-input": 0,

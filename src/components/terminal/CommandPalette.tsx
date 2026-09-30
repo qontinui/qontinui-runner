@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { Search } from "lucide-react";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
+import { isAuthoritativePermissionAsk, isNeedsInputState, type AgentTruthEntry } from "./agentTruth";
 import type { TerminalTab } from "./useTerminalManager";
 import { fuzzyScore } from "./commands/fuzzy";
 import { useDisplayTitleResolver } from "./displayTitle";
@@ -57,6 +58,12 @@ interface CommandPaletteProps {
   tabs: TerminalTab[];
   assignments: ZoneAssignments;
   sessionStates: Record<string, SessionState>;
+  /**
+   * Runner verdicts. A per-zone approve row on a pane whose needs-input is NOT
+   * an `isAuthoritativePermissionAsk` stays available (the operator is choosing
+   * that pane) but is labelled "inferred".
+   */
+  agentVerdicts?: Record<string, AgentTruthEntry>;
   focusedZone: number;
   onFocusZone: (zoneIndex: number) => void;
   onApproveTab: (tabId: string) => void;
@@ -87,6 +94,7 @@ export function CommandPalette({
   tabs,
   assignments,
   sessionStates,
+  agentVerdicts,
   focusedZone,
   onFocusZone,
   onApproveTab,
@@ -147,7 +155,7 @@ export function CommandPalette({
     for (let z = 0; z < zoneCount; z++) {
       const tabId = assignments[z];
       const tab = tabs.find((t) => t.id === tabId);
-      const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
+      const state = tabId ? (sessionStates[tabId] ?? "unknown") : "unknown";
       const label = zoneLabels[z];
       const name = tab ? resolveTitle(tab) : `Zone ${z + 1}`;
       const isPinned = pinnedZones.has(z);
@@ -161,17 +169,20 @@ export function CommandPalette({
         action: () => onFocusZone(z),
       });
 
-      if (state === "needs-input" && tabId) {
+      if (isNeedsInputState(state) && tabId) {
+        const inferred = isAuthoritativePermissionAsk(agentVerdicts?.[tabId]?.verdict)
+          ? ""
+          : " (inferred)";
         list.push({
           id: `approve-${z}`,
-          label: `Approve zone ${z + 1}: ${name}`,
+          label: `Approve zone ${z + 1}: ${name}${inferred}`,
           category: "Actions",
           priority: 0,
           action: () => onApproveTab(tabId),
         });
         list.push({
           id: `reject-${z}`,
-          label: `Reject zone ${z + 1}: ${name}`,
+          label: `Reject zone ${z + 1}: ${name}${inferred}`,
           category: "Actions",
           priority: 1,
           action: () => onRejectTab(tabId),
@@ -235,7 +246,7 @@ export function CommandPalette({
     }
 
     // Global actions
-    const needsInputCount = Object.values(sessionStates).filter((s) => s === "needs-input").length;
+    const needsInputCount = Object.values(sessionStates).filter((s) => isNeedsInputState(s)).length;
     // Phase 7 dedupe — only render the hard-coded `approve-all` row
     // when the registry hasn't already projected its equivalent. This
     // is the one "delete the duplicated construction" beat from the
@@ -367,6 +378,7 @@ export function CommandPalette({
     tabs,
     assignments,
     sessionStates,
+    agentVerdicts,
     focusedZone,
     zoneCount,
     pinnedZones,

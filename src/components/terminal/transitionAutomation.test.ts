@@ -8,6 +8,19 @@ import {
   type TransitionTab,
 } from "./transitionAutomation";
 import type { SessionState } from "./useZoneLayout";
+import type { AgentTruthEntry, Verdict } from "./agentTruth";
+
+/** A hook-reported permission ask — the only verdict auto-approve acts on. */
+const HOOK_PERMISSION: AgentTruthEntry = {
+  verdict: {
+    state: { name: "needs_you", reason: "permission" },
+    source: "hook",
+    sinceMs: 0,
+    confidence: "authoritative",
+    disagreement: null,
+  },
+  hookDelivery: { status: "installed" },
+};
 
 const TAB = (id: string, over: Partial<TransitionTab> = {}): TransitionTab => ({
   id,
@@ -24,6 +37,10 @@ function input(over: Partial<EvaluateTransitionsInput> = {}): EvaluateTransition
     autoApprovePatterns: [],
     autoRestart: false,
     getLastOutputLines: () => [],
+    // Tab `a` — the tab every auto-approve case below drives — carries a
+    // hook-reported permission ask by default, so those cases exercise the
+    // pattern logic. The gate itself is pinned by the "keystroke gate" block.
+    verdicts: { a: HOOK_PERMISSION },
     ...over,
   };
 }
@@ -280,6 +297,51 @@ describe("evaluateTransitions — auto-approve", () => {
         ...needsInput,
         autoApprovePatterns: ["proceed"],
         getLastOutputLines: () => [],
+      }),
+    );
+    expect(out.approvals).toEqual([]);
+  });
+});
+
+describe("evaluateTransitions — keystroke gate (isAuthoritativePermissionAsk)", () => {
+  const needsInput = { prev: { a: "working" as SessionState }, next: { a: "needs-input" as SessionState } };
+  const matching = {
+    autoApprovePatterns: ["proceed"],
+    getLastOutputLines: () => ["Do you want to proceed?"],
+  };
+  const withVerdict = (verdict: Partial<Verdict>): AgentTruthEntry => ({
+    verdict: { ...HOOK_PERMISSION.verdict, ...verdict },
+    hookDelivery: { status: "absent" },
+  });
+
+  it("never approves a screen-inferred needs-input (no verdict at all)", () => {
+    const reader = vi.fn(() => ["Do you want to proceed?"]);
+    const out = evaluateTransitions({
+      ...input({ ...needsInput, ...matching, verdicts: {} }),
+      getLastOutputLines: reader,
+    });
+    expect(out.newNeedsInput).toEqual(["a"]);
+    expect(out.approvals).toEqual([]);
+    expect(reader).not.toHaveBeenCalled();
+  });
+
+  it("never approves a regex-sourced (inferred) needs_you verdict", () => {
+    const out = evaluateTransitions(
+      input({
+        ...needsInput,
+        ...matching,
+        verdicts: { a: withVerdict({ source: "regex", confidence: "inferred" }) },
+      }),
+    );
+    expect(out.approvals).toEqual([]);
+  });
+
+  it("never approves an authoritative QUESTION — only a permission ask", () => {
+    const out = evaluateTransitions(
+      input({
+        ...needsInput,
+        ...matching,
+        verdicts: { a: withVerdict({ state: { name: "needs_you", reason: "question" } }) },
       }),
     );
     expect(out.approvals).toEqual([]);

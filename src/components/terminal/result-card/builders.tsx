@@ -21,6 +21,7 @@ import type { ResultCardSpec, ResultCardSection } from "./ResultCardContext";
 
 // Ported verbatim from ZoneStatusBar.tsx:59-72.
 const STATE_COLORS: Record<SessionState, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -29,6 +30,7 @@ const STATE_COLORS: Record<SessionState, string> = {
 };
 
 const STATE_LABELS: Record<SessionState, string> = {
+  unknown: "unknown",
   idle: "idle",
   working: "working",
   "needs-input": "waiting",
@@ -92,6 +94,7 @@ export function buildMetricsCardSpec(input: BuildMetricsCardInput): ResultCardSp
   // ── Current state ─────────────────────────────────────────────────────
   // Replicate the stateCounts useMemo at ZoneStatusBar.tsx:140-154.
   const stateCounts: Record<SessionState, number> = {
+    unknown: 0,
     idle: 0,
     working: 0,
     "needs-input": 0,
@@ -99,7 +102,7 @@ export function buildMetricsCardSpec(input: BuildMetricsCardInput): ResultCardSp
     error: 0,
   };
   for (const tab of tabs) {
-    const state = sessionStates[tab.id] ?? "idle";
+    const state = sessionStates[tab.id] ?? "unknown";
     stateCounts[state]++;
   }
   // idle row OMITTED, matching ZSB.
@@ -178,7 +181,7 @@ export function buildMetricsCardSpec(input: BuildMetricsCardInput): ResultCardSp
         for (const { zone, tabId } of sortedEntries) {
           const tab = tabs.find((t) => t.id === tabId);
           if (!tab) continue;
-          const state = (sessionStates as Record<string, string>)?.[tabId] ?? "idle";
+          const state = (sessionStates as Record<string, string>)?.[tabId] ?? "unknown";
           const duration = (stateDurations as Record<string, string>)?.[tabId] ?? "-";
           const lineCount = (lastOutputLines as Record<string, unknown[]>)?.[tabId]?.length ?? 0;
           const tags = zoneLabels?.[zone] ?? "-";

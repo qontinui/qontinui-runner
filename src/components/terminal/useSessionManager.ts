@@ -20,6 +20,7 @@ import type { SessionState } from "./useZoneLayout";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
+import { isNeedsInputState } from "./agentTruth";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -30,7 +31,13 @@ export type SessionLiveStatus =
   | "needs-input"
   | "completed"
   | "error"
-  | "dormant";
+  | "dormant"
+  /**
+   * A tab-backed session whose tab has no observed state yet. Excluded from
+   * every StatusStrip count — an unobserved session is neither working nor
+   * idle (plan `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`).
+   */
+  | "unknown";
 
 export interface SessionDigest {
   session_id: string;
@@ -421,7 +428,8 @@ const STATUS_PRIORITY: Record<SessionLiveStatus, number> = {
   "active-external": 3,
   error: 4,
   completed: 5,
-  dormant: 6,
+  unknown: 6,
+  dormant: 7,
 };
 
 /** Counts surfaced to the Terminal-page StatusStrip pills. */
@@ -455,6 +463,8 @@ export interface StatusCountsInput {
  * hook. See the long-form rationale on the `statusCounts` memo below.
  *
  * - `dormant` → excluded (the bulk historical over-count).
+ * - `unknown` → excluded (a tab with no observed state is not counted as
+ *   anything).
  * - orphaned `frozen` (`isOrphaned`) → excluded (resumable historical session).
  * - tab-backed `frozen` → counts as `idle`.
  * - `active-in-zone` / `active-external` → `working`.
@@ -470,6 +480,7 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
     completed: 0,
     error: 0,
     dormant: 0,
+    unknown: 0,
   };
   // Live frozen = a stale session still open as a tab in this window.
   // Orphaned frozen (no tab) is a resumable historical transcript → excluded.
@@ -478,6 +489,8 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
     // Drop dormant historical transcripts and orphaned (tab-less) frozen
     // transcripts — they are not actively-managed sessions.
     if (s.liveStatus === "dormant") continue;
+    // Unobserved tabs are excluded from every count — never guessed as working.
+    if (s.liveStatus === "unknown") continue;
     if (s.liveStatus === "frozen" && s.isOrphaned) continue;
     counts[s.liveStatus]++;
     if (s.liveStatus === "frozen") liveFrozen++;
@@ -904,7 +917,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         if (tab) {
           zoneTabId = tab.id;
           const tabState = sessionStates[tab.id];
-          if (tabState === "needs-input") {
+          if (isNeedsInputState(tabState)) {
             liveStatus = "needs-input";
           } else if (tabState === "error") {
             liveStatus = "error";
@@ -912,6 +925,11 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             liveStatus = "completed";
           } else if (staleTabs.has(tab.id)) {
             liveStatus = "frozen";
+          } else if (tabState === undefined || tabState === "unknown") {
+            // Explicit arm: nothing has been observed for this tab yet. It
+            // used to fall through to `active-in-zone`, counting an
+            // unobserved session as working.
+            liveStatus = "unknown";
           } else {
             liveStatus = "active-in-zone";
           }
@@ -1082,7 +1100,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [allSessions],
   );
   const needsInputCount = useMemo(
-    () => allSessions.filter((s) => s.liveStatus === "needs-input").length,
+    () => allSessions.filter((s) => isNeedsInputState(s.liveStatus)).length,
     [allSessions],
   );
   const activeCount = useMemo(
@@ -1123,7 +1141,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // `injected_live_status` but no real tab) are still counted when their
   // status is a live one — matching what the operator sees rendered.
   //
-  // Buckets are mapped explicitly over the 7 SessionLiveStatus values so
+  // Buckets are mapped explicitly over the 8 SessionLiveStatus values so
   // adding a new status forces a compile-time decision here rather than
   // silently dropping it.
   const statusCounts = useMemo(() => computeStatusCounts(allSessions), [allSessions]);

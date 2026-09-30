@@ -38,6 +38,18 @@ describe("computeStatusCounts", () => {
     expect(counts.workingCount).toBe(0);
   });
 
+  it("excludes an unknown (unobserved) tab-backed session from every count", () => {
+    // Plan 2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping:
+    // a tab with no observed state used to fall through to `active-in-zone`
+    // and was counted as working.
+    const counts = computeStatusCounts([s("unknown"), s("active-in-zone")]);
+    expect(counts.claudeSessionCount).toBe(1);
+    expect(counts.workingCount).toBe(1);
+    expect(counts.idleCount).toBe(0);
+    expect(counts.completedCount).toBe(0);
+    expect(counts.errorCount).toBe(0);
+  });
+
   it("counts active-in-zone and active-external as working", () => {
     const counts = computeStatusCounts([s("active-in-zone"), s("active-external")]);
     expect(counts.workingCount).toBe(2);

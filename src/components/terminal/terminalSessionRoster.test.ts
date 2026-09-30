@@ -54,9 +54,9 @@ describe("buildTerminalSessionRoster", () => {
     ]);
   });
 
-  it("defaults an untracked tab's state to idle, exactly like the sibling projection", () => {
+  it("defaults an untracked tab's state to unknown — never a guessed idle — exactly like the sibling projection", () => {
     const rows = buildTerminalSessionRoster([{ id: "t-new", title: "new", isAlive: true }], {}, {});
-    expect(rows[0].state).toBe("idle");
+    expect(rows[0].state).toBe("unknown");
     expect(rows[0].isAlive).toBe(true);
     expect(rows[0].exitCode).toBeNull();
   });

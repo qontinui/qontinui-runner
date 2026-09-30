@@ -166,13 +166,14 @@ export function useZoneActions({
       error: 1,
       working: 2,
       idle: 3,
-      completed: 4,
+      unknown: 4,
+      completed: 5,
     };
     const entries = Object.entries(zoneLayout.assignments)
       .map(([z, tabId]) => ({
         zoneIndex: Number(z),
         tabId,
-        priority: STATE_PRIORITY[stateTracking.sessionStates[tabId] ?? "idle"],
+        priority: STATE_PRIORITY[stateTracking.sessionStates[tabId] ?? "unknown"],
       }))
       .sort((a, b) => a.priority - b.priority);
 
@@ -216,7 +217,7 @@ export function useZoneActions({
     for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab) continue;
-      const state = stateTracking.sessionStates[tabId] ?? "idle";
+      const state = stateTracking.sessionStates[tabId] ?? "unknown";
       const output = hotStore.getLastOutputLines(tabId);
       lines.push("");
       lines.push(`--- Zone ${Number(zoneStr) + 1}: ${resolveTitle(tab)} [${state}] ---`);
@@ -234,7 +235,7 @@ export function useZoneActions({
       lines.push("");
       lines.push("--- Unassigned Sessions ---");
       for (const tab of unassigned) {
-        const state = stateTracking.sessionStates[tab.id] ?? "idle";
+        const state = stateTracking.sessionStates[tab.id] ?? "unknown";
         const output = hotStore.getLastOutputLines(tab.id);
         lines.push(`  ${resolveTitle(tab)} [${state}]`);
         if (output.length > 0) lines.push(...output.map((l) => `    ${l}`));
@@ -273,7 +274,7 @@ export function useZoneActions({
       const tab = tabs.find((t) => t.id === tabId);
       const lines = hotStore.getLastOutputLines(tabId);
       const title = tab ? resolveTitle(tab) : `Zone ${zoneIndex + 1}`;
-      const state = stateTracking.sessionStates[tabId] ?? "idle";
+      const state = stateTracking.sessionStates[tabId] ?? "unknown";
       const label = labelsAndTags.zoneLabels[zoneIndex] ?? "";
 
       let content: string;
