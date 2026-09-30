@@ -581,7 +581,8 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     log "Rust generates. But this push changes NONE of the sources that feed"
     log "them — nothing under ${GEN_EVENTS_ATTRIBUTION_PATHS[*]}"
     if [ -z "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
-        log "(markdown aside — it cannot reach schemas.json; see lib/gen-events-attribution.sh)"
+        log "(markdown aside — the premise guard found no way for it to reach schemas.json;"
+        log " see lib/gen-events-attribution.sh)"
     else
         log "(markdown included this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON)"
     fi
