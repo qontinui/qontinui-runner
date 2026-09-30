@@ -137,7 +137,10 @@ fi
 . "$ATTRIBUTION_LIB"
 
 # Which stage this is, for every line below that would otherwise say "push":
-# this hook also runs at pre-commit, where "this push" is false.
+# this hook also runs at pre-commit, where "this push" is false. Under the
+# direct pre-push shim nothing but git's stdin says so, and nothing in this
+# hook reads stdin — so read it here, once, first.
+gen_events_detect_stage_from_stdin
 STAGE="$(gen_events_stage)"
 if [ "$STAGE" = "push" ]; then BYPASS_CMD="git push"; else BYPASS_CMD="git commit"; fi
 
@@ -270,7 +273,7 @@ case "$SCRATCH_PARENT/" in
         fail "    schemas : $SCHEMAS_DIR"
         fail "This hook must never write into a repository it does not own; that"
         fail "tree holds other sessions' uncommitted work. Point TMPDIR somewhere"
-        fail "outside the schemas checkout and re-push."
+        fail "outside the schemas checkout and re-run."
         exit 1
         ;;
 esac
@@ -291,7 +294,7 @@ case "$SCRATCH_ROOT_ABS/" in
     "$SCHEMAS_DIR"/*)
         fail "REFUSING TO RUN — mktemp placed the scratch directory INSIDE the"
         fail "qontinui-schemas checkout ($SCRATCH_ROOT_ABS). Set TMPDIR to a path"
-        fail "outside $SCHEMAS_DIR and re-push."
+        fail "outside $SCHEMAS_DIR and re-run."
         exit 1
         ;;
 esac
@@ -608,7 +611,7 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
         case "$entry" in */) DIR_INPUTS+="${DIR_INPUTS:+ }$entry" ;; esac
     done
     log "them — nothing under $DIR_INPUTS"
-    log "or in the manifest/toolchain/cargo-config files"
+    log "or in any other input listed in lib/gen-events-attribution.sh"
     if [ -z "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
         log "(markdown aside — the premise guard found no way for it to reach schemas.json;"
         log " see lib/gen-events-attribution.sh)"

@@ -18,11 +18,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# $1 overrides the repo root, so the attribution self-test can run this hook
+# against fixtures.
+REPO_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # shellcheck source=lib/gen-events-attribution.sh
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 
-UNCOVERED="$(gen_events_uncovered_path_deps "$REPO_ROOT")"
+# Exit 2 from the walk means it could not run meaningfully (no manifest, a
+# manifest it could read nothing from, a failed awk). That is a failure, never
+# a pass: an empty answer from a walk that read nothing is not "complete".
+WALK_RC=0
+UNCOVERED="$(gen_events_uncovered_path_deps "$REPO_ROOT")" || WALK_RC=$?
+if [ "$WALK_RC" -ne 0 ]; then
+    echo "[gen-events-path-deps] ERROR: the manifest walk could not run (exit $WALK_RC):" >&2
+    printf '%s\n' "$UNCOVERED" | sed 's/^/[gen-events-path-deps]     /' >&2
+    exit 2
+fi
 if [ -z "$UNCOVERED" ]; then
     echo "[gen-events-path-deps] OK — every in-repo path dependency is an attribution input."
     exit 0

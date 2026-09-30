@@ -662,8 +662,9 @@ echo "  -- every in-repo path dependency is an input --"
 # with the `gen-events-path-deps` hook that runs it on every Cargo.toml edit;
 # here it is run on the real tree and proved able to fail on a fixture.
 if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    REAL_DEPS="$(gen_events_uncovered_path_deps "$REPO_ROOT")" && REAL_RC=0 || REAL_RC=$?
     check "every in-repo path dependency of the export build is under an input" \
-        "" "$(gen_events_uncovered_path_deps "$REPO_ROOT")"
+        "0|" "$REAL_RC|$REAL_DEPS"
     SEEN_DEPS="$(_gen_events_cargo_path_deps "$REPO_ROOT/src-tauri/Cargo.toml" | grep -c . || true)"
     if [ "${SEEN_DEPS:-0}" -gt 0 ]; then
         pass_note "  and it read $SEEN_DEPS path dependencies from src-tauri/Cargo.toml"
@@ -703,6 +704,24 @@ PTY_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
 check "a new pty-holder path dependency, and its own, are reported uncovered" \
     "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
     "$PTY_OUT"
+
+# The hook script itself, against fixtures: it must FAIL on an uncovered
+# dependency (double- or single-quoted), and must not pass a walk that read
+# nothing — a missing manifest is a failure, not an empty answer.
+PATH_DEPS_HOOK="$SCRIPT_DIR/gen-events-path-deps-check.sh"
+path_deps_hook_rc() { bash "$PATH_DEPS_HOOK" "$1" >/dev/null 2>&1; echo "$?"; }
+check "the path-deps hook fails on the uncovered pty-holder fixture" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+premise_fixture 'fn f() {}'
+printf "[dependencies]\nqontinui-pty-holder = { path = '../crates/pty-holder' }\n" > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
+check "  and on a single-quoted (TOML literal string) uncovered path" "1" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+EMPTY_ROOT="$(mktemp -d -t gen-events-nomanifest-XXXXXX)"; FIXTURE_ROOTS+=("$EMPTY_ROOT")
+check "  and does not pass when src-tauri/Cargo.toml is missing" "2" "$(path_deps_hook_rc "$EMPTY_ROOT")"
+premise_fixture 'fn f() {}'
+printf '[package]\nname = "x"\n' > "$PREMISE_FIXTURE/src-tauri/Cargo.toml"
+check "  or when it yields no path dependency at all" "2" "$(path_deps_hook_rc "$PREMISE_FIXTURE")"
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    check "  and passes on the real tree" "0" "$(path_deps_hook_rc "$REPO_ROOT")"
+fi
 
 echo "  -- the premise gates the exclusion at decision time --"
 
@@ -960,6 +979,15 @@ check "gen-events-drift.sh words its verdicts and bypass by stage" "yes|no" \
 # PRE_COMMIT_REMOTE_NAME for a push; either alone means push.
 check "gen_events_stage: TO_REF alone, REMOTE_NAME alone, neither" "push|push|commit" \
     "$(unset PRE_COMMIT_REMOTE_NAME; PRE_COMMIT_TO_REF=abc gen_events_stage)|$(unset PRE_COMMIT_TO_REF; PRE_COMMIT_REMOTE_NAME=origin gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME; gen_events_stage)"
+
+# Under the fleet's direct pre-push shim no PRE_COMMIT_* is exported; git's
+# own protocol on stdin is the only sign of a push. A real ref line reads as
+# push; an empty stdin (pre-commit, a manual run) as commit.
+STAGE_REF_LINE="refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222"
+check "gen_events_stage under the direct shim: ref line on stdin, empty stdin" "push|commit" \
+    "$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin <<< "$STAGE_REF_LINE"; gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin < /dev/null; gen_events_stage)"
+check "gen-events-drift.sh reads the stage from stdin before deciding it" yes \
+    "$(awk '/^gen_events_detect_stage_from_stdin$/ {d=NR} /^STAGE="\$\(gen_events_stage\)"$/ {s=NR} END {print (d && s && d < s) ? "yes" : "no"}' "$SCRIPT_DIR/gen-events-drift.sh")"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.
