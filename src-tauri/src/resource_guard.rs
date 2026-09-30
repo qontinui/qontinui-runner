@@ -1904,6 +1904,394 @@ fn emit_notice(
     }
 }
 
+// ===========================================================================
+// Background-work shedding — rung 1 of the degradation ladder
+// ===========================================================================
+//
+// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+// Phase 3 ("shed the runner's own periodic work first").
+//
+// Everything above this line gates a NEW session. Nothing gated the runner's
+// OWN periodic work — `worktree_census`, `fleet::tree_publisher`,
+// `git_status_subset`, the auto-fresh engine, `build_drift` and the transcript
+// WMI enumeration — and on the MSI box that work is the `git` burst (≈2,500
+// spawns per census tick, uncapped `2N`/s commit-state probes) that preceded
+// every one of the four commit-exhaustion aborts. Under
+// `ERROR_COMMITMENT_LIMIT` each of those spawns failed, logged one WARN and was
+// folded into a `Degraded`, and **the loop did not slow down**. The guard asked
+// the operator to give something up before the runner gave up anything.
+//
+// This section is the missing rung: the cheapest one on the ladder, and the
+// only one that costs the user nothing when it fires, because every spender it
+// gates is periodic and idempotent — the next cycle recomputes from scratch.
+//
+// Three rules shape it, each argued at its item:
+//
+// - **One verdict, many call sites.** [`background_work_verdict`] reads the SAME
+//   free-commit reading the spawn gate reads, against the SAME effective floors
+//   ([`effective_session_floors`]), and maps [`evaluate`]'s three verdicts onto
+//   Run / Throttle / Skip. No threshold is invented here; a machine whose owner
+//   tightened the floors sheds earlier for exactly that reason.
+// - **Gate the LOOP, never the helper.** `run_probe` and `git_trunk` also serve
+//   on-demand paths the operator is waiting on (worktree allocation, the probe
+//   executor). Shedding those would turn a memory-pressure signal into a
+//   silently missing answer; shedding a periodic tick costs one tick.
+// - **UNKNOWN runs as today.** An unreadable sensor, a disabled guard, and a box
+//   with no commit concept (every non-Windows box) all produce
+//   [`BackgroundWork::Run`] — the gate's fail-open posture, unchanged.
+//
+// And the ladder's one prohibition holds here too: nothing in this section
+// touches a live session. It only declines to START a unit of the runner's own
+// background work.
+
+/// What the runner's own periodic work should do this tick.
+///
+/// The mapping from [`SpawnGate`] is one-to-one — Proceed → Run, Warn →
+/// Throttle, Critical → Skip — and deliberately so: the floors a spawn is
+/// warned at are the floors background work starts yielding at. What each
+/// spender DOES with a Throttle is its own decision (the periodic walks skip the
+/// cycle; `git_status_subset` lengthens its debounce), which is why this is a
+/// verdict rather than a boolean.
+///
+/// The observation rides along so the one line a spender logs on entering the
+/// shed state can say WHICH floor, at WHICH reading — the same clause the spawn
+/// gate's toast uses, not a second vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BackgroundWork {
+    /// Enough headroom, or no readable opinion (UNKNOWN / guard disabled). Run
+    /// exactly as before this rung existed.
+    Run,
+    /// Free commit is below the WARN floor. Do less.
+    Throttle(GateObservation),
+    /// Free commit is below the CRITICAL floor. Do nothing this tick.
+    Skip(GateObservation),
+}
+
+impl BackgroundWork {
+    /// The observation behind a shed verdict, with its severity word, or `None`
+    /// for [`BackgroundWork::Run`].
+    fn tripped(&self) -> Option<(&'static str, &GateObservation)> {
+        match self {
+            BackgroundWork::Run => None,
+            BackgroundWork::Throttle(o) => Some(("warn", o)),
+            BackgroundWork::Skip(o) => Some(("critical", o)),
+        }
+    }
+}
+
+/// Pure verdict over an injected free-commit reading and effective floors.
+///
+/// Built ON [`evaluate`] rather than beside it, so the three properties that
+/// function already argues — strictly-below boundaries, critical tested first,
+/// and fail-open on both `None` and `enabled == false` — are inherited rather
+/// than restated. A second comparison against the same floors is how the two
+/// would one day disagree about which side of a floor a reading is on.
+pub(crate) fn background_work_verdict_for(
+    lane: &str,
+    free_commit_bytes: Option<u64>,
+    floors: &SessionGuardSettings,
+) -> BackgroundWork {
+    match evaluate(lane, free_commit_bytes, floors) {
+        SpawnGate::Proceed => BackgroundWork::Run,
+        SpawnGate::Warn(observation) => BackgroundWork::Throttle(observation),
+        SpawnGate::Critical(observation) => BackgroundWork::Skip(observation),
+    }
+}
+
+/// How long [`background_work_verdict`] reuses the machine owner's guard
+/// SETTINGS before re-reading them.
+///
+/// `get_session_guard_settings()` is a full `load_settings()` — a disk read and
+/// parse of `settings.json` plus the loader's own side work. That is fine at a
+/// spawn, which happens a few times an hour; it is not fine at the head of
+/// `git_status_subset`'s emit, which runs up to `2N` times a second across N
+/// sessions — and it would be allocating most heavily at exactly the moment this
+/// verdict exists for, a box running out of commit. The settings change when an
+/// operator edits the Settings panel, so a few seconds of lag in when a changed
+/// floor starts shedding background work is invisible.
+///
+/// The READING is deliberately not memoised — the same choice the spawn gate
+/// makes for the memory lane: it is one `GlobalMemoryStatusEx` (microseconds, no
+/// allocation), and its freshness is the whole argument for consulting it.
+const BACKGROUND_SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The memoised guard settings behind [`BACKGROUND_SETTINGS_TTL`].
+static BACKGROUND_SETTINGS: Mutex<Option<(std::time::Instant, SessionGuardSettings)>> =
+    Mutex::new(None);
+
+/// The live verdict for the runner's own background work: this instant's
+/// free-commit reading against the effective session floors.
+///
+/// Reads [`crate::fleet::resource_sample::spawn_gate_reading`] — the spawn
+/// gate's own reading, host lane, one syscall — and the floors through
+/// [`effective_session_floors`], so the three-term fold, the cap and the ladder
+/// coercion all apply exactly as they do at a spawn. Called at the HEAD of each
+/// spender's tick, never inside `run_probe` / `git_trunk` (see the section
+/// header for why).
+///
+/// Never call this from a unit test: it reads the operator's real settings.
+/// Every shedding decision below takes the verdict as an argument precisely so a
+/// test can inject one.
+pub(crate) fn background_work_verdict() -> BackgroundWork {
+    let local = {
+        let mut memo = BACKGROUND_SETTINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match memo.as_ref() {
+            Some((read_at, settings)) if read_at.elapsed() < BACKGROUND_SETTINGS_TTL => {
+                settings.clone()
+            }
+            _ => {
+                let settings = crate::settings::get_session_guard_settings();
+                *memo = Some((std::time::Instant::now(), settings.clone()));
+                settings
+            }
+        }
+    };
+    if !local.enabled {
+        return BackgroundWork::Run;
+    }
+    let (lane, free_commit_bytes, _free_phys_bytes) =
+        crate::fleet::resource_sample::spawn_gate_reading();
+    let floors = effective_session_floors(&local, lane);
+    background_work_verdict_for(lane, free_commit_bytes, &floors)
+}
+
+/// What one spender actually did on its last decision — the state the
+/// edge-triggered log line reports a CHANGE of.
+///
+/// Richer than [`BackgroundWork`] because a spender's behaviour is not a pure
+/// function of the verdict: a walk that is holding off after a critical episode
+/// is shedding under a `Run` verdict, and that has to be logged as its own state
+/// or the "resumed" line would be a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedState {
+    /// Doing its work exactly as before this rung existed.
+    Running,
+    /// Doing its work, but less of it (a longer debounce, say).
+    Throttled,
+    /// Not doing its work this tick.
+    Skipped,
+    /// Pressure has cleared, but the spender is still waiting out its backoff.
+    HoldingOff,
+}
+
+/// Edge-triggered logger for one spender's shed state.
+///
+/// The `note_ladder_coercion` discipline, applied per spender: remember the last
+/// state logged and emit ONLY on a change. Unconditional per-tick logging is the
+/// exact failure this rung exists to end — the census alone put ≈6,000 WARN
+/// lines a day into the log while the box was dying — so a shed that repeated
+/// its line every tick would re-create the flood through the mechanism meant to
+/// stop it. A spender that stays shed for an hour logs one line on entry and one
+/// on recovery.
+///
+/// One instance per spender, owned by whoever owns the spender's state: a loop
+/// holds it in its own stack frame (so its tests see only their own lines), and
+/// the two spenders that are not loops (`git_status_subset`, the WMI command)
+/// hold one in a `static Mutex`.
+#[derive(Debug)]
+pub(crate) struct ShedLog {
+    spender: &'static str,
+    state: ShedState,
+}
+
+impl ShedLog {
+    /// A logger that starts in [`ShedState::Running`], so the FIRST shed is
+    /// reported and a spender that never sheds never logs. `const` so it can
+    /// initialise a `static`.
+    pub(crate) const fn new(spender: &'static str) -> Self {
+        Self {
+            spender,
+            state: ShedState::Running,
+        }
+    }
+
+    /// Record that the spender is now in `next`, logging one line if — and
+    /// only if — that is a change. Returns whether a line was emitted.
+    ///
+    /// `verdict` supplies the reading and floor the line quotes; on a return to
+    /// [`ShedState::Running`] it is not consulted, because the line that matters
+    /// there is "resumed", and the reading that permitted it is not above any
+    /// floor worth naming.
+    pub(crate) fn note(&mut self, next: ShedState, verdict: &BackgroundWork) -> bool {
+        if self.state == next {
+            return false;
+        }
+        let previous = std::mem::replace(&mut self.state, next);
+        let spender = self.spender;
+        let why = verdict
+            .tripped()
+            .map(|(severity, obs)| obs.clause(severity))
+            .unwrap_or_else(|| "free commit is back above the warn floor".to_string());
+        match next {
+            ShedState::Running => tracing::info!(
+                spender,
+                "resource_guard: {spender} resumed its background work (was {previous:?}) — {why}"
+            ),
+            ShedState::Throttled => warn!(
+                spender,
+                "resource_guard: throttling {spender}'s background work — {why}. The runner sheds \
+                 its own periodic work before it asks the operator to give anything up; this \
+                 line is logged once per change, not per tick"
+            ),
+            ShedState::Skipped => warn!(
+                spender,
+                "resource_guard: skipping {spender}'s background work — {why}. Nothing it does \
+                 is lost: it is periodic and recomputes from scratch on the next cycle that \
+                 runs; this line is logged once per change, not per tick"
+            ),
+            ShedState::HoldingOff => tracing::info!(
+                spender,
+                "resource_guard: memory pressure eased, but {spender} is holding off a few more \
+                 cycles before resuming (exponential backoff after a critical episode) — {why}"
+            ),
+        }
+        true
+    }
+}
+
+/// How a periodic spender answers a [`BackgroundWork::Throttle`] and
+/// [`BackgroundWork::Skip`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedPolicy {
+    /// Skip the tick at Throttle and at Skip, and resume the moment the verdict
+    /// is Run again. For the cheap re-checks (the auto-fresh engine, 300 s;
+    /// `build_drift`, 900 s): a handful of `git` calls, where the backoff's
+    /// extra staleness would buy nothing.
+    SkipTick,
+    /// Skip at Throttle; at Skip, skip AND back off exponentially (capped) so
+    /// the walk does not restart on the first tick the reading pokes back above
+    /// the floor. For the two big walks — the census (~12–15 `git` per worktree
+    /// row) and the tree publisher (~9 per repo plus a `git fetch`) — whose
+    /// burst is itself enough to push an oscillating box back under.
+    SkipWithBackoff,
+}
+
+/// Cap on [`ShedPolicy::SkipWithBackoff`]'s hold-off, in cycles.
+///
+/// The hold-off doubles with each consecutive critical tick — 1, 2, 4 — and
+/// stops at 4. Four is where the extra staleness stops being cheap: for the
+/// publisher (60 s) it is four minutes of stale tree rows; for the census
+/// (300 s) twenty minutes, and the census has an on-demand refresh
+/// (`spawn_census_rebuild`) that this rung does not gate, so an operator who
+/// needs it sooner is never waiting on the backoff. Past four, a box that has
+/// genuinely recovered is being punished for a past episode.
+pub(crate) const SHED_BACKOFF_MAX_CYCLES: u32 = 4;
+
+/// Per-loop shedding state: the policy, the edge-triggered logger, and the
+/// backoff counters. Owned by the loop, so two loops (or two tests) never share
+/// a streak.
+#[derive(Debug)]
+pub(crate) struct BackgroundShed {
+    policy: ShedPolicy,
+    log: ShedLog,
+    /// Consecutive ticks that saw [`BackgroundWork::Skip`]. Reset when a cycle
+    /// actually runs.
+    critical_streak: u32,
+    /// Cycles still to skip after the verdict returns to Run.
+    holdoff: u32,
+}
+
+impl BackgroundShed {
+    pub(crate) const fn new(spender: &'static str, policy: ShedPolicy) -> Self {
+        Self {
+            policy,
+            log: ShedLog::new(spender),
+            critical_streak: 0,
+            holdoff: 0,
+        }
+    }
+
+    /// Decide whether THIS tick runs, given this tick's verdict. Logs a line
+    /// only when the decision's state changes.
+    ///
+    /// The backoff counts only ticks whose verdict is Run: a Throttle tick after
+    /// a critical episode is still a box under pressure, so it is skipped on its
+    /// own account and does not spend the hold-off that exists for the recovery.
+    pub(crate) fn admit(&mut self, verdict: &BackgroundWork) -> bool {
+        let (run, state) = match verdict {
+            BackgroundWork::Skip(_) => {
+                if self.policy == ShedPolicy::SkipWithBackoff {
+                    self.critical_streak = self.critical_streak.saturating_add(1);
+                    let doubling = 1u32
+                        .checked_shl(self.critical_streak.saturating_sub(1))
+                        .unwrap_or(u32::MAX);
+                    self.holdoff = doubling.min(SHED_BACKOFF_MAX_CYCLES);
+                }
+                (false, ShedState::Skipped)
+            }
+            BackgroundWork::Throttle(_) => (false, ShedState::Skipped),
+            BackgroundWork::Run if self.holdoff > 0 => {
+                self.holdoff -= 1;
+                (false, ShedState::HoldingOff)
+            }
+            BackgroundWork::Run => {
+                self.critical_streak = 0;
+                (true, ShedState::Running)
+            }
+        };
+        self.log.note(state, verdict);
+        run
+    }
+}
+
+/// Test-only: run `f` with a scoped `tracing` subscriber and return what it
+/// logged at INFO and above. Scoped (`with_default`) rather than global because
+/// the harness runs tests in parallel and a global subscriber can be set once.
+/// Shared by every module whose shedding wiring asserts "exactly one line".
+#[cfg(test)]
+pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let sink = Sink::default();
+    let buf = sink.0.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    (out, text)
+}
+
+/// Test-only: the two shed verdicts, at a reading below the named floor of the
+/// shipped defaults. For the modules that inject a verdict into their own tick.
+#[cfg(test)]
+pub(crate) fn test_skip_verdict() -> BackgroundWork {
+    background_work_verdict_for("host", Some(0), &SessionGuardSettings::default())
+}
+
+#[cfg(test)]
+pub(crate) fn test_throttle_verdict() -> BackgroundWork {
+    let floors = SessionGuardSettings::default();
+    // Midway between the two floors: below warn, at-or-above critical.
+    let between = (floors.warn_free_commit_bytes + floors.critical_free_commit_bytes) / 2;
+    background_work_verdict_for("host", Some(between), &floors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3543,5 +3931,159 @@ mod tests {
         ));
         // And the band is non-empty, or the distinction would be unreachable.
         assert!(guard.critical_thread_count > guard.warn_thread_count + 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Background-work shedding (plan 2026-09-23-…-ungated, Phase 3)
+    // -----------------------------------------------------------------------
+
+    /// The verdict table over (reading, floors). Every row is the reading
+    /// against the shipped defaults (3 GiB warn, 1.5 GiB critical) unless it
+    /// names otherwise.
+    #[test]
+    fn background_work_verdict_table() {
+        let d = defaults();
+        let warn = d.warn_free_commit_bytes;
+        let crit = d.critical_free_commit_bytes;
+        let off = SessionGuardSettings {
+            enabled: false,
+            ..defaults()
+        };
+        let tightened = SessionGuardSettings {
+            warn_free_commit_bytes: 8 * GIB_U64,
+            critical_free_commit_bytes: 6 * GIB_U64,
+            ..defaults()
+        };
+        #[derive(Debug, PartialEq)]
+        enum V {
+            Run,
+            Throttle,
+            Skip,
+        }
+        let rows: Vec<(&str, Option<u64>, &SessionGuardSettings, V)> = vec![
+            // UNKNOWN reading ⇒ run exactly as today (fail open).
+            ("unknown reading", None, &d, V::Run),
+            // Disabled guard ⇒ run, at every reading including zero.
+            ("disabled, zero free", Some(0), &off, V::Run),
+            ("disabled, unknown", None, &off, V::Run),
+            ("plenty", Some(32 * GIB_U64), &d, V::Run),
+            // Strictly below: exactly at a floor is not under it.
+            ("at warn floor", Some(warn), &d, V::Run),
+            ("one byte under warn", Some(warn - 1), &d, V::Throttle),
+            ("at critical floor", Some(crit), &d, V::Throttle),
+            ("one byte under critical", Some(crit - 1), &d, V::Skip),
+            ("zero free", Some(0), &d, V::Skip),
+            // A machine owner who tightened the floors sheds earlier — the
+            // verdict reads the effective floors, not a constant of its own.
+            (
+                "5 GiB on a tightened box",
+                Some(5 * GIB_U64),
+                &tightened,
+                V::Skip,
+            ),
+            (
+                "7 GiB on a tightened box",
+                Some(7 * GIB_U64),
+                &tightened,
+                V::Throttle,
+            ),
+        ];
+        for (name, reading, floors, want) in rows {
+            let got = match background_work_verdict_for("host", reading, floors) {
+                BackgroundWork::Run => V::Run,
+                BackgroundWork::Throttle(o) => {
+                    assert_eq!(o.limit, floors.warn_free_commit_bytes, "{name}");
+                    V::Throttle
+                }
+                BackgroundWork::Skip(o) => {
+                    assert_eq!(o.limit, floors.critical_free_commit_bytes, "{name}");
+                    V::Skip
+                }
+            };
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// A `SkipTick` spender skips at Throttle and at Skip and resumes on the
+    /// very next Run — no backoff.
+    #[test]
+    fn skip_tick_policy_resumes_immediately() {
+        let mut shed = BackgroundShed::new("test_skip_tick", ShedPolicy::SkipTick);
+        assert!(shed.admit(&BackgroundWork::Run));
+        assert!(!shed.admit(&test_throttle_verdict()));
+        assert!(!shed.admit(&test_skip_verdict()));
+        assert!(!shed.admit(&test_skip_verdict()));
+        assert!(shed.admit(&BackgroundWork::Run));
+    }
+
+    /// `SkipWithBackoff`: the hold-off doubles per consecutive critical tick,
+    /// caps at [`SHED_BACKOFF_MAX_CYCLES`], and is spent only on Run ticks.
+    #[test]
+    fn skip_with_backoff_holds_off_exponentially_and_caps() {
+        let held_off_after = |critical_ticks: u32| {
+            let mut shed = BackgroundShed::new("test_backoff", ShedPolicy::SkipWithBackoff);
+            for _ in 0..critical_ticks {
+                assert!(!shed.admit(&test_skip_verdict()));
+            }
+            // A throttle tick after the episode does not spend the hold-off.
+            assert!(!shed.admit(&test_throttle_verdict()));
+            let mut skipped = 0;
+            while !shed.admit(&BackgroundWork::Run) {
+                skipped += 1;
+                assert!(skipped <= SHED_BACKOFF_MAX_CYCLES, "backoff must be capped");
+            }
+            skipped
+        };
+        assert_eq!(held_off_after(1), 1);
+        assert_eq!(held_off_after(2), 2);
+        assert_eq!(held_off_after(3), 4);
+        assert_eq!(held_off_after(40), SHED_BACKOFF_MAX_CYCLES);
+    }
+
+    /// Throttle alone never arms the backoff: the walk resumes on the first Run.
+    #[test]
+    fn throttle_alone_does_not_arm_backoff() {
+        let mut shed = BackgroundShed::new("test_throttle", ShedPolicy::SkipWithBackoff);
+        for _ in 0..5 {
+            assert!(!shed.admit(&test_throttle_verdict()));
+        }
+        assert!(shed.admit(&BackgroundWork::Run));
+    }
+
+    /// The edge trigger: a spender that stays shed logs ONE line on entry and
+    /// one on recovery, never one per tick; a spender that never sheds logs
+    /// nothing at all.
+    #[test]
+    fn shed_log_is_edge_triggered() {
+        let ((), logs) = capture_logs(|| {
+            let mut shed = BackgroundShed::new("edge_spender", ShedPolicy::SkipTick);
+            for _ in 0..3 {
+                shed.admit(&BackgroundWork::Run);
+            }
+            for _ in 0..50 {
+                shed.admit(&test_skip_verdict());
+            }
+            for _ in 0..3 {
+                shed.admit(&BackgroundWork::Run);
+            }
+        });
+        assert_eq!(
+            logs.matches("skipping edge_spender's background work")
+                .count(),
+            1,
+            "{logs}"
+        );
+        assert_eq!(logs.matches("edge_spender resumed").count(), 1, "{logs}");
+        assert_eq!(logs.lines().count(), 2, "{logs}");
+        // The skip line quotes the reading and the floor it fell below.
+        assert!(logs.contains("below the 1.50 GiB critical floor"), "{logs}");
+
+        let ((), quiet) = capture_logs(|| {
+            let mut shed = BackgroundShed::new("quiet_spender", ShedPolicy::SkipWithBackoff);
+            for _ in 0..10 {
+                shed.admit(&BackgroundWork::Run);
+            }
+        });
+        assert!(quiet.is_empty(), "{quiet}");
     }
 }
