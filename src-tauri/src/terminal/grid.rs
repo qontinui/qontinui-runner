@@ -1183,7 +1183,10 @@ mod tests {
         feed(&mut grid, b"\x1b[?2026hHALF A FRAME");
         let opened = grid.sync_output_opened_at.expect("clock started");
         let just_before = opened + SYNC_OUTPUT_TIMEOUT - Duration::from_millis(1);
-        assert!(grid.sync_output_at(just_before), "still open inside the timeout");
+        assert!(
+            grid.sync_output_at(just_before),
+            "still open inside the timeout"
+        );
         assert!(
             !grid.sync_output_at(opened + SYNC_OUTPUT_TIMEOUT),
             "expired at the timeout"
@@ -1192,7 +1195,10 @@ mod tests {
         // The stored flag is cleared by the next advance, even one carrying
         // no DEC 2026 sequence at all.
         grid.backdate_sync_output_open(SYNC_OUTPUT_TIMEOUT);
-        assert!(grid.sync_output, "flag is still stored until the next advance");
+        assert!(
+            grid.sync_output,
+            "flag is still stored until the next advance"
+        );
         feed(&mut grid, b"later output");
         assert!(!grid.sync_output, "cleared on the next advance");
         assert!(grid.sync_output_opened_at.is_none());
@@ -1223,7 +1229,11 @@ mod tests {
         grid.backdate_sync_output_open(SYNC_OUTPUT_TIMEOUT / 2);
         let opened = grid.sync_output_opened_at.expect("open");
         feed(&mut grid, b"\x1b[?2026h");
-        assert_eq!(grid.sync_output_opened_at, Some(opened), "clock not restarted");
+        assert_eq!(
+            grid.sync_output_opened_at,
+            Some(opened),
+            "clock not restarted"
+        );
         assert!(!grid.sync_output_at(opened + SYNC_OUTPUT_TIMEOUT));
     }
 
