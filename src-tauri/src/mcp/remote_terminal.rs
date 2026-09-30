@@ -3376,8 +3376,16 @@ impl RemoteAttachClient {
                 }
                 // A target's refusal of a `terminal_end` (bad grant, missing
                 // block, terminal mismatch), translated by the relay.
+                //
+                // Or the RELAY's report that it FORWARDED the end and can get
+                // no answer (`end_reply_timeout`, `target_not_connected`,
+                // `listener_lost`) — `unknown`, see [`end_error_reply`].
                 if let Some(tx) = request_id.and_then(|rid| self.take_pending_end(rid)) {
-                    let _ = tx.send(end_refusal(&code, &message));
+                    let _ = tx.send(end_error_reply(
+                        EndErrorFrame::RemoteTerminalError,
+                        &code,
+                        &message,
+                    ));
                     return true;
                 }
                 // A refused RE-attach names the pane in its request id.
@@ -3428,7 +3436,7 @@ impl RemoteAttachClient {
                 let Some(tx) = request_id.and_then(|rid| self.take_pending_end(rid)) else {
                     return false;
                 };
-                let _ = tx.send(end_refusal(&code, &message));
+                let _ = tx.send(end_error_reply(EndErrorFrame::BareError, &code, &message));
                 true
             }
             _ => false,
@@ -3500,24 +3508,55 @@ impl RemoteAttachClient {
     }
 }
 
-/// A correlated refusal of an end: `refused`, the code leading the reason so
-/// the caller can branch on it (e.g. an expired open-tab grant → mint).
+/// Which frame a correlated end error arrived as — the half of the mapping the
+/// code alone cannot supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndErrorFrame {
+    /// `{"type":"remote_terminal_error", code, request_id}` — the end WAS
+    /// forwarded to the target. Either the target refused it, or the relay
+    /// lost the way to its answer.
+    RemoteTerminalError,
+    /// `{"type":"error", code, request_id}` — the relay refused the end or
+    /// could not forward it: nothing reached the target.
+    BareError,
+}
+
+/// `remote_terminal_error` codes meaning the end was FORWARDED and no answer
+/// can come: the relay's `pending_end` TTL lapsed (`end_reply_timeout`), or
+/// the target's connection (`target_not_connected`) or the relay's listener
+/// for it (`listener_lost`) went away after the forward. The target may be
+/// mid-`/exit`, so these are `unknown`, never `refused`.
+const END_FORWARDED_UNANSWERED_CODES: &[&str] = &[
+    END_REPLY_TIMEOUT_CODE,
+    "target_not_connected",
+    "listener_lost",
+];
+
+/// Map a correlated error on an end to its reply, on frame TYPE plus code —
+/// never on the code alone, because `target_not_connected` means opposite
+/// things on the two frames:
 ///
-/// `end_reply_timeout` — the relay's `pending_end` TTL lapsing with no answer
-/// from the target — is the one correlated code that is `unknown` rather than
-/// `refused`: the target may still be mid-`/exit`. Neither it nor
-/// `end_already_pending` is in [`FATAL_REMOTE_ERROR_CODES`], so an open tab is
-/// never closed by an end's error.
-fn end_refusal(code: &str, message: &str) -> EndReply {
+/// - `remote_terminal_error` + a code in [`END_FORWARDED_UNANSWERED_CODES`] →
+///   `unknown` (forwarded, unanswerable); any other code → `refused` (the
+///   target's own refusal: bad grant, missing block, terminal mismatch).
+/// - bare `error` → always `refused`: nothing was forwarded
+///   (`target_not_connected` here means never sent), or the relay refused it
+///   (`end_already_pending`, grant invalid / expired / not registered).
+///
+/// The code leads the reason so the caller can branch on it (e.g. an expired
+/// open-tab grant → mint). None of these closes an open tab: a correlated end
+/// error resolves the end's waiter and returns before any pane is settled.
+fn end_error_reply(frame: EndErrorFrame, code: &str, message: &str) -> EndReply {
     let reason = if message.is_empty() {
         code.to_string()
     } else {
         format!("{code}: {message}")
     };
-    let outcome = if code == END_REPLY_TIMEOUT_CODE {
-        EndOutcome::Unknown
-    } else {
-        EndOutcome::Refused
+    let outcome = match frame {
+        EndErrorFrame::RemoteTerminalError if END_FORWARDED_UNANSWERED_CODES.contains(&code) => {
+            EndOutcome::Unknown
+        }
+        EndErrorFrame::RemoteTerminalError | EndErrorFrame::BareError => EndOutcome::Refused,
     };
     EndReply::local(outcome, reason)
 }
@@ -5093,6 +5132,121 @@ mod tests {
         assert_eq!(reply.outcome, EndOutcome::Unknown);
         assert!(!is_fatal_remote_error(END_REPLY_TIMEOUT_CODE));
         assert!(!is_fatal_remote_error("end_already_pending"));
+    }
+
+    /// Send an end, answer it with one correlated error frame, return the reply.
+    async fn end_answered_by(
+        client: &Arc<RemoteAttachClient>,
+        grant: EndGrant<'static>,
+        msg_type: &str,
+        code: &str,
+        grant_jti: Option<&str>,
+    ) -> EndReply {
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.end(grant, false, Duration::from_secs(5)).await });
+        let sent = pump.recv().await.expect("frame sent");
+        let rid = sent["request_id"].as_str().unwrap().to_string();
+        let mut frame = json!({
+            "type": msg_type,
+            "request_id": rid,
+            "code": code,
+            "message": "m",
+        });
+        if let Some(j) = grant_jti {
+            frame["grant_jti"] = json!(j);
+        }
+        assert!(client.handle_inbound(msg_type, &frame), "{msg_type}/{code}");
+        task.await.unwrap()
+    }
+
+    /// `target_not_connected` means opposite things on the two frames: on a
+    /// `remote_terminal_error` the end was forwarded and the target dropped
+    /// before answering (`unknown`); on a bare `error` it was never sent
+    /// (`refused`). The mapping is on frame type plus code.
+    #[tokio::test]
+    async fn target_not_connected_is_unknown_when_forwarded_and_refused_when_never_sent() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let forwarded = end_answered_by(
+            &client,
+            EndGrant::Fresh { grant: "g" },
+            "remote_terminal_error",
+            "target_not_connected",
+            None,
+        )
+        .await;
+        assert_eq!(forwarded.outcome, EndOutcome::Unknown);
+        assert!(forwarded
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("target_not_connected"));
+
+        let never_sent = end_answered_by(
+            &client,
+            EndGrant::Fresh { grant: "g" },
+            "error",
+            "target_not_connected",
+            None,
+        )
+        .await;
+        assert_eq!(never_sent.outcome, EndOutcome::Refused);
+        assert!(never_sent
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("target_not_connected"));
+    }
+
+    /// `listener_lost` after the forward is `unknown` — and, correlated to an
+    /// end, it does not close the open tab whose grant the end rode on, even
+    /// though the same code IS fatal to an uncorrelated pane error.
+    #[tokio::test]
+    async fn listener_lost_on_an_end_is_unknown_and_keeps_the_tab() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let pane = new_pane(&client, "jti-tab", AttachedRing::default());
+        client.register_pane(pane.clone());
+        let reply = end_answered_by(
+            &client,
+            EndGrant::Attached {
+                grant_jti: "jti-tab",
+                terminal_id: None,
+            },
+            "remote_terminal_error",
+            "listener_lost",
+            Some("jti-tab"),
+        )
+        .await;
+        assert_eq!(reply.outcome, EndOutcome::Unknown);
+        assert!(client.pane("jti-tab").is_some(), "tab kept");
+        assert!(!pane.is_finished(), "tab still live");
+    }
+
+    /// Every other `remote_terminal_error` code is the target's own refusal,
+    /// and `end_already_pending` (a bare `error`) is the relay's.
+    #[tokio::test]
+    async fn target_refusals_and_end_already_pending_are_refused() {
+        let client = Arc::new(RemoteAttachClient::new());
+        for (msg_type, code) in [
+            ("remote_terminal_error", "remote_block_required"),
+            ("remote_terminal_error", "attach_terminal_mismatch"),
+            ("error", "end_already_pending"),
+            ("error", "listener_lost"),
+            ("error", END_REPLY_TIMEOUT_CODE),
+        ] {
+            let reply = end_answered_by(
+                &client,
+                EndGrant::Fresh { grant: "g" },
+                msg_type,
+                code,
+                None,
+            )
+            .await;
+            assert_eq!(reply.outcome, EndOutcome::Refused, "{msg_type}/{code}");
+            assert!(reply.reason.as_deref().unwrap().starts_with(code));
+        }
+        assert!(!is_fatal_remote_error("end_already_pending"));
+        assert!(!is_fatal_remote_error("target_not_connected"));
     }
 
     #[tokio::test]
