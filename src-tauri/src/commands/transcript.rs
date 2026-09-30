@@ -2096,12 +2096,10 @@ mod tests {
     /// is the cheapest way to stop it coming back.
     #[test]
     fn the_scan_path_uses_no_tokio_timer() {
-        let src = include_str!("transcript.rs");
-        // Split on the attribute alone: line-ending independent, and this file
-        // contains exactly one `#[cfg(test)]`. Match on the CALL shape
-        // (trailing paren) so the module docs, which have to name the defect
-        // in order to explain it, do not trip their own guard.
-        let production = src.split("#[cfg(test)]").next().expect("module body");
+        // The production half only (`ProdSource` removes the test module). Match
+        // on the CALL shape (trailing paren) so the module docs, which have to
+        // name the defect in order to explain it, do not trip their own guard.
+        let production = crate::source_pin::ProdSource::of(include_str!("transcript.rs"));
         assert!(
             !production.contains("tokio::time::timeout("),
             "tokio::time::timeout is back on the scan path — it cannot fire when the runtime it \

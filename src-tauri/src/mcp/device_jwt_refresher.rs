@@ -11023,11 +11023,8 @@ mod tenant_slot_refresh_tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/mcp/device_jwt_refresher.rs");
         let text = std::fs::read_to_string(&path).expect("read this file");
-        // Production code only: everything before the first test MODULE.
-        let end = text
-            .find("\n#[cfg(test)]\nmod ")
-            .expect("this file has test modules");
-        let production: String = text[..end]
+        // Production code only: every test module removed.
+        let production: String = crate::source_pin::ProdSource::of(&text)
             .lines()
             .map(|line| line.find("//").map_or(line, |i| &line[..i]))
             .collect::<Vec<_>>()
@@ -11452,7 +11449,7 @@ mod tenant_slot_refresh_tests {
     /// coord finding `f2dce2cb-b7a8-473b-b1bf-f5631954427b`.
     #[test]
     fn no_headless_pair_cli_seeds_a_bound_tenants_slot() {
-        let src = include_str!("device_jwt_refresher.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("device_jwt_refresher.rs"));
         // Every CODE line naming the pairing entry points — a qualified call,
         // an import, or the `pair_with_auth_token` wrapper — not one spelling.
         // Comment lines and string literals are skipped; the needle is split
@@ -11493,12 +11490,9 @@ mod tenant_slot_refresh_tests {
                 "the refresher must not call {other} — it re-points coord.devices.tenant_id"
             );
         }
-        // Nor a hand-rolled request to the route: production code (everything
-        // before the first test module) never names it.
-        let production = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("split");
+        // Nor a hand-rolled request to the route: production code never names
+        // it. (`src` is already the production half.)
+        let production = &src;
         let route = concat!("/pair", "-cli");
         assert!(
             !production

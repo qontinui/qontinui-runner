@@ -3469,18 +3469,10 @@ mod tests {
     /// assertion flakes here (`instance::primary_keeps_the_unscoped_path`).
     #[test]
     fn the_census_post_chokepoint_carries_the_guard() {
-        const SRC: &str = include_str!("census.rs");
         const GUARD: &str =
             "machine_state_publish_allowed(crate::instance::owns_shared_root_state())";
 
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("census.rs"));
 
         let dest_fn = prod
             .split_once("fn resolve_dest(")
@@ -4395,15 +4387,7 @@ mod tests {",
     /// the unit test above still passed.
     #[test]
     fn the_empty_probe_branch_calls_the_throttled_warner() {
-        const SRC: &str = include_str!("census.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("census.rs"));
         let sampler = prod
             .split_once("pub(crate) async fn sample_and_publish_volumes(")
             .map(|(_, after)| after)
@@ -4429,15 +4413,7 @@ mod tests {",
     /// "simplification" that folds `post_volumes` back into `post`.
     #[test]
     fn a_volumes_only_post_never_releases_the_census_boot_gate() {
-        const SRC: &str = include_str!("census.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("census.rs"));
 
         let volumes_fn = prod
             .split_once("async fn post_volumes(")
@@ -4491,15 +4467,7 @@ mod tests {",
     /// a coord-configured profile and an HTTP server.
     #[test]
     fn the_census_chunk_post_still_releases_the_boot_gate() {
-        const SRC: &str = include_str!("census.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("census.rs"));
 
         let post_fn = prod
             .split_once("async fn post(&mut self, chunk: CensusChunk)")
@@ -4589,15 +4557,7 @@ mod tests {",
     /// above still passes.
     #[test]
     fn the_volume_tick_resolves_identity_off_the_async_worker_and_reuses_the_cache() {
-        const SRC: &str = include_str!("census.rs");
-        let prod = SRC
-            .split_once(
-                "
-#[cfg(test)]
-mod tests {",
-            )
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("census.rs"));
         let tick = prod
             .split_once("async fn post_volumes_to_coord(")
             .map(|(_, after)| after)

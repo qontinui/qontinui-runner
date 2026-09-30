@@ -3416,7 +3416,7 @@ mod tests {
     /// a re-typed copy would assert only that the copy matches itself.
     #[test]
     fn the_forward_table_has_a_row_for_every_registered_route() {
-        let source = include_str!("plan_library.rs");
+        let source = crate::source_pin::ProdSource::of(include_str!("plan_library.rs"));
         let rows: Vec<&str> = source
             .lines()
             .take_while(|l| l.starts_with("//!"))
@@ -3487,7 +3487,7 @@ mod tests {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");
         let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
-        let src = include_str!("plan_library.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("plan_library.rs"));
 
         let start = src
             .find(fn_header.as_str())
