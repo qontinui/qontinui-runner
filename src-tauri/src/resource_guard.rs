@@ -992,9 +992,7 @@ pub(crate) fn commit_ladder_scale(
 ) -> f64 {
     match capability.commit_limit {
         None | Some(0) => 1.0,
-        Some(limit) => {
-            (limit as f64 / REFERENCE_COMMIT_LIMIT as f64).clamp(1.0, SCALE_MAX)
-        }
+        Some(limit) => (limit as f64 / REFERENCE_COMMIT_LIMIT as f64).clamp(1.0, SCALE_MAX),
     }
 }
 
@@ -1254,7 +1252,8 @@ pub(crate) fn note_commit_ladder_shadow(
         Lane::Host.as_str(),
     );
     let host = crate::ci_node::host_sizing::probe();
-    let admitted = crate::settings::get_ci_node_settings().effective_max_concurrent_builds_for(host);
+    let admitted =
+        crate::settings::get_ci_node_settings().effective_max_concurrent_builds_for(host);
     let alternative = admitted_concurrency_scale(host, admitted);
     let shadow = commit_ladder_shadow(capability, &effective, free_commit, alternative);
 
@@ -1323,8 +1322,7 @@ pub(crate) fn note_commit_ladder_shadow(
 mod commit_ladder_scale_tests {
     use super::*;
     use crate::ci_node::admission::{
-        defer_commit_floor_gb, DEFER_FREE_COMMIT_GB, MAX_SESSION_DEFER_FLOOR_GB,
-        MIN_FREE_COMMIT_GB,
+        defer_commit_floor_gb, DEFER_FREE_COMMIT_GB, MAX_SESSION_DEFER_FLOOR_GB, MIN_FREE_COMMIT_GB,
     };
     use crate::ci_node::host_sizing::HostCapacity;
     use crate::fleet::machine_capability::MachineCapability;
@@ -1390,7 +1388,13 @@ mod commit_ladder_scale_tests {
             enabled: false,
             ..SessionGuardSettings::default()
         };
-        for limit in [1, 8 * GIB_U, 24 * GIB_U, REFERENCE_COMMIT_LIMIT - 1, REFERENCE_COMMIT_LIMIT] {
+        for limit in [
+            1,
+            8 * GIB_U,
+            24 * GIB_U,
+            REFERENCE_COMMIT_LIMIT - 1,
+            REFERENCE_COMMIT_LIMIT,
+        ] {
             let scale = commit_ladder_scale(&capability(Some(limit)));
             assert_eq!(scale, 1.0, "L = {limit}");
             for effective in [&defaults, &raised, &disabled] {
@@ -1419,7 +1423,11 @@ mod commit_ladder_scale_tests {
         assert_gib(l.session_warn, 6.72, "session warn");
         assert_gib(l.session_critical, 3.36, "session critical");
         assert_gib(l.ci_reject, 8.96, "ci_node reject");
-        assert_gib(l.ci_defer, 17.93, "ci_node defer (cap scaled, so it does not bind)");
+        assert_gib(
+            l.ci_defer,
+            17.93,
+            "ci_node defer (cap scaled, so it does not bind)",
+        );
         assert_gib(l.session_cap, 26.89, "session cap");
     }
 
@@ -1450,7 +1458,10 @@ mod commit_ladder_scale_tests {
             assert!(l.ci_defer > l.ci_reject, "s={scale}: {l:?}");
             assert!(l.ci_reject > l.session_warn, "s={scale}: {l:?}");
             assert!(l.session_warn > l.session_critical, "s={scale}: {l:?}");
-            assert_eq!(l.session_warn, scale_bytes(effective.warn_free_commit_bytes, scale));
+            assert_eq!(
+                l.session_warn,
+                scale_bytes(effective.warn_free_commit_bytes, scale)
+            );
             assert_eq!(
                 l.session_critical,
                 scale_bytes(effective.critical_free_commit_bytes, scale)
@@ -1476,7 +1487,10 @@ mod commit_ladder_scale_tests {
                 let effective = merge_floors(&local, SessionFloors::default());
                 for scale in [1.0, 1.5, 2.24, 3.3, SCALE_MAX] {
                     let l = scaled_commit_ladder(&effective, scale);
-                    assert_eq!(l.session_warn, scale_bytes(effective.warn_free_commit_bytes, scale));
+                    assert_eq!(
+                        l.session_warn,
+                        scale_bytes(effective.warn_free_commit_bytes, scale)
+                    );
                     assert!(l.session_critical <= l.session_warn, "{l:?}");
                 }
             }
@@ -1550,7 +1564,10 @@ mod commit_ladder_scale_tests {
             SpawnGate::Proceed
         );
         // UNKNOWN reading ⇒ nothing to compare, both fail open.
-        assert_eq!(commit_ladder_shadow(&cap, &effective, None, None).verdicts, None);
+        assert_eq!(
+            commit_ladder_shadow(&cap, &effective, None, None).verdicts,
+            None
+        );
     }
 
     /// The shipped verdicts at scale 1.0 agree with the real `ci_node` rules.
@@ -1558,7 +1575,15 @@ mod commit_ladder_scale_tests {
     fn shipped_ci_verdicts_match_the_integer_gib_rules() {
         let effective = SessionGuardSettings::default();
         let shipped = scaled_commit_ladder(&effective, 1.0);
-        for free in [0, GIB_U, 4 * GIB_U - 1, 4 * GIB_U, 7 * GIB_U + 5, 8 * GIB_U, 20 * GIB_U] {
+        for free in [
+            0,
+            GIB_U,
+            4 * GIB_U - 1,
+            4 * GIB_U,
+            7 * GIB_U + 5,
+            8 * GIB_U,
+            20 * GIB_U,
+        ] {
             let v = ladder_verdicts(free, &effective, &shipped);
             assert_eq!(
                 v.ci_reject,
@@ -1584,7 +1609,10 @@ mod commit_ladder_scale_tests {
         assert!(shadow_edge(&mut last, a));
         assert!(!shadow_edge(&mut last, a));
         let same_band = commit_ladder_shadow(&cap, &effective, Some(21 * GIB_U), None).key();
-        assert!(!shadow_edge(&mut last, same_band), "no rung crossed, no line");
+        assert!(
+            !shadow_edge(&mut last, same_band),
+            "no rung crossed, no line"
+        );
         let crossed = commit_ladder_shadow(&cap, &effective, Some(5 * GIB_U), None).key();
         assert!(shadow_edge(&mut last, crossed));
     }

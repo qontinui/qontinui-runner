@@ -192,8 +192,9 @@ pub(crate) fn parse_paging_files<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Pagef
             [path] => (path.to_string(), PagefileSize::SystemManaged),
             [path, initial, max] => {
                 let parse = |t: &str| {
-                    t.parse::<u64>()
-                        .map_err(|_| format!("PagingFiles entry {line:?}: size {t:?} is not a number"))
+                    t.parse::<u64>().map_err(|_| {
+                        format!("PagingFiles entry {line:?}: size {t:?} is not a number")
+                    })
                 };
                 let (initial_mib, max_mib) = (parse(initial)?, parse(max)?);
                 let size = if initial_mib == 0 && max_mib == 0 {
@@ -540,7 +541,10 @@ mod tests {
             let entries = parse_paging_files(&[line]).unwrap();
             assert_eq!(entries[0].size, PagefileSize::SystemManaged, "{line}");
             assert!(!pagefile_fixed(&entries), "{line} must not read as fixed");
-            assert!(pagefile_max(&entries).is_err(), "{line} has no configured max");
+            assert!(
+                pagefile_max(&entries).is_err(),
+                "{line} has no configured max"
+            );
         }
     }
 
@@ -601,7 +605,11 @@ Committed_AS:   98765432 kB
         let (limit, charged) = parse_commit_meminfo(MEMINFO_FIXTURE);
         assert_eq!(limit, Ok(205_960_708 * 1024));
         assert_eq!(charged, Ok(98_765_432 * 1024));
-        assert_ne!(limit, Ok(395_144_208 * 1024), "CommitLimit must never be MemTotal");
+        assert_ne!(
+            limit,
+            Ok(395_144_208 * 1024),
+            "CommitLimit must never be MemTotal"
+        );
     }
 
     #[test]
@@ -647,7 +655,11 @@ Committed_AS:   98765432 kB
     #[test]
     fn the_msi_box_assembles_to_its_measured_capability() {
         let cap = assemble(msi_inputs());
-        assert!(cap.capability_unknown.is_empty(), "{:?}", cap.capability_unknown);
+        assert!(
+            cap.capability_unknown.is_empty(),
+            "{:?}",
+            cap.capability_unknown
+        );
         assert_eq!(cap.cores, Some(16));
         assert_eq!(cap.pagefile_fixed, Some(true));
         assert_eq!(cap.pagefile_max, Some(40 * GIB));
@@ -718,6 +730,8 @@ Committed_AS:   98765432 kB
     fn the_live_probe_never_publishes_a_silent_gap() {
         let cap = probe();
         assert!(cap.commit_limit.is_some() || cap.capability_unknown.contains_key("commitLimit"));
-        assert!(cap.pagefile_fixed.is_some() || cap.capability_unknown.contains_key("pagefileFixed"));
+        assert!(
+            cap.pagefile_fixed.is_some() || cap.capability_unknown.contains_key("pagefileFixed")
+        );
     }
 }
