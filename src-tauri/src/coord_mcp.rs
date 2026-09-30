@@ -5931,15 +5931,10 @@ mod session_tenant_resolution_tests {
         // result through the mapping. Comment lines are dropped first, so a
         // needle left in a comment cannot satisfy it.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
-        let start = text
-            .find("async fn session_bearer_and_tenant_or_refuse(")
-            .expect("session_bearer_and_tenant_or_refuse exists");
-        let end = text[start..]
-            .find("\n}\n")
-            .map(|i| start + i)
-            .expect("its body ends");
-        let code: String = text[start..end]
+        let raw = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        let text = crate::source_pin::ProdSource::of(&raw);
+        let code: String = text
+            .item_of("async fn session_bearer_and_tenant_or_refuse(", 150..20_000)
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -22483,7 +22478,10 @@ mod runner_credential_tests {
     #[test]
     fn the_two_credential_breadcrumb_sites_share_one_literal() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        let raw = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        // The production half: a copy of the literal in a test must neither
+        // count toward nor hide a production call site.
+        let text = crate::source_pin::ProdSource::of(&raw);
         let occurrences = text.matches(RUNNER_CREDENTIAL_BREADCRUMB_REASON).count();
         assert_eq!(
             occurrences, 3,

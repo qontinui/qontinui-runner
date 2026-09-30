@@ -14765,10 +14765,12 @@ mod coord_mcp_body_gate_tests {
                 .is_ok(),
             "membership is a binary_search, so the entry must sit in sorted position"
         );
-        let parsed = crate::build_drift::parse_tool_policy_consts(
-            &crate::source_pin::ProdSource::of(include_str!("mcp_api.rs")),
-        )
-        .expect("mcp_api.rs parses");
+        let parsed =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
+            .expect("mcp_api.rs parses");
         assert_eq!(
             parsed
                 .allowed
@@ -15427,10 +15429,12 @@ mod coord_mcp_body_gate_tests {
     /// silently against the one file it exists to read.
     #[test]
     fn trunk_policy_parser_round_trips_this_files_consts() {
-        let p = crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::of(
-            include_str!("mcp_api.rs"),
-        ))
-        .expect("mcp_api.rs parses");
+        let p =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
+            .expect("mcp_api.rs parses");
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
             p.allowed_prefixes,
@@ -16286,7 +16290,8 @@ mod coord_claims_proxy_tests {
         // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
         // from anywhere.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let raw = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::source_pin::ProdSource::of(&raw);
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -16426,7 +16431,8 @@ mod coord_claims_proxy_tests {
     )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let raw = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::source_pin::ProdSource::of(&raw);
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -19893,10 +19899,11 @@ mod supervised_workers_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
-        let src = std::fs::read_to_string(
+        let raw = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
         )
         .expect("read mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(&raw);
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()
