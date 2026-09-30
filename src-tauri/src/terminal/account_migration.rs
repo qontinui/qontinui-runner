@@ -547,6 +547,7 @@ pub(crate) fn spawn_resumed_pane(
         Some(spec.page_id),
         spec.resource_override,
     )
+    .map_err(String::from)
 }
 
 /// The full PTY-child argv of the `--resume` respawn. With no operator launch
