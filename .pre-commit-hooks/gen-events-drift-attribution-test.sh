@@ -45,9 +45,19 @@ gen_events_clear_inherited_git_env
 # `PRE_COMMIT_REMOTE_NAME=origin PRE_COMMIT_TO_REF=bbbb`. So the suite starts
 # from none of it, and never reads git's stdin: it neither needs it nor may
 # consume it. Cases that want a push stage set it themselves.
+#
+# Command-line git config too. Under `git -c k=v <cmd>` git exports
+# GIT_CONFIG_PARAMETERS (and GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n /
+# GIT_CONFIG_VALUE_n for `--config-env`) to every hook, and it overrides the
+# fixtures' local config: `-c core.hooksPath=…` meant no fixture hook ran
+# (11 failures), `-c commit.gpgsign=true` failed ~92 fixture commits. The
+# LIBRARY deliberately keeps the user's `-c` settings for the hook's own git
+# calls — they are the user's intent for this repo, and the attribution's
+# calls pin what matters (`-z`, `--no-renames`) explicitly — so only this
+# suite, whose fixtures are not the user's repo, drops them.
 sanitize_hook_stage_env() {
     local v
-    for v in $(compgen -v PRE_COMMIT_); do unset "$v"; done
+    for v in $(compgen -v PRE_COMMIT_) $(compgen -v GIT_CONFIG); do unset "$v"; done
     unset GEN_EVENTS_STAGE_HINT QONTINUI_GEN_EVENTS_DRIFT_STRICT
 }
 sanitize_hook_stage_env
@@ -1047,8 +1057,8 @@ POLLUTED="$(
 )"
 check "under an inherited pre-push environment the stage cases still hold" \
     "yes|yes|yes|commit" "$POLLUTED"
-check "  and the suite itself started with no PRE_COMMIT_* or stage hint" "" \
-    "$(compgen -v PRE_COMMIT_; printf '%s' "${GEN_EVENTS_STAGE_HINT:-}")"
+check "  and the suite itself started with no PRE_COMMIT_*, command-line git config or stage hint" "" \
+    "$(compgen -v PRE_COMMIT_; compgen -v GIT_CONFIG; printf '%s' "${GEN_EVENTS_STAGE_HINT:-}")"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.
@@ -1085,6 +1095,7 @@ printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
 gen_events_detect_stage_from_stdin
 $attribute_line
 printf '%s\n' "\$ATTRIBUTION_STATE" > "$WORK/.hook-state"
+printf '%s\n' "\$ATTRIBUTION_UNAVAILABLE_REASON" > "$WORK/.hook-reason"
 printf '%s\n' "\$ATTRIBUTION_TOUCHED_DETAIL" > "$WORK/.hook-detail"
 exit 1
 HOOK
@@ -1166,16 +1177,31 @@ check "a plain commit with an intent-to-add input: MINE, not in this commit" \
 # When the hook's index IS the real index (a plain commit), the staged-later
 # read must not run at all: it would only repeat the staged source. A logging
 # `git`, placed first on the HOOK's PATH, records every call the hook makes.
+# Committed through a SYMLINK to the fixture: the hook's $PWD — and so the
+# recorded index — then names the link while git reports the real path, and
+# only canonicalising both makes them the same file.
 index_hook_fixture
+WORK_LINK="$(dirname "$WORK")/work-link"
+ln -s "$WORK" "$WORK_LINK"
 GIT_LOG_SHIM="$(dirname "$WORK")/shim-gitlog"
 mkdir -p "$GIT_LOG_SHIM"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$WORK/.git-calls" "$(command -v git)" > "$GIT_LOG_SHIM/git"
 chmod +x "$GIT_LOG_SHIM/git"
 printf '// edited\n' >> "$WORK/src-tauri/src/lib.rs"
 git -C "$WORK" add src-tauri/src/lib.rs
-( cd "$WORK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
-check "a plain commit never runs the staged-later read (same index)" "yes|0" \
+( cd "$WORK_LINK" && HOOK_PATH_PREFIX="$GIT_LOG_SHIM" git commit -qm "plain" ) >/dev/null 2>&1
+check "a plain commit, via a symlinked path, never runs the staged-later read" "yes|0" \
     "$(grep -qF -- '--cached HEAD' "$WORK/.git-calls" 2>/dev/null && echo yes || echo no)|$(grep -cF -- '--ita-visible-in-index' "$WORK/.git-calls" 2>/dev/null || true)"
+
+# The staged-later read fails closed like every other source: a failure is
+# UNAVAILABLE, never an empty list that could clear the committer.
+index_hook_fixture
+ITA_SHIM="$(git_shim_failing ita '*--ita-visible-in-index*')"
+printf '# readme\n' >> "$WORK/README"
+git -C "$WORK" add README
+( cd "$WORK" && HOOK_PATH_PREFIX="$ITA_SHIM" git commit -qm "partial" -- README ) >/dev/null 2>&1
+check "a failing staged-later read is UNAVAILABLE, naming the call" "unavailable|yes" \
+    "$(hook_state)|$(grep -qF 'against the real index failed' "$WORK/.hook-reason" 2>/dev/null && echo yes || echo no)"
 
 # `commit -a` with a path ALREADY staged: it is in both indexes, and is listed
 # once, as staged — not a second time as staged-later.
