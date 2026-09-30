@@ -7827,16 +7827,19 @@ mod tenant_slot_refresh_tests {
     }
 
     /// (c) A Cognito refresh that recovers after a HARD failure yields
-    /// `notify_recovered` from `plan_refresh_wait` — and that is the COGNITO
-    /// source's signal only (`emit_credential_dark(.., false)` sends
-    /// `source: "cognito"`). It is not a posture event: the posture cell and
-    /// its transition log are untouched, so a still-dark posture stays dark.
+    /// `notify_recovered` from `plan_refresh_wait`, and — the part this test
+    /// actually pins — the posture it runs beside keeps its dark value.
     ///
-    /// The frontend reducer (`src/components/web-integration-banner-logic.ts`,
-    /// M5) clears only the entry of the source that sent `dark: false`, so a
-    /// Cognito recovery cannot clear a posture-sourced banner.
+    /// Scope, stated so the name is not over-read: `plan_refresh_wait` is pure
+    /// over `RefreshBackoff`, so the posture assertions below pin the
+    /// SEPARATION of the two authorities' state, not the emitted event. That a
+    /// Cognito `dark:false` cannot clear a posture-sourced banner rests on
+    /// `emit_credential_dark` sending `source: "cognito"` and on the frontend
+    /// reducer (`src/components/web-integration-banner-logic.ts`, M5) clearing
+    /// only the sending source's entry — covered by that reducer's own tests,
+    /// not here.
     #[test]
-    fn posture_is_not_cleared_by_a_cognito_recovery_after_hard() {
+    fn cognito_recovery_after_hard_notifies_recovered_and_leaves_the_posture_state_alone() {
         let _serialised = health_lock();
         reset_posture();
         let now = chrono::Utc::now().timestamp();
