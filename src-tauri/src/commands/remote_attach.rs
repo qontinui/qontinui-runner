@@ -272,7 +272,7 @@ pub(crate) async fn mint_attach_grant_awaiting_session(
     ))
 }
 
-async fn mint_attach_grant(
+pub(crate) async fn mint_attach_grant(
     coord_base: &str,
     session_id: uuid::Uuid,
 ) -> Result<AttachGrantResponse, String> {
