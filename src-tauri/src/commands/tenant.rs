@@ -9,8 +9,16 @@
 //! doctor, flag-poll) — NOT "the only tenant this device serves". A device
 //! holds N concurrent tenant bindings (`paired_user.json` v2 +
 //! `coord.tenant_devices`); each session records its own tenant at
-//! creation (spawn input, else this default) and keeps it for life, so
-//! switching the active tenant re-points FUTURE sessions only.
+//! creation (spawn input, else this default).
+//!
+//! A switch is NOT limited to future sessions. A coord-mcp binding frozen
+//! PINNED at creation keeps its tenant, but one frozen UNPINNED (the normal
+//! single-tenant shape, and a restored/adopted nonce with no recorded tenant)
+//! re-reads the machine pin on every request (`coord_mcp::decide_session_tenant`
+//! rows 2-4), so an unpinned -> pinned switch moves running sessions too. And
+//! the dual-write gate and the nonce restore read the pin once at startup, so
+//! they see a switch only at the next runner start. [`PIN_SURFACES`] is the
+//! per-consumer table; `PUT /tenant/active` reports it with a live count.
 //!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)
 //! and offers a switcher when the operator belongs to >1 tenant. The
@@ -35,7 +43,8 @@
 //! headless `GET`/`PUT /tenant/active` routes (`mcp::tenant`) call — plan
 //! `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
 //! Phase 4. A write refuses any tenant outside this device's local binding
-//! set, and reports when it takes effect ([`TAKES_EFFECT_DETAIL`]).
+//! set, and reports which surfaces see a switch live and which at the next
+//! start ([`PIN_SURFACES`]), and how many running sessions it moves.
 
 use std::path::{Path, PathBuf};
 
@@ -202,29 +211,115 @@ impl std::fmt::Display for MachineJsonWriteError {
 // `2026-09-23-remote-create-residuals-after-coord-registration-confirm` Phase 4.
 // ============================================================================
 
-/// When a tenant switch takes effect. See [`TAKES_EFFECT_DETAIL`].
-pub(crate) const TAKES_EFFECT: &str = "live";
+/// When a tenant switch takes effect, overall: some surfaces switch at once,
+/// some only at the next runner start. The per-surface answer is
+/// [`PIN_SURFACES`]; this is its one-word summary.
+pub(crate) const TAKES_EFFECT: &str = "mixed";
 
-/// What "live" means, stated for the caller rather than left to inference.
+/// When one pin consumer sees a switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PinTiming {
+    /// Re-reads `machine.json` on each use (`ambient::read_machine_json` is a
+    /// fresh `std::fs::read`, no cache), so the next use sees the new pin.
+    Live,
+    /// Reads the pin once when the runner starts; this process keeps what it
+    /// read, and the new pin applies from the next runner start.
+    NextStart,
+}
+
+/// One consumer of the pin, and when it sees a switch.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) struct PinSurface {
+    pub surface: &'static str,
+    pub timing: PinTiming,
+    /// Where the read is: `file::fn`. Named by function rather than line so it
+    /// does not go stale on the next unrelated edit.
+    pub evidence: &'static str,
+    pub detail: &'static str,
+}
+
+/// Every consumer of the machine pin, classified per-use vs startup. Built
+/// from a grep of every `resolve_tenant_pin` / `resolve_active_tenant_id` /
+/// `active_tenant_uuid` / `active_tenant_id_str` reader, excluding tests, this
+/// module's own readout, and one-shot diagnostics (`coord_doctor`), which read
+/// per invocation.
 ///
-/// Every consumer of the pin re-reads `machine.json` per use: the lib's
-/// `tenant_pin::resolve_tenant_pin` and `session::dual_write::resolve_active_tenant_id`
-/// go through `ambient::read_machine_json`, which is a fresh `std::fs::read`
-/// with no process cache, and no consumer snapshots the pin at startup. So a
-/// switch reaches each NEW session and each device-level surface on that
-/// surface's next read, without a restart. What it does NOT reach is a session
-/// that already exists: each session records its tenant at creation and keeps
-/// it for life (Phase 8b semantics, module docs).
-pub(crate) const TAKES_EFFECT_DETAIL: &str =
-    "live: machine.json is re-read on every use (no process cache, nothing snapshots the pin \
-     at startup), so NEW sessions and device-level surfaces (heartbeat, census, backstop, \
-     coord status publish, the coord-mcp default slot) use the new tenant on their next read \
-     with no restart. Sessions that already exist keep the tenant recorded at their creation \
-     for life.";
-
-/// What already-running sessions do on a switch. A constant so the HTTP
-/// response and the docs above say the same thing.
-pub(crate) const EXISTING_SESSIONS: &str = "unchanged";
+/// Sessions that ALREADY exist are not a surface here. Whether one moves
+/// depends on how its tenant was held at creation, which is what the
+/// `existing_sessions` block of the response reports
+/// ([`crate::coord_mcp::device_session_pin_census`]).
+pub(crate) const PIN_SURFACES: &[PinSurface] = &[
+    PinSurface {
+        surface: "new_session_tenant",
+        timing: PinTiming::Live,
+        evidence: "session/mod.rs::resolve_new_session_tenant \
+                   (also claude_session/coord_register.rs::AiCoordRegistrar::new, \
+                   ::federation_session_tenant)",
+        detail: "the tenant a NEW session is recorded under, read at its creation",
+    },
+    PinSurface {
+        surface: "coord_mcp_new_nonce_mint",
+        timing: PinTiming::Live,
+        evidence: "coord_mcp.rs::mint_and_register_nonce_with (MintPin::MachineNow)",
+        detail: "a new coord-mcp binding with no spawn-chosen tenant samples the pin at mint \
+                 and, if pinned, freezes it for the binding's life",
+    },
+    PinSurface {
+        surface: "coord_mcp_unpinned_session_requests",
+        timing: PinTiming::Live,
+        evidence: "coord_mcp.rs::decide_session_tenant rows 2-4 \
+                   (via session_tenant_or_refuse / session_tenant_decision)",
+        detail: "a binding frozen unpinned re-reads the pin on every proxied request; one \
+                 frozen pinned (row 1) does not",
+    },
+    PinSurface {
+        surface: "device_jwt_refresher",
+        timing: PinTiming::Live,
+        evidence: "mcp/device_jwt_refresher.rs::refresher_loop, \
+                   ::publish_coord_credential_status, ::read_sweep_inputs",
+        detail: "re-read on each refresher tick (5 min) and each slot sweep",
+    },
+    PinSurface {
+        surface: "device_level_publishers",
+        timing: PinTiming::Live,
+        evidence: "agent_worktree/census.rs::build_and_publish, ::resolve_volume_poster; \
+                   agent_worktree/fs_backstop.rs::tick_once; \
+                   agent_worktree/maintenance_executor.rs::report_reset_git_op; \
+                   fleet/resource_sample.rs::publish_once",
+        detail: "re-read on each publish/tick; the volume poster is rebuilt when the tenant \
+                 in its key changes",
+    },
+    PinSurface {
+        surface: "session_outbox_tenant_backfill",
+        timing: PinTiming::Live,
+        evidence: "session/coord_sync.rs::push_record, ::rebuild_create_body",
+        detail: "fills the tenant only for records that carry none, read per record",
+    },
+    PinSurface {
+        surface: "per_request_readouts",
+        timing: PinTiming::Live,
+        evidence: "mcp_api.rs::health; commands/session_info.rs::read_session_tenancy; \
+                   mcp/ui_bridge/gated_flow.rs::ui_bridge_session_handler; \
+                   repo_detection.rs::register_repo_with_coord",
+        detail: "read per request",
+    },
+    PinSurface {
+        surface: "session_coordination_dual_write_gate",
+        timing: PinTiming::NextStart,
+        evidence: "session/dual_write.rs::DualWriteGate::new; \
+                   session/coord_sync.rs::CoordSync::start_flag_poll_task",
+        detail: "the gate resolves its tenant once at construction and the flag poll is \
+                 started only for that tenant; this process keeps both",
+    },
+    PinSurface {
+        surface: "coord_mcp_nonce_restore",
+        timing: PinTiming::NextStart,
+        evidence: "coord_mcp.rs::restore_proxy_nonces_from (restore_time_pin)",
+        detail: "persisted bindings with no recorded tenant take the pin as sampled once at \
+                 boot; bindings already restored count under existing_sessions",
+    },
+];
 
 /// The pin as it stands, plus the bound tenants a switch may choose from.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -384,17 +479,35 @@ pub(crate) fn apply_active_tenant(tenant_id: &str) -> Result<String, SetActiveTe
 }
 
 /// The success payload both doors return after [`apply_active_tenant`].
+///
+/// `existing_sessions` is measured, not asserted: a coord-mcp binding frozen
+/// `Pinned` at creation keeps its tenant, while one frozen unpinned — the
+/// normal single-tenant shape, and a restored or adopted nonce with no recorded
+/// tenant — follows the new pin on its next request. So an unpinned → pinned
+/// switch, the likely first headless use, DOES move running sessions.
 pub(crate) fn applied_payload(
     active_tenant_id: &str,
     previous: Option<String>,
 ) -> serde_json::Value {
+    let census = crate::coord_mcp::device_session_pin_census();
     serde_json::json!({
         "active_tenant_id": active_tenant_id,
         "previous_active_tenant_id": previous,
         "source": "machine.json",
         "takes_effect": TAKES_EFFECT,
-        "takes_effect_detail": TAKES_EFFECT_DETAIL,
-        "existing_sessions": EXISTING_SESSIONS,
+        "surfaces": PIN_SURFACES,
+        "existing_sessions": {
+            "pinned_at_creation": {
+                "count": census.pinned_at_creation,
+                "effect": "keep the tenant they were created with",
+            },
+            "follows_machine_pin": {
+                "count": census.follows_machine_pin,
+                "effect": "use the new pin on their next coord-mcp request, unless their \
+                           workspace declares a tenant (so the count is an upper bound)",
+            },
+            "scope": "live device coord-mcp bindings in this runner process",
+        },
     })
 }
 
@@ -732,7 +845,7 @@ mod tests {
         let data = resp.data.expect("payload");
         assert_eq!(data["active_tenant_id"], BOUND);
         assert_eq!(data["takes_effect"], TAKES_EFFECT);
-        assert_eq!(data["existing_sessions"], EXISTING_SESSIONS);
+        assert!(data["existing_sessions"]["follows_machine_pin"]["count"].is_u64());
         assert_eq!(read_active_tenant_id(&machine).as_deref(), Some(BOUND));
     }
 
