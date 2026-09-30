@@ -2785,6 +2785,16 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                  metadata.area omitted for this plan"
             );
         }
+        // The same rule for `Initiative-Item:` — warned here, every pass, the
+        // push still runs with `metadata.initiative_item` omitted.
+        if let Some(why) = &u.initiative_item_rejected {
+            tracing::warn!(
+                slug = %u.slug,
+                path = %u.source_path,
+                "plan adapter: status-block `Initiative-Item:` rejected — {why}; \
+                 metadata.initiative_item omitted for this plan"
+            );
+        }
         // A push coord has already refused is not re-issued: the request would
         // be byte-identical, so the verdict would be too. Stopping here — rather
         // than merely muting the log — is what makes this a fix and not a mute:
@@ -10872,6 +10882,8 @@ Body.
             depends_on,
             area: None,
             area_rejected: None,
+            initiative_item: None,
+            initiative_item_rejected: None,
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -11222,7 +11234,7 @@ Body.
     /// omitted. A unit with an accepted area is not warned and carries it.
     #[tokio::test]
     async fn reconcile_warns_once_per_pass_for_a_rejected_area() {
-        use super::super::parser::AreaRejection;
+        use super::super::parser::HeaderRejection;
         let buf = LogBuf::default();
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -11239,7 +11251,7 @@ Body.
         let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let bad = ParsedWorkUnit {
-            area_rejected: Some(AreaRejection::NotKebab("agent_worktree".to_string())),
+            area_rejected: Some(HeaderRejection::NotKebab("agent_worktree".to_string())),
             ..unit("2026-01-01-bad-area", "draft")
         };
         let good = ParsedWorkUnit {
@@ -11290,6 +11302,85 @@ Body.
             .get("area")
             .is_none_or(|a| a.is_null()));
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
+    }
+
+    /// `Initiative-Item:` mirrors `Area:`: a rejected declaration is warned
+    /// once per plan per pass and the push still lands with
+    /// `metadata.initiative_item` omitted; an accepted one is carried.
+    #[tokio::test]
+    async fn reconcile_warns_once_per_pass_for_a_rejected_initiative_item() {
+        use super::super::parser::HeaderRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let bad = ParsedWorkUnit {
+            initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+            ..unit("2026-01-01-bad-item", "draft")
+        };
+        let good = ParsedWorkUnit {
+            initiative_item: Some("one-screen".to_string()),
+            ..unit("2026-01-01-good-item", "draft")
+        };
+        let units = vec![bad, good];
+        for _ in 0..2 {
+            reconcile_once(
+                &units,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+                TenantScope::Unresolved,
+            )
+            .await;
+        }
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("status-block `Initiative-Item:` rejected"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            2,
+            "one warning per pass for the one bad plan: {log}"
+        );
+        assert!(warned
+            .iter()
+            .all(|l| l.contains("2026-01-01-bad-item") && l.contains("One Screen")));
+
+        let upserts = sink.upserts.lock().unwrap();
+        let meta_for = |slug: &str| {
+            upserts
+                .iter()
+                .rev()
+                .find(|b| b.slug == slug)
+                // A phase-less unit (this fixture's) pushes a metadata_patch.
+                .and_then(|b| b.metadata.clone().or_else(|| b.metadata_patch.clone()))
+                .expect("the unit was pushed")
+        };
+        // A rejected item is never sent as a value: absent, or an RFC 7396
+        // null (delete) in the phase-less patch arm.
+        assert!(meta_for("2026-01-01-bad-item")
+            .get("initiative_item")
+            .is_none_or(|v| v.is_null()));
+        assert_eq!(
+            meta_for("2026-01-01-good-item")["initiative_item"],
+            "one-screen"
+        );
     }
 
     #[tokio::test]

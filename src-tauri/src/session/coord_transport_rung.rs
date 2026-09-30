@@ -376,12 +376,15 @@ const READ_TOOLS: &[&str] = &[
     "coord_orient",
     "coord_overlord_interventions",
     "coord_pr_status",
+    "coord_project_state",
     "coord_reevaluate_dry",
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
+    // Not covered by the `coord_work_unit_list` prefix below.
+    "coord_work_unit_overview",
 ];
 
 /// Read-only tool FAMILIES by prefix.
@@ -976,6 +979,16 @@ mod tests {
         assert_eq!(
             operation_for_call("tools/call", Some("coord_overlord_record")),
             OPERATION_WRITE
+        );
+        // The one-screen reads: neither is prefix-covered (`coord_work_unit_list`
+        // does not claim `coord_work_unit_overview`), so both are exact entries.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_project_state")),
+            OPERATION_READ
+        );
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_work_unit_overview")),
+            OPERATION_READ
         );
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
         assert_eq!(
