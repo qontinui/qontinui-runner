@@ -122,11 +122,15 @@ repos:
       # any Cargo.toml — and on the library that holds the list. Its own hook
       # rather than a wider trigger on the attribution test: the manifest walk
       # takes well under a second, the full test ~16s, and Cargo.toml changes
-      # in about one commit in a hundred.
+      # in a few percent of commits (38 of 2021 since 2026-06-30, measured
+      # 2026-09-30). `stages: [pre-commit]` for the reason push-range-test
+      # gives below: the pre-push stage set is what the direct-shim installer
+      # mirrors, and this gates the edit, not the push.
       - id: gen-events-path-deps
         name: gen-events drift — in-repo path deps are attribution inputs
         entry: bash .pre-commit-hooks/gen-events-path-deps-check.sh
         language: system
+        stages: [pre-commit]
         files: '(^|/)Cargo\.toml$|^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
@@ -141,7 +145,7 @@ repos:
       # assert on cargo's own manifest-load error text; they SKIP with a stated
       # reason when cargo is absent.)
       #
-      # Explicitly `stages: [pre-commit]`, unlike the entry above. The pre-push
+      # Explicitly `stages: [pre-commit]`, unlike gen-events-attribution-test. The pre-push
       # stage set is what a direct-shim installer has to mirror, so this test
       # deliberately does not enlarge it — it gates the edit, which is when it
       # can actually catch something.

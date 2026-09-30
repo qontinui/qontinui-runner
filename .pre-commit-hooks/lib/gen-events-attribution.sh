@@ -117,8 +117,9 @@
 # It errs the other way on purpose elsewhere, and each of these merely costs
 # the exclusion: a raw-string literal (`title = r"x"`), a `true` value, or an
 # `=` inside a string (`title = "a=b"`) in a schemars attribute; and a Rust
-# raw string holding TOML whose line begins `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
-# as a wrapped cfg_attr the day that file also gains a `.md"` literal; and a
+# raw string holding TOML whose line begins `path = "…"` (as
+# src-tauri/src/restate/config.rs has today), which arm 4 reads as a wrapped
+# cfg_attr the day that file also gains a `.md"` literal; and a
 # crate doc `#![doc = include_str!("../README.md")]`, which arm 5 flags on
 # every push. That last is deliberately not carved out: a crate doc cannot
 # reach a schema today, but a carve-out is a narrowing, and the header's rule
@@ -278,20 +279,23 @@ _gen_events_derive_premise_paths() {
 }
 _gen_events_derive_premise_paths
 
-# `path = "…"` values in the manifest at $1, from dependency-shaped sections
-# only — any section whose name contains `dependencies`, and `[patch.*]` — so
-# the `path` of a `[[bin]]`/`[lib]`/`[[test]]` target is not taken for a
-# dependency. Comments are stripped first.
+# `path = "…"` (or TOML's single-quoted literal `path = '…'`) values in the
+# manifest at $1, from dependency-shaped sections only — any section whose
+# name contains `dependencies`, and `[patch.*]` — so the `path` of a
+# `[[bin]]`/`[lib]`/`[[test]]` target is not taken for a dependency. Comments
+# are stripped first. The quote class is built from a -v variable because a
+# `'` cannot sit inside the single-quoted awk program.
 _gen_events_cargo_path_deps() {
-    awk '
+    awk -v q="'" '
+        BEGIN { re = "(^|[^_a-zA-Z0-9])path *= *[\"" q "][^\"" q "]*[\"" q "]" }
         /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
         { sub(/#.*/, "") }
         sec ~ /dependencies/ || sec ~ /^\[patch/ {
             s = $0
-            while (match(s, /(^|[^_a-zA-Z0-9])path *= *"[^"]*"/)) {
+            while (match(s, re)) {
                 v = substr(s, RSTART, RLENGTH)
-                sub(/^.*path *= *"/, "", v); sub(/"$/, "", v)
-                print v
+                sub(/^.*path *= */, "", v)
+                print substr(v, 2, length(v) - 2)
                 s = substr(s, RSTART + RLENGTH)
             }
         }' "$1"
@@ -325,14 +329,34 @@ _gen_events_normalize_rel() {
 # in-repo dependency to its own manifest. Out-of-repo paths are skipped: a push
 # to this repo cannot change them. The input list names crates by hand, and
 # two were once missing — this is what keeps it honest.
+#
+# Exit 0: the walk ran (its output is the answer). Exit 2: it could not run
+# meaningfully — src-tauri/Cargo.toml is missing, yields no path dependency
+# at all (the export crate has several, so zero means the parser is not
+# seeing them), or awk failed — with an ERROR line. A caller must fail on 2:
+# an empty answer from a walk that read nothing is not "complete".
 gen_events_uncovered_path_deps() {
-    local root="$1" m dir dep rel entry covered seen=" "
+    local root="$1" m dir dep deps rel entry covered seen=$'\n'
     local queue=("src-tauri/Cargo.toml" "Cargo.toml")
+    if [ ! -f "$root/src-tauri/Cargo.toml" ]; then
+        echo "ERROR $root/src-tauri/Cargo.toml does not exist — nothing to walk"
+        return 2
+    fi
     while [ "${#queue[@]}" -gt 0 ]; do
         m="${queue[0]}"; queue=("${queue[@]:1}")
-        case "$seen" in *" $m "*) continue ;; esac
-        seen+="$m "
+        # Newline-delimited, so a manifest path with a space cannot alias.
+        case "$seen" in *$'\n'"$m"$'\n'*) continue ;; esac
+        seen+="$m"$'\n'
         [ -f "$root/$m" ] || continue
+        # Captured, not fed through `< <(..)`, so awk's status is not lost.
+        if ! deps="$(_gen_events_cargo_path_deps "$root/$m")"; then
+            echo "ERROR reading path dependencies from $m failed (awk)"
+            return 2
+        fi
+        if [ "$m" = "src-tauri/Cargo.toml" ] && [ -z "$deps" ]; then
+            echo "ERROR src-tauri/Cargo.toml yielded no path dependency at all — the parser is not seeing them"
+            return 2
+        fi
         dir="$(dirname "$m")"
         while IFS= read -r dep; do
             [ -n "$dep" ] || continue
@@ -344,8 +368,27 @@ gen_events_uncovered_path_deps() {
             done
             [ "$covered" = yes ] || printf '%s (from %s)\n' "$rel" "$m"
             queue+=("$rel/Cargo.toml")
-        done < <(_gen_events_cargo_path_deps "$root/$m")
+        done <<< "$deps"
     done
+    return 0
+}
+
+# Record whether git's pre-push protocol is on stdin, for `gen_events_stage`.
+# The fleet's direct pre-push shim runs each hook as `bash <hook> < <copy of
+# git's stdin>` and exports no PRE_COMMIT_* at all, so without this a real
+# push reads as `commit`. Reads stdin through push-range.sh's
+# `push_pushed_refs`, which never blocks (a terminal stdin is skipped, reads
+# are time-bounded) and is safe to consume because the shim hands every hook
+# its own copy. Call it ONCE, before anything else reads stdin. Only a
+# complete ref list (exit 0) counts: a stalled or malformed stream is not
+# evidence of a push.
+gen_events_detect_stage_from_stdin() {
+    [ -z "${PRE_COMMIT_TO_REF:-}${PRE_COMMIT_REMOTE_NAME:-}" ] || return 0
+    if push_pushed_refs >/dev/null 2>&1; then
+        GEN_EVENTS_STAGE_HINT=push
+        export GEN_EVENTS_STAGE_HINT
+    fi
+    return 0
 }
 
 # Which hook stage is running: `push` when pre-commit is running a pre-push
@@ -353,10 +396,13 @@ gen_events_uncovered_path_deps() {
 # lib/push-range.sh reads the first the same way — otherwise `commit`. A
 # manual `pre-commit run --from-ref .. --to-ref ..` sets PRE_COMMIT_TO_REF
 # too, and reads as `push`: it checks a range of commits, which is what a
-# push is. A plain manual run reads as `commit`. The wording of every verdict
-# depends on it: "this push" is false at pre-commit.
+# push is. A plain manual run reads as `commit`. Under the direct pre-push
+# shim, which exports none of those, `gen_events_detect_stage_from_stdin` has
+# read git's own protocol and left GEN_EVENTS_STAGE_HINT=push. The wording of
+# every verdict depends on it: "this push" is false at pre-commit.
 gen_events_stage() {
-    if [ -n "${PRE_COMMIT_TO_REF:-}" ] || [ -n "${PRE_COMMIT_REMOTE_NAME:-}" ]; then
+    if [ -n "${PRE_COMMIT_TO_REF:-}" ] || [ -n "${PRE_COMMIT_REMOTE_NAME:-}" ] \
+       || [ "${GEN_EVENTS_STAGE_HINT:-}" = "push" ]; then
         echo push
     else
         echo commit
