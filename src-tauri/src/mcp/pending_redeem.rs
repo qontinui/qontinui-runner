@@ -29,18 +29,25 @@
 //! only the `device_id` cannot forge it. Web verifies the signature, the
 //! `device_id` claim against the path, a 30-day grace past `exp`, that the
 //! device is not revoked, and that an operator authorized it. A device that
-//! holds no such token (never paired, store wiped, or past the grace window)
-//! is outside this door and still needs a typed or CLI pair code — so we make
-//! no request at all rather than send one web must refuse.
+//! holds no such token (never paired, fully signed out, store wiped, or past
+//! the grace window) is outside this door and still needs a typed or CLI pair
+//! code — so we make no request at all rather than send one web must refuse.
+//!
+//! The refresher CLEARS dead slots (the `unrefreshable` path) and a default
+//! logout clears `access_token`, so the store keeps the newest device JWT it
+//! has held in a dedicated anchor slot (`secure_storage`'s
+//! `redeem_anchor_jwt`, maintained on every write) that survives those clears.
+//! It is used only as this poll's bearer and is reset after a successful redeem.
 //!
 //! ## When it runs
 //!
 //! Once per device-JWT refresher pass ([`on_refresher_pass`], called from
 //! `device_jwt_refresher::refresher_loop` after the pass has published its
-//! posture), and only when that posture is `expired`, `unrefreshable` or
-//! `absent`. The refresher can iterate faster than its 300 s cadence (transient
-//! backoff, kicks), so this module carries its own spacing: at most one poll per
-//! [`MIN_POLL_SPACING`], longer after a failure.
+//! posture), and only when that posture cannot answer coord (`expired`,
+//! `unrefreshable`, `absent` or `dark`; see [`posture_wants_poll`] for where an
+//! operator revoke lands). The refresher can iterate faster than its 300 s
+//! cadence (transient backoff, kicks), so this module carries its own spacing:
+//! at most one poll per [`MIN_POLL_SPACING`], longer after a failure.
 //!
 //! ## Secrets
 //!
@@ -106,19 +113,21 @@ pub(crate) fn redact_code(msg: &str, code: &RedeemCode) -> String {
 
 /// Does this posture call for claiming an operator-authorized redeem?
 ///
-/// `None` (no refresher pass has concluded yet) is UNKNOWN, not dark, so it
-/// does not poll. `dark(upstream_401)` is excluded: coord is refusing a
-/// locally valid credential, which a pair code does not explain and web's
-/// device-scoped revocation already answers.
+/// Every posture that cannot answer coord polls: `expired`, `unrefreshable`,
+/// `absent` and `dark(..)`. `live`/`expiring` do not, and neither does `None`
+/// (no refresher pass has concluded yet), which is UNKNOWN rather than dark.
+///
+/// Where an operator REVOKE lands: coord then refuses the device's refresh
+/// (`403 device_credential_revoked`) and web refuses the machine-key exchange,
+/// so a per-tenant slot is cleared on that 403 and its re-derive fails —
+/// `unrefreshable` — and a legacy-only runner reaches `expired` when its token
+/// lapses. `dark(upstream_401)` is the remaining way coord says "not this
+/// credential" (a locally valid token refused on use), and a fresh pairing is
+/// its cure too. Polling in any of them is safe: web answers `204` or a typed
+/// `403 device_credential_revoked` until an operator clicks Authenticate, and
+/// the failure backoff bounds the rate.
 pub(crate) fn posture_wants_poll(posture: Option<CoordCredentialPosture>) -> bool {
-    matches!(
-        posture,
-        Some(
-            CoordCredentialPosture::Expired
-                | CoordCredentialPosture::Unrefreshable
-                | CoordCredentialPosture::Absent
-        )
-    )
+    posture.is_some_and(|p| !p.can_answer())
 }
 
 /// Decode a JWT payload WITHOUT verifying it. Web is the verifier; this only
@@ -260,6 +269,9 @@ pub(crate) trait RedeemEffects {
     /// Redeem `code` against `web_base` and persist the resulting credential.
     /// An `Err` may embed the code; the caller redacts it before logging.
     async fn redeem(&self, web_base: &str, code: &RedeemCode) -> Result<(), String>;
+    /// Drop the now-spent pending-redeem anchor (re-seeded from the fresh
+    /// credential the redeem stored).
+    async fn clear_anchor(&self);
     /// Wake the cloud relay so it reconnects with the fresh credential.
     async fn kick_relay(&self);
 }
@@ -396,6 +408,7 @@ where
             );
             match effects.redeem(inputs.web_base, &code).await {
                 Ok(()) => {
+                    effects.clear_anchor().await;
                     effects.kick_relay().await;
                     info!("pending_redeem: device {device_id} re-paired from an operator-authorized redeem; relay kicked");
                     state.succeeded(now);
@@ -465,6 +478,12 @@ impl RedeemEffects for LiveEffects {
         .map(|_| ())
     }
 
+    async fn clear_anchor(&self) {
+        if let Err(e) = crate::auth::AuthManager::new().reset_redeem_anchor() {
+            warn!("pending_redeem: could not reset the spent redeem anchor: {e:#}");
+        }
+    }
+
     async fn kick_relay(&self) {
         // `redeem_pair_code` already kicks the relay; kicking again is
         // idempotent and keeps this door's contract explicit rather than
@@ -488,11 +507,15 @@ fn resolve_device_id() -> Option<String> {
         .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok())
 }
 
-/// Every stored device JWT — the legacy `access_token` slot and each
-/// per-tenant slot — expired or not.
+/// Every stored device JWT — the retained redeem anchor, the legacy
+/// `access_token` slot and each per-tenant slot — expired or not. The anchor
+/// is what a stranded device still holds after its slots were cleared.
 fn stored_device_jwts() -> Vec<String> {
     let am = crate::auth::AuthManager::new();
     let mut out = Vec::new();
+    if let Ok(Some(t)) = am.get_redeem_anchor_jwt() {
+        out.push(t);
+    }
     if let Ok(t) = am.get_access_token() {
         out.push(t);
     }
@@ -667,6 +690,10 @@ mod tests {
             }
         }
 
+        async fn clear_anchor(&self) {
+            self.calls.lock().unwrap().push("clear_anchor");
+        }
+
         async fn kick_relay(&self) {
             self.calls.lock().unwrap().push("kick_relay");
         }
@@ -713,9 +740,6 @@ mod tests {
         for posture in [
             Some(CoordCredentialPosture::Live),
             Some(CoordCredentialPosture::Expiring),
-            Some(CoordCredentialPosture::Dark(
-                crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected,
-            )),
             None, // UNKNOWN is not dark
         ] {
             let mut state = PollState::default();
@@ -797,6 +821,9 @@ mod tests {
             CoordCredentialPosture::Expired,
             CoordCredentialPosture::Unrefreshable,
             CoordCredentialPosture::Absent,
+            CoordCredentialPosture::Dark(
+                crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected,
+            ),
         ] {
             let fx = FakeEffects::default();
             let mut state = PollState::default();
@@ -812,8 +839,8 @@ mod tests {
             assert_eq!(r, PassResult::Redeemed, "{posture:?}");
             assert_eq!(
                 fx.calls(),
-                vec!["redeem", "kick_relay"],
-                "redeem, THEN kick"
+                vec!["redeem", "clear_anchor", "kick_relay"],
+                "redeem, then drop the spent anchor, then kick"
             );
             assert_eq!(fx.redeemed_code.lock().unwrap().as_deref(), Some(CODE));
             assert_eq!(
@@ -894,6 +921,55 @@ mod tests {
         assert_eq!(r, PassResult::Throttled);
         assert_eq!(web.hits(), 3, "one direct poll + two passes");
         assert!(fx.calls().is_empty());
+    }
+
+    /// Revoke → Authenticate end to end, runner side: while the device is
+    /// revoked web answers 403 `device_credential_revoked` and the runner backs
+    /// off; once an operator authorizes, the next due poll collects the code.
+    #[tokio::test]
+    async fn a_revoked_device_polls_and_collects_the_code_once_authorized() {
+        for posture in [
+            CoordCredentialPosture::Unrefreshable,
+            CoordCredentialPosture::Expired,
+            CoordCredentialPosture::Dark(
+                crate::mcp::device_jwt_refresher::DarkCause::UpstreamRejected,
+            ),
+        ] {
+            assert!(posture_wants_poll(Some(posture)), "{posture:?}");
+        }
+        let anchor = device_jwt(DID, now_unix() - 600);
+        let fx = FakeEffects::default();
+        let mut state = PollState::default();
+        let now = Instant::now();
+
+        let revoked = spawn_web(
+            StatusCode::FORBIDDEN,
+            Some(serde_json::json!({"detail": {"code": "device_credential_revoked"}})),
+        );
+        let r = pass(
+            Some(CoordCredentialPosture::Unrefreshable),
+            &revoked.base,
+            Some(anchor.clone()),
+            &mut state,
+            now,
+            &fx,
+        )
+        .await;
+        assert_eq!(r, PassResult::PollFailed);
+        assert_eq!(revoked.hits(), 1);
+
+        let authorized = spawn_web(StatusCode::OK, Some(serde_json::json!({"code": CODE})));
+        let r = pass(
+            Some(CoordCredentialPosture::Unrefreshable),
+            &authorized.base,
+            Some(anchor),
+            &mut state,
+            now + MIN_POLL_SPACING,
+            &fx,
+        )
+        .await;
+        assert_eq!(r, PassResult::Redeemed);
+        assert_eq!(fx.calls(), vec!["redeem", "clear_anchor", "kick_relay"]);
     }
 
     #[test]
