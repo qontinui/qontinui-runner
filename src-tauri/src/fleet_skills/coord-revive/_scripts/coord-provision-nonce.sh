@@ -191,21 +191,51 @@ curl_path() {
 
 # JSON reader: jq if present, else python. Both read from STDIN (or take the
 # FILE PATH, which is not key material) so no credential ever crosses to argv.
-if command -v jq >/dev/null 2>&1; then
+# COORD_PROVISION_NONCE_NO_JQ=1 selects the python arm even where jq exists:
+# it is how coord-provision-nonce-test.sh exercises that arm on a box (and a
+# CI image) that has jq, where it otherwise never runs - which is how it went
+# broken unnoticed.
+# JSON_READER records which arm was chosen, so the body ENCODER below uses the
+# same one: it used to re-test `command -v jq` on its own, which put jq back on
+# the forced-python path.
+if [ "${COORD_PROVISION_NONCE_NO_JQ:-}" != "1" ] && command -v jq >/dev/null 2>&1; then
+  JSON_READER=jq
   # `// empty` would be WRONG here and the bug would be invisible: jq's `//`
   # treats `false` as absent, so `.frontendReady // empty` returns nothing for
   # a HEADLESS runner - the one answer this whole helper exists to surface, read
   # as "the field is missing". `select(. != null)` keeps `false` and drops only
   # a genuinely absent key.
   json_get() { jq -r "try ($1) catch empty | select(. != null)" 2>/dev/null; }
+  # TYPE-STRICT boolean read: prints true/false only for a JSON boolean, and
+  # nothing for a string "true", a number or an object - the same rule the
+  # PowerShell twin (Get-RunnerFrontendState, `-is [bool]`) applies, so the
+  # two languages cannot reach different verdicts on one /health body.
+  json_get_bool() { jq -r "try ($1) catch empty | select(type == \"boolean\")" 2>/dev/null; }
 elif command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+  JSON_READER=python
   PY="python3"; command -v python3 >/dev/null 2>&1 || PY="python"
-  # $1 is a dotted path like `mcpServers.coord-mcp.url`; walk it defensively so
-  # a shape change becomes an empty answer the caller NAMES, not a stack trace.
-  json_get() {
+  # $1 is the SAME jq path the jq arm evaluates - `.port`, or
+  # `.mcpServers["coord-mcp"].headers["X-Coord-Mcp-Proxy-Key"]` - and it is
+  # parsed as such: `.name` and `["quoted key"]` segments, nothing else. The
+  # previous arm stripped `"[]` with tr and split on dots, which fused a
+  # bracketed key onto its parent (`.mcpServerscoord-mcp.url`), so on a box
+  # without jq EVERY provision-session answer read as
+  # PROVISION_SHAPE_UNRECOGNISED and the mint never succeeded. An unparseable
+  # path or a shape change is an empty answer the caller NAMES, never a stack
+  # trace. $2 is the mode: `any`, or `bool` for the type-strict read.
+  json_walk() {
     "$PY" -c '
-import json,sys
-path=sys.argv[1].lstrip(".").split(".")
+import json,re,sys
+expr,mode=sys.argv[1],sys.argv[2]
+seg=re.compile(r"\.([A-Za-z_][A-Za-z0-9_-]*)|\[\x22([^\x22]*)\x22\]")
+path=[]
+pos=0
+while pos<len(expr):
+    m=seg.match(expr,pos)
+    if not m:
+        sys.exit(0)
+    path.append(m.group(1) if m.group(1) is not None else m.group(2))
+    pos=m.end()
 try:
     node=json.load(sys.stdin)
 except Exception:
@@ -215,11 +245,18 @@ for key in path:
         node=node[key]
     else:
         sys.exit(0)
+if mode=="bool":
+    if isinstance(node,bool):
+        print(json.dumps(node))
+    sys.exit(0)
 if node is None:
     sys.exit(0)
 print(node if isinstance(node,str) else json.dumps(node))
-' "$(printf '%s' "$1" | tr -d '"[]' )" 2>/dev/null
+' "$1" "$2" 2>/dev/null
   }
+  json_get() { json_walk "$1" any; }
+  # TYPE-STRICT boolean read; see the jq arm above.
+  json_get_bool() { json_walk "$1" bool; }
 else
   echo "coord-provision-nonce: ERROR: neither jq nor python can read JSON (LOCAL fault, not a runner verdict)." >&2
   exit 127
@@ -322,8 +359,21 @@ if [ "$MODE" = "frontend-state" ]; then
         echo "frontend-state: $origin -> HTTP ${CODE:-000} [$(printf '%s' "$(cat "$TMPD/err" 2>/dev/null)" | one_line)]" >&2
         continue ;;
     esac
-    READY="$(printf '%s' "$BODY" | json_get '.frontendReady')"
+    # Top level first, then under `data`: current runner builds serve /health
+    # in their ApiResponse envelope ({success, data: {frontendReady, ...}},
+    # buildId still top-level), and a top-level-only read turned every such
+    # ANSWER into `unknown`, so a headless runner was never named (measured on
+    # build ce72c6ca3-1790142085123, 2026-09-28; coord finding ba492848).
+    # Booleans only: a top-level value that is not true/false (absent, null,
+    # the STRING "true") falls through to `data`, and a non-boolean there is
+    # UNKNOWN below - never read as a verdict.
+    READY="$(printf '%s' "$BODY" | json_get_bool '.frontendReady')"
+    case "$READY" in
+      true|false) ;;
+      *) READY="$(printf '%s' "$BODY" | json_get_bool '.data.frontendReady')" ;;
+    esac
     STATE="$(printf '%s' "$BODY" | json_get '.frontendState')"
+    [ -n "$STATE" ] || STATE="$(printf '%s' "$BODY" | json_get '.data.frontendState')"
     [ -n "$STATE" ] || STATE="unknown"
     # The runner's buildId, from the SAME body. A missing or non-string field
     # is `unknown` -- a caller stamping a claim with it renders the honest
@@ -469,7 +519,7 @@ resolve_loopback_key_file() {
 # already present rather than hand-escaping.
 # `tenant_id` rides only when --tenant was given, so a caller that names no
 # tenant sends the byte-identical `{cwd}` body every runner build understands.
-if command -v jq >/dev/null 2>&1; then
+if [ "$JSON_READER" = "jq" ]; then
   if [ -n "$TENANT_ARG" ]; then
     BODY_JSON="$(jq -nc --arg cwd "$CWD_ARG" --arg t "$TENANT_ARG" '{cwd:$cwd, tenant_id:$t}')"
   else
