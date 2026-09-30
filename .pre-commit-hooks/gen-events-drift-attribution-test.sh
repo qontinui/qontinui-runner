@@ -586,6 +586,16 @@ premise_case "guard fires: a rustfmt-wrapped cfg_attr path" violation \
     "$(printf '#[cfg_attr(\n    unix,\n    path = "body.md"\n)]\nmod body;')"
 premise_case "guard is quiet on tracing's path = %p beside a .md literal" clean \
     'fn f() { debug!(path = %rel, "see notes.md"); }'
+# Non-Rust files beside the sources DESCRIBE these patterns without the
+# compiler ever reading them: a command body quoting attributes and TOML, a
+# shell helper assigning `path=`. Probing them would drop the exclusion on
+# every push (#1667 again).
+premise_case "guard is quiet on a .md command body that quotes the patterns" clean \
+    "$(printf 'Use #[schemars(description = BODY)] with include_str!("x.md") on a JsonSchema type.\n#[path = "body.md"] mod body;\npath = "../qontinui-schemas"\n')" \
+    src-tauri/src/fleet_commands/describe.md
+premise_case "guard is quiet on a .sh helper with path= and a .md literal" clean \
+    "$(printf '#!/usr/bin/env bash\npath="$1"\ncat "notes.md"\ninclude!("x.md")\n')" \
+    src-tauri/src/fleet_skills/helper/run.sh
 premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) and #[path = x.rs]" clean \
     "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
 premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \

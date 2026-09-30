@@ -97,15 +97,22 @@
 #    expression (`description = "x".to_owned() + BODY`): arm 6 reads only the
 #    first character after the `=`.
 #
-# Reach: the premise probe reads the working tree including untracked AND
-# gitignored files, since the compiler reads an ignored `.rs` as readily as a
-# tracked one. The attribution list itself (`ls-files --others
+# Reach: the premise probe reads Rust sources only (`*.rs` under the
+# directory-prefix inputs, plus the build scripts), in the working tree
+# including untracked AND gitignored files, since the compiler reads an ignored
+# `.rs` as readily as a tracked one. Not the ~100 markdown command bodies and
+# shell helpers beside them: those DESCRIBE these patterns (a TOML
+# `path = "…"`, prose quoting `include_str!` and JsonSchema) and the compiler
+# never reads them as Rust, so probing them would drop the exclusion on every
+# push and bring #1667 back. The attribution list itself (`ls-files --others
 # --exclude-standard`) still skips ignored inputs, so an edit to an ignored
 # source file is never blamed — a limitation that predates the markdown
 # exclusion and is not changed by it.
-# It errs the other way on purpose elsewhere: a raw-string literal
-# (`title = r"x"`) or a `true` value reads as a violation and merely costs the
-# exclusion.
+# It errs the other way on purpose elsewhere, and each of these merely costs
+# the exclusion: a raw-string literal (`title = r"x"`) or a `true` value in a
+# schemars attribute; and a Rust raw string holding TOML whose line begins
+# `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
+# as a wrapped cfg_attr the day that file also gains a `.md"` literal.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -203,12 +210,14 @@ GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
     ':(exclude)*.md'
 )
 
-# Where the premise guard looks: the directory-prefix inputs above, the only
-# ones under which a `.md` could be a sibling of Rust that embeds it.
+# Where the premise guard looks: the Rust sources under the directory-prefix
+# inputs above, the only ones under which a `.md` could be a sibling of Rust
+# that embeds it. Rust only — see "Reach" in the header. `**/` also matches
+# zero directories, so `src-tauri/src/lib.rs` is in.
 GEN_EVENTS_PREMISE_PATHS=(
-    "src-tauri/src"
-    "src-tauri/clorinde"
-    "crates/spec-check"
+    ":(glob)src-tauri/src/**/*.rs"
+    ":(glob)src-tauri/clorinde/**/*.rs"
+    ":(glob)crates/spec-check/**/*.rs"
 )
 
 # Build scripts the export build runs. A build script can read a markdown file
@@ -230,10 +239,14 @@ GEN_EVENTS_PREMISE_BUILD_SCRIPTS=(
 _gen_events_grep_in() {
     local dir="$1" n="$2"; shift 2
     local paths=("${@:1:$n}"); shift "$n"
-    local out rc=0
-    out="$(git -C "$dir" grep --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>&1)" || rc=$?
+    local out err rc=0
+    # stdout only: a warning on stderr must not become a "matched path". The
+    # error text is fetched only when the grep actually failed, by re-running
+    # it with stdout discarded — cheaper and tidier than a temp file.
+    out="$(git -C "$dir" grep --no-color --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>/dev/null)" || rc=$?
     if [ "$rc" -gt 1 ]; then
-        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${out%%$'\n'*}"
+        err="$(git -C "$dir" grep --no-color --untracked --no-exclude-standard "$@" -- "${paths[@]}" 2>&1 >/dev/null || true)"
+        printf 'ERROR git grep %s (exit %d): %s\n' "$*" "$rc" "${err%%$'\n'*}"
         return 2
     fi
     [ "$rc" -eq 0 ] && printf '%s\n' "$out"
