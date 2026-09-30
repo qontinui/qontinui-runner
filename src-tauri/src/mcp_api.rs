@@ -4239,11 +4239,20 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
     "coord_work_unit_add_citation",
+    // Plan 2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr
+    // Phase 4 (qontinui-coord#2616): attest a phase that ships no PR. It cannot
+    // forge `shipped` — coord's I1+I2 mean an attestation never creates delivery
+    // nor demotes; it only releases a phase-coverage pin on a unit that already
+    // has a real landed PR, disclosed as a `PHASE ATTESTED WITHOUT A PR` gap.
+    "coord_work_unit_attest_phase",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
     "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
+    // Same plan/phase: the undo of `coord_work_unit_attest_phase`. It writes the
+    // attestation table, not citations, so it cannot erase a citation.
+    "coord_work_unit_retract_phase_attestation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
     "coord_write_prompt_document",
@@ -15131,6 +15140,30 @@ mod coord_mcp_body_gate_tests {
             "the parser must read the entry exactly once: {:?}",
             parsed.allowed
         );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr`
+    /// Phase 4: coord grants the phase-attestation pair to device principals, so
+    /// this door must forward both — and the source-text parser must read each
+    /// entry back exactly once despite the comments above them.
+    #[test]
+    fn phase_attestation_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_work_unit_attest_phase",
+            "coord_work_unit_retract_phase_attestation",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
