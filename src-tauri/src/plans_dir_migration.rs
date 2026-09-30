@@ -79,7 +79,7 @@ use crate::settings::PathSettings;
 use tracing::info;
 
 /// The retired per-machine override. Read here, once per primary boot, to
-/// seed a blank setting — and nowhere else.
+/// seed a blank setting — and nowhere else in production.
 pub const PLAN_ADAPTER_DIR_ENV: &str = "QONTINUI_PLAN_ADAPTER_DIR";
 
 /// The fleet's "am I inside the runner?" identity marker, injected into every
@@ -488,7 +488,7 @@ mod tests {
     /// reads the variables: a SET env var has NO effect on the resolved plans
     /// dir. The resolver returns the setting regardless of the environment,
     /// and an unset setting stays unset however the env is exported — only
-    /// the one-shot migration reads it.
+    /// the boot-time seed reads it.
     ///
     /// The empty map and `None` tenant are the device-default rung — this
     /// migration is device-wide and deliberately keys nothing by tenant: it
