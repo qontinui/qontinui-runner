@@ -23,6 +23,8 @@ import {
   stateChipTitle,
   type AgentTruthEntry,
 } from "../agentTruth";
+import { useAgentMetrics } from "../agentMetrics";
+import { AgentMetricsStrip } from "../AgentMetricsStrip";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
 import { ActivitySparkline } from "./ActivitySparkline";
@@ -173,6 +175,7 @@ function CompactZoneCardInner({
 }) {
   const needsInput = isNeedsInputState(state);
   const approvalInferred = !isAuthoritativePermissionAsk(agentTruth?.verdict);
+  const agentMetrics = useAgentMetrics(tab.id);
   const [cardState, dispatch] = useReducer(
     compactCardReducer,
     { zoneLabel, note },
@@ -588,6 +591,13 @@ function CompactZoneCardInner({
             </div>
           )}
         </div>
+      )}
+
+      {/* Context / cost / 5h headroom with source + age (Phase 7). Only a tab
+          running an agent can have them: a Claude session, or any tab the runner
+          has already reported metrics for. */}
+      {(tab.claudeSessionId || agentMetrics) && (
+        <AgentMetricsStrip metrics={agentMetrics} className="shrink-0" />
       )}
 
       {cardState.showFilter && (
