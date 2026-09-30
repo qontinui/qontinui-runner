@@ -857,27 +857,6 @@ fn collect_host_lane() -> ResourceSample {
         s.commit_available_bytes = Some(m.commit_available);
     }
 
-    // The machine's capability, built around the SAME reading (no second
-    // `GlobalMemoryStatusEx`), and the Phase 2 shadow ladder derived from it
-    // (plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`).
-    //
-    // Nothing new goes on the wire here: the capability figures coord has
-    // columns for (`cpu_cores`, `mem_total_bytes`, and on Windows
-    // `commit_total_bytes`) are already filled above, and the rest is served
-    // on `/health` → `machineCapability` — see `machine_capability`'s module
-    // doc for why the pagefile trio waits for a coord column.
-    //
-    // The shadow runs HERE because this is the one periodic, off-runtime,
-    // off-spawn-path loop that already holds a fresh free-commit reading: it
-    // costs the shadow no memory syscall of its own and adds nothing to any
-    // spawn. It changes no verdict — it logs, edge-triggered, what the scaled
-    // ladder WOULD decide beside what the shipped one does.
-    let capability = super::machine_capability::probe_from(reading);
-    crate::resource_guard::note_commit_ladder_shadow(
-        &capability,
-        reading.map(|m| m.commit_available),
-    );
-
     // Windows has no load average; sysinfo returns zeros there, and a
     // fabricated 0.0 would render as "idle" on a saturated box.
     #[cfg(not(windows))]
@@ -898,7 +877,12 @@ fn collect_host_lane() -> ResourceSample {
     // The runner's build lane IS its `ci_node` executor, so slots and CI jobs
     // are the same occupancy read two ways. The supervisor publishes the
     // Windows build pool's slots under `source='supervisor'`.
-    let ci = crate::settings::get_ci_node_settings();
+    //
+    // ONE settings load serves both this block and the commit-ladder shadow
+    // below (`ci_node` + `session_guard` out of the same document), so the
+    // shadow adds no settings read of its own.
+    let settings = crate::settings::load_settings();
+    let ci = &settings.ci_node;
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
         s.build_slots_total =
@@ -907,6 +891,44 @@ fn collect_host_lane() -> ResourceSample {
     s.build_slots_busy = Some(running.min(i32::MAX as usize) as i32);
     s.build_queue_depth = Some(queued.min(i32::MAX as usize) as i32);
     s.ci_jobs_running = Some(running.min(i32::MAX as usize) as i32);
+
+    // The machine's capability, built around the SAME memory reading (no second
+    // `GlobalMemoryStatusEx`), and the Phase 2 shadow ladder derived from it
+    // (plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`).
+    //
+    // Nothing new goes on the wire here: the capability figures coord has
+    // columns for (`cpu_cores`, `mem_total_bytes`, and on Windows
+    // `commit_total_bytes`) are already filled above, and the rest is served
+    // on `/health` → `machineCapability` — see `machine_capability`'s module
+    // doc for why the pagefile trio waits for a coord column.
+    //
+    // The shadow runs HERE because this is the one periodic, off-runtime,
+    // off-spawn-path loop that already holds every input it needs: the free
+    // commit reading, physical RAM and core count (so the `ci_node`
+    // admitted-concurrency alternative is sized from THIS reading, not from a
+    // `host_sizing::probe` sysinfo refresh), and the settings document loaded
+    // just above. What it does add, exactly: the capability probe itself (a
+    // registry read plus a `stat` per live pagefile on Windows, one
+    // `/proc/meminfo` read on Linux) and one lock on the fleet-floor cache.
+    // Nothing on any spawn path. It changes no verdict — it logs,
+    // edge-triggered, what the scaled ladder WOULD decide beside what the
+    // shipped one does.
+    let capability = super::machine_capability::probe_from(reading);
+    let host = crate::ci_node::host_sizing::HostCapacity {
+        mem_bytes: reading.map(|m| m.phys_total).filter(|b| *b > 0),
+        cpus: s
+            .cpu_cores
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(1)
+            .max(1),
+    };
+    crate::resource_guard::note_commit_ladder_shadow(
+        &capability,
+        reading.map(|m| m.commit_available),
+        &settings.session_guard,
+        ci,
+        host,
+    );
 
     // The spawn-pressure pair (plan
     // `2026-08-30-load-aware-spawn-admission-control`, Phase 3b). Pure
