@@ -33,23 +33,35 @@
 //!
 //! The log records ONSETS only. `ended_at` is therefore set only from evidence
 //! the runner actually holds, and `ended_by` names which evidence it was, so a
-//! reader never has to guess how an end was derived:
+//! reader never has to guess how an end was derived. An incident with
+//! `ended_at: null` is one whose condition this process can vouch still holds
+//! — except for the one row below that says otherwise, unknown reason tokens.
 //!
 //! | kind | ends when | `ended_by` | `ended_at` |
 //! |---|---|---|---|
+//! | every known kind below, written by ANOTHER runner process (pid differs) | a later line from a different pid, or else the first read by this process — one runner instance writes a given log, and every writer runs in the process it reports on, so nothing it latched outlives the process | `process_exited` | that later line, else that read |
 //! | `backend_wedged`, `ui_thread_wedged`, `recovery_wedged` | this process's live predicate (`health_monitor::backend_wedged()` / `ui_thread_wedged()` / `webview_recovery::recovery_wedged()`) reads false | `cleared` | the first read that saw it false (an upper bound) |
-//! | same three, written by ANOTHER runner process (pid differs) | a later line from a different pid, or else the first read by this process — one runner instance writes a given log, and a process's wedge cannot outlive the process | `process_exited` | that later line, else that read |
+//! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`coord_outside_observer::fault_open` reads false) — the latch is set exactly when the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
 //! | `health_monitor_thread_stalled`, `health_metrics_thread_stalled` (watchdog, re-written every `WATCHDOG_REPEAT_SECS` while they hold) | no line for 2 × that cadence | `silent` | last line + one cadence (the latest instant the cadence allows it to have held) |
-//! | `coord_*` and any unknown reason (written once per episode, latched) | a newer onset of the same kind — the writer's latch re-armed, so the earlier episode was over | `superseded` | the newer onset |
+//! | any other (unknown) reason token — its writer, cadence and predicate are unknown to this build | a newer onset of the same token | `superseded` | the newer onset |
 //! | same, with no newer onset | its onset is older than [`OPEN_WINDOW_SECS`] | `expired` | onset + that window — the runner stops vouching for it, which is NOT an observed end |
 //!
 //! Any kind is also `superseded` when a new episode of it begins while an
 //! earlier one is still open. Lines that continue an open episode (the
 //! watchdog's repeats, or the monitor's one escalation line landing beside the
-//! watchdog's for the same wedge) extend it rather than opening another. One
-//! stated undercount: two episodes of a live-predicate kind that begin AND end
+//! watchdog's for the same wedge) extend it rather than opening another. Two
+//! stated undercounts: two episodes of a live-predicate kind that begin AND end
 //! entirely between two reads are indistinguishable from one when both lines
-//! came from the watchdog alone.
+//! came from the watchdog alone; and `coord_worker_dead` is per WORKER in the
+//! log but per KIND here, so a second worker's death supersedes the first
+//! worker's row while the kind (some worker is dead) stays open on the newest.
+//!
+//! ## The bound
+//!
+//! At most [`WEDGE_REPORT_BOUND`] rows are kept and published, NEWEST FIRST.
+//! Closed rows are evicted before open ones, oldest first; an open row is
+//! dropped only when more than the bound are open at once — an open wedge is
+//! the one row coord must not lose to twenty closed coord flaps.
 //!
 //! ## Cursor, persistence, rotation
 //!
@@ -64,8 +76,9 @@
 //! nothing is lost from the new one. Only complete lines are consumed; a line
 //! still being written is read on the next pass. The incidents are persisted
 //! with the cursor, so a restart neither re-reports what was read nor loses
-//! what was appended while the runner was down. A missing or corrupt state
-//! file rebuilds the list from the whole log, which is correct, just slower.
+//! what was appended while the runner was down; a pass that changed nothing
+//! does not rewrite the file. A missing or corrupt state file rebuilds the list
+//! from the whole log, which is correct, just slower.
 //!
 //! `build_id` is the build that WROTE the line: this binary's `git_sha` for
 //! this process's pid, else the build a previous process registered for its
@@ -82,10 +95,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-/// Newest incidents published (and kept).
+use crate::coord_outside_observer::FaultClass;
+
+/// Most incidents published (and kept). See "The bound" above.
 pub(crate) const WEDGE_REPORT_BOUND: usize = 20;
 
-/// How long a once-per-episode incident with no end evidence stays open.
+/// How long an incident of an UNKNOWN reason token with no end evidence stays
+/// open. Known kinds never use it.
 pub(crate) const OPEN_WINDOW_SECS: i64 = 86_400;
 
 /// Persisted state, beside `wedge-incidents.log`.
@@ -123,15 +139,31 @@ enum EndRule {
     LivePredicate,
     /// Re-written every watchdog cadence while it holds.
     Repeating,
-    /// Written once per episode by a latched writer.
-    OncePerEpisode,
+    /// An unknown token: writer, cadence and predicate all unknown.
+    Unknown,
 }
 
+/// The kinds with a live in-process predicate ([`LiveView::holds`]).
+const LIVE_PREDICATE_KINDS: [&str; 7] = [
+    "backend_wedged",
+    "ui_thread_wedged",
+    "recovery_wedged",
+    "coord_unreachable",
+    "coord_worker_dead",
+    "coord_no_leader",
+    "coord_liveness_unknown",
+];
+
 fn end_rule(kind: &str) -> EndRule {
-    match kind {
-        "backend_wedged" | "ui_thread_wedged" | "recovery_wedged" => EndRule::LivePredicate,
-        "health_monitor_thread_stalled" | "health_metrics_thread_stalled" => EndRule::Repeating,
-        _ => EndRule::OncePerEpisode,
+    if LIVE_PREDICATE_KINDS.contains(&kind) {
+        EndRule::LivePredicate
+    } else if matches!(
+        kind,
+        "health_monitor_thread_stalled" | "health_metrics_thread_stalled"
+    ) {
+        EndRule::Repeating
+    } else {
+        EndRule::Unknown
     }
 }
 
@@ -268,34 +300,42 @@ impl Default for WedgeReportState {
     }
 }
 
-/// This process's view, sampled once per pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This process's view, sampled once per pass: its pid, its build, and which
+/// live-predicate kinds hold right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveView {
     pub pid: u32,
     pub build_id: Option<&'static str>,
-    pub backend_wedged: bool,
-    pub ui_thread_wedged: bool,
-    pub recovery_wedged: bool,
+    /// The [`LIVE_PREDICATE_KINDS`] whose predicate reads true.
+    pub holding: Vec<&'static str>,
 }
 
 impl LiveView {
     fn sample() -> Self {
+        let mut holding = Vec::new();
+        if crate::health_monitor::backend_wedged() {
+            holding.push("backend_wedged");
+        }
+        if crate::health_monitor::ui_thread_wedged() {
+            holding.push("ui_thread_wedged");
+        }
+        if crate::webview_recovery::recovery_wedged() {
+            holding.push("recovery_wedged");
+        }
+        for class in FaultClass::ALL {
+            if crate::coord_outside_observer::fault_open(class) {
+                holding.push(class.breadcrumb_reason());
+            }
+        }
         Self {
             pid: std::process::id(),
             build_id: crate::fleet::served_git_sha(),
-            backend_wedged: crate::health_monitor::backend_wedged(),
-            ui_thread_wedged: crate::health_monitor::ui_thread_wedged(),
-            recovery_wedged: crate::webview_recovery::recovery_wedged(),
+            holding,
         }
     }
 
     fn holds(&self, kind: &str) -> bool {
-        match kind {
-            "backend_wedged" => self.backend_wedged,
-            "ui_thread_wedged" => self.ui_thread_wedged,
-            "recovery_wedged" => self.recovery_wedged,
-            _ => false,
-        }
+        self.holding.contains(&kind)
     }
 }
 
@@ -335,7 +375,7 @@ impl WedgeReportState {
                         inc.close(at, EndedBy::Silent);
                     }
                 }
-                EndRule::OncePerEpisode => {
+                EndRule::Unknown => {
                     if (now - inc.began_at).num_seconds() > OPEN_WINDOW_SECS {
                         let at = inc.began_at + ChronoDuration::seconds(OPEN_WINDOW_SECS);
                         inc.close(at, EndedBy::Expired);
@@ -346,20 +386,39 @@ impl WedgeReportState {
         }
     }
 
+    /// Close every open KNOWN-kind incident written by a pid other than
+    /// `alive`. Unknown tokens are exempt: their writer is unknown, so its
+    /// process is too.
+    fn close_other_processes(&mut self, alive: u32, at: DateTime<Utc>) {
+        for inc in self.incidents.iter_mut().filter(|i| {
+            i.ended_at.is_none()
+                && end_rule(&i.kind) != EndRule::Unknown
+                && i.pid.is_some_and(|p| p != alive)
+        }) {
+            inc.close(at, EndedBy::ProcessExited);
+        }
+    }
+
+    /// Enforce [`WEDGE_REPORT_BOUND`]: closed rows go first, oldest first;
+    /// open rows only when more than the bound are open.
+    fn enforce_bound(&mut self) {
+        while self.incidents.len() > WEDGE_REPORT_BOUND {
+            let victim = self
+                .incidents
+                .iter()
+                .position(|i| i.ended_at.is_some())
+                .unwrap_or(0);
+            self.incidents.remove(victim);
+        }
+    }
+
     /// Fold one line in, in file order.
     pub(crate) fn fold(&mut self, onset: Onset, live: &LiveView) {
         self.settle_by_time(onset.at);
         // One runner instance writes a given log (`instance::scope_path`), so a
-        // line from pid P proves every OTHER pid's process has exited — and a
-        // process's wedge cannot outlive it.
+        // line from pid P proves every OTHER pid's process has exited.
         if let Some(writer) = onset.pid {
-            for inc in self.incidents.iter_mut().filter(|i| {
-                i.ended_at.is_none()
-                    && end_rule(&i.kind) == EndRule::LivePredicate
-                    && i.pid.is_some_and(|p| p != writer)
-            }) {
-                inc.close(onset.at, EndedBy::ProcessExited);
-            }
+            self.close_other_processes(writer, onset.at);
         }
         let open = self
             .incidents
@@ -386,28 +445,33 @@ impl WedgeReportState {
             last_seen_at: onset.at,
             once_line_seen: !onset.repeats,
         });
-        let excess = self.incidents.len().saturating_sub(WEDGE_REPORT_BOUND);
-        self.incidents.drain(..excess);
+        self.enforce_bound();
     }
 
     /// Close what this process's own live state says is over.
     pub(crate) fn settle(&mut self, now: DateTime<Utc>, live: &LiveView) {
         self.settle_by_time(now);
-        for inc in self.incidents.iter_mut().filter(|i| i.ended_at.is_none()) {
-            if end_rule(&inc.kind) != EndRule::LivePredicate {
-                continue;
-            }
-            match inc.pid {
-                Some(pid) if pid != live.pid => inc.close(now, EndedBy::ProcessExited),
-                _ if !live.holds(&inc.kind) => inc.close(now, EndedBy::Cleared),
-                _ => {}
+        self.close_other_processes(live.pid, now);
+        for inc in self
+            .incidents
+            .iter_mut()
+            .filter(|i| i.ended_at.is_none() && end_rule(&i.kind) == EndRule::LivePredicate)
+        {
+            if !live.holds(&inc.kind) {
+                inc.close(now, EndedBy::Cleared);
             }
         }
     }
 
-    /// The published array, oldest first.
+    /// The published array, NEWEST first.
     pub(crate) fn published(&self) -> serde_json::Value {
-        serde_json::Value::Array(self.incidents.iter().map(Incident::published).collect())
+        serde_json::Value::Array(
+            self.incidents
+                .iter()
+                .rev()
+                .map(Incident::published)
+                .collect(),
+        )
     }
 }
 
@@ -460,12 +524,21 @@ pub(crate) fn read_tail(path: &Path, cursor: Option<&Cursor>) -> std::io::Result
         }
         _ => 0,
     };
-    // Bound one pass: past MAX_READ_BYTES, skip to the newest tail and drop
-    // the partial line the skip lands in.
-    let (seek_to, drop_partial) = if len - start > MAX_READ_BYTES {
-        (len - MAX_READ_BYTES, true)
+    // Bound one pass: past MAX_READ_BYTES, skip to the newest tail. The skip
+    // lands mid-line unless the byte BEFORE it is a newline, and only a
+    // mid-line landing drops its partial first line.
+    let seek_to = if len - start > MAX_READ_BYTES {
+        len - MAX_READ_BYTES
     } else {
-        (start, false)
+        start
+    };
+    let drop_partial = if seek_to > start {
+        f.seek(SeekFrom::Start(seek_to - 1))?;
+        let mut prev = [0u8; 1];
+        f.read_exact(&mut prev)?;
+        prev[0] != b'\n'
+    } else {
+        false
     };
     f.seek(SeekFrom::Start(seek_to))?;
     let mut buf = Vec::with_capacity((len - seek_to) as usize);
@@ -504,41 +577,44 @@ pub(crate) fn read_tail(path: &Path, cursor: Option<&Cursor>) -> std::io::Result
     })
 }
 
-fn load_state(path: &Path) -> WedgeReportState {
+/// The state, and the exact bytes last written for it (`None` when nothing
+/// valid is on disk), so an unchanged pass skips the rewrite.
+fn load_state(path: &Path) -> (WedgeReportState, Option<Vec<u8>>) {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WedgeReportState::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (WedgeReportState::default(), None)
+        }
         Err(e) => {
             warn!(
                 "fleet::wedge_report: state {} unreadable ({e}); rebuilding from the whole log",
                 path.display()
             );
-            return WedgeReportState::default();
+            return (WedgeReportState::default(), None);
         }
     };
     match serde_json::from_slice::<WedgeReportState>(&bytes) {
-        Ok(s) if s.version == STATE_VERSION => s,
+        Ok(s) if s.version == STATE_VERSION => (s, Some(bytes)),
         Ok(s) => {
             warn!(
                 "fleet::wedge_report: state version {} != {STATE_VERSION}; rebuilding from the \
                  whole log",
                 s.version
             );
-            WedgeReportState::default()
+            (WedgeReportState::default(), None)
         }
         Err(e) => {
             warn!(
                 "fleet::wedge_report: state {} is corrupt ({e}); rebuilding from the whole log",
                 path.display()
             );
-            WedgeReportState::default()
+            (WedgeReportState::default(), None)
         }
     }
 }
 
 /// Atomic persist: sibling temp file carrying the pid, then rename.
-fn persist_state(path: &Path, state: &WedgeReportState) -> Result<(), String> {
-    let bytes = serde_json::to_vec(state).map_err(|e| format!("serialising state: {e}"))?;
+fn persist_state(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -547,14 +623,23 @@ fn persist_state(path: &Path, state: &WedgeReportState) -> Result<(), String> {
     })
 }
 
+/// The in-process copy of one log's state.
+struct Cached {
+    state_path: PathBuf,
+    state: WedgeReportState,
+    /// The bytes last persisted (or loaded); `None` = nothing valid on disk.
+    persisted: Option<Vec<u8>>,
+}
+
 /// In-process copy of the state, so a failed persist costs nothing until a
 /// restart, and consecutive passes never race each other's read-modify-write.
-static STATE: Mutex<Option<(PathBuf, WedgeReportState)>> = Mutex::new(None);
+static STATE: Mutex<Option<Cached>> = Mutex::new(None);
 
 /// One pass over an explicit log path: read the tail, fold, settle, persist.
 ///
 /// `Ok(array)` is the `details.wedge_incidents` value; `Err` means the log
-/// exists but could not be read, and the key must be omitted.
+/// exists but could not be read. The error names the file, never its
+/// directory — it is published off-box.
 pub(crate) fn report_from(
     log_path: &Path,
     now: DateTime<Utc>,
@@ -562,13 +647,25 @@ pub(crate) fn report_from(
 ) -> Result<serde_json::Value, String> {
     let state_path = log_path.with_file_name(STATE_FILE_NAME);
     let mut guard = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.as_ref().is_some_and(|(p, _)| *p != state_path) {
+    if guard.as_ref().is_some_and(|c| c.state_path != state_path) {
         *guard = None;
     }
-    let (_, state) = guard.get_or_insert_with(|| (state_path.clone(), load_state(&state_path)));
+    let cached = guard.get_or_insert_with(|| {
+        let (state, persisted) = load_state(&state_path);
+        Cached {
+            state_path: state_path.clone(),
+            state,
+            persisted,
+        }
+    });
+    let state = &mut cached.state;
     state.register_build(live);
+    let file_name = log_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the wedge incident log".to_string());
     let tail = read_tail(log_path, state.cursor.as_ref())
-        .map_err(|e| format!("reading {} failed: {e}", log_path.display()))?;
+        .map_err(|e| format!("reading {file_name} failed: {e}"))?;
     match tail {
         TailRead::Absent => state.cursor = None,
         TailRead::Lines {
@@ -591,24 +688,50 @@ pub(crate) fn report_from(
         }
     }
     state.settle(now, live);
-    if let Err(e) = persist_state(&state_path, state) {
-        warn!("fleet::wedge_report: state not persisted ({e}); a restart re-reads the log");
+    let published = state.published();
+    match serde_json::to_vec(&*state) {
+        Ok(bytes) if cached.persisted.as_deref() != Some(bytes.as_slice()) => {
+            match persist_state(&state_path, &bytes) {
+                Ok(()) => cached.persisted = Some(bytes),
+                Err(e) => warn!(
+                    "fleet::wedge_report: state not persisted ({e}); a restart re-reads the log"
+                ),
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("fleet::wedge_report: serialising state failed ({e}); not persisted"),
     }
-    Ok(state.published())
+    Ok(published)
 }
 
-/// Write this module's key into the heartbeat `details` object:
-/// `wedge_incidents` (an array; `[]` when no log exists), or
-/// `wedge_incidents_error` when the log could not be read. Blocking IO.
+/// The `details` pair this module owns, from one pass's outcome. BOTH keys
+/// are always written, the unused one as JSON `null`: coord merges `details`
+/// per top-level key and a `null` removes it, so this is what retires a
+/// previous pass's error (or a previous pass's array beside a new error)
+/// instead of leaving it on the row looking current.
+pub(crate) fn details_pair(
+    outcome: Result<serde_json::Value, String>,
+) -> [(&'static str, serde_json::Value); 2] {
+    match outcome {
+        Ok(v) => [
+            ("wedge_incidents", v),
+            ("wedge_incidents_error", serde_json::Value::Null),
+        ],
+        Err(e) => [
+            ("wedge_incidents", serde_json::Value::Null),
+            ("wedge_incidents_error", serde_json::Value::String(e)),
+        ],
+    }
+}
+
+/// Write this module's keys into the heartbeat `details` object:
+/// `wedge_incidents` (an array, newest first; `[]` when no log exists) and
+/// `wedge_incidents_error` (`null`, or why the log could not be read — then
+/// `wedge_incidents` is `null`). Blocking IO.
 pub(crate) fn publish_into(details: &mut serde_json::Map<String, serde_json::Value>) {
     let log = crate::health_monitor::wedge_incidents_path(&crate::paths::get_dev_logs_dir());
-    match report_from(&log, Utc::now(), &LiveView::sample()) {
-        Ok(v) => {
-            details.insert("wedge_incidents".to_string(), v);
-        }
-        Err(e) => {
-            details.insert("wedge_incidents_error".to_string(), serde_json::json!(e));
-        }
+    for (k, v) in details_pair(report_from(&log, Utc::now(), &LiveView::sample())) {
+        details.insert(k.to_string(), v);
     }
 }
 
@@ -624,12 +747,15 @@ mod tests {
     const ME: u32 = 4242;
 
     fn live(backend: bool) -> LiveView {
+        let kinds: &[&'static str] = if backend { &["backend_wedged"] } else { &[] };
+        live_holding(kinds)
+    }
+
+    fn live_holding(kinds: &[&'static str]) -> LiveView {
         LiveView {
             pid: ME,
             build_id: Some("abc123def456"),
-            backend_wedged: backend,
-            ui_thread_wedged: false,
-            recovery_wedged: false,
+            holding: kinds.to_vec(),
         }
     }
 
@@ -785,12 +911,44 @@ mod tests {
     }
 
     #[test]
-    fn latched_kinds_are_superseded_by_a_newer_onset_and_expire_after_the_window() {
+    fn coord_kinds_stay_open_exactly_while_the_observer_latch_holds() {
+        let mut s = WedgeReportState::default();
+        let open = live_holding(&["coord_liveness_unknown"]);
+        s.fold(
+            parse_line(&format!(
+                "2026-09-29T10:00:00Z coord_liveness_unknown x (pid {ME})"
+            ))
+            .unwrap(),
+            &open,
+        );
+        // Far past any window: still open, because the latch still holds.
+        s.settle(at("2026-10-05T10:00:00Z"), &open);
+        assert_eq!(s.incidents[0].ended_at, None);
+        s.settle(at("2026-10-05T10:05:00Z"), &live(false));
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::Cleared));
+        assert_eq!(s.incidents[0].ended_at, Some(at("2026-10-05T10:05:00Z")));
+
+        // Written by an earlier process: over the moment this one reads it,
+        // whatever this process's own latch says.
+        let mut s = WedgeReportState::default();
+        s.fold(
+            parse_line("2026-09-29T10:00:00Z coord_no_leader x (pid 77)").unwrap(),
+            &live_holding(&["coord_no_leader"]),
+        );
+        s.settle(
+            at("2026-09-29T11:00:00Z"),
+            &live_holding(&["coord_no_leader"]),
+        );
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ProcessExited));
+    }
+
+    #[test]
+    fn unknown_tokens_are_superseded_by_a_newer_onset_and_expire_after_the_window() {
         let mut s = WedgeReportState::default();
         let lv = live(false);
         for ts in ["2026-09-29T10:00:00Z", "2026-09-29T12:00:00Z"] {
             s.fold(
-                parse_line(&format!("{ts} coord_liveness_unknown x (pid {ME})")).unwrap(),
+                parse_line(&format!("{ts} some_future_reason x (pid {ME})")).unwrap(),
                 &lv,
             );
         }
@@ -804,6 +962,16 @@ mod tests {
         s.settle(at("2026-09-30T12:00:01Z"), &lv);
         assert_eq!(s.incidents[1].ended_by, Some(EndedBy::Expired));
         assert_eq!(s.incidents[1].ended_at, Some(at("2026-09-30T12:00:00Z")));
+
+        // An unknown token's writer is unknown, so a line from another pid
+        // proves nothing about it.
+        let mut s = WedgeReportState::default();
+        s.fold(
+            parse_line("2026-09-29T10:00:00Z some_future_reason x (pid 5)").unwrap(),
+            &lv,
+        );
+        s.settle(at("2026-09-29T11:00:00Z"), &lv);
+        assert_eq!(s.incidents[0].ended_at, None);
     }
 
     #[test]
@@ -835,11 +1003,16 @@ mod tests {
     }
 
     #[test]
-    fn the_list_keeps_the_newest_twenty() {
+    fn the_list_keeps_twenty_evicting_closed_before_open_and_publishes_newest_first() {
         let mut s = WedgeReportState::default();
-        let lv = live(false);
+        let lv = live_holding(&["backend_wedged"]);
         let t0 = at("2026-09-30T00:00:00Z");
-        for i in 0..25 {
+        // One OPEN wedge first, then 24 coord flaps each superseding the last.
+        s.fold(
+            parse_line(&monitor_line(&t0.to_rfc3339(), "backend_wedged", ME)).unwrap(),
+            &lv,
+        );
+        for i in 1..25 {
             let ts = (t0 + ChronoDuration::minutes(i)).to_rfc3339();
             s.fold(
                 parse_line(&format!("{ts} coord_no_leader x (pid {ME})")).unwrap(),
@@ -847,8 +1020,28 @@ mod tests {
             );
         }
         assert_eq!(s.incidents.len(), WEDGE_REPORT_BOUND);
-        assert_eq!(s.incidents[0].began_at, t0 + ChronoDuration::minutes(5));
-        assert_eq!(s.published().as_array().unwrap().len(), WEDGE_REPORT_BOUND);
+        assert_eq!(
+            s.incidents[0].kind, "backend_wedged",
+            "the oldest row survives because it is OPEN"
+        );
+        assert_eq!(s.incidents[1].began_at, t0 + ChronoDuration::minutes(6));
+        let rows = s.published();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), WEDGE_REPORT_BOUND);
+        assert_eq!(rows[0]["began_at"], "2026-09-30T00:24:00Z", "newest first");
+        assert_eq!(rows[WEDGE_REPORT_BOUND - 1]["kind"], "backend_wedged");
+
+        // More than twenty OPEN rows: only then does an open row go, oldest first.
+        let mut s = WedgeReportState::default();
+        for i in 0..22 {
+            let ts = (t0 + ChronoDuration::minutes(i)).to_rfc3339();
+            s.fold(
+                parse_line(&format!("{ts} reason_{i} x (pid {ME})")).unwrap(),
+                &lv,
+            );
+        }
+        assert_eq!(s.incidents.len(), WEDGE_REPORT_BOUND);
+        assert_eq!(s.incidents[0].kind, "reason_2");
     }
 
     #[test]
@@ -876,12 +1069,22 @@ mod tests {
         let v = report_from(&log, now, &lv).unwrap();
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 2, "{v}");
-        assert_eq!(rows[0]["kind"], "coord_unreachable");
-        assert_eq!(rows[1]["kind"], "coord_worker_dead");
+        assert_eq!(rows[0]["kind"], "coord_worker_dead", "newest first");
+        assert_eq!(rows[1]["kind"], "coord_unreachable");
 
-        // A pass with nothing new changes nothing.
+        // A pass with nothing new changes nothing — not even the state file.
         restart();
+        let state_file = tmp.path().join(STATE_FILE_NAME);
+        let before = std::fs::metadata(&state_file).unwrap().modified().unwrap();
+        std::fs::write(&state_file, std::fs::read(&state_file).unwrap()).unwrap();
+        let rewritten = std::fs::metadata(&state_file).unwrap().modified().unwrap();
+        assert!(rewritten >= before);
         assert_eq!(report_from(&log, now, &lv).unwrap(), v);
+        assert_eq!(
+            std::fs::metadata(&state_file).unwrap().modified().unwrap(),
+            rewritten,
+            "an unchanged pass does not rewrite the state"
+        );
 
         // A partial line is left for the next pass, then read whole.
         append(&log, "2026-09-30T11:30:00Z coord_no_le");
@@ -895,7 +1098,7 @@ mod tests {
         );
         append(&log, &format!("ader c (pid {ME})\n"));
         let v = report_from(&log, now, &lv).unwrap();
-        assert_eq!(v.as_array().unwrap()[2]["kind"], "coord_no_leader");
+        assert_eq!(v.as_array().unwrap()[0]["kind"], "coord_no_leader");
         restart();
     }
 
@@ -932,7 +1135,7 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            ["coord_unreachable", "coord_no_leader", "coord_worker_dead"]
+            ["coord_worker_dead", "coord_no_leader", "coord_unreachable"]
         );
 
         // Replaced by a LONGER file with a different head: the offset alone
@@ -947,7 +1150,8 @@ mod tests {
         let v = report_from(&log, now, &lv).unwrap();
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 3 + 5);
-        assert_eq!(rows[3]["began_at"], "2026-09-30T10:00:00Z");
+        assert_eq!(rows[0]["began_at"], "2026-09-30T10:04:00Z");
+        assert_eq!(rows[4]["began_at"], "2026-09-30T10:00:00Z");
 
         // Removed: publishes what is known, and a recreated file starts fresh.
         std::fs::remove_file(&log).unwrap();
@@ -975,8 +1179,58 @@ mod tests {
         restart();
         // A directory where the log should be cannot be read as one.
         std::fs::create_dir(&log).unwrap();
-        assert!(report_from(&log, Utc::now(), &live(false)).is_err());
+        let err = report_from(&log, Utc::now(), &live(false)).unwrap_err();
+        assert!(
+            err.starts_with("reading wedge-incidents.log failed"),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&tmp.path().display().to_string()),
+            "never an absolute path off-box: {err}"
+        );
         restart();
+    }
+
+    #[test]
+    fn both_keys_of_the_pair_are_always_sent_the_unused_one_null() {
+        assert_eq!(
+            details_pair(Ok(serde_json::json!([]))),
+            [
+                ("wedge_incidents", serde_json::json!([])),
+                ("wedge_incidents_error", serde_json::Value::Null),
+            ]
+        );
+        assert_eq!(
+            details_pair(Err("boom".into())),
+            [
+                ("wedge_incidents", serde_json::Value::Null),
+                ("wedge_incidents_error", serde_json::json!("boom")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_capped_read_that_lands_on_a_line_start_keeps_that_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("wedge-incidents.log");
+        let line = format!("2026-09-30T08:00:00Z coord_unreachable a (pid {ME})\n");
+        // Build the file so the capped window starts EXACTLY on a line start:
+        // 300 bytes of padding lines, one `y…` line, then the tail lines.
+        let tail_lines = (MAX_READ_BYTES as usize) / line.len() - 1;
+        let lead = (MAX_READ_BYTES as usize) - tail_lines * line.len();
+        let mut body = ("x".repeat(99) + "\n").repeat(3);
+        body.push_str(&"y".repeat(lead - 1));
+        body.push('\n');
+        body.push_str(&line.repeat(tail_lines));
+        std::fs::write(&log, &body).unwrap();
+        let TailRead::Lines { lines, cursor, .. } = read_tail(&log, None).unwrap() else {
+            panic!("expected lines");
+        };
+        assert_eq!(cursor.offset, body.len() as u64);
+        // The byte before the window is a newline, so the `y…` line is whole
+        // and is kept rather than dropped as a partial.
+        assert_eq!(lines.len(), tail_lines + 1);
+        assert!(lines[0].starts_with('y'));
     }
 
     #[test]

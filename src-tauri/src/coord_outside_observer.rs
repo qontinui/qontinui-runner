@@ -165,7 +165,7 @@
 //! did not.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -342,6 +342,31 @@ pub enum FaultClass {
 }
 
 impl FaultClass {
+    /// Every class, for walking the latch mask.
+    pub const ALL: [FaultClass; 4] = [
+        FaultClass::Unreachable,
+        FaultClass::WorkerDead,
+        FaultClass::NoLeader,
+        FaultClass::LivenessUnknown,
+    ];
+
+    /// This class's bit in [`OPEN_FAULTS`].
+    fn bit(self) -> u8 {
+        match self {
+            FaultClass::Unreachable => 1,
+            FaultClass::WorkerDead => 2,
+            FaultClass::NoLeader => 4,
+            FaultClass::LivenessUnknown => 8,
+        }
+    }
+
+    /// The class whose [`Self::breadcrumb_reason`] is `reason`.
+    pub fn from_breadcrumb_reason(reason: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.breadcrumb_reason() == reason)
+    }
+
     /// The greppable token written into `wedge-incidents.log`, in the same
     /// vocabulary as `health_monitor`'s `backend_wedged` / `ui_thread_wedged`.
     pub fn breadcrumb_reason(self) -> &'static str {
@@ -1358,6 +1383,27 @@ impl ObserverState {
         // predicate (iv) is the one that must survive every OTHER arm's reset.
         out.extend(self.observe_unobserved(outcome, now));
         out
+    }
+
+    /// The classes whose episode is OPEN right now: reported (the latch is
+    /// set, so its `wedge-incidents.log` line was written) and not yet re-armed
+    /// by the predicate ceasing to hold. For (ii), open while any worker of the
+    /// current episode is still reported dead.
+    pub fn open_mask(&self) -> u8 {
+        let mut mask = 0;
+        if self.unreachable_notified {
+            mask |= FaultClass::Unreachable.bit();
+        }
+        if !self.dead_notified.is_empty() {
+            mask |= FaultClass::WorkerDead.bit();
+        }
+        if self.leaderless_notified {
+            mask |= FaultClass::NoLeader.bit();
+        }
+        if self.unobserved_notified {
+            mask |= FaultClass::LivenessUnknown.bit();
+        }
+        mask
     }
 
     fn clear_unreachable(&mut self) {
@@ -2436,7 +2482,9 @@ impl CoordOutsideObserver {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.observe(&outcome)
+            let reports = guard.observe(&outcome);
+            OPEN_FAULTS.store(guard.open_mask(), Ordering::SeqCst);
+            reports
         };
         for report in &reports {
             surface(app, report);
@@ -2449,6 +2497,20 @@ impl CoordOutsideObserver {
             }
         }
     }
+}
+
+/// [`ObserverState::open_mask`] of the running observer, published after every
+/// fold so other in-process readers see the latches without taking the
+/// observer's lock. Zero before the first probe and on a disabled observer —
+/// in both, no line of this process's can be open either, since the line is
+/// written only when a latch is set.
+static OPEN_FAULTS: AtomicU8 = AtomicU8::new(0);
+
+/// Whether `class`'s episode is open right now in this process — the live
+/// predicate `fleet::wedge_report` closes a `coord_*` incident against, the
+/// same way it uses `health_monitor::backend_wedged()`.
+pub fn fault_open(class: FaultClass) -> bool {
+    OPEN_FAULTS.load(Ordering::SeqCst) & class.bit() != 0
 }
 
 impl Default for CoordOutsideObserver {
@@ -2964,6 +3026,43 @@ mod tests {
         assert_eq!(reports[0].class, FaultClass::WorkerDead);
         assert!(reports[0].post_finding);
         assert!(reports[0].summary.contains("work_unit_derive.sweep"));
+    }
+
+    /// The latch mask `fleet::wedge_report` closes `coord_*` incidents
+    /// against: a class is open exactly while its report is latched, and the
+    /// re-arm that lets the next episode page again is what closes it.
+    #[test]
+    fn open_mask_tracks_the_reporting_latches() {
+        let mut state = ObserverState::default();
+        assert_eq!(state.open_mask(), 0);
+        let down = ProbeOutcome::Unreachable {
+            reason: "connect refused".into(),
+        };
+        for _ in 0..CADENCES_TO_FIRE {
+            state.observe(&down);
+        }
+        assert_eq!(state.open_mask(), FaultClass::Unreachable.bit());
+
+        let dead = ledger_body(
+            1,
+            json!([dead_row("merge_scheduler.dispatch", true, false)]),
+        );
+        state.observe(&classify_ledger(&dead));
+        assert_eq!(
+            state.open_mask(),
+            FaultClass::WorkerDead.bit(),
+            "coord answered, so (i) re-armed; the dead worker is open"
+        );
+        state.observe(&classify_ledger(&ledger_body(0, json!([]))));
+        assert_eq!(state.open_mask(), 0, "recovery re-arms every latch");
+
+        for class in FaultClass::ALL {
+            assert_eq!(
+                FaultClass::from_breadcrumb_reason(class.breadcrumb_reason()),
+                Some(class)
+            );
+        }
+        assert_eq!(FaultClass::from_breadcrumb_reason("backend_wedged"), None);
     }
 
     #[test]

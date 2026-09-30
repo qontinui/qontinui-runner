@@ -29,13 +29,35 @@
 //! vocabulary is `UNKNOWN` too: a reader must not have to guess what `OK`
 //! meant.
 //!
-//! ## Present-and-empty vs absent
+//! ## The mechanism id is the doctor's
+//!
+//! `mechanism` is published as the doctor's CANONICAL id — the record's own
+//! `mechanism` field, else its file stem, mapped through the doctor's alias
+//! table ([`doctor_mechanism_id`], a transcription of `capability-doctor.sh`
+//! `stem_to_mech`, in the same order the doctor tries them) — so
+//! `render-memory-cache.json` and a record saying `memory-cache-renderer` both
+//! publish `memory_cache_renderer`, the id the doctor's own report uses. A
+//! record the doctor's table does not know publishes its own `mechanism` field
+//! (else its stem) verbatim; the doctor calls such a record unregistered, and
+//! so can a reader. `record` carries the file stem, so two records that bind to
+//! one mechanism stay distinguishable.
+//!
+//! ## What leaves the box
+//!
+//! A record file larger than [`MAX_RECORD_BYTES`] is not parsed (UNKNOWN,
+//! naming the size); every `reason` is cut at [`REASON_MAX_CHARS`] characters on
+//! a character boundary; and errors name the record's FILE NAME, never a path
+//! — this is published off-box, and the home directory is not coord's business.
+//!
+//! ## Present-and-empty vs absent, and the key triple
 //!
 //! An absent directory is `Looked(vec![])` — "looked, nothing recorded" — and
 //! is published as `[]`. Only a directory that could not be resolved or read
-//! is [`CapabilityRead::CouldNotLook`], which the publisher turns into an
-//! omitted `capability` key plus a `capability_error` string, because coord
-//! reads key-absence as "this build predates the key".
+//! is [`CapabilityRead::CouldNotLook`]. The publisher ALWAYS writes all three
+//! keys — `capability`, `capability_error`, `capability_omitted` — with the
+//! unused ones as JSON `null`: coord merges `details` per top-level key and a
+//! `null` removes it, so this is what retires a previous pass's error or
+//! overflow count instead of leaving it beside a fresh array.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +73,71 @@ pub(crate) const CAPABILITY_STALE_SECS: i64 = 86_400;
 /// inflating every heartbeat. Overflow is COUNTED (`capability_omitted`),
 /// never silently dropped.
 pub(crate) const CAPABILITY_REPORT_BOUND: usize = 64;
+
+/// Largest record file parsed. The doctor's records are a few hundred bytes;
+/// a bigger file is not one of them, and is not read into a heartbeat.
+pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+/// Longest `reason` published, in characters.
+pub(crate) const REASON_MAX_CHARS: usize = 512;
+
+/// `capability-doctor.sh` `stem_to_mech`, transcribed: the doctor's canonical
+/// mechanism id for a hyphenated record name, or `None` for a name its table
+/// does not register. Keep in step with that function (qontinui-claude-config
+/// `scripts/capability-doctor.sh`); a missing arm publishes the record's own
+/// name, which is honest but unregistered.
+pub(crate) fn doctor_mechanism_id(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "memory-cache-renderer" | "render-memory-cache" => "memory_cache_renderer",
+        "plan-cache-renderer" | "render-plan-cache" => "plan_cache_renderer",
+        "steering-cache-renderer" | "render-steering-cache" => "steering_cache_renderer",
+        "landed-not-live-refresh" | "landed-not-live-staleness" | "refresh-landed-not-live" => {
+            "landed_not_live_refresh"
+        }
+        "service-manager" | "dev-start" => "service_manager",
+        "cargo-sweep" | "cargo-stale-target-sweep" | "install-cargo-sweep" => "cargo_sweep",
+        "return-to-main-sweep" | "return-to-main" => "return_to_main_sweep",
+        "findings-steward" | "schedule-findings-steward" => "findings_steward",
+        "hooks-doctor" | "skills-doctor" => "hooks_doctor",
+        "coord-doctor" | "coord-credential-doctor" => "coord_doctor",
+        "coord-native-tools" | "native-coord-tools" => "coord_native_tools",
+        "steward-serving-read" | "merge-train-steward-serving" => "steward_serving_read",
+        "python-spawned-bash" | "bash-resolve" => "python_spawned_bash",
+        "harness-links" | "workspace-root-links" | "bootstrap-machine" => "harness_links",
+        "install-guard-hooks" | "installer-guard-hooks" => "installer_guard_hooks",
+        "install-claude-settings" | "installer-claude-settings" => "installer_claude_settings",
+        "install-claude-accounts" | "installer-claude-accounts" => "installer_claude_accounts",
+        "install-repo-git-hooks" | "installer-repo-git-hooks" => "installer_repo_git_hooks",
+        "install-agent-skills" | "installer-agent-skills" => "installer_agent_skills",
+        "install-pwsh-linux" | "installer-pwsh-linux" => "installer_pwsh_linux",
+        "plans-dir-setting" | "plans-dir" | "paths-plans-dir" => "plans_dir_setting",
+        "plan-corpus-invariant" | "plan-corpus" => "plan_corpus_invariant",
+        "shared-node-modules" | "node-modules-doctor" => "shared_node_modules",
+        _ => return None,
+    })
+}
+
+/// The doctor's binding order: the record's `mechanism` field (underscores
+/// read as hyphens), else the file stem; the first the alias table knows wins.
+/// Neither known: the field verbatim, else the stem.
+fn canonical_mechanism(field: Option<&str>, stem: &str) -> String {
+    field
+        .and_then(|f| doctor_mechanism_id(&f.replace('_', "-")))
+        .or_else(|| doctor_mechanism_id(stem))
+        .map(str::to_string)
+        .unwrap_or_else(|| field.unwrap_or(stem).to_string())
+}
+
+/// `s` cut to [`REASON_MAX_CHARS`] characters (so always on a char
+/// boundary), with `…` marking a cut.
+fn bounded_reason(s: String) -> String {
+    if s.chars().nth(REASON_MAX_CHARS).is_none() {
+        return s;
+    }
+    let mut cut: String = s.chars().take(REASON_MAX_CHARS).collect();
+    cut.push('…');
+    cut
+}
 
 /// The doctor's state vocabulary, spelled exactly as it prints it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -77,14 +164,16 @@ impl CapabilityState {
     }
 }
 
-/// One published record: `{mechanism, state, reason, written_at}`.
+/// One published record: `{mechanism, record, state, reason, written_at}`.
 ///
-/// `written_at` is the record's own stamp normalised to
-/// `%Y-%m-%dT%H:%M:%SZ`, or `null` when the record carries none that parses
-/// (the raw value is then quoted in `reason`).
+/// `mechanism` is the doctor's canonical id (see the module docs); `record`
+/// is the file stem it was read from. `written_at` is the record's own stamp
+/// normalised to `%Y-%m-%dT%H:%M:%SZ`, or `null` when the record carries none
+/// that parses (the raw value is then quoted in `reason`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CapabilityEntry {
     pub mechanism: String,
+    pub record: String,
     pub state: CapabilityState,
     pub reason: String,
     pub written_at: Option<String>,
@@ -158,7 +247,9 @@ pub(crate) fn read_capability_dir(dir: &Path, now: DateTime<Utc>) -> CapabilityR
             }
         }
         Err(e) => {
-            return CapabilityRead::CouldNotLook(format!("listing {} failed: {e}", dir.display()))
+            return CapabilityRead::CouldNotLook(format!(
+                "listing the capability directory failed: {e}"
+            ))
         }
     };
     let mut files: Vec<PathBuf> = Vec::new();
@@ -167,8 +258,7 @@ pub(crate) fn read_capability_dir(dir: &Path, now: DateTime<Utc>) -> CapabilityR
             Ok(e) => e,
             Err(e) => {
                 return CapabilityRead::CouldNotLook(format!(
-                    "listing {} failed mid-walk: {e}",
-                    dir.display()
+                    "listing the capability directory failed mid-walk: {e}"
                 ))
             }
         };
@@ -197,39 +287,66 @@ pub(crate) fn read_capability_dir(dir: &Path, now: DateTime<Utc>) -> CapabilityR
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let parsed = std::fs::read(p)
-                .map_err(|e| format!("record {} is unreadable: {e}", p.display()))
-                .and_then(|bytes| {
-                    serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .map_err(|e| format!("record {} is not JSON: {e}", p.display()))
-                });
-            capability_entry(&stem, parsed, now)
+            capability_entry(&stem, read_record(p, &stem), now)
         })
         .collect();
     CapabilityRead::Looked { entries, omitted }
 }
 
+/// Read one record file, bounded by [`MAX_RECORD_BYTES`]. Errors name the
+/// file, never its directory.
+fn read_record(path: &Path, stem: &str) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let name = format!("{stem}.json");
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("record {name} is unreadable: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("record {name} is unreadable: {e}"))?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(format!(
+            "record {name} is larger than {} KiB, so it was not parsed",
+            MAX_RECORD_BYTES / 1024
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("record {name} is not JSON: {e}"))
+}
+
+/// Map one record (or the error reading it) to its published entry, with the
+/// reason bounded to [`REASON_MAX_CHARS`].
+pub(crate) fn capability_entry(
+    stem: &str,
+    parsed: Result<serde_json::Value, String>,
+    now: DateTime<Utc>,
+) -> CapabilityEntry {
+    let mut entry = capability_entry_unbounded(stem, parsed, now);
+    entry.reason = bounded_reason(entry.reason);
+    entry
+}
+
 /// Map one record (or the error reading it) to its published entry.
 ///
 /// Pure: the clock is threaded in, so the ageing boundary is testable.
-pub(crate) fn capability_entry(
+fn capability_entry_unbounded(
     stem: &str,
     parsed: Result<serde_json::Value, String>,
     now: DateTime<Utc>,
 ) -> CapabilityEntry {
     let unknown = |mechanism: String, reason: String, written_at: Option<String>| CapabilityEntry {
         mechanism,
+        record: stem.to_string(),
         state: CapabilityState::Unknown,
         reason,
         written_at,
     };
     let record = match parsed {
         Ok(v) => v,
-        Err(e) => return unknown(stem.to_string(), e, None),
+        Err(e) => return unknown(canonical_mechanism(None, stem), e, None),
     };
     let Some(obj) = record.as_object() else {
         return unknown(
-            stem.to_string(),
+            canonical_mechanism(None, stem),
             "record is JSON but not an object".to_string(),
             None,
         );
@@ -242,7 +359,7 @@ pub(crate) fn capability_entry(
     };
     // The doctor binds a record by its `mechanism` field, failing that by its
     // file stem; the published id follows the same order.
-    let mechanism = text("mechanism").unwrap_or(stem).to_string();
+    let mechanism = canonical_mechanism(text("mechanism"), stem);
     let said_reason = text("reason").unwrap_or("(the record gives no reason)");
     let raw_state = text("state");
 
@@ -289,6 +406,7 @@ pub(crate) fn capability_entry(
     match raw_state.and_then(CapabilityState::parse) {
         Some(state) => CapabilityEntry {
             mechanism,
+            record: stem.to_string(),
             state,
             reason: said_reason.to_string(),
             written_at,
@@ -306,29 +424,40 @@ pub(crate) fn capability_entry(
     }
 }
 
-/// Write this module's keys into the heartbeat `details` object.
+/// Write this module's three keys into the heartbeat `details` object, ALWAYS
+/// all three (see the module docs):
 ///
-/// `capability` (always an array when the directory was examined) and
-/// `capability_omitted` (only when the bound cut records off); or, when it
-/// could not look, `capability_error` alone.
+/// - looked: `capability` = the array, `capability_error` = `null`,
+///   `capability_omitted` = the overflow count, or `null` when nothing was cut;
+/// - could not look (or could not serialise what it read): `capability` =
+///   `null`, `capability_error` = why, `capability_omitted` = `null`.
 pub(crate) fn publish_into(
     details: &mut serde_json::Map<String, serde_json::Value>,
     read: CapabilityRead,
 ) {
-    match read {
-        CapabilityRead::Looked { entries, omitted } => {
-            details.insert(
-                "capability".to_string(),
-                serde_json::to_value(entries).unwrap_or_else(|_| serde_json::json!([])),
-            );
-            if omitted > 0 {
-                details.insert("capability_omitted".to_string(), serde_json::json!(omitted));
-            }
-        }
-        CapabilityRead::CouldNotLook(why) => {
-            details.insert("capability_error".to_string(), serde_json::json!(why));
-        }
-    }
+    use serde_json::Value;
+    let (array, error, omitted) = match read {
+        CapabilityRead::Looked { entries, omitted } => match serde_json::to_value(entries) {
+            Ok(v) => (
+                v,
+                Value::Null,
+                if omitted > 0 {
+                    serde_json::json!(omitted)
+                } else {
+                    Value::Null
+                },
+            ),
+            Err(e) => (
+                Value::Null,
+                Value::String(format!("serialising the capability records failed: {e}")),
+                Value::Null,
+            ),
+        },
+        CapabilityRead::CouldNotLook(why) => (Value::Null, Value::String(why), Value::Null),
+    };
+    details.insert("capability".to_string(), array);
+    details.insert("capability_error".to_string(), error);
+    details.insert("capability_omitted".to_string(), omitted);
 }
 
 #[cfg(test)]
@@ -346,7 +475,11 @@ mod tests {
         let rec = json!({"mechanism": "memory-cache-renderer", "state": "OPERATIVE",
             "reason": "render spawned detached", "written_at": "2026-09-30T11:00:00Z"});
         let e = capability_entry("render-memory-cache", Ok(rec), now);
-        assert_eq!(e.mechanism, "memory-cache-renderer");
+        assert_eq!(
+            e.mechanism, "memory_cache_renderer",
+            "the doctor's canonical id"
+        );
+        assert_eq!(e.record, "render-memory-cache");
         assert_eq!(e.state, CapabilityState::Operative);
         assert_eq!(e.reason, "render spawned detached");
         assert_eq!(e.written_at.as_deref(), Some("2026-09-30T11:00:00Z"));
@@ -437,7 +570,11 @@ mod tests {
         let rec = json!({"state": "INOPERATIVE-ON-THIS-MACHINE", "reason": "no pwsh",
             "written_at": "2026-09-30T11:00:00Z"});
         let e = capability_entry("render-plan-cache", Ok(rec), now);
-        assert_eq!(e.mechanism, "render-plan-cache");
+        assert_eq!(
+            e.mechanism, "plan_cache_renderer",
+            "bound by stem via the alias table"
+        );
+        assert_eq!(e.record, "render-plan-cache");
         assert_eq!(e.state, CapabilityState::InoperativeOnThisMachine);
     }
 
@@ -472,6 +609,12 @@ mod tests {
         assert_eq!(omitted, 0);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].mechanism, "a");
+        assert!(
+            !entries[0].reason.contains(&dir.display().to_string()),
+            "a file name, never a path: {}",
+            entries[0].reason
+        );
+        assert!(entries[0].reason.contains("a.json"));
         assert_eq!(entries[0].state, CapabilityState::Unknown);
         assert_eq!(entries[1].mechanism, "b");
         assert_eq!(entries[1].state, CapabilityState::Operative);
@@ -518,39 +661,85 @@ mod tests {
     }
 
     #[test]
-    fn details_shape_is_an_array_or_an_error_string_never_both() {
+    fn unregistered_records_keep_their_own_name_and_the_table_matches_the_doctor() {
+        let now = at("2026-09-30T12:00:00Z");
+        let rec = json!({"mechanism": "coord_inbox_drain", "state": "OPERATIVE",
+            "reason": "drained", "written_at": "2026-09-30T11:00:00Z"});
+        let e = capability_entry("coord-inbox-drain", Ok(rec), now);
+        assert_eq!(e.mechanism, "coord_inbox_drain");
+        assert_eq!(e.record, "coord-inbox-drain");
+        // Underscores in the field read as hyphens, as the doctor reads them.
+        assert_eq!(
+            canonical_mechanism(Some("landed_not_live_staleness"), "x"),
+            "landed_not_live_refresh"
+        );
+        // The field wins over the stem when both are registered.
+        assert_eq!(
+            canonical_mechanism(Some("cargo-sweep"), "render-plan-cache"),
+            "cargo_sweep"
+        );
+        assert_eq!(doctor_mechanism_id("fleet-skill-bundle-parity"), None);
+    }
+
+    #[test]
+    fn oversize_records_are_unknown_and_reasons_are_bounded_on_a_char_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big.json");
+        std::fs::write(&big, vec![b' '; (MAX_RECORD_BYTES + 1) as usize]).unwrap();
+        let err = read_record(&big, "big").unwrap_err();
+        assert!(err.contains("larger than 64 KiB"), "{err}");
+        assert!(!err.contains(&tmp.path().display().to_string()));
+
+        let now = at("2026-09-30T12:00:00Z");
+        let long = "é".repeat(REASON_MAX_CHARS + 50);
+        let rec = json!({"mechanism": "m", "state": "DEGRADED", "reason": long,
+            "written_at": "2026-09-30T11:00:00Z"});
+        let e = capability_entry("m", Ok(rec), now);
+        assert_eq!(e.reason.chars().count(), REASON_MAX_CHARS + 1);
+        assert!(e.reason.ends_with('…'));
+    }
+
+    #[test]
+    fn details_always_carry_all_three_keys_with_the_unused_ones_null() {
+        let entry = CapabilityEntry {
+            mechanism: "m".into(),
+            record: "m-file".into(),
+            state: CapabilityState::InoperativeOnThisMachine,
+            reason: "r".into(),
+            written_at: None,
+        };
         let mut d = serde_json::Map::new();
         publish_into(
             &mut d,
             CapabilityRead::Looked {
-                entries: vec![CapabilityEntry {
-                    mechanism: "m".into(),
-                    state: CapabilityState::InoperativeOnThisMachine,
-                    reason: "r".into(),
-                    written_at: None,
-                }],
+                entries: vec![entry.clone()],
                 omitted: 0,
             },
         );
         assert_eq!(
             serde_json::Value::Object(d),
-            json!({"capability": [{"mechanism": "m",
-                "state": "INOPERATIVE-ON-THIS-MACHINE", "reason": "r", "written_at": null}]})
+            json!({"capability": [{"mechanism": "m", "record": "m-file",
+                "state": "INOPERATIVE-ON-THIS-MACHINE", "reason": "r", "written_at": null}],
+                "capability_error": null, "capability_omitted": null})
         );
         let mut d = serde_json::Map::new();
         publish_into(
             &mut d,
             CapabilityRead::Looked {
                 entries: vec![],
-                omitted: 0,
+                omitted: 3,
             },
         );
-        assert_eq!(serde_json::Value::Object(d), json!({"capability": []}));
+        assert_eq!(
+            serde_json::Value::Object(d),
+            json!({"capability": [], "capability_error": null, "capability_omitted": 3})
+        );
         let mut d = serde_json::Map::new();
         publish_into(&mut d, CapabilityRead::CouldNotLook("no home".into()));
         assert_eq!(
             serde_json::Value::Object(d),
-            json!({"capability_error": "no home"})
+            json!({"capability": null, "capability_error": "no home",
+                "capability_omitted": null})
         );
     }
 }

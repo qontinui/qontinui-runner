@@ -736,9 +736,15 @@ async fn observed_details() -> serde_json::Map<String, serde_json::Value> {
         Ok(d) => d,
         Err(e) => {
             let why = format!("the runner's read of this key failed: {e}");
+            // Same key set a successful read sends, the data keys `null` so the
+            // merge retires the previous pass's arrays rather than leaving them
+            // beside this error looking current.
             let mut d = serde_json::Map::new();
+            d.insert("wedge_incidents".into(), serde_json::Value::Null);
             d.insert("wedge_incidents_error".into(), serde_json::json!(why));
+            d.insert("capability".into(), serde_json::Value::Null);
             d.insert("capability_error".into(), serde_json::json!(why));
+            d.insert("capability_omitted".into(), serde_json::Value::Null);
             d
         }
     }
@@ -4960,6 +4966,9 @@ async fn refresher_loop(
             Ok(b) => b,
             Err(e) => {
                 warn!("device_jwt_refresher: device_jwt_needs_refresh failed: {e}");
+                // Keep the observed keys moving even while the credential
+                // read is failing — see `republish_device_status`.
+                republish_device_status(&auth_manager).await;
                 // Sleep before retrying to avoid a hot-loop on persistent error.
                 if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
                     return;
@@ -5015,6 +5024,7 @@ async fn refresher_loop(
                          pass rather than deriving a posture from nothing"
                     );
                 }
+                republish_device_status(&auth_manager).await;
                 if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
                     return;
                 }
@@ -10616,19 +10626,39 @@ mod tenant_slot_refresh_tests {
     fn status_details_carry_the_observed_keys_beside_the_credential_bag() {
         let fallback = coord_credential_health(Decision::IdleWrongTier, None);
         let bag = coord_credential_bag(&fallback, None);
+        // Built by the two publishers' own pure halves: a wedge read that
+        // succeeded, and a capability directory that could not be looked at.
         let mut observed = serde_json::Map::new();
-        observed.insert("wedge_incidents".into(), serde_json::json!([]));
-        observed.insert("capability_error".into(), serde_json::json!("no home"));
+        for (k, v) in crate::fleet::wedge_report::details_pair(Ok(serde_json::json!([]))) {
+            observed.insert(k.to_string(), v);
+        }
+        crate::fleet::capability_report::publish_into(
+            &mut observed,
+            crate::fleet::capability_report::CapabilityRead::CouldNotLook("no home".into()),
+        );
         let d = status_details(Some(bag.clone()), observed.clone());
         let obj = d.as_object().expect("details is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["capability_error", "coord_credential", "wedge_incidents"]
+            [
+                "capability",
+                "capability_error",
+                "capability_omitted",
+                "coord_credential",
+                "wedge_incidents",
+                "wedge_incidents_error",
+            ],
+            "every key of each pair is SENT — the unused one as null, which is what \
+             retires a previous pass's value under coord's per-key merge"
         );
         assert_eq!(d["coord_credential"], serde_json::to_value(bag).unwrap());
         assert_eq!(d["wedge_incidents"], serde_json::json!([]));
+        assert!(d["wedge_incidents_error"].is_null());
+        assert!(d["capability"].is_null());
+        assert_eq!(d["capability_error"], "no home");
+        assert!(d["capability_omitted"].is_null());
         assert!(
             obj.keys().all(|k| k != "_coord_received_at"),
             "coord's reserved key"
