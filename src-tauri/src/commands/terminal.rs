@@ -692,6 +692,82 @@ pub fn terminal_get_bracketed_paste(
     })
 }
 
+/// Is a `claude` process running in this pane's process subtree right now,
+/// and which session id was it launched with?
+///
+/// WHY. The resume path (boot-restore retype and the "Retry resume" banner)
+/// types `claude --permission-mode bypassPermissions --resume <id>` into the
+/// pane on the assumption it is sitting at a shell prompt. When the handshake
+/// scrape false-negatives, claude IS already running there, and the command
+/// lands as a prompt in the live session. The process table answers "is there
+/// a claude in this pane" without scraping the screen, so the frontend asks
+/// here before every resume write.
+///
+/// `state`:
+/// - `live` / `absent` — readings of the process table. On `live`,
+///   `sessionIds` carries the `--resume` / `--session-id` value parsed from
+///   each claude's command line (one targeted query, only the claude pids);
+///   a claude started with neither, or whose command line was unreadable,
+///   contributes nothing, so a requested id missing from the list is NOT
+///   evidence that a different session runs.
+/// - `remote` — the pane has no local pid; the subtree cannot be observed.
+/// - `unknown` — a LOCAL pane whose process table could not be read. Says
+///   nothing either way, and the caller must not treat it as `absent`.
+#[tauri::command]
+pub async fn terminal_probe_claude(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    use crate::terminal::graceful_exit::{probe_claude_under, ClaudeProbe};
+
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+    let Some(root_pid) = session.child_pid() else {
+        return Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "state": "remote",
+                "claudePids": [],
+                "sessionIds": [],
+            })),
+        });
+    };
+    let data = match probe_claude_under(Some(root_pid), Vec::new()).await {
+        ClaudeProbe::Readable(p) => {
+            let pids: Vec<u32> = p.subtree_claude.iter().map(|id| id.pid).collect();
+            let session_ids: Vec<String> = if pids.is_empty() {
+                Vec::new()
+            } else {
+                crate::process_capture::process_tree::command_lines_for_pids(&pids)
+                    .await
+                    .values()
+                    .filter_map(|cl| {
+                        crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
+                    })
+                    .collect()
+            };
+            serde_json::json!({
+                "state": if pids.is_empty() { "absent" } else { "live" },
+                "claudePids": pids,
+                "sessionIds": session_ids,
+            })
+        }
+        ClaudeProbe::Unreadable(detail) => serde_json::json!({
+            "state": "unknown",
+            "claudePids": [],
+            "sessionIds": [],
+            "detail": detail,
+        }),
+    };
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(data),
+    })
+}
+
 /// Compact text-only snapshot for verifiers and external tools.
 ///
 /// Returns the rendered grid as `lines: Vec<String>` plus a single

@@ -9,6 +9,7 @@ import {
   getResumeSummaryPolicy,
   buildPickerAnswer,
   type ResumeSummaryPolicy,
+  type ResumeOutcome,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
 import { providerDescriptorFor } from "./providerAdapter";
@@ -228,7 +229,7 @@ export async function runVerifiedResume(params: {
    */
   recordOpen?: SessionOpenArgs;
   verifyOptions?: TypeAndVerifyOptions;
-}): Promise<"verified" | "failed"> {
+}): Promise<ResumeOutcome> {
   const {
     terminalRefs,
     tabId,
@@ -252,6 +253,7 @@ export async function runVerifiedResume(params: {
     // this catches CLI version drift and the opt-in "summary" policy.
     pickerAnswer: buildPickerAnswer(policy),
     handshakePatterns,
+    sessionId: claudeSessionId,
     ...verifyOptions,
   });
   if (outcome === "verified") {
@@ -289,7 +291,9 @@ export async function runVerifiedResume(params: {
       console.warn(`[TerminalPage] clear restore-pending failed for ${claudeSessionId}:`, err);
     });
   } else {
-    // Resume never landed. Surface an explicit retry affordance and KEEP the
+    // Resume never landed — or was not typed because the pane could not be
+    // checked or already runs a claude not provably this session (see
+    // `ResumeOutcome`). Surface an explicit retry affordance and KEEP the
     // restore-pending marker — the open record must survive for the retry.
     console.warn(
       `[TerminalPage] resume verification failed for ${tabId} (session ${claudeSessionId})`,
@@ -1418,6 +1422,9 @@ export function useTerminalInitialization({
                     provider: restore.provider,
                     updateTab,
                     recordOpen: restore.recordOpen,
+                    // The pane was created as a plain shell just above, so no
+                    // claude can be in it before the first type.
+                    verifyOptions: { skipFirstProbe: true },
                   });
                 }
               }
