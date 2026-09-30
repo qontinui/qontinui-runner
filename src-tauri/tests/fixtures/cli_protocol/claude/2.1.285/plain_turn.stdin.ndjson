@@ -1,0 +1,2 @@
+{"type": "control_request", "request": {"subtype": "initialize", "protocolVersion": "1"}, "request_id": "req_1"}
+{"type": "user", "message": {"role": "user", "content": "Reply with exactly the single word: pong"}, "session_id": "default"}
