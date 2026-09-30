@@ -15,6 +15,23 @@ fn main() {
     // own), i.e. a binary that compiles and then panics on startup.
     guard_tokio_console_cfg();
 
+    // Pin the main-thread stack reserve HERE, not only in
+    // `src-tauri/.cargo/config.toml`. Cargo reads `.cargo/config.toml` from its
+    // CWD upward, and `pnpm run build:exe` (scripts/build-exe.mjs, the path
+    // dev-start.ps1 launches the primary from) runs cargo from the repo ROOT,
+    // so that file's `/STACK` never reached the link and the exe got MSVC's
+    // default 1 MB. An exported `RUSTFLAGS` drops it the same way, since it
+    // replaces config `rustflags` instead of merging with them. In a debug
+    // build the Tauri invoke-handler closure in `run_app` alone takes ~916 KB of
+    // stack (measured under cdb 2026-09-30), so the first IPC call from the
+    // webview overflowed the main thread every boot. A link-arg emitted by the
+    // build script applies whatever directory cargo was started from.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
+
     // Self-provision a `../dist/index.html` placeholder on a fresh worktree so a
     // bare `cargo check`/`cargo build` doesn't panic inside
     // `tauri::generate_context!` — `tauri.conf.json` pins

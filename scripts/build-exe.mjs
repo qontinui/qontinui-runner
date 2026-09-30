@@ -19,12 +19,12 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const isWin = process.platform === "win32";
 
-function run(cmd, args, env) {
+function run(cmd, args, env, cwd = root) {
   // Windows needs a shell to resolve pnpm.cmd; pass it ONE command string there
   // (the arguments are constants), since args + shell is deprecated (DEP0190).
   const r = isWin
-    ? spawnSync([cmd, ...args].join(" "), { cwd: root, stdio: "inherit", env, shell: true })
-    : spawnSync(cmd, args, { cwd: root, stdio: "inherit", env });
+    ? spawnSync([cmd, ...args].join(" "), { cwd, stdio: "inherit", env, shell: true })
+    : spawnSync(cmd, args, { cwd, stdio: "inherit", env });
   if (r.error) {
     console.error(`build:exe: could not run ${cmd}: ${r.error.message}`);
     process.exit(1);
@@ -33,7 +33,18 @@ function run(cmd, args, env) {
 }
 
 run("pnpm", ["run", "build"], process.env);
-run("cargo", ["build", "--bin", "qontinui-runner", "--features", "custom-protocol"], {
-  ...process.env,
-  QONTINUI_PROVENANCE_NONCE: `${Date.now()}-${process.pid}`,
-});
+// Cargo from src-tauri, NOT the repo root: cargo reads `.cargo/config.toml`
+// from its CWD upward, and the runner's lives at src-tauri/.cargo/config.toml
+// (/Brepro, the sccache port pin, the /STACK reserve). Run from the root, every
+// one of those was silently dropped -- the exe linked with MSVC's 1 MB default
+// stack and overflowed on its first IPC call. The target dir is unaffected: it
+// defaults to the workspace root's target/ from either directory.
+run(
+  "cargo",
+  ["build", "--bin", "qontinui-runner", "--features", "custom-protocol"],
+  {
+    ...process.env,
+    QONTINUI_PROVENANCE_NONCE: `${Date.now()}-${process.pid}`,
+  },
+  path.join(root, "src-tauri"),
+);
