@@ -199,10 +199,13 @@ the way. The mechanical test is that a linked worktree's own git dir is not the
 repo's common one:
 
 ```bash
-# Skip 0b entirely unless this is the repo's canonical checkout.
-if [ "$(git rev-parse --absolute-git-dir)" \
-   = "$(git rev-parse --path-format=absolute --git-common-dir)" ]; then
-  REPO=$(basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")")
+# Skip 0b entirely unless this is the repo's canonical checkout. Each dir is read
+# ONCE with its status tested: outside a repo both reads print nothing, and two
+# empty strings compare equal -- "canonical" from a probe that never ran.
+if GIT_DIR_OWN=$(git rev-parse --absolute-git-dir) \
+   && GIT_DIR_COMMON=$(git rev-parse --path-format=absolute --git-common-dir) \
+   && [ "$GIT_DIR_OWN" = "$GIT_DIR_COMMON" ]; then
+  REPO=$(basename "$(dirname "$GIT_DIR_COMMON")")
   BRANCH=$(git rev-parse --abbrev-ref HEAD)
   DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
   [ -n "$DEFAULT" ] && [ "$BRANCH" != "$DEFAULT" ] && echo "0b applies: $REPO $BRANCH"
@@ -409,6 +412,25 @@ gh pr list --state all --search "<the target PR's own title keywords>"
 A commit or PR in that range already addressing the diagnosed gap → the work is
 **done**; stop. This is the SAME check as the plan-path grep above, adapted for a
 dispatch with no plan file to cite — not a different, weaker substitute.
+
+### 4a. Read the merge train's in-flight candidates for the repo
+
+*(Plan `2026-09-02-touching-another-sessions-work-needs-a-policy-not-a-taboo`,
+Phase 4.)* `declare_intent` sees only sessions currently DECLARING, and its
+`prior_plan_realizations` is empty (UNKNOWN, not absent) whenever
+`prior_realizations_status != "ok"` — a prose `work_unit_id` returns
+`not_slug_shaped` and the lookup never runs. Neither sees an OPEN PR from a
+finished session. `coord_query_train_health` does: read its
+`candidates_in_flight[].branch` for each repo the work touches and scan the
+branch names against your intent. A branch such as
+`fix/untimed-subprocess-isolated-edit` beside an intent to fix that very
+function means the work is already in flight — stop and coordinate. On
+2026-09-02 a session wrote a duplicate fix to `claude_tree_is_repo_authored`
+while two PRs on that function sat queued for 10.4h and 7.2h, both named in
+plain text by exactly this read. Then list the repo's open PRs and filter by
+your files CLIENT-SIDE (`gh pr list --json number,headRefName,files`); never
+`gh pr list --search`, which is tokenised full text and has returned `[]` for a
+PR a plain listing finds. An unanswered read is UNKNOWN, never clear.
 
 ### 4b. Cover the uncommitted-WIP blind spot on disk
 
