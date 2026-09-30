@@ -281,8 +281,14 @@ pub const KNOWN_COORD_DEFER_TOKENS: &[(&str, SkipReason)] = &[
     ("not_a_candidate", SkipReason::NotACandidate),
     ("pinned", SkipReason::Pinned),
     ("stale_census", SkipReason::StaleCensus),
-    ("undeclared_not_removable", SkipReason::UndeclaredNotRemovable),
-    ("landed_idle_not_removable", SkipReason::LandedIdleNotRemovable),
+    (
+        "undeclared_not_removable",
+        SkipReason::UndeclaredNotRemovable,
+    ),
+    (
+        "landed_idle_not_removable",
+        SkipReason::LandedIdleNotRemovable,
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2241,9 +2247,15 @@ mod tests {
             ("dirty", SkipReason::Dirty),
             ("pinned", SkipReason::Pinned),
             ("stale_census", SkipReason::StaleCensus),
-            ("undeclared_not_removable", SkipReason::UndeclaredNotRemovable),
-            ("landed_idle_not_removable", SkipReason::LandedIdleNotRemovable),
-                    ("something-new", SkipReason::NotCleared),
+            (
+                "undeclared_not_removable",
+                SkipReason::UndeclaredNotRemovable,
+            ),
+            (
+                "landed_idle_not_removable",
+                SkipReason::LandedIdleNotRemovable,
+            ),
+            ("something-new", SkipReason::NotCleared),
         ] {
             assert_eq!(SkipReason::from_coord_token(token), expected, "{token}");
         }
@@ -3730,18 +3742,29 @@ mod tests {
             "landed_idle_not_removable",
         ];
         let tokens: Vec<&str> = KNOWN_COORD_DEFER_TOKENS.iter().map(|(t, _)| *t).collect();
-        assert_eq!(tokens, expected, "the coord token table changed — update coord's pair");
+        assert_eq!(
+            tokens, expected,
+            "the coord token table changed — update coord's pair"
+        );
 
         let mut arms: Vec<&str> = Vec::new();
         for &(token, reason) in KNOWN_COORD_DEFER_TOKENS {
-            assert_ne!(reason, SkipReason::NotCleared, "{token} must map to a named arm");
+            assert_ne!(
+                reason,
+                SkipReason::NotCleared,
+                "{token} must map to a named arm"
+            );
             assert_eq!(SkipReason::from_coord_token(token), reason, "{token}");
             arms.push(reason.as_str());
         }
         let n = arms.len();
         arms.sort_unstable();
         arms.dedup();
-        assert_eq!(arms.len(), n, "two coord tokens collapsed onto one SkipReason");
+        assert_eq!(
+            arms.len(),
+            n,
+            "two coord tokens collapsed onto one SkipReason"
+        );
     }
 
     #[test]
@@ -3772,16 +3795,29 @@ mod tests {
         assert_eq!(items[0].reason, Some("landed-idle-not-removable"));
     }
 
+    /// Every `SkipReason` variant — the list the per-variant tests iterate.
+    const ALL_SKIP_REASONS: [SkipReason; 16] = [
+        SkipReason::Dirty,
+        SkipReason::DirtinessUnknown,
+        SkipReason::Pinned,
+        SkipReason::SessionLive,
+        SkipReason::Building,
+        SkipReason::NotLanded,
+        SkipReason::MainMerge,
+        SkipReason::Grace,
+        SkipReason::NotACandidate,
+        SkipReason::StaleCensus,
+        SkipReason::UndeclaredNotRemovable,
+        SkipReason::LandedIdleNotRemovable,
+        SkipReason::NotCleared,
+        SkipReason::CoordUnreachable,
+        SkipReason::Absent,
+        SkipReason::NotReapable,
+    ];
+
     #[test]
     fn skip_reason_serde_label_equals_as_str() {
-        for &(_, reason) in KNOWN_COORD_DEFER_TOKENS {
-            assert_eq!(
-                serde_json::to_value(reason).unwrap(),
-                serde_json::Value::String(reason.as_str().to_string()),
-                "{reason:?}"
-            );
-        }
-        for reason in [SkipReason::NotCleared, SkipReason::CoordUnreachable] {
+        for reason in ALL_SKIP_REASONS {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),
                 serde_json::Value::String(reason.as_str().to_string()),
@@ -3792,24 +3828,7 @@ mod tests {
 
     #[test]
     fn skip_reasons_all_have_distinct_tokens_and_details() {
-        let all = [
-            SkipReason::Dirty,
-            SkipReason::DirtinessUnknown,
-            SkipReason::Pinned,
-            SkipReason::SessionLive,
-            SkipReason::Building,
-            SkipReason::NotLanded,
-            SkipReason::MainMerge,
-            SkipReason::Grace,
-            SkipReason::NotACandidate,
-            SkipReason::StaleCensus,
-            SkipReason::UndeclaredNotRemovable,
-            SkipReason::LandedIdleNotRemovable,
-            SkipReason::NotCleared,
-            SkipReason::CoordUnreachable,
-            SkipReason::Absent,
-            SkipReason::NotReapable,
-        ];
+        let all = ALL_SKIP_REASONS;
         let mut tokens: Vec<&str> = all.iter().map(|r| r.as_str()).collect();
         tokens.sort_unstable();
         let unique = {
