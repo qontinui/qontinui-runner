@@ -196,10 +196,14 @@ pub(crate) enum SourceRelay {
     /// The relay reports its websocket NOT connected; `last_error` is its
     /// latest registration / connection error when it recorded one.
     Down { last_error: Option<String> },
-    /// No app state or no server mode to read — nothing is established about
-    /// this runner's relay either way.
+    /// No `AppState` to read — nothing is established about this runner's
+    /// relay either way. (A readable `AppState` with NO server mode is `Down`:
+    /// web integration is not running, so there is no relay at all.)
     Unknown,
 }
+
+/// `SourceRelay::Down`'s error when no server mode is installed at all.
+const NO_SERVER_MODE: &str = "web integration is not running on this runner";
 
 impl SourceRelay {
     /// Read this runner's relay state off the live `AppState`.
@@ -212,10 +216,13 @@ impl SourceRelay {
     }
 
     /// [`Self::sample`] over the `ServerModeState` it reads — the same pair
-    /// `backend_relay::web_integration_status_for` reports.
+    /// `backend_relay::web_integration_status_for` reports, which also reads
+    /// an absent server mode as `ws_connected: false`.
     pub(crate) async fn of(server_mode: Option<&crate::server_mode::ServerModeState>) -> Self {
         match server_mode {
-            None => Self::Unknown,
+            None => Self::Down {
+                last_error: Some(NO_SERVER_MODE.to_string()),
+            },
             Some(sm) if sm.is_ws_connected() => Self::Connected,
             Some(sm) => Self::Down {
                 last_error: sm
@@ -248,18 +255,7 @@ pub(crate) fn explain_relay_timeout(
     timeout_secs: u64,
 ) -> String {
     let head = format!("no {what} from target device {target_device_id} within {timeout_secs}s");
-    if let SourceRelay::Down { last_error } = source_relay {
-        return format!(
-            "{head}. THIS runner's own backend relay is down{}, so the request may never have \
-             reached the relay — this failure says nothing about the target device. Restore \
-             this runner's relay first (its web-integration status says why it is down).",
-            last_error
-                .as_deref()
-                .map(|e| format!(" (last error: {e})"))
-                .unwrap_or_default(),
-        );
-    }
-    let target = match target_runner {
+    with_source_relay(&head, source_relay, || match target_runner {
         Some(tr) if tr.state == "supports" => format!(
             "{head}. Coord observed that device serving a runner build{} that carries the \
              handler, so the target runner is wedged or offline, or the relay lost the frame — \
@@ -285,13 +281,51 @@ pub(crate) fn explain_relay_timeout(
             "{head}. Coord did not report the target's runner build. The target may be offline, \
              or running a runner too old to answer — such a runner ignores the request silently."
         ),
-    };
+    })
+}
+
+/// [`explain_relay_timeout`] for a HISTORY request, which mints no grant and so
+/// never asks coord about the target's runner build — its target text must not
+/// claim coord was silent about something it was never asked.
+pub(crate) fn explain_history_timeout(
+    target_device_id: &str,
+    source_relay: &SourceRelay,
+    timeout_secs: u64,
+) -> String {
+    let head = format!(
+        "no remote_terminal_buffer from target device {target_device_id} within {timeout_secs}s"
+    );
+    with_source_relay(&head, source_relay, || {
+        format!(
+            "{head}. The target did not answer the history request; it may be offline, wedged, \
+             or running a runner that does not serve history."
+        )
+    })
+}
+
+/// The SOURCE-relay framing both explainers share: a down local relay replaces
+/// the target text entirely, an unreadable one is appended to it.
+fn with_source_relay(
+    head: &str,
+    source_relay: &SourceRelay,
+    target_text: impl FnOnce() -> String,
+) -> String {
     match source_relay {
-        SourceRelay::Unknown => format!(
-            "{target} This runner's own relay state could not be read, so a local relay outage \
-             is not ruled out."
+        SourceRelay::Down { last_error } => format!(
+            "{head}. THIS runner's own backend relay is down{}, so the request may never have \
+             reached the relay — this failure says nothing about the target device. Restore \
+             this runner's relay first (its web-integration status says why it is down).",
+            last_error
+                .as_deref()
+                .map(|e| format!(" (last error: {e})"))
+                .unwrap_or_default(),
         ),
-        _ => target,
+        SourceRelay::Unknown => format!(
+            "{} This runner's own relay state could not be read, so a local relay outage is not \
+             ruled out.",
+            target_text()
+        ),
+        SourceRelay::Connected => target_text(),
     }
 }
 
@@ -1133,10 +1167,8 @@ pub async fn terminal_remote_history_load(
         Err(mut e) => {
             if e.code == "timeout" {
                 let source_relay = SourceRelay::sample(&app).await;
-                e.message = explain_relay_timeout(
-                    "remote_terminal_buffer",
+                e.message = explain_history_timeout(
                     &identity.device_id,
-                    None,
                     &source_relay,
                     HISTORY_TIMEOUT.as_secs(),
                 );
@@ -1343,10 +1375,42 @@ mod relay_timeout_tests {
         }
     }
 
-    /// No server mode installed is UNKNOWN, never "down" and never "connected".
+    /// No server mode installed means web integration is not running, so there
+    /// is no relay at all: DOWN, as `web_integration_status_for` reads it.
     #[tokio::test]
-    async fn no_server_mode_samples_as_unknown() {
-        assert_eq!(SourceRelay::of(None).await, SourceRelay::Unknown);
+    async fn no_server_mode_samples_as_down_integration_not_running() {
+        assert_eq!(
+            SourceRelay::of(None).await,
+            SourceRelay::Down {
+                last_error: Some(super::NO_SERVER_MODE.into())
+            }
+        );
+    }
+
+    /// The history explainer never claims coord was asked about the target —
+    /// history mints no grant — and shares the source-relay framing.
+    #[test]
+    fn a_history_timeout_never_claims_coord_reported_on_the_target() {
+        for relay in [
+            SourceRelay::Connected,
+            SourceRelay::Unknown,
+            SourceRelay::Down {
+                last_error: Some(REJECTED.into()),
+            },
+        ] {
+            let m = super::explain_history_timeout(DEV, &relay, 15);
+            assert!(m.contains("remote_terminal_buffer"), "{m}");
+            assert!(m.contains(DEV) && m.contains("15s"), "{m}");
+            assert!(!m.contains("Coord"), "{m}");
+            match relay {
+                SourceRelay::Down { .. } => {
+                    assert!(m.contains("THIS runner's own backend relay is down"), "{m}");
+                    assert!(!m.contains("offline"), "{m}");
+                }
+                SourceRelay::Unknown => assert!(m.contains("not ruled out"), "{m}"),
+                SourceRelay::Connected => assert!(!m.contains("relay is down"), "{m}"),
+            }
+        }
     }
 
     /// The sample reads the same pair `web_integration_status_for` reports:
