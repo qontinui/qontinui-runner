@@ -332,7 +332,13 @@ impl TransportStats {
 
     /// Read (`take == false`) or read-and-zero (`take == true`) every counter.
     fn collect(&self, take: bool) -> TransportSnapshot {
-        let read = |c: &AtomicU64| if take { c.swap(0, Relaxed) } else { c.load(Relaxed) };
+        let read = |c: &AtomicU64| {
+            if take {
+                c.swap(0, Relaxed)
+            } else {
+                c.load(Relaxed)
+            }
+        };
         let now = self.now_ms();
         let since_reset_ms = if take {
             now.saturating_sub(self.reset_at_ms.swap(now, Relaxed))
@@ -605,7 +611,13 @@ mod tests {
         s.record_ring_replay(1 << 20);
 
         let a = s.snapshot();
-        assert_eq!(a.reader, ReaderSnapshot { chunks: 2, bytes: 128 });
+        assert_eq!(
+            a.reader,
+            ReaderSnapshot {
+                chunks: 2,
+                bytes: 128
+            }
+        );
         assert_eq!(
             a.encode,
             EncodeSnapshot {
@@ -617,14 +629,44 @@ mod tests {
                 frame_count: 2,
             }
         );
-        assert_eq!(a.legs.sse, LegSnapshot { chunks: 1, bytes: 11 });
-        assert_eq!(a.legs.ws, LegSnapshot { chunks: 2, bytes: 14 });
-        assert_eq!(a.legs.webview, WebviewSnapshot { emits: 1, emit_ns: 9, bytes: 6 });
+        assert_eq!(
+            a.legs.sse,
+            LegSnapshot {
+                chunks: 1,
+                bytes: 11
+            }
+        );
+        assert_eq!(
+            a.legs.ws,
+            LegSnapshot {
+                chunks: 2,
+                bytes: 14
+            }
+        );
+        assert_eq!(
+            a.legs.webview,
+            WebviewSnapshot {
+                emits: 1,
+                emit_ns: 9,
+                bytes: 6
+            }
+        );
         assert_eq!(
             a.pipe,
-            PipeSnapshot { chunks: 1, decode_ns: 2, redact_ns: 3, reencode_ns: 4 }
+            PipeSnapshot {
+                chunks: 1,
+                decode_ns: 2,
+                redact_ns: 3,
+                reencode_ns: 4
+            }
         );
-        assert_eq!(a.ring_replay, RingReplaySnapshot { calls: 1, bytes: 1 << 20 });
+        assert_eq!(
+            a.ring_replay,
+            RingReplaySnapshot {
+                calls: 1,
+                bytes: 1 << 20
+            }
+        );
         assert_eq!(a.frame_size_hist.counts, [1, 0, 0, 0, 1, 0, 0]);
         // A plain read leaves the counters where they were.
         assert_eq!(s.snapshot().reader, a.reader);
@@ -632,7 +674,13 @@ mod tests {
         let pre = s.reset();
         assert_eq!(pre.reader, a.reader, "reset returns the pre-reset values");
         let after = s.snapshot();
-        assert_eq!(after.reader, ReaderSnapshot { chunks: 0, bytes: 0 });
+        assert_eq!(
+            after.reader,
+            ReaderSnapshot {
+                chunks: 0,
+                bytes: 0
+            }
+        );
         assert_eq!(after.encode.count, 0);
         assert_eq!(after.encode.waste, 0);
         assert_eq!(after.encode.frame_count, 0);
@@ -668,14 +716,19 @@ mod tests {
             "/ring_replay/calls",
             "/ring_replay/bytes",
         ] {
-            assert!(v.pointer(path).and_then(|x| x.as_u64()).is_some(), "{path} missing");
+            assert!(
+                v.pointer(path).and_then(|x| x.as_u64()).is_some(),
+                "{path} missing"
+            );
         }
         assert_eq!(
             v.pointer("/frame_size_hist/bounds").unwrap(),
             &serde_json::json!([1024, 4096, 16384, 49152, 65536, 262144])
         );
         assert_eq!(
-            v.pointer("/frame_size_hist/counts").and_then(|c| c.as_array()).map(Vec::len),
+            v.pointer("/frame_size_hist/counts")
+                .and_then(|c| c.as_array())
+                .map(Vec::len),
             Some(7)
         );
     }
