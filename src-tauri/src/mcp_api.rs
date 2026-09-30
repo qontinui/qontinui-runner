@@ -1724,7 +1724,8 @@ async fn health(
         "uiBridgeBinding": state.relay_binding.health_json(),
         // Operator-input emitter (plan 2026-09-20-agents-sustained-per-
         // operator-hour-needs-an-operator-touch-record, Phase 2): `emitter:
-        // true` is what coord's coverage block counts as an emitting device;
+        // true` is what the plan's coord coverage block (Phase 3, not yet
+        // built) is specified to count as an emitting device;
         // `by_caller_class.automated` climbing while nothing is emitted for it
         // is the proof automated writers are seen and not recorded. No kill
         // switch and no enable flag — see `crate::terminal::operator_input`.

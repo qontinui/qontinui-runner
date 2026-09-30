@@ -4414,6 +4414,7 @@ mod tests {
                     channel: Channel::LocalTerminal,
                 },
                 bucket: 1_726_000_020,
+                previous: i64::MIN,
             },
             SessionStateAtInput::AtPrompt,
         );

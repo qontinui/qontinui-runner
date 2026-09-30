@@ -260,9 +260,9 @@ const NEVER: i64 = i64::MIN;
 #[derive(Debug)]
 pub struct InputEpisodes {
     last_bucket: [AtomicI64; CHANNEL_COUNT],
-    /// Latches THIS terminal holds open (claimed and not rolled back) — the
-    /// per-terminal twin of the process-wide `latched` counter, readable
-    /// without cross-test noise.
+    /// Latches THIS terminal holds open: claimed and not rolled back — the
+    /// per-terminal NET of the process-wide `latched` minus `released`
+    /// counters, readable without cross-test noise.
     opened: AtomicU64,
     /// Grid reads this terminal took for `session_state_at_input` — one per
     /// ATTRIBUTED latch opening, never per keystroke.
@@ -330,7 +330,7 @@ impl InputEpisodes {
             Ordering::Relaxed,
         );
         self.opened.fetch_sub(1, Ordering::Relaxed);
-        COUNTERS.latched.fetch_sub(1, Ordering::Relaxed);
+        COUNTERS.released.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many latches this terminal holds open.
@@ -512,8 +512,13 @@ fn append_to_outbox(pending: Pending) {
 // ===========================================================================
 
 struct Counters {
-    /// Latches opened, process-wide.
+    /// Latch claims, process-wide. MONOTONIC — a rolled-back claim is not
+    /// subtracted here but counted in `released`, so `latched - released` is
+    /// the episodes that went on to attribution.
     latched: AtomicU64,
+    /// Claims rolled back because the terminal had no coord session id yet
+    /// ([`InputEpisodes::release`]). Moves with `unattributed`.
+    released: AtomicU64,
     /// Appended to the durable outbox.
     emitted: AtomicU64,
     /// Opened but lost: queue full, no outbox thread, no registry, or an
@@ -529,6 +534,7 @@ struct Counters {
 
 static COUNTERS: Counters = Counters {
     latched: AtomicU64::new(0),
+    released: AtomicU64::new(0),
     emitted: AtomicU64::new(0),
     dropped: AtomicU64::new(0),
     unattributed: AtomicU64::new(0),
@@ -538,15 +544,20 @@ static COUNTERS: Counters = Counters {
 };
 
 /// The `/health` `operatorInput` block. `emitter: true` is the per-box
-/// "this build carries the emitter" signal coord's coverage block reads;
+/// "this build carries the emitter" signal the plan's coord coverage block
+/// (Phase 3, not yet built) is specified to read;
 /// `by_caller_class.automated` climbing while nothing is emitted for it is
 /// the proof automated writers are seen and deliberately not recorded.
+/// `latched` is monotonic; `released` counts claims rolled back for want of
+/// a coord session id, so `latched - released` is what reached attribution
+/// (then `emitted` or `dropped`).
 pub fn health_json() -> Value {
     let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
     json!({
         "emitter": true,
         "emitted": n(&COUNTERS.emitted),
         "latched": n(&COUNTERS.latched),
+        "released": n(&COUNTERS.released),
         "dropped": n(&COUNTERS.dropped),
         "unattributed": n(&COUNTERS.unattributed),
         "by_caller_class": {
@@ -797,6 +808,7 @@ mod tests {
                 channel: Channel::LocalTerminal,
             },
             bucket: 1_726_000_020,
+            previous: NEVER,
         };
         let body = input_payload(sid, episode, SessionStateAtInput::Working);
         assert_eq!(body["session_id"], sid.to_string());
@@ -854,7 +866,7 @@ mod tests {
     fn health_block_carries_the_declared_keys() {
         let h = health_json();
         assert_eq!(h["emitter"], true);
-        for k in ["emitted", "latched", "dropped", "unattributed"] {
+        for k in ["emitted", "latched", "released", "dropped", "unattributed"] {
             assert!(h[k].is_u64(), "{k}");
         }
         for k in ["human", "unknown", "automated"] {
