@@ -570,70 +570,6 @@
       "reason": "find_claude_config_dirs() caller: where a provider's transcripts/config dirs live is profile.transcript + account_isolation"
     },
     {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::account_isolation",
-      "pattern": "CLAUDE_CONFIG_DIR",
-      "count": 1,
-      "class": "M",
-      "reason": "ClaudeAdapter data method folding into CliProfile.account_isolation (Phase 4)"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::launch_with_identity",
-      "pattern": "--session-id",
-      "count": 1,
-      "class": "M",
-      "reason": "test-only launch_with_identity argv; deleted with provider_adapter::LaunchSpec in Phase 6"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::launch_with_identity",
-      "pattern": "bypassPermissions",
-      "count": 1,
-      "class": "M",
-      "reason": "test-only launch_with_identity argv; deleted with provider_adapter::LaunchSpec in Phase 6"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::launch_with_identity",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "M",
-      "reason": "test-only launch_with_identity argv; deleted with provider_adapter::LaunchSpec in Phase 6, profile-driven LaunchSpec instead"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::provider",
-      "pattern": "DEFAULT_PROVIDER",
-      "count": 1,
-      "class": "M",
-      "reason": "ClaudeAdapter::provider() id; CliProfile.id (Phase 4)"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::resume_command",
-      "pattern": "--resume",
-      "count": 1,
-      "class": "M",
-      "reason": "ClaudeAdapter::resume_command data; CliProfile.resume (Phase 4)"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<ClaudeAdapter as SessionProviderAdapter>::resume_command",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "M",
-      "reason": "ClaudeAdapter::resume_command data; CliProfile.resume (Phase 4)"
-    },
-    {
-      "file": "src-tauri/src/session/provider_adapter.rs",
-      "item": "<module>",
-      "pattern": "DEFAULT_PROVIDER",
-      "count": 1,
-      "class": "M",
-      "reason": "imports DEFAULT_PROVIDER for a provider stamp/compare in this file; goes with those sites"
-    },
-    {
       "file": "src-tauri/src/session/reconcile.rs",
       "item": "<module>",
       "pattern": "DEFAULT_PROVIDER",
@@ -1176,30 +1112,6 @@
       "count": 1,
       "class": "M",
       "reason": "autonomous resume flags; profile.auto_approve"
-    },
-    {
-      "file": "src/components/terminal/providerAdapter.ts",
-      "item": "claudeDescriptor",
-      "pattern": "--resume",
-      "count": 1,
-      "class": "M",
-      "reason": "hand-kept TS resume argv; served CliProfile.resume (Phase 4)"
-    },
-    {
-      "file": "src/components/terminal/providerAdapter.ts",
-      "item": "claudeDescriptor",
-      "pattern": "lit:claude",
-      "count": 2,
-      "class": "M",
-      "reason": "hand-kept TS descriptor; deleted for served CliProfile (Phase 4)"
-    },
-    {
-      "file": "src/components/terminal/providerAdapter.ts",
-      "item": "providerDescriptorFor",
-      "pattern": "lit:claude",
-      "count": 1,
-      "class": "M",
-      "reason": "TS registry arm; profile_for over served profiles, degrade-to-claude deleted (Phase 4)"
     },
     {
       "file": "src/components/terminal/sessionStateDetector.ts",

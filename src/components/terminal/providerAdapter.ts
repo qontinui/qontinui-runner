@@ -1,56 +1,54 @@
 /**
- * Frontend descriptor mirror of the Rust `SessionProviderAdapter` contract
- * (session-restore-redesign plan §4). The provider-agnostic CORE lives in the
- * runner backend; the frontend only needs the per-provider capability surface
- * that drives the boot-restore UX: the resume command shape, the resume
- * handshake patterns `resumeVerification` matches against, and the declared
- * restore tier for the honest-capability UI.
+ * Per-provider session facts for the boot-restore UX, read from the runner's
+ * served CLI profiles (plan
+ * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+ * Phase 4).
  *
- * Phase 1 ships the TYPES + a registry lookup ({@link providerDescriptorFor})
- * only. The concrete Claude descriptor is filled in Phase 2 (port from
- * `aiLaunchCommand.ts` / `resumeVerification.ts`); Phase 3 adds Gemini. Until
- * then the registry returns a minimal default so callers compile and behave
- * sensibly.
+ * The frontend holds NO provider data of its own. The single source is the
+ * Rust manifest (`src-tauri/src/cli_profile/`), fetched once through the Tauri
+ * command `terminal_cli_profiles` (the same data `GET /terminals/cli-profiles`
+ * serves a headless runner or remote webview) and cached here. Each profile is
+ * exposed as a {@link SessionProviderDescriptor}: the resume command, the
+ * resume handshake patterns `resumeVerification` matches against, and the
+ * restore tier.
+ *
+ * **An unknown provider has no descriptor — and neither does any provider
+ * before the cache is primed.** {@link providerDescriptorFor} answers `null`,
+ * never a default CLI's descriptor, so a record of a provider the runner does
+ * not know (or cannot yet vouch for) restores terminal-only instead of having
+ * another CLI's resume typed at it. Synchronous callers must therefore run after
+ * {@link loadCliProfiles} has resolved; the restore path awaits it before
+ * classifying any record.
  */
 
+import { invoke } from "@tauri-apps/api/core";
+
 /**
- * Declared restore capability of a provider (mirrors Rust `RestoreTier`).
+ * Declared restore capability of a provider.
  * - `"full"`: the provider deterministically resumes the FULL conversation by
- *   id (`--resume <id>`) — restore brings the chat back.
+ *   id — restore brings the chat back.
  * - `"terminal-only"`: only terminal+cwd+launch-command restore; no
  *   conversation resume. The UI is honest about the loss ("fresh conversation").
  */
 export type RestoreTier = "full" | "terminal-only";
 
 /**
- * Success/failure patterns (ANSI-stripped) for `resumeVerification`.
+ * Success/failure markers for `resumeVerification`, which checks failure
+ * first and unions both kinds. Failure markers match ANSI-stripped text;
+ * success markers match rendered text, where cursor motion becomes whitespace
+ * (`renderAnsi`), because Claude Code v2 draws word gaps with cursor moves:
  *
- * TWO matcher kinds, both live, unioned by `resumeVerification`'s detectors:
- *
- * - `success` / `failure` — case-insensitive SUBSTRINGS. The portable half of
- *   the descriptor contract; a provider adapter can be declared without
- *   regex knowledge.
+ * - `success` / `failure` — case-insensitive SUBSTRINGS.
  * - `successPatterns` / `failurePatterns` — REGEXES, for markers a substring
- *   cannot express (the Claude TUI's rounded input-box frame, `/[╭╰]─{3,}/`,
- *   is the motivating one — it is a shape, not a phrase).
+ *   cannot express (the Claude TUI's input-box frames are shapes, not
+ *   phrases).
+ * - `titlePatterns` — REGEXES matched against the pane's current window title
+ *   only (the profile's `titleRegex`).
  *
- * A given provider declares each marker in EXACTLY ONE of the two kinds. The
- * Claude descriptor used to carry every phrase marker twice — once as a
- * substring, once as a regex — so adding a marker to one list silently
- * under-matched the other (plan 2026-08-23-single-source-derived-facts item 9).
- * Claude now declares its markers only as regexes (the superset:
- * `/Welcome (?:back )?to Claude/i` covers two substrings, and the box frame
- * has no substring form), and its substring lists are empty.
- *
- * THE DEFECT this closes: boot-restore ALWAYS passes a descriptor's
- * `HandshakePatterns`, and the detectors used to treat that as an EITHER/OR —
- * `if (patterns) return matchSubstrings(...)`. The regex sets in
- * `resumeVerification.ts` were therefore dead on the only path that runs in
- * production, so the frame marker never participated in a real verification: a
- * restored pane that had painted only the box frame read as "handshake not
- * observed" and burned the full retry budget. The regexes now travel WITH the
- * provider descriptor, so unioning them cannot leak Claude's frames into a
- * future non-Claude adapter's verification.
+ * Every regex is compiled from the profile's sources with the `"i"` flag:
+ *   the manifest's dialect contract is that every source matches
+ *   case-insensitively in both engines and carries no inline flags
+ *   (`src-tauri/src/cli_profile/mod.rs`).
  */
 export interface HandshakePatterns {
   /** Substrings whose presence confirms the resume landed. */
@@ -69,75 +67,15 @@ export interface HandshakePatterns {
   titlePatterns?: RegExp[];
 }
 
-/**
- * Markers that the Claude Code TUI actually rendered in this pane — i.e. the
- * resume command landed and the CLI took over the terminal. Deliberately
- * Claude-UI-shaped (rounded input box, status-line hints) rather than "any
- * output grew": a shell prompt echo or an error message must NOT count.
- *
- * The interactive resume-size picker ("Resume from summary?") is itself
- * Claude UI — a pane wedged on it still counts as HANDSHAKE OK (the resume
- * landed; answering the picker is a separate concern).
- *
- * Claude Code v2 (measured on 2.1.286) dropped the rounded `╭───╮` input box
- * for plain `────` rules around a `❯` prompt. Its first paint of a resumed
- * session in a small pane showed NONE of the older markers: no shortcuts hint,
- * no status line, no banner. Every boot-restore resume therefore timed out and
- * was retyped into the live session's prompt. The v2 markers below match
- * that first paint, and each is anchored against a known false positive:
- * - "Claude Code" alone also appears in CLI errors printed to the shell
- *   ("Claude Code requires Node.js …") and in the folder-trust dialog, so the
- *   logo marker needs the version. The window title is matched separately
- *   ({@link CLAUDE_TITLE_REGEXES}).
- * - `❯` is a common shell prompt glyph, and some two-line prompts end their
- *   first line in a `─` fill. The frame marker needs a rule that starts its
- *   line, the prompt on the next line, and a closing rule below it.
- */
-export const CLAUDE_HANDSHAKE_REGEXES: RegExp[] = [
-  /\? for shortcuts/i, // persistent status-line hint under the input box
-  /esc to interrupt/i, // shown while Claude is actively working
-  /bypass permissions/i, // permission-mode indicator in the status line
-  /Welcome (?:back )?to Claude/i, // launch banner
-  /Claude Code v\d/, // v2 logo line ("▛███▛█ Claude Code v2.1.286")
-  /[╭╰]─{3,}/, // rounded input-box / dialog frame
-  /(?:^|\n)[ \t]*─{3,}[ \t]*\r?\n[ \t]*❯[^\n]*\n[ \t]*─{3,}/, // v2 input box: `❯` between two `────` rules
-];
-
-/**
- * Claude Code's own window title at launch: a spinner glyph, then
- * `Claude Code` (`✳ Claude Code`). Matched against the current OSC title
- * only. The glyph is required because the shell titles the window too, and a
- * shell title can be a bare path such as `~/Claude Code`.
- */
-export const CLAUDE_TITLE_REGEXES: RegExp[] = [/^[✳✢✶✻✽·*]\s*Claude Code$/];
-
-/**
- * Definitive evidence that the REQUESTED session did NOT resume — evaluated
- * BEFORE the success markers on every probe. "The Claude TUI appeared" is not
- * the same claim as "the requested session resumed": a
- * `claude --resume <bogus-id>` can fall through to an error dialog, a fresh
- * session, or the interactive session picker, all of which still render
- * Claude-UI frames.
- */
-export const CLAUDE_RESUME_FAILURE_REGEXES: RegExp[] = [
-  /No conversation found/i, // `--resume <unknown-id>` error
-  /No conversations? (?:found|to resume)/i, // empty-history variants
-  /Select a (?:session|conversation) to resume/i, // interactive session picker frame
-];
-
-/**
- * The capability surface the frontend needs from a provider adapter (plan §4).
- * The launch/account-isolation/hook-delivery halves are backend concerns and
- * are NOT mirrored here — the frontend only consumes resume + handshake + tier.
- */
+/** The capability surface the boot-restore UX needs from one provider. */
 export interface SessionProviderDescriptor {
-  /** Provider id (`"claude"`, `"gemini"`). Matches the record's `provider`. */
+  /** Provider id (`"claude"`). Matches a session record's `provider`. */
   provider: string;
   /**
-   * Build the deterministic, non-interactive resume command for `sessionId`.
-   * Phase 2 fills the Claude shape (`["claude", "--resume", sessionId]`).
+   * The deterministic, non-interactive resume argv for `sessionId`, or `null`
+   * when the provider declares no resume by id.
    */
-  resumeCommand(sessionId: string): string[];
+  resumeCommand(sessionId: string): string[] | null;
   /** Resume success/failure handshake patterns. */
   handshakePatterns(): HandshakePatterns;
   /** Declared restore capability for the honest-UX surface. */
@@ -145,43 +83,125 @@ export interface SessionProviderDescriptor {
 }
 
 /**
- * The Claude descriptor (Phase 2). Resume is the deterministic, non-interactive
- * `claude --resume <id>`. `restoreTier` is `"full"` — Claude resumes the FULL
- * conversation by id.
- *
- * Every Claude marker lives in exactly one place:
- * {@link CLAUDE_HANDSHAKE_REGEXES} / {@link CLAUDE_RESUME_FAILURE_REGEXES}. The
- * substring lists are deliberately EMPTY — the regexes are a strict superset of
- * the substrings they replaced, and a second list is a second place for a new
- * marker to be forgotten. `resumeVerification` unions both kinds, so the regexes
- * are live on the boot-restore path (which always supplies this descriptor) —
- * see {@link HandshakePatterns} for the defect note. Failure is still checked
- * FIRST, since a failure dialog is itself Claude UI.
+ * The fields of the served `CliProfile` (`qontinui-schemas`
+ * `rust/src/cli_session.rs`) this module reads. `@qontinui/shared-types`
+ * 0.6.0, the version the runner installs from npm, predates that type, so the
+ * shape consumed here is declared locally; the wire is camelCase fields and
+ * `kind`-tagged fact enums.
  */
-export const claudeDescriptor: SessionProviderDescriptor = {
-  provider: "claude",
-  resumeCommand: (sessionId: string) => ["claude", "--resume", sessionId],
-  handshakePatterns: () => ({
-    success: [],
-    failure: [],
-    successPatterns: CLAUDE_HANDSHAKE_REGEXES,
-    titlePatterns: CLAUDE_TITLE_REGEXES,
-    failurePatterns: CLAUDE_RESUME_FAILURE_REGEXES,
-  }),
-  restoreTier: () => "full",
-};
+export interface ServedCliProfile {
+  id: string;
+  displayName: string;
+  programs: string[];
+  resume?: { kind: "by_id_argv"; template: string[] } | { kind: "none" } | { kind: "unknown" };
+  handshake?: {
+    success?: string[];
+    failure?: string[];
+    successRegex?: string[];
+    failureRegex?: string[];
+    titleRegex?: string[];
+  };
+  usageLimitPhrases?: string[];
+  restoreTier?: "full" | "terminal_only";
+}
+
+/** The placeholder a `by_id_argv` resume template carries for the session id. */
+const ID_PLACEHOLDER = "{id}";
+
+/** Build the descriptor for one served profile. Regexes compile once, here. */
+export function descriptorFromProfile(profile: ServedCliProfile): SessionProviderDescriptor {
+  const hp = profile.handshake ?? {};
+  const patterns: HandshakePatterns = {
+    success: hp.success ?? [],
+    failure: hp.failure ?? [],
+    successPatterns: (hp.successRegex ?? []).map((src) => new RegExp(src, "i")),
+    failurePatterns: (hp.failureRegex ?? []).map((src) => new RegExp(src, "i")),
+    titlePatterns: (hp.titleRegex ?? []).map((src) => new RegExp(src, "i")),
+  };
+  const template = profile.resume?.kind === "by_id_argv" ? profile.resume.template : null;
+  // Mirrors `cli_profile::restore_tier`: a Full claim is only honoured when
+  // the profile also says HOW to resume.
+  const tier: RestoreTier =
+    profile.restoreTier === "full" && template !== null ? "full" : "terminal-only";
+  return {
+    provider: profile.id,
+    resumeCommand: (sessionId: string) =>
+      template === null ? null : template.map((arg) => arg.split(ID_PLACEHOLDER).join(sessionId)),
+    handshakePatterns: () => patterns,
+    restoreTier: () => tier,
+  };
+}
+
+/** Primed cache: provider id → descriptor. `null` until profiles arrive. */
+let descriptors: Map<string, SessionProviderDescriptor> | null = null;
+/** The in-flight load, so concurrent callers share one IPC round trip. */
+let inflight: Promise<boolean> | null = null;
 
 /**
- * Registry lookup (plan §4 registry seam). Phase 1 knows only the Claude
- * descriptor; Phase 3 adds the Gemini arm. An unknown provider degrades to the
- * Claude descriptor (the only shipped provider today) rather than failing — a
- * record with an unexpected provider should still restore via the default path.
+ * Prime the cache from served profiles. Exported for callers that already
+ * hold the list (and for tests, which prime from the checked-in snapshot the
+ * Rust suite pins to the live manifest).
  */
-export function providerDescriptorFor(provider: string | undefined): SessionProviderDescriptor {
-  switch (provider) {
-    // Phase 3 adds: case "gemini": return geminiDescriptor;
-    case "claude":
-    default:
-      return claudeDescriptor;
-  }
+export function setCliProfiles(profiles: readonly ServedCliProfile[]): void {
+  descriptors = new Map(profiles.map((p) => [p.id, descriptorFromProfile(p)]));
+}
+
+/** Drop the cache (tests). */
+export function resetCliProfiles(): void {
+  descriptors = null;
+  inflight = null;
+}
+
+/** True once served profiles are cached. */
+export function cliProfilesLoaded(): boolean {
+  return descriptors !== null;
+}
+
+/**
+ * Fetch the served profiles once and cache them. Resolves `true` when the
+ * cache is primed. A failed fetch resolves `false`, logs why, and leaves the
+ * cache unprimed so the next call retries — while unprimed, every provider
+ * reads as unknown (terminal-only), never as Claude.
+ */
+export function loadCliProfiles(): Promise<boolean> {
+  if (descriptors !== null) return Promise.resolve(true);
+  if (inflight !== null) return inflight;
+  inflight = invoke<unknown>("terminal_cli_profiles")
+    .then((served) => {
+      if (!Array.isArray(served)) {
+        console.warn(
+          "[providerAdapter] terminal_cli_profiles returned no profile list — every provider " +
+            "restores terminal-only until it loads",
+          served,
+        );
+        return false;
+      }
+      setCliProfiles(served as ServedCliProfile[]);
+      return true;
+    })
+    .catch((err: unknown) => {
+      console.warn(
+        "[providerAdapter] terminal_cli_profiles failed — every provider restores terminal-only " +
+          "until it loads:",
+        err,
+      );
+      return false;
+    })
+    .finally(() => {
+      inflight = null;
+    });
+  return inflight;
+}
+
+/**
+ * The descriptor for `provider`, or `null` when the runner serves no profile
+ * for it — including every provider while the cache is unprimed. `null` means
+ * UNKNOWN: restore the terminal only, and name the provider; never substitute
+ * another CLI's descriptor.
+ */
+export function providerDescriptorFor(
+  provider: string | undefined,
+): SessionProviderDescriptor | null {
+  if (descriptors === null || provider === undefined) return null;
+  return descriptors.get(provider) ?? null;
 }
