@@ -2372,7 +2372,15 @@ impl CoordOutsideObserver {
         if !self.enabled {
             return;
         }
-        if !tick.is_multiple_of(Self::ticks_per_probe(host_cadence)) {
+        let ticks = Self::ticks_per_probe(host_cadence);
+        // The probe period this host cadence actually yields, so the latch
+        // staleness bound scales with a configured-slow heartbeat instead of
+        // declaring a healthy observer silent.
+        EFFECTIVE_PROBE_PERIOD_SECS.store(
+            ticks.saturating_mul(host_cadence.as_secs().max(1)) as i64,
+            Ordering::SeqCst,
+        );
+        if !tick.is_multiple_of(ticks) {
             return;
         }
         if self.in_flight.swap(true, Ordering::SeqCst) {
@@ -2483,9 +2491,17 @@ impl CoordOutsideObserver {
                 Err(poisoned) => poisoned.into_inner(),
             };
             let reports = guard.observe(&outcome);
+            let now = chrono::Utc::now().timestamp();
+            let previous = OPEN_FAULTS_FOLDED_AT.load(Ordering::SeqCst);
             OPEN_FAULTS.store(guard.open_mask(), Ordering::SeqCst);
-            // Stamp AFTER the mask: a reader that sees this stamp sees that mask.
-            OPEN_FAULTS_FOLDED_AT.store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
+            // A fold after a stale gap (or the first one) starts a new fresh
+            // streak — the instant the latches became believable again.
+            if previous <= 0 || now - previous > open_faults_stale_after_secs() {
+                OPEN_FAULTS_FRESH_SINCE.store(now, Ordering::SeqCst);
+            }
+            // Stamp LAST: a reader that sees this stamp sees that mask or a
+            // newer one.
+            OPEN_FAULTS_FOLDED_AT.store(now, Ordering::SeqCst);
             reports
         };
         for report in &reports {
@@ -2511,11 +2527,32 @@ static OPEN_FAULTS: AtomicU8 = AtomicU8::new(0);
 /// Unix seconds of the fold that last stored [`OPEN_FAULTS`]; `0` = never.
 static OPEN_FAULTS_FOLDED_AT: AtomicI64 = AtomicI64::new(0);
 
-/// How old the last fold may be before the latches say nothing: three probe
-/// periods. A probe is single-flight and bounded, so an observer that has not
-/// folded in that long is stalled or gone — and a latch it can no longer
-/// re-arm must not be read as "still holds".
-pub const OPEN_FAULTS_STALE_AFTER_SECS: i64 = 3 * PROBE_PERIOD_SECS as i64;
+/// Unix seconds of the first fold of the current FRESH streak (the first fold
+/// ever, or the first after a gap longer than the staleness bound); `0` = never.
+static OPEN_FAULTS_FRESH_SINCE: AtomicI64 = AtomicI64::new(0);
+
+/// The probe period the host's cadence yields (`ticks_per_probe × cadence`),
+/// stored on every host tick; `0` until the first tick.
+static EFFECTIVE_PROBE_PERIOD_SECS: AtomicI64 = AtomicI64::new(0);
+
+/// The floor of the staleness bound: three nominal probe periods.
+pub const OPEN_FAULTS_MIN_STALE_AFTER_SECS: i64 = 3 * PROBE_PERIOD_SECS as i64;
+
+/// How old the last fold may be before the latches say nothing:
+/// `max(OPEN_FAULTS_MIN_STALE_AFTER_SECS, 3 × effective probe period)`. A probe
+/// is single-flight and bounded, so an observer that has not folded in three
+/// of its own periods is stalled or gone — and a latch it can no longer re-arm
+/// must not be read as "still holds". Scaled by the EFFECTIVE period, so a
+/// host heartbeat configured slower than [`PROBE_PERIOD_SECS`] does not make a
+/// healthy observer read silent.
+pub fn stale_after_for(effective_probe_period_secs: i64) -> i64 {
+    OPEN_FAULTS_MIN_STALE_AFTER_SECS.max(effective_probe_period_secs.saturating_mul(3))
+}
+
+/// [`stale_after_for`] over this process's effective probe period.
+pub fn open_faults_stale_after_secs() -> i64 {
+    stale_after_for(EFFECTIVE_PROBE_PERIOD_SECS.load(Ordering::SeqCst))
+}
 
 /// What the observer's latch for one class says right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2524,36 +2561,65 @@ pub enum FaultLatch {
     Open,
     /// No open episode.
     Closed,
-    /// The observer has not folded within [`OPEN_FAULTS_STALE_AFTER_SECS`]
-    /// (or ever): the latch is frozen and vouches for nothing. `last_fold` is
-    /// when it last spoke, `None` if it never has.
+    /// The observer has not folded within the staleness bound (or ever): the
+    /// latch is frozen and vouches for nothing. `last_fold` is when it last
+    /// spoke, `None` if it never has.
     Unknown {
         last_fold: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
 
-/// `class`'s latch in this process — the live predicate `fleet::wedge_report`
-/// closes a `coord_*` incident against, the way it uses
-/// `health_monitor::backend_wedged()`, except that it can be UNKNOWN.
-pub fn fault_latch(class: FaultClass) -> FaultLatch {
-    // Stamp first: the writer stores the mask before the stamp, so a stamp
-    // read here dates a mask at least as new as it.
-    let stamp = OPEN_FAULTS_FOLDED_AT.load(Ordering::SeqCst);
-    let mask = OPEN_FAULTS.load(Ordering::SeqCst);
-    fault_latch_at(mask, stamp, class, chrono::Utc::now())
+/// One consistent read of the published latches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatchSnapshot {
+    pub mask: u8,
+    pub folded_at: i64,
+    pub fresh_since: i64,
+    pub stale_after: i64,
 }
 
-/// Pure core of [`fault_latch`].
+impl LatchSnapshot {
+    /// `class`'s latch at `now` — the live predicate `fleet::wedge_report`
+    /// closes a `coord_*` incident against, the way it uses
+    /// `health_monitor::backend_wedged()`, except that it can be UNKNOWN.
+    pub fn latch(&self, class: FaultClass, now: chrono::DateTime<chrono::Utc>) -> FaultLatch {
+        fault_latch_at(self.mask, self.folded_at, self.stale_after, class, now)
+    }
+
+    /// When the current fresh streak began, if the observer ever folded.
+    pub fn fresh_since(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        (self.fresh_since > 0)
+            .then(|| chrono::DateTime::from_timestamp(self.fresh_since, 0))
+            .flatten()
+    }
+}
+
+/// Read the latches. Stamp first: the writer stores the mask, then the streak
+/// start, then the stamp, so the mask read after it is at least as new.
+pub fn latch_snapshot() -> LatchSnapshot {
+    let folded_at = OPEN_FAULTS_FOLDED_AT.load(Ordering::SeqCst);
+    let fresh_since = OPEN_FAULTS_FRESH_SINCE.load(Ordering::SeqCst);
+    let mask = OPEN_FAULTS.load(Ordering::SeqCst);
+    LatchSnapshot {
+        mask,
+        folded_at,
+        fresh_since,
+        stale_after: open_faults_stale_after_secs(),
+    }
+}
+
+/// Pure core of [`LatchSnapshot::latch`].
 pub fn fault_latch_at(
     mask: u8,
     folded_at: i64,
+    stale_after: i64,
     class: FaultClass,
     now: chrono::DateTime<chrono::Utc>,
 ) -> FaultLatch {
     if folded_at <= 0 {
         return FaultLatch::Unknown { last_fold: None };
     }
-    if now.timestamp() - folded_at > OPEN_FAULTS_STALE_AFTER_SECS {
+    if now.timestamp() - folded_at > stale_after {
         return FaultLatch::Unknown {
             last_fold: chrono::DateTime::from_timestamp(folded_at, 0),
         };
@@ -3121,35 +3187,54 @@ mod tests {
     fn a_frozen_fold_stamp_makes_every_latch_unknown() {
         let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         let t = now.timestamp();
+        let bound = OPEN_FAULTS_MIN_STALE_AFTER_SECS;
         let open = FaultClass::NoLeader.bit();
         assert_eq!(
-            fault_latch_at(open, t - 10, FaultClass::NoLeader, now),
+            fault_latch_at(open, t - 10, bound, FaultClass::NoLeader, now),
             FaultLatch::Open
         );
         assert_eq!(
-            fault_latch_at(open, t - 10, FaultClass::Unreachable, now),
+            fault_latch_at(open, t - 10, bound, FaultClass::Unreachable, now),
             FaultLatch::Closed
         );
         assert_eq!(
-            fault_latch_at(
-                open,
-                t - OPEN_FAULTS_STALE_AFTER_SECS,
-                FaultClass::NoLeader,
-                now
-            ),
+            fault_latch_at(open, t - bound, bound, FaultClass::NoLeader, now),
             FaultLatch::Open,
             "exactly at the bound is still fresh"
         );
-        let stale = t - OPEN_FAULTS_STALE_AFTER_SECS - 1;
+        let stale = t - bound - 1;
         assert_eq!(
-            fault_latch_at(open, stale, FaultClass::NoLeader, now),
+            fault_latch_at(open, stale, bound, FaultClass::NoLeader, now),
             FaultLatch::Unknown {
                 last_fold: chrono::DateTime::from_timestamp(stale, 0)
             }
         );
         assert_eq!(
-            fault_latch_at(open, 0, FaultClass::NoLeader, now),
+            fault_latch_at(open, 0, bound, FaultClass::NoLeader, now),
             FaultLatch::Unknown { last_fold: None }
+        );
+    }
+
+    #[test]
+    fn the_stale_bound_scales_with_the_effective_probe_period_never_below_the_floor() {
+        assert_eq!(stale_after_for(0), OPEN_FAULTS_MIN_STALE_AFTER_SECS);
+        assert_eq!(stale_after_for(15), OPEN_FAULTS_MIN_STALE_AFTER_SECS);
+        assert_eq!(stale_after_for(60), 180);
+        // A heartbeat configured at 90 s yields one probe per tick = 90 s.
+        let period = CoordOutsideObserver::ticks_per_probe(Duration::from_secs(90)) as i64 * 90;
+        assert_eq!(stale_after_for(period), 270);
+        // So a fold 200 s old is FRESH under that cadence, not silent.
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let snap = LatchSnapshot {
+            mask: FaultClass::Unreachable.bit(),
+            folded_at: now.timestamp() - 200,
+            fresh_since: now.timestamp() - 400,
+            stale_after: stale_after_for(period),
+        };
+        assert_eq!(snap.latch(FaultClass::Unreachable, now), FaultLatch::Open);
+        assert_eq!(
+            snap.fresh_since(),
+            chrono::DateTime::from_timestamp(now.timestamp() - 400, 0)
         );
     }
 
