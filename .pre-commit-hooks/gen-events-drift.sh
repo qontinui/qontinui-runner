@@ -572,15 +572,20 @@ print_dirty_checkout_note() {
     fi
 }
 
+# "this push" is false at pre-commit, where this hook also runs; every verdict
+# line names the stage it is actually in.
+STAGE="$(gen_events_stage)"
+if [ "$STAGE" = "push" ]; then BYPASS_CMD="git push"; else BYPASS_CMD="git commit"; fi
+
 if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     # NOT a failure, and deliberately not silent either. The drift is real and
     # someone must eventually refresh the shared artifact — but it is not this
     # push's to answer for, and blocking on it would train everyone to reach
     # for SKIP=, which is how a guard stops being read at all.
     echo
-    log "PRE-EXISTING DRIFT — not caused by this push."
+    log "PRE-EXISTING DRIFT — not caused by this $STAGE."
     log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
-    log "Rust generates. But this push changes NONE of the sources that feed"
+    log "Rust generates. But this $STAGE changes NONE of the sources that feed"
     log "them — nothing under ${GEN_EVENTS_ATTRIBUTION_PATHS[*]}"
     if [ -z "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
         log "(markdown aside — the premise guard found no way for it to reach schemas.json;"
@@ -596,7 +601,7 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
     print_dirty_checkout_note log
     echo
-    log "Nothing to do for this push. To clear it for everyone:"
+    log "Nothing to do for this $STAGE. To clear it for everyone:"
     print_remedy log
     log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
     echo
@@ -614,10 +619,10 @@ if [ "$ATTRIBUTION_STATE" = "mine" ]; then
 elif [ "$ATTRIBUTION_STATE" = "pre-existing" ]; then
     # Only reachable under STRICT. Say why it blocks rather than printing the
     # "this is yours" line, which would be false.
-    fail "This drift is PRE-EXISTING — this push changes none of the sources that"
+    fail "This drift is PRE-EXISTING — this $STAGE changes none of the sources that"
     fail "feed the bindings — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it."
 elif [ "$ATTRIBUTION_STATE" = "unavailable" ]; then
-    fail "Could not tell whether this push caused it: $ATTRIBUTION_UNAVAILABLE_REASON."
+    fail "Could not tell whether this $STAGE caused it: $ATTRIBUTION_UNAVAILABLE_REASON."
     fail "Failing closed. A hook that cannot attribute drift must not excuse it —"
     fail "the alternative is silently clearing a real break."
 else
@@ -626,7 +631,7 @@ else
     # an empty reason and read as a diagnosed verdict.
     fail "Attribution returned an unrecognized state: '$ATTRIBUTION_STATE'."
     fail "That is a bug in lib/gen-events-attribution.sh, not a verdict about"
-    fail "this push. Failing closed, for the same reason 'unavailable' does."
+    fail "this $STAGE. Failing closed, for the same reason 'unavailable' does."
 fi
 echo >&2
 git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || true
@@ -636,5 +641,5 @@ print_remedy
 print_dirty_checkout_note
 
 echo >&2
-fail "Bypass for this push only: SKIP=gen-events-drift git push"
+fail "Bypass for this $STAGE only: SKIP=gen-events-drift $BYPASS_CMD"
 exit 1

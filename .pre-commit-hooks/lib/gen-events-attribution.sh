@@ -132,8 +132,13 @@
 # The list is derived from what actually produces the artifact, not from what
 # has produced a diff so far: `schemas.json` comes from ONE command,
 # `cargo run --bin export_schemas --release` (src-tauri/scripts/generate_types.sh),
-# so the inputs are the whole compiled crate graph plus everything that pins how
-# it compiles. That is why the IN-REPO path dependencies and the toolchain pin
+# so the inputs are the whole compiled crate graph plus the configuration that
+# pins how cargo compiles it (manifests, lockfile, toolchain, cargo config).
+# NOT included, deliberately: the non-Rust files build scripts read —
+# src-tauri/tauri.conf.json, src-tauri/capabilities/, src/components/app/
+# tab-types.ts, useAppNavigation.ts, ../dist/*. Counting them would make
+# frontend-only pushes MINE, which is the false blame this split exists to
+# stop, and none of them reaches a JsonSchema type today. That is why the IN-REPO path dependencies and the toolchain pin
 # are here even though nothing under them derives `JsonSchema` today — the day
 # one does, or the day a feature edit in one of their manifests changes feature
 # unification for `serde`/`chrono`/`uuid`, a narrower list would start clearing
@@ -218,6 +223,10 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     # The compiler that expands the `schemars` derive. A channel bump is a real
     # input to the generated JSON and touches none of the paths above.
     "rust-toolchain.toml"
+    # Cargo configuration: `[env]`, rustflags and cfgs apply to the export
+    # build, which runs from src-tauri, and so does a root one if it appears.
+    "src-tauri/.cargo/config.toml"
+    ".cargo/config.toml"
 )
 
 # Appended to every pathspec above. Non-glob pathspec magic lets `*` cross `/`,
@@ -229,30 +238,36 @@ GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
     ':(exclude)*.md'
 )
 
-# Where the premise guard looks: the Rust sources under the directory-prefix
-# inputs above, the only ones under which a `.md` could be a sibling of Rust
-# that embeds it. Rust only — see "Reach" in the header. `**/` also matches
-# zero directories, so `src-tauri/src/lib.rs` is in.
-GEN_EVENTS_PREMISE_PATHS=(
-    ":(glob)src-tauri/src/**/*.rs"
-    ":(glob)src-tauri/clorinde/**/*.rs"
-    ":(glob)crates/spec-check/**/*.rs"
-    ":(glob)crates/runner-stats/**/*.rs"
-    ":(glob)crates/runner-win32/**/*.rs"
-    ":(glob)vendor/**/*.rs"
-)
+# Where the premise guard looks, DERIVED from GEN_EVENTS_ATTRIBUTION_PATHS
+# rather than kept as a second list: a hand-kept copy could lose a directory
+# and still pass every test, and markdown in that crate would then be cleared
+# unprobed. Each DIRECTORY input contributes `:(glob)<dir>/**/*.rs` (Rust
+# only — see "Reach" in the header; `**/` also matches zero directories) and
+# `:(glob)<dir>/**/build.rs`; a FILE input named `build.rs` is a build script
+# as it stands. An entry is a directory when its last component has no `.` —
+# the self-test checks that rule against the real tree for every entry.
+GEN_EVENTS_PREMISE_PATHS=()
+GEN_EVENTS_PREMISE_BUILD_SCRIPTS=()
+_gen_events_derive_premise_paths() {
+    local entry
+    for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "${entry##*/}" in
+            build.rs) GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=("$entry") ;;
+            *.*)      ;;
+            *)        GEN_EVENTS_PREMISE_PATHS+=(":(glob)$entry/**/*.rs")
+                      GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=(":(glob)$entry/**/build.rs") ;;
+        esac
+    done
+}
+_gen_events_derive_premise_paths
 
-# Build scripts the export build runs. A build script can read a markdown file
-# and GENERATE a JsonSchema type or doc from it, which no embed arm would see.
-GEN_EVENTS_PREMISE_BUILD_SCRIPTS=(
-    "src-tauri/build.rs"
-    ":(glob)src-tauri/src/**/build.rs"
-    ":(glob)src-tauri/clorinde/**/build.rs"
-    ":(glob)crates/spec-check/**/build.rs"
-    ":(glob)crates/runner-stats/**/build.rs"
-    ":(glob)crates/runner-win32/**/build.rs"
-    ":(glob)vendor/**/build.rs"
-)
+# Which hook stage is running: `push` when pre-commit is running a pre-push
+# hook (it sets PRE_COMMIT_TO_REF only then — lib/push-range.sh reads it the
+# same way), otherwise `commit`, which also covers a manual run. The wording
+# of every verdict depends on it: "this push" is false at pre-commit.
+gen_events_stage() {
+    if [ -n "${PRE_COMMIT_TO_REF:-}" ]; then echo push; else echo commit; fi
+}
 
 # `git grep` in the WORKING TREE of $1, untracked and gitignored files included
 # (`--no-exclude-standard`) — the regeneration compiles the working tree,
@@ -390,9 +405,10 @@ gen_events_markdown_premise_violations() {
     # source and a `path` attribute makes it a module — either can define a
     # JsonSchema type, so the file's extension says nothing. File-level (the
     # macro or attribute anywhere, plus any `.md"` literal anywhere) so a
-    # `concat!` or wrapped form is caught too. The real tree's six uses in four
-    # files, plus the TOML `path =` at restate/config.rs:145, name `.rs` files,
-    # OUT_DIR or a data dir, and stay quiet.
+    # `concat!` or wrapped form is caught too. The real tree's uses — `#[path]`
+    # to sibling `.rs` modules (including vendored tao's platform `mod.rs`),
+    # `include!` of OUT_DIR-generated `.rs`, and the TOML `path =` in
+    # restate/config.rs — name no markdown, and stay quiet.
     _gen_events_premise_arm "include!/path attribute in a file that names a .md path" \
         "$as_rust" "$md_lit" && arm_rc=0 || arm_rc=$?
     case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
@@ -578,7 +594,9 @@ gen_events_attribution() {
     # sorts below every path character and a path's lines stay adjacent.
     ATTRIBUTION_TOUCHED_DETAIL="$(printf '%s' "$detail_lines" | LC_ALL=C sort -u | sed '/^$/d')"
 
-    if [ -n "$ATTRIBUTION_TOUCHED" ]; then
+    # Decided from the raw collection, not the sorted rendering of it: the
+    # verdict must not hang on a formatting pipeline.
+    if [ -n "$touched_lines" ]; then
         ATTRIBUTION_STATE="mine"
     else
         ATTRIBUTION_STATE="pre-existing"
@@ -593,8 +611,7 @@ gen_events_attribution() {
 #
 # Stage-aware. The hook runs at pre-commit AND pre-push, and "this push" is
 # false at pre-commit: there the staged input IS the change being made.
-# pre-commit sets PRE_COMMIT_TO_REF only for a push (lib/push-range.sh reads
-# it the same way), so its absence means a commit or a manual run.
+# `gen_events_stage` decides which.
 #
 # It prints no commands. Earlier versions printed a set-aside recipe (a
 # tag-found stash, then a clean-worktree route), and each revision still had a
@@ -603,8 +620,8 @@ gen_events_attribution() {
 # entry behind. What to do with local state is the pusher's call; the message
 # states the facts that call needs.
 gen_events_render_mine() {
-    local stage="commit" p src label own=0 earlier=0 local_only=0
-    [ -n "${PRE_COMMIT_TO_REF:-}" ] && stage="push"
+    local stage p src label own=0 earlier=0 local_only=0
+    stage="$(gen_events_stage)"
 
     # `own`: something in the change being made (committed for a push, staged
     # for a commit). `earlier`: commits already on the branch, at pre-commit.

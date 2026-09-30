@@ -322,7 +322,8 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # `src-tauri/src` file changing. Pinned here because the asymmetry only works
 # while the list stays complete — a narrowed list clears a guilty pusher.
 for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
-    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs; do
+    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
+    src-tauri/.cargo/config.toml .cargo/config.toml; do
     fixture
     commit_change "$input" "# touched"
     decide
@@ -601,14 +602,48 @@ premise_case "guard is quiet on the real tree's include!(concat!(OUT_DIR, .rs)) 
     "$(printf 'include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));\n#[path = "../build.rs"]\nmod b;')"
 premise_case "an exporter with no JsonSchema anywhere is UNVERIFIABLE, not clean" "probe-failed(2)" \
     'fn main() {}' src-tauri/src/bin/export_schemas.rs
-premise_case "a generator script with no exporter beside it is UNVERIFIABLE" "probe-failed(2)" \
-    '# gen' src-tauri/scripts/generate_types.sh
+# The generator-without-exporter check ALONE: a JsonSchema file is present,
+# so the empty-JsonSchema check cannot be what fires.
+premise_fixture '#[derive(JsonSchema)] struct S;'
+mkdir -p "$PREMISE_FIXTURE/src-tauri/scripts"
+printf '# gen\n' > "$PREMISE_FIXTURE/src-tauri/scripts/generate_types.sh"
+GEN_OUT="$(gen_events_markdown_premise_violations "$PREMISE_FIXTURE")" && GEN_RC=0 || GEN_RC=$?
+check "a generator script with no exporter beside it is UNVERIFIABLE" "2|yes|no" \
+    "$GEN_RC|$(printf '%s\n' "$GEN_OUT" | grep -qF 'exists but src-tauri/src/bin/export_schemas.rs does not' && echo yes || echo no)|$(printf '%s\n' "$GEN_OUT" | grep -qF 'no file mentions JsonSchema' && echo yes || echo no)"
 premise_case "guard fires: a build script reading markdown" violation \
     'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
 premise_case "guard fires: a build script filtering on the md extension" violation \
     'fn main() { if p.extension() == Some("md".as_ref()) {} }' src-tauri/build.rs
 premise_case "guard is quiet on a build script that only mentions a .md in prose" clean \
     'fn main() { println!("See src-tauri/docs/tokio-console.md.\\n"); }' src-tauri/build.rs
+
+echo "  -- the probe's reach is derived from the input list --"
+
+# Every DIRECTORY input is probed: a violation seeded under any of them drops
+# the exclusion, so a markdown push there is MINE. Iterating the library's own
+# list, so a new directory input is covered the day it is added.
+for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+    case "${PDIR##*/}" in *.*) continue ;; esac
+    fixture
+    seed_base "$PDIR/src/v.rs" '#[derive(JsonSchema)] struct V; const B: &str = include_str!("../x.md");'
+    commit_change "$PDIR/x.md" "# a body"
+    decide
+    check "a violation under $PDIR is probed, so its .md is MINE" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(case "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" in "markdown may reach"*) echo yes ;; *) echo no ;; esac)"
+done
+
+# The derivation's rule — no `.` in the last component means a directory —
+# checked against the real tree for every entry that exists there.
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    MISCLASSIFIED=""
+    for PDIR in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        [ -e "$REPO_ROOT/$PDIR" ] || continue
+        case "${PDIR##*/}" in *.*) want=file ;; *) want=dir ;; esac
+        if [ -d "$REPO_ROOT/$PDIR" ]; then got=dir; else got=file; fi
+        [ "$want" = "$got" ] || MISCLASSIFIED+=" $PDIR($got)"
+    done
+    check "every input's dir/file classification matches the real tree" "" "$MISCLASSIFIED"
+fi
 
 echo "  -- the premise gates the exclusion at decision time --"
 
@@ -801,6 +836,9 @@ check "  and it says to set them aside, not to commit them" "yes|no" \
 render_with "$(detail_line src-tauri/src/lib.rs staged)"
 check "staged at pre-push: labelled as not in the push" \
     yes "$(has 'src-tauri/src/lib.rs  (staged, not committed — not part of this push)')"
+check "  the lead line blames the working tree, not the push" "yes|no" \
+    "$(has 'Your working tree (not this push')|$(has 'This push changes')"
+check "  and the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
 
 render_with "$(detail_line src-tauri/src/new.rs untracked)"
 check "untracked: labelled as not in the push" \
@@ -848,6 +886,16 @@ ATTRIBUTION_TOUCHED="src-tauri/src/lib.rs"
 ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
 render_now
 check "  and not when no .md is blamed" no "$(has 'Markdown was counted as a codegen input this time')"
+# A %q-escaped markdown name ends in `.md'`, not `.md`.
+render_with "$(detail_line "\$'src-tauri/src/a\\tb.md'" committed)"
+ATTRIBUTION_TOUCHED="\$'src-tauri/src/a\\tb.md'"
+ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (x)"
+render_now
+check "  and when the blamed .md is a %q-escaped name" yes "$(has 'Markdown was counted as a codegen input this time')"
+
+# The hook's own verdict lines (outside the renderer) name the stage too.
+check "gen-events-drift.sh words its verdicts and bypass by stage" "yes|no" \
+    "$(grep -qF 'Bypass for this $STAGE only: SKIP=gen-events-drift $BYPASS_CMD' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)|$(grep -qE '^[^#]*(log|fail) "[^"]*(not caused by|Nothing to do for|whether) this push' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.
