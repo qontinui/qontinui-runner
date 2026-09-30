@@ -1,0 +1,4 @@
+// Planted fixture for class `fleet_device_uuid` (from qontinui-schemas/fleet-nouns.toml).
+fn planted_fleet_device_uuid() -> &'static str {
+    "84c02292-32cb-4983-be85-d00f868b7003"
+}
