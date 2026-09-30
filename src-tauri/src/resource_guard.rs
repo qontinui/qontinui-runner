@@ -996,6 +996,56 @@ pub(crate) fn commit_ladder_scale(
     }
 }
 
+/// WHY [`commit_ladder_scale`] gave the factor it gave — so a `1.0` on
+/// `/health` or in the shadow log says which of three very different things it
+/// is. PURE.
+///
+/// - `"unknown_identity"` — no usable commit limit (absent or `0`): the
+///   shipped ladder because the machine's size is UNKNOWN.
+/// - `"below_reference"` — a measured limit at or below
+///   [`REFERENCE_COMMIT_LIMIT`]: the shipped ladder because it is already
+///   correct for a box this size (the lower clamp).
+/// - `"derived"` — a measured limit above the reference: the factor is the
+///   box's own (possibly clamped at [`SCALE_MAX`]).
+pub(crate) fn commit_ladder_scale_source(
+    capability: &crate::fleet::machine_capability::MachineCapability,
+) -> &'static str {
+    match capability.commit_limit {
+        None | Some(0) => "unknown_identity",
+        Some(limit) if limit <= REFERENCE_COMMIT_LIMIT => "below_reference",
+        Some(_) => "derived",
+    }
+}
+
+/// The `/health` `commitLadderShadow` block. `Err(reason)` when the capability
+/// probe never ran: the SAME object with `scale` and `scaleSource` null and the
+/// reason beside them — never a bare `null`, which a reader cannot tell from a
+/// build that serves no such block.
+pub(crate) fn commit_ladder_shadow_health_json(
+    capability: Result<&crate::fleet::machine_capability::MachineCapability, &str>,
+) -> serde_json::Value {
+    let (scale, source, reason) = match capability {
+        Ok(c) => (
+            serde_json::json!(commit_ladder_scale(c)),
+            serde_json::json!(commit_ladder_scale_source(c)),
+            serde_json::Value::Null,
+        ),
+        Err(reason) => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!(reason),
+        ),
+    };
+    serde_json::json!({
+        "armed": false,
+        "scale": scale,
+        "scaleSource": source,
+        "reason": reason,
+        "referenceCommitLimit": REFERENCE_COMMIT_LIMIT,
+        "scaleMax": SCALE_MAX,
+    })
+}
+
 /// `base × scale`, never below `base`. At (or below, or NaN) a scale of `1.0`
 /// the answer is `base` itself, not a float round-trip of it — which is what
 /// makes the identity property hold byte for byte for every `u64`.
@@ -1229,14 +1279,18 @@ fn shadow_edge(last: &mut Option<ShadowKey>, key: ShadowKey) -> bool {
 /// the shipped one does. **Changes no verdict.**
 ///
 /// Called from the fleet sampler's host lane (`collect_host_lane`), which runs
-/// every ~30 s on a blocking-pool thread, already holds a fresh free-commit
-/// reading and the capability built around it, and is off every spawn path.
-/// Hooking it there adds no memory syscall and nothing to any spawn; hooking it
-/// into [`effective_session_floors`] instead would put a settings read and a
-/// `host_sizing` probe on the spawn path, which is the cost this module's gate
-/// is argued never to pay. The sampler runs on the primary only, which is the
-/// right population for the soak: every runner on a box reads the same
-/// machine.
+/// every ~30 s on a blocking-pool thread and is off every spawn path. Every
+/// input is handed in from what that loop already holds — the free-commit
+/// reading and the capability built around it, the session-guard and
+/// `ci_node` settings out of the one settings document it loads anyway, and a
+/// [`HostCapacity`](crate::ci_node::host_sizing::HostCapacity) built from its
+/// own memory reading and core count — so this function makes no memory
+/// syscall, no settings read and no sysinfo refresh of its own. Its one impure
+/// read is [`effective_session_floors`]' lock on the fleet-floor cache.
+/// Hooking it into [`effective_session_floors`] instead would have put all of
+/// that on the spawn path, which is the cost this module's gate is argued
+/// never to pay. The sampler runs on the primary only, which is the right
+/// population for the soak: every runner on a box reads the same machine.
 ///
 /// Edge-triggered with [`note_ladder_coercion`]'s discipline — a line only
 /// when the scale, the rungs or either ladder's verdict CHANGES — because an
@@ -1246,14 +1300,12 @@ fn shadow_edge(last: &mut Option<ShadowKey>, key: ShadowKey) -> bool {
 pub(crate) fn note_commit_ladder_shadow(
     capability: &crate::fleet::machine_capability::MachineCapability,
     free_commit: Option<u64>,
+    session_guard: &SessionGuardSettings,
+    ci_node: &crate::settings::CiNodeSettings,
+    host: crate::ci_node::host_sizing::HostCapacity,
 ) {
-    let effective = effective_session_floors(
-        &crate::settings::get_session_guard_settings(),
-        Lane::Host.as_str(),
-    );
-    let host = crate::ci_node::host_sizing::probe();
-    let admitted =
-        crate::settings::get_ci_node_settings().effective_max_concurrent_builds_for(host);
+    let effective = effective_session_floors(session_guard, Lane::Host.as_str());
+    let admitted = ci_node.effective_max_concurrent_builds_for(host);
     let alternative = admitted_concurrency_scale(host, admitted);
     let shadow = commit_ladder_shadow(capability, &effective, free_commit, alternative);
 
@@ -1296,6 +1348,7 @@ pub(crate) fn note_commit_ladder_shadow(
     tracing::info!(
         target: "resource_guard::commit_ladder_shadow",
         scale = shadow.scale,
+        scale_source = commit_ladder_scale_source(capability),
         commit_limit = ?capability.commit_limit,
         commit_limit_source = capability.commit_limit_source,
         free_commit = ?free_commit,
@@ -1411,6 +1464,41 @@ mod commit_ladder_scale_tests {
     fn an_unknown_capability_is_exactly_the_identity() {
         assert_eq!(commit_ladder_scale(&capability(None)), 1.0);
         assert_eq!(commit_ladder_scale(&capability(Some(0))), 1.0);
+    }
+
+    /// S4 — a 1.0 says WHY: unknown, or small enough that the shipped ladder
+    /// already fits.
+    #[test]
+    fn the_scale_source_names_why() {
+        assert_eq!(
+            commit_ladder_scale_source(&capability(None)),
+            "unknown_identity"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(0))),
+            "unknown_identity"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(REFERENCE_COMMIT_LIMIT))),
+            "below_reference"
+        );
+        assert_eq!(
+            commit_ladder_scale_source(&capability(Some(REFERENCE_COMMIT_LIMIT + 1))),
+            "derived"
+        );
+    }
+
+    /// W3 — the probe-failed block is the same object, scale null + reason.
+    #[test]
+    fn the_health_block_on_a_failed_probe_is_an_object_with_a_reason() {
+        let failed = commit_ladder_shadow_health_json(Err("join failed"));
+        assert!(failed["scale"].is_null());
+        assert!(failed["scaleSource"].is_null());
+        assert_eq!(failed["reason"], "join failed");
+        assert_eq!(failed["armed"], false);
+        let ok = commit_ladder_shadow_health_json(Ok(&capability(Some(75_191_424 * 1024))));
+        assert_eq!(ok["scaleSource"], "derived");
+        assert!(ok["reason"].is_null());
     }
 
     /// The MSI operator box: 75,191,424 KB = 71.71 GiB ⇒ 2.24, and the plan's

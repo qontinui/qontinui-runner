@@ -25,7 +25,7 @@
 //! | `commit_charged` | `ullTotalPageFile − ullAvailPageFile` | `/proc/meminfo` `Committed_AS` |
 //! | `phys_total` | `ullTotalPhys` | sysinfo `total_memory()` (`MemTotal`) |
 //! | `cores` | `available_parallelism` | `available_parallelism` |
-//! | `pagefile_*` | the `PagingFiles` registry value + the live files' sizes | UNKNOWN — Linux has no pagefile |
+//! | `pagefile_*` | the live files (`ExistingPageFiles` + their sizes), checked against `PagingFiles` | UNKNOWN — no Windows pagefile off Windows |
 //!
 //! `commit_limit` and `phys_total` on Windows come out of the ONE
 //! `GlobalMemoryStatusEx` buffer the fleet sample and the spawn gate already
@@ -113,19 +113,21 @@ pub(crate) struct MachineCapability {
     /// Usable parallelism (`available_parallelism`: honours cgroup quotas and
     /// affinity), the same figure the fleet sample publishes as `cpu_cores`.
     pub(crate) cores: Option<u32>,
-    /// Bytes currently allocated to pagefiles on disk (the sum of the live
+    /// Bytes currently allocated to pagefiles on disk (the sum of the LIVE
     /// files' sizes — what `Win32_PageFileUsage.AllocatedBaseSize` reports).
     /// `Some(0)` is a real reading: a box configured with no pagefile.
     pub(crate) pagefile_allocated: Option<u64>,
     /// The configured maximum pagefile size in bytes, summed over every file.
     /// UNKNOWN for a system-managed pagefile, which has no configured maximum —
-    /// Windows grows it on demand.
+    /// Windows grows it on demand — and UNKNOWN while a changed configuration is
+    /// pending a reboot (see [`configuration_is_live`]).
     pub(crate) pagefile_max: Option<u64>,
     /// Whether the commit limit is FIXED: every pagefile has
     /// `initial == maximum`, or there is no pagefile at all. On a fixed box
     /// "the paging file is too small" (`os error 1455`) is TERMINAL — Windows
     /// will never grow the file — whereas on a system-managed one it is often
-    /// transient. See [`pagefile_fixed`].
+    /// transient. See [`pagefile_fixed`]. UNKNOWN while a changed configuration
+    /// is pending a reboot.
     pub(crate) pagefile_fixed: Option<bool>,
     /// Why each `None` field above is `None`, keyed by its JSON name. Empty
     /// when every field was read.
@@ -151,12 +153,31 @@ pub(crate) struct PagefileEntry {
     pub(crate) size: PagefileSize,
 }
 
-/// What the pagefile probe found: the configuration, and the bytes the live
-/// files currently occupy (which can fail independently of the configuration).
+/// One pagefile that is live THIS boot (an `ExistingPageFiles` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LivePagefile {
+    /// Normalised by [`normalize_pagefile_path`].
+    pub(crate) path: String,
+    /// Its size on disk right now — can fail per file.
+    pub(crate) size: Result<u64, String>,
+}
+
+/// What the pagefile probe found. The two halves come from different moments
+/// and must never be conflated:
+///
+/// - `configured` is `PagingFiles` — the **NEXT-BOOT** configuration. System
+///   Properties writes it the instant the operator clicks OK, and it takes
+///   effect only after a reboot.
+/// - `live` is `ExistingPageFiles` plus each file's size — what is in effect
+///   THIS boot.
+///
+/// So the allocated figure is always summed from `live`, and the configuration
+/// describes growability only once [`configuration_is_live`] shows it is the
+/// one actually in effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PagefileReading {
-    pub(crate) entries: Vec<PagefileEntry>,
-    pub(crate) allocated: Result<u64, String>,
+    pub(crate) configured: Result<Vec<PagefileEntry>, String>,
+    pub(crate) live: Result<Vec<LivePagefile>, String>,
 }
 
 /// Everything [`assemble`] needs, each input either a value or the reason it
@@ -268,6 +289,89 @@ fn pagefile_max(entries: &[PagefileEntry]) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Normalise a pagefile path for comparison: trimmed, the NT `\??\` prefix
+/// `ExistingPageFiles` carries stripped, lower-cased (Windows paths are
+/// case-insensitive, and the two registry values need not agree on case).
+/// PURE.
+pub(crate) fn normalize_pagefile_path(raw: &str) -> String {
+    let t = raw.trim();
+    t.strip_prefix(r"\??\").unwrap_or(t).to_ascii_lowercase()
+}
+
+/// Is the `PagingFiles` configuration the one in effect THIS boot? PURE.
+///
+/// `PagingFiles` is written immediately and applied at the next boot, so after
+/// an operator changes it the registry describes a machine that does not exist
+/// yet. Two checks, both against what is live:
+///
+/// 1. **Paths.** The configured file set must equal the live set. A `?:`
+///    ("manage all drives automatically") entry matches any non-empty live set
+///    whose every file has the same name after its drive letter.
+/// 2. **Sizes.** For each custom-sized entry, the live file's size must lie in
+///    `[initial, max]` — a custom pagefile is created at `initial` and only ever
+///    grows toward `max`, so a size outside that band means the sizes changed
+///    and are pending. A live size that could not be read cannot rule that out,
+///    so it answers `false` too: "cannot establish" is not "consistent".
+///
+/// No pagefile configured and none live is consistent (a box with no pagefile).
+pub(crate) fn configuration_is_live(configured: &[PagefileEntry], live: &[LivePagefile]) -> bool {
+    use std::collections::BTreeSet;
+    let live_paths: BTreeSet<&str> = live.iter().map(|l| l.path.as_str()).collect();
+    let (automatic, explicit): (Vec<&PagefileEntry>, Vec<&PagefileEntry>) =
+        configured.iter().partition(|e| e.path.starts_with("?:"));
+
+    let paths_match = if automatic.is_empty() {
+        let configured_paths: BTreeSet<String> = explicit
+            .iter()
+            .map(|e| normalize_pagefile_path(&e.path))
+            .collect();
+        configured_paths
+            .iter()
+            .map(String::as_str)
+            .eq(live_paths.iter().copied())
+    } else {
+        // `?:\pagefile.sys` → tail `:\pagefile.sys`, matched against each live
+        // path's tail after its one-byte drive letter.
+        let tails: BTreeSet<String> = automatic
+            .iter()
+            .filter_map(|e| {
+                normalize_pagefile_path(&e.path)
+                    .get(1..)
+                    .map(str::to_string)
+            })
+            .collect();
+        !live.is_empty()
+            && live_paths
+                .iter()
+                .all(|p| p.get(1..).is_some_and(|t| tails.contains(t)))
+            && explicit
+                .iter()
+                .all(|e| live_paths.contains(normalize_pagefile_path(&e.path).as_str()))
+    };
+    if !paths_match {
+        return false;
+    }
+
+    explicit.iter().all(|e| match e.size {
+        PagefileSize::SystemManaged => true,
+        PagefileSize::Custom {
+            initial_mib,
+            max_mib,
+        } => {
+            let path = normalize_pagefile_path(&e.path);
+            live.iter()
+                .filter(|l| l.path == path)
+                .all(|l| match l.size {
+                    Ok(bytes) => {
+                        bytes >= initial_mib.saturating_mul(MIB)
+                            && bytes <= max_mib.saturating_mul(MIB)
+                    }
+                    Err(_) => false,
+                })
+        }
+    })
+}
+
 /// Pull `CommitLimit` and `Committed_AS` out of `/proc/meminfo` text. PURE.
 ///
 /// Each is `Err` with a reason when its key is absent or unparseable — never a
@@ -318,21 +422,60 @@ pub(crate) fn assemble(inputs: CapabilityInputs) -> MachineCapability {
 
     let (pagefile_allocated, pagefile_max_bytes, pagefile_fixed_flag) = match inputs.pagefile {
         Ok(reading) => {
-            let allocated = match reading.allocated {
+            // ALWAYS the live files — never zero because the next-boot
+            // configuration happens to be empty.
+            let allocated = match &reading.live {
+                Ok(live) => live.iter().try_fold(0u64, |acc, l| match &l.size {
+                    Ok(bytes) => Ok(acc.saturating_add(*bytes)),
+                    Err(reason) => Err(reason.clone()),
+                }),
+                Err(reason) => Err(reason.clone()),
+            };
+            let allocated = match allocated {
                 Ok(v) => Some(v),
                 Err(reason) => {
                     unknown.insert("pagefileAllocated", reason);
                     None
                 }
             };
-            let max = match pagefile_max(&reading.entries) {
-                Ok(v) => Some(v),
-                Err(reason) => {
-                    unknown.insert("pagefileMax", reason);
-                    None
+            let in_effect = match (reading.configured, &reading.live) {
+                (Err(reason), _) => Err(reason),
+                (Ok(_), Err(reason)) => Err(format!(
+                    "the live pagefile list is unreadable ({reason}), so whether PagingFiles \
+                     (the next-boot configuration) is the one in effect cannot be established"
+                )),
+                (Ok(configured), Ok(live)) if !configuration_is_live(&configured, live) => {
+                    Err(format!(
+                        "configuration pending reboot: PagingFiles (applied at the next boot) \
+                         names {:?}, which does not match the live pagefiles {:?}",
+                        configured
+                            .iter()
+                            .map(|e| e.path.as_str())
+                            .collect::<Vec<_>>(),
+                        live.iter()
+                            .map(|l| (l.path.as_str(), l.size.as_ref().ok()))
+                            .collect::<Vec<_>>(),
+                    ))
                 }
+                (Ok(configured), Ok(_)) => Ok(configured),
             };
-            (allocated, max, Some(pagefile_fixed(&reading.entries)))
+            match in_effect {
+                Ok(entries) => {
+                    let max = match pagefile_max(&entries) {
+                        Ok(v) => Some(v),
+                        Err(reason) => {
+                            unknown.insert("pagefileMax", reason);
+                            None
+                        }
+                    };
+                    (allocated, max, Some(pagefile_fixed(&entries)))
+                }
+                Err(reason) => {
+                    unknown.insert("pagefileMax", reason.clone());
+                    unknown.insert("pagefileFixed", reason);
+                    (allocated, None, None)
+                }
+            }
         }
         Err(reason) => {
             for name in ["pagefileAllocated", "pagefileMax", "pagefileFixed"] {
@@ -352,6 +495,45 @@ pub(crate) fn assemble(inputs: CapabilityInputs) -> MachineCapability {
         pagefile_max: pagefile_max_bytes,
         pagefile_fixed: pagefile_fixed_flag,
         capability_unknown: unknown,
+    }
+}
+
+/// Every capability field's `/health` name, in wire order.
+pub(crate) const CAPABILITY_FIELDS: [&str; 7] = [
+    "commitLimit",
+    "commitCharged",
+    "physTotal",
+    "cores",
+    "pagefileAllocated",
+    "pagefileMax",
+    "pagefileFixed",
+];
+
+/// Which instrument this platform reads the commit limit from.
+#[cfg(windows)]
+pub(crate) const COMMIT_LIMIT_SOURCE: &str = "GlobalMemoryStatusEx.ullTotalPageFile";
+/// Which instrument this platform reads the commit limit from.
+#[cfg(not(windows))]
+pub(crate) const COMMIT_LIMIT_SOURCE: &str = "/proc/meminfo CommitLimit";
+
+/// A capability in which NOTHING could be read: every field null, every field
+/// carrying `reason` — for a caller whose probe never ran at all (`/health`'s
+/// blocking task failing to join). The same shape as a partial read, so a
+/// consumer needs one code path, not two.
+pub(crate) fn unknown_everywhere(reason: &str) -> MachineCapability {
+    MachineCapability {
+        commit_limit: None,
+        commit_limit_source: COMMIT_LIMIT_SOURCE,
+        commit_charged: None,
+        phys_total: None,
+        cores: None,
+        pagefile_allocated: None,
+        pagefile_max: None,
+        pagefile_fixed: None,
+        capability_unknown: CAPABILITY_FIELDS
+            .iter()
+            .map(|name| (*name, reason.to_string()))
+            .collect(),
     }
 }
 
@@ -386,7 +568,7 @@ fn platform_inputs(reading: Option<MemoryStatus>) -> CapabilityInputs {
         commit_limit: reading
             .map(|m| m.commit_total)
             .ok_or_else(|| NO_READING.to_string()),
-        commit_limit_source: "GlobalMemoryStatusEx.ullTotalPageFile",
+        commit_limit_source: COMMIT_LIMIT_SOURCE,
         commit_charged: reading
             .map(|m| m.commit_total.saturating_sub(m.commit_available))
             .ok_or_else(|| NO_READING.to_string()),
@@ -400,26 +582,50 @@ fn platform_inputs(reading: Option<MemoryStatus>) -> CapabilityInputs {
 
 #[cfg(not(windows))]
 fn platform_inputs(reading: Option<MemoryStatus>) -> CapabilityInputs {
-    let (commit_limit, commit_charged) = match std::fs::read_to_string("/proc/meminfo") {
-        Ok(text) => parse_commit_meminfo(&text),
-        Err(e) => {
-            let reason = format!("/proc/meminfo unreadable: {e}");
-            (Err(reason.clone()), Err(reason))
-        }
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|e| format!("/proc/meminfo unreadable: {e}"));
+    let (commit_limit, commit_charged) = match &meminfo {
+        Ok(text) => parse_commit_meminfo(text),
+        Err(reason) => (Err(reason.clone()), Err(reason.clone())),
     };
     CapabilityInputs {
         commit_limit,
-        commit_limit_source: "/proc/meminfo CommitLimit",
+        commit_limit_source: COMMIT_LIMIT_SOURCE,
         commit_charged,
-        phys_total: reading
-            .map(|m| m.phys_total)
-            .ok_or_else(|| "sysinfo reported no memory".to_string()),
+        phys_total: non_windows_phys_total(reading, meminfo.as_deref()),
         cores: cores(),
         pagefile: Err(
-            "no pagefile on this OS — Linux backs commit with swap (the fleet sample's \
-             swap_total_bytes)"
+            "no Windows pagefile on this OS — commit is backed by swap here, not a \
+                       pagefile (see the fleet sample's swap_total_bytes)"
                 .to_string(),
         ),
+    }
+}
+
+/// Physical RAM off Windows. PURE over its two sources.
+///
+/// `memory_status` withholds its WHOLE reading when `MemAvailable` is 0 (it
+/// will not publish half a pair), which says nothing about how much RAM the box
+/// has. So a missing reading falls back to `/proc/meminfo` `MemTotal` — the line
+/// sysinfo itself reads on Linux — and only when neither answers is the field
+/// UNKNOWN, with a reason naming both.
+#[cfg(not(windows))]
+fn non_windows_phys_total(
+    reading: Option<MemoryStatus>,
+    meminfo: Result<&str, &String>,
+) -> Result<u64, String> {
+    if let Some(m) = reading {
+        return Ok(m.phys_total);
+    }
+    match meminfo {
+        Ok(text) => super::resource_sample::meminfo_kb(text, "MemTotal:").ok_or_else(|| {
+            "no memory reading (sysinfo reported MemAvailable = 0, or failed) and \
+             /proc/meminfo carries no parseable `MemTotal:` line"
+                .to_string()
+        }),
+        Err(reason) => Err(format!(
+            "no memory reading (sysinfo reported MemAvailable = 0, or failed) and {reason}"
+        )),
     }
 }
 
@@ -438,22 +644,28 @@ fn platform_inputs(reading: Option<MemoryStatus>) -> CapabilityInputs {
 /// seconds before abort #4. A capability probe that breaks on the condition it
 /// describes is the wrong instrument.
 ///
-/// ## Cached once, except for the live size
+/// ## Read fresh every time, and never trusted as live on its own
 ///
-/// The configuration only changes across a reboot, so it is read ONCE per
-/// process (first capability read, which is always on a blocking-pool thread —
-/// never on the async runtime or the spawn path) and cached, including a
-/// failure. The allocated size is re-`stat`ed on every read: a system-managed
-/// pagefile GROWS under load, and a cached size would publish the one number
-/// most likely to have changed at the moment it matters.
+/// `PagingFiles` is the **next-boot** configuration: System Properties writes it
+/// immediately and it takes effect only after a reboot. So it is NOT cached for
+/// the process lifetime (a change made mid-run would otherwise be published as
+/// the live state until the runner restarted), and it describes growability
+/// only once [`configuration_is_live`] has matched it against
+/// `ExistingPageFiles` — the files actually live this boot — and their sizes.
+/// Both values and the sizes are re-read on every call: microseconds, only ever
+/// from the ~30 s fleet sampler or `/health`'s blocking task (never the async
+/// runtime, never the spawn path), and a system-managed pagefile GROWS under
+/// load, so a cached size would publish the one number most likely to have
+/// changed at the moment it matters.
+///
+/// `ExistingPageFiles` absent is UNKNOWN, not "no pagefile": nothing here can
+/// tell a box with no pagefile from a registry that did not answer.
 #[cfg(windows)]
 mod windows_pagefile {
-    use std::sync::OnceLock;
-
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
-    use super::{parse_paging_files, PagefileEntry, PagefileReading};
+    use super::{normalize_pagefile_path, parse_paging_files, LivePagefile, PagefileReading};
 
     const MEMORY_MANAGEMENT: &str =
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
@@ -464,43 +676,36 @@ mod windows_pagefile {
             .map_err(|e| format!("HKLM\\{MEMORY_MANAGEMENT} unreadable: {e}"))
     }
 
-    fn configuration() -> &'static Result<Vec<PagefileEntry>, String> {
-        static CONFIG: OnceLock<Result<Vec<PagefileEntry>, String>> = OnceLock::new();
-        CONFIG.get_or_init(|| {
-            let key = memory_management()?;
-            let lines: Vec<String> = key
-                .get_value("PagingFiles")
-                .map_err(|e| format!("PagingFiles registry value unreadable: {e}"))?;
-            parse_paging_files(&lines)
-        })
-    }
-
-    /// The bytes the live pagefiles occupy right now. `ExistingPageFiles`
-    /// lists them in NT form (`\??\C:\pagefile.sys`); `std::fs::metadata`
-    /// reads an in-use `pagefile.sys` through its `FindFirstFileW` fallback.
-    fn allocated(entries: &[PagefileEntry]) -> Result<u64, String> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-        let key = memory_management()?;
-        let live: Vec<String> = key
+    /// The live pagefiles, each with its size. `ExistingPageFiles` lists them
+    /// in NT form (`\??\C:\pagefile.sys`); `std::fs::metadata` reads an in-use
+    /// `pagefile.sys` through its `FindFirstFileW` fallback.
+    fn live(key: &RegKey) -> Result<Vec<LivePagefile>, String> {
+        let raw: Vec<String> = key
             .get_value("ExistingPageFiles")
             .map_err(|e| format!("ExistingPageFiles registry value unreadable: {e}"))?;
-        let mut total: u64 = 0;
-        for raw in live.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let path = raw.strip_prefix(r"\??\").unwrap_or(raw);
-            let len = std::fs::metadata(path)
-                .map_err(|e| format!("pagefile {path} could not be stat'ed: {e}"))?
-                .len();
-            total = total.saturating_add(len);
-        }
-        Ok(total)
+        Ok(raw
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let path = normalize_pagefile_path(s);
+                let size = std::fs::metadata(&path)
+                    .map(|m| m.len())
+                    .map_err(|e| format!("pagefile {path} could not be stat'ed: {e}"));
+                LivePagefile { path, size }
+            })
+            .collect())
     }
 
     pub(super) fn reading() -> Result<PagefileReading, String> {
-        let entries = configuration().clone()?;
-        let allocated = allocated(&entries);
-        Ok(PagefileReading { entries, allocated })
+        let key = memory_management()?;
+        let configured = key
+            .get_value::<Vec<String>, _>("PagingFiles")
+            .map_err(|e| format!("PagingFiles registry value unreadable: {e}"))
+            .and_then(|lines| parse_paging_files(&lines));
+        Ok(PagefileReading {
+            configured,
+            live: live(&key),
+        })
     }
 }
 
@@ -642,10 +847,23 @@ Committed_AS:   98765432 kB
             commit_charged: Ok((75_191_424 - 32_678_912) * 1024),
             phys_total: Ok(33_248_384 * 1024),
             cores: Ok(16),
-            pagefile: Ok(PagefileReading {
-                entries: vec![custom(r"C:\pagefile.sys", 40960, 40960)],
-                allocated: Ok(40 * GIB),
-            }),
+            pagefile: Ok(msi_pagefile(Ok(40 * GIB))),
+        }
+    }
+
+    fn live(path: &str, size: Result<u64, String>) -> LivePagefile {
+        LivePagefile {
+            path: normalize_pagefile_path(path),
+            size,
+        }
+    }
+
+    /// The MSI box's pagefile as the registry reports it: configured
+    /// `C:\pagefile.sys 40960 40960`, live as `\??\C:\pagefile.sys`.
+    fn msi_pagefile(size: Result<u64, String>) -> PagefileReading {
+        PagefileReading {
+            configured: Ok(vec![custom(r"C:\pagefile.sys", 40960, 40960)]),
+            live: Ok(vec![live(r"\??\C:\pagefile.sys", size)]),
         }
     }
 
@@ -686,23 +904,139 @@ Committed_AS:   98765432 kB
         }
     }
 
-    /// An allocation read can fail on its own while the configuration still
-    /// answers `pagefileFixed` — the two are independent.
+    /// A live size that cannot be read blinds BOTH the allocation and the
+    /// fixed flag: without it, a pending resize of the same path cannot be
+    /// ruled out, and "cannot establish" is not "consistent".
     #[test]
-    fn an_unreadable_allocation_does_not_blind_the_fixed_flag() {
+    fn an_unreadable_live_size_is_unknown_for_allocation_and_growability() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(msi_pagefile(Err("stat failed".into()))),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, None);
+        assert_eq!(cap.pagefile_fixed, None);
+        assert_eq!(cap.pagefile_max, None);
+        assert_eq!(
+            cap.capability_unknown.keys().copied().collect::<Vec<_>>(),
+            vec!["pagefileAllocated", "pagefileFixed", "pagefileMax"]
+        );
+    }
+
+    /// W1 — `PagingFiles` is the NEXT-BOOT configuration. An operator who
+    /// moved the pagefile to D: has not moved it yet: the allocation is still
+    /// the live C: file, and growability is UNKNOWN "pending reboot" rather
+    /// than a description of a machine that does not exist yet.
+    #[test]
+    fn a_changed_path_is_pending_reboot_and_allocation_stays_live() {
         let cap = assemble(CapabilityInputs {
             pagefile: Ok(PagefileReading {
-                entries: vec![custom(r"C:\pagefile.sys", 40960, 40960)],
-                allocated: Err("stat failed".into()),
+                configured: Ok(vec![custom(r"D:\pagefile.sys", 8192, 8192)]),
+                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, Some(40 * GIB));
+        assert_eq!(cap.pagefile_fixed, None);
+        assert_eq!(cap.pagefile_max, None);
+        assert!(cap.capability_unknown["pagefileFixed"].contains("pending reboot"));
+    }
+
+    /// Same path, new sizes: the live file sits outside the configured
+    /// `[initial, max]` band, so the resize has not happened yet.
+    #[test]
+    fn a_changed_size_on_the_same_path_is_pending_reboot() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Ok(vec![custom(r"C:\pagefile.sys", 16384, 16384)]),
+                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_fixed, None);
+        assert!(cap.capability_unknown["pagefileMax"].contains("pending reboot"));
+    }
+
+    /// Pagefile REMOVED for the next boot: the configuration is empty, but the
+    /// live file still occupies 40 GiB — never `Some(0)`.
+    #[test]
+    fn an_empty_configuration_never_zeroes_a_live_allocation() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Ok(vec![]),
+                live: Ok(vec![live(r"\??\C:\pagefile.sys", Ok(40 * GIB))]),
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, Some(40 * GIB));
+        assert_eq!(cap.pagefile_fixed, None);
+    }
+
+    /// No pagefile configured and none live: consistent, fixed, a real zero.
+    #[test]
+    fn no_pagefile_configured_or_live_is_a_real_fixed_zero() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Ok(vec![]),
+                live: Ok(vec![]),
+            }),
+            ..msi_inputs()
+        });
+        assert_eq!(cap.pagefile_allocated, Some(0));
+        assert_eq!(cap.pagefile_max, Some(0));
+        assert_eq!(cap.pagefile_fixed, Some(true));
+    }
+
+    /// An unreadable live list keeps the allocation AND growability unknown.
+    #[test]
+    fn an_unreadable_live_list_is_unknown_not_consistent() {
+        let cap = assemble(CapabilityInputs {
+            pagefile: Ok(PagefileReading {
+                configured: Ok(vec![custom(r"C:\pagefile.sys", 40960, 40960)]),
+                live: Err("ExistingPageFiles registry value unreadable".into()),
             }),
             ..msi_inputs()
         });
         assert_eq!(cap.pagefile_allocated, None);
-        assert_eq!(cap.pagefile_fixed, Some(true));
-        assert_eq!(
-            cap.capability_unknown.keys().copied().collect::<Vec<_>>(),
-            vec!["pagefileAllocated"]
-        );
+        assert_eq!(cap.pagefile_fixed, None);
+        assert!(cap.capability_unknown["pagefileFixed"].contains("cannot be established"));
+    }
+
+    #[test]
+    fn configuration_is_live_matching_rules() {
+        let growable = [custom(r"C:\pagefile.sys", 4096, 16384)];
+        // Grown within the band is still the live configuration.
+        assert!(configuration_is_live(
+            &growable,
+            &[live(r"\??\c:\PAGEFILE.SYS", Ok(10 * GIB))]
+        ));
+        // Automatic all-drives matches any live set with the same file name.
+        let automatic = parse_paging_files(&[r"?:\pagefile.sys"]).unwrap();
+        assert!(configuration_is_live(
+            &automatic,
+            &[
+                live(r"\??\C:\pagefile.sys", Ok(GIB)),
+                live(r"\??\D:\pagefile.sys", Ok(GIB))
+            ]
+        ));
+        assert!(!configuration_is_live(&automatic, &[]));
+        // System-managed on a named drive needs only the path.
+        let managed = parse_paging_files(&[r"C:\pagefile.sys"]).unwrap();
+        assert!(configuration_is_live(
+            &managed,
+            &[live(r"\??\C:\pagefile.sys", Err("stat failed".into()))]
+        ));
+    }
+
+    /// W3 — a probe that never ran is null everywhere, with the reason under
+    /// EVERY field name.
+    #[test]
+    fn unknown_everywhere_names_every_field() {
+        let cap = unknown_everywhere("join failed");
+        let json = serde_json::to_value(&cap).unwrap();
+        for name in CAPABILITY_FIELDS {
+            assert!(json[name].is_null(), "{name}");
+            assert_eq!(json["capabilityUnknown"][name], "join failed", "{name}");
+        }
     }
 
     /// The `/health` wire names — pinned so the coordinator's verification and
