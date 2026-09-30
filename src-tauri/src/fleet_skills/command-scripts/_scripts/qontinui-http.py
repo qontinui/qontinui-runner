@@ -31,12 +31,14 @@ import asyncio
 import json
 import sys
 
-import httpx
-
+# Both imports are guarded: httpx is a dependency of qontinui-mcp, so a missing
+# httpx means the same missing install and gets the same instruction.
 try:
+    import httpx
     from qontinui_mcp.client import QontinuiClient, DEFAULT_RUNNER_PORT, EXECUTION_TIMEOUT
-except ImportError:
-    print("ERROR: qontinui-mcp not found. Please install it:", file=sys.stderr)
+except ImportError as exc:
+    print(f"ERROR: qontinui-mcp (and its httpx dependency) not importable: {exc}", file=sys.stderr)
+    print("Install it from a qontinui-mcp source checkout (it is not on PyPI):", file=sys.stderr)
     print("  cd qontinui-mcp && pip install -e .", file=sys.stderr)
     sys.exit(1)
 

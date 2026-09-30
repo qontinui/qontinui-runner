@@ -257,8 +257,9 @@ are started is a property of your project, not of Qontinui.
 
 After a runner restart, restore the loaded config, workflow and monitor.
 `qontinui-http.py` is carried by the `command-scripts` skill and needs Python 3
-with `httpx` and the `qontinui-mcp` package (it imports `qontinui_mcp.client`);
-`pip install qontinui-mcp` if the import fails.
+with the `qontinui-mcp` package (it imports `qontinui_mcp.client`, which brings
+`httpx`). `qontinui-mcp` is not on PyPI: install it from source with
+`pip install -e <your qontinui-mcp checkout>`, as the helper's own error says.
 
 ```bash
 command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
@@ -376,7 +377,18 @@ If `.automation-results/latest/` doesn't exist or is empty:
 
 1. Check if runner is running:
    ```bash
-   # Define command_script exactly as in Phase 4 first: each shell starts empty.
+   command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+     local d="$PWD" c
+     while :; do
+       c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+       [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+       [ "$d" = / ] && break; d=$(dirname "$d")
+     done
+     c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+     [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+     echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+     return 1
+   }
    QH=$(CS_REL=qontinui-http.py command_script) && python3 "$QH" status
    ```
 
