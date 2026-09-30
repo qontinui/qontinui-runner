@@ -945,8 +945,8 @@ mod tests {
         // RefusalSource, NextAction, NextActionKind — plan
         // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
         // C1/D1) = 560.
-        // Independently corroborated by the codegen, which reports
-        // "Processing 560 top-level types" and emits 560 .d.ts files.
+        // The codegen's "Processing N top-level types" line (last measured at
+        // 554, before the glossary/refusal six) should read 560 here.
         assert_eq!(obj.len(), 560, "Expected 560 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
