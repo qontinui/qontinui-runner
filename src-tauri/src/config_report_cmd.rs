@@ -1268,9 +1268,9 @@ pub(crate) fn coord_prompt_documents_reading(
 ///
 /// # The freshness asymmetry, reported rather than smoothed over
 ///
-/// Four caches sit behind one poll loop and they do not agree about what they
+/// Five caches sit behind one poll loop and they do not agree about what they
 /// can tell you. The session-briefing cache carries `fetched_at` +
-/// `provenance` per document, so this row prints them. The other three are a
+/// `provenance` per document, so this row prints them. The other four are a
 /// bare `RwLock<T>` holding a value and nothing else, so their last-refresh
 /// time is genuinely unavailable — and the row says `UNKNOWN` for it rather
 /// than substituting `captured_at`. Substituting would make every dial look
@@ -1353,8 +1353,8 @@ pub(crate) fn fleet_policy_dial_reading(
     let value = format!(
         "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
          thread ceilings warn={} crit={} | \
-         plan_capture={}{} (armed at {:?}) | briefings: {} | poll interval {} ms | last refresh of \
-         the first three caches: {}",
+         plan_capture={}{} (armed at {:?}) | account_selection_mode={} | briefings: {} | poll \
+         interval {} ms | last refresh of the value-only caches (all but the briefings): {}",
         dial.install_intercept_mode,
         ambiguous(&dial.install_intercept_mode, dial.install_intercept_default),
         floor(dial.host_warn_free_bytes),
@@ -1366,6 +1366,11 @@ pub(crate) fn fleet_policy_dial_reading(
         dial.plan_capture_level,
         ambiguous(&dial.plan_capture_level, dial.plan_capture_default),
         dial.plan_capture_record_level,
+        // `None` is NO fleet opinion (the machine's local mode governs) — it
+        // must never render as a mode, or the row would claim a fleet value
+        // that is not there.
+        dial.account_selection_mode
+            .unwrap_or("(no fleet opinion — the local mode governs)"),
         briefings,
         dial.poll_interval_ms,
         if dial.caches_expose_refresh_time {
@@ -1377,7 +1382,7 @@ pub(crate) fn fleet_policy_dial_reading(
     );
     LayerReading::known(
         value,
-        "mcp::fleet_policy_poller::dial_snapshot (four process-global caches, one poll loop — \
+        "mcp::fleet_policy_poller::dial_snapshot (five process-global caches, one poll loop — \
          TIME-VARYING with no restart)",
         captured_at,
     )
@@ -3174,6 +3179,7 @@ mod tests {
             plan_capture_level: capture.to_string(),
             plan_capture_default: "off",
             plan_capture_record_level: "record",
+            account_selection_mode: None,
             briefings,
             caches_expose_refresh_time: false,
         }
@@ -3230,8 +3236,9 @@ mod tests {
 
         assert!(
             value.contains(
-                "last refresh of the first three caches: UNKNOWN — those caches hold a value \
-                 and no stamp; the report REFUSES to substitute its own read time"
+                "last refresh of the value-only caches (all but the briefings): UNKNOWN — those \
+                 caches hold a value and no stamp; the report REFUSES to substitute its own read \
+                 time"
             ),
             "the row must refuse to invent a refresh time: {value}"
         );
@@ -3297,6 +3304,26 @@ mod tests {
             value.contains("plan_capture=record (armed at"),
             "a non-default level must not be annotated as ambiguous: {value}"
         );
+
+        // The fleet account-selection mode: `None` is NO fleet opinion and
+        // must never render as a mode; a named one renders its wire spelling.
+        assert!(
+            value.contains("account_selection_mode=(no fleet opinion — the local mode governs)"),
+            "got {value}"
+        );
+        let mut named = d.clone();
+        named.account_selection_mode = Some("highest_expected_usage");
+        let LayerReading::Known {
+            value: named_value, ..
+        } = fleet_policy_dial_reading(&named, fixed_stamp())
+        else {
+            panic!("the runner app always resolves layer 10");
+        };
+        assert!(
+            named_value.contains("account_selection_mode=highest_expected_usage |"),
+            "got {named_value}"
+        );
+
         assert!(
             source.contains("TIME-VARYING with no restart"),
             "got {source}"

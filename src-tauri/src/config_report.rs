@@ -682,7 +682,7 @@ pub struct ConfigReportInputs {
     /// Resolved in the bin by `config_report_cmd::coord_prompt_documents_reading`;
     /// `prompt_library` is a bin-only module.
     pub coord_prompt_documents: Option<LayerReading>,
-    /// Layer 10 (`fleet_policy_dial`): the four process-global caches one
+    /// Layer 10 (`fleet_policy_dial`): the five process-global caches one
     /// supervised poll loop refreshes, as they stand right now. TIME-VARYING
     /// with no restart of anything — the layer this module's per-reading
     /// `captured_at` was put there for. Resolved in the bin by
