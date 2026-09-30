@@ -341,11 +341,11 @@ fn extract_depends_on(body: &str) -> Vec<String> {
     out
 }
 
-/// `github.com/<owner>/<repo>/pull/<n>`. The trailing `\b` refuses a number
+/// `github.com/<owner>/<repo>/pull/<n>` (host matched case-insensitively). The trailing `\b` refuses a number
 /// glued to a word character (`/pull/706abc` is not PR 706); a following `/`,
 /// `#`, `)` or `.` is fine (`/pull/706/files`, `/pull/706#discussion_r1`).
 static PR_URL: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+)\b")
+    Regex::new(r"(?i:github\.com)/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+)\b")
         .expect("valid regex")
 });
 
@@ -1385,6 +1385,14 @@ mod tests {
             parse(body).pr_refs,
             vec![pr("qontinui-runner", 164), pr("qontinui/qontinui-web", 706)]
         );
+    }
+
+    /// The host is matched case-insensitively (`GitHub.com` in a pasted URL);
+    /// the owner/repo keep the case they were written in.
+    #[test]
+    fn pr_refs_url_host_is_case_insensitive() {
+        let body = "> **Status: SHIPPED** https://GitHub.com/qontinui/qontinui-web/pull/9\n";
+        assert_eq!(parse(body).pr_refs, vec![pr("qontinui/qontinui-web", 9)]);
     }
 
     /// The SAME strings below the blockquote are prose, not a claim. Mutation

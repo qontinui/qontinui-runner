@@ -1071,10 +1071,6 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
-/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
-/// its status block declares one. coord replaces `metadata` wholesale, so an
-/// archive stamp without the area would erase it from the unit — the same
-/// omit-when-`None` rule as [`build_metadata`].
 /// Add the plan file's own claim — `file_status` and `file_pr_refs` — to a
 /// metadata object. Shared by [`build_metadata`] and [`archive_metadata`]
 /// because both are wholesale `metadata` replacements: an archived plan
@@ -1084,6 +1080,10 @@ fn insert_file_claim(m: &mut serde_json::Value, u: &ParsedWorkUnit) {
     m["file_pr_refs"] = serde_json::json!(u.pr_refs);
 }
 
+/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
+/// its status block declares one. coord replaces `metadata` wholesale, so an
+/// archive stamp without the area would erase it from the unit — the same
+/// omit-when-`None` rule as [`build_metadata`].
 fn archive_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     let mut m = serde_json::json!({ "archive_path": u.source_path });
     insert_file_claim(&mut m, u);
