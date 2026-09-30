@@ -171,6 +171,7 @@ pub mod task_run_workflow_state;
 pub mod task_runs;
 pub mod task_supervisor;
 pub mod tauri_proxy;
+pub mod tenant; // GET/PUT /tenant/active — headless door to the device tenant pin
 pub mod terminals;
 pub mod testing;
 // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
