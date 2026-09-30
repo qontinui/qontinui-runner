@@ -1866,8 +1866,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Same shape, same ordering argument: the plan adapter's loop below reads
     // `paths.plans_dir` (every tick, but its FIRST tick is what decides whether
-    // this boot scans at all), so the retired env shim's value must be in the
-    // setting before that thread spawns.
+    // this boot scans at all), so any env-seeded value (the retired shim, or an
+    // operator-exported `QONTINUI_PLANS_DIR` outside runner context) must be in
+    // the setting before that thread spawns.
     if let Err(e) = plans_dir_migration::persist_env_plans_dir() {
         warn!("plans dir migration failed (non-fatal): {}", e);
     }
