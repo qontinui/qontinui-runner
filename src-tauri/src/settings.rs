@@ -140,6 +140,15 @@ pub struct ClaudeCliSettings {
     /// How to select which account to use when multiple config dirs exist
     #[serde(default)]
     pub account_selection_mode: AccountSelectionMode,
+    /// Pin this machine's `account_selection_mode` against the fleet's
+    /// `account_selection_mode` fleet-policy domain. `false` (the default, and
+    /// what every settings file predating the field decodes to) lets a fleet
+    /// value override the local mode; `true` makes the local mode win
+    /// regardless. Machine-global exactly like the mode itself: when
+    /// `claude-accounts.json` exists its copy overlays this one — see
+    /// `claude_accounts::resolve_selection_mode`.
+    #[serde(default)]
+    pub account_selection_pinned: bool,
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
@@ -173,6 +182,7 @@ impl Default for ClaudeCliSettings {
             timeout_seconds: 600,
             config_dir: None,
             account_selection_mode: AccountSelectionMode::HighestExpectedUsage,
+            account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
         }
@@ -5695,18 +5705,20 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
 /// Save AI settings.
 ///
 /// The whole-`AiSettings` per-instance save stays as-is (its embedded
-/// `claude_cli.config_dir` / `account_selection_mode` copies become stale
-/// shadows — harmless, because the machine-global overlay in `load_settings`
-/// wins unconditionally). ADDITIONALLY mirrors those two roster fields into
-/// the machine-global `claude-accounts.json` so mode/pin changes made on any
-/// instance reach every instance.
+/// `claude_cli.config_dir` / `account_selection_mode` / `account_selection_pinned`
+/// copies become stale shadows — harmless, because the machine-global overlay
+/// in `load_settings` wins unconditionally). ADDITIONALLY mirrors those three
+/// roster fields into the machine-global `claude-accounts.json` so mode/pin
+/// changes made on any instance reach every instance.
 pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
     let config_dir = ai_settings.claude_cli.config_dir.clone();
     let selection_mode = ai_settings.claude_cli.account_selection_mode;
+    let selection_pinned = ai_settings.claude_cli.account_selection_pinned;
     crate::config_facade::save_setting(ai_settings)?;
     crate::claude_accounts::update(move |roster| {
         roster.config_dir = config_dir;
         roster.account_selection_mode = selection_mode;
+        roster.account_selection_pinned = selection_pinned;
     })
 }
 
@@ -6890,6 +6902,43 @@ mod account_selection_mode_tests {
             AccountSelectionMode::HighestExpectedUsage.as_str(),
             "highest_expected_usage"
         );
+    }
+
+    /// A settings file written before the pin existed carries no
+    /// `account_selection_pinned` key. It must decode to `false` — unpinned,
+    /// i.e. the fleet policy governs — never to an error and never to `true`,
+    /// which would silently exempt every pre-existing machine from the fleet.
+    #[test]
+    fn pin_defaults_to_false_on_a_settings_file_that_predates_it() {
+        let cli: super::ClaudeCliSettings = serde_json::from_value(serde_json::json!({
+            "execution_mode": "auto",
+            "custom_path": null,
+            "timeout_seconds": 600,
+            "config_dir": "/acct-a",
+            "account_selection_mode": "least_usage",
+        }))
+        .expect("an old claude_cli block decodes");
+        assert!(!cli.account_selection_pinned);
+        assert_eq!(cli.account_selection_mode, AccountSelectionMode::LeastUsage);
+        assert!(!super::ClaudeCliSettings::default().account_selection_pinned);
+    }
+
+    /// The pin survives a serialize → deserialize round trip in both states.
+    #[test]
+    fn pin_round_trips() {
+        for pinned in [true, false] {
+            let cli = super::ClaudeCliSettings {
+                account_selection_mode: AccountSelectionMode::Manual,
+                account_selection_pinned: pinned,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&cli).expect("serializes");
+            assert_eq!(json["account_selection_pinned"], serde_json::json!(pinned));
+            let back: super::ClaudeCliSettings =
+                serde_json::from_value(json).expect("deserializes");
+            assert_eq!(back.account_selection_pinned, pinned);
+            assert_eq!(back.account_selection_mode, AccountSelectionMode::Manual);
+        }
     }
 }
 

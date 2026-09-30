@@ -113,6 +113,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             account_selection_mode:
               result.data.claude_cli?.account_selection_mode ||
               DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
+            account_selection_pinned: result.data.claude_cli?.account_selection_pinned ?? false,
             auto_migrate_on_token_exhaustion:
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
@@ -226,6 +227,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         configDir: settings.claude_cli.config_dir || null,
         accountSelectionMode:
           settings.claude_cli.account_selection_mode || "highest_expected_usage",
+        accountSelectionPinned: settings.claude_cli.account_selection_pinned ?? false,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
         model: settings.claude_api.model,

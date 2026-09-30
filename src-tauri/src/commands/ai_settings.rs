@@ -115,10 +115,11 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    account_selection_pinned: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, account_selection_pinned={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, account_selection_pinned, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -162,6 +163,11 @@ pub fn save_ai_settings(
             timeout_seconds,
             config_dir,
             account_selection_mode: selection_mode,
+            // `None` (an older frontend that does not send the pin) PRESERVES
+            // the configured value — it must never silently unpin a machine
+            // and hand it to the fleet policy.
+            account_selection_pinned: account_selection_pinned
+                .unwrap_or(existing_settings.claude_cli.account_selection_pinned),
             // `None` (older frontends) preserves whatever is configured.
             auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
                 existing_settings

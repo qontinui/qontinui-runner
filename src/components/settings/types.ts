@@ -105,6 +105,11 @@ export interface ClaudeCliSettings {
   config_dir?: string;
   /** How to select which account to use when multiple config dirs exist */
   account_selection_mode?: AccountSelectionMode;
+  /** Pin this machine's selection mode against the fleet's
+   * `account_selection_mode` fleet policy. `false` (the default) lets a fleet
+   * value override the local mode; `true` keeps the local mode. Machine-global,
+   * stored beside the mode in `claude-accounts.json`. */
+  account_selection_pinned?: boolean;
   /** Auto-migrate a token-exhausted terminal session to a fresh account
    * (transcript copy + `claude --resume` respawn). Runner default: true. */
   auto_migrate_on_token_exhaustion?: boolean;
