@@ -115,8 +115,8 @@
 # source file is never blamed — a limitation that predates the markdown
 # exclusion and is not changed by it.
 # It errs the other way on purpose elsewhere, and each of these merely costs
-# the exclusion: a raw-string literal (`title = r"x"`) or a `true` value in a
-# schemars attribute; and a Rust raw string holding TOML whose line begins
+# the exclusion: a raw-string literal (`title = r"x"`), a `true` value, or an
+# `=` inside a string (`title = "a=b"`) in a schemars attribute; and a Rust raw string holding TOML whose line begins
 # `path = "…"` (src-tauri/src/restate/config.rs:145 today), which arm 4 reads
 # as a wrapped cfg_attr the day that file also gains a `.md"` literal; and a
 # crate doc `#![doc = include_str!("../README.md")]`, which arm 5 flags on
@@ -134,17 +134,19 @@
 # `cargo run --bin export_schemas --release` (src-tauri/scripts/generate_types.sh),
 # so the inputs are the whole compiled crate graph plus the configuration that
 # pins how cargo compiles it (manifests, lockfile, toolchain, cargo config).
+# That is why the IN-REPO path dependencies and the toolchain pin are here
+# even though nothing under them derives `JsonSchema` today — the day one
+# does, or the day a feature edit in one of their manifests changes feature
+# unification for `serde`/`chrono`/`uuid`, a narrower list would start
+# clearing guilty pushers with nothing to notice. Out-of-repo inputs (the
+# qontinui-schemas path deps, its TS compile step) are deliberately absent: a
+# push to THIS repo cannot change them, so they can never be this push's fault.
+#
 # NOT included, deliberately: the non-Rust files build scripts read —
 # src-tauri/tauri.conf.json, src-tauri/capabilities/, src/components/app/
 # tab-types.ts, useAppNavigation.ts, ../dist/*. Counting them would make
 # frontend-only pushes MINE, which is the false blame this split exists to
-# stop, and none of them reaches a JsonSchema type today. That is why the IN-REPO path dependencies and the toolchain pin
-# are here even though nothing under them derives `JsonSchema` today — the day
-# one does, or the day a feature edit in one of their manifests changes feature
-# unification for `serde`/`chrono`/`uuid`, a narrower list would start clearing
-# guilty pushers with nothing to notice. Out-of-repo inputs (the qontinui-schemas
-# path deps, its TS compile step) are deliberately absent: a push to THIS repo
-# cannot change them, so they can never be this push's fault.
+# stop, and none of them reaches a JsonSchema type today.
 
 # The base-ref cascade this library measures "before this push" against lives
 # in a NEUTRAL sibling: `lib/push-range.sh`. It was moved out because the cargo
@@ -199,8 +201,13 @@ gen_events_clear_inherited_git_env() {
         GIT_REFLOG_ACTION
 }
 
+# A DIRECTORY entry ends in `/`, a FILE entry does not. Marked rather than
+# inferred, because the names cannot be trusted to say: `rust-toolchain` and
+# `.cargo/config` are files with no extension. The `/` is stripped when the
+# list becomes git pathspecs and read by the premise derivation below; the
+# self-test checks every marking against the real tree.
 GEN_EVENTS_ATTRIBUTION_PATHS=(
-    "src-tauri/src"
+    "src-tauri/src/"
     "src-tauri/build.rs"
     "src-tauri/Cargo.toml"
     "src-tauri/scripts/generate_types.sh"
@@ -212,21 +219,31 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
     # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
-    # pusher. Re-check against `grep 'path = ' */Cargo.toml` when adding one.
-    "src-tauri/clorinde"
-    "crates/spec-check"
-    "crates/runner-stats"
-    "crates/runner-win32"
-    "vendor"
+    # pusher. The self-test now walks the manifests and fails on any in-repo
+    # path dependency no entry covers; to look by hand,
+    # `git grep -n 'path *= *"' -- '*Cargo.toml'`.
+    "src-tauri/clorinde/"
+    "crates/spec-check/"
+    "crates/runner-stats/"
+    "crates/runner-win32/"
+    "vendor/"
     "Cargo.toml"
     "Cargo.lock"
     # The compiler that expands the `schemars` derive. A channel bump is a real
-    # input to the generated JSON and touches none of the paths above.
+    # input to the generated JSON and touches none of the paths above. rustup
+    # searches from the build's cwd upward (the export build runs from
+    # src-tauri) and still reads the legacy extension-less name, so all four.
     "rust-toolchain.toml"
+    "rust-toolchain"
+    "src-tauri/rust-toolchain.toml"
+    "src-tauri/rust-toolchain"
     # Cargo configuration: `[env]`, rustflags and cfgs apply to the export
-    # build, which runs from src-tauri, and so does a root one if it appears.
+    # build, which runs from src-tauri, as does a root one if it appears —
+    # each under both the current and the legacy extension-less name.
     "src-tauri/.cargo/config.toml"
+    "src-tauri/.cargo/config"
     ".cargo/config.toml"
+    ".cargo/config"
 )
 
 # Appended to every pathspec above. Non-glob pathspec magic lets `*` cross `/`,
@@ -244,29 +261,34 @@ GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
 # unprobed. Each DIRECTORY input contributes `:(glob)<dir>/**/*.rs` (Rust
 # only — see "Reach" in the header; `**/` also matches zero directories) and
 # `:(glob)<dir>/**/build.rs`; a FILE input named `build.rs` is a build script
-# as it stands. An entry is a directory when its last component has no `.` —
-# the self-test checks that rule against the real tree for every entry.
+# as it stands. Directory entries are the ones marked with a trailing `/`.
 GEN_EVENTS_PREMISE_PATHS=()
 GEN_EVENTS_PREMISE_BUILD_SCRIPTS=()
 _gen_events_derive_premise_paths() {
     local entry
     for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
-        case "${entry##*/}" in
-            build.rs) GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=("$entry") ;;
-            *.*)      ;;
-            *)        GEN_EVENTS_PREMISE_PATHS+=(":(glob)$entry/**/*.rs")
-                      GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=(":(glob)$entry/**/build.rs") ;;
+        case "$entry" in
+            */)          GEN_EVENTS_PREMISE_PATHS+=(":(glob)${entry}**/*.rs")
+                         GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=(":(glob)${entry}**/build.rs") ;;
+            build.rs|*/build.rs) GEN_EVENTS_PREMISE_BUILD_SCRIPTS+=("$entry") ;;
         esac
     done
 }
 _gen_events_derive_premise_paths
 
 # Which hook stage is running: `push` when pre-commit is running a pre-push
-# hook (it sets PRE_COMMIT_TO_REF only then — lib/push-range.sh reads it the
-# same way), otherwise `commit`, which also covers a manual run. The wording
-# of every verdict depends on it: "this push" is false at pre-commit.
+# hook — it sets PRE_COMMIT_TO_REF and PRE_COMMIT_REMOTE_NAME then, and
+# lib/push-range.sh reads the first the same way — otherwise `commit`. A
+# manual `pre-commit run --from-ref .. --to-ref ..` sets PRE_COMMIT_TO_REF
+# too, and reads as `push`: it checks a range of commits, which is what a
+# push is. A plain manual run reads as `commit`. The wording of every verdict
+# depends on it: "this push" is false at pre-commit.
 gen_events_stage() {
-    if [ -n "${PRE_COMMIT_TO_REF:-}" ]; then echo push; else echo commit; fi
+    if [ -n "${PRE_COMMIT_TO_REF:-}" ] || [ -n "${PRE_COMMIT_REMOTE_NAME:-}" ]; then
+        echo push
+    else
+        echo commit
+    fi
 }
 
 # `git grep` in the WORKING TREE of $1, untracked and gitignored files included
@@ -465,8 +487,9 @@ _gen_events_read_z() {
 #   ATTRIBUTION_TOUCHED_DETAIL  the same paths as `<path><TAB><source>` lines,
 #                       source one of `committed` (in merge-base..HEAD),
 #                       `staged` (`git diff --cached HEAD`), `unstaged`
-#                       (working tree against the index) or `untracked`. A path in several sources gets one line
-#                       per source — see the computation for why. Paths are
+#                       (working tree against the index) or `untracked`. A
+#                       path in several sources gets one line per source —
+#                       see the computation for why. Paths are
 #                       raw, never C-quoted; one holding a tab or newline
 #                       appears in its `printf %q` form (`$'a\tb.rs'`).
 #   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
@@ -501,7 +524,7 @@ gen_events_attribution() {
 
     local ref
     if ! ref="$(push_base_ref "$repo")"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure this push against"
+        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure against"
         return 0
     fi
     ATTRIBUTION_BASE_REF="$ref"
@@ -516,7 +539,7 @@ gen_events_attribution() {
     # hook runs under `set -e`, and a non-zero here is an answer, not a crash.
     local premise premise_rc
     premise="$(gen_events_markdown_premise_violations "$repo")" && premise_rc=0 || premise_rc=$?
-    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]}")
+    local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]%/}")
     if [ "$premise_rc" -eq 0 ]; then
         pathspec+=("${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
     elif [ "$premise_rc" -eq 1 ]; then
@@ -559,7 +582,7 @@ gen_events_attribution() {
             committed)
                 _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z "$ATTRIBUTION_BASE_SHA" HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
-                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so this push's commits could not be read"; return 0; } ;;
+                || { ATTRIBUTION_UNAVAILABLE_REASON="git diff $ATTRIBUTION_BASE_SHA HEAD failed, so the commits since the merge-base could not be read"; return 0; } ;;
             staged)
                 _gen_events_read_z < <(git -C "$repo" diff --name-only --no-renames -z --cached HEAD \
                     -- "${pathspec[@]}" 2>/dev/null; printf 'rc=%d\0' "$?") \
@@ -611,7 +634,10 @@ gen_events_attribution() {
 #
 # Stage-aware. The hook runs at pre-commit AND pre-push, and "this push" is
 # false at pre-commit: there the staged input IS the change being made.
-# `gen_events_stage` decides which.
+# `gen_events_stage` decides which. One case it cannot word right: `git commit
+# --amend` at pre-commit. The commit being replaced is already in HEAD, so its
+# inputs read `already committed on this branch` although they are part of
+# the commit being made; the verdict is unaffected, only that label is.
 #
 # It prints no commands. Earlier versions printed a set-aside recipe (a
 # tag-found stash, then a clean-worktree route), and each revision still had a

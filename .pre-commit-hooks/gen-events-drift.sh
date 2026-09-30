@@ -136,6 +136,11 @@ fi
 # shellcheck source=lib/gen-events-attribution.sh
 . "$ATTRIBUTION_LIB"
 
+# Which stage this is, for every line below that would otherwise say "push":
+# this hook also runs at pre-commit, where "this push" is false.
+STAGE="$(gen_events_stage)"
+if [ "$STAGE" = "push" ]; then BYPASS_CMD="git push"; else BYPASS_CMD="git commit"; fi
+
 # The TypeScript codegen's own Node dependencies. Same guarded-source shape and
 # the same reason: without it the hook dies with a raw bash error instead of a
 # typed message. See that file's header for why a missing `node_modules` in the
@@ -189,7 +194,7 @@ cannot_evaluate() {
         fail "  QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 — treating this as a failure."
         exit 1
     fi
-    fail "  Not blocking the push — a missing local build artifact is not"
+    fail "  Not blocking the $STAGE — a missing local build artifact is not"
     fail "  evidence of drift. Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block."
     echo
     exit 0
@@ -432,7 +437,7 @@ tripwire_epilogue() {
     fail "  1. A CONCURRENT SESSION wrote to $SCHEMAS_DIR"
     fail "     during the ~minute this hook took. On a box running several"
     fail "     sessions against one shared checkout this is the likely cause,"
-    fail "     and nothing is wrong with your push — just re-run it."
+    fail "     and nothing is wrong with your $STAGE — just re-run it."
     fail "  2. A REGRESSION IN THIS HOOK. It is required to be read-only with"
     fail "     respect to that checkout; if it wrote there, peer work may have"
     fail "     been overwritten and this needs fixing at the source."
@@ -571,11 +576,6 @@ print_dirty_checkout_note() {
         "$say" "that shared checkout. Check with its owner before regenerating over it."
     fi
 }
-
-# "this push" is false at pre-commit, where this hook also runs; every verdict
-# line names the stage it is actually in.
-STAGE="$(gen_events_stage)"
-if [ "$STAGE" = "push" ]; then BYPASS_CMD="git push"; else BYPASS_CMD="git commit"; fi
 
 if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     # NOT a failure, and deliberately not silent either. The drift is real and
