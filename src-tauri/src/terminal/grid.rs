@@ -149,10 +149,12 @@ pub const MAX_AGENT_STATUS_SIDEBAND_BYTES: usize = 8192;
 /// A TUI that dies (or is killed) between `?2026h` and `?2026l` never sends
 /// the close, and nothing else clears the flag. Without an expiry the session
 /// reader's `SyncFrameCoalescer` then holds EVERY later chunk of that session
-/// to its 50 ms time cap, forever — a latency tax on a pane whose frame will
-/// never finish. 150 ms is alacritty/vte's value for the same timeout (idea
-/// only; alacritty/vte is Apache-2.0, no code taken): long enough for any
-/// real frame, which the coalescer already caps at 50 ms / 256 KiB anyway.
+/// until the first read that returns after its 50 ms time cap — the pane runs
+/// one read behind for the rest of the session, and a chunk followed by quiet
+/// output stays invisible until the next byte arrives. 150 ms is
+/// alacritty/vte's value for the same timeout (idea only; alacritty/vte is
+/// Apache-2.0, no code taken): long enough for any real frame, which the
+/// coalescer already caps at 50 ms / 256 KiB anyway.
 pub const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_millis(150);
 
 impl Grid {
@@ -1216,9 +1218,13 @@ mod tests {
     fn repeated_open_does_not_extend_sync_block() {
         let mut grid = Grid::new(80, 24);
         feed(&mut grid, b"\x1b[?2026h");
-        let opened = grid.sync_output_opened_at;
+        // Backdate well inside the timeout, so a restarted clock (a fresh
+        // `Instant::now()`) could never compare equal to the stored value.
+        grid.backdate_sync_output_open(SYNC_OUTPUT_TIMEOUT / 2);
+        let opened = grid.sync_output_opened_at.expect("open");
         feed(&mut grid, b"\x1b[?2026h");
-        assert_eq!(grid.sync_output_opened_at, opened);
+        assert_eq!(grid.sync_output_opened_at, Some(opened), "clock not restarted");
+        assert!(!grid.sync_output_at(opened + SYNC_OUTPUT_TIMEOUT));
     }
 
     /// Manual-test-loop iteration 24, item 6.

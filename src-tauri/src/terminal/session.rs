@@ -5603,7 +5603,10 @@ mod tests {
         // The TUI opens a frame and dies mid-frame: held, as designed.
         read(b"\x1b[?2026hHALF A FRAME", 0, &mut coalescer);
         assert!(emitted.lock().unwrap().is_empty(), "an open frame is held");
-        // The reader's pre-read time cap ships the orphaned half frame.
+        // Ship the orphaned half frame. This stands in for the pre-read time
+        // cap (`flush_if_timed_out`), which in the real loop can only fire once
+        // another read returns — a held frame cannot flush while the read is
+        // blocked. That gap is separate from the expiry pinned here.
         coalescer.flush_remaining(|p, o| emitted.lock().unwrap().push((p.to_vec(), o)));
         assert_eq!(emitted.lock().unwrap().len(), 1);
 
