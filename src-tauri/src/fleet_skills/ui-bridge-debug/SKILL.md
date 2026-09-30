@@ -31,7 +31,7 @@ checkable examples:
 | Application | UI Bridge Base URL |
 |-------------|-------------------|
 | **Runner** (Tauri webview) | `http://127.0.0.1:9876/ui-bridge/control/*` |
-| **qontinui-web** (Next.js) | `http://localhost:3001/api/ui-bridge/control/*` |
+| **qontinui-web** (Next.js) | `http://127.0.0.1:3001/api/ui-bridge/control/*` |
 
 Note (2026-05-13, Phase 2 of the UI Bridge vision-pipeline plan): the legacy
 `/ui-bridge/control/screenshot`, `/ui-bridge/control/annotated-screenshot`,
@@ -140,8 +140,40 @@ curl -s -o screenshot.jpg "$BASE/vision/cache/<sha256>"
 ```
 
 Phase 2 only captures the runner's own window — cross-runner / cross-window
-capture is not supported here. `/vision/extract` (OCR) and `/vision/describe`
-(VLM caption) arrive in Phase 4.
+capture is not supported here.
+
+### Observation routes — read `status` first
+
+`/vision/extract` (OCR), `/vision/describe` (VLM caption) and
+`/control/page-health` answer an **Observation envelope**, always HTTP 200:
+`{status, value?, unknown?, provenance}`. `/vision/analyze` and
+`/vision/assert` keep their own shape but carry the same `provenance` block and
+report the frame as a `frame` observation. Rules for reading any of them:
+
+- **Read `status` before anything else.** `measured` → `value` holds the answer.
+  `absent` → the producer looked with full coverage and found nothing (a real
+  statement). `unknown` → the producer **could not look**; `unknown.code` says
+  why. An `unknown` is **never** reported as a clean page or as a broken one.
+- **Branch on `unknown.code`, not on `unknown.detail`** (prose, for humans):
+  `app_unreachable` / `producer_failed` → check the bridge or model endpoint is
+  up; `input_missing` → the input (frame, `elements`, bbox) was absent — fix
+  the target or re-capture; `producer_not_run` → nothing registered yet — wait
+  for the page to hydrate; `below_confidence_floor` → lower `minConfidence`;
+  `model_reply_unparseable` → retry with `"force": true`;
+  `needs_multi_frame_input` → use `vision/diff` over two captures.
+- **When `provenance.cache.hit` is `true`, quote `provenance.observedAt` and
+  `provenance.cache.storedAt`**: the answer describes the page as it was then.
+  The cache key (`provenance.cache.keyInputs`) cannot see a page that changed
+  on its own.
+- `/vision/assert`: read `outcome` (`failed` > `unknown` > `passed`) and
+  `outcomeCounts`, never a two-state pass bit. A `frame.status: "unknown"`
+  says why no pixels were captured.
+
+```bash
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/control/page-health \
+  -H "Content-Type: application/json" -d '{}' \
+  | jq '.data | {status, code: .unknown.code, summary: .value.summary, coverage: .provenance.coverage}'
+```
 
 ## Injected mode for pre-auth pages
 
