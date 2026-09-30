@@ -110,6 +110,7 @@ pub mod orchestration_report;
 pub mod orchestration_run_api;
 pub mod origin_guard; // Host gate + browser-origin classification + per-class route allowlists for the loopback API (plan 2026-09-17-runner-loopback-api-accepts-any-origin)
 pub mod otel_status;
+pub mod pending_redeem; // Claim an operator-authorized redeem while the device credential is dark (plan 2026-09-26-authenticate-and-perpetually-renew-a-specific-runner-from-qontinui-web)
 pub mod pg_guard;
 pub mod physical_device;
 pub mod physical_device_api;
