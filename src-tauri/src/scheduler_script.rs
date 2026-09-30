@@ -143,7 +143,10 @@ fn shell_candidates(command: &str) -> Vec<(String, Vec<String>)> {
     }
     #[cfg(not(windows))]
     {
-        vec![("sh".to_string(), vec!["-c".to_string(), command.to_string()])]
+        vec![(
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )]
     }
 }
 
@@ -342,7 +345,10 @@ mod tests {
         let got = windows_bash_paths(
             &[r"C:\Program Files".to_string()],
             Some(r"C:\Users\u\AppData\Local"),
-            &[r"C:\Windows\System32".to_string(), r"D:\tools\bin\".to_string()],
+            &[
+                r"C:\Windows\System32".to_string(),
+                r"D:\tools\bin\".to_string(),
+            ],
         );
         assert_eq!(
             got,
