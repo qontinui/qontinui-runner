@@ -657,7 +657,7 @@ pub async fn terminal_create_remote(
     );
 
     // 2/3. Present, and wait for the target to spawn.
-    let created = crate::mcp::remote_terminal::client()
+    let created = match crate::mcp::remote_terminal::client()
         .create(
             &minted.grant,
             cols,
@@ -668,13 +668,15 @@ pub async fn terminal_create_remote(
             crate::mcp::remote_terminal::CREATE_TIMEOUT,
         )
         .await
-        .map_err(|e| RemoteCreateError {
-            stage: "create",
-            code: e.code.clone(),
+    {
+        Ok(created) => created,
+        Err(e) => {
             // Against a coord carrying the target-runner check, a minted create
             // grant is always `supports` (coord refuses `unknown` for create), so
             // the `unknown` arm of the explanation only serves an older coord.
-            message: if e.code == "timeout" {
+            // This runner's own relay is sampled NOW, when the timeout fired.
+            let message = if e.code == "timeout" {
+                let source_relay = super::remote_attach::SourceRelay::sample(&app_handle).await;
                 format!(
                     "{} The grant is single-use; if the target did spawn a terminal it is \
                      running there unattached.",
@@ -682,18 +684,25 @@ pub async fn terminal_create_remote(
                         "remote_terminal_created",
                         &target.to_string(),
                         minted.target_runner.as_ref(),
+                        &source_relay,
                         crate::mcp::remote_terminal::CREATE_TIMEOUT.as_secs(),
                     )
                 )
             } else {
                 e.message.clone()
-            },
-            detail: Some(json!({
-                "grantJti": minted.grant_jti,
-                "targetDeviceId": target.to_string(),
-            })),
-            created_terminal_id: None,
-        })?;
+            };
+            return Err(RemoteCreateError {
+                stage: "create",
+                code: e.code.clone(),
+                message,
+                detail: Some(json!({
+                    "grantJti": minted.grant_jti,
+                    "targetDeviceId": target.to_string(),
+                })),
+                created_terminal_id: None,
+            });
+        }
+    };
     info!(
         target_device = %target,
         grant_jti = %created.grant_jti,

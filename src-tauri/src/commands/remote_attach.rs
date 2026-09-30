@@ -181,22 +181,85 @@ pub(crate) struct TargetRunner {
     pub served_sha: Option<String>,
 }
 
+/// THIS runner's own backend relay, sampled when a relay request times out.
+///
+/// A request made while this runner's relay is down just waits out its window
+/// (`RemoteTerminalHub::send` only enqueues), so without this input a timeout
+/// blames the PEER for a failure that never left this machine — the incident
+/// in plan `2026-09-25-runner-loses-its-relay-and-announces-it-under-a-false-cause-or-not-at-all`
+/// (S6). Sampled at TIMEOUT, never used to refuse at send time: a relay that
+/// reconnects inside the window drains the queue and must still succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceRelay {
+    /// The relay reports its websocket connected.
+    Connected,
+    /// The relay reports its websocket NOT connected; `last_error` is its
+    /// latest registration / connection error when it recorded one.
+    Down { last_error: Option<String> },
+    /// No app state or no server mode to read — nothing is established about
+    /// this runner's relay either way.
+    Unknown,
+}
+
+impl SourceRelay {
+    /// Read this runner's relay state off the live `AppState`.
+    pub(crate) async fn sample(app: &tauri::AppHandle) -> Self {
+        let Some(app_state) = app.try_state::<Arc<super::AppState>>() else {
+            return Self::Unknown;
+        };
+        let server_mode = app_state.current_server_mode().await;
+        Self::of(server_mode.as_ref()).await
+    }
+
+    /// [`Self::sample`] over the `ServerModeState` it reads — the same pair
+    /// `backend_relay::web_integration_status_for` reports.
+    pub(crate) async fn of(server_mode: Option<&crate::server_mode::ServerModeState>) -> Self {
+        match server_mode {
+            None => Self::Unknown,
+            Some(sm) if sm.is_ws_connected() => Self::Connected,
+            Some(sm) => Self::Down {
+                last_error: sm
+                    .registration_error()
+                    .await
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty()),
+            },
+        }
+    }
+}
+
 /// Explain a relay timeout — the target never answered — with what is actually
 /// known, instead of guessing "relay disconnected or target offline".
 ///
-/// A runner built before the target-side handler IGNORES the frame without a
+/// The SOURCE's own relay is consulted first: when it is down the request may
+/// never have reached the relay at all, so the message names THIS runner's
+/// relay (and its last error) and says nothing about the target. Otherwise a
+/// runner built before the target-side handler IGNORES the frame without a
 /// reply, which is indistinguishable from a wedged target on the wire; coord's
 /// `target_runner` block is the only evidence that separates them. `what` is
 /// the reply that never came (`remote_terminal_attached` /
-/// `remote_terminal_created`). Pure, so every arm is a unit test.
+/// `remote_terminal_created` / `remote_terminal_buffer`). Pure, so every arm is
+/// a unit test.
 pub(crate) fn explain_relay_timeout(
     what: &str,
     target_device_id: &str,
     target_runner: Option<&TargetRunner>,
+    source_relay: &SourceRelay,
     timeout_secs: u64,
 ) -> String {
     let head = format!("no {what} from target device {target_device_id} within {timeout_secs}s");
-    match target_runner {
+    if let SourceRelay::Down { last_error } = source_relay {
+        return format!(
+            "{head}. THIS runner's own backend relay is down{}, so the request may never have \
+             reached the relay — this failure says nothing about the target device. Restore \
+             this runner's relay first (its web-integration status says why it is down).",
+            last_error
+                .as_deref()
+                .map(|e| format!(" (last error: {e})"))
+                .unwrap_or_default(),
+        );
+    }
+    let target = match target_runner {
         Some(tr) if tr.state == "supports" => format!(
             "{head}. Coord observed that device serving a runner build{} that carries the \
              handler, so the target runner is wedged or offline, or the relay lost the frame — \
@@ -222,6 +285,13 @@ pub(crate) fn explain_relay_timeout(
             "{head}. Coord did not report the target's runner build. The target may be offline, \
              or running a runner too old to answer — such a runner ignores the request silently."
         ),
+    };
+    match source_relay {
+        SourceRelay::Unknown => format!(
+            "{target} This runner's own relay state could not be read, so a local relay outage \
+             is not ruled out."
+        ),
+        _ => target,
     }
 }
 
@@ -729,20 +799,26 @@ pub(crate) async fn open_remote_tab(
     )
     .await;
     waiting.settle(started.elapsed(), GRANT_LEARN_WINDOW);
-    let attached = presented.map_err(|mut e| {
-        if e.code == "timeout" {
-            e.message = explain_relay_timeout(
-                "remote_terminal_attached",
-                minted
-                    .target_device_id
-                    .as_deref()
-                    .unwrap_or(device_id.trim()),
-                minted.target_runner.as_ref(),
-                ATTACH_TIMEOUT.as_secs(),
-            );
+    let attached = match presented {
+        Ok(attached) => attached,
+        Err(mut e) => {
+            if e.code == "timeout" {
+                // Sampled NOW, when the timeout fired — not at send time.
+                let source_relay = SourceRelay::sample(app_handle).await;
+                e.message = explain_relay_timeout(
+                    "remote_terminal_attached",
+                    minted
+                        .target_device_id
+                        .as_deref()
+                        .unwrap_or(device_id.trim()),
+                    minted.target_runner.as_ref(),
+                    &source_relay,
+                    ATTACH_TIMEOUT.as_secs(),
+                );
+            }
+            return Err(e.to_string());
         }
-        e.to_string()
-    })?;
+    };
     if attached.grant_jti != minted.grant_jti {
         client().discard_pending_output(&attached.grant_jti);
         return Err(format!(
@@ -1024,6 +1100,7 @@ const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 /// `success: false` with the reason rather than an empty payload.
 #[tauri::command]
 pub async fn terminal_remote_history_load(
+    app: tauri::AppHandle,
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
 ) -> Result<CommandResponse, String> {
@@ -1048,10 +1125,25 @@ pub async fn terminal_remote_history_load(
             data: None,
         });
     };
-    let reply = client()
+    let reply = match client()
         .request_history(&pane, from, to, HISTORY_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(reply) => reply,
+        Err(mut e) => {
+            if e.code == "timeout" {
+                let source_relay = SourceRelay::sample(&app).await;
+                e.message = explain_relay_timeout(
+                    "remote_terminal_buffer",
+                    &identity.device_id,
+                    None,
+                    &source_relay,
+                    HISTORY_TIMEOUT.as_secs(),
+                );
+            }
+            return Err(e.to_string());
+        }
+    };
     let start = reply.ring.start_offset;
     let end = start.saturating_add(reply.ring.buffer.len() as u64);
     info!(
@@ -1116,14 +1208,17 @@ pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -
 
 #[cfg(test)]
 mod relay_timeout_tests {
-    use super::{explain_relay_timeout, AttachGrantResponse, TargetRunner};
+    use super::{explain_relay_timeout, AttachGrantResponse, SourceRelay, TargetRunner};
 
     const DEV: &str = "84c02292-32cb-4983-be85-d00f868b7003";
 
     /// A relay that is not connected refuses the attach at once as
     /// `relay_unavailable`, and a relay drop mid-wait settles it as
     /// `relay_disconnected` (`RemoteAttachClient::attach` /
-    /// `on_relay_disconnected`), so no timeout arm blames the relay.
+    /// `on_relay_disconnected`), so with THIS runner's relay connected no
+    /// timeout arm guesses a relay disconnect. (A relay whose outbound pump is
+    /// held but whose registration keeps failing is the `SourceRelay::Down`
+    /// case, covered by the tests below.)
     #[test]
     fn every_arm_names_the_target_device_and_never_guesses_a_relay_disconnect() {
         let supports = TargetRunner {
@@ -1137,11 +1232,147 @@ mod relay_timeout_tests {
             served_sha: None,
         };
         for tr in [None, Some(&supports), Some(&unknown)] {
-            let m = explain_relay_timeout("remote_terminal_attached", DEV, tr, 20);
+            let m = explain_relay_timeout(
+                "remote_terminal_attached",
+                DEV,
+                tr,
+                &SourceRelay::Connected,
+                20,
+            );
             assert!(m.contains(DEV), "{m}");
             assert!(m.contains("20s"), "{m}");
             assert!(!m.contains("relay may be disconnected"), "{m}");
         }
+    }
+
+    /// The three replies a relay request can wait for — attach, create and
+    /// history — each explained by the same pure fn.
+    const WHATS: [&str; 3] = [
+        "remote_terminal_attached",
+        "remote_terminal_created",
+        "remote_terminal_buffer",
+    ];
+
+    const REJECTED: &str = "registration rejected: code=1008, reason=Device token has expired";
+
+    fn target_evidence() -> [Option<TargetRunner>; 3] {
+        [
+            None,
+            Some(TargetRunner {
+                state: "supports".into(),
+                served_sha: Some("b74a09312aaa".into()),
+                ..Default::default()
+            }),
+            Some(TargetRunner {
+                state: "unknown".into(),
+                reason: Some("served-sha heartbeat is STALE".into()),
+                required_sha: Some("f521e1012e1e".into()),
+                served_sha: None,
+            }),
+        ]
+    }
+
+    /// S6 (plan `2026-09-25-runner-loses-its-relay-and-announces-it-under-a-false-cause-or-not-at-all`):
+    /// when THIS runner's relay is down, the timeout names the local relay and
+    /// its last error, and says nothing about the target being offline or
+    /// wedged — whatever coord reported about the target.
+    #[test]
+    fn a_down_source_relay_names_the_local_relay_and_never_blames_the_target() {
+        for what in WHATS {
+            for tr in target_evidence() {
+                let down = SourceRelay::Down {
+                    last_error: Some(REJECTED.into()),
+                };
+                let m = explain_relay_timeout(what, DEV, tr.as_ref(), &down, 20);
+                assert!(m.contains(what), "{m}");
+                assert!(m.contains("20s"), "{m}");
+                assert!(m.contains("THIS runner's own backend relay is down"), "{m}");
+                assert!(m.contains(REJECTED), "{m}");
+                assert!(!m.contains("offline"), "{m}");
+                assert!(!m.contains("wedged"), "{m}");
+                assert!(!m.contains("too old"), "{m}");
+                assert!(!m.contains("older than"), "{m}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_down_source_relay_without_a_recorded_error_still_names_the_local_relay() {
+        for what in WHATS {
+            let down = SourceRelay::Down { last_error: None };
+            let m = explain_relay_timeout(what, DEV, None, &down, 45);
+            assert!(
+                m.contains("THIS runner's own backend relay is down,"),
+                "{m}"
+            );
+            assert!(!m.contains("last error"), "{m}");
+            assert!(!m.contains("offline"), "{m}");
+        }
+    }
+
+    /// The false-alarm twin: a CONNECTED source relay keeps today's
+    /// target-based text and never claims the local relay is down.
+    #[test]
+    fn a_connected_source_relay_keeps_the_target_text_and_never_claims_a_local_outage() {
+        for what in WHATS {
+            for tr in target_evidence() {
+                let m = explain_relay_timeout(what, DEV, tr.as_ref(), &SourceRelay::Connected, 20);
+                assert!(m.contains(DEV), "{m}");
+                assert!(!m.contains("relay is down"), "{m}");
+                assert!(!m.contains("THIS runner"), "{m}");
+                assert!(!m.contains("This runner's own relay"), "{m}");
+                assert!(!m.contains("relay may be disconnected"), "{m}");
+            }
+        }
+    }
+
+    /// UNKNOWN keeps the target-based text but does not assert the local
+    /// relay is fine — nor that it is down.
+    #[test]
+    fn an_unknown_source_relay_keeps_the_target_text_and_leaves_the_local_relay_open() {
+        for what in WHATS {
+            for tr in target_evidence() {
+                let connected =
+                    explain_relay_timeout(what, DEV, tr.as_ref(), &SourceRelay::Connected, 20);
+                let m = explain_relay_timeout(what, DEV, tr.as_ref(), &SourceRelay::Unknown, 20);
+                assert!(m.starts_with(&connected), "{m}");
+                assert!(m.contains("could not be read"), "{m}");
+                assert!(m.contains("not ruled out"), "{m}");
+                assert!(!m.contains("relay is down"), "{m}");
+            }
+        }
+    }
+
+    /// No server mode installed is UNKNOWN, never "down" and never "connected".
+    #[tokio::test]
+    async fn no_server_mode_samples_as_unknown() {
+        assert_eq!(SourceRelay::of(None).await, SourceRelay::Unknown);
+    }
+
+    /// The sample reads the same pair `web_integration_status_for` reports:
+    /// `is_ws_connected()` and `registration_error()`.
+    #[tokio::test]
+    async fn a_server_mode_samples_connected_or_down_with_its_last_error() {
+        use crate::server_mode::{ServerModeConfig, ServerModeState};
+        let sm = ServerModeState::new(ServerModeConfig {
+            web_backend_url: "https://example.invalid".into(),
+            runner_token: String::new(),
+        });
+        sm.set_ws_connected(false);
+        sm.set_registration_error(Some(REJECTED.into())).await;
+        assert_eq!(
+            SourceRelay::of(Some(&sm)).await,
+            SourceRelay::Down {
+                last_error: Some(REJECTED.into())
+            }
+        );
+        sm.set_registration_error(Some("   ".into())).await;
+        assert_eq!(
+            SourceRelay::of(Some(&sm)).await,
+            SourceRelay::Down { last_error: None }
+        );
+        sm.set_ws_connected(true);
+        assert_eq!(SourceRelay::of(Some(&sm)).await, SourceRelay::Connected);
     }
 
     #[test]
@@ -1152,7 +1383,13 @@ mod relay_timeout_tests {
             required_sha: Some("f521e1012e1e".into()),
             served_sha: None,
         };
-        let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&tr), 20);
+        let m = explain_relay_timeout(
+            "remote_terminal_attached",
+            DEV,
+            Some(&tr),
+            &SourceRelay::Connected,
+            20,
+        );
         assert!(m.contains("served-sha heartbeat is STALE"), "{m}");
         assert!(m.contains("f521e1012e1e"), "{m}");
         assert!(!m.contains("last reported serving"), "{m}");
@@ -1168,14 +1405,26 @@ mod relay_timeout_tests {
             required_sha: Some("f521e1012e1e".into()),
             served_sha: Some("3472fc6a1c58".into()),
         };
-        let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&unknown), 20);
+        let m = explain_relay_timeout(
+            "remote_terminal_attached",
+            DEV,
+            Some(&unknown),
+            &SourceRelay::Connected,
+            20,
+        );
         assert!(m.contains("last reported serving 3472fc6a1c58"), "{m}");
         let supports = TargetRunner {
             state: "supports".into(),
             served_sha: Some("b74a09312aaa".into()),
             ..Default::default()
         };
-        let m = explain_relay_timeout("remote_terminal_created", DEV, Some(&supports), 45);
+        let m = explain_relay_timeout(
+            "remote_terminal_created",
+            DEV,
+            Some(&supports),
+            &SourceRelay::Connected,
+            45,
+        );
         assert!(m.contains("build (b74a09312aaa) that carries"), "{m}");
         assert!(m.contains("wedged or offline"), "{m}");
     }
@@ -1186,7 +1435,13 @@ mod relay_timeout_tests {
             state: "supports".into(),
             ..Default::default()
         };
-        let m = explain_relay_timeout("remote_terminal_created", DEV, Some(&tr), 45);
+        let m = explain_relay_timeout(
+            "remote_terminal_created",
+            DEV,
+            Some(&tr),
+            &SourceRelay::Connected,
+            45,
+        );
         assert!(m.contains("wedged or offline"), "{m}");
         assert!(!m.contains("older"), "{m}");
     }

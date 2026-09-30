@@ -2409,11 +2409,7 @@ impl RemoteAttachClient {
                 self.take_pending(&request_id);
                 Err(AttachError {
                     code: "timeout".to_string(),
-                    message: format!(
-                        "no remote_terminal_attached within {}s — the relay may be \
-                         disconnected or the target offline",
-                        timeout.as_secs()
-                    ),
+                    message: format!("no remote_terminal_attached within {}s", timeout.as_secs()),
                 })
             }
         }
@@ -2492,8 +2488,7 @@ impl RemoteAttachClient {
                 Err(AttachError {
                     code: "timeout".to_string(),
                     message: format!(
-                        "no remote_terminal_created within {}s — the relay may be \
-                         disconnected or the target offline. The grant is single-use; if the \
+                        "no remote_terminal_created within {}s. The grant is single-use; if the \
                          target did spawn a terminal it is running there unattached.",
                         timeout.as_secs()
                     ),
@@ -2543,11 +2538,7 @@ impl RemoteAttachClient {
                 self.take_pending(&request_id);
                 Err(AttachError {
                     code: "timeout".to_string(),
-                    message: format!(
-                        "no remote_terminal_buffer within {}s — the relay may be disconnected \
-                         or the target offline",
-                        timeout.as_secs()
-                    ),
+                    message: format!("no remote_terminal_buffer within {}s", timeout.as_secs()),
                 })
             }
         }
