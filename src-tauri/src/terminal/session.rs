@@ -8425,8 +8425,18 @@ pub(crate) mod tests {
     // ---- operator-input emitter (plan 2026-09-20-agents-sustained-per-
     // operator-hour-needs-an-operator-touch-record, Phase 2) ----------------
 
-    /// Driven through the real `write` funnel: each producer on a fresh
-    /// terminal opens an episode iff its door is `human` or `unknown`.
+    /// A live fixture BOUND to a coord session id, so the funnel reaches the
+    /// attributed path (state read + enqueue) instead of stopping at
+    /// `unattributed`.
+    fn attributed_session() -> LiveTestSession {
+        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        session.set_coord_session_id(uuid::Uuid::new_v4());
+        session
+    }
+
+    /// Driven through the real `write` funnel: each producer on a fresh,
+    /// attributed terminal opens an episode iff its door is `human` or
+    /// `unknown`.
     #[test]
     fn write_opens_an_operator_input_episode_only_for_human_and_ambiguous_doors() {
         use crate::terminal::operator_input::actor_class_of;
@@ -8456,7 +8466,7 @@ pub(crate) mod tests {
         for caller in every {
             let expected = u64::from(actor_class_of(&caller).is_some());
             emitting += expected;
-            let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+            let session = attributed_session();
             let tag = caller.to_string();
             session.write(b"x", caller).expect("live fixture write");
             assert_eq!(
@@ -8471,24 +8481,37 @@ pub(crate) mod tests {
     /// `submit_prompt` is the second funnel and carries the same hook.
     #[test]
     fn submit_prompt_opens_an_operator_input_episode_for_an_ambiguous_door() {
-        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        let session = attributed_session();
         session
             .submit_prompt("redirect", PtyWriteCaller::HttpSubmitPrompt)
             .expect("live fixture submit");
         assert_eq!(session.operator_input_episodes().opened(), 1);
-        let nudge = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        let nudge = attributed_session();
         nudge
             .submit_prompt("nudge", PtyWriteCaller::LoopingAgentNudge)
             .expect("live fixture submit");
         assert_eq!(nudge.operator_input_episodes().opened(), 0);
     }
 
-    /// 500 keystrokes → one episode (two only if the loop straddled a bucket
-    /// boundary, which the bracketing reads detect).
+    /// 500 keystrokes on an attributed terminal → one episode and ONE state
+    /// read (two of each only if the loop straddled a bucket boundary, which
+    /// the bracketing reads detect). The global counters move with it: the
+    /// latch is counted and the episode reaches the enqueue path, where the
+    /// outbox thread — no Tauri app in a unit test — counts it `dropped`.
+    /// Other tests move the same process-wide counters concurrently, so the
+    /// global assertions are lower bounds on deltas, never equalities.
     #[test]
-    fn five_hundred_writes_through_the_funnel_emit_one_episode_per_bucket() {
+    fn five_hundred_attributed_writes_read_state_once_and_reach_the_enqueue_path() {
         use crate::session::operator_touch::epoch_bucket;
-        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        let counter = |key: &str| {
+            crate::terminal::operator_input::health_json()[key]
+                .as_u64()
+                .expect("counter")
+        };
+        let latched_before = counter("latched");
+        let delivered_before = counter("emitted") + counter("dropped");
+
+        let session = attributed_session();
         let before = epoch_bucket(chrono::Utc::now().timestamp());
         for _ in 0..500 {
             session
@@ -8497,13 +8520,50 @@ pub(crate) mod tests {
         }
         let after = epoch_bucket(chrono::Utc::now().timestamp());
         let expected = if before == after { 1 } else { 2 };
-        assert_eq!(session.operator_input_episodes().opened(), expected);
+        let episodes = session.operator_input_episodes();
+        assert_eq!(episodes.opened(), expected);
+        assert_eq!(
+            episodes.state_reads(),
+            expected,
+            "the grid is read on the latch-opening write only, never per keystroke"
+        );
+        assert!(counter("latched") >= latched_before + expected);
+
+        // The outbox thread settles asynchronously.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while counter("emitted") + counter("dropped") < delivered_before + expected {
+            assert!(
+                Instant::now() < deadline,
+                "the episode never reached the outbox thread"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Unattributed (no coord session id): the latch is rolled back, so no
+    /// state read happens and the bucket is NOT burned — binding the coord id
+    /// mid-bucket lets the very next write emit.
+    #[test]
+    fn an_unattributed_write_does_not_burn_the_bucket() {
+        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        session
+            .write(b"a", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        let episodes = session.operator_input_episodes();
+        assert_eq!(episodes.opened(), 0);
+        assert_eq!(episodes.state_reads(), 0);
+        session.set_coord_session_id(uuid::Uuid::new_v4());
+        session
+            .write(b"b", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        assert_eq!(episodes.opened(), 1);
+        assert_eq!(episodes.state_reads(), 1);
     }
 
     /// A focus report is the emulator talking, not a person — no episode.
     #[test]
     fn a_focus_report_only_chunk_or_an_empty_write_opens_no_operator_input_episode() {
-        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        let session = attributed_session();
         session
             .write(b"\x1b[I", PtyWriteCaller::TauriTerminalWrite)
             .expect("live fixture write");
@@ -8517,6 +8577,7 @@ pub(crate) mod tests {
             .write(&[], PtyWriteCaller::TauriTerminalWrite)
             .expect("live fixture write");
         assert_eq!(session.operator_input_episodes().opened(), 0);
+        assert_eq!(session.operator_input_episodes().state_reads(), 0);
     }
 
     /// The non-blocking grid read answers `None` under contention, never waits.

@@ -414,7 +414,8 @@ pub enum SessionEventKind {
     ///
     /// Drained to `POST /coord/sessions/operator-input`, payload forwarded
     /// VERBATIM: `session_id`, `channel`, `actor_class` (`human` | `unknown`
-    /// — never `automated`, which coord refuses), `session_state_at_input`,
+    /// — never `automated`, which the coord route is specified to refuse;
+    /// plan Phase 1, coord PR pending), `session_state_at_input`,
     /// `occurred_at` (bucket start) and the caller-formed `idempotency_key`
     /// `<session_id>:input:<channel>:<bucket>`. Never content, never a byte
     /// count.

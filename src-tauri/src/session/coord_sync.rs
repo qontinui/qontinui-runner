@@ -1764,8 +1764,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // 2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record,
             // Phase 2). POST /coord/sessions/operator-input with the payload
             // built by crate::terminal::operator_input forwarded VERBATIM —
-            // it already carries the caller-formed idempotency key; coord
-            // takes the tenant from the device JWT and tenant-prefixes the key.
+            // it already carries the caller-formed idempotency key. The coord
+            // route is being built to this contract (plan Phase 1, coord PR
+            // pending): tenant from the device JWT, key tenant-prefixed via
+            // the operator-touch route's `stored_idempotency_key`. Until it
+            // deploys, these rows are lost under the best-effort posture
+            // (Ack-dropped) rather than blocking session lifecycle events.
             //
             // ⚠️ LOAD-BEARING, same hazard as "operator_touch" above: without
             // this arm the kind falls to the `other` catch-all, is ACKed and

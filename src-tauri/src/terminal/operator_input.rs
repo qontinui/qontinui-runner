@@ -44,9 +44,18 @@
 //! re-armed by each new bucket — so a human typing a 400-character redirect
 //! produces ONE row however many keystrokes it took. The bucket is
 //! [`crate::session::operator_touch::epoch_bucket`] — the one bucket width
-//! the demand store already uses; there is no second constant. coord
-//! additionally stores `ON CONFLICT (idempotency_key) DO NOTHING`, so a
-//! latch race costs at most a round trip, never a duplicate row.
+//! the demand store already uses; there is no second constant. The latch is
+//! MONOTONIC (`fetch_max`): a bucket at or behind the last one claimed never
+//! re-opens, so neither a boundary race nor a backward clock step can emit a
+//! past bucket twice. The coord route this feeds is being built (plan Phase 1,
+//! coord PR pending) to store `ON CONFLICT (idempotency_key) DO NOTHING`, so
+//! a latch race would then cost at most a round trip — a contract that route
+//! is built to, not a property of anything deployed today.
+//!
+//! A latch opened on a terminal that has no coord session id yet is ROLLED
+//! BACK (`compare_exchange` to the previous bucket), so an unattributable
+//! opening write does not burn the bucket: the first write after the coord
+//! id is wired still emits.
 //!
 //! ## `session_state_at_input` — observed, not judged
 //!
@@ -58,6 +67,12 @@
 //! the grid could not be read without blocking. The debounced
 //! `looks_idle_quiescent` is async and sleeps, so it is never called here —
 //! nothing may block a keystroke.
+//!
+//! ⚠️ `unknown` is NOT uniformly distributed. The grid lock is contended by
+//! the PTY reader thread while it applies OUTPUT, so a `try_lock`
+//! `WouldBlock` correlates with a session that is streaming — i.e. working.
+//! `unknown` is therefore biased toward `working`, and the Phase 3 read must
+//! not treat it as a neutral share split evenly between the two.
 //!
 //! ## Off the keystroke path
 //!
@@ -85,11 +100,13 @@ use super::session::{PtyWriteCaller, TerminalSession};
 use crate::session::operator_touch::epoch_bucket;
 
 // ===========================================================================
-// Vocabulary — the closed words coord's write boundary accepts
+// Vocabulary — the closed words the coord write route is being built to
+// accept (plan Phase 1, coord PR pending)
 // ===========================================================================
 
 /// Who the door says typed. `automated` is deliberately NOT a variant: an
-/// automated producer yields no event, and coord refuses the word with a 422.
+/// automated producer yields no event, and the coord route is specified
+/// (plan Phase 1, coord PR pending) to refuse the word with a 422.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorClass {
     /// A door only a human uses.
@@ -108,9 +125,11 @@ impl ActorClass {
     }
 }
 
-/// Which runner door the input came through. A subset of coord's
-/// `ACCEPTED_CHANNELS`; the other three (`coord_answer`,
-/// `coord_gate_clearance`, `admin_edit`) are emitted by coord itself.
+/// Which runner door the input came through. A subset of the
+/// `ACCEPTED_CHANNELS` the plan specifies for the coord route being built
+/// (plan Phase 1, coord PR pending); the other three (`coord_answer`,
+/// `coord_gate_clearance`, `admin_edit`) are to be emitted by coord itself
+/// (plan Phase 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// The pane's own keystrokes (the Tauri `terminal_write` command).
@@ -235,13 +254,19 @@ const NEVER: i64 = i64::MIN;
 
 /// One terminal's episode latch: per channel, the bucket it last emitted for.
 /// Owned by the [`TerminalSession`], so it lives and dies with the terminal
-/// and needs no prune. Lock-free — one atomic swap per input write.
+/// and needs no prune. Lock-free — one atomic `fetch_max` per input write.
+/// `Relaxed` throughout: each slot is an independent monotonic value and
+/// nothing else is published through it.
 #[derive(Debug)]
 pub struct InputEpisodes {
     last_bucket: [AtomicI64; CHANNEL_COUNT],
-    /// Latches THIS terminal has opened — the per-terminal twin of the
-    /// process-wide `latched` counter, readable without cross-test noise.
+    /// Latches THIS terminal holds open (claimed and not rolled back) — the
+    /// per-terminal twin of the process-wide `latched` counter, readable
+    /// without cross-test noise.
     opened: AtomicU64,
+    /// Grid reads this terminal took for `session_state_at_input` — one per
+    /// ATTRIBUTED latch opening, never per keystroke.
+    state_reads: AtomicU64,
 }
 
 impl Default for InputEpisodes {
@@ -249,22 +274,26 @@ impl Default for InputEpisodes {
         Self {
             last_bucket: std::array::from_fn(|_| AtomicI64::new(NEVER)),
             opened: AtomicU64::new(0),
+            state_reads: AtomicU64::new(0),
         }
     }
 }
 
 /// A latch this write opened: the first input on `door.channel` in `bucket`.
+/// `previous` is the bucket the slot held before, for [`InputEpisodes::release`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenedEpisode {
     pub door: Door,
     pub bucket: i64,
+    pub previous: i64,
 }
 
 impl InputEpisodes {
     /// Observe one input write. Returns `Some` iff this write OPENED a new
-    /// `(channel, bucket)` latch — claim-first, so exactly one of any number
-    /// of concurrent writes in a bucket wins. Also tallies the write under
-    /// its actor class for `/health`.
+    /// `(channel, bucket)` latch — claim-first via `fetch_max`, so exactly one
+    /// of any number of concurrent writes in a bucket wins, and a bucket at or
+    /// behind the last claimed one never re-opens. Also tallies the write
+    /// under its actor class for `/health`.
     pub fn observe(&self, caller: &PtyWriteCaller, now_unix_secs: i64) -> Option<OpenedEpisode> {
         let Some(door) = classify(caller) else {
             COUNTERS.seen_automated.fetch_add(1, Ordering::Relaxed);
@@ -275,18 +304,43 @@ impl InputEpisodes {
             ActorClass::Unknown => COUNTERS.seen_unknown.fetch_add(1, Ordering::Relaxed),
         };
         let bucket = epoch_bucket(now_unix_secs);
-        let previous = self.last_bucket[door.channel.index()].swap(bucket, Ordering::AcqRel);
-        if previous == bucket {
+        let previous = self.last_bucket[door.channel.index()].fetch_max(bucket, Ordering::Relaxed);
+        if previous >= bucket {
             return None;
         }
         self.opened.fetch_add(1, Ordering::Relaxed);
         COUNTERS.latched.fetch_add(1, Ordering::Relaxed);
-        Some(OpenedEpisode { door, bucket })
+        Some(OpenedEpisode {
+            door,
+            bucket,
+            previous,
+        })
     }
 
-    /// How many latches this terminal has opened.
+    /// Un-claim a latch this terminal cannot attribute (no coord session id
+    /// yet), so the bucket is not burned — the same rollback #1829's
+    /// operator-touch latch makes. Only succeeds if no later bucket has been
+    /// claimed since; if one has, that later claim stands and this is a no-op
+    /// beyond the counters.
+    pub fn release(&self, episode: OpenedEpisode) {
+        let _ = self.last_bucket[episode.door.channel.index()].compare_exchange(
+            episode.bucket,
+            episode.previous,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.opened.fetch_sub(1, Ordering::Relaxed);
+        COUNTERS.latched.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// How many latches this terminal holds open.
     pub fn opened(&self) -> u64 {
         self.opened.load(Ordering::Relaxed)
+    }
+
+    /// How many `session_state_at_input` grid reads this terminal has taken.
+    pub fn state_reads(&self) -> u64 {
+        self.state_reads.load(Ordering::Relaxed)
     }
 }
 
@@ -295,7 +349,9 @@ impl InputEpisodes {
 // ===========================================================================
 
 /// The caller-formed idempotency key: `<session_id>:input:<channel>:<bucket>`.
-/// coord tenant-prefixes it before storing (`stored_idempotency_key`).
+/// The coord route being built for it (plan Phase 1, coord PR pending) is
+/// specified to tenant-prefix it before storing, reusing the operator-touch
+/// route's `stored_idempotency_key` contract.
 pub fn idempotency_key(coord_session_id: Uuid, channel: Channel, bucket: i64) -> String {
     format!("{coord_session_id}:input:{}:{bucket}", channel.as_str())
 }
@@ -308,8 +364,8 @@ fn bucket_start_rfc3339(bucket: i64) -> String {
 }
 
 /// The `POST /coord/sessions/operator-input` body, forwarded verbatim by the
-/// outbox drain. No tenant (coord takes it from the device JWT), no content,
-/// no byte count.
+/// outbox drain. No tenant (the route is specified to take it from the
+/// device JWT), no content, no byte count.
 pub fn input_payload(
     coord_session_id: Uuid,
     episode: OpenedEpisode,
@@ -331,13 +387,16 @@ pub fn input_payload(
 
 /// Called by [`TerminalSession::write`] (for non-control-response chunks) and
 /// [`TerminalSession::submit_prompt`] once the input is on the wire. Never
-/// fails, never blocks: an atomic swap per write; on the one write per
-/// bucket that opens a latch, a coord-id read, one `try_lock` grid read and
-/// a non-blocking `try_send`.
+/// fails, never blocks: an atomic `fetch_max` per write; on the one write
+/// per bucket that opens a latch, a coord-id read, one `try_lock` grid read
+/// and a non-blocking `try_send`.
 ///
 /// A terminal with no coord session id yet has nothing to attribute the input
-/// to — the same skip `operator_touch_watch` makes — and is counted
-/// `unattributed` rather than silently vanishing.
+/// to — the same skip `operator_touch_watch` makes. The latch is rolled back
+/// ([`InputEpisodes::release`]) so the bucket is not burned, and the write is
+/// counted `unattributed` rather than silently vanishing. On such a terminal
+/// every input write re-opens and re-releases, so `unattributed` counts
+/// WRITES, not episodes.
 pub fn on_input(session: &TerminalSession, caller: &PtyWriteCaller, now_unix_secs: i64) {
     let Some(episode) = session
         .operator_input_episodes()
@@ -345,10 +404,13 @@ pub fn on_input(session: &TerminalSession, caller: &PtyWriteCaller, now_unix_sec
     else {
         return;
     };
+    let episodes = session.operator_input_episodes();
     let Some(coord_session_id) = session.coord_session_id() else {
+        episodes.release(episode);
         COUNTERS.unattributed.fetch_add(1, Ordering::Relaxed);
         return;
     };
+    episodes.state_reads.fetch_add(1, Ordering::Relaxed);
     let state = SessionStateAtInput::from_snapshot(session.try_grid_text());
     enqueue(Pending {
         coord_session_id,
@@ -500,8 +562,11 @@ mod tests {
     use super::*;
 
     /// Every [`PtyWriteCaller`] variant, with its expected actor class. The
-    /// `match` below has no wildcard, so a new variant fails to compile HERE
-    /// as well as in [`classify`] — the table cannot silently fall behind.
+    /// compile-time guarantee lives in [`classify`]'s wildcard-free match. The
+    /// `match` below is wildcard-free too, so a new variant forces a decision
+    /// here — but nothing forces it into the `callers` vec, and the length
+    /// check only catches that if someone updates the number. Keep both in
+    /// step with the enum by hand.
     fn every_caller_with_expected_class() -> Vec<(PtyWriteCaller, Option<ActorClass>)> {
         let callers = vec![
             PtyWriteCaller::HttpSubmitPrompt,
@@ -631,6 +696,69 @@ mod tests {
         assert!(latch
             .observe(&PtyWriteCaller::TauriTerminalWrite, bucket_start + 60)
             .is_some());
+    }
+
+    /// L2: a past bucket never re-opens — neither a boundary race (a writer
+    /// that read the clock just before the flip landing after one that read
+    /// it just after) nor a backward clock step.
+    #[test]
+    fn the_latch_is_monotonic() {
+        let latch = InputEpisodes::default();
+        let t = 1_726_000_020;
+        assert!(latch
+            .observe(&PtyWriteCaller::TauriTerminalWrite, t + 60)
+            .is_some());
+        assert!(
+            latch
+                .observe(&PtyWriteCaller::TauriTerminalWrite, t + 59)
+                .is_none(),
+            "a late writer from the previous bucket must not re-open it"
+        );
+        assert!(
+            latch
+                .observe(&PtyWriteCaller::TauriTerminalWrite, t - 3600)
+                .is_none(),
+            "a backward clock step must not re-open a past bucket"
+        );
+        assert_eq!(latch.opened(), 1);
+    }
+
+    /// L1: a released (unattributable) opening does not burn the bucket.
+    #[test]
+    fn a_released_latch_re_opens_in_the_same_bucket() {
+        let latch = InputEpisodes::default();
+        let t = 1_726_000_020;
+        let first = latch
+            .observe(&PtyWriteCaller::TauriTerminalWrite, t)
+            .expect("first write opens");
+        assert_eq!(first.previous, NEVER);
+        latch.release(first);
+        assert_eq!(latch.opened(), 0);
+        let again = latch
+            .observe(&PtyWriteCaller::TauriTerminalWrite, t + 5)
+            .expect("the bucket was not burned");
+        assert_eq!(again.bucket, first.bucket);
+        assert_eq!(latch.opened(), 1);
+    }
+
+    /// A release that lost the race to a LATER bucket leaves that claim alone.
+    #[test]
+    fn release_never_rolls_back_a_later_claim() {
+        let latch = InputEpisodes::default();
+        let t = 1_726_000_020;
+        let stale = latch
+            .observe(&PtyWriteCaller::TauriTerminalWrite, t)
+            .expect("opens");
+        latch
+            .observe(&PtyWriteCaller::TauriTerminalWrite, t + 60)
+            .expect("next bucket opens");
+        latch.release(stale);
+        assert!(
+            latch
+                .observe(&PtyWriteCaller::TauriTerminalWrite, t + 61)
+                .is_none(),
+            "the later bucket's claim must survive the stale release"
+        );
     }
 
     #[test]
