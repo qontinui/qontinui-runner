@@ -1614,6 +1614,16 @@ pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
 ///
+/// Every AI-CLI profile the runner knows — the frontend's only source for
+/// per-CLI session facts (resume argv, resume handshake markers, restore
+/// tier). Plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 4; `GET /terminals/cli-profiles` serves the same data over HTTP.
+#[tauri::command]
+pub fn terminal_cli_profiles() -> Vec<qontinui_types::cli_session::CliProfile> {
+    qontinui_runner_lib::cli_profile::all().to_vec()
+}
+
 /// Returns the restorable set (see `restorable_records`): `open` records
 /// whose `last_seen_at` is recent relative to the registry's cohort ANCHOR
 /// (the newest instant of the densest death cohort — see `restorable_records`;

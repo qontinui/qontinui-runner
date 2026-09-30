@@ -1,0 +1,6 @@
+user@host:~/repo$ claude --permission-mode bypassPermissions --resume 3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e
+bash: claude: command not found
+user@host:~/repo$ cargo build
+   Compiling qontinui-runner v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.04s
+user@host:~/repo$

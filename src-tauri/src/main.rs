@@ -3530,6 +3530,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::sync_deferred_questions,
             commands::terminal::terminal_ack,
             commands::terminal::terminal_cleanup_scrollback,
+            commands::terminal::terminal_cli_profiles,
             commands::terminal::terminal_close,
             commands::terminal::terminal_collect_session_metadata,
             commands::terminal::terminal_create,

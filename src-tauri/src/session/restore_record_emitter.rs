@@ -62,10 +62,11 @@
 //!    mtime-guess `reconciled`);
 //! 3. the record is CONFIRMED (`confirmed_at` set);
 //! 4. its transcript was not probed ABSENT (unknown never downgrades);
-//! 5. its provider adapter declares [`RestoreTier::Full`].
+//! 5. its provider's profile (`qontinui_runner_lib::cli_profile`) declares a
+//!    full-tier by-id resume. A provider with no profile is never full.
 //!
 //! Everything else (invalid ids, provisional phantom shells, reconciled ids,
-//! transcript-less confirmations, terminal-only providers) is
+//! transcript-less confirmations, terminal-only or unknown providers) is
 //! `"terminal_only"` with a null `authoritative_session_id`, and the id is
 //! never interpolated into `launch_command` — the remote materialization then
 //! restores terminal+cwd+command with a fresh conversation, never a resume
@@ -93,12 +94,14 @@ use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
 use super::local_store::OutboxWriter;
-use super::provider_adapter::{adapter_for, RestoreTier, SessionProviderAdapter};
+use super::provider_adapter::RestoreTier;
 use super::session_id::is_valid_session_id;
 use super::session_lifecycle_store::{
     TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
 };
 use super::SessionEventKind;
+use qontinui_runner_lib::cli_profile;
+use qontinui_types::cli_session::CliProfile;
 
 /// Wire value of the mirrored event's kind. Binding contract with the web
 /// UI (`coord.session_events.event_kind` stores it verbatim). Matches
@@ -274,20 +277,22 @@ impl std::fmt::Debug for RestoreRecordEmitter {
 /// this machine now refuses to `--resume` would hand a peer a resume that can
 /// only fail. Unknown never downgrades, matching the local gate.
 ///
-/// `launch_command` is adapter-derived and carries NO env vars or tokens:
+/// `launch_command` is profile-derived and carries NO env vars or tokens:
 /// the deterministic resume argv for `"full"` (account isolation rides env
 /// at spawn time, never the recorded command), the provider's bare program
-/// for `"terminal_only"` (a fresh conversation needs no id).
+/// for `"terminal_only"` (a fresh conversation needs no id). A provider the
+/// runner has no profile for is `"terminal_only"` with its provider NAME as the
+/// command — never another CLI's resume.
 pub fn restore_record_payload(
     rec: &TerminalSessionRecord,
     machine_id: Uuid,
     transcript_exists: Option<bool>,
 ) -> JsonValue {
-    restore_record_payload_for_adapter(
+    restore_record_payload_for_profile(
         rec,
         machine_id,
         transcript_exists,
-        adapter_for(&rec.provider).as_ref(),
+        cli_profile::profile_for(&rec.provider),
     )
 }
 
@@ -328,36 +333,40 @@ pub fn mirrored_restore_tier(
     }
 }
 
-/// [`restore_record_payload`] over an explicit adapter — the seam the
-/// cross-product test uses to drive a terminal-only provider, which no shipped
-/// adapter declares yet.
-fn restore_record_payload_for_adapter(
+/// [`restore_record_payload`] over an explicit profile (`None` = the runner
+/// knows no such provider) — the seam the cross-product test uses to drive a
+/// terminal-only provider, which no shipped profile declares yet.
+fn restore_record_payload_for_profile(
     rec: &TerminalSessionRecord,
     machine_id: Uuid,
     transcript_exists: Option<bool>,
-    adapter: &dyn SessionProviderAdapter,
+    profile: Option<&CliProfile>,
 ) -> JsonValue {
-    let full =
-        mirrored_restore_tier(rec, transcript_exists, adapter.restore_tier()) == RestoreTier::Full;
+    let provider_tier = profile.map_or(RestoreTier::TerminalOnly, |p| {
+        cli_profile::restore_tier(p).into()
+    });
+    let full = mirrored_restore_tier(rec, transcript_exists, provider_tier) == RestoreTier::Full;
+    let resume = profile
+        .filter(|_| full)
+        .and_then(|p| cli_profile::resume_argv(p, &rec.claude_session_id));
 
-    let (tier, authoritative_session_id, launch_command) = if full {
-        (
+    let (tier, authoritative_session_id, launch_command) = match resume {
+        Some(argv) => (
             TIER_FULL,
             JsonValue::String(rec.claude_session_id.clone()),
-            adapter
-                .resume_command(&rec.claude_session_id, None)
-                .join(" "),
-        )
-    } else {
-        // The provider's bare program (first element of its resume argv) —
-        // enough for a remote terminal-only restore to relaunch a fresh
-        // conversation at the right cwd.
-        let program = adapter
-            .resume_command("", None)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| rec.provider.clone());
-        (TIER_TERMINAL_ONLY, JsonValue::Null, program)
+            argv.join(" "),
+        ),
+        // The provider's bare program — enough for a remote terminal-only
+        // restore to relaunch a fresh conversation at the right cwd. With no
+        // profile, the provider's name: it says which CLI this was without
+        // claiming a program the runner cannot vouch for.
+        None => (
+            TIER_TERMINAL_ONLY,
+            JsonValue::Null,
+            profile
+                .and_then(|p| p.programs.first().cloned())
+                .unwrap_or_else(|| rec.provider.clone()),
+        ),
     };
 
     json!({
@@ -623,6 +632,21 @@ mod tests {
         assert_eq!(ok["restore_tier"], TIER_FULL);
     }
 
+    /// A provider the runner has no profile for is never restored with another
+    /// CLI's resume: even a record that passes every other gate mirrors
+    /// `terminal_only`, with the provider's own name as the command.
+    #[test]
+    fn payload_for_an_unknown_provider_is_terminal_only_and_names_it() {
+        let machine = Uuid::new_v4();
+        let mut foreign = rec("sess-1", "t");
+        foreign.provider = "gemini".to_string();
+        let p = restore_record_payload(&foreign, machine, Some(true));
+        assert_eq!(p["restore_tier"], TIER_TERMINAL_ONLY);
+        assert!(p["authoritative_session_id"].is_null());
+        assert_eq!(p["launch_command"], "gemini");
+        assert_eq!(p["provider"], "gemini");
+    }
+
     // -- the cross-seam guard (plan item 1 Verification, 12c #2) -------------
 
     /// The shared table. The vitest `restoreTierCrossProduct.test.ts` pins it
@@ -631,43 +655,17 @@ mod tests {
         "../../../src/components/terminal/__fixtures__/restore-tier-crossproduct.json"
     );
 
-    /// The fixture's terminal-only provider. No shipped adapter declares
+    /// The fixture's terminal-only provider. No shipped profile declares
     /// [`RestoreTier::TerminalOnly`], so this test supplies one (the vitest
-    /// supplies its TS twin through a module mock); everything but the tier
-    /// delegates to the real Claude adapter.
+    /// registers its TS twin the same way); everything but the id and the tier
+    /// is the real Claude profile.
     const FIXTURE_TERMINAL_ONLY_PROVIDER: &str = "fixture-terminal-only";
 
-    struct FixtureTerminalOnlyAdapter;
-
-    impl SessionProviderAdapter for FixtureTerminalOnlyAdapter {
-        fn provider(&self) -> &'static str {
-            FIXTURE_TERMINAL_ONLY_PROVIDER
-        }
-        fn launch_with_identity(
-            &self,
-            cwd: &str,
-            account: Option<&str>,
-        ) -> crate::session::provider_adapter::LaunchSpec {
-            crate::session::provider_adapter::ClaudeAdapter.launch_with_identity(cwd, account)
-        }
-        fn capture_hook_delivery(
-            &self,
-            cwd: &str,
-        ) -> crate::session::provider_adapter::DeliverySpec {
-            crate::session::provider_adapter::ClaudeAdapter.capture_hook_delivery(cwd)
-        }
-        fn resume_command(&self, session_id: &str, account: Option<&str>) -> Vec<String> {
-            crate::session::provider_adapter::ClaudeAdapter.resume_command(session_id, account)
-        }
-        fn account_isolation(
-            &self,
-            account: Option<&str>,
-        ) -> std::collections::BTreeMap<String, String> {
-            crate::session::provider_adapter::ClaudeAdapter.account_isolation(account)
-        }
-        fn restore_tier(&self) -> RestoreTier {
-            RestoreTier::TerminalOnly
-        }
+    fn fixture_terminal_only_profile() -> CliProfile {
+        let mut p = cli_profile::profile_for("claude").unwrap().clone();
+        p.id = FIXTURE_TERMINAL_ONLY_PROVIDER.to_string();
+        p.restore_tier = qontinui_types::cli_session::RestoreTier::TerminalOnly;
+        p
     }
 
     #[derive(serde::Deserialize)]
@@ -737,7 +735,12 @@ mod tests {
 
         // The `claude` rows go through the REAL registry: pin that it is still
         // the full-tier provider the fixture says it is.
-        assert_eq!(adapter_for("claude").restore_tier(), RestoreTier::Full);
+        assert_eq!(
+            RestoreTier::from(cli_profile::restore_tier(
+                cli_profile::profile_for("claude").unwrap()
+            )),
+            RestoreTier::Full
+        );
 
         let mut full_rows = 0;
         for r in &rows {
@@ -774,11 +777,11 @@ mod tests {
                 }
                 RestoreTier::TerminalOnly => {
                     assert_eq!(r.provider, FIXTURE_TERMINAL_ONLY_PROVIDER, "{label}");
-                    restore_record_payload_for_adapter(
+                    restore_record_payload_for_profile(
                         &record,
                         machine,
                         transcript_exists,
-                        &FixtureTerminalOnlyAdapter,
+                        Some(&fixture_terminal_only_profile()),
                     )
                 }
             };

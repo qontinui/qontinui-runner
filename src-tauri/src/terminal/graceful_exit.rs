@@ -1441,6 +1441,18 @@ mod tests {
         }
     }
 
+    /// This module keeps its own copy of the command the Claude profile
+    /// declares (`cli_profile::claude` `graceful_exit`). Pin the two equal.
+    #[test]
+    fn exit_text_equals_the_claude_profile_command() {
+        use qontinui_types::cli_session::GracefulExit;
+        let profile = qontinui_runner_lib::cli_profile::profile_for("claude").unwrap();
+        let GracefulExit::TypedCommand { text } = &profile.graceful_exit else {
+            panic!("the Claude profile declares a typed exit command");
+        };
+        assert_eq!(EXIT_TEXT, text.as_bytes());
+    }
+
     /// Structural pin on the invariant: this module's code never names a kill
     /// path. `drive` reaches the pane only through its injected effects, and
     /// the production close is `TerminalManager::graceful_exit`'s.

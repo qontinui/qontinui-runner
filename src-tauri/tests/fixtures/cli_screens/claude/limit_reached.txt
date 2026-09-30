@@ -1,0 +1,7 @@
+╭───────────────────────────────────────────────────╮
+│ >                                                 │
+╰───────────────────────────────────────────────────╯
+  ⎿  Claude usage   limit
+     reached ∙ resets 3am (Europe/Berlin)
+     /upgrade to increase your usage limit.
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

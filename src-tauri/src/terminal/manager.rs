@@ -1291,6 +1291,32 @@ mod tests {
             "echo bypassPermissions is a mode",
         ])));
     }
+
+    /// This matcher keeps its own copy of the spellings the Claude profile
+    /// declares (`cli_profile::claude` `auto_approve`). Pin the two together:
+    /// every declared detect token, and the declared launch flags themselves,
+    /// read as bypass here.
+    #[test]
+    fn matcher_agrees_with_the_claude_profile_auto_approve() {
+        use qontinui_types::cli_session::AutoApprove;
+        let profile = qontinui_runner_lib::cli_profile::profile_for("claude").unwrap();
+        let AutoApprove::Flags {
+            argv: flags,
+            detect,
+        } = &profile.auto_approve
+        else {
+            panic!("the Claude profile declares auto-approve flags");
+        };
+        for token in detect {
+            assert!(
+                command_implies_bypass_permissions(&argv(&["claude", token])),
+                "{token:?}"
+            );
+        }
+        let mut launch = argv(&["claude"]);
+        launch.extend(flags.iter().cloned());
+        assert!(command_implies_bypass_permissions(&launch));
+    }
 }
 
 #[cfg(test)]

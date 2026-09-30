@@ -1,0 +1,3 @@
+$ claude --resume 230feb99-2dd7-42d7-92bc-6d36c1883089
+Claude Code requires Node.js version 22 or higher.
+$ 

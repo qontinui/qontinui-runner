@@ -129,6 +129,13 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
+   * Provider (CLI profile id) that owns `claudeSessionId`, copied from the
+   * durable record on restore. The operator's "Retry resume" reads it: without
+   * it the retry would have no provider, and a provider-less resume is never
+   * typed.
+   */
+  sessionProvider?: string;
+  /**
    * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
    * Conductor worker (`dispatch_subtask` in
    * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
@@ -1608,6 +1615,7 @@ export function useTerminalManager(
           | "workingDir"
           | "claudeSessionId"
           | "claudeConfigDir"
+          | "sessionProvider"
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"
