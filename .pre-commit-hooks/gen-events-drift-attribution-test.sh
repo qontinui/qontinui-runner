@@ -36,6 +36,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # hypothetical: it happened the first time this script ran from a pre-push hook.
 gen_events_clear_inherited_git_env
 
+# The same for the HOOK-STAGE environment. pre-commit runs this suite at
+# pre-push as well as pre-commit (it has no `stages:`), exporting
+# PRE_COMMIT_TO_REF / FROM_REF / REMOTE_NAME / …; the direct shim hands it
+# git's pre-push stdin; a parent drift hook may have left
+# GEN_EVENTS_STAGE_HINT. Every stage-sensitive case below would then read
+# `push` whatever it set up — measured: 8 failures under
+# `PRE_COMMIT_REMOTE_NAME=origin PRE_COMMIT_TO_REF=bbbb`. So the suite starts
+# from none of it, and never reads git's stdin: it neither needs it nor may
+# consume it. Cases that want a push stage set it themselves.
+sanitize_hook_stage_env() {
+    local v
+    for v in $(compgen -v PRE_COMMIT_); do unset "$v"; done
+    unset GEN_EVENTS_STAGE_HINT QONTINUI_GEN_EVENTS_DRIFT_STRICT
+}
+sanitize_hook_stage_env
+exec </dev/null
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -671,6 +688,12 @@ if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
     else
         fail_note "  it read no path dependency from src-tauri/Cargo.toml — the parser is broken"
     fi
+    ROOT_DEPS="$(_gen_events_cargo_path_deps "$REPO_ROOT/Cargo.toml" | grep -c . || true)"
+    if [ "${ROOT_DEPS:-0}" -gt 0 ]; then
+        pass_note "  and $ROOT_DEPS from the root Cargo.toml's [patch.*]/workspace sections"
+    else
+        fail_note "  it read no path dependency from the root Cargo.toml — the [patch.*] arm is broken"
+    fi
 fi
 
 # Non-vacuity: a tree that adds the pty-holder crate as a dependency (and a
@@ -700,9 +723,17 @@ cat > "$PREMISE_FIXTURE/crates/pty-holder/Cargo.toml" <<'TOML'
 [target.'cfg(unix)'.dependencies]
 frame = { path = "../frame-proto" }
 TOML
+# The root manifest's [patch.*] arm: how vendor/tao reaches the graph today.
+cat > "$PREMISE_FIXTURE/Cargo.toml" <<'TOML'
+[workspace]
+members = ["src-tauri"]
+
+[patch.crates-io]
+foo = { path = "patched/foo" }
+TOML
 PTY_OUT="$(gen_events_uncovered_path_deps "$PREMISE_FIXTURE")"
-check "a new pty-holder path dependency, and its own, are reported uncovered" \
-    "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
+check "a new pty-holder path dependency, its own, and a [patch] path are reported uncovered" \
+    "crates/pty-holder (from src-tauri/Cargo.toml)"$'\n'"patched/foo (from Cargo.toml)"$'\n'"crates/frame-proto (from crates/pty-holder/Cargo.toml)" \
     "$PTY_OUT"
 
 # The hook script itself, against fixtures: it must FAIL on an uncovered
@@ -866,15 +897,15 @@ echo "  -- the MINE message the hook prints --"
 
 # `gen_events_render_mine` renders from the ATTRIBUTION_* variables alone, so
 # these set them directly rather than building a repo per case. The stage is
-# set explicitly every time — this suite itself runs from a hook, where
-# PRE_COMMIT_TO_REF may already be set — through RENDER_STAGE: `push` sets
-# PRE_COMMIT_TO_REF as pre-commit does for a push, `commit` unsets it.
+# set explicitly every time through RENDER_STAGE, independent of the top-level
+# sanitizing: `push` sets PRE_COMMIT_TO_REF as pre-commit does for a push;
+# `commit` unsets every variable `gen_events_stage` reads.
 RENDER_STAGE="push"
 render_now() {
     if [ "$RENDER_STAGE" = "push" ]; then
         RENDERED="$(PRE_COMMIT_TO_REF=0123456789abcdef gen_events_render_mine)"
     else
-        RENDERED="$(unset PRE_COMMIT_TO_REF; gen_events_render_mine)"
+        RENDERED="$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_render_mine)"
     fi
 }
 render_with() {
@@ -978,7 +1009,7 @@ check "gen-events-drift.sh words its verdicts and bypass by stage" "yes|no" \
 # The stage helper's three answers: pre-commit sets PRE_COMMIT_TO_REF and
 # PRE_COMMIT_REMOTE_NAME for a push; either alone means push.
 check "gen_events_stage: TO_REF alone, REMOTE_NAME alone, neither" "push|push|commit" \
-    "$(unset PRE_COMMIT_REMOTE_NAME; PRE_COMMIT_TO_REF=abc gen_events_stage)|$(unset PRE_COMMIT_TO_REF; PRE_COMMIT_REMOTE_NAME=origin gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME; gen_events_stage)"
+    "$(unset PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; PRE_COMMIT_TO_REF=abc gen_events_stage)|$(unset PRE_COMMIT_TO_REF GEN_EVENTS_STAGE_HINT; PRE_COMMIT_REMOTE_NAME=origin gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_stage)"
 
 # Under the fleet's direct pre-push shim no PRE_COMMIT_* is exported; git's
 # own protocol on stdin is the only sign of a push. A real ref line reads as
@@ -988,6 +1019,25 @@ check "gen_events_stage under the direct shim: ref line on stdin, empty stdin" "
     "$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin <<< "$STAGE_REF_LINE"; gen_events_stage)|$(unset PRE_COMMIT_TO_REF PRE_COMMIT_REMOTE_NAME GEN_EVENTS_STAGE_HINT; gen_events_detect_stage_from_stdin < /dev/null; gen_events_stage)"
 check "gen-events-drift.sh reads the stage from stdin before deciding it" yes \
     "$(awk '/^gen_events_detect_stage_from_stdin$/ {d=NR} /^STAGE="\$\(gen_events_stage\)"$/ {s=NR} END {print (d && s && d < s) ? "yes" : "no"}' "$SCRIPT_DIR/gen-events-drift.sh")"
+
+# Regression for the suite's own isolation: with the environment a pre-push
+# run of this suite inherits re-exported, the commit-stage cases must still
+# read `commit`. Before the fix these read `push` and 8 cases failed.
+POLLUTED="$(
+    export PRE_COMMIT_REMOTE_NAME=origin PRE_COMMIT_TO_REF=bbbb PRE_COMMIT_FROM_REF=aaaa GEN_EVENTS_STAGE_HINT=push
+    RENDER_STAGE="commit"
+    render_with "$(detail_line src-tauri/src/lib.rs staged)"
+    printf '%s|' "$(has 'This commit changes sources')" "$(has '(staged for this commit)')"
+    RENDER_STAGE="push"
+    render_with "$(detail_line src-tauri/src/lib.rs committed)"
+    printf '%s|' "$(has 'This push changes sources')"
+    sanitize_hook_stage_env
+    printf '%s' "$(gen_events_stage)"
+)"
+check "under an inherited pre-push environment the stage cases still hold" \
+    "yes|yes|yes|commit" "$POLLUTED"
+check "  and the suite itself started with no PRE_COMMIT_* or stage hint" "" \
+    "$(compgen -v PRE_COMMIT_; printf '%s' "${GEN_EVENTS_STAGE_HINT:-}")"
 
 # Everything above pins the renderer; this pins that the hook still USES it,
 # so the tests describe the message a pusher actually sees.

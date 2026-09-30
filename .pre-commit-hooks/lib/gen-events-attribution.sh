@@ -381,8 +381,12 @@ gen_events_uncovered_path_deps() {
 # are time-bounded) and is safe to consume because the shim hands every hook
 # its own copy. Call it ONCE, before anything else reads stdin. Only a
 # complete ref list (exit 0) counts: a stalled or malformed stream is not
-# evidence of a push.
+# evidence of a push. A DELETE-ONLY push reads as `commit` too:
+# push_pushed_refs drops zero-sha lines, since a deletion carries no commits.
+# That costs only wording, on a push that regenerates nothing of its own.
+# An inherited hint is cleared first: it describes some other process.
 gen_events_detect_stage_from_stdin() {
+    unset GEN_EVENTS_STAGE_HINT
     [ -z "${PRE_COMMIT_TO_REF:-}${PRE_COMMIT_REMOTE_NAME:-}" ] || return 0
     if push_pushed_refs >/dev/null 2>&1; then
         GEN_EVENTS_STAGE_HINT=push

@@ -113,7 +113,7 @@ repos:
         # output only when it fails, and a passing run should still say which
         # arms it exercised (it reports skips, which a bare "Passed" would hide).
         verbose: true
-        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh)$'
+        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
       # Every in-repo path dependency of the export build must be an attribution
