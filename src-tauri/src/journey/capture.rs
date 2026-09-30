@@ -123,25 +123,50 @@ pub(crate) fn record_control_result<T: serde::Serialize, E: serde::Serialize>(
     }
 }
 
+/// Where an SDK-route action landed (N2), or `None` when it landed nowhere.
+///
+/// - a refusal ([`sdk_refusal`]) reached no UI → `None`;
+/// - an active SDK app was connected → that app, with its reported version
+///   and the request's relay `scope` (`tabId`);
+/// - no SDK app was connected → the route fell back to the runner's own
+///   webview (the `NotConnected` IPC fallback), so the action is the runner
+///   app's, in its main-window cursor. A route with no fallback answers
+///   `success:false`, which lands as an `error` edge there — it was an attempt
+///   against the runner's UI surface that failed.
+pub(crate) fn sdk_action_target(
+    active_app: Option<(String, Option<String>)>,
+    scope: Option<&str>,
+    response: &serde_json::Value,
+) -> Option<(CursorKey, Option<String>)> {
+    if sdk_refusal(response) {
+        return None;
+    }
+    Some(match active_app {
+        Some((app_id, version)) => (CursorKey::new(app_id, scope), version),
+        None => (
+            CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
+            None,
+        ),
+    })
+}
+
 /// Record an SDK-route action from its JSON answer (M3). `active_app` is the
-/// active SDK connection read BEFORE dispatch; with none, the dispatch reached
-/// no app and nothing is recorded. A relay refusal records nothing (m3); an
-/// explicit `success: false` is an `error` edge.
+/// active SDK connection read BEFORE dispatch and `scope` the request's
+/// `tabId`; [`sdk_action_target`] decides where it landed. An explicit
+/// `success: false` is an `error` edge.
 pub(crate) fn record_sdk_result(
     state: &Arc<crate::mcp::types::ApiState>,
     active_app: Option<(String, Option<String>)>,
+    scope: Option<&str>,
     response: &serde_json::Value,
     action: ActionSpec,
 ) {
-    let Some((app_id, app_version)) = active_app else {
+    let Some((key, app_version)) = sdk_action_target(active_app, scope, response) else {
         return;
     };
-    if sdk_refusal(response) {
-        return;
-    }
     record_action(
         state.app_state.pg_db.clone(),
-        CursorKey::new(app_id, None),
+        key,
         action,
         Provenance {
             app_version,
@@ -149,6 +174,24 @@ pub(crate) fn record_sdk_result(
         },
         response.get("success") == Some(&serde_json::Value::Bool(false)),
     );
+}
+
+/// The relay tab an SDK request is pinned to: `?tabId=` / `?targetTabId=`,
+/// else the body's `tabId` / `targetTabId`.
+pub(crate) fn sdk_request_scope(
+    query: &std::collections::HashMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> Option<String> {
+    query
+        .get("tabId")
+        .or_else(|| query.get("targetTabId"))
+        .cloned()
+        .or_else(|| {
+            body.and_then(|b| b.get("tabId").or_else(|| b.get("targetTabId")))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Is a snapshot request FILTERED (M2)? `visibleOnly`, `currentRouteOnly`,
@@ -179,9 +222,12 @@ pub(crate) fn snapshot_query_is_filtered(
 pub(crate) const SDK_REFUSAL_CODES: [&str; 2] = ["TAB_NOT_FOUND", "TAB_STALE"];
 
 /// Did an SDK route's answer come from a REFUSAL rather than an attempted
-/// action (m3)? The relay's `TAB_NOT_FOUND` / `TAB_STALE` envelope — `code`
-/// or `errorCode` at the top level, under `error`, or under `data`. Like the
-/// control surface's 4xx rule, a refusal records nothing.
+/// action (m3, N3)? Either the relay's `TAB_NOT_FOUND` / `TAB_STALE`
+/// envelope — `code` or `errorCode` at the top level, under `error`, or under
+/// `data` — or a TRANSPORT-origin dispatch refusal (`failure_origin:
+/// "transport"`, from `ipc_fallback_refusal`): neither reached any UI, so,
+/// like the control surface's 4xx rule, neither records. An APP-origin
+/// failure (`failure_origin: "app"`) did reach the app and is an `error` edge.
 pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
     let code_in = |v: Option<&serde_json::Value>| {
         v.into_iter().any(|v| {
@@ -192,7 +238,12 @@ pub(crate) fn sdk_refusal(response: &serde_json::Value) -> bool {
             })
         })
     };
-    code_in(Some(response)) || code_in(response.get("error")) || code_in(response.get("data"))
+    let transport_refusal =
+        response.get("failure_origin").and_then(|v| v.as_str()) == Some("transport");
+    transport_refusal
+        || code_in(Some(response))
+        || code_in(response.get("error"))
+        || code_in(response.get("data"))
 }
 
 /// `task_run_id` (the run the action routes already attribute events to) as
@@ -1058,6 +1109,62 @@ mod tests {
         let ok: Result<_, (StatusCode, Json<ApiResponse<()>>)> =
             Ok(Json(ApiResponse::success(serde_json::json!({}))));
         assert_eq!(control_action_verdict(&ok), Some(false));
+    }
+
+    // ---- N2 / N3: where an SDK action landed ---------------------------------
+
+    #[test]
+    fn an_sdk_action_with_no_app_connected_lands_on_the_runner() {
+        let (key, version) = sdk_action_target(None, Some("t1"), &json!({"success": true}))
+            .expect("the IPC fallback acted on the runner webview");
+        assert_eq!(key.app_id, crate::spec_api::storage::RUNNER_APP_ID);
+        assert_eq!(
+            key.scope, None,
+            "the runner's main window, not the relay tab"
+        );
+        assert_eq!(version, None);
+        let (key, version) = sdk_action_target(
+            Some(("qontinui-web".into(), Some("1.0".into()))),
+            Some("t1"),
+            &json!({"success": false, "error": "boom"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (key.app_id.as_str(), key.scope.as_deref()),
+            ("qontinui-web", Some("t1"))
+        );
+        assert_eq!(version.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn only_transport_and_tab_refusals_record_nothing() {
+        let transport =
+            json!({"success": false, "code": "SDK_DISPATCH_FAILED", "failure_origin": "transport"});
+        let app = json!({"success": false, "code": "ELEMENT_DISABLED", "failure_origin": "app"});
+        assert!(sdk_action_target(None, None, &transport).is_none());
+        assert!(sdk_action_target(Some(("a".into(), None)), None, &transport).is_none());
+        assert!(
+            sdk_action_target(Some(("a".into(), None)), None, &app).is_some(),
+            "an app-origin failure reached the app: an error edge"
+        );
+    }
+
+    #[test]
+    fn the_sdk_scope_comes_from_the_query_then_the_body() {
+        let mut q = std::collections::HashMap::new();
+        assert_eq!(
+            sdk_request_scope(&q, Some(&json!({"targetTabId": "b"}))).as_deref(),
+            Some("b")
+        );
+        q.insert("tabId".to_string(), "a".to_string());
+        assert_eq!(
+            sdk_request_scope(&q, Some(&json!({"tabId": "b"}))).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            sdk_request_scope(&std::collections::HashMap::new(), None),
+            None
+        );
     }
 
     // ---- M2: filtered snapshots ----------------------------------------------
