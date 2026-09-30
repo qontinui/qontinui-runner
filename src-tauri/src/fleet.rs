@@ -249,9 +249,15 @@ impl LocalBindingSet {
 /// MEDIUM 2). The register heartbeat alone has that fallback:
 /// [`resolve_heartbeat_binding_set`].
 pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
-    choose_binding_set(read_file_binding_source, read_legacy_binding_source, || {
-        None
-    })
+    resolve_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_binding_set`] over injected sources. Takes the SAME source set
+/// the heartbeat does and deliberately never reads `slots`, `bound` or
+/// `active` — so a test handing it panicking slot sources pins that the
+/// non-heartbeat path cannot regain the slot fallback (review round 3).
+pub(crate) fn resolve_binding_set_with(src: &BindingSources<'_>) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || None)
 }
 
 /// The register heartbeat's binding set: [`resolve_binding_set`]'s sources,
@@ -265,14 +271,61 @@ pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
 /// ([`LocalBindingSet::bearer_scope`]), the same tenant it sends as
 /// `tenant_id`.
 pub(crate) fn resolve_heartbeat_binding_set() -> Option<LocalBindingSet> {
-    choose_binding_set(read_file_binding_source, read_legacy_binding_source, || {
-        let (_, candidates) = qontinui_runner_lib::pair::usable_slot_claim_tenants()?;
-        heartbeat_slot_fallback(
-            candidates,
-            &qontinui_runner_lib::pair::coord_bound_tenants(),
-            qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid(),
-        )
+    resolve_heartbeat_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_heartbeat_binding_set`] over injected sources: the slot
+/// candidates, coord's bound set and the active tenant are read only when
+/// the file and a usable legacy claim both missed, and are fed to
+/// [`heartbeat_slot_fallback`].
+pub(crate) fn resolve_heartbeat_binding_set_with(
+    src: &BindingSources<'_>,
+) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || {
+        let candidates = (src.slots)()?;
+        heartbeat_slot_fallback(candidates, &(src.bound)(), (src.active)())
     })
+}
+
+/// Every source the two binding-set resolvers read, injectable so their
+/// WIRING — which sources each consults, and what the heartbeat hands its
+/// fallback — is testable without a credential store (review round 3).
+/// [`BindingSources::production`] is the real set.
+pub(crate) struct BindingSources<'a> {
+    /// Branch 1: `paired_user.json`'s default + binding set.
+    pub(crate) file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    /// Branch 2: the legacy slot's claim tenant and whether it is USABLE.
+    pub(crate) legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    /// Heartbeat only: tenants whose per-tenant slot holds a usable,
+    /// self-naming JWT.
+    pub(crate) slots: &'a dyn Fn() -> Option<Vec<uuid::Uuid>>,
+    /// Heartbeat only: coord's recorded bound set.
+    pub(crate) bound: &'a dyn Fn() -> qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    /// Heartbeat only: `machine.json`'s `active_tenant_id`.
+    pub(crate) active: &'a dyn Fn() -> Option<uuid::Uuid>,
+}
+
+impl BindingSources<'static> {
+    /// The real sources.
+    pub(crate) fn production() -> Self {
+        Self {
+            file: &read_file_binding_source,
+            legacy: &read_legacy_binding_source,
+            slots: &read_slot_claim_candidates,
+            bound: &qontinui_runner_lib::pair::coord_bound_tenants,
+            active: &read_active_tenant,
+        }
+    }
+}
+
+/// Heartbeat source: the per-tenant slots' usable, self-naming tenants.
+fn read_slot_claim_candidates() -> Option<Vec<uuid::Uuid>> {
+    qontinui_runner_lib::pair::usable_slot_claim_tenants().map(|(_, candidates)| candidates)
+}
+
+/// Heartbeat source: `machine.json`'s `active_tenant_id`.
+fn read_active_tenant() -> Option<uuid::Uuid> {
+    qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid()
 }
 
 /// Branch 1 source: `paired_user.json`'s default + binding set.
@@ -8995,36 +9048,116 @@ mod binding_set_resolution_tests {
         }
     }
 
-    /// Review round 2, MEDIUM 2: the per-tenant-slot fallback is the
-    /// heartbeat's ALONE. `resolve_binding_set` (and so `resolve_tenant_id`,
-    /// which slot leases, session attribution and coord registration stamp on
-    /// their writes) passes `|| None` for it — with no file and an empty
-    /// legacy slot it answers `None`, however many usable slots exist; a dead
-    /// legacy slot still yields its claim (the historical behaviour).
+    /// Injected sources: `file` and `legacy` as given; the three heartbeat
+    /// sources PANIC, so any resolver that reads them fails the test.
+    fn sources_without_slots<'a>(
+        file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+        legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    ) -> BindingSources<'a> {
+        BindingSources {
+            file,
+            legacy,
+            slots: &|| panic!("the per-tenant slots must not be read"),
+            bound: &|| panic!("coord's bound set must not be read"),
+            active: &|| panic!("machine.json's active tenant must not be read"),
+        }
+    }
+
+    /// Review round 2, MEDIUM 2 + round 3: the per-tenant-slot fallback is
+    /// the heartbeat's ALONE, pinned through `resolve_binding_set`'s own
+    /// wiring (`resolve_binding_set_with`, which `resolve_binding_set` calls
+    /// with the real sources) rather than through `choose_binding_set` with a
+    /// hand-written `|| None` — so re-adding the slot fallback there fails
+    /// this test. It is handed panicking slot / bound / active sources: with
+    /// no file and an empty legacy slot it answers `None` without touching
+    /// them, and a dead legacy slot still yields its claim (the historical
+    /// behaviour).
     #[test]
     fn the_non_heartbeat_path_never_falls_back_to_the_per_tenant_slots() {
-        // Exactly the closure `resolve_binding_set` passes.
-        assert!(choose_binding_set(|| None, || None, || None).is_none());
-        let dead = choose_binding_set(|| None, || Some((t(7), false)), || None)
-            .expect("a dead legacy claim still names its tenant");
+        assert!(resolve_binding_set_with(&sources_without_slots(&|| None, &|| None)).is_none());
+        let dead =
+            resolve_binding_set_with(&sources_without_slots(&|| None, &|| Some((t(7), false))))
+                .expect("a dead legacy claim still names its tenant");
         assert_eq!(dead.default_tenant, t(7));
         assert_eq!(dead.source, BindingSource::LegacySlotClaim);
-        // …whereas the heartbeat, with usable slots, gets the slot tenant.
-        let hb = choose_binding_set(
-            || None,
-            || None,
-            || {
-                heartbeat_slot_fallback(
-                    vec![t(4), t(5)],
-                    &qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("never recorded"),
-                    None,
-                )
-            },
-        )
-        .expect("the heartbeat resolves from the slots");
+        // Given the SAME no-file / no-legacy shape and usable slots, the
+        // heartbeat resolver does read them — the counter proves the source
+        // is wired there and only there.
+        let slot_reads = std::cell::Cell::new(0u32);
+        let slots = || {
+            slot_reads.set(slot_reads.get() + 1);
+            Some(vec![t(4), t(5)])
+        };
+        let src = BindingSources {
+            file: &|| None,
+            legacy: &|| None,
+            slots: &slots,
+            bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("never recorded"),
+            active: &|| None,
+        };
+        assert!(resolve_binding_set_with(&src).is_none());
+        assert_eq!(
+            slot_reads.get(),
+            0,
+            "resolve_binding_set_with read the slots"
+        );
+        let hb = resolve_heartbeat_binding_set_with(&src)
+            .expect("the heartbeat resolves from the slots");
+        assert_eq!(slot_reads.get(), 1);
         assert_eq!(hb.default_tenant, t(5));
         assert_eq!(hb.source, BindingSource::TenantSlotClaims);
         assert_eq!(hb.bearer_scope(), crate::auth::TenantScope::Owned(t(5)));
+    }
+
+    /// Review round 3: `resolve_heartbeat_binding_set_with` feeds the bound
+    /// set and the active tenant into the slot fallback — a Known set
+    /// excludes an unbound slot tenant (even the greatest id, even the
+    /// active one), the active tenant is preferred when it survives, and the
+    /// file or a usable legacy claim still answers first without any
+    /// heartbeat source being read.
+    #[test]
+    fn the_heartbeat_resolver_feeds_bound_and_active_into_the_slot_fallback() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        let resolve = |bound: Vec<uuid::Uuid>, active: Option<uuid::Uuid>| {
+            let bound_fn = move || B::Known(bound.clone());
+            let active_fn = move || active;
+            resolve_heartbeat_binding_set_with(&BindingSources {
+                file: &|| None,
+                legacy: &|| Some((t(9), false)),
+                slots: &|| Some(vec![t(4), t(5), t(6)]),
+                bound: &bound_fn,
+                active: &active_fn,
+            })
+        };
+        // Unbound 6 (the greatest id) is excluded; greatest bound wins.
+        let set = resolve(vec![t(4), t(5)], None).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+        assert_eq!(set.source, BindingSource::TenantSlotClaims);
+        // The active tenant is preferred over the greatest id…
+        let set = resolve(vec![t(4), t(5)], Some(t(4))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(4));
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Owned(t(4)));
+        // …but never when coord does not list it as bound.
+        let set = resolve(vec![t(4), t(5)], Some(t(6))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        // A Known set listing none of the slots: the dead legacy claim.
+        let set = resolve(vec![t(1)], None).expect("legacy claim");
+        assert_eq!(set.default_tenant, t(9));
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        // The file answers first; the heartbeat sources are never read.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(
+            &|| Some((t(1), vec![t(1)])),
+            &|| panic!("the legacy slot is not read when the file answers"),
+        ))
+        .expect("file");
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        // So does a usable legacy claim.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(&|| None, &|| {
+            Some((t(3), true))
+        }))
+        .expect("legacy");
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
     }
 
     /// The heartbeat's slot fallback drops tenants coord's KNOWN set does not
