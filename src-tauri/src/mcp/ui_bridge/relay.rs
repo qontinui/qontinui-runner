@@ -21,10 +21,18 @@
 //!   5. `POST /ui-bridge/relay/dispatch` — runner-side command entry point:
 //!      queue a command to a registered tab and await its result.
 //!
-//! Unlike the qontinui-web relay, heartbeats are LENIENT: the runner is a
-//! single-operator loopback surface, so `registrationMetadata`
+//! Heartbeats are LENIENT about metadata: `registrationMetadata`
 //! (`{userId, sessionId}`) is stored when present but not required. Plan:
 //! `plans/2026-06-12-co-pilot-automation-ui-bridge-remediation.md` item 6(a).
+//!
+//! Identity is NOT lenient. Every tab is bound to the [`Principal`] that first
+//! attached or heartbeat it (its `Origin`, or the digest of its
+//! `X-UI-Bridge-Tab-Key`), and a `tabId` in a request is not evidence of who
+//! sent it: a live holder is displaced only by its own principal or operator
+//! trust (R1), an ended tab's id is reserved for its holder for the eviction
+//! window (R5), and a result completes a command only when the poster is the
+//! tab's principal, with no operator-trust exemption (R3). Plan:
+//! `2026-09-17-ui-bridge-relay-registration-is-unauthenticated` Phase 2.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +41,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::Json,
 };
@@ -43,7 +51,9 @@ use tracing::{info, warn};
 use axum::Extension;
 
 use crate::mcp::origin_guard::RequesterPrincipal;
-use crate::mcp::relay_binding::RelayState;
+use crate::mcp::relay_binding::{
+    BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R1, RULE_R5, RULE_R9_UNKEYED,
+};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 /// Tabs with no live SSE listener are evicted from the registry once their
@@ -78,6 +88,18 @@ const HEARTBEAT_METADATA_KEYS: &[&str] = &[
     "capabilities",
     "version",
 ];
+
+/// The header a pinned injected tab sends to bind itself to a key rather than
+/// to an origin (R9). Read by the runner, never issued by it.
+const TAB_KEY_HEADER: &str = "x-ui-bridge-tab-key";
+
+const ROUTE_STREAM: &str = "commands/stream";
+const ROUTE_HEARTBEAT: &str = "heartbeat";
+const ROUTE_RESULT: &str = "commands";
+
+fn tab_key(headers: &HeaderMap) -> Option<&str> {
+    headers.get(TAB_KEY_HEADER).and_then(|v| v.to_str().ok())
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -134,12 +156,26 @@ struct TabRecord {
     last_seen_ms: u64,
     metadata: serde_json::Map<String, serde_json::Value>,
     listener: Option<Listener>,
+    /// Who holds this tab id. Set by the first attach or heartbeat and moved
+    /// only by an admitted displacement. `None` only for a principal-less
+    /// (opaque-origin) claim admitted under `shadow` / `off`, which any
+    /// principal may then claim.
+    principal: Option<Principal>,
+}
+
+/// A dispatched command awaiting its result.
+struct PendingTabCommand {
+    tab_id: String,
+    /// The tab's principal when the command was queued; the fallback for R3
+    /// when the tab's record has since been evicted.
+    principal: Option<Principal>,
+    sender: tokio::sync::oneshot::Sender<CommandResult>,
 }
 
 #[derive(Default)]
 struct RegistryInner {
     tabs: HashMap<String, TabRecord>,
-    pending: HashMap<String, tokio::sync::oneshot::Sender<CommandResult>>,
+    pending: HashMap<String, PendingTabCommand>,
 }
 
 /// Process-wide relay tab registry. One per runner (held on `ApiState`).
@@ -169,17 +205,30 @@ impl RelayRegistry {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register (or replace) the SSE listener for `tab_id`. Returns the
-    /// connection id (for drop-time deregistration) and the command receiver.
-    pub fn connect_stream(
-        &self,
+    /// R1 / R5 / R9-unkeyed, then bind: create the record for `tab_id` or
+    /// admit `principal` onto the existing one. The check and the write are one
+    /// lock acquisition (`inner` is the held guard), so two concurrent claims
+    /// can never both pass against the same prior holder.
+    ///
+    /// - A live holder is displaced only by its own principal or operator
+    ///   trust (R1).
+    /// - An ended tab's record is kept for `STALE_TAB_EVICT_MS`, which equals
+    ///   the reservation window, so the record IS the R5 tombstone: nobody but
+    ///   the holder (or operator trust) may take the id until it evicts.
+    /// - One arm is not enforced by default: an UNKEYED browser re-attaching
+    ///   from a different origin after the prior stream ended. A pinned
+    ///   injected tab that predates the tab key legitimately crosses origins
+    ///   (an OAuth hop), so that arm rides `active_binding` and is only
+    ///   counted (`R9-unkeyed`) until Phase 4 graduates it.
+    fn claim(
+        inner: &mut RegistryInner,
+        binding: &RelayBinding,
+        principal: &Principal,
+        route: &'static str,
         tab_id: &str,
-    ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<QueuedCommand>) {
-        let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let now = now_ms();
-        let mut inner = self.lock();
-        evict_stale(&mut inner, now);
+        now: u64,
+    ) -> Result<(), Refusal> {
+        let checked = binding.config.binding != BindingMode::Off;
         let record = inner
             .tabs
             .entry(tab_id.to_string())
@@ -189,10 +238,63 @@ impl RelayRegistry {
                 last_seen_ms: now,
                 metadata: serde_json::Map::new(),
                 listener: None,
+                principal: None,
             });
+        if checked {
+            if let Some(holder) = record.principal.as_ref() {
+                if !principal.may_displace(holder) {
+                    let live = record.listener.is_some();
+                    let unkeyed_hop = !live
+                        && matches!(holder, Principal::Browser { .. })
+                        && matches!(principal, Principal::Browser { .. });
+                    if unkeyed_hop {
+                        binding.meter(
+                            binding.config.active_binding,
+                            principal,
+                            route,
+                            Refusal::registration_held(RULE_R9_UNKEYED),
+                        )?;
+                    } else {
+                        binding.meter(
+                            binding.config.binding,
+                            principal,
+                            route,
+                            Refusal::registration_held(if live { RULE_R1 } else { RULE_R5 }),
+                        )?;
+                    }
+                }
+            }
+        }
+        // Admitted. A principal-less claim never replaces a bound holder.
+        match principal {
+            Principal::Opaque { .. } => {}
+            p => record.principal = Some(p.clone()),
+        }
+        Ok(())
+    }
+
+    /// Register (or replace) the SSE listener for `tab_id`. Returns the
+    /// connection id (for drop-time deregistration) and the command receiver,
+    /// or the [`Refusal`] when `principal` may not take this tab id.
+    pub fn connect_stream(
+        &self,
+        binding: &RelayBinding,
+        principal: &Principal,
+        tab_id: &str,
+    ) -> Result<(u64, tokio::sync::mpsc::UnboundedReceiver<QueuedCommand>), Refusal> {
+        let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let now = now_ms();
+        let mut inner = self.lock();
+        evict_stale(&mut inner, now);
+        Self::claim(&mut inner, binding, principal, ROUTE_STREAM, tab_id, now)?;
+        let record = inner
+            .tabs
+            .get_mut(tab_id)
+            .expect("claim created or found this record under the same lock");
         record.last_seen_ms = now;
         record.listener = Some(Listener { conn_id, tx });
-        (conn_id, rx)
+        Ok((conn_id, rx))
     }
 
     /// Deregister the SSE listener for `tab_id`, but only if it is still the
@@ -215,20 +317,21 @@ impl RelayRegistry {
     /// Upsert a tab from a heartbeat body. Returns whether the tab currently
     /// holds a live SSE listener (`tabRegistered` in the response — the
     /// client's silent-drop recovery signal).
-    pub fn heartbeat(&self, tab_id: &str, body: &serde_json::Value) -> bool {
+    pub fn heartbeat(
+        &self,
+        binding: &RelayBinding,
+        principal: &Principal,
+        tab_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<bool, Refusal> {
         let now = now_ms();
         let mut inner = self.lock();
         evict_stale(&mut inner, now);
+        Self::claim(&mut inner, binding, principal, ROUTE_HEARTBEAT, tab_id, now)?;
         let record = inner
             .tabs
-            .entry(tab_id.to_string())
-            .or_insert_with(|| TabRecord {
-                registered_at_ms: now,
-                last_heartbeat_ms: None,
-                last_seen_ms: now,
-                metadata: serde_json::Map::new(),
-                listener: None,
-            });
+            .get_mut(tab_id)
+            .expect("claim created or found this record under the same lock");
         record.last_heartbeat_ms = Some(now);
         record.last_seen_ms = now;
         for key in HEARTBEAT_METADATA_KEYS {
@@ -250,7 +353,7 @@ impl RelayRegistry {
                 }
             }
         }
-        record.listener.is_some()
+        Ok(record.listener.is_some())
     }
 
     /// Snapshot the registry as JSON tab entries (stale tabs evicted first).
@@ -293,6 +396,15 @@ impl RelayRegistry {
                     "connected".to_string(),
                     serde_json::json!(record.listener.is_some()),
                 );
+                // Provenance, from the verified header and never the body.
+                entry.insert(
+                    "verifiedOrigin".to_string(),
+                    serde_json::json!(record.principal.as_ref().and_then(|p| p.verified_origin())),
+                );
+                entry.insert(
+                    "principalClass".to_string(),
+                    serde_json::json!(record.principal.as_ref().map(|p| p.class_str())),
+                );
                 entry.insert(
                     "isPrimary".to_string(),
                     serde_json::json!(primary.as_deref() == Some(tab_id.as_str())),
@@ -319,14 +431,47 @@ impl RelayRegistry {
         ids
     }
 
-    /// Deliver a result envelope for `command_id`. Returns `false` when no
+    /// Deliver a result envelope for `command_id` (R3). `Ok(false)` when no
     /// dispatch is awaiting that id (already timed out, or unknown).
-    pub fn complete(&self, command_id: &str, result: CommandResult) -> bool {
-        let sender = self.lock().pending.remove(command_id);
-        match sender {
-            Some(tx) => tx.send(result).is_ok(),
-            None => false,
+    ///
+    /// The result is accepted only from the tab the command was routed to:
+    /// the body `tab_id` must be the recorded target AND the poster must be
+    /// that tab's principal. There is NO operator-trust exemption — no agent
+    /// ever posts a tab's result, and the exemption is exactly what a
+    /// laundered (supervisor-proxied, Origin-stripped) POST would use. A
+    /// refusal leaves the command pending, so the genuine tab can still answer.
+    pub fn complete(
+        &self,
+        binding: &RelayBinding,
+        principal: &Principal,
+        tab_id: &str,
+        command_id: &str,
+        result: CommandResult,
+    ) -> Result<bool, Refusal> {
+        let mut inner = self.lock();
+        let Some(pending) = inner.pending.get(command_id) else {
+            return Ok(false);
+        };
+        if binding.config.binding != BindingMode::Off {
+            let holder = inner
+                .tabs
+                .get(&pending.tab_id)
+                .and_then(|t| t.principal.as_ref())
+                .or(pending.principal.as_ref());
+            let ours = tab_id == pending.tab_id && holder.is_none_or(|h| principal.same(h));
+            if !ours {
+                binding.meter(
+                    binding.config.binding,
+                    principal,
+                    ROUTE_RESULT,
+                    Refusal::command_not_yours(),
+                )?;
+            }
         }
+        Ok(match inner.pending.remove(command_id) {
+            Some(p) => p.sender.send(result).is_ok(),
+            None => false,
+        })
     }
 
     /// Queue a command to a registered tab and await its result envelope.
@@ -377,7 +522,15 @@ impl RelayRegistry {
                     }
                 }
             };
-            inner.pending.insert(command_id.clone(), result_tx);
+            let principal = inner.tabs.get(&target).and_then(|t| t.principal.clone());
+            inner.pending.insert(
+                command_id.clone(),
+                PendingTabCommand {
+                    tab_id: target.clone(),
+                    principal,
+                    sender: result_tx,
+                },
+            );
             let command = QueuedCommand {
                 command_id: command_id.clone(),
                 action: action.to_string(),
@@ -462,16 +615,33 @@ impl Drop for StreamGuard {
 /// client disconnects.
 pub async fn ui_bridge_relay_command_stream_handler(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let principal = state
+        .binding
+        .principal(
+            requester.as_ref().map(|e| &e.0),
+            tab_key(&headers),
+            ROUTE_STREAM,
+        )
+        .map_err(Refusal::into_http)?;
     let registry = state.ui_bridge_relay.clone();
     let tab_id = query
         .get("tabId")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (conn_id, mut rx) = registry.connect_stream(&tab_id);
+    // A refusal is a JSON body sent BEFORE the stream starts, so the victim
+    // keeps its stream and `relay-client.ts` (which treats `!resp.ok` as
+    // `scheduleReconnect()`) keeps retrying into a refusal counter.
+    let (conn_id, mut rx) = registry
+        .connect_stream(&state.binding, &principal, &tab_id)
+        .map_err(Refusal::into_http)?;
     info!(
         "UI Bridge relay: SSE stream opened for tab {} (conn {})",
         tab_id, conn_id
@@ -495,22 +665,25 @@ pub async fn ui_bridge_relay_command_stream_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
             .text("heartbeat"),
-    )
+    ))
 }
 
 /// POST /ui-bridge/heartbeat
 ///
-/// Relay tab registry upsert. LENIENT (unlike the strict web relay): only
-/// `tabId` is required; `registrationMetadata` is stored when present. The
+/// Relay tab registry upsert. LENIENT about metadata (unlike the strict web
+/// relay): only `tabId` is required; `registrationMetadata` is stored when
+/// present. Who may heartbeat a tab id is NOT lenient: the caller must be the
+/// tab's principal (see the module doc). The
 /// response's `data.tabRegistered` reports whether this tab currently holds
 /// a live SSE listener — the client forces a stream reconnect on `false`.
 pub async fn ui_bridge_relay_heartbeat_handler(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let Some(tab_id) = body
@@ -523,7 +696,18 @@ pub async fn ui_bridge_relay_heartbeat_handler(
         err.code = Some("MISSING_TAB_ID".to_string());
         return Err((StatusCode::BAD_REQUEST, Json(err)));
     };
-    let tab_registered = state.ui_bridge_relay.heartbeat(tab_id, &body);
+    let principal = state
+        .binding
+        .principal(
+            requester.as_ref().map(|e| &e.0),
+            tab_key(&headers),
+            ROUTE_HEARTBEAT,
+        )
+        .map_err(Refusal::into_http)?;
+    let tab_registered = state
+        .ui_bridge_relay
+        .heartbeat(&state.binding, &principal, tab_id, &body)
+        .map_err(Refusal::into_http)?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "received": true,
         "tabRegistered": tab_registered,
@@ -538,7 +722,8 @@ pub async fn ui_bridge_relay_heartbeat_handler(
 /// fire-and-forgets these.
 pub async fn ui_bridge_relay_command_result_handler(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let Some(command_id) = body
@@ -565,7 +750,29 @@ pub async fn ui_bridge_relay_command_result_handler(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     };
-    let matched = state.ui_bridge_relay.complete(command_id, result);
+    let principal = state
+        .binding
+        .principal(
+            requester.as_ref().map(|e| &e.0),
+            tab_key(&headers),
+            ROUTE_RESULT,
+        )
+        .map_err(Refusal::into_http)?;
+    let posted_tab_id = body
+        .get("tabId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    let matched = state
+        .ui_bridge_relay
+        .complete(
+            &state.binding,
+            &principal,
+            posted_tab_id,
+            command_id,
+            result,
+        )
+        .map_err(Refusal::into_http)?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "received": true,
         "matched": matched,
@@ -780,6 +987,19 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::relay_binding::BindingConfig;
+
+    fn b() -> Arc<RelayBinding> {
+        RelayBinding::new(BindingConfig::default())
+    }
+
+    /// The caller every legacy registry test stands in for: an agent / script
+    /// with no `Origin`, i.e. operator trust.
+    fn op() -> Principal {
+        Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        }
+    }
 
     fn heartbeat_body(tab_id: &str) -> serde_json::Value {
         serde_json::json!({
@@ -797,7 +1017,9 @@ mod tests {
     #[test]
     fn heartbeat_registers_tab_without_stream() {
         let registry = RelayRegistry::new();
-        let tab_registered = registry.heartbeat("tab-a", &heartbeat_body("tab-a"));
+        let tab_registered = registry
+            .heartbeat(&b(), &op(), "tab-a", &heartbeat_body("tab-a"))
+            .unwrap();
         assert!(!tab_registered, "no SSE listener yet");
 
         let tabs = registry.list_tabs();
@@ -815,15 +1037,26 @@ mod tests {
     fn heartbeat_is_lenient_about_registration_metadata() {
         let registry = RelayRegistry::new();
         // No registrationMetadata at all — accepted (unlike the strict web relay).
-        assert!(!registry.heartbeat("tab-a", &serde_json::json!({ "tabId": "tab-a" })));
+        assert!(!registry
+            .heartbeat(
+                &b(),
+                &op(),
+                "tab-a",
+                &serde_json::json!({ "tabId": "tab-a" })
+            )
+            .unwrap());
         // With metadata — stored and surfaced on the tab entry.
-        registry.heartbeat(
-            "tab-a",
-            &serde_json::json!({
-                "tabId": "tab-a",
-                "registrationMetadata": { "userId": "user-1", "sessionId": "sess-1" },
-            }),
-        );
+        registry
+            .heartbeat(
+                &b(),
+                &op(),
+                "tab-a",
+                &serde_json::json!({
+                    "tabId": "tab-a",
+                    "registrationMetadata": { "userId": "user-1", "sessionId": "sess-1" },
+                }),
+            )
+            .unwrap();
         let tabs = registry.list_tabs();
         assert_eq!(tabs[0]["userId"], "user-1");
         assert_eq!(tabs[0]["sessionId"], "sess-1");
@@ -832,8 +1065,10 @@ mod tests {
     #[tokio::test]
     async fn connect_stream_flips_tab_registered_and_connected() {
         let registry = RelayRegistry::new();
-        let (_conn_id, _rx) = registry.connect_stream("tab-a");
-        assert!(registry.heartbeat("tab-a", &heartbeat_body("tab-a")));
+        let (_conn_id, _rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
+        assert!(registry
+            .heartbeat(&b(), &op(), "tab-a", &heartbeat_body("tab-a"))
+            .unwrap());
         let tabs = registry.list_tabs();
         assert_eq!(tabs[0]["connected"], true);
         assert_eq!(registry.connected_tab_ids(), vec!["tab-a".to_string()]);
@@ -842,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_delivers_command_and_returns_result() {
         let registry = Arc::new(RelayRegistry::new());
-        let (_conn_id, mut rx) = registry.connect_stream("tab-a");
+        let (_conn_id, mut rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
 
         let responder = {
             let registry = registry.clone();
@@ -850,14 +1085,19 @@ mod tests {
                 let command = rx.recv().await.expect("command frame");
                 assert_eq!(command.action, "discover");
                 assert_eq!(command.payload["query"], "smoke");
-                let matched = registry.complete(
-                    &command.command_id,
-                    CommandResult {
-                        success: true,
-                        result: serde_json::json!({ "elements": [{ "id": "button-run" }] }),
-                        error: None,
-                    },
-                );
+                let matched = registry
+                    .complete(
+                        &b(),
+                        &op(),
+                        "tab-a",
+                        &command.command_id,
+                        CommandResult {
+                            success: true,
+                            result: serde_json::json!({ "elements": [{ "id": "button-run" }] }),
+                            error: None,
+                        },
+                    )
+                    .unwrap();
                 assert!(matched, "dispatch should be awaiting this commandId");
             })
         };
@@ -882,14 +1122,19 @@ mod tests {
     async fn dispatch_without_tab_id_targets_sole_connected_tab() {
         let registry = Arc::new(RelayRegistry::new());
         // A heartbeat-only (not connected) tab must NOT make this ambiguous.
-        registry.heartbeat("tab-idle", &heartbeat_body("tab-idle"));
-        let (_conn_id, mut rx) = registry.connect_stream("tab-live");
+        registry
+            .heartbeat(&b(), &op(), "tab-idle", &heartbeat_body("tab-idle"))
+            .unwrap();
+        let (_conn_id, mut rx) = registry.connect_stream(&b(), &op(), "tab-live").unwrap();
 
         let responder = {
             let registry = registry.clone();
             tokio::spawn(async move {
                 let command = rx.recv().await.expect("command frame");
-                registry.complete(
+                let _ = registry.complete(
+                    &b(),
+                    &op(),
+                    "tab-live",
                     &command.command_id,
                     CommandResult {
                         success: true,
@@ -916,7 +1161,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_with_no_connected_tab_is_no_tab_connected() {
         let registry = RelayRegistry::new();
-        registry.heartbeat("tab-idle", &heartbeat_body("tab-idle"));
+        registry
+            .heartbeat(&b(), &op(), "tab-idle", &heartbeat_body("tab-idle"))
+            .unwrap();
         let err = registry
             .dispatch(
                 None,
@@ -932,8 +1179,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_with_two_connected_tabs_is_ambiguous() {
         let registry = RelayRegistry::new();
-        let (_c1, _rx1) = registry.connect_stream("tab-a");
-        let (_c2, _rx2) = registry.connect_stream("tab-b");
+        let (_c1, _rx1) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
+        let (_c2, _rx2) = registry.connect_stream(&b(), &op(), "tab-b").unwrap();
         let err = registry
             .dispatch(
                 None,
@@ -967,7 +1214,9 @@ mod tests {
 
         // Known via heartbeat but no live stream — pinned dispatch must NOT
         // silently target some other tab; it reports TAB_NOT_FOUND.
-        registry.heartbeat("tab-idle", &heartbeat_body("tab-idle"));
+        registry
+            .heartbeat(&b(), &op(), "tab-idle", &heartbeat_body("tab-idle"))
+            .unwrap();
         let err = registry
             .dispatch(
                 Some("tab-idle"),
@@ -983,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_times_out_and_cleans_pending() {
         let registry = RelayRegistry::new();
-        let (_conn_id, mut rx) = registry.connect_stream("tab-a");
+        let (_conn_id, mut rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
         let err = registry
             .dispatch(
                 Some("tab-a"),
@@ -1001,21 +1250,26 @@ mod tests {
         let frame = rx.recv().await.expect("command frame");
         assert_eq!(frame.command_id, command_id);
         // ...but the pending waiter is gone: a late result no longer matches.
-        let matched = registry.complete(
-            &command_id,
-            CommandResult {
-                success: true,
-                result: serde_json::Value::Null,
-                error: None,
-            },
-        );
+        let matched = registry
+            .complete(
+                &b(),
+                &op(),
+                "tab-a",
+                &command_id,
+                CommandResult {
+                    success: true,
+                    result: serde_json::Value::Null,
+                    error: None,
+                },
+            )
+            .unwrap();
         assert!(!matched, "timed-out dispatch must remove its pending entry");
     }
 
     #[tokio::test]
     async fn dispatch_to_dropped_stream_is_tab_not_found() {
         let registry = RelayRegistry::new();
-        let (_conn_id, rx) = registry.connect_stream("tab-a");
+        let (_conn_id, rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
         drop(rx); // client vanished without the guard firing yet
         let err = registry
             .dispatch(
@@ -1034,8 +1288,8 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replaces_listener_and_old_disconnect_is_ignored() {
         let registry = RelayRegistry::new();
-        let (old_conn, _old_rx) = registry.connect_stream("tab-a");
-        let (_new_conn, mut new_rx) = registry.connect_stream("tab-a");
+        let (old_conn, _old_rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
+        let (_new_conn, mut new_rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
 
         // The OLD stream's drop guard fires late — it must not tear down the
         // replacement listener.
@@ -1048,7 +1302,10 @@ mod tests {
             let registry = registry.clone();
             tokio::spawn(async move {
                 let command = new_rx.recv().await.expect("command frame");
-                registry.complete(
+                let _ = registry.complete(
+                    &b(),
+                    &op(),
+                    "tab-a",
                     &command.command_id,
                     CommandResult {
                         success: true,
@@ -1073,7 +1330,7 @@ mod tests {
     #[tokio::test]
     async fn matching_disconnect_deregisters_listener() {
         let registry = RelayRegistry::new();
-        let (conn_id, _rx) = registry.connect_stream("tab-a");
+        let (conn_id, _rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
         registry.disconnect_stream("tab-a", conn_id);
         assert!(registry.connected_tab_ids().is_empty());
         // The tab record survives (until stale eviction) — connected: false.
@@ -1128,7 +1385,9 @@ mod tests {
         let registry = RelayRegistry::new();
 
         // Heartbeat path: both clocks are set, and they agree.
-        registry.heartbeat("tab-beat", &heartbeat_body("tab-beat"));
+        registry
+            .heartbeat(&b(), &op(), "tab-beat", &heartbeat_body("tab-beat"))
+            .unwrap();
         let beat = registry.list_tabs().remove(0);
         assert_eq!(beat["lastSeen"], beat["lastHeartbeat"]);
 
@@ -1137,7 +1396,9 @@ mod tests {
         // tab eviction is about to act on. Without `lastSeen` a caller holding
         // `staleTabEvictMs` has nothing to subtract it from.
         let registry = RelayRegistry::new();
-        let (conn_id, _rx) = registry.connect_stream("tab-stream-only");
+        let (conn_id, _rx) = registry
+            .connect_stream(&b(), &op(), "tab-stream-only")
+            .unwrap();
         registry.disconnect_stream("tab-stream-only", conn_id);
 
         let tabs = registry.list_tabs();
@@ -1154,7 +1415,9 @@ mod tests {
     #[test]
     fn eviction_fires_when_the_age_reaches_the_bound_not_after() {
         let registry = RelayRegistry::new();
-        registry.heartbeat("tab-a", &heartbeat_body("tab-a"));
+        registry
+            .heartbeat(&b(), &op(), "tab-a", &heartbeat_body("tab-a"))
+            .unwrap();
         let last_seen = registry.list_tabs()[0]["lastSeen"]
             .as_u64()
             .expect("lastSeen is emitted");
@@ -1173,8 +1436,10 @@ mod tests {
     #[test]
     fn stale_unconnected_tabs_are_evicted_connected_tabs_are_not() {
         let registry = RelayRegistry::new();
-        registry.heartbeat("tab-stale", &heartbeat_body("tab-stale"));
-        let (_conn_id, _rx) = registry.connect_stream("tab-live");
+        registry
+            .heartbeat(&b(), &op(), "tab-stale", &heartbeat_body("tab-stale"))
+            .unwrap();
+        let (_conn_id, _rx) = registry.connect_stream(&b(), &op(), "tab-live").unwrap();
 
         registry.evict_stale_at(now_ms() + STALE_TAB_EVICT_MS + 1);
         let tabs = registry.list_tabs();
@@ -1185,14 +1450,19 @@ mod tests {
     #[test]
     fn complete_with_unknown_command_id_is_unmatched() {
         let registry = RelayRegistry::new();
-        assert!(!registry.complete(
-            "no-such-command",
-            CommandResult {
-                success: true,
-                result: serde_json::Value::Null,
-                error: None,
-            },
-        ));
+        assert!(!registry
+            .complete(
+                &b(),
+                &op(),
+                "tab-a",
+                "no-such-command",
+                CommandResult {
+                    success: true,
+                    result: serde_json::Value::Null,
+                    error: None,
+                },
+            )
+            .unwrap());
     }
 
     /// The SSE command frame must use the relay client's camelCase field
@@ -1221,10 +1491,14 @@ mod tests {
     #[test]
     fn primary_is_oldest_registered_tab() {
         let registry = RelayRegistry::new();
-        registry.heartbeat("tab-first", &heartbeat_body("tab-first"));
+        registry
+            .heartbeat(&b(), &op(), "tab-first", &heartbeat_body("tab-first"))
+            .unwrap();
         // Force a strictly later registered_at for the second tab.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        registry.heartbeat("tab-second", &heartbeat_body("tab-second"));
+        registry
+            .heartbeat(&b(), &op(), "tab-second", &heartbeat_body("tab-second"))
+            .unwrap();
         let tabs = registry.list_tabs();
         assert_eq!(tabs[0]["tabId"], "tab-first");
         assert_eq!(tabs[0]["isPrimary"], true);
