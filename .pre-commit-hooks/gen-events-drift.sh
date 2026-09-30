@@ -586,7 +586,12 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     log "PRE-EXISTING DRIFT — not caused by this $STAGE."
     log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
     log "Rust generates. But this $STAGE changes NONE of the sources that feed"
-    log "them — nothing under ${GEN_EVENTS_ATTRIBUTION_PATHS[*]}"
+    DIR_INPUTS=""
+    for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "$entry" in */) DIR_INPUTS+="${DIR_INPUTS:+ }$entry" ;; esac
+    done
+    log "them — nothing under $DIR_INPUTS"
+    log "or in the manifest/toolchain/cargo-config files"
     if [ -z "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
         log "(markdown aside — the premise guard found no way for it to reach schemas.json;"
         log " see lib/gen-events-attribution.sh)"

@@ -100,7 +100,8 @@ repos:
       # network, only throwaway git repos under $TMPDIR (which it now cleans up
       # after itself). The markdown premise guard does NOT depend on this
       # trigger: the library re-runs it on every attribution decision the drift
-      # hook makes.
+      # hook makes. Nor does the path-dependency completeness check, which
+      # guards Cargo.toml rather than these files: it has its own hook below.
       #
       # It is deliberately NOT `always_run`. A guard's guard that fires on every
       # commit gets SKIP=-ed, and then neither runs.
@@ -113,6 +114,20 @@ repos:
         # arms it exercised (it reports skips, which a bare "Passed" would hide).
         verbose: true
         files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh)$'
+        pass_filenames: false
+
+      # Every in-repo path dependency of the export build must be an attribution
+      # input, or an edit to that crate clears a guilty pusher (two crates were
+      # once missing). What can break that is a MANIFEST edit, so this runs on
+      # any Cargo.toml — and on the library that holds the list. Its own hook
+      # rather than a wider trigger on the attribution test: the manifest walk
+      # takes well under a second, the full test ~16s, and Cargo.toml changes
+      # in about one commit in a hundred.
+      - id: gen-events-path-deps
+        name: gen-events drift — in-repo path deps are attribution inputs
+        entry: bash .pre-commit-hooks/gen-events-path-deps-check.sh
+        language: system
+        files: '(^|/)Cargo\.toml$|^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
       # Same reasoning one file over: the base-ref cascade in
