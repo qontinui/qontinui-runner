@@ -43,15 +43,18 @@ macro_rules! from_node_key_sql {
 /// See [`from_node_key_sql!`]; the expression as a `&str` for tests and reuse.
 pub(crate) const FROM_NODE_KEY_SQL: &str = from_node_key_sql!();
 
-/// Batched frontier upsert: one row per element of the three parallel arrays.
+/// Batched frontier upsert: one row per element of the four parallel arrays.
 ///
-/// - `NOT EXISTS` skips an affordance already activated from this node by a
-///   live (not invalidated) edge — the frontier never re-lists what was
-///   observed;
-/// - `ON CONFLICT` refreshes `last_seen_*` and the affordance's current role /
-///   effect, and leaves `reason` and `first_seen_at` alone (a reason another
-///   producer — the Phase 3 explorer — set is not overwritten by an agent's
-///   passing observation).
+/// - `NOT EXISTS` skips an affordance already EXPLORED from this node: a live
+///   (not invalidated) edge whose outcome is `changed` / `no_change` /
+///   `settle_timeout` (M4 — an `error` or `to_node_unobserved` edge explored
+///   nothing). The `= ANY($5)` pre-filter narrows the scan to this batch's
+///   fingerprints before the node-key expression is computed (m7);
+/// - each row's `reason` follows plan D4 ([`d4_reason`]);
+/// - `ON CONFLICT` refreshes `last_seen_*`, the role / effect and the D4
+///   reason — except that an `activation_failed` reason (set when an edge
+///   from here errored) is kept: seeing the affordance again does not undo a
+///   failed activation.
 ///
 /// The caller dedups fingerprints first ([`AffordanceIndex::distinct`]): a
 /// duplicate key in one statement makes `ON CONFLICT DO UPDATE` fail with
@@ -60,13 +63,16 @@ pub(crate) const FRONTIER_UPSERT_SQL: &str = concat!(
     "INSERT INTO project.journey_frontier\n",
     "    (app_id, node_key, node, affordance_fingerprint, affordance_role,\n",
     "     declared_effect, reason, last_seen_run_id)\n",
-    "SELECT $1::text, $2::text, $3::jsonb, a.fp, a.role, a.effect, 'not_yet_activated', $4::text\n",
-    "  FROM unnest($5::text[], $6::text[], $7::text[]) AS a(fp, role, effect)\n",
+    "SELECT $1::text, $2::text, $3::jsonb, a.fp, a.role, a.effect, a.reason, $4::text\n",
+    "  FROM unnest($5::text[], $6::text[], $7::text[], $8::text[])\n",
+    "       AS a(fp, role, effect, reason)\n",
     " WHERE NOT EXISTS (\n",
     "     SELECT 1 FROM project.journey_edge_observations e\n",
     "      WHERE e.app_id = $1\n",
     "        AND e.invalidated_at IS NULL\n",
+    "        AND e.trigger->>'targetFingerprint' = ANY($5::text[])\n",
     "        AND e.trigger->>'targetFingerprint' = a.fp\n",
+    "        AND e.outcome IN ('changed', 'no_change', 'settle_timeout')\n",
     "        AND (",
     from_node_key_sql!(),
     ") = $2)\n",
@@ -74,17 +80,31 @@ pub(crate) const FRONTIER_UPSERT_SQL: &str = concat!(
     "   SET node = EXCLUDED.node,\n",
     "       affordance_role = EXCLUDED.affordance_role,\n",
     "       declared_effect = EXCLUDED.declared_effect,\n",
+    "       reason = CASE WHEN journey_frontier.reason = 'activation_failed'\n",
+    "                     THEN journey_frontier.reason ELSE EXCLUDED.reason END,\n",
     "       last_seen_at = now(),\n",
     "       last_seen_run_id = EXCLUDED.last_seen_run_id"
 );
 
 /// Number of parameters [`FRONTIER_UPSERT_SQL`] binds.
-pub(crate) const FRONTIER_UPSERT_BINDS: usize = 7;
+pub(crate) const FRONTIER_UPSERT_BINDS: usize = 8;
 
-/// The reason every agent-observed frontier row carries.
-pub(crate) const OBSERVED_REASON: FrontierReason = FrontierReason::NotYetActivated;
+/// A frontier row's reason, by plan D4's closed predicate, in order:
+/// declared `write` → `effect_write`; declared `destructive` →
+/// `effect_destructive`; declared `read` → `not_yet_activated`; no
+/// declaration and an explicit navigation role/type → `not_yet_activated`;
+/// anything else → `effect_undeclared`. Never guesses an effect.
+pub(crate) fn d4_reason(declared_effect: Option<IrEffect>, navigation: bool) -> FrontierReason {
+    match declared_effect {
+        Some(IrEffect::Write) => FrontierReason::EffectWrite,
+        Some(IrEffect::Destructive) => FrontierReason::EffectDestructive,
+        Some(IrEffect::Read) => FrontierReason::NotYetActivated,
+        None if navigation => FrontierReason::NotYetActivated,
+        None => FrontierReason::EffectUndeclared,
+    }
+}
 
-fn effect_str(e: IrEffect) -> &'static str {
+pub(crate) fn effect_str(e: IrEffect) -> &'static str {
     match e {
         IrEffect::Read => "read",
         IrEffect::Write => "write",
@@ -102,6 +122,7 @@ pub(crate) struct FrontierBatch {
     pub fingerprints: Vec<String>,
     pub roles: Vec<Option<String>>,
     pub effects: Vec<Option<String>>,
+    pub reasons: Vec<String>,
 }
 
 /// Build the upsert binds for a node's affordances.
@@ -125,7 +146,13 @@ pub(crate) fn frontier_batch(
     let mut fingerprints = Vec::with_capacity(distinct.len());
     let mut roles = Vec::with_capacity(distinct.len());
     let mut effects = Vec::with_capacity(distinct.len());
+    let mut reasons = Vec::with_capacity(distinct.len());
     for a in distinct {
+        reasons.push(
+            d4_reason(a.declared_effect, a.navigation)
+                .as_str()
+                .to_string(),
+        );
         fingerprints.push(a.fingerprint);
         roles.push(a.role);
         effects.push(a.declared_effect.map(|e| effect_str(e).to_string()));
@@ -138,6 +165,7 @@ pub(crate) fn frontier_batch(
         fingerprints,
         roles,
         effects,
+        reasons,
     }))
 }
 
@@ -259,15 +287,83 @@ mod tests {
             FRONTIER_UPSERT_SQL.contains(FROM_NODE_KEY_SQL),
             "the key expression is shared"
         );
-        assert!(FRONTIER_UPSERT_SQL.contains(&format!("'{}'", OBSERVED_REASON.as_str())));
-        assert!(FRONTIER_UPSERT_SQL.contains("unnest($5::text[], $6::text[], $7::text[])"));
+        assert!(
+            FRONTIER_UPSERT_SQL.contains("unnest($5::text[], $6::text[], $7::text[], $8::text[])")
+        );
         assert!(FRONTIER_UPSERT_SQL.contains("e.invalidated_at IS NULL"));
         assert!(FRONTIER_UPSERT_SQL
             .contains("ON CONFLICT (app_id, node_key, affordance_fingerprint) DO UPDATE"));
+    }
+
+    // ---- M4: outcome-aware frontier -------------------------------------
+
+    #[test]
+    fn only_explored_outcomes_suppress_or_clear_a_frontier_row() {
+        // The skip counts only outcomes that observed something after the
+        // activation; error / to_node_unobserved edges explored nothing.
         assert!(
-            !FRONTIER_UPSERT_SQL.contains("reason = EXCLUDED"),
-            "an observation must not overwrite a reason another producer set"
+            FRONTIER_UPSERT_SQL.contains("e.outcome IN ('changed', 'no_change', 'settle_timeout')")
         );
+        // The edge statement: explored outcomes DELETE, error UPSERTs
+        // activation_failed, to_node_unobserved matches neither branch.
+        let sql = EDGE_WRITE_SQL;
+        assert!(sql.contains("$12 IN ('changed', 'no_change', 'settle_timeout')"));
+        assert!(sql.contains("WHERE $12 = 'error'"));
+        assert!(sql.contains("SET reason = 'activation_failed'"));
+        assert!(
+            !sql.contains("to_node_unobserved"),
+            "unobserved touches no frontier row"
+        );
+        // A later observation does not undo a failed activation.
+        assert!(FRONTIER_UPSERT_SQL.contains("WHEN journey_frontier.reason = 'activation_failed'"));
+    }
+
+    #[test]
+    fn the_skip_prefilters_on_the_batch_fingerprints() {
+        // m7: the ANY($5) narrowing precedes the per-row key expression.
+        let any = FRONTIER_UPSERT_SQL
+            .find("= ANY($5::text[])")
+            .expect("prefilter present");
+        let key_expr = FRONTIER_UPSERT_SQL
+            .find(FROM_NODE_KEY_SQL)
+            .expect("key expr");
+        assert!(any < key_expr);
+    }
+
+    // ---- m8: D4 reasons ----------------------------------------------------
+
+    #[test]
+    fn frontier_reason_follows_d4() {
+        assert_eq!(
+            d4_reason(Some(IrEffect::Write), true),
+            FrontierReason::EffectWrite
+        );
+        assert_eq!(
+            d4_reason(Some(IrEffect::Destructive), true),
+            FrontierReason::EffectDestructive,
+            "a declared effect overrides navigation-ness"
+        );
+        assert_eq!(
+            d4_reason(Some(IrEffect::Read), false),
+            FrontierReason::NotYetActivated
+        );
+        assert_eq!(d4_reason(None, true), FrontierReason::NotYetActivated);
+        assert_eq!(d4_reason(None, false), FrontierReason::EffectUndeclared);
+    }
+
+    #[test]
+    fn the_batch_carries_a_d4_reason_per_affordance() {
+        let snap = json!({"elements": [
+            {"id": "l", "type": "link", "label": "Home", "actions": ["click"]},
+            {"id": "b", "type": "button", "label": "Go", "actions": ["click"]}
+        ]});
+        let batch = frontier_batch("app", &node(), &extract_affordances(&snap), None)
+            .unwrap()
+            .unwrap();
+        let mut reasons = batch.reasons.clone();
+        reasons.sort();
+        assert_eq!(reasons, vec!["effect_undeclared", "not_yet_activated"]);
+        assert_eq!(batch.reasons.len(), batch.fingerprints.len());
     }
 
     #[test]

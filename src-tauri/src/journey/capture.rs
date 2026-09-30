@@ -130,9 +130,17 @@ pub(crate) fn finalize(draft: EdgeDraft) -> JourneyEdgeObservation {
     }
 }
 
-/// The edge INSERT and, in the same statement, the frontier DELETE it
-/// implies: once an affordance has been the trigger of an edge from a node it
-/// is no longer frontier there. One statement, so the two cannot disagree.
+/// The edge INSERT and, in the same statement, the frontier change its
+/// OUTCOME implies (M4) — one statement, so the two cannot disagree:
+///
+/// - `changed` / `no_change` / `settle_timeout`: the affordance was activated
+///   from this node and something was observed after it, so it leaves the
+///   frontier there (DELETE);
+/// - `error`: the activation was attempted and failed — the row stays on the
+///   frontier with `reason = activation_failed` (upserted if absent), never
+///   deleted: a failed click has not explored anything;
+/// - `to_node_unobserved`: where it led is unknown, so the frontier row is left
+///   exactly as it is.
 ///
 /// Casts: `$1::text::uuid` and `$2::text::timestamptz` so the row carries
 /// exactly the id / close time the validated struct carries; the three JSONB
@@ -140,8 +148,11 @@ pub(crate) fn finalize(draft: EdgeDraft) -> JourneyEdgeObservation {
 /// `Option<serde_json::Value>`, and `None` is SQL NULL — NEVER a JSON `null`,
 /// which the migration's `jsonb_typeof` CHECK rejects and which would satisfy
 /// `NOT NULL`-style reasoning while naming nothing (see [`EdgeInsert`]).
+/// Select-list binds carry explicit casts so Postgres never has to infer a
+/// parameter type from an `INSERT … SELECT` target list.
 ///
-/// The DELETE matches nothing when `$14` (the trigger's fingerprint) is NULL.
+/// Neither frontier branch matches anything when `$14` (the trigger's
+/// fingerprint) is NULL.
 pub(crate) const EDGE_WRITE_SQL: &str = r#"WITH inserted AS (
     INSERT INTO project.journey_edge_observations
         (id, observed_at, app_id, app_version, runner_build_id, runner_instance,
@@ -154,15 +165,31 @@ pub(crate) const EDGE_WRITE_SQL: &str = r#"WITH inserted AS (
      WHERE f.app_id = $3
        AND f.node_key = $13
        AND f.affordance_fingerprint = $14
+       AND $12 IN ('changed', 'no_change', 'settle_timeout')
        AND EXISTS (SELECT 1 FROM inserted)
+    RETURNING 1
+), failed AS (
+    INSERT INTO project.journey_frontier
+        (app_id, node_key, node, affordance_fingerprint, affordance_role,
+         declared_effect, reason, last_seen_run_id)
+    SELECT $3::text, $13::text, $9::jsonb, $14::text, $15::text,
+           $16::text, 'activation_failed', $7::text
+     WHERE $12 = 'error'
+       AND $14 IS NOT NULL
+       AND EXISTS (SELECT 1 FROM inserted)
+    ON CONFLICT (app_id, node_key, affordance_fingerprint) DO UPDATE
+       SET reason = 'activation_failed',
+           last_seen_at = now(),
+           last_seen_run_id = EXCLUDED.last_seen_run_id
     RETURNING 1
 )
 SELECT (SELECT count(*) FROM inserted) AS inserted,
-       (SELECT count(*) FROM cleared) AS cleared"#;
+       (SELECT count(*) FROM cleared) AS cleared,
+       (SELECT count(*) FROM failed) AS failed"#;
 
 /// Number of parameters [`EDGE_WRITE_SQL`] binds; sizes the call site's
 /// params array so SQL/param arity drift is a compile error plus a test.
-pub(crate) const EDGE_WRITE_BINDS: usize = 14;
+pub(crate) const EDGE_WRITE_BINDS: usize = 16;
 
 /// The bind values of [`EDGE_WRITE_SQL`], built by a pure function so the
 /// null-handling of `to_node` is testable without a database.
@@ -183,6 +210,11 @@ pub(crate) struct EdgeInsert {
     pub outcome: String,
     pub from_node_key: String,
     pub target_fingerprint: Option<String>,
+    /// For the `error` branch's frontier upsert.
+    pub target_role: Option<String>,
+    /// For the `error` branch's frontier upsert (`read` / `write` /
+    /// `destructive`; `None` = undeclared).
+    pub declared_effect: Option<String>,
 }
 
 /// Validate a row against the contract and produce its binds.
@@ -215,6 +247,11 @@ pub(crate) fn edge_insert(obs: &JourneyEdgeObservation) -> Result<EdgeInsert, St
         outcome: obs.outcome.as_str().to_string(),
         from_node_key: obs.from_node.key(),
         target_fingerprint: obs.trigger.target_fingerprint.clone(),
+        target_role: obs.trigger.target_role.clone(),
+        declared_effect: obs
+            .trigger
+            .declared_effect
+            .map(|e| frontier::effect_str(e).to_string()),
     })
 }
 
@@ -689,6 +726,8 @@ async fn write_edge(pg: &PgDb, draft: EdgeDraft) {
         &binds.outcome,
         &binds.from_node_key,
         &binds.target_fingerprint,
+        &binds.target_role,
+        &binds.declared_effect,
     ];
     match conn.query_one(EDGE_WRITE_SQL, &params).await {
         Ok(row) => {
@@ -727,6 +766,7 @@ async fn write_frontier(
         &batch.fingerprints,
         &batch.roles,
         &batch.effects,
+        &batch.reasons,
     ];
     match conn.execute(frontier::FRONTIER_UPSERT_SQL, &params).await {
         Ok(n) => health::record_frontier_upserted(n),
@@ -880,6 +920,9 @@ mod tests {
             "$9::jsonb, $10::jsonb, $11::jsonb",
             "DELETE FROM project.journey_frontier",
             "f.affordance_fingerprint = $14",
+            "$12 IN ('changed', 'no_change', 'settle_timeout')",
+            "WHERE $12 = 'error'",
+            "SET reason = 'activation_failed'",
         ] {
             assert!(EDGE_WRITE_SQL.contains(needle), "missing {needle:?}");
         }
