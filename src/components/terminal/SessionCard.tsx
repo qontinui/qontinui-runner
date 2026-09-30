@@ -22,6 +22,7 @@ import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
+import { isNeedsInputState } from "./agentTruth";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -83,6 +84,7 @@ const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; lab
   completed: { color: "#565f89", pulse: false, label: "Completed" },
   error: { color: "#f7768e", pulse: false, label: "Error" },
   dormant: { color: "#414868", pulse: false, label: "Dormant" },
+  unknown: { color: "#414868", pulse: false, label: "State unknown" },
 };
 
 const ACCOUNT_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
@@ -267,7 +269,7 @@ function SessionCardInner({
   // be promoted from this UI (the backend would just 404).
   const canPromote =
     session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
+    isNeedsInputState(session.liveStatus) ||
     session.liveStatus === "frozen";
 
   // Hide the button entirely once the promotion has succeeded — the parent
@@ -350,7 +352,7 @@ function SessionCardInner({
   // the explicit, correct behavior.
   const canCommit =
     session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
+    isNeedsInputState(session.liveStatus) ||
     session.liveStatus === "frozen";
 
   const handleCommit = useCallback(
@@ -449,7 +451,7 @@ function SessionCardInner({
             ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
             : session.liveStatus === "frozen"
               ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
-              : session.liveStatus === "needs-input"
+              : isNeedsInputState(session.liveStatus)
                 ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
                 : session.liveStatus === "active-in-zone"
                   ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"

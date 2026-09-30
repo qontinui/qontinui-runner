@@ -693,7 +693,7 @@ const PageSessionScope = memo(function PageSessionScope({
     updateTab,
     renameTab,
     createTerminal,
-    setSessionStates: stateTracking.setSessionStates,
+    offerInferredState: stateTracking.offerInferredState,
     terminalRefs,
     setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
     setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),

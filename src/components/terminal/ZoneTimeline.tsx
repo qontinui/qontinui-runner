@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
+import { isNeedsInputState } from "./agentTruth";
 
 interface ZoneTimelineProps {
   tabs: TerminalTab[];
@@ -12,6 +13,7 @@ interface ZoneTimelineProps {
 }
 
 const STATE_COLORS: Record<string, string> = {
+  unknown: "#414868",
   idle: "#565f89",
   working: "#7aa2f7",
   "needs-input": "#e0af68",
@@ -23,10 +25,11 @@ const STATE_COLORS: Record<string, string> = {
 function eventTypeToState(type: string): string {
   const lower = type.toLowerCase();
   if (lower === "started" || lower === "working") return "working";
-  if (lower === "needs-input" || lower === "waiting") return "needs-input";
+  if (isNeedsInputState(lower) || lower === "waiting") return "needs-input";
   if (lower === "completed" || lower === "done") return "completed";
   if (lower === "error") return "error";
   if (lower === "idle") return "idle";
+  if (lower === "unknown") return "unknown";
   // Fallback: use the type as-is if it matches a known state
   if (STATE_COLORS[type]) return type;
   return "working";

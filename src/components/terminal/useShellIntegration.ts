@@ -4,6 +4,7 @@ import type { ShellIntegrationEvent } from "./TerminalInstance";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
+import { isNeedsInputState } from "./agentTruth";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import {
   describeRecordOpenOutcome,
@@ -43,7 +44,17 @@ interface UseShellIntegrationParams {
   ) => void;
   renameTab: (id: string, title: string) => void;
   createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
-  setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
+  /**
+   * Shell-integration marks are an INFERENCE about the session's state, not an
+   * event from the agent — so they go through the same door as the screen
+   * detector (`useSessionStateTracking`'s `offerInferredState`): ignored for a
+   * tab whose verdict is event-sourced, otherwise applied and offered to the
+   * runner's reducer.
+   */
+  offerInferredState: (
+    tabId: string,
+    compute: (current: SessionState) => SessionState | null,
+  ) => void;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   setRightPanelMode: React.Dispatch<
     React.SetStateAction<
@@ -68,7 +79,7 @@ export function useShellIntegration({
   updateTab,
   renameTab,
   createTerminal,
-  setSessionStates,
+  offerInferredState,
   terminalRefs,
   setRightPanelMode,
   setSelectedTranscriptSessionId,
@@ -109,14 +120,12 @@ export function useShellIntegration({
         // the prompt *text* by `sessionStateDetector` (tool-approval / y-n
         // prompts), not from the prompt-start marker. Don't clobber a real
         // `needs-input`/`error` that the detector already set.
-        setSessionStates((prev) => {
-          const current = prev[tabId];
-          if (current === "needs-input" || current === "error") return prev;
-          return { ...prev, [tabId]: "idle" };
-        });
+        offerInferredState(tabId, (current) =>
+          isNeedsInputState(current) || current === "error" ? null : "idle",
+        );
       }
       if (event.type === "command_execute") {
-        setSessionStates((prev) => ({ ...prev, [tabId]: "working" }));
+        offerInferredState(tabId, () => "working");
       }
       if (event.type === "cwd") {
         updateTab(tabId, { workingDir: event.path });
@@ -144,7 +153,7 @@ export function useShellIntegration({
         }
       }
     },
-    [updateTab, renameTab, tabs, terminalRefs, setSessionStates],
+    [updateTab, renameTab, tabs, terminalRefs, offerInferredState],
   );
 
   // ── Resume Claude Code session in terminal ─────────────────────────────────

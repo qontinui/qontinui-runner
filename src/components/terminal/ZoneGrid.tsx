@@ -64,6 +64,7 @@ import {
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
+import { isNeedsInputState, type AgentTruthEntry } from "./agentTruth";
 import { useTabHotSlice } from "./useTerminalHotStore";
 
 export type ViewMode = "auto" | "full" | "compact";
@@ -204,6 +205,7 @@ function ZoneGridInner({
   const onAssignTab = zoneLayout.assignTabToZone;
   const stateTracking = session;
   const sessionStates = stateTracking.sessionStates;
+  const agentVerdicts = stateTracking.agentVerdicts;
   const staleTabs = stateTracking.staleTabs;
   // Session-state tracking is fed by the single global `terminal-output` tap in
   // `TerminalSessionContext.PageSessionScope` (Phase 2), NOT by instance
@@ -628,7 +630,11 @@ function ZoneGridInner({
           >
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
             <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
-            <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={singleViewZone} />
+            <SessionInfoDropdown
+              claudeSessionId={tab.claudeSessionId}
+              zoneIndex={singleViewZone}
+              agentTruth={agentVerdicts[tab.id]}
+            />
             {tab.claudeSessionId && (
               <button
                 onClick={(e) => {
@@ -780,6 +786,7 @@ function ZoneGridInner({
           focusedZone={focusedZone}
           pageId={pageId}
           sessionStates={sessionStates}
+          agentTruth={assignments[zoneIdx] ? agentVerdicts[assignments[zoneIdx]] : undefined}
           terminalRefs={terminalRefs}
           onZoneClick={onZoneClick}
           onZoneDoubleClick={onZoneDoubleClick}
@@ -928,7 +935,7 @@ function ZoneGridInner({
         (() => {
           const cmTabId = assignments[gridState.contextMenu.zoneIndex];
           const cmTab = tabs.find((t) => t.id === cmTabId);
-          const cmState = cmTab ? (sessionStates[cmTab.id] ?? "idle") : "idle";
+          const cmState = cmTab ? (sessionStates[cmTab.id] ?? "unknown") : "unknown";
           const others = layout.zones
             .map((_, idx) => {
               if (idx === gridState.contextMenu!.zoneIndex) return null;
@@ -948,6 +955,7 @@ function ZoneGridInner({
               zoneIndex={gridState.contextMenu.zoneIndex}
               tab={cmTab}
               state={cmState}
+              verdict={cmTab ? agentVerdicts[cmTab.id]?.verdict : undefined}
               otherZones={others}
               onClose={() => dispatch({ type: "SET_CONTEXT_MENU", menu: null })}
               onFocus={() => onZoneClick(gridState.contextMenu!.zoneIndex)}
@@ -1000,6 +1008,7 @@ function ZoneCellInner({
   focusedZone,
   pageId,
   sessionStates,
+  agentTruth,
   terminalRefs,
   onZoneClick: _onZoneClick,
   onZoneDoubleClick,
@@ -1063,6 +1072,11 @@ function ZoneCellInner({
    */
   pageId: string;
   sessionStates: Record<string, SessionState>;
+  /**
+   * The runner's verdict for THIS cell's tab only (not the whole map), so a
+   * verdict change re-renders only the cell it concerns.
+   */
+  agentTruth?: AgentTruthEntry;
   terminalRefs: Map<string, RefObject<TerminalInstanceHandle | null>>;
   onZoneClick: (zoneIndex: number, ctrlKey?: boolean) => void;
   onZoneDoubleClick: (zoneIndex: number) => void;
@@ -1207,7 +1221,7 @@ function ZoneCellInner({
   );
 
   const isFocused = zoneIdx === focusedZone;
-  const state = (tab ? (sessionStates[tab.id as string] ?? "idle") : "idle") as SessionState;
+  const state = (tab ? (sessionStates[tab.id as string] ?? "unknown") : "unknown") as SessionState;
   const borderColor = isFocused
     ? STATE_BORDER_COLORS[state] === "#2a2d3d"
       ? "#7aa2f7"
@@ -1289,7 +1303,7 @@ function ZoneCellInner({
               : "none";
 
   const zoneShadow =
-    state === "needs-input" && baseBoxShadow === "none"
+    isNeedsInputState(state) && baseBoxShadow === "none"
       ? `inset 3px 0 8px -4px ${stateColor}40`
       : baseBoxShadow;
 
@@ -1316,7 +1330,7 @@ function ZoneCellInner({
                     ? "#e0af68"
                     : borderColor
         }`,
-        borderLeftWidth: state === "needs-input" ? "3px" : "2px",
+        borderLeftWidth: isNeedsInputState(state) ? "3px" : "2px",
         borderLeftColor: stateColor,
         borderStyle: isSwapSource
           ? "dashed"
@@ -1341,7 +1355,7 @@ function ZoneCellInner({
           ? 0.25
           : outputSearchQuery && !searchMatch
             ? 0.4
-            : focusMode && !isFocused && state !== "needs-input" && state !== "error"
+            : focusMode && !isFocused && !isNeedsInputState(state) && state !== "error"
               ? 0.3
               : 1,
         animation: isFlashing ? "zone-flash-border 1s ease-out" : undefined,
@@ -1445,6 +1459,7 @@ function ZoneCellInner({
               state={state}
               zoneIndex={zoneIdx}
               lastLines={lastLines}
+              agentTruth={agentTruth}
               onQuickApprove={() => writeToTerminalById(terminalRefs, tab.id, "y\r")}
               onQuickReject={() => writeToTerminalById(terminalRefs, tab.id, "n\r")}
               onSendCommand={(text) => writeToTerminalById(terminalRefs, tab.id, `${text}\r`)}
@@ -1477,6 +1492,7 @@ function ZoneCellInner({
               allTabs={tabs}
               assignments={assignments}
               sessionStates={sessionStates}
+              agentTruth={agentTruth}
               onAssignTab={onAssignTab}
               isPinned={isPinned}
               onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
@@ -1510,7 +1526,11 @@ function ZoneCellInner({
               className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-1 bg-[#13141f]/85 backdrop-blur-sm z-10"
               style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
             >
-              <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
+              <SessionInfoDropdown
+                claudeSessionId={tab.claudeSessionId}
+                zoneIndex={zoneIdx}
+                agentTruth={agentTruth}
+              />
               {promptsAvailable && (
                 <button
                   onClick={(e) => {
