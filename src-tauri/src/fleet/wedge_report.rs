@@ -41,8 +41,13 @@
 //! |---|---|---|---|
 //! | every known kind below, written by ANOTHER runner process (pid differs) | a later line from a different pid, or else the first read by this process — one runner instance writes a given log, and every writer runs in the process it reports on, so nothing it latched outlives the process | `process_exited` | that later line, else that read |
 //! | `backend_wedged`, `ui_thread_wedged`, `recovery_wedged` | this process's live predicate (`health_monitor::backend_wedged()` / `ui_thread_wedged()` / `webview_recovery::recovery_wedged()`) reads false | `cleared` | the first read that saw it false (an upper bound) |
-//! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`coord_outside_observer::fault_latch` reads `Closed`) — the latch is set before the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
-//! | same four, while the observer has not folded a probe within `OPEN_FAULTS_STALE_AFTER_SECS` (`fault_latch` reads `Unknown`) | at once — a frozen latch vouches for nothing, so the row is never held open on it | `observer_silent` | the observer's last fold (the last instant it vouched), else that read |
+//! | `coord_unreachable`, `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown` | the outside observer's reporting latch for that class has re-armed (`coord_outside_observer::latch reads `Closed`) — the latch is set before the line is written and re-arms when the predicate stops holding | `cleared` | the first read that saw it re-armed |
+//! | same four, while the observer has not folded a probe within its staleness bound (`max(180 s, 3 × effective probe period)`; the latch reads `Unknown`) | at once — a frozen latch vouches for nothing, so the row is never held open on it | `observer_silent` | the observer's last fold (the last instant it vouched), else that read |
+//!
+//! A gap is not a clear: when the observer is fresh again with that class's
+//! latch Open, and this process's newest row of the kind ended
+//! `observer_silent`, a SUCCESSOR row opens (`began_at` = the start of the new
+//! fresh streak, `ended_at: null`). Came back Closed: no successor.
 //! | `health_monitor_thread_stalled`, `health_metrics_thread_stalled` (watchdog, re-written every `WATCHDOG_REPEAT_SECS` while they hold) | no line for 2 × that cadence | `silent` | last line + one cadence (the latest instant the cadence allows it to have held) |
 //! | any other (unknown) reason token — its writer, cadence and predicate are unknown to this build | a newer onset of the same token | `superseded` | the newer onset |
 //! | same, with no newer onset | its onset is older than [`OPEN_WINDOW_SECS`] | `expired` | onset + that window — the runner stops vouching for it, which is NOT an observed end |
@@ -306,8 +311,11 @@ impl Default for WedgeReportState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObserverView {
     /// It folded a probe recently; `holding` carries its open classes.
-    Fresh,
-    /// It has not folded within `OPEN_FAULTS_STALE_AFTER_SECS`; `since` is its
+    /// `since` is when its current fresh streak began (the first fold after
+    /// the last stale gap), `None` if unknown.
+    Fresh { since: Option<DateTime<Utc>> },
+    /// It has not folded within its staleness bound
+    /// (`coord_outside_observer::open_faults_stale_after_secs`); `since` is its
     /// last fold, `None` if it never folded.
     Silent { since: Option<DateTime<Utc>> },
 }
@@ -336,9 +344,13 @@ impl LiveView {
         if crate::webview_recovery::recovery_wedged() {
             holding.push("recovery_wedged");
         }
-        let mut observer = ObserverView::Fresh;
+        let latches = crate::coord_outside_observer::latch_snapshot();
+        let now = Utc::now();
+        let mut observer = ObserverView::Fresh {
+            since: latches.fresh_since(),
+        };
         for class in FaultClass::ALL {
-            match crate::coord_outside_observer::fault_latch(class) {
+            match latches.latch(class, now) {
                 FaultLatch::Open => holding.push(class.breadcrumb_reason()),
                 FaultLatch::Closed => {}
                 FaultLatch::Unknown { last_fold } => {
@@ -491,6 +503,57 @@ impl WedgeReportState {
                 inc.close(now, EndedBy::Cleared);
             }
         }
+        self.open_successors(now, live);
+    }
+
+    /// Re-open a coord episode that an observer GAP closed.
+    ///
+    /// `observer_silent` records that the observer stopped vouching, not that
+    /// the fault cleared. When the observer is fresh again and its latch for a
+    /// class is Open, and this process's newest row of that kind ended
+    /// `observer_silent` with no open row beside it, the fault is ongoing: a
+    /// successor row opens at the start of the fresh streak (never before the
+    /// gap's recorded end). A latch that came back Closed opens nothing — the
+    /// episode ended somewhere inside the gap, and the silent row already says
+    /// the runner cannot say where.
+    fn open_successors(&mut self, now: DateTime<Utc>, live: &LiveView) {
+        let ObserverView::Fresh { since } = live.observer else {
+            return;
+        };
+        for class in FaultClass::ALL {
+            let kind = class.breadcrumb_reason();
+            if !live.holds(kind) {
+                continue;
+            }
+            let mine = |i: &&Incident| i.kind == kind && i.pid == Some(live.pid);
+            if self
+                .incidents
+                .iter()
+                .filter(mine)
+                .any(|i| i.ended_at.is_none())
+            {
+                continue;
+            }
+            let Some(prior) = self.incidents.iter().rev().find(mine) else {
+                continue;
+            };
+            if prior.ended_by != Some(EndedBy::ObserverSilent) {
+                continue;
+            }
+            let gap_end = prior.ended_at.unwrap_or(prior.began_at);
+            let began_at = since.unwrap_or(now).max(gap_end);
+            self.incidents.push(Incident {
+                kind: kind.to_string(),
+                began_at,
+                ended_at: None,
+                ended_by: None,
+                build_id: live.build_id.map(str::to_string),
+                pid: Some(live.pid),
+                last_seen_at: began_at,
+                once_line_seen: true,
+            });
+        }
+        self.enforce_bound();
     }
 
     /// The published array, NEWEST first.
@@ -793,7 +856,7 @@ mod tests {
             pid: ME,
             build_id: Some("abc123def456"),
             holding: kinds.to_vec(),
-            observer: ObserverView::Fresh,
+            observer: ObserverView::Fresh { since: None },
         }
     }
 
@@ -1018,6 +1081,79 @@ mod tests {
         assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ObserverSilent));
         assert_eq!(s.incidents[0].ended_at, Some(at("2026-09-30T10:02:00Z")));
         assert_eq!(s.incidents[1].ended_at, None, "backend_wedged still holds");
+    }
+
+    #[test]
+    fn a_gap_closes_observer_silent_and_a_fresh_open_latch_opens_a_successor() {
+        let line = format!("2026-09-30T10:00:00Z coord_no_leader x (pid {ME})");
+        let mut gapped = live_holding(&[]);
+        gapped.observer = ObserverView::Silent {
+            since: Some(at("2026-09-30T10:10:00Z")),
+        };
+        let back = |since: &str, kinds: &[&'static str]| {
+            let mut lv = live_holding(kinds);
+            lv.observer = ObserverView::Fresh {
+                since: Some(at(since)),
+            };
+            lv
+        };
+
+        // Gap, then fresh with the latch still Open: a successor opens.
+        let mut s = WedgeReportState::default();
+        s.fold(
+            parse_line(&line).unwrap(),
+            &live_holding(&["coord_no_leader"]),
+        );
+        s.settle(at("2026-09-30T10:20:00Z"), &gapped);
+        assert_eq!(s.incidents.len(), 1);
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ObserverSilent));
+        let fresh_open = back("2026-09-30T10:25:00Z", &["coord_no_leader"]);
+        s.settle(at("2026-09-30T10:26:00Z"), &fresh_open);
+        assert_eq!(s.incidents.len(), 2);
+        assert_eq!(s.incidents[1].kind, "coord_no_leader");
+        assert_eq!(s.incidents[1].began_at, at("2026-09-30T10:25:00Z"));
+        assert_eq!(s.incidents[1].ended_at, None);
+        assert_eq!(s.incidents[1].build_id.as_deref(), Some("abc123def456"));
+        // Idempotent: the open successor is not duplicated on the next pass.
+        s.settle(at("2026-09-30T10:27:00Z"), &fresh_open);
+        assert_eq!(s.incidents.len(), 2);
+        // And it clears like any coord row once the latch re-arms.
+        s.settle(
+            at("2026-09-30T10:30:00Z"),
+            &back("2026-09-30T10:25:00Z", &[]),
+        );
+        assert_eq!(s.incidents[1].ended_by, Some(EndedBy::Cleared));
+
+        // Gap, then fresh with the latch Closed: no successor.
+        let mut s = WedgeReportState::default();
+        s.fold(
+            parse_line(&line).unwrap(),
+            &live_holding(&["coord_no_leader"]),
+        );
+        s.settle(at("2026-09-30T10:20:00Z"), &gapped);
+        s.settle(
+            at("2026-09-30T10:26:00Z"),
+            &back("2026-09-30T10:25:00Z", &[]),
+        );
+        assert_eq!(s.incidents.len(), 1);
+        assert_eq!(s.incidents[0].ended_by, Some(EndedBy::ObserverSilent));
+
+        // A row cleared normally is never resurrected by a later Open latch
+        // (that is a NEW episode, and it arrives with its own line).
+        let mut s = WedgeReportState::default();
+        s.fold(
+            parse_line(&line).unwrap(),
+            &live_holding(&["coord_no_leader"]),
+        );
+        s.settle(
+            at("2026-09-30T10:05:00Z"),
+            &back("2026-09-30T10:00:00Z", &[]),
+        );
+        s.settle(
+            at("2026-09-30T10:06:00Z"),
+            &back("2026-09-30T10:00:00Z", &["coord_no_leader"]),
+        );
+        assert_eq!(s.incidents.len(), 1);
     }
 
     #[test]
