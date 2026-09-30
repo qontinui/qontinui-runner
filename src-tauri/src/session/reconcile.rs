@@ -36,18 +36,27 @@
 //!    claimed-id set removes ids already bound to other live terminals, so two
 //!    same-second launches converge across ticks). The transcript proves the
 //!    session exists ⇒ `origin:"observed"` + confirmed ⇒ auto-resume eligible.
+//!
+//!    Rungs 2 and 3 both require a claude IMAGE in the pane's subtree. Accepted
+//!    narrowing: a shim-bypassed claude whose image is not detected as claude
+//!    (e.g. hosted under `node`) is no longer bound by this binder — such a
+//!    pane is left alone, and the lifecycle poll already treats it as
+//!    claude-absent. Likewise a freshly restored pane whose claude has not
+//!    started yet is skipped by the boot pass and picked up by the periodic
+//!    poll once its claude process appears.
 //! 4. **Reconciled** (rung 4): the mtime guess AND the degraded rung-3 case
 //!    where NO start anchor could be resolved (the process table yielded
 //!    neither a claude nor a shell creation time). Without the anchor the
 //!    post-start filter is a no-op and "unique in this cwd" is the only
 //!    evidence left — which is exactly the guess this rung exists to grade
-//!    down. Never auto-resumed: restore opens a plain terminal only. The grade follows the anchor, not the
-//!    uniqueness gate.
+//!    down. Never auto-resumed: restore opens a plain terminal only. The
+//!    grade follows the anchor, not the uniqueness gate.
 //!
 //! The anchor is the **claude descendant**, not the shell: anchoring on shell
 //! start would admit a foreign same-cwd session started after the shell but
-//! before claude. The shell pid stays the FALLBACK anchor when no claude image
-//! resolves in the subtree.
+//! before claude. A pane with no claude image in its subtree is left alone —
+//! never bound. The shell pid's start is a fallback anchor ONLY when a claude
+//! image WAS found but its own start time is unknown.
 //!
 //! It also PRUNES the inverse: a **phantom** provisional record — an
 //! authoritative-but-unconfirmed row written at spawn for a plain shell that
@@ -198,8 +207,9 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 ///   >1 passes ⇒ `SkipAmbiguous` (retry next tick); 0 pass ⇒ `LeaveAlone`.
 /// - **Rung 4 (degraded):** `anchor_start_unix <= 0` disables the start filter
 ///   (the uniqueness gate still applies), so the bind rests on "unique in this
-///   cwd" alone. It is therefore graded `Reconciled` — QUARANTINED, not
-///   auto-resumed. The grade tracks the anchor; only an anchored bind earns
+///   cwd" alone. It is therefore graded `Reconciled` — restored as a plain
+///   terminal (`terminal-only`), never auto-resumed. The grade tracks the
+///   anchor; only an anchored bind earns
 ///   `Observed`.
 ///
 /// `anchor_start_unix` is the claude anchor's creation time (epoch seconds);
@@ -546,7 +556,9 @@ pub fn run_reconcile<I: TranscriptIndex>(
                     BindOrigin::Reconciled => {
                         // Degraded rung 4: no start anchor was resolvable, so the
                         // bind rests on the uniqueness gate alone and is written
-                        // QUARANTINED. Logged at info (not debug) because a
+                        // `reconciled`, which restore opens as a plain terminal
+                        // (terminal-only, never auto-resumed). Logged at info
+                        // (not debug) because a
                         // recurring one means the process table is failing to
                         // yield creation times — the anchor, not the bind, is the
                         // thing to fix.
@@ -554,7 +566,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
                             terminal_id = %pty.terminal_id,
                             claude_session = %session_id,
                             working_dir = %pty.working_dir,
-                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (quarantined, not auto-resumed)"
+                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (restores as a plain terminal, never auto-resumed)"
                         );
                     }
                 }
@@ -1872,7 +1884,8 @@ mod tests {
         let p = pty("term-1", None, "C:/repo");
         // Single candidate, anchor unknown → the start filter could not run, so
         // the only evidence is "unique in this cwd" — the mtime-guess class.
-        // It binds, but graded `reconciled` so the frontend QUARANTINES it.
+        // It binds, but graded `reconciled`, so restore opens it as a plain
+        // terminal (terminal-only) and never types a resume for it.
         // Grading it `observed` here would auto-resume a possibly-foreign
         // session on the weakest evidence in the ladder.
         let one = vec![cand("a", "C:/cfg", Some(500))];
@@ -2348,6 +2361,57 @@ mod tests {
         assert!(
             store.find_open_by_terminal("shell-term").is_none(),
             "no row written for the shell pane"
+        );
+    }
+
+    /// The KEPT fallback: a claude image WAS found (`ai_pid: Some`) but its own
+    /// start time is unknown (`ai_start_unix: None`). The shell pid's creation
+    /// time then anchors the correlation, so a unique same-cwd transcript that
+    /// started after the shell binds `Observed` (auto-resume eligible). Removing
+    /// the fallback would leave the anchor at 0 and downgrade this real session
+    /// to `Reconciled`.
+    #[test]
+    fn run_reconcile_claude_with_unknown_start_falls_back_to_shell_start() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // Shell pid 4242 started at 1000; claude 5151 found, start unknown.
+        let live = vec![LivePty {
+            ai_pid: Some(5151),
+            ai_start_unix: None,
+            ..pty("claude-term", Some(4242), "C:/repo")
+        }];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("real-sess", "C:/cfg", Some(1_500))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["real-sess".to_string()].into_iter().collect(),
+        };
+
+        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
+        assert!(
+            actions.contains(&ReconcileAction::Bind {
+                terminal_id: "claude-term".to_string(),
+                session_id: "real-sess".to_string(),
+                config_dir: "C:/cfg".to_string(),
+                origin: BindOrigin::Observed,
+                confirmed: true,
+            }),
+            "shell-start fallback anchors the bind ⇒ Observed, got {actions:?}"
+        );
+        assert_eq!(
+            store
+                .get("real-sess")
+                .expect("observed bind written")
+                .origin
+                .as_deref(),
+            Some(ORIGIN_OBSERVED)
         );
     }
 }

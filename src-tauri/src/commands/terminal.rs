@@ -2432,8 +2432,8 @@ fn resolve_latest_claude_session_id(
 /// backend-spawned session whose id was NOT pre-pinned (no `--session-id` in the
 /// hint) — there the id only appears once the child writes its first transcript,
 /// so this poll is the only recourse. It records with origin `"reconciled"` (a
-/// freshest-mtime guess that may be foreign — quarantined on restore, never
-/// auto-resumed). Do NOT add new callers; pin the id at spawn instead.
+/// freshest-mtime guess that may be foreign — restored as a plain terminal
+/// (terminal-only), never auto-resumed). Do NOT add new callers; pin the id at spawn instead.
 ///
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
