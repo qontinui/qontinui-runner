@@ -41,8 +41,8 @@
 //! names an unrelated process. So a printed pid is published only when that
 //! process is CONFIRMED to hold the lock (a `lock:` line on the same file in
 //! its `/proc/<pid>/fdinfo/*`). Otherwise the owner is resolved by the
-//! processes that hold the lock file open (minus the waiters), confirmed the
-//! same way; and if nothing confirms, `holder_pid` is `null` with
+//! processes that hold the lock file open, confirmed the same way (fdinfo
+//! lists only a GRANTED lock, so a waiter never confirms); and if nothing confirms, `holder_pid` is `null` with
 //! `holder_kind: "unknown"` — never an unconfirmed pid. That scan runs at most
 //! once per tick, and only on such a miss.
 //!
@@ -775,7 +775,7 @@ impl ProcReader {
 
     /// Scan `/proc/*/fd/*` ONCE per tick for fds open on any of the lock
     /// files, bounded by [`MAX_FD_SCAN`]. Processes owned by another uid are
-    /// skipped up front (their `fd/` is unreadable anyway).
+    /// skipped up front (their `fd/` is unreadable to a non-root runner anyway).
     fn open_index(&mut self, lock_paths: &[PathBuf]) -> &HashMap<PathBuf, Vec<(u32, String)>> {
         self.open_index.get_or_insert_with(|| {
             use std::os::unix::fs::MetadataExt;

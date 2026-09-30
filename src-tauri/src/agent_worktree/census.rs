@@ -3001,8 +3001,12 @@ async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
         debug!("worktree_census: previous cargo lock probe still running — cargo_locks UNKNOWN this tick");
         return None;
     }
-    let task = spawn_blocking_tracked(|| {
-        let _in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+    // The guard exists BEFORE the spawn and moves into the closure, so the flag
+    // clears on every path: normal return, panic, and a closure dropped unrun
+    // (runtime shutdown while queued, or a panicking spawn).
+    let in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+    let task = spawn_blocking_tracked(move || {
+        let _in_flight = in_flight;
         super::cargo_locks::probe_current()
     });
     match tokio::time::timeout(CARGO_LOCK_PROBE_TIMEOUT, task).await {
