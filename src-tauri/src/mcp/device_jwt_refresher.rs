@@ -4752,6 +4752,9 @@ async fn refresher_loop(
             }
         }
 
+        // Dark posture → ask web whether an operator authorized a redeem.
+        crate::mcp::pending_redeem::on_refresher_pass(&resolve_pair_base(&settings_snapshot)).await;
+
         match decision {
             Decision::IdleWrongTier => {
                 // Phase 1b: publish the credential-dark signal so coord's
