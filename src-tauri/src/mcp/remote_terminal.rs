@@ -306,6 +306,19 @@ impl RemoteAttachGrants {
             .unwrap_or(false)
     }
 
+    /// Non-blocking, allocation-free twin of [`Self::is_terminal_attached`]
+    /// for the PTY reader thread (`terminal::transport_stats`): `Some(true)`
+    /// when an unexpired grant is bound to `terminal_id`, `Some(false)` when
+    /// none is, and `None` when the table is locked (or poisoned) right now —
+    /// an UNKNOWN the caller must not read as either answer.
+    pub fn has_bound_try(&self, terminal_id: &str, now: u64) -> Option<bool> {
+        let map = self.inner.try_lock().ok()?;
+        Some(
+            map.values()
+                .any(|g| g.expires_at > now && g.terminal_id.as_deref() == Some(terminal_id)),
+        )
+    }
+
     /// The jtis of every unexpired grant bound to `terminal_id` — the remote
     /// subscribers of that terminal, which the outbound flow gate consults
     /// per frame.
@@ -4142,6 +4155,23 @@ mod tests {
 
     /// `grants_bound_to` lists exactly the unexpired grants bound to the
     /// terminal, by jti.
+    /// `has_bound_try` answers the bound/unbound question without blocking,
+    /// ignores expired and unbound rows, and reports a held lock as UNKNOWN.
+    #[test]
+    fn has_bound_try_answers_without_blocking_and_is_unknown_while_locked() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("live", Some("t1"), NOW + 100), NOW);
+        table.insert(grant("stale", Some("t2"), NOW - 1), NOW - 10);
+        table.insert(grant("unbound", None, NOW + 100), NOW);
+        assert_eq!(table.has_bound_try("t1", NOW), Some(true));
+        assert_eq!(table.has_bound_try("t2", NOW), Some(false), "expired row");
+        assert_eq!(table.has_bound_try("t3", NOW), Some(false), "no row");
+        let held = table.inner.lock().unwrap();
+        assert_eq!(table.has_bound_try("t1", NOW), None, "held lock is UNKNOWN");
+        drop(held);
+        assert_eq!(table.has_bound_try("t1", NOW), Some(true));
+    }
+
     #[test]
     fn grants_bound_to_lists_live_subscribers_of_a_terminal() {
         let table = RemoteAttachGrants::new();

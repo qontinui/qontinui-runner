@@ -789,13 +789,17 @@ pub async fn ws_terminal_handler(
 
     // Subscribe before reading scrollback to avoid missing data in between
     let output_rx = session.subscribe_output();
+    // An external reader of the output broadcast: while it lives, no SSE-leg
+    // encode is counted as waste (`terminal::transport_stats`).
+    let external = crate::terminal::transport_stats::ExternalOutputSubscriber::acquire();
     let (scrollback_data, _) = session.get_scrollback_buffer();
     let is_alive = session.is_alive();
 
     info!("WebSocket client connecting for terminal {}", id);
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws_terminal(socket, id, session, output_rx, scrollback_data, is_alive)
+    Ok(ws.on_upgrade(move |socket| async move {
+        let _external = external;
+        handle_ws_terminal(socket, id, session, output_rx, scrollback_data, is_alive).await
     }))
 }
 
@@ -1017,6 +1021,23 @@ pub async fn get_coord_session_handler(
     coord_session_response(&id, lookup)
 }
 
+/// GET /terminals/transport-stats — the terminal output transport counters
+/// (plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+/// Phase 1). What each counter measures is documented on
+/// [`crate::terminal::transport_stats`]. Read-only; process-global.
+pub async fn get_transport_stats_handler(
+) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
+    Json(ApiResponse::success(crate::terminal::transport_stats::snapshot()))
+}
+
+/// POST /terminals/transport-stats — zero the counters and return the
+/// snapshot they held just before, so a harness gets one clean measurement
+/// window per reset without a separate read.
+pub async fn reset_transport_stats_handler(
+) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
+    Json(ApiResponse::success(crate::terminal::transport_stats::reset()))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -1032,6 +1053,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         // Page-centric grouping of live terminals (which sessions on which page).
         .route("/terminal-pages", get(list_terminal_pages_handler))
+        // Transport counters. A literal segment, registered before the
+        // `/terminals/{id}/…` family; axum's router prefers a static segment
+        // over a `{id}` capture regardless of order, and
+        // `transport_stats_route_is_not_captured_by_the_id_routes` pins it.
+        .route(
+            "/terminals/transport-stats",
+            get(get_transport_stats_handler).post(reset_transport_stats_handler),
+        )
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         // Alias — the cheatsheet and intuition both reach for `/output`.
@@ -1069,6 +1098,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/terminals"),
         ("POST", "/terminals"),
         ("GET", "/terminal-pages"),
+        ("GET", "/terminals/transport-stats"),
+        ("POST", "/terminals/transport-stats"),
         ("POST", "/terminals/{id}/write"),
         ("GET", "/terminals/{id}/buffer"),
         ("GET", "/terminals/{id}/output"),
@@ -1324,6 +1355,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `/terminals/transport-stats` must reach its own handlers, not the
+    /// `{id}` family (a terminal literally named `transport-stats` is not a
+    /// thing this route should ever address). Built on the REAL path strings
+    /// and the REAL GET handler; the `{id}` routes are stand-ins because
+    /// `routes()` needs a full `ApiState`. POST is a stand-in too so this test
+    /// does not zero the process-global counters other tests read.
+    #[tokio::test]
+    async fn transport_stats_route_is_not_captured_by_the_id_routes() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use axum::routing::{delete, get, post};
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route(
+                "/terminals/transport-stats",
+                get(get_transport_stats_handler).post(|| async { "reset-handler" }),
+            )
+            .route("/terminals/{id}/write", post(|| async { "id-route" }))
+            .route("/terminals/{id}/ws", get(|| async { "id-route" }))
+            .route("/terminals/{id}", delete(|| async { "id-route" }));
+
+        let call = |method: Method| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/terminals/transport-stats")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                (status, String::from_utf8(bytes.to_vec()).unwrap())
+            }
+        };
+
+        let (status, body) = call(Method::GET).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["success"], true);
+        assert!(v.pointer("/data/frame_size_hist/counts").is_some(), "{body}");
+
+        let (status, body) = call(Method::POST).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "reset-handler"));
+
+        // A method the literal route does not serve is a 405 on IT, not a
+        // fall-through to `DELETE /terminals/{id}` closing a terminal.
+        let (status, body) = call(Method::DELETE).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
     }
 
     /// `route_entries()` is the policy's view of this module, so it must not

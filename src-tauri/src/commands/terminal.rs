@@ -924,6 +924,7 @@ pub fn terminal_get_scrollback(
     session.reset_flow_control();
     let (data, start_offset) = session.get_scrollback_buffer();
     let end_offset = start_offset + data.len() as u64;
+    crate::terminal::transport_stats::record_ring_replay(data.len());
     let encoded = STANDARD.encode(&data);
 
     Ok(CommandResponse {

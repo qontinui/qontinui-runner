@@ -57,6 +57,13 @@ import {
   RESYNC_INCOMPLETE_MARKER,
   type OffsetChunk,
 } from "./scrollbackReplay";
+import {
+  noteDecode,
+  noteRingReplay,
+  noteWriteRendered,
+  transportClockStart,
+} from "./transportStats";
+import { base64ToBytes } from "./terminalOutputTap";
 import { REMOTE_HISTORY_EVENT, type RemoteHistoryDetail } from "./remoteTabs";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
@@ -619,8 +626,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         coalesceQueue = [];
         coalesceLen = 0;
         renderAck.onWriteIssued(writtenLen);
+        const writeStart = transportClockStart();
         try {
           b.write(merged, () => {
+            noteWriteRendered(writeStart, writtenLen);
             sendAck(renderAck.onRendered(writtenLen));
           });
         } catch (e) {
@@ -769,6 +778,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             }
             const from = resyncSliceStart(ringWindow, writtenThrough);
             const slice = ringBytes.subarray(from);
+            noteRingReplay(ringBytes.length, slice.length);
             if (slice.length > 0) {
               // Direct write (not the coalesce queue): any pre-gap staged
               // chunks flushed in an earlier microtask, and the held
@@ -967,11 +977,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
        * IPC deserialize + dispatch that every mounted pane paid.
        */
       const handleOutputPayload = (payload: TerminalOutputPayload) => {
-        const raw = atob(payload.data);
-        const bytes = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) {
-          bytes[i] = raw.charCodeAt(i);
-        }
+        const decodeStart = transportClockStart();
+        const bytes = base64ToBytes(payload.data);
+        noteDecode("pane", decodeStart, bytes.length);
         const offset = payload.offset;
 
         // Emission-gap detection: the backend gates webview emission (not
@@ -1127,6 +1135,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           b.reset();
           b.write(detail.bytes);
           b.write(ring.bytes);
+          noteRingReplay(ring.bytes.length, ring.bytes.length);
           replayedThrough = ring.endOffset;
           writtenThrough = ring.endOffset;
           nextExpectedOffset = ring.endOffset;
@@ -1472,6 +1481,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           if (disposed) return;
           if (ring && ring.bytes.length > 0) {
             backend.write(ring.bytes);
+            noteRingReplay(ring.bytes.length, ring.bytes.length);
             replayedThrough = ring.endOffset;
             writtenThrough = Math.max(writtenThrough, ring.endOffset);
           }
