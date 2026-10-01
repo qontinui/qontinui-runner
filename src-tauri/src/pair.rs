@@ -1021,9 +1021,10 @@ const RECONCILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// How long `persist_pairing_with` waits for the reconcile lock. It runs AFTER
 /// coord already minted the credential, so failing here discards a good token:
-/// the budget must sit clearly above a reconcile's worst-case hold, which is
-/// two store-lock waits (the one batched conditional clear, plus the default
-/// re-point's legacy write, 10 s each) plus file I/O.
+/// the budget must sit clearly above a reconcile's worst-case hold: three
+/// store-lock waits (the one batched conditional clear, then the default
+/// re-point's `store_tokens` — its legacy write and its `mirror_into_tenant_slot`
+/// write — 10 s each), one bounded keychain call (3 s), plus file I/O (~33 s).
 pub(crate) const PAIRING_RECONCILE_LOCK_WAIT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -3445,7 +3446,9 @@ mod tests {
     #[test]
     fn a_pairing_concurrent_with_a_reconcile_succeeds() {
         assert!(
-            PAIRING_RECONCILE_LOCK_WAIT > 2 * RECONCILE_LOCK_WAIT,
+            PAIRING_RECONCILE_LOCK_WAIT
+                > 3 * crate::secure_storage::STORE_LOCK_TIMEOUT
+                    + crate::auth::KEYCHAIN_CALL_TIMEOUT,
             "the pairing budget must exceed a reconcile's worst-case hold"
         );
         let dir = temp_dir_for("reconcile_concurrent_pair");
