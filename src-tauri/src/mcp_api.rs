@@ -2055,12 +2055,12 @@ pub(crate) enum SelfIdOutcome {
     InjectedViaClientAssertionUnrecordedTerminal,
     /// The leg-3 twin of
     /// [`SelfIdOutcome::InjectedViaClientAssertionUnrecordedTerminal`]: the
-    /// workdir key did not settle the caller to the session it ASSERTED —
-    /// the workdir held no admitted record, several the assertion is not one
-    /// of, or a single one naming a DIFFERENT session (the workdir key is 1:N,
-    /// so its lone candidate is a guess about a session the runner did not
-    /// launch) — and no open record on any OTHER workdir anchors the asserted
-    /// id.
+    /// workdir key held no admitted record, or several the assertion is not
+    /// one of, and the runner's records do not contradict the asserted id (no
+    /// record on any OTHER workdir anchors it, and it is not a CLOSED record
+    /// of this one — see [`ClientAssertion`]). The case where the workdir held
+    /// a single candidate naming a DIFFERENT session is counted apart, as
+    /// [`SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate`].
     ///
     /// **Why this arm exists.** Measured on the operator's box 2026-10-01
     /// (plan `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
@@ -2068,8 +2068,9 @@ pub(crate) enum SelfIdOutcome {
     /// `client_pick_not_candidate_workdir` — an operator-launched session (and
     /// its subagents) on the shared workspace root, naming itself through the
     /// #865 client header, refused because the runner never launched it and
-    /// so holds no lifecycle record of it — while 908 of 909 such sessions
-    /// already had a `coord.agent_sessions` row bound to this device. The
+    /// so holds no lifecycle record of it — while, of all 909 ccsid-carrying
+    /// `coord.sessions` rows active in that window, 908 already had a
+    /// `coord.agent_sessions` row bound to this device. The
     /// runner was the only thing standing between a correct, coord-provable
     /// id and coord.
     ///
@@ -2086,6 +2087,25 @@ pub(crate) enum SelfIdOutcome {
     /// records contradict: an id anchored on another key is
     /// [`ClientAssertion::PlacedElsewhere`] and is never forwarded.
     InjectedViaClientAssertionUnrecordedWorkdir,
+    /// The header was sent, carrying the caller's uncontradicted assertion
+    /// IN PLACE OF the id leg 3 resolved on its own: the workdir held exactly
+    /// ONE admitted session and the request asserted a DIFFERENT id that no
+    /// record — open or closed, on this workdir or any other — contradicts.
+    ///
+    /// Split from [`SelfIdOutcome::InjectedViaClientAssertionUnrecordedWorkdir`]
+    /// because it is the one arm where the client's word REPLACES a runner
+    /// answer rather than filling a gap, so its rate is the one to watch. The
+    /// workdir key is 1:N (the operator's own session beside a lone
+    /// runner-launched one is exactly what leg 3 used to misattribute), but a
+    /// STALE assertion — a shim environment carried across `/clear` or
+    /// `--resume`, a pinned `QONTINUI_AGENT_SESSION_ID` — would land here too.
+    /// The guard against that is [`ClientAssertion::Superseded`]: an id that a
+    /// CLOSED record on this workdir still names keeps the runner's id. What
+    /// the guard cannot see is history the store no longer holds (a re-keyed
+    /// record keeps no trace of its old id; closed rows are pruned after
+    /// 24 h), so a value climbing here with no matching rise in operator
+    /// sessions is the signal to look.
+    InjectedViaClientAssertionOverSingleCandidate,
     /// An agent-spawn session — out of scope by design; those carry their own
     /// scoped identity.
     NonDevicePrincipal,
@@ -2165,10 +2185,11 @@ pub(crate) enum SelfIdOutcome {
     AmbiguousWorkdir,
     /// The key was ambiguous (on either leg) AND the request asserted a
     /// session id, but the asserted id is NOT one of the runner's admitted
-    /// candidates for that key AND an open lifecycle record on ANOTHER key
-    /// anchors it ([`ClientAssertion::PlacedElsewhere`]) — the runner's own
-    /// records say that id is a different session, so it settled nothing and
-    /// the call goes headerless.
+    /// candidates for that key AND the runner's own records contradict it — a
+    /// record on ANOTHER key anchors it ([`ClientAssertion::PlacedElsewhere`]),
+    /// or only a CLOSED record on this key does
+    /// ([`ClientAssertion::Superseded`], the key's previous session) — so it
+    /// settled nothing and the call goes headerless.
     ///
     /// **Narrowed 2026-10-01** (plan
     /// `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
@@ -2239,6 +2260,9 @@ impl SelfIdOutcome {
             Self::InjectedViaClientAssertionUnrecordedWorkdir => {
                 "injected_via_client_assertion_unrecorded_workdir"
             }
+            Self::InjectedViaClientAssertionOverSingleCandidate => {
+                "injected_via_client_assertion_over_single_candidate"
+            }
         }
     }
 
@@ -2283,12 +2307,13 @@ impl SelfIdOutcome {
             Self::ClientPickNotCandidateWorkdir => 19,
             Self::InjectedViaClientAssertionUnrecordedTerminal => 20,
             Self::InjectedViaClientAssertionUnrecordedWorkdir => 21,
+            Self::InjectedViaClientAssertionOverSingleCandidate => 22,
         }
     }
 
     /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
     /// in the tests so the two orderings cannot drift.
-    pub(crate) const ALL: [Self; 22] = [
+    pub(crate) const ALL: [Self; 23] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
@@ -2311,13 +2336,14 @@ impl SelfIdOutcome {
         Self::ClientPickNotCandidateWorkdir,
         Self::InjectedViaClientAssertionUnrecordedTerminal,
         Self::InjectedViaClientAssertionUnrecordedWorkdir,
+        Self::InjectedViaClientAssertionOverSingleCandidate,
     ];
 }
 
 /// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
 /// declaration order of [`SelfIdOutcome::ALL`]).
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 22] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 22]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 23] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 23]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -2780,8 +2806,9 @@ impl AmbiguousKey {
             Self::Workdir => SelfIdOutcome::InjectedViaClientPickWorkdir,
         }
     }
-    /// Asserted, NOT one of the runner's candidates, and contradicted by an
-    /// open record on another key ([`ClientAssertion::PlacedElsewhere`]).
+    /// Asserted, NOT one of the runner's candidates, and contradicted by the
+    /// runner's records ([`ClientAssertion::PlacedElsewhere`] or
+    /// [`ClientAssertion::Superseded`]).
     const fn rejected(self) -> SelfIdOutcome {
         match self {
             Self::Terminal => SelfIdOutcome::ClientPickNotCandidateTerminal,
@@ -2789,7 +2816,7 @@ impl AmbiguousKey {
         }
     }
     /// Asserted, not settled by the key's own proof, and contradicted by no
-    /// open record ([`ClientAssertion::Unplaced`]) — forwarded as the
+    /// record ([`ClientAssertion::Unplaced`]) — forwarded as the
     /// caller's own word, for coord's device binding to decide.
     const fn unrecorded(self) -> SelfIdOutcome {
         match self {
@@ -2800,7 +2827,8 @@ impl AmbiguousKey {
 }
 
 /// What the request's own `X-Coord-Caller-Session` says, set against what the
-/// runner's open lifecycle records say about that id.
+/// runner's lifecycle records — OPEN and CLOSED alike, i.e. every anchor the
+/// store still holds — say about that id.
 ///
 /// The runner cannot prove a caller it did not launch is who it says it is —
 /// and it does not need to: coord re-validates every forwarded id fail-closed
@@ -2813,28 +2841,36 @@ impl AmbiguousKey {
 enum ClientAssertion {
     /// The request asserted nothing usable (absent, or not a strict uuid).
     None,
-    /// Asserted, and no open lifecycle record on ANOTHER key anchors that id.
-    /// Either the runner holds no record of it at all (the session was not
-    /// launched by this runner — the operator's own sessions and their
-    /// subagents, the measured majority), or the only records naming it sit
-    /// on this very key (where they corroborate rather than contradict).
+    /// Asserted, and no record contradicts it: none on ANOTHER key anchors
+    /// that id, and if a record on this key does, at least one of them is
+    /// OPEN. Either the runner holds no record of it at all (the session was
+    /// not launched by this runner — the operator's own sessions and their
+    /// subagents, the measured majority), or a live record on this very key
+    /// names it (where it corroborates rather than contradicts).
     Unplaced(uuid::Uuid),
     /// Asserted, and an open lifecycle record on a DIFFERENT terminal (leg 1)
     /// or workdir (leg 3) anchors that id: the runner's own records say it is
     /// another session's. Never forwarded — a wrong id is worse than no id.
     ///
-    /// Any open record counts, whatever its `origin`: this is the REFUSAL
-    /// side, and a guessed (`reconciled`) anchor elsewhere is still the
-    /// runner's evidence that the id belongs to someone else. A record with
-    /// no `working_dir` is not on any workdir key, so on leg 3 it counts as
-    /// elsewhere too (conservative in the same direction).
+    /// Any record counts, open or closed and whatever its `origin`: this is
+    /// the REFUSAL side, and a guessed (`reconciled`) anchor elsewhere is
+    /// still the runner's evidence that the id belongs to someone else. A
+    /// record with no `working_dir` is not on any workdir key, so on leg 3 it
+    /// counts as elsewhere too (conservative in the same direction).
     PlacedElsewhere(uuid::Uuid),
+    /// Asserted, and the only records naming it on this key are CLOSED: the
+    /// id is this key's PREVIOUS session, not its current one. The shape of a
+    /// stale assertion — a shim environment kept across `/clear` or
+    /// `--resume` while the lifecycle record moved on, or a pinned
+    /// `QONTINUI_AGENT_SESSION_ID` — and so treated as contradicted: never
+    /// forwarded, and never allowed to displace the runner's own answer.
+    Superseded(uuid::Uuid),
 }
 
 impl ClientAssertion {
-    /// Classify `asserted` against `records`, where `on_this_key` says
-    /// whether a record sits on the key being resolved (the nonce's terminal,
-    /// or its workdir). Pure; filters on the anchor FIRST so the key test —
+    /// Classify `asserted` against `records` — EVERY record the store holds,
+    /// open and closed — where `on_this_key` says whether a record sits on
+    /// the key being resolved (the nonce's terminal, or its workdir). Pure; filters on the anchor FIRST so the key test —
     /// which may `canonicalize` a record dir on leg 3 — runs only for records
     /// naming the asserted id.
     fn classify(
@@ -2845,11 +2881,23 @@ impl ClientAssertion {
         let Some(asserted) = asserted else {
             return Self::None;
         };
-        let elsewhere = records.iter().any(|rec| {
-            anchor_as_caller_session(&rec.claude_session_id) == Some(asserted) && !on_this_key(rec)
-        });
+        let (mut elsewhere, mut here_open, mut here_closed) = (false, false, false);
+        for rec in records {
+            if anchor_as_caller_session(&rec.claude_session_id) != Some(asserted) {
+                continue;
+            }
+            if !on_this_key(rec) {
+                elsewhere = true;
+            } else if rec.state == "open" {
+                here_open = true;
+            } else {
+                here_closed = true;
+            }
+        }
         if elsewhere {
             Self::PlacedElsewhere(asserted)
+        } else if here_closed && !here_open {
+            Self::Superseded(asserted)
         } else {
             Self::Unplaced(asserted)
         }
@@ -2859,7 +2907,7 @@ impl ClientAssertion {
     const fn id(self) -> Option<uuid::Uuid> {
         match self {
             Self::None => None,
-            Self::Unplaced(id) | Self::PlacedElsewhere(id) => Some(id),
+            Self::Unplaced(id) | Self::PlacedElsewhere(id) | Self::Superseded(id) => Some(id),
         }
     }
 }
@@ -2880,7 +2928,9 @@ fn admit_assertion_on_miss(
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     match assertion {
         ClientAssertion::Unplaced(id) => (Some(id), key.unrecorded()),
-        ClientAssertion::None | ClientAssertion::PlacedElsewhere(_) => (None, miss),
+        ClientAssertion::None
+        | ClientAssertion::PlacedElsewhere(_)
+        | ClientAssertion::Superseded(_) => (None, miss),
     }
 }
 
@@ -2892,7 +2942,8 @@ fn admit_assertion_on_miss(
 /// that is not a candidate is forwarded as the caller's own word iff the
 /// runner's records do not contradict it ([`ClientAssertion::Unplaced`],
 /// counted apart as `injected_via_client_assertion_unrecorded_*`), and
-/// refused when they place it on another key. The proxy's standing strip of
+/// refused when they contradict it (a record on another key, or only a closed
+/// one on this key). The proxy's standing strip of
 /// the client header (see [`coord_mcp_forward_header_is_dropped`]) still
 /// holds: what goes upstream is always this function's verdict, never the
 /// client's copy of the header.
@@ -2929,8 +2980,8 @@ fn admit_assertion_on_miss(
 /// - asserted and a candidate → `picked()` (`injected_via_client_pick_*`);
 /// - asserted, not a candidate, uncontradicted → `unrecorded()`
 ///   (`injected_via_client_assertion_unrecorded_*`), carrying the assertion;
-/// - asserted, not a candidate, placed on another key by the runner's records
-///   → `rejected()` (`client_pick_not_candidate_*`), headerless — a wrong id
+/// - asserted, not a candidate, contradicted by the runner's records (another
+///   key, or only a closed record on this one) → `rejected()` (`client_pick_not_candidate_*`), headerless — a wrong id
 ///   is worse than no id;
 /// - nothing asserted → `unsettled()` (the leg's own `ambiguous_*` bucket),
 ///   headerless, exactly as before.
@@ -2945,7 +2996,9 @@ fn settle_ambiguity(
         // vouches for it on THIS key, which is the stronger statement.
         a if a.id().is_some_and(|id| candidates.contains(&id)) => (a.id(), key.picked()),
         ClientAssertion::Unplaced(id) => (Some(id), key.unrecorded()),
-        ClientAssertion::PlacedElsewhere(_) => (None, key.rejected()),
+        ClientAssertion::PlacedElsewhere(_) | ClientAssertion::Superseded(_) => {
+            (None, key.rejected())
+        }
     }
 }
 
@@ -3218,7 +3271,9 @@ fn resolve_caller_via_terminal(
     else {
         return Some((None, SelfIdOutcome::ResolverStateMissing));
     };
-    let records = store.open_records(); // snapshot under the store lock
+    // EVERY record (open and closed), so the assertion can be checked against
+    // the anchor history the store still holds; selection reads the open ones.
+    let records = store.all_records(); // snapshot under the store lock
     Some(settle_terminal_leg(&records, &terminal_id, client_asserted))
 }
 
@@ -3230,12 +3285,15 @@ fn resolve_caller_via_terminal(
 /// - several → [`settle_ambiguity`];
 /// - a typed miss → [`admit_assertion_on_miss`].
 ///
-/// The assertion is classified against THIS terminal: a record anchoring the
-/// asserted id on any other terminal contradicts it, because a PTY hosts one
-/// live session — a session on this terminal naming a session the runner
-/// hosts on another is not believed. Records on this terminal never
-/// contradict it, stale or not (a reused terminal's fresh session may well be
-/// the one its unconfirmed row names).
+/// `records` is EVERY record the store holds; the leg selects from the open
+/// ones ([`open_only`]) and classifies the assertion against all of them. A
+/// record anchoring the asserted id on any other terminal contradicts it,
+/// because a PTY hosts one live session — a session on this terminal naming a
+/// session the runner hosts on another is not believed. An OPEN record on
+/// this terminal never contradicts it, stale or not (a reused terminal's
+/// fresh session may well be the one its unconfirmed row names); an id only
+/// a CLOSED record on this terminal names is its previous session
+/// ([`ClientAssertion::Superseded`]) and is refused.
 fn settle_terminal_leg(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
@@ -3244,7 +3302,8 @@ fn settle_terminal_leg(
     let assertion = ClientAssertion::classify(records, client_asserted, |rec| {
         rec.terminal_id == terminal_id
     });
-    match terminal_leg(records, Some(terminal_id)) {
+    let open = open_only(records);
+    match terminal_leg(&open, Some(terminal_id)) {
         TerminalLeg::Resolved(sid) => (Some(sid), SelfIdOutcome::InjectedViaTerminal),
         // Several open rows on one terminal: the live session is the one
         // that can say which row is its own.
@@ -3379,7 +3438,10 @@ fn resolve_caller_via_lifecycle(
     else {
         return (None, SelfIdOutcome::ResolverStateMissing);
     };
-    let records = store.open_records(); // snapshot under the store lock
+    // EVERY record (open and closed) for the assertion's anchor history; the
+    // selector, the census and the miss sample read the open ones only.
+    let all = store.all_records(); // snapshot under the store lock
+    let records = open_only(&all);
     let target_canon = std::fs::canonicalize(workdir).ok();
     // The CENSUSED form: the selector already counts the funnel on its way to
     // a verdict, so the miss sample reports the numbers production actually
@@ -3387,7 +3449,7 @@ fn resolve_caller_via_lifecycle(
     // drift from the admission rules. See [`LifecycleMissCensus`].
     let (result, census) =
         select_lifecycle_caller_censused(&records, workdir, target_canon.as_deref());
-    let assertion = ClientAssertion::classify(&records, client_asserted, |rec| {
+    let assertion = ClientAssertion::classify(&all, client_asserted, |rec| {
         rec.working_dir
             .as_deref()
             .is_some_and(|dir| lifecycle_workdir_matches(dir, workdir, target_canon.as_deref()))
@@ -3406,7 +3468,10 @@ fn resolve_caller_via_lifecycle(
 ///
 /// - a single candidate resolves to itself — unless the request asserted a
 ///   DIFFERENT id the runner's records do not contradict, which then wins
-///   (`injected_via_client_assertion_unrecorded_workdir`). The workdir key is
+///   under its own series (`injected_via_client_assertion_over_single_candidate`,
+///   so the replacement rate is observable apart from the gap-filling arm). An
+///   id that a CLOSED record on this workdir still names is this workdir's
+///   previous session ([`ClientAssertion::Superseded`]) and never wins. The workdir key is
 ///   1:N: a lone admitted record on the shared workspace root says nothing
 ///   about the operator's own session sitting beside it, and it was this leg
 ///   that attributed such a session to the runner-launched one (the
@@ -3422,9 +3487,10 @@ fn settle_lifecycle_selection(
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     match selection {
         Ok(sid) => match assertion {
-            ClientAssertion::Unplaced(id) if id != sid => {
-                (Some(id), AmbiguousKey::Workdir.unrecorded())
-            }
+            ClientAssertion::Unplaced(id) if id != sid => (
+                Some(id),
+                SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate,
+            ),
             _ => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
         },
         Err(LifecycleMiss::Ambiguous(candidates)) => {
@@ -3454,6 +3520,20 @@ fn settle_lifecycle_selection(
 /// never being SENT at all).
 fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(claude_session_id.trim()).ok()
+}
+
+/// The OPEN records of a full store snapshot — the same set
+/// `SessionLifecycleStore::open_records` returns (`state == "open"`). The two
+/// resolver legs snapshot `all_records()` ONCE, so the caller's assertion can
+/// be checked against closed anchors as well, and select from this projection.
+fn open_only(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+) -> Vec<crate::session::session_lifecycle_store::TerminalSessionRecord> {
+    records
+        .iter()
+        .filter(|r| r.state == "open")
+        .cloned()
+        .collect()
 }
 
 /// The `coord.sessions.id` to file this proxy call's `coord-transport-rung`
@@ -13731,8 +13811,9 @@ mod self_id_chain_tests {
         // `terminal_anchor_not_uuid`, `ambiguous_terminal`); +4 for the
         // client-pick arm, two per leg (`injected_via_client_pick_*`,
         // `client_pick_not_candidate_*`); +2 for the uncontradicted-assertion
-        // arm, one per leg (`injected_via_client_assertion_unrecorded_*`).
-        assert_eq!(SelfIdOutcome::ALL.len(), 22);
+        // arm, one per leg (`injected_via_client_assertion_unrecorded_*`); +1
+        // for the single-candidate override split out of the workdir one.
+        assert_eq!(SelfIdOutcome::ALL.len(), 23);
     }
 
     /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
@@ -13946,6 +14027,7 @@ mod self_id_chain_tests {
                         | SelfIdOutcome::InjectedViaClientPickWorkdir
                         | SelfIdOutcome::InjectedViaClientAssertionUnrecordedTerminal
                         | SelfIdOutcome::InjectedViaClientAssertionUnrecordedWorkdir
+                        | SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate
                 )
             })
             .map(|o| o.label())
@@ -13960,6 +14042,7 @@ mod self_id_chain_tests {
                 "injected_via_client_pick_workdir",
                 "injected_via_client_assertion_unrecorded_terminal",
                 "injected_via_client_assertion_unrecorded_workdir",
+                "injected_via_client_assertion_over_single_candidate",
             ]
         );
     }
@@ -14880,15 +14963,31 @@ mod self_id_chain_tests {
     /// assertion stays the leg's own outcome.
     #[test]
     fn a_single_workdir_candidate_yields_only_to_an_uncontradicted_assertion() {
+        // The override is its OWN series, apart from the gap-filling arm, so
+        // the rate at which the client's word replaces a runner answer is
+        // observable on its own.
         assert_eq!(
             settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), unplaced(ANCHOR_B)),
             (
                 Some(uuid_of(ANCHOR_B)),
-                SelfIdOutcome::InjectedViaClientAssertionUnrecordedWorkdir
+                SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate
             )
+        );
+        assert_ne!(
+            SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate.label(),
+            SelfIdOutcome::InjectedViaClientAssertionUnrecordedWorkdir.label()
         );
         assert_eq!(
             settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), elsewhere(ANCHOR_B)),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+        // A SUPERSEDED assertion (this workdir's previous session) never
+        // displaces the runner's answer either.
+        assert_eq!(
+            settle_lifecycle_selection(
+                Ok(uuid_of(ANCHOR_A)),
+                ClientAssertion::Superseded(uuid_of(ANCHOR_B))
+            ),
             (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
         );
         // Agreement is not a client pick: the pick/assertion counters mean
@@ -15015,6 +15114,119 @@ mod self_id_chain_tests {
         );
     }
 
+    fn closed(rec: TerminalSessionRecord) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            state: "closed".to_string(),
+            closed_at: Some(1),
+            close_reason: Some("exit".to_string()),
+            ..rec
+        }
+    }
+
+    /// Review M1: a STALE assertion — the previous session of this key, kept
+    /// in a shim's environment across `/clear` or `--resume` while the
+    /// lifecycle record moved on — matches only a CLOSED record on this key.
+    /// It is classified Superseded and refused on every arm, and above all it
+    /// can never beat the runner's correct single-candidate answer.
+    #[test]
+    fn an_assertion_naming_only_a_closed_record_on_this_key_is_superseded() {
+        let root = "D:/qontinui-root";
+        let on_root = |r: &TerminalSessionRecord| r.working_dir.as_deref() == Some(root);
+        // The workdir's live session is A; B is the session that held it
+        // before (closed), and the caller's environment still says B.
+        let all = vec![
+            rec(ANCHOR_A, Some(root), 200),
+            closed(rec(ANCHOR_B, Some(root), 100)),
+        ];
+        let assertion = ClientAssertion::classify(&all, Some(uuid_of(ANCHOR_B)), on_root);
+        assert_eq!(assertion, ClientAssertion::Superseded(uuid_of(ANCHOR_B)));
+
+        // Selection reads the OPEN projection only, so A is the lone
+        // candidate — and the stale B does not displace it.
+        let open = super::open_only(&all);
+        assert_eq!(open.len(), 1);
+        let selection = select_lifecycle_caller(&open, root, None);
+        assert_eq!(selection, Ok(uuid_of(ANCHOR_A)));
+        assert_eq!(
+            settle_lifecycle_selection(selection, assertion),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+
+        // On an ambiguous workdir it is refused, not forwarded.
+        let mut busy = all.clone();
+        busy.push(rec(ANCHOR_C, Some(root), 300));
+        let busy_open = super::open_only(&busy);
+        let selection = select_lifecycle_caller(&busy_open, root, None);
+        assert!(matches!(selection, Err(LifecycleMiss::Ambiguous(_))));
+        assert_eq!(
+            settle_lifecycle_selection(
+                selection,
+                ClientAssertion::classify(&busy, Some(uuid_of(ANCHOR_B)), on_root)
+            ),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+
+        // On a key with no open record at all it leaves the miss as typed.
+        let only_closed = vec![closed(rec(ANCHOR_B, Some(root), 100))];
+        let selection = select_lifecycle_caller(&super::open_only(&only_closed), root, None);
+        assert_eq!(selection, Err(LifecycleMiss::NoRecord));
+        assert_eq!(
+            settle_lifecycle_selection(
+                selection,
+                ClientAssertion::classify(&only_closed, Some(uuid_of(ANCHOR_B)), on_root)
+            ),
+            (None, SelfIdOutcome::NoLifecycleRecord)
+        );
+
+        // A record that is both closed AND open on this key (a reused id
+        // that came back) is live, so the assertion is Unplaced, not stale.
+        let reopened = vec![
+            closed(rec(ANCHOR_B, Some(root), 100)),
+            rec(ANCHOR_B, Some(root), 300),
+        ];
+        assert_eq!(
+            ClientAssertion::classify(&reopened, Some(uuid_of(ANCHOR_B)), on_root),
+            unplaced(ANCHOR_B)
+        );
+        // A CLOSED record on ANOTHER key still places the id elsewhere.
+        let closed_elsewhere = vec![closed(rec(ANCHOR_B, Some("D:/other"), 100))];
+        assert_eq!(
+            ClientAssertion::classify(&closed_elsewhere, Some(uuid_of(ANCHOR_B)), on_root),
+            elsewhere(ANCHOR_B)
+        );
+    }
+
+    /// The same guard on leg 1: a terminal's PREVIOUS session (its closed
+    /// row) is refused, and the terminal's live row still resolves.
+    #[test]
+    fn the_terminal_leg_refuses_its_previous_session() {
+        let mut live = rec(ANCHOR_A, Some("D:/repo"), 200);
+        live.terminal_id = "term-1".to_string();
+        let mut prev = closed(rec(ANCHOR_B, Some("D:/repo"), 100));
+        prev.terminal_id = "term-1".to_string();
+        let records = vec![live, prev.clone()];
+
+        // Exact resolution: the runner's proof, whatever was asserted.
+        assert_eq!(
+            settle_terminal_leg(&records, "term-1", Some(uuid_of(ANCHOR_B))),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaTerminal)
+        );
+        // A terminal whose only row is closed: the stale id is not forwarded
+        // past the typed miss, while an id no record names still is.
+        let only_prev = vec![prev];
+        assert_eq!(
+            settle_terminal_leg(&only_prev, "term-1", Some(uuid_of(ANCHOR_B))),
+            (None, SelfIdOutcome::TerminalRecordMissing)
+        );
+        assert_eq!(
+            settle_terminal_leg(&only_prev, "term-1", Some(uuid_of(ANCHOR_D))),
+            (
+                Some(uuid_of(ANCHOR_D)),
+                SelfIdOutcome::InjectedViaClientAssertionUnrecordedTerminal
+            )
+        );
+    }
+
     /// Every outcome an assertion can END on is a counted series of its own,
     /// and each forwarding arm is one of the success outcomes — the header
     /// actually goes on exactly those.
@@ -15024,6 +15236,7 @@ mod self_id_chain_tests {
         for o in [
             SelfIdOutcome::InjectedViaClientAssertionUnrecordedTerminal,
             SelfIdOutcome::InjectedViaClientAssertionUnrecordedWorkdir,
+            SelfIdOutcome::InjectedViaClientAssertionOverSingleCandidate,
         ] {
             assert!(
                 snap[o.label()].as_u64().is_some(),
