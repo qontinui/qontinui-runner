@@ -25288,15 +25288,19 @@ mod terminal_env_reference_tests {
         nonce
     }
 
+    /// The CREDENTIAL-bearing header values only (`Authorization` and the
+    /// legacy proxy-key header). The transport-rung declaration headers
+    /// (`x-qontinui-transport` / `x-qontinui-reporter`) carry no credential and
+    /// are never env-referenced, so they are not counted here.
     fn header_values(doc: &serde_json::Value) -> Vec<String> {
-        doc["mcpServers"]["coord-mcp"]["headers"]
-            .as_object()
-            .map(|h| {
-                h.values()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let headers = &doc["mcpServers"]["coord-mcp"]["headers"];
+        [
+            crate::coord_mcp_config::PROXY_AUTHORIZATION_HEADER_JSON,
+            crate::coord_mcp_config::COORD_MCP_PROXY_KEY_HEADER_JSON,
+        ]
+        .iter()
+        .filter_map(|k| headers[*k].as_str().map(str::to_owned))
+        .collect()
     }
 
     /// Writer: ONLY the in-cwd device document is env-referenced. The agent
