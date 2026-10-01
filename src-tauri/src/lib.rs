@@ -50,6 +50,11 @@ pub mod profiles;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
+// The `is_test_only_file` predicate the source-scanning guards share. Test
+// builds only, and declared in BOTH crate roots (same file) because guards
+// live in both (`process_helpers` is itself compiled twice). See the module doc.
+#[cfg(test)]
+pub(crate) mod source_lex;
 pub mod tauri_event_payloads;
 
 // Temp-file-then-rename writer. Declared in BOTH the lib and the runner bin

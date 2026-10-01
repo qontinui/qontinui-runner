@@ -2520,6 +2520,72 @@ mod console_window_guard {
         }
     }
 
+    /// The un-suppressed, unmarked `Command::new(` sites in one file's
+    /// PRODUCTION text, as `rel:line: code`.
+    ///
+    /// Production text only: a spawn written inside a test module is not
+    /// shipped, so it cannot flash anything on a user's machine. That is the
+    /// prefix before the first in-file `#[cfg(test)]` — or nothing at all for a
+    /// file opening `#![cfg(test)]`, because an extracted test module carries
+    /// no in-file span (plan
+    /// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b).
+    fn file_violations(rel: &str, src: &str) -> Vec<String> {
+        if crate::source_lex::is_test_only_file(src) {
+            return Vec::new();
+        }
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut violations = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("Command::new(") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            // Prose, not code.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Suppressed inline, a few lines down — either the raw flag
+            // or a helper that sets it on an already-built command
+            // (`pm_detect::no_window(&mut cmd)`).
+            let end = (i + FLAG_WINDOW).min(lines.len());
+            if lines[i..end]
+                .iter()
+                .any(|l| l.contains("creation_flags") || l.contains("no_window("))
+            {
+                continue;
+            }
+            // Explicitly marked, on the line or just above it.
+            let start = i.saturating_sub(3);
+            if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
+                continue;
+            }
+            violations.push(format!("{rel}:{}: {trimmed}", i + 1));
+        }
+        violations
+    }
+
+    /// An extracted test module is test code end to end; the same spawn in a
+    /// production file is still reported (the control).
+    #[test]
+    fn an_extracted_test_only_file_is_not_scanned_as_production() {
+        let body = "fn t() {\n    let _ = std::process::Command::new(\"git\");\n}\n";
+        let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+        assert_eq!(
+            file_violations("foo/tests.rs", &extracted),
+            Vec::<String>::new(),
+            "a `#![cfg(test)]` file's spawn was read as a production site"
+        );
+        assert_eq!(
+            file_violations("foo.rs", body).len(),
+            1,
+            "control: the scan sees the same spawn in a production file"
+        );
+    }
+
     /// Every `Command::new(` in production code must either be suppressed
     /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
     /// `creation_flags`) or carry a `console-ok:` marker saying why a console
@@ -2547,45 +2613,8 @@ mod console_window_guard {
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            // Production text only: a spawn written inside a test module is
-            // not shipped, so it cannot flash anything on a user's machine.
-            let prod = src
-                .split_once("\n#[cfg(test)]")
-                .map(|(before, _)| before)
-                .unwrap_or(&src);
-            let lines: Vec<&str> = prod.lines().collect();
-
-            for (i, line) in lines.iter().enumerate() {
-                if !line.contains("Command::new(") {
-                    continue;
-                }
-                let trimmed = line.trim_start();
-                // Prose, not code.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Suppressed inline, a few lines down — either the raw flag
-                // or a helper that sets it on an already-built command
-                // (`pm_detect::no_window(&mut cmd)`).
-                let end = (i + FLAG_WINDOW).min(lines.len());
-                if lines[i..end]
-                    .iter()
-                    .any(|l| l.contains("creation_flags") || l.contains("no_window("))
-                {
-                    continue;
-                }
-                // Explicitly marked, on the line or just above it.
-                let start = i.saturating_sub(3);
-                if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
-                    continue;
-                }
-                violations.push(format!(
-                    "{}:{}: {}",
-                    rel.to_string_lossy().replace('\\', "/"),
-                    i + 1,
-                    trimmed
-                ));
-            }
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            violations.extend(file_violations(&rel, &src));
         }
 
         assert!(
