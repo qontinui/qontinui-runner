@@ -350,15 +350,8 @@ fn local_selection() -> (AccountSelectionMode, bool) {
     }
 }
 
-/// This machine's LOCAL account-selection mode — what its settings say,
-/// WITHOUT the fleet-policy term. For surfaces that report "local vs
-/// effective"; a decision site reads [`effective_selection_mode`].
-pub fn local_selection_mode() -> AccountSelectionMode {
-    local_selection().0
-}
-
 /// The account-selection mode that will ACTUALLY be applied on this machine:
-/// the local `(mode, pinned)` pair ([`local_selection_mode`]'s source)
+/// the local `(mode, pinned)` pair ([`local_selection`])
 /// resolved against the fleet's `account_selection_mode` policy by
 /// [`resolve_selection_mode`].
 ///

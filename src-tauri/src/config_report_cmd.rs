@@ -1752,9 +1752,9 @@ pub(crate) struct SettingsDerivedInputs {
 ///   `load_with_migration()`, which runs the one-shot seed migration and WRITES
 ///   `claude-accounts.json`. The overlay itself is
 ///   `claude_accounts::apply_roster_overlay`, unchanged, because it overwrites
-///   `ai.claude_cli.{account_selection_mode, config_dir}` UNCONDITIONALLY when
-///   the roster exists and the per-instance copies in settings.json are stale
-///   shadows.
+///   `ai.claude_cli.{account_selection_mode, account_selection_pinned, config_dir}`
+///   UNCONDITIONALLY when the roster exists and the per-instance copies in
+///   settings.json are stale shadows.
 ///
 /// Layer 11's cost of taking the read variant is stated in
 /// [`claude_config_dir_reading`]: on a machine where the seed has NOT run, this

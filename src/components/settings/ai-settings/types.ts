@@ -104,9 +104,10 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
     // safe as the default. Matches the Rust default (settings.rs
     // AccountSelectionMode::HighestExpectedUsage).
     account_selection_mode: "highest_expected_usage",
-    // Unpinned: the fleet's `account_selection_mode` policy, when set, governs.
-    // Matches the Rust default (settings.rs ClaudeCliSettings).
-    account_selection_pinned: false,
+    // `account_selection_pinned` is deliberately ABSENT: these defaults are
+    // what the form shows when the load failed, and an unknown pin must be
+    // sent as "not provided" (the runner keeps the stored value), never as an
+    // explicit `false` that would unpin the machine.
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",
