@@ -158,6 +158,34 @@ impl Dispatched {
     }
 }
 
+/// A WebSocket wrapper's bare `result` as a typed [`ApiResponse`], for the
+/// handlers that answer one. Same rule as [`ws_result_envelope`]: an outcome
+/// object's own `success: false` makes the response a FAILURE carrying its
+/// `error` and `code` (or `errorCode`), with the object kept as `data` —
+/// never `{success: true, data: {success: false}}`.
+pub fn ws_result_api_response(
+    result: serde_json::Value,
+) -> crate::mcp::types::ApiResponse<serde_json::Value> {
+    let inner_success = result.get("success").and_then(serde_json::Value::as_bool);
+    let error = result
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let code = ["code", "errorCode"]
+        .into_iter()
+        .find_map(|k| result.get(k).and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    let mut resp = crate::mcp::types::ApiResponse::success(result);
+    if inner_success == Some(false) {
+        resp.success = false;
+        resp.error = Some(error.unwrap_or_else(|| {
+            "wrapper reported success=false without an error message".to_string()
+        }));
+        resp.code = code;
+    }
+    resp
+}
+
 /// Wrap a WebSocket wrapper's bare `result` in the `{success, data}` envelope
 /// the HTTP arm answers with.
 ///
@@ -168,17 +196,25 @@ impl Dispatched {
 /// command-level `true` — along with its `error`.
 pub fn ws_result_envelope(result: serde_json::Value) -> serde_json::Value {
     let inner_success = result.get("success").and_then(serde_json::Value::as_bool);
-    let inner_error = if inner_success == Some(false) {
-        result.get("error").cloned()
+    // On a failed outcome, the keys a caller branches on travel to the top
+    // level, where the HTTP arm carries them: the prose `error` and the
+    // machine-readable `code` / `errorCode`.
+    let lifted: Vec<(String, serde_json::Value)> = if inner_success == Some(false) {
+        ["error", "code", "errorCode"]
+            .into_iter()
+            .filter_map(|k| result.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect()
     } else {
-        None
+        Vec::new()
     };
     let mut env = serde_json::json!({
         "success": inner_success.unwrap_or(true),
         "data": result,
     });
-    if let (Some(err), Some(obj)) = (inner_error, env.as_object_mut()) {
-        obj.insert("error".to_string(), err);
+    if let Some(obj) = env.as_object_mut() {
+        for (k, v) in lifted {
+            obj.insert(k, v);
+        }
     }
     env
 }
@@ -909,7 +945,34 @@ mod tests {
                 "data": {"success": false, "error": "not clickable"}
             })
         );
+        // Machine-readable codes travel to the top level too, where the HTTP
+        // arm carries them.
+        let coded = ws_result_envelope(json!({
+            "success": false, "error": "gone", "code": "ELEMENT_NOT_FOUND", "errorCode": "E404"
+        }));
+        assert_eq!(coded["success"], false);
+        assert_eq!(coded["code"], "ELEMENT_NOT_FOUND");
+        assert_eq!(coded["errorCode"], "E404");
+        // …but never on a success, where a `code` is payload, not a failure.
+        let ok = ws_result_envelope(json!({"success": true, "code": "x"}));
+        assert!(ok.get("code").is_none());
         let http = json!({"success": true, "data": {"x": 1}});
         assert_eq!(Dispatched::Http(http.clone()).into_envelope(), http);
+    }
+
+    /// The typed twin: a failed outcome is a failed `ApiResponse` carrying
+    /// its error and code; a plain result is a success.
+    #[test]
+    fn ws_result_api_response_does_not_wrap_a_failure_in_success() {
+        let failed = ws_result_api_response(json!({
+            "success": false, "error": "no such action", "code": "ACTION_NOT_FOUND"
+        }));
+        assert!(!failed.success);
+        assert_eq!(failed.error.as_deref(), Some("no such action"));
+        assert_eq!(failed.code.as_deref(), Some("ACTION_NOT_FOUND"));
+        let ok = ws_result_api_response(json!({"ok": true}));
+        assert!(ok.success);
+        assert_eq!(ok.data, Some(json!({"ok": true})));
+        assert!(ok.error.is_none());
     }
 }

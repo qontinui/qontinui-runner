@@ -195,7 +195,10 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
 
 `target` resolves against a registered physical device → registered app → adb
 serial, in that order; an unknown id is a malformed request — HTTP 404 with
-`unknown vision target '<id>'`, on every vision route — and a target whose
+`unknown vision target '<id>'`, on every vision route (a target that WAS valid
+but has gone away — adb device unplugged, an app whose registration heartbeat
+expired — answers the same 404, so re-list the targets before assuming a
+typo) — and a target whose
 capture fails (serves no screenshot, unreachable) comes back as
 `frame.status: "unknown"` / `producer_failed` rather than a silent capture of
 the runner desktop — `frame.provenance.source.target` names
