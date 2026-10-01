@@ -1,0 +1,759 @@
+//! Computer events (plan §3.3, Phase 2.4): `oom_kill`, `service_failed`,
+//! `service_recovered`, `reboot`, `telemetry_gap` — derived by comparing this
+//! tick's observation with the last one.
+//!
+//! ## Why the observer state is on disk
+//!
+//! Every event here is a CHANGE, and the runner process does not outlive the
+//! things it has to notice: a reboot kills it, and an OOM-killed box is
+//! exactly when a runner restart is likely. An in-memory "previous" would
+//! reset to "first observation, no events" at the worst possible moment. So
+//! the previous observation (boot id, the `oom_kill` counter, each unit's
+//! state) and the unsent events live in `<runner_dir>/computer-observer.json`.
+//!
+//! ## Stable, content-derived event ids
+//!
+//! `client_event_id` is derived from what the event IS (kind, unit, boot, the
+//! counter value or the unit's own `StateChangeTimestamp`) — never from when
+//! this process happened to notice it — so a re-derivation after a crash that
+//! lost the state write produces the SAME id and coord's
+//! `UNIQUE (computer_id, client_event_id)` dedupes it.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use super::services::WatchedUnit;
+
+/// Upper bound on unsent events per computer. Beyond it the OLDEST are
+/// dropped and a `telemetry_gap` marker says how many — a silent drop would
+/// read as "nothing happened".
+pub(crate) const MAX_PENDING_PER_COMPUTER: usize = 200;
+
+/// One `computer_events` row on the wire (contract §3 `events[]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ComputerEvent {
+    pub(crate) client_event_id: String,
+    pub(crate) kind: String,
+    pub(crate) observed_at: String,
+    pub(crate) detail: serde_json::Value,
+}
+
+/// The last observation of one unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub(crate) struct UnitObs {
+    pub(crate) active_state: Option<String>,
+    pub(crate) result: Option<String>,
+    pub(crate) state_changed_at: Option<String>,
+    pub(crate) n_restarts: Option<u32>,
+    pub(crate) cgroup_oom_kill: Option<u64>,
+    /// A `service_failed` was emitted (or the unit was first seen failed) and
+    /// no `service_recovered` has closed it yet.
+    #[serde(default)]
+    pub(crate) failed_open: bool,
+}
+
+/// The last observation of one computer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub(crate) struct ComputerObs {
+    pub(crate) boot_id: Option<String>,
+    pub(crate) oom_kill_total: Option<u64>,
+    pub(crate) units: BTreeMap<String, UnitObs>,
+}
+
+/// Everything persisted between ticks and across runner restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub(crate) struct ObserverState {
+    #[serde(default)]
+    pub(crate) computers: BTreeMap<String, ComputerObs>,
+    /// Unsent events per `identity_hash`.
+    #[serde(default)]
+    pub(crate) pending: BTreeMap<String, Vec<ComputerEvent>>,
+    /// When the gated loop last ticked (RFC3339), for `telemetry_gap`.
+    #[serde(default)]
+    pub(crate) last_tick_at: Option<String>,
+    #[serde(default)]
+    pub(crate) last_tick_boot_id: Option<String>,
+}
+
+/// This tick's observation of one computer, as the deriver needs it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ObsInput<'a> {
+    pub(crate) boot_id: Option<&'a str>,
+    pub(crate) booted_at: Option<&'a str>,
+    pub(crate) oom_kill_total: Option<u64>,
+    /// `None` = no service information this tick (keep the previous units).
+    pub(crate) services: Option<&'a [WatchedUnit]>,
+    pub(crate) services_complete: bool,
+}
+
+pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// `<kind>:<32 hex>` — a SHA-256 over the kind and the identifying parts.
+pub(crate) fn event_id(kind: &str, parts: &[&str]) -> String {
+    let mut h = Sha256::new();
+    h.update(kind.as_bytes());
+    for p in parts {
+        h.update([0x1f]);
+        h.update(p.as_bytes());
+    }
+    let digest = h.finalize();
+    format!("{kind}:{}", hex::encode(&digest[..16]))
+}
+
+fn is_up(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some("active" | "reloading" | "activating" | "deactivating")
+    )
+}
+
+fn is_down(state: Option<&str>) -> bool {
+    matches!(state, Some("failed" | "inactive"))
+}
+
+/// Derive this tick's events and the next observation.
+pub(crate) fn derive(
+    prev: Option<&ComputerObs>,
+    input: &ObsInput<'_>,
+    now: DateTime<Utc>,
+) -> (Vec<ComputerEvent>, ComputerObs) {
+    let now_s = rfc3339(now);
+    let empty = ComputerObs::default();
+    let first_ever = prev.is_none();
+    let prev = prev.unwrap_or(&empty);
+    let boot = input.boot_id.unwrap_or("");
+    let mut events = Vec::new();
+
+    // ---- reboot ---------------------------------------------------------
+    let rebooted = matches!(
+        (prev.boot_id.as_deref(), input.boot_id),
+        (Some(a), Some(b)) if a != b
+    );
+    if rebooted {
+        events.push(ComputerEvent {
+            client_event_id: event_id("reboot", &[boot]),
+            kind: "reboot".into(),
+            observed_at: input.booted_at.map(str::to_string).unwrap_or(now_s.clone()),
+            detail: json!({
+                "previous_boot_id": prev.boot_id,
+                "boot_id": input.boot_id,
+                "booted_at": input.booted_at,
+            }),
+        });
+    }
+
+    // ---- per-unit: OOM attribution and state transitions -----------------
+    let mut units = prev.units.clone();
+    let mut attributed: u64 = 0;
+    if let Some(current) = input.services {
+        if input.services_complete {
+            units.retain(|name, _| current.iter().any(|w| &w.row.unit == name));
+        }
+        for w in current {
+            let r = &w.row;
+            let cur_state = r.active_state.as_deref();
+            let Some(p) = prev.units.get(&r.unit) else {
+                // First sight of this unit: its current state is a baseline,
+                // not a transition. A unit first seen `failed` is marked open
+                // so its eventual recovery is reported.
+                units.insert(
+                    r.unit.clone(),
+                    UnitObs {
+                        active_state: r.active_state.clone(),
+                        result: r.result.clone(),
+                        state_changed_at: r.state_changed_at.clone(),
+                        n_restarts: r.n_restarts,
+                        cgroup_oom_kill: w.cgroup_oom_kill,
+                        failed_open: cur_state == Some("failed"),
+                    },
+                );
+                continue;
+            };
+            let prev_state = p.active_state.as_deref();
+            let transition_at = r.state_changed_at.clone().unwrap_or(now_s.clone());
+            let changed =
+                p.state_changed_at != r.state_changed_at || p.active_state != r.active_state;
+
+            // OOM victim: a cgroup `memory.events` delta while the cgroup
+            // lives, else the unit's own `Result=oom-kill` on this transition
+            // (with `OOMPolicy=stop` the cgroup is gone by the next tick —
+            // exactly the 2026-09-30 shape).
+            let cg_delta = match (p.cgroup_oom_kill, w.cgroup_oom_kill) {
+                (Some(a), Some(b)) if b > a && !rebooted => Some(b - a),
+                _ => None,
+            };
+            let victim = if let Some(n) = cg_delta {
+                Some((
+                    n,
+                    "cgroup_memory_events",
+                    now_s.clone(),
+                    w.cgroup_oom_kill.unwrap_or(0).to_string(),
+                ))
+            } else if r.result.as_deref() == Some("oom-kill")
+                && is_down(cur_state)
+                && (p.result.as_deref() != Some("oom-kill")
+                    || p.state_changed_at != r.state_changed_at)
+            {
+                Some((
+                    1,
+                    "unit_result",
+                    transition_at.clone(),
+                    transition_at.clone(),
+                ))
+            } else {
+                None
+            };
+            if let Some((count, how, at, key)) = victim {
+                attributed = attributed.saturating_add(count);
+                events.push(ComputerEvent {
+                    client_event_id: event_id("oom_kill", &[boot, &r.unit, how, &key]),
+                    kind: "oom_kill".into(),
+                    observed_at: at,
+                    detail: json!({
+                        "victim_unit": r.unit,
+                        "unit_kind": r.kind,
+                        "count": count,
+                        "attribution": how,
+                        "oom_kill_total": input.oom_kill_total,
+                        "oom_policy": r.oom_policy,
+                        "memory_peak": r.memory_peak,
+                        "runner_name": r.runner_name,
+                    }),
+                });
+            }
+
+            let mut failed_open = p.failed_open;
+            let base_detail = |kind: &str| {
+                json!({
+                    "unit": r.unit,
+                    "unit_kind": r.kind,
+                    "from": prev_state,
+                    "to": cur_state,
+                    "sub_state": r.sub_state,
+                    "result": r.result,
+                    "restart_policy": r.restart_policy,
+                    "oom_policy": r.oom_policy,
+                    "n_restarts": r.n_restarts,
+                    "runner_name": r.runner_name,
+                    "event": kind,
+                })
+            };
+            if is_down(cur_state)
+                && !failed_open
+                && changed
+                && (cur_state == Some("failed") || is_up(prev_state))
+            {
+                events.push(ComputerEvent {
+                    client_event_id: event_id("service_failed", &[boot, &r.unit, &transition_at]),
+                    kind: "service_failed".into(),
+                    observed_at: transition_at.clone(),
+                    detail: base_detail("service_failed"),
+                });
+                failed_open = true;
+            } else if cur_state == Some("active") && failed_open {
+                events.push(ComputerEvent {
+                    client_event_id: event_id(
+                        "service_recovered",
+                        &[boot, &r.unit, &transition_at],
+                    ),
+                    kind: "service_recovered".into(),
+                    observed_at: transition_at.clone(),
+                    detail: base_detail("service_recovered"),
+                });
+                failed_open = false;
+            } else if cur_state == Some("active")
+                && prev_state == Some("active")
+                && matches!((p.n_restarts, r.n_restarts), (Some(a), Some(b)) if b > a)
+            {
+                // Died and was auto-restarted between two ticks: `NRestarts`
+                // counts only automatic restarts, so this is a crash the
+                // state words alone never show.
+                let n = r.n_restarts.unwrap_or(0).to_string();
+                let mut d = base_detail("service_failed");
+                d["auto_restarted"] = json!(true);
+                events.push(ComputerEvent {
+                    client_event_id: event_id("service_failed", &[boot, &r.unit, "n_restarts", &n]),
+                    kind: "service_failed".into(),
+                    observed_at: transition_at.clone(),
+                    detail: d,
+                });
+                let mut d = base_detail("service_recovered");
+                d["auto_restarted"] = json!(true);
+                events.push(ComputerEvent {
+                    client_event_id: event_id(
+                        "service_recovered",
+                        &[boot, &r.unit, "n_restarts", &n],
+                    ),
+                    kind: "service_recovered".into(),
+                    observed_at: transition_at.clone(),
+                    detail: d,
+                });
+            }
+
+            units.insert(
+                r.unit.clone(),
+                UnitObs {
+                    active_state: r.active_state.clone(),
+                    result: r.result.clone(),
+                    state_changed_at: r.state_changed_at.clone(),
+                    n_restarts: r.n_restarts,
+                    cgroup_oom_kill: w.cgroup_oom_kill,
+                    failed_open,
+                },
+            );
+        }
+    }
+
+    // ---- machine-wide OOM kills no watched unit accounts for ------------
+    if !rebooted && !first_ever {
+        if let (Some(a), Some(b)) = (prev.oom_kill_total, input.oom_kill_total) {
+            if b > a {
+                let unattributed = (b - a).saturating_sub(attributed);
+                if unattributed > 0 {
+                    events.push(ComputerEvent {
+                        client_event_id: event_id("oom_kill", &[boot, "", &b.to_string()]),
+                        kind: "oom_kill".into(),
+                        observed_at: now_s.clone(),
+                        detail: json!({
+                            "victim_unit": null,
+                            "count": unattributed,
+                            "attribution": "vmstat_delta",
+                            "oom_kill_total": b,
+                            "previous_oom_kill_total": a,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    let next = ComputerObs {
+        boot_id: input.boot_id.map(str::to_string).or(prev.boot_id.clone()),
+        oom_kill_total: input
+            .oom_kill_total
+            .or(if rebooted { None } else { prev.oom_kill_total }),
+        units,
+    };
+    (events, next)
+}
+
+/// A `telemetry_gap` when the gated loop's previous tick is more than 3× the
+/// configured cadence ago — the sampler itself starved (a fleet host on
+/// 2026-09-30: a 33-minute hole spanning the OOM kill), or the runner was not
+/// running at all. `None` on the first tick ever and on a normal cadence.
+pub(crate) fn telemetry_gap(
+    last_tick_at: Option<&str>,
+    last_tick_boot_id: Option<&str>,
+    now: DateTime<Utc>,
+    expected_secs: u64,
+    boot_id: Option<&str>,
+    load_1m_at_resume: Option<f64>,
+) -> Option<ComputerEvent> {
+    let last_s = last_tick_at?;
+    let last = DateTime::parse_from_rfc3339(last_s)
+        .ok()?
+        .with_timezone(&Utc);
+    let gap_secs = (now - last).num_seconds();
+    let threshold = expected_secs.saturating_mul(3);
+    if gap_secs <= i64::try_from(threshold).unwrap_or(i64::MAX) {
+        return None;
+    }
+    let across_reboot = matches!((last_tick_boot_id, boot_id), (Some(a), Some(b)) if a != b);
+    Some(ComputerEvent {
+        client_event_id: event_id("telemetry_gap", &[boot_id.unwrap_or(""), last_s]),
+        kind: "telemetry_gap".into(),
+        observed_at: rfc3339(now),
+        detail: json!({
+            "gap_secs": gap_secs,
+            "expected_secs": expected_secs,
+            "threshold_secs": threshold,
+            "last_tick_at": last_s,
+            "resumed_at": rfc3339(now),
+            "load_1m_at_resume": load_1m_at_resume,
+            "across_reboot": across_reboot,
+        }),
+    })
+}
+
+/// Queue events for a computer: dedupe by id, then bound the queue, replacing
+/// what overflowed with one `telemetry_gap` marker counting it.
+pub(crate) fn push_pending(state: &mut ObserverState, identity: &str, new: Vec<ComputerEvent>) {
+    let q = state.pending.entry(identity.to_string()).or_default();
+    for e in new {
+        if !q.iter().any(|x| x.client_event_id == e.client_event_id) {
+            q.push(e);
+        }
+    }
+    if q.len() > MAX_PENDING_PER_COMPUTER {
+        let overflow = q.len() - (MAX_PENDING_PER_COMPUTER - 1);
+        let dropped: Vec<ComputerEvent> = q.drain(..overflow).collect();
+        // A previous marker folded into this one keeps the running total.
+        let dropped_total: u64 = dropped
+            .iter()
+            .map(|e| {
+                if e.detail.get("reason").and_then(|r| r.as_str())
+                    == Some("pending_event_buffer_full")
+                {
+                    e.detail
+                        .get("dropped_events")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0)
+                } else {
+                    1
+                }
+            })
+            .sum();
+        let first_id = dropped
+            .first()
+            .map(|e| e.client_event_id.as_str())
+            .unwrap_or("");
+        let marker = ComputerEvent {
+            client_event_id: event_id(
+                "telemetry_gap",
+                &["dropped", first_id, &dropped_total.to_string()],
+            ),
+            kind: "telemetry_gap".into(),
+            observed_at: dropped
+                .first()
+                .map(|e| e.observed_at.clone())
+                .unwrap_or_default(),
+            detail: json!({
+                "reason": "pending_event_buffer_full",
+                "dropped_events": dropped_total,
+            }),
+        };
+        q.insert(0, marker);
+    }
+}
+
+/// Load the observer state; a missing or unreadable file is a fresh state
+/// (first observation — baselines, no events).
+pub(crate) fn load(path: &Path) -> ObserverState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic write (temp file + rename). Best-effort: a failure costs the
+/// persistence of this tick, which the content-derived ids make safe.
+pub(crate) fn save(path: &Path, state: &ObserverState) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(state)?)?;
+    std::fs::rename(tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::services::{parse_systemctl_show, row_from_props, tests as svc};
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    const BOOT: &str = "0f0e0d0c-0b0a-4908-8706-050403020100";
+
+    fn watched(show: &str, cgroup: Option<u64>) -> Vec<WatchedUnit> {
+        parse_systemctl_show(show)
+            .iter()
+            .map(|p| WatchedUnit {
+                row: row_from_props(p, None),
+                cgroup_oom_kill: cgroup,
+            })
+            .collect()
+    }
+
+    fn input<'a>(units: &'a [WatchedUnit], oom: Option<u64>) -> ObsInput<'a> {
+        ObsInput {
+            boot_id: Some(BOOT),
+            booted_at: Some("2026-09-21T14:13:20Z"),
+            oom_kill_total: oom,
+            services: Some(units),
+            services_complete: true,
+        }
+    }
+
+    const ACTIVE_BEFORE: &str = "\
+Id=actions.runner.example-org-example-repo.fleetbox.service
+ActiveState=active
+SubState=running
+Result=success
+Restart=no
+OOMPolicy=stop
+NRestarts=0
+StateChangeTimestamp=Tue 2026-09-29 09:12:40 UTC
+ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.service
+";
+
+    /// The incident, replayed: active (vmstat oom_kill=5) → the unit is
+    /// OOM-killed and stays down (vmstat 6, cgroup gone). Expect exactly one
+    /// attributed `oom_kill` and one `service_failed`, no unattributed kill.
+    #[test]
+    fn the_incident_yields_an_attributed_oom_kill_and_a_service_failure() {
+        let before = watched(ACTIVE_BEFORE, Some(0));
+        let (ev0, obs0) = derive(None, &input(&before, Some(5)), t("2026-09-30T01:40:00Z"));
+        assert!(ev0.is_empty(), "first observation is a baseline");
+
+        let after = watched(svc::INCIDENT_SHOW, None);
+        let (ev, obs1) = derive(
+            Some(&obs0),
+            &input(&after, Some(6)),
+            t("2026-09-30T01:48:40Z"),
+        );
+        let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["oom_kill", "service_failed"]);
+
+        let oom = &ev[0];
+        assert_eq!(oom.observed_at, "2026-09-30T01:48:16Z");
+        assert_eq!(
+            oom.detail["victim_unit"],
+            "actions.runner.example-org-example-repo.fleetbox.service"
+        );
+        assert_eq!(oom.detail["attribution"], "unit_result");
+        assert_eq!(oom.detail["count"], 1);
+        assert_eq!(oom.detail["oom_kill_total"], 6);
+        assert_eq!(oom.detail["oom_policy"], "stop");
+
+        let failed = &ev[1];
+        assert_eq!(failed.detail["from"], "active");
+        assert_eq!(failed.detail["to"], "failed");
+        assert_eq!(failed.detail["result"], "oom-kill");
+        assert_eq!(failed.detail["restart_policy"], "no");
+
+        // Idempotent: the same observation again derives nothing new.
+        let (again, _) = derive(
+            Some(&obs1),
+            &input(&after, Some(6)),
+            t("2026-09-30T01:49:10Z"),
+        );
+        assert!(again.is_empty(), "{again:?}");
+
+        // Stable ids: a re-derivation from the same prior state (a lost
+        // state write) yields byte-identical ids.
+        let (ev_redo, _) = derive(
+            Some(&obs0),
+            &input(&after, Some(6)),
+            t("2026-09-30T01:49:30Z"),
+        );
+        let ids = |v: &[ComputerEvent]| {
+            v.iter()
+                .map(|e| e.client_event_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&ev), ids(&ev_redo));
+    }
+
+    #[test]
+    fn a_cgroup_delta_attributes_and_the_remainder_is_unattributed() {
+        let before = watched(ACTIVE_BEFORE, Some(2));
+        let (_, obs0) = derive(None, &input(&before, Some(10)), t("2026-09-30T01:00:00Z"));
+        // The runner's cgroup killed one process (cgroup 2 → 3) but the unit
+        // survived (OOMPolicy=continue); the machine killed two more elsewhere.
+        let after = watched(ACTIVE_BEFORE, Some(3));
+        let (ev, _) = derive(
+            Some(&obs0),
+            &input(&after, Some(13)),
+            t("2026-09-30T01:00:30Z"),
+        );
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].detail["attribution"], "cgroup_memory_events");
+        assert_eq!(ev[0].detail["count"], 1);
+        assert_eq!(ev[1].detail["attribution"], "vmstat_delta");
+        assert_eq!(ev[1].detail["victim_unit"], serde_json::Value::Null);
+        assert_eq!(ev[1].detail["count"], 2);
+        assert_eq!(ev[1].detail["previous_oom_kill_total"], 10);
+    }
+
+    #[test]
+    fn recovery_closes_a_failure_exactly_once() {
+        let failed = watched(svc::INCIDENT_SHOW, None);
+        let (_, obs0) = derive(None, &input(&failed, Some(6)), t("2026-09-30T02:00:00Z"));
+        let back = watched(
+            &ACTIVE_BEFORE.replace("Tue 2026-09-29 09:12:40 UTC", "Wed 2026-09-30 18:28:57 UTC"),
+            Some(0),
+        );
+        let (ev, obs1) = derive(
+            Some(&obs0),
+            &input(&back, Some(6)),
+            t("2026-09-30T18:29:10Z"),
+        );
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].kind, "service_recovered");
+        assert_eq!(ev[0].observed_at, "2026-09-30T18:28:57Z");
+        let (ev2, _) = derive(
+            Some(&obs1),
+            &input(&back, Some(6)),
+            t("2026-09-30T18:29:40Z"),
+        );
+        assert!(ev2.is_empty());
+    }
+
+    #[test]
+    fn an_auto_restart_between_ticks_is_a_failure_and_a_recovery() {
+        let before = watched(ACTIVE_BEFORE, None);
+        let (_, obs0) = derive(None, &input(&before, None), t("2026-09-30T01:00:00Z"));
+        let after = watched(
+            &ACTIVE_BEFORE
+                .replace("NRestarts=0", "NRestarts=1")
+                .replace("Tue 2026-09-29 09:12:40 UTC", "Wed 2026-09-30 01:00:12 UTC"),
+            None,
+        );
+        let (ev, _) = derive(Some(&obs0), &input(&after, None), t("2026-09-30T01:00:30Z"));
+        let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["service_failed", "service_recovered"]);
+        assert_eq!(ev[0].detail["auto_restarted"], true);
+    }
+
+    #[test]
+    fn a_boot_id_change_is_a_reboot_and_resets_the_oom_baseline() {
+        let units = watched(ACTIVE_BEFORE, None);
+        let (_, obs0) = derive(None, &input(&units, Some(40)), t("2026-09-30T01:00:00Z"));
+        let new_boot = "11111111-2222-4333-8444-555555555555";
+        let inp = ObsInput {
+            boot_id: Some(new_boot),
+            booted_at: Some("2026-09-30T03:00:00Z"),
+            oom_kill_total: Some(1),
+            services: Some(&units),
+            services_complete: true,
+        };
+        let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].kind, "reboot");
+        assert_eq!(ev[0].observed_at, "2026-09-30T03:00:00Z");
+        assert_eq!(ev[0].detail["previous_boot_id"], BOOT);
+        assert_eq!(ev[0].client_event_id, event_id("reboot", &[new_boot]));
+        assert_eq!(obs1.boot_id.as_deref(), Some(new_boot));
+        assert_eq!(obs1.oom_kill_total, Some(1));
+    }
+
+    #[test]
+    fn no_service_information_keeps_the_previous_units() {
+        let units = watched(ACTIVE_BEFORE, None);
+        let (_, obs0) = derive(None, &input(&units, Some(1)), t("2026-09-30T01:00:00Z"));
+        let inp = ObsInput {
+            services: None,
+            services_complete: false,
+            ..input(&units, Some(1))
+        };
+        let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T01:00:30Z"));
+        assert!(ev.is_empty());
+        assert_eq!(obs1.units, obs0.units);
+    }
+
+    /// The Phase 0 census shape: the sampler starved for 33 minutes across
+    /// the OOM kill (01:14:53 → 01:48:16).
+    #[test]
+    fn a_starved_loop_emits_a_telemetry_gap() {
+        let ev = telemetry_gap(
+            Some("2026-09-30T01:14:53Z"),
+            Some(BOOT),
+            t("2026-09-30T01:48:16Z"),
+            30,
+            Some(BOOT),
+            Some(41.2),
+        )
+        .unwrap();
+        assert_eq!(ev.kind, "telemetry_gap");
+        assert_eq!(ev.observed_at, "2026-09-30T01:48:16Z");
+        assert_eq!(
+            ev.detail,
+            json!({
+                "gap_secs": 2003,
+                "expected_secs": 30,
+                "threshold_secs": 90,
+                "last_tick_at": "2026-09-30T01:14:53Z",
+                "resumed_at": "2026-09-30T01:48:16Z",
+                "load_1m_at_resume": 41.2,
+                "across_reboot": false,
+            })
+        );
+        assert_eq!(
+            ev.client_event_id,
+            event_id("telemetry_gap", &[BOOT, "2026-09-30T01:14:53Z"])
+        );
+        // On cadence (even with jitter) and at the exact threshold: nothing.
+        assert!(telemetry_gap(
+            Some("2026-09-30T01:14:53Z"),
+            None,
+            t("2026-09-30T01:15:29Z"),
+            30,
+            None,
+            None
+        )
+        .is_none());
+        assert!(telemetry_gap(
+            Some("2026-09-30T01:14:53Z"),
+            None,
+            t("2026-09-30T01:16:23Z"),
+            30,
+            None,
+            None
+        )
+        .is_none());
+        assert!(telemetry_gap(None, None, t("2026-09-30T01:16:23Z"), 30, None, None).is_none());
+    }
+
+    #[test]
+    fn the_pending_queue_is_bounded_and_says_what_it_dropped() {
+        let mut st = ObserverState::default();
+        let mk = |i: usize| ComputerEvent {
+            client_event_id: format!("e{i}"),
+            kind: "oom_kill".into(),
+            observed_at: format!("t{i}"),
+            detail: json!({}),
+        };
+        push_pending(
+            &mut st,
+            "h",
+            (0..MAX_PENDING_PER_COMPUTER).map(mk).collect(),
+        );
+        assert_eq!(st.pending["h"].len(), MAX_PENDING_PER_COMPUTER);
+        // Duplicates are not re-queued.
+        push_pending(&mut st, "h", vec![mk(3)]);
+        assert_eq!(st.pending["h"].len(), MAX_PENDING_PER_COMPUTER);
+        push_pending(&mut st, "h", (1000..1005).map(mk).collect());
+        let q = &st.pending["h"];
+        assert_eq!(q.len(), MAX_PENDING_PER_COMPUTER);
+        assert_eq!(q[0].kind, "telemetry_gap");
+        assert_eq!(q[0].detail["dropped_events"], 6);
+        assert_eq!(q.last().unwrap().client_event_id, "e1004");
+    }
+
+    #[test]
+    fn observer_state_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "qontinui-computer-observer-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("computer-observer.json");
+        let mut st = ObserverState {
+            last_tick_at: Some("2026-09-30T01:14:53Z".into()),
+            ..ObserverState::default()
+        };
+        push_pending(
+            &mut st,
+            "h",
+            vec![ComputerEvent {
+                client_event_id: "x".into(),
+                kind: "reboot".into(),
+                observed_at: "2026-09-30T01:14:53Z".into(),
+                detail: json!({"a": 1}),
+            }],
+        );
+        save(&path, &st).unwrap();
+        assert_eq!(load(&path), st);
+        assert_eq!(load(&dir.join("absent.json")), ObserverState::default());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

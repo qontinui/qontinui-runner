@@ -201,6 +201,52 @@ pub(crate) struct ResourceSample {
     /// equivalent, and a fabricated 0.0 would read as "idle".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) load_1m: Option<f64>,
+    /// 5- and 15-minute load averages — same source and same `None` rule as
+    /// [`Self::load_1m`] (plan 2026-09-30 §3.4: extend the existing column
+    /// family, never a second `load1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_5m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_15m: Option<f64>,
+    /// Linux PSI, percent 0-100, from `/proc/pressure/{memory,cpu,io}`.
+    /// `psi_cpu_full_*` is `None` on kernels before 5.13, which print no
+    /// `full` line for cpu — UNKNOWN, not "no stall".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_full_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_full_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_full_avg60: Option<f64>,
+    /// `/proc/vmstat` `oom_kill` — monotonic since boot, so a delta across a
+    /// `boot_id` change is meaningless and consumers must key on both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) oom_kill_total: Option<u64>,
+    /// The kernel's per-boot UUID (`/proc/sys/kernel/random/boot_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+    /// Axis name → `measured` | `not_supported` | `unavailable` for the axes
+    /// this lane attempted (see [`crate::fleet::host_axes`]). An axis absent
+    /// from the manifest was not attempted by this lane: UNKNOWN.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -577,6 +623,23 @@ impl ResourceSample {
             lane_instance,
             cpu_cores: None,
             load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            psi_memory_some_avg10: None,
+            psi_memory_some_avg60: None,
+            psi_memory_full_avg10: None,
+            psi_memory_full_avg60: None,
+            psi_cpu_some_avg10: None,
+            psi_cpu_some_avg60: None,
+            psi_cpu_full_avg10: None,
+            psi_cpu_full_avg60: None,
+            psi_io_some_avg10: None,
+            psi_io_some_avg60: None,
+            psi_io_full_avg10: None,
+            psi_io_full_avg60: None,
+            oom_kill_total: None,
+            boot_id: None,
+            measured: None,
             mem_total_bytes: None,
             mem_available_bytes: None,
             commit_total_bytes: None,
@@ -632,6 +695,65 @@ impl ResourceSample {
             }
         }
         self.saturation_source = Some(r.source.as_str().to_string());
+    }
+
+    /// The `wsl` lane's load triple from its existing procfs `cat`, with a
+    /// manifest naming the three load axes (and nothing else it did not try).
+    fn set_wsl_load(&mut self, load: Option<crate::fleet::host_axes::LoadAvg>) {
+        use crate::fleet::host_axes::{Measured, AXIS_LOAD_15M, AXIS_LOAD_1M, AXIS_LOAD_5M};
+        let m = Measured::from_read(&load).as_str().to_string();
+        if let Some(l) = load {
+            self.load_1m = Some(l.one);
+            self.load_5m = Some(l.five);
+            self.load_15m = Some(l.fifteen);
+        }
+        self.measured = Some(
+            [AXIS_LOAD_1M, AXIS_LOAD_5M, AXIS_LOAD_15M]
+                .iter()
+                .map(|a| (a.to_string(), m.clone()))
+                .collect(),
+        );
+    }
+
+    /// Write the §3.4 kernel pressure axes and their manifest — the ONLY way
+    /// the load/PSI/OOM/boot fields are set, so the values and the manifest
+    /// that explains their absence always come from one reading.
+    pub(crate) fn set_host_axes(&mut self, a: &crate::fleet::host_axes::HostAxes) {
+        if let Some(l) = a.load {
+            self.load_1m = Some(l.one);
+            self.load_5m = Some(l.five);
+            self.load_15m = Some(l.fifteen);
+        }
+        let split = |p: Option<crate::fleet::host_axes::Psi>| {
+            let p = p.unwrap_or_default();
+            (
+                p.some.map(|x| x.0),
+                p.some.map(|x| x.1),
+                p.full.map(|x| x.0),
+                p.full.map(|x| x.1),
+            )
+        };
+        (
+            self.psi_memory_some_avg10,
+            self.psi_memory_some_avg60,
+            self.psi_memory_full_avg10,
+            self.psi_memory_full_avg60,
+        ) = split(a.psi_memory);
+        (
+            self.psi_cpu_some_avg10,
+            self.psi_cpu_some_avg60,
+            self.psi_cpu_full_avg10,
+            self.psi_cpu_full_avg60,
+        ) = split(a.psi_cpu);
+        (
+            self.psi_io_some_avg10,
+            self.psi_io_some_avg60,
+            self.psi_io_full_avg10,
+            self.psi_io_full_avg60,
+        ) = split(a.psi_io);
+        self.oom_kill_total = a.oom_kill_total;
+        self.boot_id = a.boot_id.clone();
+        self.measured = (!a.measured.is_empty()).then(|| a.measured.clone());
     }
 }
 
@@ -825,12 +947,12 @@ fn collect_host_lane() -> ResourceSample {
         s.commit_available_bytes = Some(m.commit_available);
     }
 
-    // Windows has no load average; sysinfo returns zeros there, and a
-    // fabricated 0.0 would render as "idle" on a saturated box.
-    #[cfg(not(windows))]
-    {
-        s.load_1m = Some(sysinfo::System::load_average().one);
-    }
+    // Load 1/5/15, PSI, the oom_kill counter and boot_id, with a manifest
+    // naming which were measured. Windows has no load average (sysinfo
+    // returns zeros there) and no PSI: its manifest says `not_supported` and
+    // the values stay NULL — a fabricated 0.0 would render as "idle" on a
+    // saturated box.
+    s.set_host_axes(&crate::fleet::host_axes::collect());
 
     // Same volume probe the disk floor gates on, so the dashboard's disk figure
     // and the gate's are literally one reading.
@@ -1058,7 +1180,7 @@ pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>, Option<u64>) {
 /// `wsl.exe` (98k handles, 23% of all system handles) over ~3h — jamming the
 /// very distro it was trying to read, and outliving the fault that started it.
 #[cfg(windows)]
-async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
+pub(crate) async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
     let mut cmd = crate::process_helpers::tokio_no_window("wsl.exe");
     cmd.args(args)
         .kill_on_drop(true)
@@ -1118,7 +1240,7 @@ async fn resolve_wsl_distro() -> Option<String> {
 /// NUL-interleaved garbage that parses as a distro name. Same class as the
 /// UTF-16LE Tauri log encoding this repo already tripped over once.
 #[cfg(windows)]
-fn decode_utf16le(bytes: &[u8]) -> String {
+pub(crate) fn decode_utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -1192,6 +1314,11 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sample = parse_meminfo(&text, distro)?;
     sample.set_saturation(parse_proc_saturation(&text));
+    // `/proc/loadavg` already rides this one `cat`; PSI, vmstat and boot_id
+    // do not (three PSI files share one line shape and could not be told
+    // apart without markers), so this lane's manifest names only the load
+    // axes it actually attempted.
+    sample.set_wsl_load(crate::fleet::host_axes::parse_loadavg(&text));
     attach_wsl_disk(&mut sample);
     Some(sample)
 }
@@ -1773,6 +1900,88 @@ SwapFree:        8036352 kB
              measurement"
         );
         assert!(!obj.contains_key("lane_instance"));
+    }
+
+    /// Plan 2026-09-30 §3.4 / contract §2: the new axes use coord's exact
+    /// column names, and the manifest rides beside them. Built from recorded
+    /// fleet-host procfs text, with the cpu PSI file unreadable.
+    #[test]
+    fn the_pressure_axes_use_the_contract_wire_names() {
+        let axes = crate::fleet::host_axes::linux_axes_from(
+            Some("32.07 28.81 31.69 31/16803 2177659\n"),
+            Some("some avg10=2.12 avg60=7.81 avg300=2.78 total=1\nfull avg10=1.95 avg60=7.18 avg300=2.56 total=1\n"),
+            None,
+            Some("some avg10=2.97 avg60=9.17 avg300=3.48 total=1\n"),
+            Some("pgfault 9\noom_kill 6\n"),
+            Some("0f0e0d0c-0b0a-4908-8706-050403020100\n"),
+        );
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.set_host_axes(&axes);
+        let v = serde_json::to_value(&s).unwrap();
+        let o = v.as_object().unwrap();
+        assert_eq!(o["load_1m"], 32.07);
+        assert_eq!(o["load_5m"], 28.81);
+        assert_eq!(o["load_15m"], 31.69);
+        assert_eq!(o["psi_memory_some_avg10"], 2.12);
+        assert_eq!(o["psi_memory_some_avg60"], 7.81);
+        assert_eq!(o["psi_memory_full_avg10"], 1.95);
+        assert_eq!(o["psi_memory_full_avg60"], 7.18);
+        assert_eq!(o["psi_io_some_avg10"], 2.97);
+        assert_eq!(o["psi_io_some_avg60"], 9.17);
+        // An io file with no `full` line and an unreadable cpu file: absent,
+        // never zero.
+        for k in [
+            "psi_io_full_avg10",
+            "psi_io_full_avg60",
+            "psi_cpu_some_avg10",
+            "psi_cpu_some_avg60",
+            "psi_cpu_full_avg10",
+            "psi_cpu_full_avg60",
+        ] {
+            assert!(!o.contains_key(k), "{k} must be absent");
+        }
+        assert_eq!(o["oom_kill_total"], 6);
+        assert_eq!(o["boot_id"], "0f0e0d0c-0b0a-4908-8706-050403020100");
+        assert_eq!(
+            o["measured"],
+            serde_json::json!({
+                "boot_id": "measured",
+                "load_15m": "measured",
+                "load_1m": "measured",
+                "load_5m": "measured",
+                "oom_kill_total": "measured",
+                "psi_cpu": "unavailable",
+                "psi_io": "measured",
+                "psi_memory": "measured"
+            })
+        );
+
+        // Windows: every axis `not_supported`, no value at all.
+        let mut w = ResourceSample::empty(Lane::Host, None);
+        w.set_host_axes(&crate::fleet::host_axes::windows_axes());
+        let v = serde_json::to_value(&w).unwrap();
+        let o = v.as_object().unwrap();
+        assert!(!o.contains_key("load_1m"));
+        assert!(!o.contains_key("psi_memory_some_avg60"));
+        assert_eq!(o["measured"]["psi_memory"], "not_supported");
+        assert_eq!(o["measured"]["load_1m"], "not_supported");
+    }
+
+    #[test]
+    fn the_wsl_lane_names_only_the_load_axes_it_attempted() {
+        let mut s = ResourceSample::empty(Lane::Wsl, Some("Ubuntu-24.04".into()));
+        s.set_wsl_load(crate::fleet::host_axes::parse_loadavg(
+            "1.00 2.00 3.00 4/500 99\n",
+        ));
+        assert_eq!(s.load_15m, Some(3.0));
+        assert_eq!(
+            serde_json::to_value(&s.measured).unwrap(),
+            serde_json::json!({"load_1m":"measured","load_5m":"measured","load_15m":"measured"})
+        );
+        let mut u = ResourceSample::empty(Lane::Wsl, None);
+        u.set_wsl_load(None);
+        assert_eq!(u.load_1m, None);
+        assert_eq!(u.measured.unwrap()["load_1m"], "unavailable");
     }
 
     #[test]
