@@ -462,7 +462,10 @@ fn read_paired_user_file_at(path: &std::path::Path) -> Option<PairedUserFile> {
 /// ([`preserve_legacy_credential`], [`copy_default_into_legacy_slot`]) also
 /// take it — each alone, after the heal's file-write guard is dropped — so
 /// their recheck-then-write is atomic against a pairing's credential writes
-/// (review round 3).
+/// (review round 3). It does NOT cover the background refresher, which writes
+/// the legacy slot and its per-tenant mirror without this lock: a re-mint
+/// landing inside a heal's copy can be overwritten by an older (still usable)
+/// token, which the next refresh replaces.
 static PAIRED_USER_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take [`PAIRED_USER_WRITE`]. A poisoned lock is recovered: it guards no
@@ -1669,9 +1672,10 @@ fn heal_vanished_paired_user_hooked(
     };
 
     before_write();
-    // The recheck, the set-aside and the file write run under the write lock;
-    // the credential-store copies below run AFTER it is dropped, so no
-    // keychain I/O is ever done while holding it (review round 2, LOW).
+    // The recheck, the set-aside and the file write run under the write lock.
+    // The credential-store copies below re-take it on their own after this
+    // guard is dropped, and do their (bounded) keychain I/O under it, as
+    // `persist_pairing_with` already does (review round 3).
     let cause = {
         let _write = paired_user_write_lock();
         // A real pairing may have landed while the credentials were read.
@@ -1809,8 +1813,11 @@ fn preserve_legacy_credential(
 ///   refresh wrote a fresher credential there; an unreadable read on either
 ///   side means nothing is established — both skip.
 ///
-/// A skipped copy costs nothing durable: the per-tenant slot still serves the
-/// default, and whatever write moved the state carries its own credential.
+/// A skipped copy never overwrites a fresher credential: the per-tenant slot
+/// still serves the default, and whatever write moved the state carries its
+/// own credential. It can, however, leave the legacy slot holding another
+/// tenant's token while the file names this default (D4 out of step) until
+/// the next pairing or reconcile — the right side to err on.
 /// Tokens are compared, never logged. Nothing called here takes the lock.
 fn copy_default_into_legacy_slot(
     mgr: &crate::auth::AuthManager,
@@ -1828,9 +1835,11 @@ fn copy_default_into_legacy_slot(
             == Some(default_tenant);
         let binding_user_is_ours = pf.effective_bindings().iter().any(|b| {
             uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(default_tenant)
-                && b.user_id.trim() == source.binding.user_id
+                && b.user_id.trim() == source.binding.user_id.trim()
         });
-        default_is_ours && binding_user_is_ours && pf.user_id.trim() == source.binding.user_id
+        default_is_ours
+            && binding_user_is_ours
+            && pf.user_id.trim() == source.binding.user_id.trim()
     });
     if !file_still_ours {
         tracing::warn!(
