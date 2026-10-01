@@ -87,6 +87,16 @@ export interface SettingsTabDef {
   id: SettingsTab;
   label: string;
   requires?: readonly FeatureDisclosure[];
+  /**
+   * A development-environment surface: every control on it talks to the dev
+   * supervisor. Listed only when the runner OBSERVES a supervisor
+   * (`GET /supervisor/observation`, `observed === true`) — an external
+   * operator's runner has none, so the entry would open onto nothing. Like
+   * `requires`, presentation-only: the panel stays routable by id, and renders
+   * its neutral "not available" line when reached without a supervisor.
+   * Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, B2.
+   */
+  devSurface?: true;
 }
 
 /**
@@ -106,7 +116,7 @@ export interface SettingsTabDef {
  */
 export const SETTINGS_TABS: readonly SettingsTabDef[] = [
   { id: "account", label: "Account" },
-  { id: "dev-loop", label: "Test My Change" },
+  { id: "dev-loop", label: "Test My Change", devSurface: true },
   { id: "backend-connection", label: "Backend Connection" },
   { id: "devenv-enroll", label: "Devenv Enrollment" },
   { id: "ai", label: "AI Providers" },
@@ -148,7 +158,7 @@ export const SETTINGS_TABS: readonly SettingsTabDef[] = [
   { id: "instances", label: "Advanced / Testing" },
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
-  { id: "ci-runner", label: "CI Runner" },
+  { id: "ci-runner", label: "CI Runner", devSurface: true },
   // Live-session protection floors + the `ci_node` build-admission floors
   // (plan 2026-08-07-runner-resource-guard-and-session-protection, Part B).
   // Deliberately NOT behind a disclosure: it protects the Terminal-first
@@ -176,8 +186,24 @@ export const VALID_SETTINGS_TABS: readonly SettingsTab[] = SETTINGS_TABS.map((t)
  */
 export function visibleSettingsTabs(
   isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
+  supervisorObserved: boolean = false,
 ): readonly SettingsTabDef[] {
-  return SETTINGS_TABS.filter((tab) => !tab.requires || tab.requires.some(isDisclosureEnabled));
+  return SETTINGS_TABS.filter((tab) => isTabShown(tab, isDisclosureEnabled, supervisorObserved));
+}
+
+/**
+ * PURE: is this tab listed, ignoring the anti-stranding rule? A `devSurface`
+ * tab needs an observed supervisor; `supervisorObserved` defaults to `false`
+ * so a caller that does not know hides the dev surfaces rather than
+ * advertising them.
+ */
+export function isTabShown(
+  tab: SettingsTabDef,
+  isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
+  supervisorObserved: boolean,
+): boolean {
+  if (tab.devSurface && !supervisorObserved) return false;
+  return !tab.requires || tab.requires.some(isDisclosureEnabled);
 }
 
 /**
@@ -199,9 +225,10 @@ export function visibleSettingsTabs(
 export function settingsTabsFor(
   isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
   activeTab: SettingsTab | null,
+  supervisorObserved: boolean = false,
 ): readonly SettingsTabDef[] {
   return SETTINGS_TABS.filter(
-    (tab) => tab.id === activeTab || !tab.requires || tab.requires.some(isDisclosureEnabled),
+    (tab) => tab.id === activeTab || isTabShown(tab, isDisclosureEnabled, supervisorObserved),
   );
 }
 
@@ -226,6 +253,7 @@ export function isSettingsNavItemVisible(
   navItemId: string,
   isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
   activeTab?: string,
+  supervisorObserved: boolean = false,
 ): boolean {
   if (!navItemId.startsWith("settings-")) return true;
   const subTab = MAIN_TAB_TO_SETTINGS_SUB_TAB[navItemId as SettingsMainTabId];
@@ -234,7 +262,9 @@ export function isSettingsNavItemVisible(
     activeTab && isSettingsTabId(activeTab as MainTabId)
       ? (MAIN_TAB_TO_SETTINGS_SUB_TAB[activeTab as SettingsMainTabId] ?? null)
       : null;
-  return settingsTabsFor(isDisclosureEnabled, activeSubTab).some((tab) => tab.id === subTab);
+  return settingsTabsFor(isDisclosureEnabled, activeSubTab, supervisorObserved).some(
+    (tab) => tab.id === subTab,
+  );
 }
 
 /**

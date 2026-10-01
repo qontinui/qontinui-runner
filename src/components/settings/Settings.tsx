@@ -46,10 +46,12 @@ import {
   SETTINGS_SUB_TAB_TO_MAIN_TAB,
   SETTINGS_TABS,
   settingsTabsFor,
+  isTabShown,
   VALID_SETTINGS_TABS,
   type SettingsTab,
 } from "./settings-tabs";
 import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
+import { useSupervisorObserved } from "@/hooks/useSupervisorObservation";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -126,7 +128,11 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
   // Sub-nav buttons: the disclosure-visible set UNION the active tab. The rule
   // lives in `settings-tabs.ts` so the sidebar's Settings flyout applies the
   // identical one — see `settingsTabsFor`.
-  const subNavTabs = useMemo(() => settingsTabsFor(isEnabled, activeTab), [isEnabled, activeTab]);
+  const supervisorObserved = useSupervisorObserved();
+  const subNavTabs = useMemo(
+    () => settingsTabsFor(isEnabled, activeTab, supervisorObserved),
+    [isEnabled, activeTab, supervisorObserved],
+  );
 
   // UI Bridge: Component-level actions for AI control
   useUIComponent({
@@ -228,7 +234,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
             id: t.id,
             label: t.label,
             // Presentation gating only — `switch-tab` accepts every id here.
-            visibleInSubNav: !t.requires || t.requires.some(isEnabled),
+            visibleInSubNav: isTabShown(t, isEnabled, supervisorObserved),
             requiresDisclosure: t.requires ?? null,
           })),
       },

@@ -182,18 +182,6 @@ reviewed = [
 [[disposition]]
 class = "supervisor_dependency"
 file = "src/api_config.rs"
-symbol = "get_supervisor_socket_addr"
-disposition = "fallback_correct"
-note = "Resolver only; parses get_supervisor_url, contacts nothing."
-reviewed = [
-    "format!(\"127.0.0.1:{}\", DEFAULT_SUPERVISOR_PORT)",
-    "let url = get_supervisor_url();",
-    "pub fn get_supervisor_socket_addr() -> String {",
-]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/api_config.rs"
 symbol = "get_supervisor_url"
 disposition = "fallback_correct"
 note = "Resolver only (env override, else 127.0.0.1:9875); returns a URL and contacts nothing. Callers carry their own disposition."
@@ -258,22 +246,23 @@ reviewed = [
 
 [[disposition]]
 class = "supervisor_dependency"
-file = "src/mcp/ai_session.rs"
-symbol = "run_prompt"
+file = "src/mcp/app_discovery.rs"
+symbol = "desktop_ports_merged"
 disposition = "fallback_correct"
-note = "Passes check_supervisor_available() to runner_rules_prefix, which picks the supervisor-DOWN rules block when it is false."
+note = "Adds the supervisor's port to the desktop scan only when the observation reports observed=true; no supervisor port is hard-coded (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B2)."
 reviewed = [
-    "super::auto_continue::check_supervisor_available(),",
+    "let (supervisor, user) = tokio::join!(observed_supervisor_port(), user_discovery_ports());",
 ]
 
 [[disposition]]
 class = "supervisor_dependency"
 file = "src/mcp/app_discovery.rs"
-symbol = "const DESKTOP_APP_PORTS"
+symbol = "observed_supervisor_port"
 disposition = "fallback_correct"
-note = "One port in a discovery scan list; an absent listener is simply not discovered."
+note = "Runs the one supervisor probe off the async runtime; a failed join or a not-observed/unknown verdict yields None, so nothing extra is scanned."
 reviewed = [
-    "9875,",
+    "async fn observed_supervisor_port() -> Option<u16> {",
+    "let obs = spawn_blocking_tracked(crate::mcp::auto_continue::observe_supervisor)",
 ]
 
 [[disposition]]
@@ -281,10 +270,49 @@ class = "supervisor_dependency"
 file = "src/mcp/auto_continue.rs"
 symbol = "check_supervisor_available"
 disposition = "fallback_correct"
-note = "A 500 ms TCP probe that returns false when no supervisor listens; that false is what selects the supervisor-less briefing."
+note = "The one 500 ms TCP probe. Tri-state: Some(false) when no supervisor listens, None when the configured address does not parse (nothing probed). Callers treat only Some(true) as present."
 reviewed = [
-    "let addr = crate::api_config::get_supervisor_socket_addr();",
-    "pub fn check_supervisor_available() -> bool {",
+    "&crate::api_config::get_supervisor_socket_addr()?,",
+    "probe_supervisor_at(",
+    "pub fn check_supervisor_available() -> Option<bool> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "get_supervisor_observation"
+disposition = "fallback_correct"
+note = "GET /supervisor/observation: the same probe served as a read for the dev-only settings panels, which render nothing supervisor-related unless observed=true (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B2)."
+reviewed = [
+    "async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "observe_supervisor"
+disposition = "fallback_correct"
+note = "Resolves the configured supervisor address/URL and probes it; contacts nothing but the TCP connect, and an absent supervisor reads observed=false."
+reviewed = [
+    "&crate::api_config::get_supervisor_url(),",
+    "observe_supervisor_at(",
+    "pub fn observe_supervisor() -> SupervisorObservation {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "observe_supervisor_at"
+disposition = "fallback_correct"
+note = "Builds GET /supervisor/observation under one deadline: no port or unresolvable => observed=null; no listener or not a supervisor => false. Only dev-only panels and discovery consume it."
+reviewed = [
+    "match confirm_supervisor_identity(&base_url, remaining) {",
+    "match probe_supervisor_at(&host_port, budget.min(SUPERVISOR_PROBE_TIMEOUT)) {",
+    "\"the configured supervisor URL {supervisor_url:?} names no port, so nothing was probed\"",
+    "let Some(host_port) = crate::api_config::supervisor_host_port(supervisor_url) else {",
+    "let scheme = supervisor_url.split_once(\"://\").map_or(\"http\", |x| x.0);",
+    "supervisor_url: &str,",
+    "pub fn observe_supervisor_at(",
 ]
 
 [[disposition]]
@@ -387,4 +415,66 @@ disposition = "fallback_correct"
 note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
 reviewed = [
     "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "get_supervisor_socket_addr"
+disposition = "fallback_correct"
+note = "Resolver only: the host:port of get_supervisor_url, None when the URL names no port (no substituted default); contacts nothing."
+reviewed = [
+    "pub fn get_supervisor_socket_addr() -> Option<String> {",
+    "supervisor_host_port(&get_supervisor_url())",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/api_config.rs"
+symbol = "supervisor_host_port"
+disposition = "fallback_correct"
+note = "Pure URL authority parser; contacts nothing."
+reviewed = [
+    "pub fn supervisor_host_port(url: &str) -> Option<String> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "confirm_supervisor_identity"
+disposition = "fallback_correct"
+note = "GET <base>/health within the observation's remaining deadline (no redirects, no proxy), body capped at 64 KiB; anything but a supervisor-shaped body reads observed=false with a reason."
+reviewed = [
+    "fn confirm_supervisor_identity(base_url: &str, timeout: std::time::Duration) -> Result<(), String> {",
+    "if is_supervisor_health(&body) {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "is_supervisor_health"
+disposition = "fallback_correct"
+note = "Pure identity predicate over a /health body (supervisor.project_dir); contacts nothing."
+reviewed = [
+    "pub fn is_supervisor_health(body: &serde_json::Value) -> bool {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/auto_continue.rs"
+symbol = "probe_supervisor_at"
+disposition = "fallback_correct"
+note = "Resolves host:port and tries every address within one bounded budget; an absent supervisor reads Some(false), unresolvable None."
+reviewed = [
+    "pub fn probe_supervisor_at(addr: &str, budget: std::time::Duration) -> Option<bool> {",
+]
+
+[[disposition]]
+class = "supervisor_dependency"
+file = "src/mcp/ai_session.rs"
+symbol = "run_prompt"
+disposition = "fallback_correct"
+note = "Runs check_supervisor_available on a blocking thread and passes == Some(true) to runner_rules_prefix: only an OBSERVED listener selects the supervisor recipe; absent, unknown (None) or a failed join selects the supervisor-DOWN rules block."
+reviewed = [
+    "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
 ]

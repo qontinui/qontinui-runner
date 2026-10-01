@@ -16,9 +16,20 @@
 // artifacts to the triple-suffixed paths Tauri expects.
 //
 // Wired into `beforeBuildCommand` (`tauri.conf.json`), so it runs on every
-// `tauri build` (CI release + local bundle) and NOT on `cargo build`/`cargo check`
-// (the supervisor's debug-exe rebuild path is unaffected — externalBin only gates
-// bundling). Fails LOUD: a missing binary at bundle time would abort `tauri build`
+// `tauri build` (CI release + local bundle) and NOT on `cargo build`/`cargo check`.
+// Those cargo-only builds (the supervisor's debug-exe rebuild, CI `cargo test`)
+// have no sidecars here, and externalBin is NOT bundling-only: tauri-build's
+// build script copies every externalBin into the cargo target dir on every run.
+// `src-tauri/build.rs` `hide_external_bin_from_tauri_build` therefore hides
+// externalBin from tauri-build on every run; the bundler still reads
+// `binaries/` itself, through the config the tauri CLI parsed. Until 2026-09-27
+// build.rs wrote 0-byte placeholders instead, which tauri-build copied over the
+// real `qontinui-pr` and the runner then published onto PATH as a CLI that exits
+// 0 having opened no PR (plan
+// 2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli).
+// So every sidecar this script writes is checked to be a real native executable
+// for the target (scripts/lib/native-exe.mjs) before the bundler can see it.
+// Fails LOUD: a missing binary at bundle time would abort `tauri build`
 // anyway, so surfacing the cause here (with the exact cargo error) is strictly
 // better than a downstream "external binary not found".
 //
@@ -32,12 +43,15 @@ import { copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { nativeExecutableProblem } from "./lib/native-exe.mjs";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const runnerRoot = resolve(scriptDir, "..");
 const srcTauri = join(runnerRoot, "src-tauri");
 
 // Keep in sync with `tauri.conf.json` `bundle.externalBin` and
-// `src-tauri/build.rs` `ensure_sidecar_placeholders`.
+// `src-tauri/build.rs` `EXTERNAL_BIN_SIDECARS` (a build.rs test pins the
+// latter to tauri.conf.json).
 const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr"];
 
 function fail(msg) {
@@ -129,5 +143,11 @@ for (const bin of SIDECAR_BINS) {
   }
   const dest = join(binariesDir, `${bin}-${triple}${exeExt}`);
   copyFileSync(builtExe, dest);
+  // Validate what LANDED, not only what cargo reported: an empty or non-native
+  // sidecar must fail the bundle here rather than ship as a silent no-op CLI.
+  const problem = nativeExecutableProblem(dest, triple);
+  if (problem) {
+    fail(`${dest} is not a real ${bin} executable for ${triple}: ${problem} (copied from ${builtExe})`);
+  }
   console.log(`[bundle-profile-sidecar] wrote sidecar -> ${dest}`);
 }

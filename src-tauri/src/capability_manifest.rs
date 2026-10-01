@@ -42,7 +42,8 @@
 //! module ([`crate::bundled_resources`], [`crate::workspace_paths`],
 //! [`crate::spec_api`], [`crate::fleet_commands`], [`crate::fleet_skills`],
 //! [`crate::fleet_agents`], [`crate::agent_runtime`],
-//! [`crate::agent_commands`], [`crate::slash_commands`]). A lib-side copy could
+//! [`crate::agent_commands`], [`crate::slash_commands`],
+//! [`crate::install_effects_producer::intercept::shim_materializer`]). A lib-side copy could
 //! not call a single one of them, and `impl From<crate::agent_commands::CommandSource>`
 //! would not even compile there.
 //!
@@ -143,6 +144,19 @@
 //! [`Rung::from_command_source`] and [`rung_for_skill_source`].
 //!
 //! Rows still owned by Phases 2 and 4-7 remain `Unknown`, naming their anchors.
+//!
+//! # The `session_cli` row: a delivery that used to fail SILENTLY
+//!
+//! Plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+//! Phase 1d. The `qontinui-pr` session CLI is published onto every runner
+//! terminal's PATH from beside the runner exe, and for months a 0-byte build
+//! placeholder was published in its place: `qontinui-pr create` exited 0 having
+//! opened no PR, and nothing anywhere said so. The materializer now refuses such a
+//! file; this row makes the refusal — and which placement answered when nothing
+//! was refused — a value. It is PROBED read-only by
+//! [`ManifestInputs::observed_here`] (its source is one file beside the exe, so a
+//! cold process can look) and RECORDED by each delivery; see
+//! [`with_recorded_reading`] for how the two meet.
 
 use qontinui_types::paths::WorkspaceRootKind;
 use serde::{Serialize, Serializer};
@@ -190,10 +204,17 @@ pub enum Rung {
     /// every machine that has the binary, by construction. This is the rung a
     /// capability wants to be on if it wants to be portable.
     Embedded,
-    /// Unpacked from the installer's `bundle.resources` and located through
-    /// Tauri's `BaseDirectory::Resource`. Ships with the installer, but — unlike
-    /// [`Embedded`](Self::Embedded) — can be absent if the bundle declaration
-    /// does not list the file, which is a defect invisible on a dev box.
+    /// Shipped inside the installer: unpacked from its `bundle.resources` and
+    /// located through Tauri's `BaseDirectory::Resource`, or placed beside the
+    /// exe as a `bundle.externalBin` sidecar (the `qontinui-pr` session CLI).
+    /// Ships with the installer, but — unlike [`Embedded`](Self::Embedded) —
+    /// can be absent if the bundle declaration does not list the file, which
+    /// is a defect invisible on a dev box.
+    ///
+    /// The sidecar arm is this rung and not a new one on purpose: the property
+    /// the rung names — carried by the INSTALLER rather than by the binary, and
+    /// missing exactly when the bundle declaration omits it — is the same, and
+    /// a sixth vocabulary is what this enum exists to prevent.
     BundleResource,
     /// Fetched over the network from qontinui-web or coord at run time. Portable
     /// in principle; unavailable to an offline or unpaired operator, which is a
@@ -278,8 +299,9 @@ impl Rung {
                  wherever the binary is"
             }
             Rung::BundleResource => {
-                "unpacked from the installer's `bundle.resources` and located via \
-                 Tauri's `BaseDirectory::Resource`"
+                "shipped inside the installer — unpacked from its `bundle.resources` and \
+                 located via Tauri's `BaseDirectory::Resource`, or placed beside the exe \
+                 as a `bundle.externalBin` sidecar"
             }
             Rung::Served => "fetched over the network from qontinui-web or coord at run time",
             Rung::DiskCache => {
@@ -760,6 +782,33 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       all there.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "slash_commands::{find_commands_directory_reported, sync_slash_commands}",
+    },
+    CapabilitySpec {
+        id: "session_cli",
+        class: "session_provisioning",
+        description: "The `qontinui-pr` session CLI on every runner terminal's PATH (the \
+                      shared identity-shim dir), copied there from beside the runner exe so \
+                      an agent can run `qontinui-pr create` with no personal GitHub login. \
+                      The row describes the file a terminal actually RUNS: once this \
+                      build's identity dir exists it is decided by the published copy on \
+                      PATH, with the source beside the exe reported alongside (a runnable \
+                      copy is kept when the source later disappears; a missing copy is \
+                      re-delivered by a later spawn); before any terminal has spawned it \
+                      is decided by the source, i.e. what the next spawn would deliver. A \
+                      dev build (a debug build, or one run from a cargo target dir) \
+                      answers `exe_relative_checkout`; an installed release build answers \
+                      from the installer's `bundle.externalBin` sidecar. A file that is \
+                      present but is not a runnable native executable is REFUSED, never \
+                      published, and named in `rejected`: a 0-byte build placeholder on \
+                      PATH made `qontinui-pr create` exit 0 having opened no PR, while an \
+                      absent CLI fails loudly as command-not-found. Probed read-only, so \
+                      a cold process answers too.",
+        expected_rungs: &[
+            Rung::BundleResource,
+            Rung::ExeRelativeCheckout,
+            Rung::Unresolved,
+        ],
+        anchor: "shim_materializer::{materialize_session_cli, session_cli_observation} over the published SESSION_CLI_BIN, else the one beside current_exe()",
     },
 ];
 
@@ -1332,6 +1381,10 @@ pub struct ManifestInputs {
     pub agent_skills_registry: Option<CapabilityObservation>,
     /// `slash_commands` — observed by [`crate::slash_commands`].
     pub slash_commands: Option<CapabilityObservation>,
+    /// `session_cli` — observed by
+    /// [`crate::install_effects_producer::intercept::shim_materializer`]:
+    /// recorded by each delivery, probed read-only by [`Self::observed_here`].
+    pub session_cli: Option<CapabilityObservation>,
 }
 
 impl ManifestInputs {
@@ -1358,6 +1411,7 @@ impl ManifestInputs {
             agent_commands_registry: None,
             agent_skills_registry: None,
             slash_commands: None,
+            session_cli: None,
         }
     }
 
@@ -1383,11 +1437,12 @@ impl ManifestInputs {
         inputs.agent_commands_registry = latest_observation("agent_commands_registry");
         inputs.agent_skills_registry = latest_observation("agent_skills_registry");
         inputs.slash_commands = latest_observation("slash_commands");
+        inputs.session_cli = latest_observation("session_cli");
         inputs
     }
 
     /// **The Phase 4 driver.** Everything [`observed`](Self::observed) has, plus
-    /// the two rows a caller can probe DIRECTLY, right here, read-only.
+    /// the three rows a caller can probe DIRECTLY, right here, read-only.
     ///
     /// Both doors — the pre-GUI `--capability-manifest` flag and
     /// `GET /capability-manifest` on a running instance — call this, so the two
@@ -1407,6 +1462,13 @@ impl ManifestInputs {
     ///   [`Rung::Unknown`] rather than a checkout rung, because the bundle rung
     ///   needs a Tauri `AppHandle` that does not exist yet; see that function's
     ///   docs for why promoting the checkout reading would fabricate a finding.
+    /// - `session_cli` — probed. [`crate::install_effects_producer::intercept::shim_materializer::session_cli_observation`]
+    ///   reads the copy PUBLISHED in this build's identity dir when that dir
+    ///   exists (the file a terminal runs), else the `qontinui-pr` beside the
+    ///   running exe (what the next spawn would deliver) — stats and at most
+    ///   4-byte header reads, the same executable check delivery applies. So
+    ///   it answers from a cold process and writes nothing: it never
+    ///   materializes the identity dir it is describing.
     /// - `spec_pages` — **not probeable**. Its `root` comes from
     ///   `spec_api::storage::resolve_specs_root`, an async lookup in the `apps`
     ///   registry in Postgres. The arm is RECORDED as real reads take it, so a
@@ -1418,14 +1480,23 @@ impl ManifestInputs {
     ///   be filled: running a provisioning pass to observe one would write files
     ///   into somebody's worktree as a side effect of a report.
     ///
-    /// The two probes overwrite whatever the ledger held for those rows on
-    /// purpose: they are live readings taken now, while a ledger entry is a
-    /// recording of something that happened earlier in this process.
+    /// The probes overwrite whatever the ledger held for those rows on purpose:
+    /// they are live readings taken now, while a ledger entry is a recording of
+    /// something that happened earlier in this process. `session_cli` is the one
+    /// probed row whose resolver ALSO records, and its recording can hold a fact
+    /// the probe cannot see (a sound source whose copy failed to land), so the
+    /// probe still wins the row but the recording rides along in its note — see
+    /// [`with_recorded_reading`].
     #[must_use]
     pub fn observed_here() -> Self {
         let mut inputs = ManifestInputs::observed();
         inputs.workspace_root = Some(crate::workspace_paths::workspace_root_observation());
         inputs.bundled_resources = Some(crate::bundled_resources::bundled_resources_observation());
+        inputs.session_cli = Some(with_recorded_reading(
+            crate::install_effects_producer::intercept::shim_materializer::session_cli_observation(
+            ),
+            inputs.session_cli.take(),
+        ));
         inputs
     }
 
@@ -1446,6 +1517,7 @@ impl ManifestInputs {
             "agent_commands_registry" => self.agent_commands_registry.as_ref(),
             "agent_skills_registry" => self.agent_skills_registry.as_ref(),
             "slash_commands" => self.slash_commands.as_ref(),
+            "session_cli" => self.session_cli.as_ref(),
             _ => None,
         }
     }
@@ -1466,7 +1538,49 @@ impl ManifestInputs {
                 | "agent_commands_registry"
                 | "agent_skills_registry"
                 | "slash_commands"
+                | "session_cli"
         )
+    }
+}
+
+/// A live probe's reading, with whatever this process RECORDED for the same row
+/// carried in its note rather than discarded.
+///
+/// The probe wins the row — the rule [`ManifestInputs::observed_here`] states
+/// for every probed row: a reading taken now beats a recording of something
+/// earlier. But a resolver that also records can hold a fact the probe cannot
+/// see — for `session_cli`, a sound source whose copy in the identity dir was
+/// refused or failed to land — and dropping it would hide exactly the kind of
+/// delivery failure the row exists to expose. So the recording is summarised
+/// (its rung, plus `rejected` / `detail` / `note` where present) and appended
+/// to the live note. `None` leaves the probe untouched. Pure.
+fn with_recorded_reading(
+    live: CapabilityObservation,
+    recorded: Option<CapabilityObservation>,
+) -> CapabilityObservation {
+    let Some(rec) = recorded else {
+        return live;
+    };
+    let mut summary = format!(
+        "recorded earlier in this process (the probe above wins the row): `{}`",
+        rec.rung.wire()
+    );
+    for (label, value) in [
+        ("rejected", &rec.rejected),
+        ("detail", &rec.detail),
+        ("note", &rec.note),
+    ] {
+        if let Some(value) = value {
+            summary.push_str(&format!("; {label}: {value}"));
+        }
+    }
+    let note = match live.note {
+        Some(live_note) => format!("{live_note} | {summary}"),
+        None => summary,
+    };
+    CapabilityObservation {
+        note: Some(note),
+        ..live
     }
 }
 
@@ -1828,6 +1942,7 @@ mod tests {
             agent_commands_registry: None,
             agent_skills_registry: None,
             slash_commands: None,
+            session_cli: None,
         }
     }
 
@@ -2394,6 +2509,7 @@ mod tests {
                 "agent_commands_registry",
                 "agent_skills_registry",
                 "slash_commands",
+                "session_cli",
             ]
         );
         let unique: BTreeSet<&str> = ids.iter().copied().collect();
@@ -2751,6 +2867,25 @@ mod tests {
             .as_deref()
             .is_some_and(|d| d.contains("asset(s) probed")));
 
+        // `session_cli` is probed too — the `qontinui-pr` file beside this
+        // (test) executable — so it carries a real verdict whatever that file
+        // is: `unknown` would mean the driver stopped calling
+        // `shim_materializer::session_cli_observation`. Which verdict depends on
+        // the box (a target dir may or may not hold the CLI beside the test
+        // binary), so only the split and the rung SET are pinned.
+        let cli = manifest.row("session_cli").expect("row present");
+        assert_ne!(
+            cli.rung,
+            Rung::Unknown,
+            "`session_cli` is probed by `observed_here`; `unknown` there means the driver \
+             stopped calling `shim_materializer::session_cli_observation`"
+        );
+        assert!(
+            capability("session_cli").expected_rungs.contains(&cli.rung),
+            "session_cli reported {:?}, a rung its probe cannot emit",
+            cli.rung.wire()
+        );
+
         // `spec_pages` is asserted CONDITIONALLY, not as `unknown`. The
         // provisioning store is process-wide and `spec_api::storage`'s own unit
         // tests exercise the bare read wrappers, which record a real arm — so a
@@ -2836,6 +2971,78 @@ mod tests {
         assert_ne!(manifest.row("workspace_root").unwrap().rung, Rung::Unknown);
 
         reset_provision_store();
+    }
+
+    /// A live probe wins the row, but a reading this process RECORDED for the
+    /// same row survives in the note — the case that matters being a sound
+    /// source whose delivery nonetheless failed, which the probe alone cannot
+    /// see. Tested on the pure fold rather than through the process-wide store:
+    /// the materializer's own tests record `session_cli` from other threads.
+    #[test]
+    fn a_live_probe_wins_the_row_and_the_recorded_reading_rides_in_its_note() {
+        let live = CapabilityObservation::new(Rung::ExeRelativeCheckout)
+            .with_resolved_path("/profile/qontinui-pr")
+            .with_detail("runnable");
+        let recorded = CapabilityObservation::new(Rung::Unresolved)
+            .with_rejected("/identity/qontinui-pr: zero-length file")
+            .with_note("the copy in the identity dir was refused");
+
+        let folded = with_recorded_reading(live.clone(), Some(recorded));
+        assert_eq!(folded.rung, Rung::ExeRelativeCheckout, "the probe wins");
+        assert_eq!(folded.resolved_path, live.resolved_path);
+        assert_eq!(folded.detail, live.detail);
+        assert_eq!(
+            folded.rejected, None,
+            "the recording's rejection is not promoted"
+        );
+        let note = folded.note.expect("the recording must survive in the note");
+        assert!(note.contains("`unresolved`"), "{note}");
+        assert!(
+            note.contains("/identity/qontinui-pr: zero-length file"),
+            "{note}"
+        );
+        assert!(
+            note.contains("the copy in the identity dir was refused"),
+            "{note}"
+        );
+
+        // An existing live note is kept, and the recording is appended to it.
+        let noted = with_recorded_reading(
+            live.clone().with_note("live note"),
+            Some(CapabilityObservation::new(Rung::BundleResource)),
+        );
+        let note = noted.note.unwrap();
+        assert!(note.starts_with("live note | "), "{note}");
+        assert!(note.contains("`bundle_resource`"), "{note}");
+
+        // Nothing recorded: the probe is returned untouched.
+        assert_eq!(with_recorded_reading(live.clone(), None), live);
+    }
+
+    /// The `session_cli` row's shape, pinned: a session-provisioning row whose
+    /// expected rungs are the installer's sidecar, the dev build's cargo
+    /// profile dir, and the honest absence — drawn from the EXISTING
+    /// vocabulary, with no rung added for it.
+    #[test]
+    fn the_session_cli_row_uses_the_existing_rung_vocabulary() {
+        let spec = capability("session_cli");
+        assert_eq!(spec.class, "session_provisioning");
+        assert_eq!(
+            spec.expected_rungs,
+            &[
+                Rung::BundleResource,
+                Rung::ExeRelativeCheckout,
+                Rung::Unresolved
+            ]
+        );
+        assert!(spec.anchor.contains("materialize_session_cli"));
+        assert!(spec.anchor.contains("session_cli_observation"));
+        // The refusal is part of the contract a reader of the doc relies on.
+        assert!(spec.description.contains("REFUSED"));
+        assert!(spec.description.contains("`rejected`"));
+        // `BundleResource` now names the sidecar arm, so the rung this row
+        // reports on an installed build is described truthfully in the doc.
+        assert!(Rung::BundleResource.describe().contains("externalBin"));
     }
 
     /// The two stale rows Phase 2 flagged, pinned so they cannot silently

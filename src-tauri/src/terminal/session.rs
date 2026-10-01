@@ -5578,6 +5578,52 @@ mod tests {
         Arc::try_unwrap(emitted).unwrap().into_inner().unwrap()
     }
 
+    /// Plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+    /// Phase 8. A TUI that died between `?2026h` and `?2026l` must not leave every
+    /// later chunk held until the next read (one read behind): once the block is older than
+    /// `grid::SYNC_OUTPUT_TIMEOUT`, the next chunk is emitted in the read that
+    /// carried it. Drives the same grid-advance → `sync_output()` → `feed`
+    /// sequence the reader thread runs.
+    #[test]
+    fn never_closed_sync_block_stops_holding_output_after_timeout() {
+        let grid = Arc::new(Mutex::new(Grid::new(80, 24)));
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut parser = vte::Parser::new();
+        let mut coalescer = SyncFrameCoalescer::new();
+        let emitted = Arc::new(Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
+        let mut read = |data: &[u8], offset: u64, coalescer: &mut SyncFrameCoalescer| {
+            advance_grid(&grid, &generation, &mut parser, data);
+            let in_sync = grid.lock().unwrap().sync_output();
+            let sink = emitted.clone();
+            coalescer.feed(data, offset, in_sync, move |p, o| {
+                sink.lock().unwrap().push((p.to_vec(), o));
+            });
+        };
+
+        // The TUI opens a frame and dies mid-frame: held, as designed.
+        read(b"\x1b[?2026hHALF A FRAME", 0, &mut coalescer);
+        assert!(emitted.lock().unwrap().is_empty(), "an open frame is held");
+        // Ship the orphaned half frame. This stands in for the pre-read time
+        // cap (`flush_if_timed_out`), which in the real loop can only fire once
+        // another read returns — a held frame cannot flush while the read is
+        // blocked. That gap is separate from the expiry pinned here.
+        coalescer.flush_remaining(|p, o| emitted.lock().unwrap().push((p.to_vec(), o)));
+        assert_eq!(emitted.lock().unwrap().len(), 1);
+
+        // The block is now older than the sync timeout.
+        grid.lock()
+            .unwrap()
+            .backdate_sync_output_open(super::super::grid::SYNC_OUTPUT_TIMEOUT);
+
+        // A later chunk (a shell prompt after the TUI died) is emitted in the
+        // same read — not held until the next read returns.
+        read(b"$ ", 20, &mut coalescer);
+        let events = emitted.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "emitted immediately: {events:?}");
+        assert_eq!(events[1], (b"$ ".to_vec(), 20));
+        assert!(!grid.lock().unwrap().sync_output());
+    }
+
     // ---- Phase 5: visibility-tiered webview admission ----
 
     /// `focused` is today's behavior, byte for byte: the flow-control gate is

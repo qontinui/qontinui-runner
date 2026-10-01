@@ -641,18 +641,42 @@ Its exit and its `verdict` must agree; disagreement is UNKNOWN — leave the rep
 | `3` | `INCOMPLETE` | Report it with its `incomplete_reason` and nothing more |
 | `4` | — | Usage — a defect in this skill's call. Leave the repo and quote the message. |
 
-**3c. Dirty tree** (`dirty_tracked` > 0). Classify each dirty file:
+**3c. Dirty tree** (`dirty_tracked` > 0 **or** `dirty_untracked` > 0). First
+answer the one question that decides most dirty trees — *is this WIP already on
+main?* — with the token-lean summary, not the JSON:
 
 ```bash
-bash "$DIRTYPROV" --json "$CO" >"$RUN_DIR/dirty-$REPO.json"
+bash "$DIRTYPROV" --summary "$CO" >"$RUN_DIR/dirty-$REPO.txt"; echo "dirty-provenance exit $?"
 ```
+
+Read the `verdict:` line, the class counts, and the `not-restorable:` and
+`untracked-not-on-upstream:` lines. You do not need the JSON to decide: the sweep
+re-runs `dirty-provenance.sh --json` itself under `--restore-residue` and enforces
+every per-file condition (each file `restorable`, the provenance list equal to
+the checkout's full dirty list, tracked AND untracked), so it abstains on
+anything the summary did not prove.
+
+A file is restorable when its bytes are already on the upstream default branch
+— `UPSTREAM_CURRENT` (every version, blob and mode, equals the upstream tip:
+restore + fast-forward reproduces the same bytes, anywhere in the tree) or
+`UPSTREAM_HISTORICAL` (an older upstream version: in upstream history, and the
+sweep snapshots it to `refs/wip/return-to-main/*-residue` before restoring) —
+or when it is `RUNNER_BUNDLE` / `EOL_ONLY` residue inside the runner
+provisioner's footprint (`.claude/commands/**`, `.claude/skills/**`). Staged
+entries count; an untracked file is restorable only when it is byte-identical to
+the upstream tip (listed under `untracked` as "on upstream").
 
 | `dirty-provenance.sh` exit | Decision |
 |---|---|
-| `0`, with `all_residue: true`, `unique_count: 0` and every `files[]` entry `restorable: true` | Every modified tracked file is restorable: a residue class (upstream-historical, runner-bundle or EOL-only) at a path inside the runner provisioner's footprint, `.claude/commands/**` or `.claude/skills/**`. ACT repo — under a QUIET verdict, or act-eligible under the per-repo override: the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below); the restore applies only to those `restorable` files. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. An exit 0 beside any `files[]` entry that is not `restorable: true` contradicts itself: UNKNOWN, leave it. |
-| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a residue-class file outside the provisioner footprint (`restorable_reason` "outside provisioner footprint" — bytes cannot tell a provisioner's write from a person's deliberate revert). Leave the repo exactly as found and list every non-restorable path with its `class` and `restorable_reason`. |
+| `0`, and the summary reads `untracked: … 0 not on upstream` | Every dirty path is already on main (or in-footprint residue). ACT repo — under a QUIET verdict, or act-eligible under the per-repo override: the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below), which removes exactly those files and lets the repo fast-forward. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. |
+| `0`, with any `untracked-not-on-upstream:` line | The tracked dirt is restorable but an untracked file is content upstream lacks, which the sweep never removes. Leave the repo and list those untracked paths. |
+| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. |
 | `3` | UNKNOWN. Leave it. |
 | `4` | Usage — a defect in this skill's call. Leave it and report the message. |
+
+The same answer is available by hand as `scripts/wip-on-main.sh <checkout>` in a
+config-repo checkout; this job calls the bundled `$DIRTYPROV` because the runner's
+fleet-skill bundle does not ship `scripts/`.
 
 ```bash
 bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-residue-$REPO.json" 2>"$RUN_DIR/quiesce-residue-$REPO.err"; echo "re-check exit $?"
@@ -664,9 +688,11 @@ Then, when 1c lets it run as written:
 bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-residue-$REPO.jsonl" --only "$REPO" --restore-residue "$REPO" >"$RUN_DIR/residue-$REPO.json"
 ```
 
-Untracked files (`dirty_untracked`, `untracked_count`) are never removed by this
-job; if one blocks the fast-forward the sweep abstains, and you report the
-count. After a residue restore, read its decision row; if it now abstains as
+Untracked files are removed only when `dirty-provenance.sh` proves them
+byte-identical to the upstream tip (`untracked_on_upstream`), and only by the
+sweep under `--restore-residue`, after they are captured in the snapshot's
+untracked parent (`^3`). Any other untracked file is never removed; if one blocks
+the fast-forward the sweep abstains, and you report it. After a residue restore, read its decision row; if it now abstains as
 UNIQUE_WIP or MIXED on a clean tree, re-pin HEAD (3a) and continue to 3d once.
 
 **3d. Unlanded commits** (clean tracked tree, verdict `UNIQUE_WIP` or `MIXED`,

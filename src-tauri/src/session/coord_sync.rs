@@ -4145,6 +4145,7 @@ mod tests {
             Some("policy"),
             Some("2"),
             Some("native_mcp"),
+            None,
             crate::session::coord_transport_rung::OUTCOME_OK,
             "https://coord.qontinui.io/mcp",
             crate::session::coord_transport_rung::OPERATION_READ,
@@ -4239,6 +4240,7 @@ mod tests {
         let _registry = build_registry(coord.clone());
 
         let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            None,
             None,
             None,
             None,

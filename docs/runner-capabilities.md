@@ -11,7 +11,7 @@ Manifest schema version: `1`.
 Ordered from *carried by the build* down to *found on the operator's disk*, then the two non-answers. A capability resolving near the top resolves the same way on every machine; one resolving near the bottom resolves only where a checkout happens to exist.
 
 - `embedded` — compiled into the binary (`include_str!` / `include_dir!`) — present wherever the binary is
-- `bundle_resource` — unpacked from the installer's `bundle.resources` and located via Tauri's `BaseDirectory::Resource`
+- `bundle_resource` — shipped inside the installer — unpacked from its `bundle.resources` and located via Tauri's `BaseDirectory::Resource`, or placed beside the exe as a `bundle.externalBin` sidecar
 - `served` — fetched over the network from qontinui-web or coord at run time
 - `disk_cache` — read from a store this device wrote for itself (the on-disk override cache, or the local database) — never carried by the build
 - `exe_relative_checkout` — found relative to `current_exe()`, i.e. the checkout this binary was built in — answers on a dev box and nowhere else
@@ -103,6 +103,14 @@ Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as run
 - Class: `session_provisioning`
 - Resolved by: `slash_commands::{find_commands_directory_reported, sync_slash_commands}`
 - Expected rungs: operator_checkout, unresolved
+
+### 11. `session_cli`
+
+The `qontinui-pr` session CLI on every runner terminal's PATH (the shared identity-shim dir), copied there from beside the runner exe so an agent can run `qontinui-pr create` with no personal GitHub login. The row describes the file a terminal actually RUNS: once this build's identity dir exists it is decided by the published copy on PATH, with the source beside the exe reported alongside (a runnable copy is kept when the source later disappears; a missing copy is re-delivered by a later spawn); before any terminal has spawned it is decided by the source, i.e. what the next spawn would deliver. A dev build (a debug build, or one run from a cargo target dir) answers `exe_relative_checkout`; an installed release build answers from the installer's `bundle.externalBin` sidecar. A file that is present but is not a runnable native executable is REFUSED, never published, and named in `rejected`: a 0-byte build placeholder on PATH made `qontinui-pr create` exit 0 having opened no PR, while an absent CLI fails loudly as command-not-found. Probed read-only, so a cold process answers too.
+
+- Class: `session_provisioning`
+- Resolved by: `shim_materializer::{materialize_session_cli, session_cli_observation} over the published SESSION_CLI_BIN, else the one beside current_exe()`
+- Expected rungs: bundle_resource, exe_relative_checkout, unresolved
 
 ---
 

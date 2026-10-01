@@ -28,8 +28,11 @@
 #        no `pr #` -> the stub is never called
 #   c13  manual message without `leaving <b>`: unique tip match -> REAPED;
 #        ambiguous -> SNAPSHOT_ONLY; none + unlanded -> REFUSED
-#   c14  residue: upstream-historical, EOL-only, bundle path (with and without
-#        a runner repo), novel blob, staged change, no origin/<default>
+#   c14  residue: upstream-historical, EOL-only inside the footprint (REAPED)
+#        and outside it (c14b2 REFUSED), bundle path (with and without a runner
+#        repo), novel blob, staged historical change (REAPED), a historical blob
+#        under a mode neither R^1 nor the tip has (c14j REFUSED), no
+#        origin/<default>
 #   c15  ABSENT, malformed name, target/name sha mismatch, default-branch
 #        fast-forward snapshot
 #   c16  usage
@@ -48,6 +51,20 @@
 #   c23  check 5b's range rev-list fails (git shim)          -> UNKNOWN; control REAPED
 #   c24  patch-id fails (git shim) in check 6 and in 5b     -> UNKNOWN; controls REAPED
 #   c25  a linked worktree's `rebase -i --update-refs` lists the branch -> SNAPSHOT_ONLY
+#   c26  residue snapshots in the `git stash push -u` shape (plan 2026-09-29, the
+#        sweep never clears WIP that is already on main): tip-equal staged add +
+#        tip-equal untracked + historical staged -> REAPED; a unique INDEX blob
+#        behind a tip-equal worktree blob -> REFUSED; a unique UNTRACKED blob ->
+#        REFUSED; a deletion of a path the tip still has -> REFUSED, of a path the
+#        tip lacks -> REAPED; an R^3 that has a parent -> REFUSED
+#   c28  a renamed path in the snapshot: X (which origin/main still has) moved
+#        back to Y (whose blob IS historical at Y) -> REFUSED, because the path
+#        lists are read with --no-renames and X's deletion meets the deletion
+#        check (with rename detection only Y is listed and it would REAP)
+#   c27  residue entry modes and the deletion read: a mode-only staged change
+#        (blob == R^1's, mode differs) -> REFUSED; a symlink whose blob IS in
+#        upstream history at that path -> REFUSED; a deletion whose tip read
+#        fails (git shim on `ls-tree origin/main`) -> UNKNOWN, control REAPED
 #
 # HERMETIC: every repository is under a mktemp sandbox, each case has its own
 # local bare `origin` so the subject's `git fetch` works offline, HOME points
@@ -193,6 +210,19 @@ residue() {
   gq "$d" checkout -- "$3"
   printf '%s' "$ref"
 }
+# residue_u <dir> <stamp>: snapshot the CURRENT dirt (index, working tree AND
+# untracked files) in the `git stash push -u` shape -- R^1 HEAD, R^2 index, R^3
+# a parentless untracked-files commit when there are any -- the shape the sweep
+# writes when it removes untracked files. The tree is left clean.
+residue_u() {
+  local d="$1" ref="refs/wip/return-to-main/$2-$(basename "$1")-residue" s
+  gq "$d" stash push -q -u -m "residue fixture" || echo "FIXTURE: stash push -u failed in $d" >&2
+  s="$(g "$d" rev-parse -q --verify refs/stash)"
+  gq "$d" stash drop -q
+  gq "$d" update-ref --create-reflog -m "return-to-main-sweep: $(basename "$d") residue restore" "$ref" "$s"
+  printf '%s' "$ref"
+}
+nparents() { g "$1" rev-list --parents -n1 "$2" | wc -w | awk '{print $1 - 1}'; }
 
 # reap <dir> <ref> [extra args]: runs the subject; sets OUT, RC, NLINES.
 reap() {
@@ -527,6 +557,8 @@ if want c14; then
   put "$R" f.txt 'one\n'; cm "$R" v1 >/dev/null
   put "$R" f.txt 'second\n'; cm "$R" v2 >/dev/null
   put "$R" .claude/skills/x/SKILL.md 'local skill\n'; cm "$R" skill >/dev/null
+  put "$R" .claude/commands/e.md 'a\nb\n'; cm "$R" "an in-footprint command" >/dev/null
+  put "$R" x.sh 'x v1\n'; cm "$R" x1 >/dev/null; put "$R" x.sh 'x v2\n'; cm "$R" x2 >/dev/null
   gq "$R" push -q origin main
   # The fake runner repo whose origin/main history holds the bundle blob.
   RUN="$C/runner"; mkdir -p "$RUN"
@@ -543,12 +575,28 @@ if want c14; then
   eq "c14a: shape" residue "$(jf shape)"
   eq "c14a: residue ref deleted" no "$(exists "$R" "$REF")"
 
-  echo "c14b EOL-only residue"
-  REF="$(residue "$R" 20260901T000002Z f.txt 'second\r\n')"
+  echo "c14b EOL-only residue inside the provisioner footprint"
+  REF="$(residue "$R" 20260901T000002Z .claude/commands/e.md 'a\r\nb\r\n')"
   QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
   outcome_is "c14b" 0 REAPED
   has "c14b: passed through the EOL_ONLY arm" "EOL_ONLY" "$OUT"
   eq "c14b: residue ref deleted" no "$(exists "$R" "$REF")"
+
+  echo "c14b2 the same EOL-only change OUTSIDE the footprint (a deliberate CRLF edit by bytes) -> REFUSED"
+  REF="$(residue "$R" 20260901T000012Z f.txt 'second\r\n')"
+  QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
+  outcome_is "c14b2" 2 REFUSED
+  lacks "c14b2: the EOL_ONLY arm did not admit it" "EOL_ONLY" "$OUT"
+  eq "c14b2: residue ref kept" yes "$(exists "$R" "$REF")"
+
+  echo "c14j a historical blob staged under a mode neither R^1 nor the tip has -> REFUSED"
+  printf 'x v1\n' >"$R/x.sh"; gq "$R" add x.sh; gq "$R" update-index --chmod=+x x.sh
+  REF="$(residue_u "$R" 20260901T000013Z)"
+  eq "c14j: FIXTURE R^2 carries x.sh at 100755" 100755 "$(g "$R" ls-tree "$REF^2" -- x.sh | cut -d' ' -f1)"
+  QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
+  outcome_is "c14j" 2 REFUSED
+  has "c14j: reason names the mode change" "mode change not reproducible from upstream: x.sh" "$(jf reason)"
+  eq "c14j: residue ref kept" yes "$(exists "$R" "$REF")"
 
   echo "c14c novel blob"
   REF="$(residue "$R" 20260901T000003Z f.txt 'novel content nobody has\n')"
@@ -575,14 +623,14 @@ if want c14; then
   echo "c14g staged change (R^2^{tree} differs from R^1^{tree}), content upstream-historical"
   REF="$(residue "$R" 20260901T000006Z f.txt 'one\n' stage)"
   QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
-  outcome_is "c14g" 2 REFUSED
-  has "c14g: reason names staged changes" "carries staged changes" "$(jf reason)"
-  eq "c14g: residue_shape failed" fail "$(chk residue_shape)"
-  eq "c14g: residue ref kept" yes "$(exists "$R" "$REF")"
+  outcome_is "c14g" 0 REAPED
+  eq "c14g: residue_shape passed (a staged change is judged by blob, not refused by shape)" pass "$(chk residue_shape)"
+  eq "c14g: the index blob went through the admission test" pass "$(chk residue-index:f.txt)"
+  eq "c14g: residue ref deleted" no "$(exists "$R" "$REF")"
 
   echo "c14h residue taken on an unlanded commit whose branch was then deleted (R^1 held by nothing)"
   gq "$R" checkout -q -b parked; put "$R" u.txt 'unlanded\n'; U="$(cm "$R" U)"
-  REF="$(residue "$R" 20260901T000008Z f.txt 'second\r\n')"
+  REF="$(residue "$R" 20260901T000008Z f.txt 'one\n')"
   gq "$R" checkout -q main; gq "$R" branch -D parked
   QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
   outcome_is "c14h" 2 REFUSED
@@ -592,7 +640,7 @@ if want c14; then
 
   echo "c14i the same residue while a local branch still holds R^1"
   gq "$R" checkout -q -b parked2; put "$R" u2.txt 'unlanded two\n'; cm "$R" U2 >/dev/null
-  REF="$(residue "$R" 20260901T000010Z f.txt 'second\r\n')"
+  REF="$(residue "$R" 20260901T000010Z f.txt 'one\n')"
   gq "$R" checkout -q main
   QONTINUI_RUNNER_REPO="$NORUN" reap "$R" "$REF"
   outcome_is "c14i" 0 REAPED
@@ -914,6 +962,148 @@ if want c25; then
   eq "c25: branch feat kept" yes "$(exists "$R" refs/heads/feat)"
 fi
 
+if want c26; then
+  newcase c26
+  put "$R" f.txt 'one\n'; cm "$R" v1 >/dev/null
+  put "$R" f.txt 'two\n'; cm "$R" v2 >/dev/null
+  put "$R" gone.txt 'going away upstream\n'; cm "$R" gone >/dev/null
+  gq "$R" push -q origin main
+  # Upstream moves ahead: adds n.txt and u.txt, changes f.txt, deletes gone.txt.
+  # The local main stays behind, where the sweep would have found the dirt.
+  gq "$R" checkout -q -b up
+  put "$R" n.txt 'tip new\n'; put "$R" u.txt 'tip untracked\n'; put "$R" f.txt 'three\n'
+  gq "$R" rm -q gone.txt; cm "$R" up >/dev/null
+  push_to_main "$R" up; gq "$R" checkout -q main; gq "$R" branch -q -D up
+
+  echo "c26a tip-equal staged add + tip-equal untracked + historical staged -> REAPED"
+  printf 'tip new\n' >"$R/n.txt"; gq "$R" add n.txt
+  printf 'one\n' >"$R/f.txt"; gq "$R" add f.txt
+  printf 'tip untracked\n' >"$R/u.txt"
+  REF="$(residue_u "$R" 20260901T000101Z)"
+  eq "c26a: FIXTURE the snapshot has 3 parents" 3 "$(nparents "$R" "$REF")"
+  reap "$R" "$REF"
+  outcome_is "c26a" 0 REAPED
+  eq "c26a: the staged add went through the admission test" pass "$(chk residue-index:n.txt)"
+  eq "c26a: the untracked blob went through the admission test" pass "$(chk residue-untracked:u.txt)"
+  eq "c26a: residue ref deleted" no "$(exists "$R" "$REF")"
+
+  echo "c26b a UNIQUE index blob hidden behind a tip-equal working-tree blob -> REFUSED"
+  printf 'unique staged content\n' >"$R/n.txt"; gq "$R" add n.txt
+  printf 'tip new\n' >"$R/n.txt"
+  REF="$(residue_u "$R" 20260901T000102Z)"
+  reap "$R" "$REF"
+  outcome_is "c26b" 2 REFUSED
+  eq "c26b: the working-tree blob passed" pass "$(chk residue:n.txt)"
+  eq "c26b: the index blob failed" fail "$(chk residue-index:n.txt)"
+  has "c26b: reason names the path" "not provable residue: n.txt" "$(jf reason)"
+  eq "c26b: residue ref kept" yes "$(exists "$R" "$REF")"
+
+  echo "c26c a UNIQUE untracked blob -> REFUSED"
+  printf 'novel untracked content\n' >"$R/u.txt"
+  REF="$(residue_u "$R" 20260901T000103Z)"
+  eq "c26c: FIXTURE the snapshot has 3 parents" 3 "$(nparents "$R" "$REF")"
+  reap "$R" "$REF"
+  outcome_is "c26c" 2 REFUSED
+  eq "c26c: the untracked blob failed" fail "$(chk residue-untracked:u.txt)"
+  eq "c26c: residue ref kept" yes "$(exists "$R" "$REF")"
+
+  echo "c26d a deletion of a path origin/main still has -> REFUSED"
+  gq "$R" rm -q f.txt
+  REF="$(residue_u "$R" 20260901T000104Z)"
+  reap "$R" "$REF"
+  outcome_is "c26d" 2 REFUSED
+  has "c26d: reason names the deletion" "deletes f.txt" "$(jf reason)"
+  eq "c26d: residue ref kept" yes "$(exists "$R" "$REF")"
+
+  echo "c26e a deletion of a path origin/main does not have either -> REAPED"
+  gq "$R" rm -q gone.txt
+  REF="$(residue_u "$R" 20260901T000105Z)"
+  reap "$R" "$REF"
+  outcome_is "c26e" 0 REAPED
+  eq "c26e: residue ref deleted" no "$(exists "$R" "$REF")"
+
+  echo "c26f a third parent that is not a parentless untracked commit -> REFUSED"
+  _I="$(g "$R" commit-tree -p HEAD -m index "HEAD^{tree}")"
+  _S="$(g "$R" commit-tree -p HEAD -p "$_I" -p HEAD~1 -m bogus "HEAD^{tree}")"
+  eq "c26f: FIXTURE the snapshot has 3 parents" 3 "$(nparents "$R" "$_S")"
+  REF="refs/wip/return-to-main/20260901T000106Z-c26-residue"
+  gq "$R" update-ref "$REF" "$_S"
+  reap "$R" "$REF"
+  outcome_is "c26f" 2 REFUSED
+  eq "c26f: residue_shape failed" fail "$(chk residue_shape)"
+  eq "c26f: residue ref kept" yes "$(exists "$R" "$REF")"
+fi
+
+if want c27; then
+  newcase c27
+  printf 'base.txt' >"$R/h.txt"; gq "$R" add h.txt; cm "$R" "h v1 (the bytes of a symlink to base.txt)" >/dev/null
+  put "$R" h.txt 'other\n'; cm "$R" "h v2" >/dev/null
+  put "$R" m.txt 'm\n'; put "$R" gone.txt 'going away upstream\n'; cm "$R" "m, gone" >/dev/null
+  gq "$R" push -q origin main
+  gq "$R" checkout -q -b up; gq "$R" rm -q gone.txt; cm "$R" "gone deleted upstream" >/dev/null
+  push_to_main "$R" up; gq "$R" checkout -q main; gq "$R" branch -q -D up
+
+  echo "c27a a mode-only staged change (blob == R^1's, mode 100644 -> 100755) -> REFUSED"
+  gq "$R" update-index --chmod=+x m.txt
+  REF="$(residue_u "$R" 20260901T000201Z)"
+  eq "c27a: FIXTURE R^2 carries m.txt at 100755" 100755 "$(g "$R" ls-tree "$REF^2" -- m.txt | cut -d' ' -f1)"
+  reap "$R" "$REF"
+  outcome_is "c27a" 2 REFUSED
+  eq "c27a: the index entry failed" fail "$(chk residue-index:m.txt)"
+  has "c27a: reason names the mode-only change" "mode-only change: m.txt" "$(jf reason)"
+  eq "c27a: residue ref kept" yes "$(exists "$R" "$REF")"
+
+  echo "c27b a symlink whose blob occurs in origin/main history at that path -> REFUSED"
+  rm -f "$R/h.txt"; ln -s base.txt "$R/h.txt" 2>/dev/null
+  if [ -L "$R/h.txt" ]; then
+    REF="$(residue_u "$R" 20260901T000202Z)"
+    eq "c27b: FIXTURE R holds h.txt as a symlink" 120000 "$(g "$R" ls-tree "$REF" -- h.txt | cut -d' ' -f1)"
+    eq "c27b: FIXTURE its blob is h.txt's v1 in history" "$(g "$R" rev-parse HEAD~2:h.txt)" "$(g "$R" rev-parse "$REF:h.txt")"
+    reap "$R" "$REF"
+    outcome_is "c27b" 2 REFUSED
+    has "c27b: reason names the symlink" "symlink entry: h.txt" "$(jf reason)"
+    eq "c27b: residue ref kept" yes "$(exists "$R" "$REF")"
+  else
+    rm -f "$R/h.txt"; gq "$R" checkout -- h.txt
+    ok "c27b: SKIPPED -- this box cannot create a symlink (ln -s made no link)"
+  fi
+
+  echo "c27c a deletion whose origin/main read fails -> UNKNOWN (never read as absent)"
+  mkdir -p "$SANDBOX/shim-lstree"
+  cat >"$SANDBOX/shim-lstree/git" <<EOF
+#!/bin/bash
+# fails \`ls-tree origin/main\` (the residue deletion's tip read)
+case " \$* " in *" ls-tree origin/main "*) echo "fatal: simulated ls-tree failure" >&2; exit 128 ;; esac
+exec "$REAL_GIT" "\$@"
+EOF
+  chmod +x "$SANDBOX/shim-lstree/git"
+  gq "$R" rm -q gone.txt
+  REF="$(residue_u "$R" 20260901T000203Z)"
+  PATH="$SANDBOX/shim-lstree:$PATH" reap "$R" "$REF"
+  outcome_is "c27c" 3 UNKNOWN
+  eq "c27c: the deletion check is unknown" unknown "$(chk residue:gone.txt)"
+  has "c27c: reason names the unread tip" "could not be read" "$(jf reason)"
+  eq "c27c: residue ref kept" yes "$(exists "$R" "$REF")"
+  reap "$R" "$REF"
+  outcome_is "c27c control: the same fixture without the shim" 0 REAPED
+fi
+
+if want c28; then
+  echo "c28 a snapshot that renames a tip path X back to its historical name Y -> REFUSED (X's deletion is checked)"
+  newcase c28
+  printf 'line %s of a file long enough for rename detection\n' 1 2 3 4 5 6 7 8 9 10 11 12 >"$R/y.txt"
+  gq "$R" add y.txt; cm "$R" "y" >/dev/null
+  gq "$R" mv y.txt x.txt; cm "$R" "y renamed to x" >/dev/null
+  gq "$R" push -q origin main
+  gq "$R" mv x.txt y.txt
+  REF="$(residue_u "$R" 20260901T000301Z)"
+  eq "c28: FIXTURE rename detection sees only the rename" "R100" "$(g "$R" diff --name-status -M "$REF^1" "$REF" | cut -f1)"
+  reap "$R" "$REF"
+  outcome_is "c28" 2 REFUSED
+  has "c28: reason names the deletion of x.txt" "deletes x.txt" "$(jf reason)"
+  eq "c28: residue ref kept" yes "$(exists "$R" "$REF")"
+fi
+
 # ================================================================================
 # Mutation control. Each declared mutant is re-run against only the cases that
 # pin its property; the control runs the whole suite against an unmutated copy
@@ -944,8 +1134,32 @@ if ! mc_is_mutant && { [ -z "${REAP_TEST_ONLY:-}" ] || [ "${REAP_MUTATION_ONLY:-
   mx "Md the branch delete is not compare-and-delete" "$REAL_SUBJECT" \
     's|gw update-ref -d "refs/heads/\$BRANCH" "\$SNAP_SHA"|gw update-ref -d "refs/heads/$BRANCH"|' \
     -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c09" bash "$SELF"
-  mx "Me residue: the R^2^{tree} == R^1^{tree} check is dropped" "$REAL_SUBJECT" \
-    's/^    finish REFUSED "residue snapshot carries staged changes"$/    :/' \
+  mx "Me residue: the INDEX blobs (R^1..R^2) are never examined" "$REAL_SUBJECT" \
+    's|admit residue-index "\$SNAP_SHA^2" "\$p"; done|:; done|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c26" bash "$SELF"
+  mx "Mm residue: the UNTRACKED blobs (R^3) are never examined" "$REAL_SUBJECT" \
+    's|admit residue-untracked "\$SNAP_SHA^3" "\$p"; done|:; done|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c26" bash "$SELF"
+  mx "Mn residue: a deletion is admitted even when the tip still has the path" "$REAL_SUBJECT" \
+    's|finish REFUSED "residue snapshot deletes \$p, which \$DEFAULT_REF still has"|:|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c26" bash "$SELF"
+  mx "Mo residue: a failed tip read of a deleted path is read as 'absent'" "$REAL_SUBJECT" \
+    's|if ! _lt="\$(g ls-tree "\$DEFAULT_REF" -- ":(literal)\$p" 2>/dev/null)"; then|if ! _lt="$(g ls-tree "$DEFAULT_REF" -- ":(literal)$p" 2>/dev/null)" \&\& false; then|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c27" bash "$SELF"
+  mx "Mp residue: symlink / gitlink entries are admitted by blob" "$REAL_SUBJECT" \
+    's/^      120000|160000)$/      120000-off|160000-off)/' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c27" bash "$SELF"
+  mx "Mq residue: a mode-only change (blob == R^1's) is admitted" "$REAL_SUBJECT" \
+    's|if \[ "\$_bb" = "\$B" \] && \[ "\$_bm" != "\$M" \]; then|if false; then|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c27" bash "$SELF"
+  mx "Mt residue: the path lists are read with rename detection again" "$REAL_SUBJECT" \
+    's|g diff --no-renames --name-only -z|g diff -M --name-only -z|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c28" bash "$SELF"
+  mx "Mr residue: a mode neither R^1 nor the tip has is admitted" "$REAL_SUBJECT" \
+    's|if \[ -n "\$_bm\$_tm" \] && \[ "\$M" != "\$_bm" \] && \[ "\$M" != "\$_tm" \]; then|if false; then|' \
+    -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c14" bash "$SELF"
+  mx "Ms residue: the EOL_ONLY arm is not footprint-bound" "$REAL_SUBJECT" \
+    's|if in_footprint "\$p" && g cat-file -e|if g cat-file -e|' \
     -- env -u REAP_MUTATION_ONLY REAP_TEST_ONLY="c14" bash "$SELF"
   # Mf keeps git's reachability filter and intersects its output with the named
   # reflog shas: the ancestors are dropped and nothing else changes. (Adding

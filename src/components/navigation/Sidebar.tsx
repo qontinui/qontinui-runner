@@ -127,11 +127,9 @@ import {
   useNavigationItem,
 } from "@qontinui/navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
-import {
-  useFeatureDisclosure,
-  type FeatureDisclosure,
-} from "@/contexts/FeatureDisclosureContext";
+import { useFeatureDisclosure, type FeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 import { isSettingsNavItemVisible } from "@/components/settings/settings-tabs";
+import { useSupervisorObserved } from "@/hooks/useSupervisorObservation";
 
 // ============================================================================
 // Icon Mapping
@@ -301,9 +299,10 @@ function getChildItems(
   parentId: string,
   isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
   activeTab: string,
+  supervisorObserved: boolean,
 ): ResolvedNavigationItem[] {
   const visible = getChildrenForPlatform(parentId, "runner").filter((child) =>
-    isSettingsNavItemVisible(child.id, isDisclosureEnabled, activeTab),
+    isSettingsNavItemVisible(child.id, isDisclosureEnabled, activeTab, supervisorObserved),
   );
   if (visible.some((child) => child.id === activeTab)) return visible.map(transformItem);
 
@@ -333,9 +332,7 @@ function getChildItems(
  */
 function buildNavigationGroups(activeTab: string): ResolvedNavigationGroup[] {
   const groups = getRunnerNavigation().map(transformGroup);
-  const shownAtTopLevel = groups.some((group) =>
-    group.items.some((item) => item.id === activeTab),
-  );
+  const shownAtTopLevel = groups.some((group) => group.items.some((item) => item.id === activeTab));
   if (shownAtTopLevel) return groups;
 
   const activeItem = findItemById(activeTab);
@@ -679,6 +676,8 @@ interface NavGroupProps {
   openFlyoutId: string | null;
   /** Disclosure predicate, threaded through so child lookups match the sidebar. */
   isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean;
+  /** Dev-surface settings entries are listed only when a supervisor is observed. */
+  supervisorObserved: boolean;
 }
 
 function NavGroup({
@@ -692,6 +691,7 @@ function NavGroup({
   getTabIndex,
   openFlyoutId,
   isDisclosureEnabled,
+  supervisorObserved,
 }: NavGroupProps) {
   const ChevronIcon = isExpanded ? ChevronDown : ChevronRight;
 
@@ -700,7 +700,8 @@ function NavGroup({
       <div className="space-y-1">
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+            item.hasChildren &&
+            getChildItems(item.id, isDisclosureEnabled, activeTab, supervisorObserved).some(
               (child) => child.id === activeTab,
             );
 
@@ -728,7 +729,8 @@ function NavGroup({
       <div className="space-y-0.5">
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+            item.hasChildren &&
+            getChildItems(item.id, isDisclosureEnabled, activeTab, supervisorObserved).some(
               (child) => child.id === activeTab,
             );
           const isFlyoutOpen = openFlyoutId === item.id;
@@ -778,7 +780,8 @@ function NavGroup({
       >
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+            item.hasChildren &&
+            getChildItems(item.id, isDisclosureEnabled, activeTab, supervisorObserved).some(
               (child) => child.id === activeTab,
             );
           const isFlyoutOpen = openFlyoutId === item.id;
@@ -1042,6 +1045,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   // @qontinui/navigation when enabled.
   const { isEnabled } = useFeatureDisclosure();
   const showAdvancedAutomation = isEnabled("advanced");
+  // Dev-only settings entries (Test My Change, CI Runner) need an OBSERVED
+  // supervisor — the same shared read the panels gate on.
+  const supervisorObserved = useSupervisorObserved();
 
   // Sync product mode + hidden-item visibility to shared navigation package and
   // rebuild groups. Both must run before buildNavigationGroups() so the freshly
@@ -1083,7 +1089,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         (item) =>
           item.id === activeTab ||
           (item.hasChildren &&
-            getChildItems(item.id, isEnabled, activeTab).some((child) => child.id === activeTab)),
+            getChildItems(item.id, isEnabled, activeTab, supervisorObserved).some(
+              (child) => child.id === activeTab,
+            )),
       ),
     );
     if (activeGroup && !isGroupExpanded(currentState, activeGroup.id)) {
@@ -1095,7 +1103,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       });
       dispatch(navigationActions.expandGroup(activeGroup.id));
     }
-  }, [activeTab, collapsed, navigationGroups, isEnabled]);
+  }, [activeTab, collapsed, navigationGroups, isEnabled, supervisorObserved]);
 
   const toggleGroup = useCallback(
     (groupId: string) => {
@@ -1117,14 +1125,14 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 
   const openFlyoutSidebar = useCallback(
     (item: ResolvedNavigationItem) => {
-      const children = getChildItems(item.id, isEnabled, activeTab);
+      const children = getChildItems(item.id, isEnabled, activeTab, supervisorObserved);
       setOpenFlyout({
         id: item.id,
         label: item.label,
         items: children,
       });
     },
-    [isEnabled, activeTab],
+    [isEnabled, activeTab, supervisorObserved],
   );
 
   const closeFlyout = useCallback(() => {
@@ -1175,7 +1183,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         } else {
           openFlyoutSidebar(item);
           if (item.selectsFirstChild) {
-            const children = getChildItems(item.id, isEnabled, activeTab);
+            const children = getChildItems(item.id, isEnabled, activeTab, supervisorObserved);
             if (children.length > 0) {
               selectTab(children[0].id);
             }
@@ -1195,7 +1203,15 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         closeFlyout();
       }
     },
-    [openFlyout, closeFlyout, openFlyoutSidebar, selectTab, isEnabled, activeTab],
+    [
+      openFlyout,
+      closeFlyout,
+      openFlyoutSidebar,
+      selectTab,
+      isEnabled,
+      activeTab,
+      supervisorObserved,
+    ],
   );
 
   const flattenedItems = useMemo(
@@ -1337,6 +1353,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
               getTabIndex={getTabIndex}
               openFlyoutId={openFlyout?.id ?? null}
               isDisclosureEnabled={isEnabled}
+              supervisorObserved={supervisorObserved}
             />
           ))}
         </div>

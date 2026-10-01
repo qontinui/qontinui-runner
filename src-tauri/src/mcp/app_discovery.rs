@@ -86,7 +86,7 @@ pub struct RegisterAppRequest {
     #[serde(default)]
     pub transport: Option<String>,
     /// Absolute URL where the runner can reach this app's UI Bridge endpoints,
-    /// e.g. "http://127.0.0.1:9875/supervisor-bridge". Preferred.
+    /// e.g. "http://127.0.0.1:1420/ui-bridge". Preferred.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Legacy — used when `base_url` is absent.
@@ -184,7 +184,8 @@ const WEB_DEV_PORTS: &[u16] = &[
 
 const DESKTOP_APP_PORTS: &[u16] = &[
     1420, // Tauri dev server
-    9875, // Qontinui Supervisor
+    // No supervisor port here: a published runner has no supervisor. When one
+    // IS observed, `desktop_ports_merged` adds the port the observation read.
     9876, // Qontinui Runner
     9877, 9878, // Runner fallback ports
     8888, // Electron common
@@ -333,17 +334,37 @@ async fn user_discovery_ports() -> Vec<u16> {
         .unwrap_or_default()
 }
 
-/// Merge the hardcoded desktop port list with user-configured ports, dedup
-/// while preserving the original order (defaults first, user entries after).
-async fn desktop_ports_merged() -> Vec<u16> {
-    let mut seen = std::collections::HashSet::new();
-    let mut merged: Vec<u16> = Vec::with_capacity(DESKTOP_APP_PORTS.len());
-    for &p in DESKTOP_APP_PORTS {
-        if seen.insert(p) {
-            merged.push(p);
-        }
+/// The supervisor's port, only when a supervisor was OBSERVED listening —
+/// the same probe `GET /supervisor/observation` serves, not a literal.
+async fn observed_supervisor_port() -> Option<u16> {
+    let obs = spawn_blocking_tracked(crate::mcp::auto_continue::observe_supervisor)
+        .await
+        .ok()?;
+    observed_port(&obs)
+}
+
+/// PURE: the port to scan for an observation — only an observed listener.
+fn observed_port(obs: &crate::mcp::auto_continue::SupervisorObservation) -> Option<u16> {
+    if obs.observed == Some(true) {
+        obs.port
+    } else {
+        None
     }
-    for p in user_discovery_ports().await {
+}
+
+/// Merge the hardcoded desktop port list, an OBSERVED supervisor's port, and
+/// user-configured ports; dedup while preserving the order (defaults first,
+/// then the supervisor, then user entries).
+async fn desktop_ports_merged() -> Vec<u16> {
+    let (supervisor, user) = tokio::join!(observed_supervisor_port(), user_discovery_ports());
+    merge_ports(DESKTOP_APP_PORTS, supervisor, &user)
+}
+
+/// PURE: ordered, deduplicated union.
+fn merge_ports(defaults: &[u16], supervisor: Option<u16>, user: &[u16]) -> Vec<u16> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<u16> = Vec::with_capacity(defaults.len() + 1 + user.len());
+    for &p in defaults.iter().chain(supervisor.iter()).chain(user.iter()) {
         if seen.insert(p) {
             merged.push(p);
         }
@@ -1715,5 +1736,42 @@ mod tests {
         let observed_body = captured_body.lock().await.clone();
         assert_eq!(observed_body["action"], "doThing");
         assert_eq!(observed_body["params"]["alpha"], 42);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_port_tests {
+    use super::*;
+    use crate::mcp::auto_continue::SupervisorObservation;
+
+    fn obs(observed: Option<bool>, port: Option<u16>) -> SupervisorObservation {
+        SupervisorObservation {
+            observed,
+            probed_at: String::new(),
+            port,
+            base_url: None,
+            reason: None,
+        }
+    }
+
+    /// No supervisor port is hard-coded into the scan: a published runner has
+    /// no supervisor, and scanning its port anyway assumes a dev box.
+    #[test]
+    fn the_default_desktop_scan_names_no_supervisor_port() {
+        let supervisor_default: u16 = crate::api_config::DEFAULT_SUPERVISOR_PORT;
+        assert!(!DESKTOP_APP_PORTS.contains(&supervisor_default));
+    }
+
+    #[test]
+    fn only_an_observed_supervisor_contributes_its_port() {
+        assert_eq!(observed_port(&obs(Some(true), Some(4242))), Some(4242));
+        assert_eq!(observed_port(&obs(Some(false), Some(4242))), None);
+        assert_eq!(observed_port(&obs(None, None)), None);
+    }
+
+    #[test]
+    fn merge_keeps_order_and_dedups() {
+        assert_eq!(merge_ports(&[1, 2], Some(3), &[2, 4, 3]), vec![1, 2, 3, 4]);
+        assert_eq!(merge_ports(&[1, 2], None, &[5]), vec![1, 2, 5]);
     }
 }

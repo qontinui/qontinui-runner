@@ -12,6 +12,11 @@ import { Radar, Plus, Trash2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import {
+  observedSupervisorPort,
+  useSupervisorObservation,
+  withObservedPort,
+} from "@/hooks/useSupervisorObservation";
 
 interface DiscoverySettingsProps {
   onLog: LogFunction;
@@ -29,13 +34,20 @@ interface ApiEnvelope<T> {
 
 // Kept in sync with `DESKTOP_APP_PORTS` in `mcp/app_discovery.rs`. Shown to
 // the user as "always scanned" so they don't duplicate them in their list.
-const HARDCODED_DESKTOP_DEFAULTS: number[] = [1420, 9875, 9876, 9877, 9878, 8888, 3333];
+// No supervisor port: a published runner has none. When the runner OBSERVES
+// one, the scan adds its port, and so does this list (from the same read).
+const HARDCODED_DESKTOP_DEFAULTS: number[] = [1420, 9876, 9877, 9878, 8888, 3333];
 const HARDCODED_WEB_DEFAULTS: number[] = [
   3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 4200, 5173, 5174, 5175, 8080,
   8081, 4000,
 ];
 
 export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
+  const supervisorObservation = useSupervisorObservation();
+  const alwaysScannedDesktop = withObservedPort(
+    HARDCODED_DESKTOP_DEFAULTS,
+    observedSupervisorPort(supervisorObservation),
+  );
   const [ports, setPorts] = useState<number[]>([]);
   const [initialPorts, setInitialPorts] = useState<number[]>([]);
   const [newPortInput, setNewPortInput] = useState("");
@@ -224,7 +236,7 @@ export function DiscoverySettings({ onLog }: DiscoverySettingsProps) {
               Desktop
             </span>
             <div className="flex flex-wrap gap-1.5 mt-1">
-              {HARDCODED_DESKTOP_DEFAULTS.map((p) => (
+              {alwaysScannedDesktop.map((p) => (
                 <code
                   key={p}
                   data-ui-bridge-content={`hardcoded-port:${p}`}

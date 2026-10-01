@@ -52,10 +52,10 @@ src/components/projects/ProjectDetail.tsx:113	literal	component	work-on-it	schem
 src/components/projects/ProjectEmptyState.tsx:33	literal	component	choose-folder	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx:240	literal	component	find-on-disk	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx:251	literal	component	refresh	schema=no	arity=0	effect=read
-src/components/settings/Settings.tsx:137	literal	component	save	schema=no	arity=0	effect=write
-src/components/settings/Settings.tsx:163	literal	component	reset	schema=no	arity=0	effect=write
-src/components/settings/Settings.tsx:185	guarded	component	switch-tab	schema=yes	arity=-	effect=write
-src/components/settings/Settings.tsx:217	literal	component	list-tabs	schema=no	arity=0	effect=read
+src/components/settings/Settings.tsx:143	literal	component	save	schema=no	arity=0	effect=write
+src/components/settings/Settings.tsx:169	literal	component	reset	schema=no	arity=0	effect=write
+src/components/settings/Settings.tsx:191	guarded	component	switch-tab	schema=yes	arity=-	effect=write
+src/components/settings/Settings.tsx:223	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no	arity=0	effect=-
 src/components/terminal/TerminalBridgeProxies.tsx:226	literal	element	focus	schema=no	arity=0	effect=read
 src/components/terminal/TerminalBridgeProxies.tsx:248	literal	element	blur	schema=no	arity=0	effect=read

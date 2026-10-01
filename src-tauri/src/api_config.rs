@@ -620,19 +620,27 @@ pub fn get_supervisor_url() -> String {
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", DEFAULT_SUPERVISOR_PORT))
 }
 
-/// Supervisor TCP socket address (`host:port`) for raw connect probes.
-/// Best-effort parses [`get_supervisor_url`]; falls back to
-/// `127.0.0.1:{DEFAULT_SUPERVISOR_PORT}` if the URL can't be parsed.
-pub fn get_supervisor_socket_addr() -> String {
-    let url = get_supervisor_url();
-    // Strip scheme and any path.
-    let after_scheme = url.split_once("://").map(|x| x.1).unwrap_or(url.as_str());
+/// Supervisor `host:port` for raw connect probes, taken from
+/// [`get_supervisor_url`]. `None` when that URL names no explicit port.
+///
+/// It used to fall back to `127.0.0.1:{DEFAULT_SUPERVISOR_PORT}` in that case,
+/// so a probe could answer for an address the configured URL never named —
+/// and the observation would then report the URL, not what was probed.
+pub fn get_supervisor_socket_addr() -> Option<String> {
+    supervisor_host_port(&get_supervisor_url())
+}
+
+/// PURE: the `host:port` authority of a supervisor URL (scheme and path
+/// stripped), or `None` when it names no explicit port.
+pub fn supervisor_host_port(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|x| x.1).unwrap_or(url);
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("127.0.0.1:{}", DEFAULT_SUPERVISOR_PORT)
-    }
+    // `[::1]` alone contains ':' but no port; require a port after the last
+    // `]` (IPv6 literal) or anywhere (host name / IPv4).
+    let tail = host_port.rsplit_once(']').map(|x| x.1).unwrap_or(host_port);
+    let (_, port) = tail.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    Some(host_port.to_string())
 }
 
 /// Tauri dev server (Vite) URL — dev builds only. Returns `None` in release.
@@ -674,6 +682,26 @@ mod tests {
             "supervisor URL should contain default port: {}",
             url
         );
+    }
+
+    #[test]
+    fn supervisor_host_port_requires_an_explicit_port() {
+        assert_eq!(
+            supervisor_host_port("http://127.0.0.1:4242").as_deref(),
+            Some("127.0.0.1:4242")
+        );
+        assert_eq!(
+            supervisor_host_port("http://localhost:4242/x/y").as_deref(),
+            Some("localhost:4242")
+        );
+        assert_eq!(
+            supervisor_host_port("http://[::1]:4242").as_deref(),
+            Some("[::1]:4242")
+        );
+        // No port: never silently substitute a default the URL did not name.
+        assert_eq!(supervisor_host_port("http://sup.example"), None);
+        assert_eq!(supervisor_host_port("http://[::1]"), None);
+        assert_eq!(supervisor_host_port("http://host:notaport"), None);
     }
 
     #[test]

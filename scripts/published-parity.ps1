@@ -73,7 +73,7 @@
 # =============================================================================
 #
 # Even over the HTTP door, a freshly booted instance has not spawned an agent
-# session. Seven of the ten rows -- fleet_commands, fleet_skills, fleet_agents,
+# session. Seven of the eleven rows -- fleet_commands, fleet_skills, fleet_agents,
 # agent_definitions, agent_commands_registry, agent_skills_registry,
 # slash_commands -- are filled by
 # the Phase 3 provisioning ledger, which records at SESSION SPAWN. No spawn, no
@@ -95,6 +95,11 @@
 #     workspace_root       always observed
 #     bundled_resources    observed once the app handle exists
 #     spec_pages           observed only if the warm-up read succeeds
+#     session_cli          always observed -- probed read-only beside the exe,
+#                          on the cold door too (plan 2026-09-27, Phase 1d).
+#                          dev 'exe_relative_checkout' vs published
+#                          'bundle_resource' is the one allowlisted pair; see
+#                          lib/parity-diff.ps1.
 #
 # and the other seven are structurally out of reach until this harness can drive a
 # real session spawn on both legs. The report prints this per row, computed from

@@ -279,6 +279,42 @@ fn wait_child_with_timeout(
     }
 }
 
+/// The half of every `prCredential` hint that names a PR door needing no
+/// personal `gh` login. Pure.
+///
+/// `qontinui-pr create` is recommended ONLY when the session CLI is actually
+/// deliverable onto runner terminals' PATH — the capability manifest's
+/// `session_cli` row reads a resolved rung. Recommending it unconditionally is
+/// how a 0-byte placeholder CLI (which exited 0 having opened no PR) was
+/// advertised as the fix (plan
+/// `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`,
+/// Phase 1d). Otherwise it names the door that CLI itself calls — this runner's
+/// loopback `POST /vcs/pull-requests`, coord-brokered — with how to
+/// authenticate it (the session's coord-mcp proxy nonce from its `.mcp.json`,
+/// in the header [`crate::coord_mcp::proxy_nonce_from_request`] reads, kept off
+/// argv), and `gh pr create` after it. `api_port` is this runner's BOUND port; `None`
+/// (no Tauri runtime) names the route without guessing a port.
+fn pr_door_without_personal_login(session_cli_deliverable: bool, api_port: Option<u16>) -> String {
+    if session_cli_deliverable {
+        return "`qontinui-pr create` (coord-brokered) needs no personal login".to_string();
+    }
+    let door = match api_port {
+        Some(port) => format!("`POST http://127.0.0.1:{port}/vcs/pull-requests`"),
+        None => "this runner's loopback `POST /vcs/pull-requests`".to_string(),
+    };
+    format!(
+        "`qontinui-pr` is NOT usable on this runner (capability-manifest row \
+         `session_cli` is not resolved), so open the PR through {door} (coord-brokered, \
+         needs no personal login). Authenticate with this session's coord-mcp proxy \
+         nonce. It is in the `coord-mcp` entry of its `.mcp.json`: in that entry's \
+         `headers` on the http shape, or on the stdio shape in the credential file \
+         named after `--credential` in the entry's `args` (a JSON file whose \
+         `headers` carry it). Send it as `Authorization: Bearer <nonce>` (the legacy \
+         `X-Coord-Mcp-Proxy-Key: <nonce>` also works), and keep the nonce off argv: \
+         write the header to a file and pass `curl -H @<file>`. Else `gh pr create`"
+    )
+}
+
 /// Run `gh auth status` (blocking — call off the async executor) and resolve a
 /// [`PrCredentialProbe`]. Exit code 0 ⇒ authenticated; non-zero ⇒ no credential;
 /// a missing `gh` binary resolves unauthenticated with a distinct hint. The
@@ -296,35 +332,36 @@ fn run_pr_credential_probe() -> PrCredentialProbe {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    // Which login-free PR door to name, decided by the SAME read-only probe the
+    // capability manifest's `session_cli` row reports: a stat plus a 4-byte
+    // header read, on this blocking thread, never on /health's hot path.
+    let door = pr_door_without_personal_login(
+        crate::install_effects_producer::intercept::shim_materializer::session_cli_observation()
+            .rung
+            .is_resolved(),
+        crate::coord_mcp::resolve_bound_api_port(),
+    );
     let (authenticated, hint) = match spawned {
         Ok(mut child) => match wait_child_with_timeout(&mut child, PR_CRED_PROBE_CHILD_TIMEOUT) {
             Some(status) if status.success() => (Some(true), None),
             Some(_) => (
                 Some(false),
-                Some(
-                    "no PR credential — `gh auth login` is the interim unblock; \
-                     `qontinui-pr create` (coord-brokered) needs no personal login"
-                        .to_string(),
-                ),
+                Some(format!(
+                    "no PR credential — `gh auth login` is the interim unblock; {door}"
+                )),
             ),
             None => (
                 None,
                 Some(format!(
                     "gh auth status did not finish within {}s and was killed — \
-                     credential state unknown; `qontinui-pr create` \
-                     (coord-brokered) needs no personal login",
+                     credential state unknown; {door}",
                     PR_CRED_PROBE_CHILD_TIMEOUT.as_secs()
                 )),
             ),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-            Some(false),
-            Some(
-                "gh CLI not installed — `qontinui-pr create` (coord-brokered) \
-                 needs no personal login"
-                    .to_string(),
-            ),
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (Some(false), Some(format!("gh CLI not installed — {door}")))
+        }
         Err(e) => (
             Some(false),
             Some(format!("gh auth status probe failed: {e}")),
@@ -3487,6 +3524,7 @@ fn hand_off_transport_rung(
         hdr(rung::REPORTER_HEADER),
         hdr(rung::REPORTER_STEP_HEADER),
         hdr(rung::ATTEMPTED_HEADER),
+        declared_failure_class(headers),
         // Runner-observed: this rung DID carry the call as far as this door.
         // The row is written before the upstream forward on purpose — the
         // metric asks whether the rung reached the door, and a row written
@@ -3511,6 +3549,21 @@ fn hand_off_transport_rung(
     // `outboxWriteFailed`.
     transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
     tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+}
+
+/// The raw `x-qontinui-failure-class` declaration, for
+/// [`crate::session::coord_transport_rung::parse_failure_class`].
+///
+/// Unlike the other declaration headers, a PRESENT value that is not visible
+/// ASCII (`to_str()` fails) must not read as absent: the header's presence is
+/// itself the claim "a rung failed", and dropping it would lose a declared
+/// failure. So it is handed on as `"unclassified"` — a member of the closed
+/// vocabulary — and the caller's bytes still never reach the payload.
+fn declared_failure_class(headers: &axum::http::HeaderMap) -> Option<&str> {
+    use crate::session::coord_transport_rung as rung;
+    headers
+        .get(rung::FAILURE_CLASS_HEADER)
+        .map(|v| v.to_str().unwrap_or(rung::FAILURE_CLASS_UNCLASSIFIED))
 }
 
 /// Why the pure lifecycle selection produced no caller. Each variant names the
@@ -12564,9 +12617,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod transport_rung_counter_tests {
     use super::{
-        hand_off_transport_rung, record_event_lane_miss, transport_rung_emitted_counter,
-        transport_rung_health_snapshot, transport_rung_lane_miss_counters,
-        transport_rung_snapshot_from, EventLaneMiss, LANE_MISS_SLOTS,
+        declared_failure_class, hand_off_transport_rung, record_event_lane_miss,
+        transport_rung_emitted_counter, transport_rung_health_snapshot,
+        transport_rung_lane_miss_counters, transport_rung_snapshot_from, EventLaneMiss,
+        LANE_MISS_SLOTS,
     };
     use std::sync::atomic::Ordering;
 
@@ -12749,7 +12803,14 @@ mod transport_rung_counter_tests {
     /// and the observation really reaches the outbox, so this is the hand-off
     /// counted, not a bare counter bump.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn successful_emit_increments_emitted() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
         use crate::session::coord_transport_rung::{RungEmitter, TRANSPORT_HEADER};
         use crate::session::local_store::OutboxWriter;
 
@@ -12802,6 +12863,155 @@ mod transport_rung_counter_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 1: a proxied call carrying EXACTLY the
+    /// static headers the http-arm `.mcp.json` document declares yields a row
+    /// tagged `native_mcp` / `mcp-client`. Built from the document itself, not
+    /// from hand-typed header names, so the config writer and the proxy reader
+    /// are proven to agree end to end.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn proxied_call_with_the_http_arm_headers_is_tagged_native_mcp() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::RungEmitter;
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let lane = uuid::Uuid::new_v4();
+
+        // The headers the MCP client sends are the document's static map.
+        let doc = crate::coord_mcp::http_proxy_config_json(9876, "nonce-under-test", false);
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in doc["mcpServers"]["coord-mcp"]["headers"]
+            .as_object()
+            .expect("headers object")
+        {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.as_str().unwrap().parse().unwrap(),
+            );
+        }
+
+        hand_off_transport_rung(
+            emitter,
+            lane,
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                let p = &pending[0].payload;
+                assert_eq!(p["transport"], serde_json::json!("native_mcp"));
+                assert_eq!(p["reporter"], serde_json::json!("mcp-client"));
+                assert_eq!(p["failure_class"], serde_json::Value::Null);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Plan 2026-09-20 first-rung, Phase 3: a declared failure class reaches
+    /// the payload's own `failure_class` key through the proxy's header read —
+    /// validated, and never in the runner-observed `failure_reason`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn proxied_failure_class_declaration_lands_in_failure_class() {
+        // `hand_off_transport_rung` bumps the process-global `emitted`
+        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
+        // every test that hands off serialises on the module lock. Held across
+        // the bounded outbox wait: each `#[tokio::test]` owns its own
+        // current-thread runtime, so a parked peer cannot starve this one.
+        let _serialised = series_lock();
+        use crate::session::coord_transport_rung::{
+            RungEmitter, ATTEMPTED_HEADER, FAILURE_CLASS_HEADER, TRANSPORT_HEADER,
+        };
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "loopback_proxy".parse().unwrap());
+        headers.insert(ATTEMPTED_HEADER, "native_mcp".parse().unwrap());
+        headers.insert(FAILURE_CLASS_HEADER, "Runner_Nonce".parse().unwrap());
+
+        hand_off_transport_rung(
+            emitter,
+            uuid::Uuid::new_v4(),
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                let p = &pending[0].payload;
+                assert_eq!(p["failure_class"], serde_json::json!("runner_nonce"));
+                assert_eq!(p["failure_reason"], serde_json::Value::Null);
+                assert_eq!(p["attempted"], serde_json::json!(["native_mcp"]));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    /// A present `x-qontinui-failure-class` header whose value is not visible
+    /// ASCII is a declared failure, not an absent one: it resolves to
+    /// `unclassified`, never to `None`.
+    #[test]
+    fn non_ascii_failure_class_header_is_unclassified_not_dropped() {
+        use crate::session::coord_transport_rung::{
+            parse_failure_class, FAILURE_CLASS_HEADER, FAILURE_CLASS_UNCLASSIFIED,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            declared_failure_class(&headers),
+            None,
+            "absent stays absent"
+        );
+
+        headers.insert(
+            FAILURE_CLASS_HEADER,
+            axum::http::HeaderValue::from_bytes(b"runner_n\xffnce").unwrap(),
+        );
+        assert!(headers[FAILURE_CLASS_HEADER].to_str().is_err());
+        let raw = declared_failure_class(&headers);
+        assert_eq!(raw, Some(FAILURE_CLASS_UNCLASSIFIED));
+        assert_eq!(parse_failure_class(raw), Some(FAILURE_CLASS_UNCLASSIFIED));
+
+        headers.insert(FAILURE_CLASS_HEADER, "tool_masked".parse().unwrap());
+        assert_eq!(
+            parse_failure_class(declared_failure_class(&headers)),
+            Some("tool_masked")
+        );
     }
 }
 
@@ -19211,6 +19421,50 @@ mod pr_credential_probe_tests {
             started.elapsed() < Duration::from_secs(10),
             "the kill happens at the deadline, not after the child's own runtime"
         );
+    }
+
+    /// The hint recommends `qontinui-pr create` ONLY when the session CLI is
+    /// deliverable; otherwise it names the loopback door (on the BOUND port)
+    /// and `gh pr create`, and never advertises the undeliverable CLI.
+    #[test]
+    fn pr_door_hint_recommends_the_session_cli_only_when_deliverable() {
+        let deliverable = pr_door_without_personal_login(true, Some(9876));
+        assert!(
+            deliverable.contains("`qontinui-pr create`"),
+            "{deliverable}"
+        );
+        assert!(!deliverable.contains("/vcs/pull-requests"), "{deliverable}");
+
+        let not = pr_door_without_personal_login(false, Some(9877));
+        assert!(
+            !not.contains("qontinui-pr create"),
+            "an undeliverable CLI must not be recommended: {not}"
+        );
+        assert!(
+            not.contains("`POST http://127.0.0.1:9877/vcs/pull-requests`"),
+            "the loopback door is named on this runner's bound port: {not}"
+        );
+        assert!(not.contains("`gh pr create`"), "{not}");
+        assert!(not.contains("session_cli"), "{not}");
+        // HOW the door is authenticated, not merely that it is: the header,
+        // where the nonce comes from, and how to keep it off argv.
+        assert!(not.contains("`Authorization: Bearer <nonce>`"), "{not}");
+        assert!(not.contains("`X-Coord-Mcp-Proxy-Key: <nonce>`"), "{not}");
+        assert!(not.contains("`.mcp.json`"), "{not}");
+        assert!(not.contains("`coord-mcp`"), "{not}");
+        // Both shapes the runner writes: inline headers (http) and the
+        // credential file a stdio entry names (`--credential <file>`).
+        assert!(not.contains("`headers`"), "{not}");
+        assert!(not.contains("`--credential`"), "{not}");
+        assert!(not.contains("curl -H @"), "{not}");
+
+        // No bound port known: the route is named without a guessed port.
+        let unbound = pr_door_without_personal_login(false, None);
+        assert!(
+            unbound.contains("loopback `POST /vcs/pull-requests`"),
+            "{unbound}"
+        );
+        assert!(!unbound.contains("127.0.0.1"), "{unbound}");
     }
 }
 

@@ -18,6 +18,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FlaskConical, RefreshCw, Square, ExternalLink, Loader2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { SupervisorGate } from "./SupervisorGate";
 import type { LogFunction } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -66,13 +67,6 @@ interface DevLoopSettingsProps {
   onLog: LogFunction;
 }
 
-const DEFAULT_SUPERVISOR_PORT = "9875";
-
-function supervisorBase(port: string): string {
-  const p = port.trim() || DEFAULT_SUPERVISOR_PORT;
-  return `http://localhost:${p}`;
-}
-
 function shortPath(p: string): string {
   // Show the trailing two path segments so long absolute paths stay readable.
   const norm = p.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -81,9 +75,23 @@ function shortPath(p: string): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
+/**
+ * A development-environment surface: every control here calls the dev
+ * supervisor, so the panel renders only when the runner OBSERVES one, at the
+ * address that observation reports (see `SupervisorGate`) — no port literal.
+ */
 export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
-  const [supervisorPort, setSupervisorPort] = useState(DEFAULT_SUPERVISOR_PORT);
+  return (
+    <SupervisorGate>
+      {(supervisorBase) => <DevLoopPanel onLog={onLog} supervisorBase={supervisorBase} />}
+    </SupervisorGate>
+  );
+}
 
+function DevLoopPanel({
+  onLog,
+  supervisorBase,
+}: DevLoopSettingsProps & { supervisorBase: string }) {
   // Source picker (provenance — mutually exclusive)
   const [sourceMode, setSourceMode] = useState<SourceMode>("worktree");
   const [worktrees, setWorktrees] = useState<DevLoopWorktree[]>([]);
@@ -114,7 +122,7 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
     setDiscovering(true);
     setDiscoveryError(null);
     try {
-      const resp = await fetch(`${supervisorBase(supervisorPort)}/health`);
+      const resp = await fetch(`${supervisorBase}/health`);
       if (!resp.ok) {
         throw new Error(`supervisor /health: HTTP ${resp.status}`);
       }
@@ -148,7 +156,7 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
     } finally {
       setDiscovering(false);
     }
-  }, [supervisorPort]);
+  }, [supervisorBase]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async discovery updates state in a callback, not synchronously
@@ -160,14 +168,14 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
   // -------------------------------------------------------------------------
   const refreshTempRunners = useCallback(async () => {
     try {
-      const resp = await fetch(`${supervisorBase(supervisorPort)}/runners`);
+      const resp = await fetch(`${supervisorBase}/runners`);
       if (!resp.ok) return;
       const runners = (await resp.json()) as SupervisorRunner[];
       setTempRunners(runners.filter((r) => r.id.startsWith("test-")));
     } catch {
       // Non-fatal — supervisor may not be up.
     }
-  }, [supervisorPort]);
+  }, [supervisorBase]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch updates state in a callback, not synchronously
@@ -267,7 +275,7 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
     };
 
     try {
-      const resp = await fetch(`${supervisorBase(supervisorPort)}/runners/spawn-test`, {
+      const resp = await fetch(`${supervisorBase}/runners/spawn-test`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -340,14 +348,11 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
 
   const handleStop = async (id: string) => {
     try {
-      const resp = await fetch(
-        `${supervisorBase(supervisorPort)}/runners/${encodeURIComponent(id)}/stop`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ force: false }),
-        },
-      );
+      const resp = await fetch(`${supervisorBase}/runners/${encodeURIComponent(id)}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: false }),
+      });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
         throw new Error(`HTTP ${resp.status}: ${body.slice(0, 200)}`);
@@ -379,20 +384,10 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
         </span>
       </div>
 
-      {/* Supervisor port */}
+      {/* Supervisor (address from the runner's observation, read-only) */}
       <div className="flex items-center gap-2 p-3 rounded-lg border border-border bg-card">
-        <label className="text-xs text-muted-foreground w-32 shrink-0" htmlFor="dev-loop-sup-port">
-          Supervisor port
-        </label>
-        <input
-          id="dev-loop-sup-port"
-          type="text"
-          inputMode="numeric"
-          value={supervisorPort}
-          onChange={(e) => setSupervisorPort(e.target.value)}
-          placeholder={DEFAULT_SUPERVISOR_PORT}
-          className="w-24 px-2 py-1 text-xs rounded border border-border bg-background"
-        />
+        <span className="text-xs text-muted-foreground w-32 shrink-0">Supervisor</span>
+        <code className="text-xs font-mono">{supervisorBase}</code>
         <button
           type="button"
           onClick={() => void discoverWorktrees()}
@@ -576,7 +571,9 @@ export function DevLoopSettings({ onLog }: DevLoopSettingsProps) {
                 <div>ref resolved: {result.git_ref_resolved_short}</div>
               )}
             </div>
-            {result.message && <p className="text-[11px] text-muted-foreground">{result.message}</p>}
+            {result.message && (
+              <p className="text-[11px] text-muted-foreground">{result.message}</p>
+            )}
             <p className="text-[11px] text-muted-foreground select-text break-all font-mono">
               http://localhost:{result.port}/
             </p>

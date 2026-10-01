@@ -91,20 +91,40 @@
 #                  reconciliation re-gates it.
 #   ABSENT         the snapshot ref no longer exists; nothing to retain.
 #
-# THE RESIDUE SHAPE (`…-residue`, a `git stash create` commit the sweep writes
-# before a residue restore — contract item 6). Deleted when every one holds,
-# otherwise REFUSED (UNKNOWN when a probe could not run):
-#   * exactly 2 parents, and R^2^{tree} == R^1^{tree} (tracked `.M` edits only);
+# THE RESIDUE SHAPE (`…-residue`, the snapshot the sweep writes before a residue
+# restore — contract item 6: `git stash create`, plus, when the restore removed
+# untracked files, the untracked-files parent `git stash push -u` writes).
+# Deleted when every one holds, otherwise REFUSED (UNKNOWN when a probe could
+# not run):
+#   * 2 parents (R^1 HEAD, R^2 index) or 3 (plus R^3, a PARENTLESS commit whose
+#     tree is exactly the untracked files);
 #   * R^1 (the parked HEAD it was taken on) is still contained in a local branch
 #     or origin/<default> — otherwise the snapshot is the only ref holding it;
-#   * every path p in `git diff --name-only R^1 R` has a blob B = R:p that
-#     passes one arm of dirty-provenance.sh's own admission test:
+#   * every path version in the snapshot passes one arm of dirty-provenance.sh's
+#     own admission test — the working tree (each p in `git diff --name-only
+#     R^1 R`, blob R:p), the index (each p in `git diff --name-only R^1 R^2`,
+#     blob R^2:p: a staged change is no longer refused by shape, its blob is
+#     judged like any other) and the untracked files (every p in R^3's tree,
+#     blob R^3:p):
 #       UPSTREAM_HISTORICAL  `git log origin/<default> -1 --find-object=B -- p`
-#       EOL_ONLY             R^1:p and B differ only by carriage returns
+#                            (a blob equal to the TIP passes here too: the tip
+#                            is in history, so UPSTREAM_CURRENT needs no arm)
+#       EOL_ONLY             R^1:p and B differ only by carriage returns, and p
+#                            is inside the provisioner footprint
+#                            (.claude/commands/**, .claude/skills/**)
 #       RUNNER_BUNDLE        B occurs at the bundle path in qontinui-runner's
 #                            origin/<default> history
-#     The running-runner-BUILD arm cannot be re-checked later, so a file that
-#     matched only there refuses. An empty diff passes.
+#     A path with NO blob in R or R^2 is a deletion relative to R^1, admitted
+#     only when origin/<default> lacks that path too (the restore recreated it
+#     and the fast-forward deletes it again); a deletion of a path the tip
+#     still has is REFUSED. "Lacks" is read with `git ls-tree origin/<default>
+#     -- p`: exit 0 and no output is absent, a non-zero exit is UNKNOWN (never
+#     "absent"). Before any arm, the entry's MODE: a symlink (120000) or gitlink
+#     (160000) is REFUSED, and so is a blob equal to R^1's at p under a
+#     different mode (a mode-only change every arm would admit as HEAD's own
+#     "historical" blob), and so is ANY mode that neither R^1 nor the tip has
+#     at p (the prover's rule: a deliberate chmod). The running-runner-BUILD arm cannot be re-checked
+#     later, so a file that matched only there refuses. Empty diffs pass.
 #
 # WRITES — the complete set (grep `gw `): `git fetch` into refs/remotes/origin/*
 # only (explicit refspec + empty --refmap=, as return-to-main-sweep.sh), and on
@@ -405,15 +425,16 @@ branch_busy() {
 # THE RESIDUE SHAPE
 if [ "$SHAPE" = residue ]; then
   _parents="$(g rev-list --parents -n1 "$SNAP_SHA" | wc -w | tr -d ' ')"
-  if [ "$_parents" != 3 ]; then
-    check residue_shape fail "commit has $((_parents - 1)) parent(s), not 2"
-    finish REFUSED "residue snapshot is not a two-parent stash commit"
+  _np=$((_parents - 1))
+  if [ "$_np" != 2 ] && [ "$_np" != 3 ]; then
+    check residue_shape fail "commit has $_np parent(s), not 2 (HEAD, index) or 3 (HEAD, index, untracked)"
+    finish REFUSED "residue snapshot is not a two- or three-parent stash commit"
   fi
-  if [ "$(g rev-parse "$SNAP_SHA^2^{tree}")" != "$(g rev-parse "$SNAP_SHA^1^{tree}")" ]; then  # [unconditional-verdict-lint: allow -- the parent count above proves R^1 and R^2 both exist, so neither tree read is of a missing commit]
-    check residue_shape fail "R^2^{tree} differs from R^1^{tree}: the stash carries staged changes"
-    finish REFUSED "residue snapshot carries staged changes"
+  if [ "$_np" = 3 ] && [ "$(g rev-list --parents -n1 "$SNAP_SHA^3" 2>/dev/null | wc -w | tr -d ' ')" != 1 ]; then
+    check residue_shape fail "R^3 is not a parentless untracked-files commit"
+    finish REFUSED "residue snapshot's third parent is not an untracked-files commit"
   fi
-  check residue_shape pass "two parents, index tree equals HEAD tree"
+  check residue_shape pass "$_np parents (HEAD, index$([ "$_np" = 3 ] && printf ', untracked'))"
 
   RUNNER_REPO="${QONTINUI_RUNNER_REPO:-$(dirname "$REPO_DIR")/qontinui-runner}"
   RUNNER_N=""; RUNNER_UP=""
@@ -431,45 +452,121 @@ if [ "$SHAPE" = residue ]; then
     esac
   }
   hash_nocr() { tr -d '\r' | cksum; }
+  in_footprint() { case "$1" in .claude/commands/?*|.claude/skills/?*) return 0 ;; *) return 1 ;; esac; }
 
-  if ! g diff --name-only -z "$SNAP_SHA^1" "$SNAP_SHA" >"$TMP/paths" 2>/dev/null; then
-    check residue_blobs unknown "git diff R^1 R failed"; finish UNKNOWN "residue path list unreadable"
-  fi
-  _n=0; _undecided=""
-  while IFS= read -r -d '' p; do
-    _n=$((_n + 1))
-    B="$(g rev-parse -q --verify "$SNAP_SHA:$p" 2>/dev/null)"
+  # admit <label> <rev> <path>: the blob at <rev>:<path> passes one arm of the
+  # admission test, or the run finishes REFUSED/UNKNOWN. No blob there is a
+  # DELETION relative to R^1, admitted only when origin/<default> lacks the path
+  # too (restoring it from HEAD and fast-forwarding deletes it again) -- read
+  # with `ls-tree`, whose exit status separates "absent" (0, no output) from a
+  # read that failed (non-zero: UNKNOWN, never "absent").
+  # MODE: a symlink (120000) or gitlink (160000) entry is refused outright -- no
+  # blob arm below proves a link target or a submodule commit. An entry whose
+  # blob equals R^1's at the path but whose mode differs is a mode-only change,
+  # which every blob arm would wrongly admit as HEAD's own "historical" blob.
+  admit() {
+    local label="$1" rev="$2" p="$3" B M _h _lrc _undecided="" bp _lt _bm _bb _tm _eb _er
+    if ! _lt="$(g ls-tree "$rev" -- ":(literal)$p" 2>/dev/null)"; then
+      check "$label:$p" unknown "git ls-tree $label failed for $p"
+      finish UNKNOWN "residue entry $p could not be read"
+    fi
+    B=""; M=""
+    if [ -n "$_lt" ]; then M="${_lt%% *}"; _lt="${_lt%%$'\t'*}"; B="${_lt##* }"; fi
     if [ -z "$B" ]; then
-      check "residue:$p" fail "no blob at R:$p (a deletion), which no provisioner produces"
-      finish REFUSED "residue snapshot deletes $p"
+      if ! _lt="$(g ls-tree "$DEFAULT_REF" -- ":(literal)$p" 2>/dev/null)"; then
+        check "$label:$p" unknown "no blob at $label:$p (a deletion), and git ls-tree $DEFAULT_REF failed, so whether it still has the path is undecided"
+        finish UNKNOWN "whether $DEFAULT_REF still has the deleted path $p could not be read"
+      fi
+      if [ -n "$_lt" ]; then
+        check "$label:$p" fail "no blob at $label:$p (a deletion) and $DEFAULT_REF still has the path"
+        finish REFUSED "residue snapshot deletes $p, which $DEFAULT_REF still has"
+      fi
+      check "$label:$p" pass "deletion of a path $DEFAULT_REF does not have either"; return 0
+    fi
+    case "$M" in
+      120000|160000)
+        check "$label:$p" fail "mode $M ($([ "$M" = 120000 ] && echo symlink || echo gitlink)) at $label:$p: no blob arm proves a link or a submodule"
+        finish REFUSED "residue snapshot holds a $([ "$M" = 120000 ] && echo symlink || echo gitlink) entry: $p" ;;
+    esac
+    if ! _lt="$(g ls-tree "$SNAP_SHA^1" -- ":(literal)$p" 2>/dev/null)"; then
+      check "$label:$p" unknown "git ls-tree R^1 failed for $p"
+      finish UNKNOWN "R^1's entry for $p could not be read"
+    fi
+    _bm=""
+    if [ -n "$_lt" ]; then
+      _bm="${_lt%% *}"; _lt="${_lt%%$'\t'*}"; _bb="${_lt##* }"
+      if [ "$_bb" = "$B" ] && [ "$_bm" != "$M" ]; then
+        check "$label:$p" fail "blob ${B:0:12} equals R^1's but the mode changed ($_bm -> $M): a mode-only change no blob arm proves"
+        finish REFUSED "residue snapshot holds a mode-only change: $p"
+      fi
+    fi
+    # The prover's mode rule: a mode that neither R^1 nor the tip has at this
+    # path is a deliberate chmod no upstream blob reproduces.
+    if ! _lt="$(g ls-tree "$DEFAULT_REF" -- ":(literal)$p" 2>/dev/null)"; then
+      check "$label:$p" unknown "git ls-tree $DEFAULT_REF failed for $p"
+      finish UNKNOWN "$DEFAULT_REF's entry for $p could not be read"
+    fi
+    _tm=""; [ -z "$_lt" ] || _tm="${_lt%% *}"
+    if [ -n "$_bm$_tm" ] && [ "$M" != "$_bm" ] && [ "$M" != "$_tm" ]; then
+      check "$label:$p" fail "mode $M differs from R^1's (${_bm:-<none>}) and $DEFAULT_REF's (${_tm:-<none>}): a mode change not reproducible from upstream"
+      finish REFUSED "residue snapshot holds a mode change not reproducible from upstream: $p"
     fi
     _h="$(g log "$DEFAULT_REF" -1 --format=%h --find-object="$B" -- ":(literal)$p" 2>/dev/null)"; _lrc=$?
     if [ "$_lrc" -eq 0 ] && [ -n "$_h" ]; then
-      check "residue:$p" pass "UPSTREAM_HISTORICAL: blob ${B:0:12} occurs in $DEFAULT_REF history (commit $_h)"; continue
+      check "$label:$p" pass "UPSTREAM_HISTORICAL: blob ${B:0:12} occurs in $DEFAULT_REF history (commit $_h)"; return 0
     fi
     [ "$_lrc" -ne 0 ] && _undecided="history read on $DEFAULT_REF failed"
-    if g cat-file -e "$SNAP_SHA^1:$p" 2>/dev/null \
-       && [ "$(g cat-file blob "$B" | hash_nocr)" = "$(g cat-file blob "$SNAP_SHA^1:$p" | hash_nocr)" ]; then  # [unconditional-verdict-lint: allow -- cat-file -e on this line proves R^1:<path>, and B is proven non-empty where it is read]
-      check "residue:$p" pass "EOL_ONLY: differs from R^1 only by carriage returns"; continue
+    # EOL_ONLY is footprint-bound, as in the prover: outside .claude/commands
+    # and .claude/skills a CRLF change is byte-identical to a deliberate one.
+    # Both blobs read with their status observed: `cksum` of an EMPTY stream is
+    # a valid-looking checksum, so two failed reads would otherwise agree
+    # (check #73). A failed read is UNKNOWN, never "EOL-only".
+    _eb=""; _er=""
+    if in_footprint "$p" && g cat-file -e "$SNAP_SHA^1:$p" 2>/dev/null; then
+      _eb="$(set -o pipefail; g cat-file blob "$B" 2>/dev/null | hash_nocr)" || _eb=""
+      _er="$(set -o pipefail; g cat-file blob "$SNAP_SHA^1:$p" 2>/dev/null | hash_nocr)" || _er=""
+      { [ -n "$_eb" ] && [ -n "$_er" ]; } || _undecided="${_undecided:+$_undecided; }the EOL-only read of $p failed"
+    fi
+    if [ -n "$_eb" ] && [ -n "$_er" ] && [ "$_eb" = "$_er" ]; then
+      check "$label:$p" pass "EOL_ONLY: differs from R^1 only by carriage returns"; return 0
     fi
     if bp="$(bundle_path_for "$p")"; then
       if [ -n "$RUNNER_UP" ]; then
         _h="$(git --no-optional-locks -C "$RUNNER_N" log "$RUNNER_UP" -1 --format=%h --find-object="$B" -- ":(literal)$bp" 2>/dev/null)"
         if [ -n "$_h" ]; then
-          check "residue:$p" pass "RUNNER_BUNDLE: blob ${B:0:12} occurs at $bp in runner $RUNNER_UP history (commit $_h)"; continue
+          check "$label:$p" pass "RUNNER_BUNDLE: blob ${B:0:12} occurs at $bp in runner $RUNNER_UP history (commit $_h)"; return 0
         fi
       else
         _undecided="${_undecided:+$_undecided; }no qontinui-runner checkout with an origin/main at $RUNNER_REPO"
       fi
     fi
     if [ -n "$_undecided" ]; then
-      check "residue:$p" unknown "not residue by any arm that ran; undecided because: $_undecided"
+      check "$label:$p" unknown "not residue by any arm that ran; undecided because: $_undecided"
       finish UNKNOWN "residue provenance of $p could not be decided"
     fi
-    check "residue:$p" fail "blob ${B:0:12} is in no upstream history, is not EOL-only, and no runner-history arm holds it (a match only against a runner BUILD cannot be re-checked)"
+    check "$label:$p" fail "blob ${B:0:12} is in no upstream history, is not EOL-only, and no runner-history arm holds it (a match only against a runner BUILD cannot be re-checked)"
     finish REFUSED "residue snapshot holds content that is not provable residue: $p"
-  done <"$TMP/paths"
-  check residue_blobs pass "$_n path(s), every blob is provable residue"
+  }
+
+  # Three sources, one admission test: the working tree (R vs R^1), the index
+  # (R^2 vs R^1), and every untracked file (R^3's whole tree).
+  # --no-renames: with rename detection a deleted X similar to an added Y is
+  # listed only as Y, and X's deletion would never meet the deletion check.
+  if ! g diff --no-renames --name-only -z "$SNAP_SHA^1" "$SNAP_SHA" >"$TMP/paths" 2>/dev/null; then
+    check residue_blobs unknown "git diff R^1 R failed"; finish UNKNOWN "residue path list unreadable"
+  fi
+  if ! g diff --no-renames --name-only -z "$SNAP_SHA^1" "$SNAP_SHA^2" >"$TMP/ipaths" 2>/dev/null; then
+    check residue_blobs unknown "git diff R^1 R^2 failed"; finish UNKNOWN "residue index path list unreadable"
+  fi
+  : >"$TMP/upaths"
+  if [ "$_np" = 3 ] && ! g ls-tree -r -z --name-only "$SNAP_SHA^3" >"$TMP/upaths" 2>/dev/null; then
+    check residue_blobs unknown "git ls-tree R^3 failed"; finish UNKNOWN "residue untracked path list unreadable"
+  fi
+  _n=0
+  while IFS= read -r -d '' p; do _n=$((_n + 1)); admit residue "$SNAP_SHA" "$p"; done <"$TMP/paths"
+  while IFS= read -r -d '' p; do _n=$((_n + 1)); admit residue-index "$SNAP_SHA^2" "$p"; done <"$TMP/ipaths"
+  while IFS= read -r -d '' p; do _n=$((_n + 1)); admit residue-untracked "$SNAP_SHA^3" "$p"; done <"$TMP/upaths"
+  check residue_blobs pass "$_n path version(s) (working tree, index, untracked), every blob is provable residue"
   _base="$(g rev-parse --verify --quiet "$SNAP_SHA^1^{commit}")"
   _base_holder=""
   if g merge-base --is-ancestor "$_base" "$DEFAULT_REF" 2>/dev/null; then _base_holder="$DEFAULT_REF"
