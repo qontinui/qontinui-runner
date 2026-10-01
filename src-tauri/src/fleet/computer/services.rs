@@ -427,8 +427,8 @@ pub(crate) mod linux {
                     .ok()
                     .and_then(Result::ok);
             }
-            match self.system.as_ref() {
-                Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
+            if let Some(conn) = self.system.as_ref() {
+                match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
                     Ok(Ok((units, whole))) => {
                         any_answered = true;
                         system_ok = whole;
@@ -440,8 +440,7 @@ pub(crate) mod linux {
                         debug!("fleet::computer: system-bus scan failed: {other:?}");
                         self.system = None;
                     }
-                },
-                None => {}
+                }
             }
 
             // Session bus: the runner's own user units.
