@@ -3868,8 +3868,10 @@ async fn clear_and_rederive_tenant_slot(
     crate::coord_mcp::log_device_jwt_slot_clear(tenant, cause.as_str(), evidence);
     warn!(
         "device_jwt_refresher: CLEARED tenant {tenant} device-JWT slot \
-         (cause={}, evidence: {evidence}) — attempting device-machine-key re-derive",
-        cause.as_str()
+         (cause={}, evidence: {evidence}, caller=refresher::clear_and_rederive_tenant_slot {}) \
+         — attempting device-machine-key re-derive",
+        cause.as_str(),
+        crate::secure_storage::process_attribution()
     );
 
     if web_base.trim().is_empty() {

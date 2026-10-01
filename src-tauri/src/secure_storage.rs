@@ -79,6 +79,55 @@ const TENANT_DEVICE_JWT_PREFIX: &str = "device_jwt:";
 /// Storage file name
 const STORAGE_FILE: &str = "auth_tokens.enc";
 
+/// Bounded wait for the cross-process store lock (see [`SecureStorage::lock_store`]).
+/// A healthy read-modify-write holds it for milliseconds; ten seconds of
+/// contention means a peer is wedged, and the write fails loudly rather than
+/// blocking a heartbeat or a refresher tick forever.
+const STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Poll interval while waiting for the store lock.
+const STORE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+thread_local! {
+    /// Lock files this THREAD already holds, so a nested read-modify-write on
+    /// the same store (none exists today) re-enters instead of deadlocking
+    /// against its own advisory lock — `flock`/`LockFileEx` conflict per open
+    /// handle, not per process.
+    static HELD_STORE_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `pid=<n> exe=<path>` for the process doing a credential-store write.
+///
+/// Plan `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// D4: a tenant slot vanished from the shared `auth_tokens.enc` with no log line
+/// naming the writer. Every slot write and clear now carries this, so the next
+/// foreign writer (CLI, instance runner, test binary) is named by the log.
+pub(crate) fn process_attribution() -> String {
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let exe = EXE.get_or_init(|| match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => format!("<unknown: {e}>"),
+    });
+    format!("pid={} exe={exe}", std::process::id())
+}
+
+/// Held for the span of one read-modify-write of the store. Dropping it
+/// releases the advisory lock (closing the handle unlocks it).
+struct StoreLockGuard {
+    /// `None` when this thread already held the lock (re-entrant no-op).
+    held: Option<(fs::File, PathBuf)>,
+}
+
+impl Drop for StoreLockGuard {
+    fn drop(&mut self) {
+        if let Some((file, path)) = self.held.take() {
+            let _ = file.unlock();
+            HELD_STORE_LOCKS.with(|h| h.borrow_mut().remove(&path));
+        }
+    }
+}
+
 /// Stored token data structure
 ///
 /// ## Token slots (Phase 5 unified-Cognito-identity)
@@ -694,6 +743,102 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// The advisory lock file beside the store: `auth_tokens.enc.lock`.
+    fn lock_path(&self) -> PathBuf {
+        let mut os = self.storage_path.clone().into_os_string();
+        os.push(".lock");
+        PathBuf::from(os)
+    }
+
+    /// Take the CROSS-PROCESS store lock, waiting at most [`STORE_LOCK_TIMEOUT`].
+    ///
+    /// [`Self::save_tokens`] is atomic but a read-modify-write is not: two
+    /// processes (the primary, the CLI, an instance runner, a test binary)
+    /// that both load before either saves each write back a struct missing the
+    /// other's slot, and one tenant's credential silently disappears with no
+    /// clear line anywhere (plan `2026-09-30-runner-says-connected-…` F2/D4).
+    /// Every mutator therefore runs load → modify → save under this lock via
+    /// [`Self::locked_rmw`]. Readers stay lock-free: the atomic rename already
+    /// guarantees they see a whole file.
+    ///
+    /// Re-entrant per thread (see [`HELD_STORE_LOCKS`]).
+    ///
+    /// BLOCKING: under contention this sleeps (up to the timeout) on the calling
+    /// thread. Every mutator was already blocking file I/O plus AES; a healthy
+    /// hold is milliseconds, and the bound keeps a wedged peer from stalling an
+    /// async worker indefinitely.
+    fn lock_store(&self) -> Result<StoreLockGuard> {
+        let path = self.lock_path();
+        if HELD_STORE_LOCKS.with(|h| h.borrow().contains(&path)) {
+            return Ok(StoreLockGuard { held: None });
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("Failed to create data directory")?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open store lock {}", path.display()))?;
+        let deadline = std::time::Instant::now() + STORE_LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        let holder = fs::read_to_string(&path)
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| "<unreadable>".to_string());
+                        anyhow::bail!(
+                            "secure storage lock {} is still held after {:?} (holder: {holder}); \
+                             refusing to write without it (a lock-free read-modify-write can \
+                             silently drop another tenant's credential slot) [waiter {}]",
+                            path.display(),
+                            STORE_LOCK_TIMEOUT,
+                            process_attribution()
+                        );
+                    }
+                    std::thread::sleep(STORE_LOCK_POLL);
+                }
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(
+                        anyhow::Error::new(e).context(format!("Failed to lock {}", path.display()))
+                    );
+                }
+            }
+        }
+        // Name the holder inside the lock file so a peer that times out can say
+        // WHO held it. Best-effort: the lock, not this text, is the exclusion.
+        {
+            use std::io::{Seek, Write};
+            let mut f = &file;
+            let _ = f.set_len(0);
+            let _ = f.seek(std::io::SeekFrom::Start(0));
+            let _ = f.write_all(process_attribution().as_bytes());
+        }
+        HELD_STORE_LOCKS.with(|h| h.borrow_mut().insert(path.clone()));
+        Ok(StoreLockGuard {
+            held: Some((file, path)),
+        })
+    }
+
+    /// One locked read-modify-write: take the store lock, `load`, apply
+    /// `modify`, save, release. The ONLY way a mutator touches the store.
+    fn locked_rmw<R>(
+        &self,
+        load: impl FnOnce(&Self) -> Result<StoredTokens>,
+        modify: impl FnOnce(&mut StoredTokens) -> R,
+    ) -> Result<R> {
+        let _guard = self.lock_store()?;
+        let mut tokens = load(self)?;
+        let out = modify(&mut tokens);
+        self.save_tokens(&tokens)?;
+        Ok(out)
+    }
+
     /// `true` iff the store file EXISTS but cannot be read/decrypted/parsed.
     ///
     /// The discriminator between "first run" (absent → a blank store is the
@@ -752,8 +897,9 @@ impl SecureStorage {
                          prior encrypted bytes were undecryptable on this machine (the AES key \
                          derives from hostname + username, so a machine rename / disk move \
                          produces exactly this) and are discarded — a background refresh would \
-                         have refused here instead.",
-                        self.storage_path.display()
+                         have refused here instead. [{}]",
+                        self.storage_path.display(),
+                        process_attribution()
                     );
                     Ok(StoredTokens::default())
                 }
@@ -766,15 +912,27 @@ impl SecureStorage {
 
     /// Stores both access and refresh tokens. Background/default posture:
     /// refuses over a present-but-unreadable store ([`WriteMode::Merge`]).
+    #[track_caller]
     pub fn store_tokens(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        self.store_tokens_mode(access_token, refresh_token, WriteMode::Merge)
+        self.store_tokens_mode(
+            access_token,
+            refresh_token,
+            WriteMode::Merge,
+            std::panic::Location::caller(),
+        )
     }
 
     /// Explicit-acquisition variant of [`Self::store_tokens`]: overwrites a
     /// present-but-unreadable store from blank rather than refusing. Only the
     /// explicit pairing path (`pair::persist_pairing`) calls this.
+    #[track_caller]
     pub fn store_tokens_fresh(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        self.store_tokens_mode(access_token, refresh_token, WriteMode::Fresh)
+        self.store_tokens_mode(
+            access_token,
+            refresh_token,
+            WriteMode::Fresh,
+            std::panic::Location::caller(),
+        )
     }
 
     fn store_tokens_mode(
@@ -782,12 +940,19 @@ impl SecureStorage {
         access_token: &str,
         refresh_token: &str,
         mode: WriteMode,
+        caller: &std::panic::Location<'static>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.access_token = Some(access_token.to_string());
-        tokens.refresh_token = Some(refresh_token.to_string());
-        self.save_tokens(&tokens)?;
-        info!("Tokens stored in secure file storage");
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens.access_token = Some(access_token.to_string());
+                tokens.refresh_token = Some(refresh_token.to_string());
+            },
+        )?;
+        info!(
+            "Tokens stored in secure file storage (mode={mode:?} caller={caller} {})",
+            process_attribution()
+        );
         Ok(())
     }
 
@@ -824,8 +989,34 @@ impl SecureStorage {
     /// only thing lost relative to a readable run, and it is a regenerable local
     /// identifier, not a credential. (Every other writer refuses, because for
     /// them a blank rewrite is silent credential loss, not the point.)
+    #[track_caller]
     pub fn clear_tokens(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let caller = std::panic::Location::caller();
+        let cleared_tenants = self.locked_rmw(
+            |s| Ok(s.load_tokens().unwrap_or_default()),
+            Self::wipe_all_credentials,
+        )?;
+        warn!(
+            "Tokens cleared from secure file storage — FULL wipe incl. {} per-tenant \
+             device-JWT slot(s) {cleared_tenants:?} (caller={caller} {})",
+            cleared_tenants.len(),
+            process_attribution()
+        );
+        Ok(())
+    }
+
+    /// The field-level body of [`Self::clear_tokens`]; returns the tenant ids
+    /// whose device-JWT slots it removed (for the attribution line).
+    fn wipe_all_credentials(tokens: &mut StoredTokens) -> Vec<String> {
+        let cleared_tenants: Vec<String> = tokens
+            .tenant_device_jwts
+            .keys()
+            .map(|k| {
+                k.strip_prefix(TENANT_DEVICE_JWT_PREFIX)
+                    .unwrap_or(k)
+                    .to_string()
+            })
+            .collect();
         tokens.access_token = None;
         tokens.refresh_token = None;
         tokens.oauth_access_token = None;
@@ -847,9 +1038,7 @@ impl SecureStorage {
         // already reports signed-out, but keep the flag consistent so a
         // partially-failed wipe can't leave the UI showing signed-in.
         tokens.interactive_signed_out = true;
-        self.save_tokens(&tokens)?;
-        info!("Tokens cleared from secure file storage");
-        Ok(())
+        cleared_tenants
     }
 
     /// Clears ONLY the device-JWT pair (`access_token` / `refresh_token`),
@@ -863,19 +1052,19 @@ impl SecureStorage {
     /// runner's autonomous terminal sessions running. Contrast with
     /// [`Self::clear_tokens`], which wipes everything.
     pub fn clear_interactive_session(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.access_token = None;
-        tokens.refresh_token = None;
-        // oauth_* slots, device_id, and the long-lived autonomy machine keys
-        // (device_machine_key / agent_machine_key) are intentionally preserved
-        // so the refresher can re-mint a device JWT after a default logout.
-        //
-        // Because those credentials survive, the presence-based signed-in check
-        // would otherwise report the operator as still signed in on the next
-        // status re-check. Mark the interactive session as deliberately ended so
-        // the logout sticks while autonomy keeps running.
-        tokens.interactive_signed_out = true;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.access_token = None;
+            tokens.refresh_token = None;
+            // oauth_* slots, device_id, and the long-lived autonomy machine keys
+            // (device_machine_key / agent_machine_key) are intentionally preserved
+            // so the refresher can re-mint a device JWT after a default logout.
+            //
+            // Because those credentials survive, the presence-based signed-in check
+            // would otherwise report the operator as still signed in on the next
+            // status re-check. Mark the interactive session as deliberately ended so
+            // the logout sticks while autonomy keeps running.
+            tokens.interactive_signed_out = true;
+        })?;
         info!(
             "Device-JWT pair cleared from secure file storage (Cognito session preserved for \
              autonomous refresh)"
@@ -945,9 +1134,9 @@ impl SecureStorage {
     /// pair-code redeem, CLI `device pair`) once the acquisition has actually
     /// been persisted — see the `interactive_signed_out` field docs.
     pub fn clear_interactive_signed_out(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.interactive_signed_out = false;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.interactive_signed_out = false;
+        })?;
         debug!("Interactive sign-out marker cleared (user signed back in)");
         Ok(())
     }
@@ -966,9 +1155,10 @@ impl SecureStorage {
     }
 
     fn store_device_id_mode(&self, device_id: &str, mode: WriteMode) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.device_id = Some(device_id.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| tokens.device_id = Some(device_id.to_string()),
+        )?;
         info!("Device ID stored in secure file storage: {}", device_id);
         Ok(())
     }
@@ -1071,12 +1261,15 @@ impl SecureStorage {
         expires_at: i64,
         mode: WriteMode,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.oauth_access_token = Some(access_token.to_string());
-        tokens.oauth_id_token = Some(id_token.to_string());
-        tokens.oauth_refresh_token = Some(refresh_token.to_string());
-        tokens.oauth_expires_at = Some(expires_at);
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens.oauth_access_token = Some(access_token.to_string());
+                tokens.oauth_id_token = Some(id_token.to_string());
+                tokens.oauth_refresh_token = Some(refresh_token.to_string());
+                tokens.oauth_expires_at = Some(expires_at);
+            },
+        )?;
         info!("Cognito (oauth) tokens stored in secure file storage");
         Ok(())
     }
@@ -1114,12 +1307,12 @@ impl SecureStorage {
     /// Clears only the Cognito (oauth) token slots, leaving the device-JWT
     /// slot intact. Used on Cognito sign-out.
     pub fn clear_oauth_tokens(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.oauth_access_token = None;
-        tokens.oauth_id_token = None;
-        tokens.oauth_refresh_token = None;
-        tokens.oauth_expires_at = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.oauth_access_token = None;
+            tokens.oauth_id_token = None;
+            tokens.oauth_refresh_token = None;
+            tokens.oauth_expires_at = None;
+        })?;
         info!("Cognito (oauth) tokens cleared from secure file storage");
         Ok(())
     }
@@ -1138,12 +1331,12 @@ impl SecureStorage {
         &self,
         nonces: &std::collections::HashMap<String, StoredNonceBinding>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.coord_mcp_nonces = nonces
-            .iter()
-            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
-            .collect();
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.coord_mcp_nonces = nonces
+                .iter()
+                .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+                .collect();
+        })?;
         Ok(())
     }
 
@@ -1157,13 +1350,13 @@ impl SecureStorage {
         nonces: &std::collections::HashMap<String, StoredNonceBinding>,
         graced: &std::collections::HashMap<String, StoredGracedNonce>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.coord_mcp_nonces = nonces
-            .iter()
-            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
-            .collect();
-        tokens.coord_mcp_graced_nonces = graced.clone();
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.coord_mcp_nonces = nonces
+                .iter()
+                .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+                .collect();
+            tokens.coord_mcp_graced_nonces = graced.clone();
+        })?;
         Ok(())
     }
 
@@ -1230,9 +1423,9 @@ impl SecureStorage {
     /// (`mk_<token>`). Minted ONCE by the enroll endpoint; overwrites any
     /// prior key. Leaves all other slots untouched.
     pub fn store_agent_machine_key(&self, key: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.agent_machine_key = Some(key.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.agent_machine_key = Some(key.to_string());
+        })?;
         info!("env-agent machine key stored in secure file storage");
         Ok(())
     }
@@ -1248,9 +1441,9 @@ impl SecureStorage {
     /// Clear the dev-environment capture agent's per-machine API key, leaving
     /// all other slots intact. Used when re-enrolling or unenrolling.
     pub fn clear_agent_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.agent_machine_key = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.agent_machine_key = None;
+        })?;
         info!("env-agent machine key cleared from secure file storage");
         Ok(())
     }
@@ -1275,8 +1468,14 @@ impl SecureStorage {
     /// Store (or overwrite) the device JWT for one tenant binding. Leaves the
     /// legacy `access_token` slot and every other slot untouched. Background/
     /// default posture: refuses over a present-but-unreadable store.
+    #[track_caller]
     pub fn store_tenant_device_jwt(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Merge)
+        self.store_tenant_device_jwt_mode(
+            tenant_id,
+            jwt,
+            WriteMode::Merge,
+            std::panic::Location::caller(),
+        )
     }
 
     /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
@@ -1285,8 +1484,14 @@ impl SecureStorage {
     /// undecryptable `.enc` it heals the store and every subsequent write in the
     /// same explicit pairing sequence then merges over the now-readable store.
     /// The background refresher's per-tenant write uses the plain (Merge) method.
+    #[track_caller]
     pub fn store_tenant_device_jwt_fresh(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Fresh)
+        self.store_tenant_device_jwt_mode(
+            tenant_id,
+            jwt,
+            WriteMode::Fresh,
+            std::panic::Location::caller(),
+        )
     }
 
     fn store_tenant_device_jwt_mode(
@@ -1294,13 +1499,23 @@ impl SecureStorage {
         tenant_id: &uuid::Uuid,
         jwt: &str,
         mode: WriteMode,
+        caller: &std::panic::Location<'static>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens
-            .tenant_device_jwts
-            .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
-        self.save_tokens(&tokens)?;
-        info!("Per-tenant device JWT stored for tenant {tenant_id}");
+        let slots_after = self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens
+                    .tenant_device_jwts
+                    .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
+                tokens.tenant_device_jwts.len()
+            },
+        )?;
+        // Never the token: tenant, slot count, mode, caller and process only.
+        info!(
+            "Per-tenant device JWT stored for tenant {tenant_id} (slots_after={slots_after} \
+             mode={mode:?} caller={caller} {})",
+            process_attribution()
+        );
         Ok(())
     }
 
@@ -1317,13 +1532,31 @@ impl SecureStorage {
 
     /// Remove one tenant's device-JWT slot, leaving all other slots (incl.
     /// the legacy `access_token`) intact. Idempotent.
+    #[track_caller]
     pub fn clear_tenant_device_jwt(&self, tenant_id: &uuid::Uuid) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens
-            .tenant_device_jwts
-            .remove(&Self::tenant_device_jwt_key(tenant_id));
-        self.save_tokens(&tokens)?;
-        info!("Per-tenant device JWT cleared for tenant {tenant_id}");
+        let caller = std::panic::Location::caller();
+        let (existed, slots_after) = self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            let existed = tokens
+                .tenant_device_jwts
+                .remove(&Self::tenant_device_jwt_key(tenant_id))
+                .is_some();
+            (existed, tokens.tenant_device_jwts.len())
+        })?;
+        // WARN when a slot actually went away: a vanished credential is the
+        // incident this line exists to attribute. An idempotent no-op is info.
+        if existed {
+            warn!(
+                "Per-tenant device JWT cleared for tenant {tenant_id} (slots_after={slots_after} \
+                 caller={caller} {})",
+                process_attribution()
+            );
+        } else {
+            info!(
+                "Per-tenant device JWT cleared for tenant {tenant_id} (no slot was present; \
+                 slots_after={slots_after} caller={caller} {})",
+                process_attribution()
+            );
+        }
         Ok(())
     }
 
@@ -1374,9 +1607,10 @@ impl SecureStorage {
     }
 
     fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.device_machine_key = Some(key.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| tokens.device_machine_key = Some(key.to_string()),
+        )?;
         info!("device machine key stored in secure file storage");
         Ok(())
     }
@@ -1394,9 +1628,9 @@ impl SecureStorage {
     /// Used on revocation / re-issue. Mirror of
     /// [`Self::clear_agent_machine_key`].
     pub fn clear_device_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.device_machine_key = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.device_machine_key = None;
+        })?;
         info!("device machine key cleared from secure file storage");
         Ok(())
     }
@@ -1408,10 +1642,21 @@ impl SecureStorage {
     /// present-but-unreadable, deleting it turns the next launch back into a
     /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
     /// writes succeed) so the operator can sign in again from the LoginScreen.
+    #[track_caller]
     pub fn delete_storage(&self) -> Result<()> {
+        let caller = std::panic::Location::caller();
+        let _guard = self.lock_store()?;
         if self.storage_path.exists() {
+            // Unreadable is the usual reason for a delete, so this is often "?".
+            let slots = self
+                .try_list_tenant_device_jwt_tenants()
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|_| "? (store unreadable)".to_string());
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
-            info!("Secure storage file deleted");
+            warn!(
+                "Secure storage file deleted — per-tenant slots {slots} gone (caller={caller} {})",
+                process_attribution()
+            );
         }
         Ok(())
     }
@@ -1909,6 +2154,155 @@ mod tests {
             "cog.r",
             "a Fresh write over a readable store must preserve sibling slots"
         );
+    }
+
+    /// D4: two writers — separate `SecureStorage` instances (separate lock
+    /// handles, exactly as two processes would hold them) on the SAME store —
+    /// each add a NEW tenant slot per iteration, concurrently. Every slot is a
+    /// distinct key, so any lost update (a load→insert→save interleaving that
+    /// drops a peer's insert) stays visible at the end rather than being
+    /// papered over by the next round.
+    #[test]
+    fn test_concurrent_writers_of_different_tenants_both_survive() {
+        const N: u128 = 120;
+        let storage = create_test_storage("concurrent_tenant_writers");
+        let path = storage.storage_path.clone();
+        let _ = fs::remove_file(storage.lock_path());
+        let writer = |base: u128| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let s = SecureStorage::with_path(path).unwrap();
+                for i in 0..N {
+                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
+                        .unwrap();
+                }
+            })
+        };
+        let a = writer(0xA000);
+        let b = writer(0xB000);
+        a.join().unwrap();
+        b.join().unwrap();
+        let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
+        assert_eq!(slots.len() as u128, 2 * N, "a concurrent writer lost slots");
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// While one handle holds the store lock, another handle cannot take it
+    /// (exclusion, not just release), and it can once the holder drops.
+    #[test]
+    fn test_store_lock_excludes_a_second_handle_until_released() {
+        let storage = create_test_storage("store_lock_excludes");
+        let guard = storage.lock_store().unwrap();
+        let path = storage.storage_path.clone();
+        let blocked = std::thread::spawn(move || {
+            let other = SecureStorage::with_path(path).unwrap();
+            let f = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(other.lock_path())
+                .unwrap();
+            matches!(f.try_lock(), Err(fs::TryLockError::WouldBlock))
+        })
+        .join()
+        .unwrap();
+        assert!(blocked, "a second handle took the lock while it was held");
+        drop(guard);
+        let other = SecureStorage::with_path(storage.storage_path.clone()).unwrap();
+        drop(other.lock_store().unwrap());
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// Env var naming the store a re-invoked child test process writes to.
+    const LOCK_CHILD_STORE_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_STORE";
+    /// Env var naming the first tenant (u128) of the range that child writes.
+    const LOCK_CHILD_TENANT_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_TENANT";
+    /// Distinct tenant slots each child adds.
+    const LOCK_CHILD_WRITES: u128 = 120;
+
+    /// Child half of the two-PROCESS test below: a no-op in a normal run; when
+    /// the parent re-invokes this test binary with the env vars set, it
+    /// hammers one tenant slot of the shared store.
+    #[test]
+    fn lock_child_process_writer() {
+        let (Ok(store), Ok(tenant)) = (
+            std::env::var(LOCK_CHILD_STORE_ENV),
+            std::env::var(LOCK_CHILD_TENANT_ENV),
+        ) else {
+            return;
+        };
+        let base: u128 = tenant.parse().unwrap();
+        let s = SecureStorage::with_path(PathBuf::from(store)).unwrap();
+        for i in 0..LOCK_CHILD_WRITES {
+            s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
+                .unwrap();
+        }
+    }
+
+    /// D4 two-PROCESS test: the test binary re-invokes itself twice
+    /// (`lock_child_process_writer`), each child rewriting a different tenant
+    /// slot of the same store concurrently. Both slots must survive.
+    #[test]
+    fn test_two_processes_writing_different_tenants_both_survive() {
+        let storage = create_test_storage("two_process_tenant_writers");
+        let _ = fs::remove_file(storage.lock_path());
+        let exe = std::env::current_exe().unwrap();
+        let spawn = |tenant: u128| {
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "secure_storage::tests::lock_child_process_writer",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env(LOCK_CHILD_STORE_ENV, &storage.storage_path)
+                .env(LOCK_CHILD_TENANT_ENV, tenant.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let a = spawn(0xA000);
+        let b = spawn(0xB000);
+        for child in [a, b] {
+            let out = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "child failed: {}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Guard against a vacuous pass: the child must have RUN the test.
+            assert!(
+                stdout.contains("1 passed"),
+                "child ran no test (filter mismatch?): {stdout}"
+            );
+        }
+        let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
+        assert_eq!(
+            slots.len() as u128,
+            2 * LOCK_CHILD_WRITES,
+            "one process's slots were lost to the other"
+        );
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// The store lock is re-entrant on one thread (no self-deadlock) and is
+    /// released on drop, so a subsequent writer is not blocked.
+    #[test]
+    fn test_store_lock_is_reentrant_and_released() {
+        let storage = create_test_storage("store_lock_reentrant");
+        {
+            let _outer = storage.lock_store().unwrap();
+            let _inner = storage.lock_store().unwrap();
+            storage
+                .store_tenant_device_jwt(&uuid::Uuid::from_u128(1), "x")
+                .unwrap();
+        }
+        let other = SecureStorage::with_path(storage.storage_path.clone()).unwrap();
+        let _g = other.lock_store().unwrap();
+        drop(_g);
+        let _ = fs::remove_file(&storage.storage_path);
     }
 
     /// The boot sweep unlinks crash-orphaned `*.enc.tmp.<...>` files older than
