@@ -417,7 +417,7 @@ pub async fn tick_once() -> Result<(), String> {
     let root = match super::census::qontinui_root() {
         Some(r) => r,
         None => {
-            debug!("fs_backstop: no qontinui-root dir resolved — skipping");
+            debug!("fs_backstop: no workspace root resolved — skipping");
             return Ok(());
         }
     };

@@ -3628,7 +3628,7 @@ fn skill_parity_due_at(now: std::time::Instant, interval: Duration) -> bool {
 ///
 ///  - **The due-check comes FIRST, and everything after it is inside the
 ///    blocking closure.** `qontinui_root()` is not a cheap getter: it goes
-///    through `workspace_paths::workspace_root()` -> `get_setting::<PathSettings>()`
+///    through `workspace_paths::require_workspace_root()` -> `get_setting::<PathSettings>()`
 ///    -> `load_settings_full()`, which can mint a `local_user_id`, rewrite the
 ///    operator's settings file and reach the OS keyring. Resolving it before the
 ///    throttle would pay that on every 60s tick instead of once per interval,
@@ -3663,7 +3663,7 @@ fn spawn_skill_parity_pass_if_due() {
     }
     tokio::spawn(async move {
         let joined = spawn_blocking_tracked(|| match qontinui_root() {
-            Some(root) => {
+            Ok(root) => {
                 let roots = (
                     join_rel(&root, SKILL_SOURCE_REL),
                     join_rel(&root, SKILL_BUNDLE_REL),
@@ -3671,11 +3671,9 @@ fn spawn_skill_parity_pass_if_due() {
                 run_skill_bundle_parity_check(&root);
                 Some(roots)
             }
-            None => {
+            Err(unresolved) => {
                 report_skill_parity_unreached(
-                    "the workspace root did not resolve, so neither tree could be \
-                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
-                        .to_string(),
+                    format!("neither tree could be located: {unresolved}"),
                     None,
                 );
                 None
@@ -3706,11 +3704,11 @@ fn spawn_skill_parity_pass_if_due() {
 /// `D:/qontinui-root` Windows arm, collapsed in Phase 2 of
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
 ///
-/// Still `Option`: a miss means this publish pass finds no repos and says so
-/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
-/// degradation rather than an error.
-fn qontinui_root() -> Option<PathBuf> {
-    crate::workspace_paths::workspace_root()
+/// A miss is the typed `workspace_root_unresolved` refusal, which each caller
+/// renders: the publish pass logs it and skips (honest degradation rather than
+/// an error), the skill-parity pass records it as its unreached reason.
+fn qontinui_root() -> Result<PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
+    crate::workspace_paths::require_workspace_root()
 }
 
 /// Decide which branch (if any) the `behind_default_count` rev-list should
@@ -4930,12 +4928,9 @@ pub async fn publish_tree_state() -> Result<(), String> {
     };
 
     let root = match qontinui_root() {
-        Some(p) => p,
-        None => {
-            info!(
-                "fleet::tree_publisher: no qontinui-root directory found (set \
-                 QONTINUI_ROOT to override). Skipping."
-            );
+        Ok(p) => p,
+        Err(unresolved) => {
+            info!("fleet::tree_publisher: skipping — {unresolved}");
             return Ok(());
         }
     };

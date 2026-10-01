@@ -221,21 +221,22 @@ pub async fn execute_htn_attempt(
     // checkouts. Resolve them under the workspace root and existence-check each
     // one, so a host that lacks them gets a named warning HERE rather than an
     // import error deep inside Python.
-    let workspace_root = crate::workspace_paths::workspace_root();
-    if workspace_root.is_none() {
-        warn!(
-            "HTN: no Qontinui workspace root resolved, so neither qontinui/src nor \
-             multistate/src was added to PYTHONPATH — the planner will see only what \
-             is already installed for this interpreter. Set $QONTINUI_ROOT to the \
-             directory holding the repo checkouts."
-        );
-    }
+    let workspace_root = match crate::workspace_paths::require_workspace_root() {
+        Ok(root) => Some(root),
+        Err(unresolved) => {
+            warn!(
+                "HTN: neither qontinui/src nor multistate/src was added to PYTHONPATH — \
+                 the planner will see only what is already installed for this \
+                 interpreter. {unresolved}"
+            );
+            None
+        }
+    };
     let src_trees = htn_src_trees(workspace_root.as_deref());
     for (repo, dir) in &src_trees.missing {
         warn!(
-            "HTN: {repo}/src does not exist at {} — omitted from PYTHONPATH. Set \
-             $QONTINUI_ROOT to the directory holding the repo checkouts if the \
-             planner needs it.",
+            "HTN: {repo}/src does not exist at {} — omitted from PYTHONPATH, so the \
+             planner will see only what is already installed for this interpreter.",
             dir.display()
         );
     }

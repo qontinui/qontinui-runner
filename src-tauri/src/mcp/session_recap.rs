@@ -266,11 +266,12 @@ async fn analyze_handler(
 ) -> Result<Json<ApiResponse<SessionRecap>>, (StatusCode, Json<ApiResponse<()>>)> {
     let lookback = input.lookback.unwrap_or_else(|| "3 hours".to_string());
 
-    // Discover qontinui-root (parent of src-tauri)
+    // Resolve the workspace root through the runner's one door. The body is the
+    // typed refusal's sentence (input at fault + the setting to set) as-is.
     let root = find_qontinui_root().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Cannot find qontinui-root: {}", e))),
+            Json(api_error(e.to_string())),
         )
     })?;
 
@@ -428,7 +429,7 @@ fn compute_start_time(
 /// Fails closed, because the recap's error is surfaced straight to the caller as
 /// a 500 and a fabricated root would silently produce an empty recap that reads
 /// like "nothing changed".
-fn find_qontinui_root() -> Result<PathBuf, String> {
+fn find_qontinui_root() -> Result<PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
     crate::workspace_paths::require_workspace_root()
 }
 

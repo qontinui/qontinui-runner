@@ -1458,6 +1458,9 @@ fn workspace_root() -> qontinui_types::paths::WorkspaceRoot {
         None,
         exe.as_deref()
             .map(|e| qontinui_types::paths::WorkspaceAnchor::new(e, RUNNER_REPO_DIR)),
+        // A capture describes the box, not a session: there is no repository a
+        // session was opened on, so the session-repository rung is skipped.
+        None,
     )
 }
 

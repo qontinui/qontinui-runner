@@ -5757,7 +5757,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // skips dev-service injection for this boot and says so. It
                 // cannot silently inject services rooted at a fabricated path.
                 if dev_services::is_dev_mode() {
-                    if let Some(workspace) = crate::workspace_paths::workspace_root() {
+                    let resolved = crate::workspace_paths::require_workspace_root();
+                    if let Ok(workspace) = resolved.as_deref() {
                         let mutated =
                             dev_services::upgrade_and_dedupe_configs(&mut configs, &workspace);
 
@@ -5789,13 +5790,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 info!("Dev-mode: persisted upgraded/deduped/injected configs to settings");
                             }
                         }
-                    } else {
+                    } else if let Err(unresolved) = resolved {
                         warn!(
-                            "Dev-mode: no Qontinui workspace root resolves, so the default \
-                             dev services (Docker/backend/frontend/embedding) were NOT \
-                             injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \
-                             the directory holding the repo checkouts. \
-                             `workspace_paths` has already logged which probe was rejected."
+                            "Dev-mode: the default dev services \
+                             (Docker/backend/frontend/embedding) were NOT injected. \
+                             {unresolved}"
                         );
                     }
                 }

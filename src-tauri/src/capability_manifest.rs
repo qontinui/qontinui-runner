@@ -56,7 +56,7 @@
 //!
 //! | Existing provenance | Owner | Conversion here |
 //! |---|---|---|
-//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
+//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`SessionRepoParent`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
 //! | `CommandSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
 //! | `AgentSkillSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_skills`] | [`Rung::from_agent_skill_source`] |
 //! | `SkillSource` (`Builtin`/`User`/`Community`/`Other`) | [`crate::skills`] | [`rung_for_skill_source`] |
@@ -419,13 +419,16 @@ impl From<WorkspaceRootKind> for Rung {
     ///   [`crate::workspace_paths::runner_workspace_root_from`] passes
     ///   `exe_anchor(std::env::current_exe().ok())` and nothing else — so
     ///   `Discovered` here is exactly "found relative to where this exe sits".
+    /// - `SessionRepoParent` → [`Rung::OperatorCheckout`]. The folder holding
+    ///   the checkout a session was opened on — the single-repository
+    ///   operator's root, inferred from a repository on their own disk.
     /// - `HomeDefault` → [`Rung::OperatorCheckout`]. `<home>/qontinui-root`, the
     ///   portable last-resort convention. Still a checkout on the operator's
     ///   disk; the fact that convention rather than declaration found it is
     ///   preserved in the row's `detail`, not in the rung.
     /// - `Unresolved` → [`Rung::Unresolved`], one to one.
     ///
-    /// **Two upstream variants collapse onto `OperatorCheckout`, and that loss
+    /// **Three upstream variants collapse onto `OperatorCheckout`, and that loss
     /// is deliberate but must not be silent.** Callers building a row from a
     /// `WorkspaceRoot` are required to put the upstream `kind.wire()` in
     /// [`CapabilityRow::detail`] — [`CapabilityObservation::from_workspace_root_kind`]
@@ -435,6 +438,7 @@ impl From<WorkspaceRootKind> for Rung {
         match kind {
             WorkspaceRootKind::Declared => Rung::OperatorCheckout,
             WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+            WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
             WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
             WorkspaceRootKind::Unresolved => Rung::Unresolved,
         }
@@ -734,9 +738,10 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       the operator's disk. It outranks the embedded floor, so on a box \
                       that has that sibling repo this row — not `fleet_agents` — decides \
                       what a session actually gets. Two sources for one asset, with \
-                      nothing asserting they agree; when the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      nothing asserting they agree; when no root resolves, or the root \
+                      holds no such sibling checkout, the copy is a no-op reported as \
+                      `sibling_checkout_absent` with the embedded copy serving, and the \
+                      spawn continues.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -2098,6 +2103,7 @@ mod tests {
         let all = [
             WorkspaceRootKind::Declared,
             WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
             WorkspaceRootKind::HomeDefault,
             WorkspaceRootKind::Unresolved,
         ];
@@ -2105,6 +2111,7 @@ mod tests {
             let expected = match kind {
                 WorkspaceRootKind::Declared => Rung::OperatorCheckout,
                 WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+                WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
                 WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
                 WorkspaceRootKind::Unresolved => Rung::Unresolved,
             };

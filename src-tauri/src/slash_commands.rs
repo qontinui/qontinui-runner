@@ -87,8 +87,14 @@ fn find_commands_directory_reported() -> (Result<(PathBuf, PathBuf), String>, Pr
                 "slash_commands",
                 0,
                 commands_dir.display().to_string(),
-                "this device has no qontinui-claude-config checkout, and this import has \
-                 no embedded or bundled fallback — the workflows simply do not exist here",
+                // This import has no embedded or bundled fallback, so the
+                // typed sibling case is the UNSUPPORTED arm: the workflows
+                // simply do not exist here.
+                qontinui_types::paths::SiblingCheckoutAbsent::new(
+                    "qontinui-claude-config",
+                    qontinui_types::paths::SiblingFallback::Unsupported,
+                )
+                .to_string(),
             ),
         );
     }

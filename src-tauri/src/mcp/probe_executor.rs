@@ -174,8 +174,7 @@ fn resolve_scoped_worktree(args: &Value) -> Result<PathBuf, String> {
         .get("worktree_path")
         .and_then(Value::as_str)
         .ok_or_else(|| "no worktree_path in probe args".to_string())?;
-    let root = crate::agent_worktree::census::qontinui_root()
-        .ok_or_else(|| "cannot resolve qontinui_root on this device".to_string())?;
+    let root = crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string())?;
     let root_c =
         std::fs::canonicalize(&root).map_err(|e| format!("canonicalize root failed: {e}"))?;
     let cand =

@@ -556,14 +556,15 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
     // Opt-in dev convenience, so an unresolved root is a skip, not an error: a
     // developer who set the flag on a machine with no discoverable workspace
     // gets a line saying why, and boot continues.
-    let Some(qontinui_root) = crate::workspace_paths::workspace_root() else {
-        info!(
-            "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no Qontinui workspace root \
-             resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \
-             `paths.workspace_root` setting) to the directory holding the repo \
-             checkouts."
-        );
-        return Ok(());
+    let qontinui_root = match crate::workspace_paths::require_workspace_root() {
+        Ok(root) => root,
+        Err(unresolved) => {
+            info!(
+                "bootstrap: QONTINUI_DEV_BOOTSTRAP=1 but no dev apps were registered. \
+                 {unresolved}"
+            );
+            return Ok(());
+        }
     };
 
     let runner_dir = qontinui_root.join("qontinui-runner");

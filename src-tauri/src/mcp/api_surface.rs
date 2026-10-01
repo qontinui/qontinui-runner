@@ -167,11 +167,15 @@ async fn handle_scan(
             Json(ApiResponse {
                 success: false,
                 data: None,
+                // The scan reads the runner's own SOURCE checkout, which an
+                // installed product does not carry and has no copy of: the
+                // typed `sibling_checkout_absent` with no fallback.
                 error: Some(
-                    "Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \
-                     to the directory holding the Qontinui repo checkouts, or run the runner \
-                     from inside a checkout."
-                        .to_string(),
+                    qontinui_types::paths::SiblingCheckoutAbsent::new(
+                        "qontinui-runner",
+                        qontinui_types::paths::SiblingFallback::Unsupported,
+                    )
+                    .to_string(),
                 ),
                 error_detail: None,
                 hint: None,

@@ -787,12 +787,12 @@ fn start_build(
     host: super::host_sizing::HostCapacity,
     max_concurrent: u32,
 ) {
-    let Some(root) = crate::agent_runtime::qontinui_root_dir() else {
-        reject(
-            &payload,
-            "QONTINUI_ROOT not resolvable on this device".to_string(),
-        );
-        return;
+    let root = match crate::workspace_paths::require_workspace_root() {
+        Ok(root) => root,
+        Err(unresolved) => {
+            reject(&payload, unresolved.to_string());
+            return;
+        }
     };
 
     // Is this build path on a declared external volume? `None` on a machine

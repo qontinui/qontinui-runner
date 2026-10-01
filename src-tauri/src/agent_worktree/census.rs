@@ -825,7 +825,7 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
     };
     let Some(root) = qontinui_root() else {
         CENSUS_BUILD_ACTIVE.store(false, Ordering::Release);
-        debug!("worktree_census: no qontinui-root dir resolved — skipping");
+        debug!("worktree_census: no workspace root resolved — skipping");
         return Ok(BuildOutcome::Skipped);
     };
     let tenant_id = resolve_tenant_id();

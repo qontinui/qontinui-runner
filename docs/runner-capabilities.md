@@ -74,7 +74,7 @@ The named-subagent definitions written into a spawned session's `<cwd>/.claude/a
 
 ### 7. `agent_definitions`
 
-The CHECKOUT copy of the same subagent definitions, read from `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off the operator's disk. It outranks the embedded floor, so on a box that has that sibling repo this row — not `fleet_agents` — decides what a session actually gets. Two sources for one asset, with nothing asserting they agree; when the root does not resolve the copy is a no-op that logs "no qontinui-root resolved; skipping .claude/agents" and continues.
+The CHECKOUT copy of the same subagent definitions, read from `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off the operator's disk. It outranks the embedded floor, so on a box that has that sibling repo this row — not `fleet_agents` — decides what a session actually gets. Two sources for one asset, with nothing asserting they agree; when no root resolves, or the root holds no such sibling checkout, the copy is a no-op reported as `sibling_checkout_absent` with the embedded copy serving, and the spawn continues.
 
 - Class: `session_provisioning`
 - Resolved by: `agent_runtime::provision_agent_definitions_from_root`

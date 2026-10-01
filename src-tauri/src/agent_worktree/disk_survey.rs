@@ -1193,11 +1193,11 @@ pub async fn survey(query: DiskSurveyQuery) -> DiskSurvey {
     } else {
         // Only report "unavailable" when the reason is structural. A resolvable
         // root with no snapshot yet is `pending`, not an error.
-        census::qontinui_root().is_none().then(|| {
-            "the workspace root could not be resolved (set QONTINUI_ROOT, or the \
-             paths.workspace_root setting)"
-                .to_string()
-        })
+        // The one typed `workspace_root_unresolved` refusal, rendered: it
+        // names the input at fault and the setting to set.
+        crate::workspace_paths::require_workspace_root()
+            .err()
+            .map(|unresolved| unresolved.to_string())
     };
 
     assemble(

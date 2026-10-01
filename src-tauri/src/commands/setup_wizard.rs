@@ -1623,10 +1623,11 @@ pub async fn suggest_dev_services_for_setup(
     // `.git`-less predicate; this is a first-run surface, so a wrong root means
     // a broken install rather than a degraded background sweep (plan
     // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
-    // Phase 8). `require_workspace_root`'s error names the input at fault, every
-    // probe tried, and `$QONTINUI_ROOT` — it surfaces in the wizard where the old
-    // "Could not find qontinui workspace root" string did, but is actionable.
-    let workspace = crate::workspace_paths::require_workspace_root()?;
+    // Phase 8). `require_workspace_root`'s error is the typed
+    // `workspace_root_unresolved` refusal; its rendered sentence surfaces in the
+    // wizard where the old "Could not find qontinui workspace root" string did,
+    // naming the input at fault and the setting to set.
+    let workspace = crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string())?;
 
     let mut existing = settings::get_managed_process_configs();
 

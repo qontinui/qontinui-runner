@@ -74,7 +74,8 @@ pub fn canonical_segment(repo_slug: &str) -> Result<String, String> {
 /// `qontinui_types::paths`, which probes `<home>/qontinui-root` on every OS.
 ///
 /// **Fails closed.** This surface *creates* git checkouts, so an unresolved root
-/// is an error naming `$QONTINUI_ROOT`, never a guess — `WorkspaceRoot::require`
+/// is the typed `workspace_root_unresolved` refusal (rendered), never a guess —
+/// `WorkspaceRoot::require`
 /// rather than `into_root`. The signature was already `Result`, so every caller
 /// already handles the arm; what changes is that on POSIX it can now actually be
 /// taken instead of silently resolving to `/tmp`.
@@ -87,7 +88,7 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     // workspace-root reader funnels through (`runner_workspace_root`), so an
     // unguarded test reaching this from the plan's `on_demand` ledger row is
     // deflected there rather than measuring the box.
-    let root = crate::workspace_paths::runner_workspace_root().require()?;
+    let root = crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string())?;
     if !has_foreign_owner(repo) {
         // `qontinui/*` and bare slugs: the layout rule, with no settings read
         // and no filesystem probe — byte-for-byte what this returned before
@@ -375,13 +376,13 @@ pub fn resolve_checkout(repo: &str) -> Result<PathBuf, CheckoutUnresolved> {
             )),
         }
     }
-    let root = match crate::workspace_paths::runner_workspace_root().require() {
+    let root = match crate::workspace_paths::require_workspace_root() {
         Ok(root) => root,
-        Err(detail) => {
+        Err(unresolved) => {
             return Err(CheckoutUnresolved {
                 repo: repo.to_string(),
                 tried: pre_tried,
-                detail: Some(detail),
+                detail: Some(unresolved.to_string()),
             })
         }
     };

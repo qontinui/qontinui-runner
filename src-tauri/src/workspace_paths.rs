@@ -65,7 +65,9 @@
 
 use std::path::{Path, PathBuf};
 
-use qontinui_types::paths::{qontinui_workspace_root, WorkspaceAnchor, WorkspaceRoot};
+use qontinui_types::paths::{
+    qontinui_workspace_root, WorkspaceAnchor, WorkspaceRoot, WorkspaceRootUnresolved,
+};
 use tracing::{info, warn};
 
 use crate::capability_manifest::CapabilityObservation;
@@ -95,15 +97,33 @@ const RUNNER_REPO_DIR: &str = "qontinui-runner";
 ///
 /// Returns the full [`WorkspaceRoot`] so each caller picks its own disposition:
 /// discovery surfaces take [`WorkspaceRoot::into_root`] and degrade, surfaces
-/// that write or execute take [`WorkspaceRoot::require`] and fail closed with an
-/// error naming `$QONTINUI_ROOT`.
+/// that write or execute take [`WorkspaceRoot::require`] and fail closed with
+/// the one typed [`WorkspaceRootUnresolved`] refusal.
 ///
 /// **Not memoized** — see the module header for why that is a decision rather
 /// than an omission.
 ///
 /// Most callers want [`workspace_root`] (degrade) or [`require_workspace_root`]
-/// (fail closed) instead of this raw form.
+/// (fail closed) instead of this raw form. A caller acting FOR a session that
+/// was opened on a repository uses [`runner_workspace_root_for_session`].
 pub fn runner_workspace_root() -> WorkspaceRoot {
+    runner_workspace_root_for_session(None)
+}
+
+/// [`runner_workspace_root`] for a caller that knows which repository the
+/// session it acts for was opened on.
+///
+/// `session_repo` is that checkout's top-level directory (a primary checkout or
+/// a linked agent worktree). It feeds the shared resolver's
+/// `SessionRepoParent` rung, ranked below every declaration and the exe
+/// ancestor walk and above `<home>/qontinui-root`: for an operator who cloned
+/// ONE repository and opened a session on it, the workspace root is the folder
+/// that repository sits in, and no setting has to be invented first. A box that
+/// declares its root, or runs a dev build from inside a checkout, is answered by
+/// a higher rung and is unaffected. A path that is not a checkout's top level
+/// simply skips the rung — it is never walked upward
+/// (`qontinui_types::paths::resolve_workspace_root` documents why).
+pub fn runner_workspace_root_for_session(session_repo: Option<&Path>) -> WorkspaceRoot {
     // Every workspace-root reader funnels through here, and the inputs are all
     // ambient: `$QONTINUI_ROOT`, `$QONTINUI_WORKSPACE_ROOT`, the persisted
     // `paths.workspace_root` (a `load_settings()` — a writer by side effect),
@@ -126,9 +146,13 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
             None,
             None,
             None,
+            None,
         );
     }
-    runner_workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
+    runner_workspace_root_from(
+        get_setting::<PathSettings>().workspace_root.as_deref(),
+        session_repo,
+    )
 }
 
 /// [`runner_workspace_root`] over a `paths.workspace_root` the caller already
@@ -156,9 +180,15 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
 /// the probes belong to `qontinui_types::paths::qontinui_workspace_root`, which
 /// both call, and `$QONTINUI_ROOT` is read live inside it either way. The only
 /// difference is who supplies the setting.
-pub fn runner_workspace_root_from(configured: Option<&str>) -> WorkspaceRoot {
+///
+/// `session_repo` is the [`runner_workspace_root_for_session`] input; `None`
+/// for every caller that resolves for the runner as a whole.
+pub fn runner_workspace_root_from(
+    configured: Option<&str>,
+    session_repo: Option<&Path>,
+) -> WorkspaceRoot {
     let exe = std::env::current_exe().ok();
-    qontinui_workspace_root(configured, exe_anchor(exe.as_deref()))
+    qontinui_workspace_root(configured, exe_anchor(exe.as_deref()), session_repo)
 }
 
 /// The workspace root for a **discovery** surface: the census sweep, the fleet
@@ -175,21 +205,38 @@ pub fn runner_workspace_root_from(configured: Option<&str>) -> WorkspaceRoot {
 /// [`require_workspace_root`] instead: materialising a git worktree at a
 /// fabricated location is strictly worse than a loud error.
 pub fn workspace_root() -> Option<PathBuf> {
-    workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
+    degrade(runner_workspace_root())
+}
+
+/// [`workspace_root`] for a surface acting for a session opened on
+/// `session_repo` — see [`runner_workspace_root_for_session`].
+pub fn workspace_root_for_session(session_repo: Option<&Path>) -> Option<PathBuf> {
+    degrade(runner_workspace_root_for_session(session_repo))
 }
 
 /// [`workspace_root`] over a `paths.workspace_root` the caller already holds.
 /// The read-only door — see [`runner_workspace_root_from`] for why resolving
 /// the root through [`get_setting`] is a write.
 pub fn workspace_root_from(configured: Option<&str>) -> Option<PathBuf> {
-    let resolved = runner_workspace_root_from(configured);
+    degrade(runner_workspace_root_from(configured, None))
+}
+
+/// The discovery disposition: log a rejected candidate (so the fall-through is
+/// never silent), then take whatever root resolved.
+fn degrade(resolved: WorkspaceRoot) -> Option<PathBuf> {
+    log_rejection(&resolved);
+    resolved.into_root()
+}
+
+/// Log the higher-priority candidate a resolution rejected, if any — carried
+/// even when a lower rung then answered.
+fn log_rejection(resolved: &WorkspaceRoot) {
     if let Some(rejected) = resolved.rejected {
         warn!(
             "workspace_paths: {} — continuing with the next resolution rung",
             rejected.describe()
         );
     }
-    resolved.into_root()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +290,7 @@ fn configured_root_readonly() -> Option<String> {
 /// the ordering and the probes belong to
 /// `qontinui_types::paths::qontinui_workspace_root`, which both doors call.
 pub fn runner_workspace_root_readonly() -> WorkspaceRoot {
-    runner_workspace_root_from(configured_root_readonly().as_deref())
+    runner_workspace_root_from(configured_root_readonly().as_deref(), None)
 }
 
 /// [`workspace_root`]'s non-mutating twin: the same degrade-to-`None`
@@ -293,12 +340,28 @@ pub fn workspace_root_observation() -> CapabilityObservation {
 /// a wrong answer materialises a worktree at a fabricated location or runs a
 /// script from one.
 ///
-/// The error names the input actually at fault, lists every probe tried, and
-/// names `$QONTINUI_ROOT`. That is the product-code counterpart of the plan's
-/// "ask rather than guess": a resolver running inside a background poller has
-/// no operator to ask, so it refuses loudly instead of guessing.
-pub fn require_workspace_root() -> Result<PathBuf, String> {
+/// The error is the shared typed [`WorkspaceRootUnresolved`]: code
+/// `workspace_root_unresolved`, the `RootRejection` wire value as its
+/// discriminator, and the next action "set the Workspace root setting". Its
+/// `Display` is the ONE sentence every runner surface renders for this case —
+/// it names an environment variable only when the operator set that variable
+/// and it was at fault, never as a generic instruction. That is the
+/// product-code counterpart of the plan's "ask rather than guess": a resolver
+/// running inside a background poller has no operator to ask, so it refuses
+/// loudly instead of guessing.
+///
+/// A surface that degrades rather than fails can still use this door to
+/// RENDER why it skipped: `match require_workspace_root() { Err(e) => …{e}… }`.
+pub fn require_workspace_root() -> Result<PathBuf, WorkspaceRootUnresolved> {
     runner_workspace_root().require()
+}
+
+/// [`require_workspace_root`] for a surface acting for a session opened on
+/// `session_repo` — see [`runner_workspace_root_for_session`].
+pub fn require_workspace_root_for_session(
+    session_repo: Option<&Path>,
+) -> Result<PathBuf, WorkspaceRootUnresolved> {
+    runner_workspace_root_for_session(session_repo).require()
 }
 
 /// The runner's contribution to the resolution: this executable's path, tagged
@@ -362,11 +425,18 @@ pub fn persist_resolved_workspace_root() -> Result<(), String> {
         return Ok(());
     }
 
-    let Some(value) = migration_write(existing.as_deref(), workspace_root().as_deref()) else {
+    // Resolved ONCE: the value written and the refusal rendered when nothing
+    // resolves must describe the same resolution.
+    let resolved = runner_workspace_root();
+    log_rejection(&resolved);
+    let resolved = resolved.require();
+    let Some(value) = migration_write(existing.as_deref(), resolved.as_deref().ok()) else {
+        // Render the one typed refusal rather than composing a sentence about
+        // variables this operator may never have heard of.
+        let why = resolved.err().map_or_else(String::new, |e| format!(" {e}"));
         info!(
             "workspace_paths: no workspace root resolves on this machine, so \
-             `paths.workspace_root` was left unset. Set $QONTINUI_ROOT (or the \
-             setting) if this runner should manage canonical checkouts."
+             `paths.workspace_root` was left unset.{why}"
         );
         return Ok(());
     };
@@ -458,7 +528,7 @@ mod tests {
         let f = fixture();
         let exe = dev_install_exe(&f.root);
 
-        let got = resolve_workspace_root(None, None, None, exe_anchor(Some(&exe)), None);
+        let got = resolve_workspace_root(None, None, None, exe_anchor(Some(&exe)), None, None);
 
         assert_eq!(
             got.root.as_deref(),
@@ -482,6 +552,7 @@ mod tests {
             None,
             f.root.to_str(),
             exe_anchor(Some(&installed_exe)),
+            None,
             None,
         );
 
@@ -538,26 +609,70 @@ mod tests {
     // Phase 2 — the two dispositions the collapsed resolvers call.
     // -----------------------------------------------------------------
 
-    /// The fail-closed door must name the input at fault, every probe tried, and
-    /// the variable to set. A surface that creates worktrees or runs scripts
-    /// under the root gets a loud, actionable error instead of a fabricated
-    /// path — the product-code counterpart of "ask rather than guess".
+    /// The fail-closed door returns the ONE typed refusal: code
+    /// `workspace_root_unresolved`, the rejection's wire value as the
+    /// discriminator, and "set the Workspace root setting" as the next action.
+    /// Its rendered sentence blames the input the operator actually set and
+    /// does not tell an operator who set no variable to go set one.
     ///
     /// Driven through the pure resolver with injected inputs, so the assertion
     /// does not depend on how the machine running the suite is configured.
     #[test]
-    fn the_fail_closed_disposition_reports_an_actionable_error() {
-        let err = resolve_workspace_root(None, None, Some("relative/path"), None, None)
+    fn the_fail_closed_disposition_reports_the_typed_refusal() {
+        use qontinui_types::refusal::{NextActionKind, RefusalCode, RefusalSource};
+
+        let err = resolve_workspace_root(None, None, Some("relative/path"), None, None, None)
             .require()
             .expect_err("a relative configured root must not resolve");
 
+        assert_eq!(err.discriminator(), "relative");
+        let refusal = err.refusal(RefusalSource::Runner, "2026-10-01T00:00:00Z");
+        assert_eq!(refusal.code, RefusalCode::WorkspaceRootUnresolved);
+        assert_eq!(refusal.next_action.kind, NextActionKind::SetSetting);
+
+        let shown = err.to_string();
         assert!(
-            err.contains("configured workspace-root setting"),
-            "must blame the setting the operator actually set: {err}"
+            shown.contains("Workspace root setting"),
+            "must blame the setting the operator actually set: {shown}"
         );
         assert!(
-            err.contains("QONTINUI_ROOT"),
-            "must name the variable: {err}"
+            !shown.contains("QONTINUI_ROOT"),
+            "an operator who set no variable must not be told to set one: {shown}"
+        );
+    }
+
+    /// The single-repository operator's answer, end to end through the real
+    /// resolver: nothing declared, an installed exe with no useful ancestry, no
+    /// `<home>/qontinui-root` — and a session opened on one checkout. The root
+    /// is the folder that checkout sits in, reported as `session_repo_parent`,
+    /// and the manifest row maps it to the operator-checkout rung while keeping
+    /// the exact upstream kind in `detail`.
+    #[test]
+    fn a_session_opened_on_one_repository_resolves_its_parent() {
+        let f = fixture();
+        let repo = f.root.join("their-only-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let installed_exe = std::env::temp_dir()
+            .join("qontinui_no_such_install_dir")
+            .join("qontinui-runner.exe");
+        let nowhere = f.root.join("no-home-here");
+
+        let got = resolve_workspace_root(
+            None,
+            None,
+            None,
+            exe_anchor(Some(&installed_exe)),
+            Some(&repo),
+            Some(&nowhere),
+        );
+
+        assert_eq!(got.root.as_deref(), Some(f.root.as_path()));
+        assert_eq!(got.kind, WorkspaceRootKind::SessionRepoParent);
+        let obs = observation_from(got);
+        assert_eq!(obs.rung, Rung::OperatorCheckout);
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some("WorkspaceRootKind::session_repo_parent")
         );
     }
 
@@ -572,7 +687,7 @@ mod tests {
             std::process::id()
         ));
 
-        let got = resolve_workspace_root(None, None, None, None, Some(&nowhere));
+        let got = resolve_workspace_root(None, None, None, None, None, Some(&nowhere));
 
         assert_eq!(got.root, None, "nothing resolves, so discovery gets None");
         assert!(
@@ -598,6 +713,7 @@ mod tests {
             None,
             f.root.to_str(),
             exe_anchor(Some(&installed_exe)),
+            None,
             None,
         );
 
@@ -672,7 +788,7 @@ mod tests {
         );
         assert_eq!(
             obs.rejected.as_deref(),
-            Some("the configured workspace-root setting is not an existing directory")
+            Some("the Workspace root setting is not an existing directory")
         );
         assert_eq!(
             obs.detail.as_deref(),

@@ -215,8 +215,9 @@ fn incomparable_scope(section: &SectionPlan) -> Option<String> {
             "canonical enumerated its repos under a `{canonical}` workspace root \
              and this box resolves a `{local}` one — the two lists do not \
              describe the same thing. Align them with \
-             `qontinui-runner env scope-root` / $QONTINUI_ROOT on one of the two \
-             boxes, then re-run."
+             `qontinui-runner env scope-root` (or the \"{setting}\" setting) on \
+             one of the two boxes, then re-run.",
+            setting = qontinui_types::paths::WORKSPACE_ROOT_SETTING
         )),
         _ => None,
     })
@@ -243,25 +244,17 @@ fn clone_real(url: &str, dest: &Path) -> Result<(), String> {
 /// [`apply_section`] with an injectable cloner.
 pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: bool) -> SectionApply {
     let resolved = collectors::workspace_root_for_apply();
-    let root = match resolved.root.clone() {
-        Some(r) => r,
-        None => {
+    let root = match resolved.require() {
+        Ok(r) => r,
+        Err(unresolved) => {
             // Hard no-op, mirroring the no-version-manager case: say what would
             // have to change for an apply to become possible, and write nothing.
-            let why = resolved
-                .rejected
-                .map(|r| r.describe())
-                .unwrap_or_else(|| "workspace-root resolution found nothing".to_string());
-            let mut out = SectionApply::inert(
+            // The one typed refusal carries both — the input at fault and the
+            // next action — so no second sentence about variables is composed.
+            return SectionApply::inert(
                 REPOS_SECTION,
-                SectionStatus::blocked_precondition(format!("no workspace root resolved — {why}")),
+                SectionStatus::blocked_precondition(unresolved.to_string()),
             );
-            out.notes.push(
-                "Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \
-                 directory holding the repo checkouts; then re-run."
-                    .to_string(),
-            );
-            return out;
         }
     };
 
