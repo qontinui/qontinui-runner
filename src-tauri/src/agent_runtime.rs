@@ -1035,15 +1035,14 @@ pub(crate) fn resolve_claude_bin() -> String {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
     };
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path)
+        .filter(|d| !is_shim_dir(d))
+        .collect();
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
-    let exts: &[&str] = &[".exe", ".com"];
-    for dir in std::env::split_paths(&path) {
-        if is_shim_dir(&dir) {
-            continue;
-        }
-        #[cfg(windows)]
-        {
+    {
+        let exts: &[&str] = &[".exe", ".com"];
+        for dir in &dirs {
             for ext in exts {
                 let cand = dir.join(format!("{bare}{ext}"));
                 if cand.is_file() {
@@ -1051,15 +1050,44 @@ pub(crate) fn resolve_claude_bin() -> String {
                 }
             }
         }
-        #[cfg(not(windows))]
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(found) =
+            pick_claude_candidate_unix(&bare, &dirs, &crate::terminal::pane_io::probe_launchable)
         {
-            let cand = dir.join(&bare);
-            if cand.is_file() {
-                return cand.to_string_lossy().into_owned();
-            }
+            return found;
         }
     }
     bare
+}
+
+/// PURE over the injected exec predicate: the unix PATH pick for `bare`.
+///
+/// The FIRST candidate that passes the exec seam's own predicate
+/// ([`crate::terminal::pane_io::probe_launchable`]) wins, so a stale,
+/// non-executable earlier match (a half-reinstalled npm bin dir) cannot mask a
+/// working later one. When no candidate is launchable, the first one that at
+/// least EXISTS as a file is returned anyway — so the pre-claim probe still
+/// names that file and reports its real fault (`eacces`) rather than
+/// `not_on_path`. `None` when nothing on PATH is even a file.
+#[cfg(not(windows))]
+fn pick_claude_candidate_unix(
+    bare: &str,
+    dirs: &[std::path::PathBuf],
+    probe: &dyn Fn(&std::path::Path) -> Result<(), crate::terminal::pane_io::ExecFault>,
+) -> Option<String> {
+    let mut first_file: Option<std::path::PathBuf> = None;
+    for dir in dirs {
+        let cand = dir.join(bare);
+        if probe(&cand).is_ok() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+        if first_file.is_none() && cand.is_file() {
+            first_file = Some(cand);
+        }
+    }
+    first_file.map(|p| p.to_string_lossy().into_owned())
 }
 
 // =============================================================================
@@ -2179,10 +2207,22 @@ enum ClaimSent {
     Unknown,
 }
 
-/// Classify a claim POST's send error. `is_connect` is the one reqwest error
-/// class raised before any request bytes are written.
-fn claim_sent_for_send_error(e: &reqwest::Error) -> ClaimSent {
-    if e.is_connect() {
+/// Classify a claim POST's send error. PURE over the three facts it needs so
+/// every arm is unit-testable.
+///
+/// `is_connect` is the one reqwest error class raised before any request bytes
+/// are written — but only for the connection it names. The shared coord client
+/// follows redirects (reqwest sets the redirect policy per CLIENT; a request
+/// cannot override it), so a connect failure on a REDIRECT target means the
+/// original POST did reach a server first. `NotSent` therefore also requires
+/// the failing URL to be the one this request was sent to; a failing URL that
+/// differs, or is absent, is [`ClaimSent::Unknown`].
+fn classify_claim_send_error(
+    is_connect: bool,
+    failed_url: Option<&reqwest::Url>,
+    requested_url: &reqwest::Url,
+) -> ClaimSent {
+    if is_connect && failed_url == Some(requested_url) {
         ClaimSent::NotSent
     } else {
         ClaimSent::Unknown
@@ -5170,7 +5210,21 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
 /// [`claim_before_spawn`] so the send-error classification ([`ClaimSent`]) is
 /// driven by a test against a real local listener, not re-implemented.
 async fn send_continuation_claim(request: reqwest::RequestBuilder) -> SpawnDecision {
-    match request.send().await {
+    // Split so the URL this request was sent to is known when classifying a
+    // send error (see `classify_claim_send_error` on redirects).
+    let (client, built) = request.build_split();
+    let built = match built {
+        Ok(built) => built,
+        // The request could not even be built: nothing was sent.
+        Err(e) => {
+            return SpawnDecision::SpawnDespiteClaimError {
+                cause: format!("claim POST could not be built: {e:#}"),
+                claim_sent: ClaimSent::NotSent,
+            }
+        }
+    };
+    let requested_url = built.url().clone();
+    match client.execute(built).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Body is needed only to distinguish the 409 cancelled / superseded
@@ -5180,7 +5234,7 @@ async fn send_continuation_claim(request: reqwest::RequestBuilder) -> SpawnDecis
         }
         Err(e) => SpawnDecision::SpawnDespiteClaimError {
             cause: format!("claim POST failed: {e:#}"),
-            claim_sent: claim_sent_for_send_error(&e),
+            claim_sent: classify_claim_send_error(e.is_connect(), e.url(), &requested_url),
         },
     }
 }
@@ -5739,9 +5793,12 @@ fn first_line(msg: &str) -> String {
     msg.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// The shared tail of EVERY local-guard deferral in
-/// [`run_gate_continuation_inner`]'s step 1: stamp coord with a non-consuming
-/// reason, then release the in-process dedupe claim.
+/// The shared tail of EVERY unclaimed deferral in
+/// [`run_gate_continuation_inner`]: stamp coord with a non-consuming reason,
+/// then release the in-process dedupe claim. Callers: the step-1 local guards,
+/// the drain deferral of an errored claim, the pre-claim spawn-readiness check
+/// ([`claim_if_spawn_ready`]), and the step-4 seam refusal after a claim that
+/// provably never reached coord ([`settle_failed_gate_spawn`]).
 ///
 /// One helper rather than three copies of the same eight lines, because the two
 /// invariants it encodes are the ones the 2026-07 delivery-stall incident was
@@ -5750,9 +5807,10 @@ fn first_line(msg: &str) -> String {
 ///
 /// ## Deliberately NO continuation claim/outcome here (contract item 4)
 ///
-/// Every caller is a LOCAL guard that fires BEFORE step 2's consume claim, so
-/// none of them may burn a coord-side claim on a dispatch the local guard
-/// rejected. The row stays pending on coord — uncancelled, unconsumed, and
+/// Every caller acts on a row coord has NOT recorded as claimed — a LOCAL guard
+/// that fires before step 2's consume claim, or (step 4, D5) a claim whose POST
+/// provably never left this host — so none of them may burn a coord-side claim
+/// on a dispatch that did not run. The row stays pending on coord — uncancelled, unconsumed, and
 /// therefore re-listable — so it can be re-delivered once the local condition
 /// clears (the anchor's session exits, threads free up, a cap slot opens), or be
 /// cancelled by the operator / takeover path.
@@ -5775,12 +5833,14 @@ fn first_line(msg: &str) -> String {
 /// It applies verbatim to the thread-pressure deferral, which is why that arm
 /// routes through here rather than growing its own tail.
 ///
-/// `reason` is the machine-matchable stamp string, built by one of the four
-/// constructors above [`post_continuation_deferred`] — never spelled inline.
-/// Three follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
-/// `thread_pressure:<severity>:<observed>_over_<limit>`, `at_cap:<cap>`) and one
-/// predates it (`spawn_authorization_<label>`). Callers log their own
-/// human-readable line first, at the severity their verdict deserves.
+/// `reason` is the machine-matchable stamp string, built by one of the stamp
+/// constructors — never spelled inline. The complete vocabulary, with the
+/// constructor for each class, is the table on [`post_continuation_deferred`]:
+/// `duplicate_anchor:`, `thread_pressure:`, `commit_pressure:`,
+/// `claude_cli_unavailable:`, `at_cap:`, `device_drain:` (all
+/// `<class>:<detail>`), and `spawn_authorization_<label>`, which predates the
+/// grammar. Callers log their own human-readable line first, at the severity
+/// their verdict deserves.
 async fn defer_continuation_unclaimed(
     consume_target: ConsumeTarget,
     device_id: uuid::Uuid,
@@ -5919,19 +5979,22 @@ enum PreClaim {
 /// Skipped for [`ConsumeTarget::None`]: the legacy path has no re-delivery,
 /// so a deferral there would be a silent drop.
 ///
-/// `post_claim` is the claim poster; production passes
-/// [`post_continuation_claim`] in ONE statement, so a unit test drives this fn
-/// rather than a re-implementation of it.
-async fn claim_if_spawn_ready<C, Fut>(
+/// `post_claim` is the claim poster and `defer_unclaimed` the deferral poster;
+/// production passes [`post_continuation_claim`] and
+/// [`defer_continuation_unclaimed`] in ONE statement, so a unit test drives
+/// this fn — and counts both posters — rather than a re-implementation of it.
+async fn claim_if_spawn_ready<C, Fut, D, DFut>(
     consume_target: ConsumeTarget,
-    device_id: uuid::Uuid,
     claude_bin: &str,
     readiness: SpawnReadiness,
     post_claim: C,
+    defer_unclaimed: D,
 ) -> PreClaim
 where
     C: FnOnce(uuid::Uuid) -> Fut,
     Fut: std::future::Future<Output = SpawnDecision>,
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = ()>,
 {
     if !matches!(consume_target, ConsumeTarget::None) {
         if let Some(deferral) = spawn_readiness_deferral(&readiness, claude_bin) {
@@ -5941,7 +6004,7 @@ where
                  consume_target={consume_target:?})",
                 deferral.why, deferral.stamp
             );
-            defer_continuation_unclaimed(consume_target, device_id, deferral.stamp.clone()).await;
+            defer_unclaimed(deferral.stamp.clone()).await;
             return PreClaim::Deferred {
                 stamp: deferral.stamp,
             };
@@ -6034,6 +6097,90 @@ fn seam_error(message: String, refusal: Option<SpawnRefusal>) -> anyhow::Error {
         Some(refusal) => anyhow::Error::new(refusal).context(message),
         None => anyhow::anyhow!(message),
     }
+}
+
+/// The error a failed PTY spawn of the continuation's `claude` returns: the
+/// seam's text verbatim, with its typed cause mapped to a [`SpawnRefusal`]
+/// when the cause concerns this spawn's own claude binary. The one
+/// constructor [`run_continuation_terminal`] uses, so a test drives the same.
+fn pty_spawn_error(
+    e: crate::terminal::session::TerminalSpawnError,
+    claude_bin: &str,
+) -> anyhow::Error {
+    let refusal = e
+        .cause
+        .and_then(|cause| SpawnRefusal::from_seam_cause(cause, claude_bin));
+    seam_error(e.message, refusal)
+}
+
+/// The error a failed headless `claude` spawn returns: the retry's own text
+/// ([`crate::claude_cli_spawn::CliSpawnFailure::describe`]), with a
+/// [`SpawnRefusal`] underneath when the binary itself fails the exec seam's
+/// predicate (an absolute path only — `ENOENT` from a missing `workdir` must
+/// not read as a missing CLI). The one constructor [`spawn_claude_child`]
+/// uses, so a test drives the same.
+fn headless_spawn_error(
+    bin: &str,
+    workdir: &str,
+    failure: &crate::claude_cli_spawn::CliSpawnFailure,
+) -> anyhow::Error {
+    let refusal = crate::terminal::session::exec_failure_cause(
+        Some(bin),
+        &crate::terminal::pane_io::probe_launchable,
+    )
+    .and_then(|cause| SpawnRefusal::from_seam_cause(cause, bin));
+    seam_error(failure.describe(bin, workdir), refusal)
+}
+
+/// Step 4 for a gate continuation whose spawn FAILED: decide
+/// ([`failed_spawn_disposition`]) and act, through the injected posters.
+///
+/// `post_spawn_failed(detail)` is the `spawn_failed` outcome poster and
+/// `defer_unclaimed(stamp)` the unclaimed-deferral poster; production passes
+/// [`post_spawn_outcome`] and [`defer_continuation_unclaimed`] in ONE
+/// statement, so the wiring from disposition to poster is what the unit test
+/// drives — not a re-implementation of a match arm. Returns the disposition
+/// so the caller can report a deferral as `Ok` (it is not a failure).
+///
+/// On `DeferUnclaimed` the cleanup matches the pre-claim deferral's: the
+/// worktree claim heartbeat (`ctx`) and the anchor reservation (with its
+/// in-flight slot) were moved into the presentation fn and dropped on its
+/// `Err`, so a re-delivery re-acquires both. The materialized worktree
+/// directory is left, as on every other exit of this path.
+async fn settle_failed_gate_spawn<P, PFut, D, DFut>(
+    gate_id: uuid::Uuid,
+    errored_claim: Option<ClaimSent>,
+    error: &anyhow::Error,
+    post_spawn_failed: P,
+    defer_unclaimed: D,
+) -> FailedSpawnDisposition
+where
+    P: FnOnce(String) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = ()>,
+{
+    let disposition = failed_spawn_disposition(errored_claim, error);
+    match &disposition {
+        FailedSpawnDisposition::DeferUnclaimed(stamp) => {
+            // D5: the claim never reached coord and the seam refused for a
+            // retriable local reason, so the row is still pending and
+            // unconsumed there — defer it UNCLAIMED rather than post the
+            // `spawn_failed` that would burn it.
+            warn!(
+                "agent_runtime: gate-continuation refused at the spawn seam after a claim \
+                 that never reached coord — deferring UNCLAIMED instead of posting \
+                 spawn_failed, row left pending for re-delivery: {} (stamp={stamp}, \
+                 gate_id={gate_id})",
+                first_line(&error.to_string())
+            );
+            defer_unclaimed(stamp.clone()).await;
+        }
+        FailedSpawnDisposition::PostSpawnFailed => {
+            post_spawn_failed(first_line(&error.to_string())).await;
+        }
+    }
+    disposition
 }
 
 /// What step 4 records for a gate continuation whose spawn failed.
@@ -6379,13 +6526,13 @@ async fn run_gate_continuation_inner(
     // over the exact string the spawn will exec.
     let decision = match claim_if_spawn_ready(
         consume_target,
-        device_id,
         &claude_bin,
         SpawnReadiness {
             resource: crate::resource_guard::probe_for_spawn(),
             cli: claude_cli_readiness(&claude_bin, &crate::terminal::pane_io::probe_launchable),
         },
         |gate_id| post_continuation_claim(gate_id, device_id),
+        |stamp| defer_continuation_unclaimed(consume_target, device_id, stamp),
     )
     .await
     {
@@ -6530,37 +6677,29 @@ async fn run_gate_continuation_inner(
             Ok(_) => {
                 post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
             }
-            Err(e) => match failed_spawn_disposition(errored_claim, e) {
-                FailedSpawnDisposition::DeferUnclaimed(stamp) => {
-                    // D5: the claim never reached coord and the seam refused
-                    // for a retriable local reason, so the row is still
-                    // pending and unconsumed there — defer it UNCLAIMED rather
-                    // than post the `spawn_failed` that would burn it. The
-                    // cleanup matches the pre-claim deferral's: the worktree
-                    // claim heartbeat (`ctx`) and the anchor `reservation`
-                    // (with its in-flight slot) were moved into the
-                    // presentation fn and dropped on its `Err`, so a
-                    // re-delivery re-acquires both cleanly.
-                    warn!(
-                        "agent_runtime: gate-continuation refused at the spawn seam after a claim \
-                         that never reached coord — deferring UNCLAIMED instead of posting \
-                         spawn_failed, row left pending for re-delivery: {} (stamp={stamp}, \
-                         gate_id={gate_id})",
-                        first_line(&e.to_string())
-                    );
-                    defer_continuation_unclaimed(consume_target, device_id, stamp).await;
+            // ONE wiring statement (D5): the decision and both posters live
+            // in `settle_failed_gate_spawn`, which the unit test drives. A
+            // deferral is not a failure, so it returns `Ok`.
+            Err(e) => {
+                if let FailedSpawnDisposition::DeferUnclaimed(_) = settle_failed_gate_spawn(
+                    gate_id,
+                    errored_claim,
+                    e,
+                    |detail| {
+                        post_spawn_outcome(
+                            gate_id,
+                            device_id,
+                            ContinuationOutcome::SpawnFailed,
+                            Some(detail),
+                        )
+                    },
+                    |stamp| defer_continuation_unclaimed(consume_target, device_id, stamp),
+                )
+                .await
+                {
                     return Ok(());
                 }
-                FailedSpawnDisposition::PostSpawnFailed => {
-                    post_spawn_outcome(
-                        gate_id,
-                        device_id,
-                        ContinuationOutcome::SpawnFailed,
-                        Some(first_line(&e.to_string())),
-                    )
-                    .await
-                }
-            },
+            }
         },
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
@@ -7116,10 +7255,14 @@ async fn run_continuation_terminal(
                 // when it had one, rides underneath the unchanged text for step 4
                 // to classify (D5). Matched against THIS attempt's binary, which
                 // a never-started retry may have re-resolved.
-                let refusal = e
-                    .cause
-                    .and_then(|cause| SpawnRefusal::from_seam_cause(cause, &claude_bin));
-                return Err(seam_error(e.message, refusal));
+                //
+                // The agent-lifecycle `spawn-failed` post above stays even when
+                // step 4 then defers the continuation: coord keys it on this
+                // attempt's `agent_id` alone — it abandons that attempt's
+                // `agent_worktrees` allocation and writes a `spawn_outcome` row
+                // that stops the dead allocation counting as in-flight — and
+                // reads no gate state from it.
+                return Err(pty_spawn_error(e, &claude_bin));
             }
         };
 
@@ -7238,7 +7381,6 @@ async fn run_continuation_terminal(
         }
     }
 }
-
 
 /// How many times a gate-continuation terminal is created before a session that
 /// never STARTS is given up on and reported `spawn_failed` (1 initial + 2
@@ -10162,19 +10304,9 @@ pub(crate) async fn spawn_claude_child(
             .await
         {
             Ok(child) => child,
-            Err(f) => {
-                // The text is the retry's own. When the binary itself fails
-                // the exec seam's predicate (an absolute path only — `ENOENT`
-                // from a missing `workdir` must not read as a missing CLI),
-                // the typed refusal rides underneath it for the continuation's
-                // step 4 (D5).
-                let refusal = crate::terminal::session::exec_failure_cause(
-                    Some(&bin),
-                    &crate::terminal::pane_io::probe_launchable,
-                )
-                .and_then(|cause| SpawnRefusal::from_seam_cause(cause, &bin));
-                return Err(seam_error(f.describe(&bin, workdir), refusal));
-            }
+            // The text is the retry's own; a typed refusal rides underneath it
+            // when the binary itself is unlaunchable (see `headless_spawn_error`).
+            Err(f) => return Err(headless_spawn_error(&bin, workdir, &f)),
         };
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
@@ -16143,26 +16275,52 @@ mod tests {
     }
 
     /// Drive `claim_if_spawn_ready` for a Gate target with a counting claim
-    /// poster, and return (result, how many claims were posted). The local
-    /// dispatch claim for `gate` is taken first, as the dispatcher does.
+    /// poster and a counting deferral poster that forwards to the REAL
+    /// `defer_continuation_unclaimed` (so the local-claim release is the
+    /// production one), and return (result, claims posted, deferrals posted).
+    async fn run_pre_claim_counted(
+        consume_target: ConsumeTarget,
+        claude_bin: &str,
+        readiness: SpawnReadiness,
+    ) -> (PreClaim, usize, usize) {
+        let claims = std::cell::Cell::new(0usize);
+        let deferrals = std::cell::Cell::new(0usize);
+        let device = uuid::Uuid::now_v7();
+        let result = claim_if_spawn_ready(
+            consume_target,
+            claude_bin,
+            readiness,
+            |_gate_id| {
+                claims.set(claims.get() + 1);
+                async { SpawnDecision::Spawn }
+            },
+            |stamp| {
+                deferrals.set(deferrals.get() + 1);
+                defer_continuation_unclaimed(consume_target, device, stamp)
+            },
+        )
+        .await;
+        (result, claims.get(), deferrals.get())
+    }
+
+    /// [`run_pre_claim_counted`] for a Gate target, asserting the invariant
+    /// every readiness test shares: a `Deferred` result posted the deferral
+    /// exactly once and no claim, a `Ready` one posted no deferral. Returns
+    /// (result, claims posted).
     async fn run_pre_claim(
         gate: uuid::Uuid,
         claude_bin: &str,
         readiness: SpawnReadiness,
     ) -> (PreClaim, usize) {
-        let calls = std::cell::Cell::new(0usize);
-        let result = claim_if_spawn_ready(
-            ConsumeTarget::Gate(gate, 0),
-            uuid::Uuid::now_v7(),
-            claude_bin,
-            readiness,
-            |_gate_id| {
-                calls.set(calls.get() + 1);
-                async { SpawnDecision::Spawn }
-            },
-        )
-        .await;
-        (result, calls.get())
+        let (result, claims, deferrals) =
+            run_pre_claim_counted(ConsumeTarget::Gate(gate, 0), claude_bin, readiness).await;
+        match &result {
+            PreClaim::Deferred { .. } => {
+                assert_eq!(deferrals, 1, "a deferral must post through the deferral poster once")
+            }
+            PreClaim::Ready { .. } => assert_eq!(deferrals, 0, "a ready dispatch defers nothing"),
+        }
+        (result, claims)
     }
 
     /// A file at `dir/claude` with `mode` (unix).
@@ -16309,32 +16467,20 @@ mod tests {
             resource: threads_critical(),
             cli: CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::NotFound),
         };
-        let calls = std::cell::Cell::new(0usize);
-        let result = claim_if_spawn_ready(
-            ConsumeTarget::None,
-            uuid::Uuid::now_v7(),
-            "/abs/claude",
-            failing.clone(),
-            |_gate_id| {
-                calls.set(calls.get() + 1);
-                async { SpawnDecision::Spawn }
-            },
-        )
-        .await;
+        let (result, claims, deferrals) =
+            run_pre_claim_counted(ConsumeTarget::None, "/abs/claude", failing.clone()).await;
         assert_eq!(result, PreClaim::Ready { decision: None });
-        assert_eq!(calls.get(), 0);
+        assert_eq!(claims, 0);
+        assert_eq!(deferrals, 0, "the legacy path posts no deferral");
 
         let dispatch = uuid::Uuid::now_v7();
         assert!(claim_dispatch_dispatch(dispatch), "the dispatcher's claim");
-        let result = claim_if_spawn_ready(
-            ConsumeTarget::Dispatch(dispatch),
-            uuid::Uuid::now_v7(),
-            "/abs/claude",
-            failing,
-            |_gate_id| async { SpawnDecision::Spawn },
-        )
-        .await;
+        let (result, claims, deferrals) =
+            run_pre_claim_counted(ConsumeTarget::Dispatch(dispatch), "/abs/claude", failing)
+                .await;
         assert!(matches!(result, PreClaim::Deferred { .. }), "{result:?}");
+        assert_eq!(claims, 0, "a Dispatch target posts no claim");
+        assert_eq!(deferrals, 1);
         assert!(
             claim_dispatch_dispatch(dispatch),
             "a Dispatch deferral must release its local claim too"
@@ -16542,6 +16688,182 @@ mod tests {
             SpawnRefusal::from_seam_cause(cause, "/some/other/program"),
             None,
             "a program that is not the claude binary is not a CLI refusal"
+        );
+    }
+
+    /// Drive `settle_failed_gate_spawn` with counting posters; returns
+    /// (disposition, outcome posts with their details, deferral stamps).
+    async fn settle_counted(
+        errored_claim: Option<ClaimSent>,
+        error: &anyhow::Error,
+    ) -> (FailedSpawnDisposition, Vec<String>, Vec<String>) {
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        let deferrals = std::cell::RefCell::new(Vec::new());
+        let disposition = settle_failed_gate_spawn(
+            uuid::Uuid::now_v7(),
+            errored_claim,
+            error,
+            |detail| {
+                outcomes.borrow_mut().push(detail);
+                async {}
+            },
+            |stamp| {
+                deferrals.borrow_mut().push(stamp);
+                async {}
+            },
+        )
+        .await;
+        (disposition, outcomes.into_inner(), deferrals.into_inner())
+    }
+
+    /// D5 wiring, end to end through the step-4 fn: a REAL seam error — built
+    /// by the constructors the two presentations use (`pty_spawn_error` over
+    /// the seam's own `exec_failure_cause`, and `headless_spawn_error`) against
+    /// a real non-executable file — plus an unsent claim posts the deferral
+    /// ONCE with the typed stamp and the `spawn_failed` outcome ZERO times.
+    /// The same error after a claim that may have landed (`Unknown`) posts the
+    /// outcome once, with the seam's text as its detail, and defers nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn step4_defers_a_real_seam_refusal_after_an_unsent_claim() {
+        use crate::terminal::session::{exec_failure_cause, SpawnSeamCause, TerminalSpawnError};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = cli_file(dir.path(), 0o644);
+        let pty_text = format!(
+            "Failed to spawn shell: Unable to spawn {bin} because it doesn't exist on the \
+             filesystem or is not executable (EACCES: Permission denied)"
+        );
+        let pty = || {
+            pty_spawn_error(
+                TerminalSpawnError {
+                    message: pty_text.clone(),
+                    cause: exec_failure_cause(
+                        Some(&bin),
+                        &crate::terminal::pane_io::probe_launchable,
+                    ),
+                },
+                &bin,
+            )
+        };
+        let headless = || {
+            headless_spawn_error(
+                &bin,
+                "/work",
+                &crate::claude_cli_spawn::CliSpawnFailure {
+                    error: std::io::Error::from_raw_os_error(libc::EACCES),
+                    attempts: 1,
+                    elapsed: std::time::Duration::ZERO,
+                    transient_kind: None,
+                },
+            )
+        };
+        let resource = || {
+            pty_spawn_error(
+                TerminalSpawnError {
+                    message: "resource_guard:critical: Not starting a new terminal session: …"
+                        .to_string(),
+                    cause: Some(SpawnSeamCause::ResourceGuard {
+                        severity: "critical",
+                        observation: observation_of(threads_critical()),
+                    }),
+                },
+                &bin,
+            )
+        };
+
+        for (label, error, stamp) in [
+            ("pty", pty(), "claude_cli_unavailable:eacces"),
+            ("headless", headless(), "claude_cli_unavailable:eacces"),
+            ("resource", resource(), "thread_pressure:critical:540_over_400"),
+        ] {
+            let (disposition, outcomes, deferrals) =
+                settle_counted(Some(ClaimSent::NotSent), &error).await;
+            assert_eq!(
+                disposition,
+                FailedSpawnDisposition::DeferUnclaimed(stamp.to_string()),
+                "{label}"
+            );
+            assert_eq!(deferrals, vec![stamp.to_string()], "{label}: deferred once");
+            assert!(outcomes.is_empty(), "{label}: no spawn_failed outcome");
+        }
+
+        for (label, error) in [("pty", pty()), ("headless", headless()), ("resource", resource())]
+        {
+            let (disposition, outcomes, deferrals) =
+                settle_counted(Some(ClaimSent::Unknown), &error).await;
+            assert_eq!(disposition, FailedSpawnDisposition::PostSpawnFailed, "{label}");
+            assert_eq!(outcomes.len(), 1, "{label}: spawn_failed posted once");
+            assert_eq!(outcomes[0], first_line(&error.to_string()), "{label}: seam detail");
+            assert!(deferrals.is_empty(), "{label}: nothing deferred");
+        }
+        // The PTY detail #2674 classifies is the seam's own text, unrenamed.
+        assert_eq!(pty().to_string(), pty_text);
+    }
+
+    /// Finding 7: a claim's connect failure is `NotSent` only when it failed
+    /// on the URL this request was sent to — a connect failure on a redirect
+    /// target means the original POST reached a server first.
+    #[test]
+    fn claim_send_error_is_not_sent_only_for_a_connect_failure_on_the_requested_url() {
+        let requested: reqwest::Url = "http://coord.example/coord/gates/g/continuation-consumed"
+            .parse()
+            .expect("url");
+        let redirect: reqwest::Url = "http://elsewhere.example/x".parse().expect("url");
+        assert_eq!(
+            classify_claim_send_error(true, Some(&requested), &requested),
+            ClaimSent::NotSent
+        );
+        assert_eq!(
+            classify_claim_send_error(true, Some(&redirect), &requested),
+            ClaimSent::Unknown,
+            "a connect failure after a redirect is not proof the claim was unsent"
+        );
+        assert_eq!(
+            classify_claim_send_error(true, None, &requested),
+            ClaimSent::Unknown
+        );
+        assert_eq!(
+            classify_claim_send_error(false, Some(&requested), &requested),
+            ClaimSent::Unknown,
+            "a timeout or mid-flight error may have landed"
+        );
+    }
+
+    /// Finding 4: the unix PATH pick prefers the first LAUNCHABLE candidate, so
+    /// a stale non-executable earlier match does not mask a working later one;
+    /// with no launchable candidate the first existing file is still returned,
+    /// so the probe names it and reports `eacces` rather than `not_on_path`.
+    #[cfg(unix)]
+    #[test]
+    fn unix_claude_pick_prefers_a_launchable_candidate_over_an_earlier_stale_one() {
+        let probe = &crate::terminal::pane_io::probe_launchable;
+        let stale = tempfile::tempdir().expect("tempdir");
+        let working = tempfile::tempdir().expect("tempdir");
+        let empty = tempfile::tempdir().expect("tempdir");
+        let stale_bin = cli_file(stale.path(), 0o644);
+        let working_bin = cli_file(working.path(), 0o755);
+        let dirs = |ds: &[&std::path::Path]| ds.iter().map(|d| d.to_path_buf()).collect::<Vec<_>>();
+
+        assert_eq!(
+            pick_claude_candidate_unix(
+                "claude",
+                &dirs(&[empty.path(), stale.path(), working.path()]),
+                probe
+            ),
+            Some(working_bin.clone()),
+            "the later executable wins over the earlier non-executable"
+        );
+        let only_stale =
+            pick_claude_candidate_unix("claude", &dirs(&[empty.path(), stale.path()]), probe);
+        assert_eq!(only_stale, Some(stale_bin.clone()));
+        assert_eq!(
+            claude_cli_readiness(&stale_bin, probe),
+            CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::PermissionDenied),
+            "the non-executable-only pick still probes as eacces"
+        );
+        assert_eq!(
+            pick_claude_candidate_unix("claude", &dirs(&[empty.path()]), probe),
+            None
         );
     }
 
