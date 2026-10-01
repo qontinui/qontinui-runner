@@ -59,7 +59,7 @@ Cascade — stops at the first LIVE door:
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
 | L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), sent `{"tenantId": "<the session's tenant>"}` when that is known (see "The session's tenant" below), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
-| L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file (plus the session's `tenant_id` when known), then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
+| L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file (plus the session's `tenant_id` when known), then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on the operator's box: static device JWT `401`, invoke mint `400`, eval mint `400` |
 | L6 | **The WEB host** — `GET $QONTINUI_WEB_HTTP_URL/api/v1/plan-library?kind=plan&limit=1` (default `https://api.qontinui.io`), first anonymously (is a program answering?), then with a **`user_id`-bearing device JWT** from `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` — the same two static sources as L4 sources 1-2, shape-tested and sent; the host's `401` is the freshness gate, exactly as at L4 (no local `exp` decode). Emits **typed faults on the credential axis** (`WEB_HOST_NO_USER_JWT`, `WEB_HOST_JWT_UNAUTHORIZED`) and a host-level one only for a transport failure (`WEB_HOST_UNREACHABLE`) | It is a **different program on a different host**: plan-library and memory live there, behind `get_audit_actor_user`, which wants a `user_id` claim the agent-minted tokens (L5, `/agents/allocate`) never carry. Measured 2026-09-06: the same device JWT `coord.qontinui.io` answered `200` to also answered `200`/`422` here — one credential, two hosts, two capabilities — and this file named `api.qontinui.io` nowhere. A `LIVE` here is `PARTIAL`: it proves the host axis, not a coord door |
 
 **L4 is the rung that was missing.** On 2026-08-08 all 14 probeable doors
@@ -458,7 +458,7 @@ default-slot `get_access_token_for_websocket` door. Both runner mints and L5 are
 ### L5 — the bootstrap credential: WIRED, PROBED, and LIVE
 
 > ✅ **L5 works. Measured against production coord 2026-09-04 from
-> `merytshost`: the anonymous `POST /agents/credential` answered **`200`**.**
+> the operator's box: the anonymous `POST /agents/credential` answered **`200`**.**
 > Body `{token, token_exp, token_jti}`; the token an EdDSA JWT claiming
 > `iss=qontinui-coord`, `sub=device:<device_id>`, `sub_type=agent`, a resolved
 > `tenant_id`, **no `agent_id` claim**, **all scopes empty/false**, TTL 14400s
@@ -861,8 +861,8 @@ stated in the output rather than left for the reader to infer:
   later while the checkout's survived). The absent-case line says so rather than
   implying the file exists nowhere.
 
-Full reason table and the writer's call sites:
-`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`
+Full reason table and the writer's call sites, in the maintainers' knowledge
+base: `knowledge-base/qontinui-specific/coord-gates-and-access.md`
 → "`.coord-mcp-status` — the runner's degraded-provisioning breadcrumb".
 
 ### The APPROVAL half: a LIVE door is not a loaded tool
@@ -959,9 +959,10 @@ MAIN checkout's root.** That is why the trust key is resolved from
 `--git-common-dir` rather than from `$PWD`, and it is a *deliberate divergence*
 from the `resolve_root()` used by L2: that helper falls back to `$HERE` because
 any anchor that finds the fleet's workspace root is as good as another, while
-trust is a property of the folder the **session** is in. `$HERE` is always
-inside `qontinui-claude-config`, so accepting it would report that repository's
-trust for a session running elsewhere. Outside a repository the key is the
+trust is a property of the folder the **session** is in. `$HERE` is wherever
+this skill was provisioned (the config repository on a maintainer box, a
+session workdir's `.claude/skills/` on a device the runner provisioned), so
+accepting it would report that folder's trust for a session running elsewhere. Outside a repository the key is the
 directory you started from. Reading the worktree's own path instead would look
 up a `projects` key that has never existed and report `noentry` — "no record of
 this folder", which the output states as UNKNOWN and never as a refusal — for a

@@ -251,18 +251,20 @@ bounding-box model cannot derive.
 ```bash
 # Web SDK / relay surface — a DIFFERENT APPLICATION from the runner's :9876
 # that every other example in this skill targets. Only run this when the page
-# you are auditing is itself qontinui-web (see the applicability note below).
+# you are auditing is itself a web page served with the SDK, and send it to
+# THAT app's base: its origin plus its configured `apiPath` (`/api/ui-bridge`
+# in the SDK's Next.js setup). See the applicability note below.
 # -f so the 404 below is a non-zero exit rather than a 0 with an error body,
 # -S so it still says why under -s. A 404 that exits 0 reads as a pass.
-curl -fsS -X POST http://localhost:3001/api/ui-bridge/control/visibility \
+curl -fsS -X POST <web-app-ui-bridge-base>/control/visibility \
   -H 'Content-Type: application/json' -d '{"minRatio":0.02}'
 ```
 
 **Only ask this of the surface you are actually auditing.** The endpoint
-answers about the surface it is sent to, and `:3001` is qontinui-web — not the
-runner. This skill's own worked example is a *runner* page (the Terminal-page
+answers about the surface it is sent to, and a web origin is that web app — not
+the runner. This skill's own worked example is a *runner* page (the Terminal-page
 occlusion bug above), and for that page the command has no correct target:
-running it anyway returns a healthy-looking 200 about qontinui-web, which is
+running it anyway returns a healthy-looking 200 about that web app, which is
 worse than the 404 in the table, because nothing in the response marks it as
 off-target. **On the runner and on React Native there is no visibility endpoint
 to reach** — record occlusion as UNVERIFIED and use `analyze`'s `occlusion`

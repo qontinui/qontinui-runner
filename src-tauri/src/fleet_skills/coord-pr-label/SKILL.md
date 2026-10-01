@@ -39,8 +39,8 @@ often stamped with the wrong one, and coord's own ownership check
 (`COORD_LABEL_INGEST_OWNERSHIP_MODE`) defaults to `shadow`, which writes under
 it anyway. Measured 2026-09-23: `coord:stacked-on=` rows written under
 meryts-2-0 for `qontinui/*` PRs, and cross-repo `upstream-of`/`downstream-of`
-refused as "not registered to this tenant". Same class as
-qontinui-claude-config#1104 (`handoff-stuck-pr.sh`).
+refused as "not registered to this tenant". Same class as the earlier
+`handoff-stuck-pr.sh` fix, which made it mint for the repo owner's tenant.
 
 The skill validates the label against the namespace before either call
 fires, so invalid labels never make it to GitHub or coord.
@@ -150,7 +150,7 @@ documentation and do not ship with the product.
 
 `set-label.sh` sits next to this SKILL.md, so every invocation below spells its
 path relative to THIS SKILL DIR — `<path-to-this-skill-dir>/set-label.sh` — and
-never through a `qontinui-claude-config` checkout. The skill is delivered by
+never through a configuration-repository checkout. The skill is delivered by
 being copied into `<session-workdir>/.claude/skills/coord-pr-label/`, on devices
 that have no such checkout and in worktrees that have no such subtree, so a
 config-repo path is a step that resolves in the operator's tree and fails
@@ -402,13 +402,13 @@ establish:
 
 ```
 ok: label "coord:downstream-of=example-plans-repo#167" is valid (42/50 chars) -- dry run, nothing sent
-note: NOT checked -- whether "coord:downstream-of=example-plans-repo#167" exists as a label in qontinui/qontinui-claude-config.
+note: NOT checked -- whether "coord:downstream-of=example-plans-repo#167" exists as a label in your-org/your-repo.
       A dry run sends nothing, so it cannot ask. This is the one cause of
       "'<label>' not found" the ceiling check above does not cover.
       This key is open-valued, so its labels are not created on demand --
       a dep label's value is unique to the PR pair it wires. If nobody has
       created this one, a real send fails until you run:
-        gh label create "coord:downstream-of=example-plans-repo#167" --repo qontinui/qontinui-claude-config
+        gh label create "coord:downstream-of=example-plans-repo#167" --repo your-org/your-repo
 ```
 
 The `gh label create` half appears only for an **open-valued key** —
@@ -531,10 +531,10 @@ it, run `gh api -X DELETE "repos/<owner>/<repo>/issues/<pr>/labels/<url-encoded 
 
 ## See Also
 
-These references live in a repo you may not have checked out
-(`qontinui-coord`); skip them when that repo is absent under `<workspace-root>/`.
+These references live in coord's source repository (`qontinui/qontinui-coord`,
+private, so you may not be able to read it); nothing above depends on them.
 
-- `<workspace-root>/qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs` —
+- `crates/coord/src/pr_merge/labels_routes.rs` —
   coord-side validator + ingest handler (single source of truth for the
   label namespace and its semantics).
 - `crates/coord/src/pr_merge/trailers.rs` in the same repo — the `Coord-*:`

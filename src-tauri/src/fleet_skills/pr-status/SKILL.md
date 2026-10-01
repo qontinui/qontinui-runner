@@ -41,7 +41,7 @@ Two shapes:
    unknown/method-not-found (per-agent allow-set masking), fall back to the HTTP
    route via `pr-status.sh`, which sits next to this SKILL.md — run it as
    `bash <path-to-this-skill-dir>/pr-status.sh --mine` (or
-   `--repo <owner/repo> --number <n>`), never through a `qontinui-claude-config`
+   `--repo <owner/repo> --number <n>`), never through a configuration-repository
    checkout, which a provisioned copy of this skill does not have.
    It mirrors the `/gate` transport
    cascade: first a sweep of the runner-written `.mcp.json` proxy doors

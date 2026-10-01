@@ -399,8 +399,8 @@ only when EVERY modified tracked file is restorable (exit 0). The sweep writes a
 classifies `UNIQUE`, blocks it; a residue-class file outside the footprint, which
 a person may have reverted on purpose, blocks it; and any restore is
 recoverable from the snapshot. Withholding it
-under the override would leave `qontinui-claude-config` dirty forever on a box
-that keeps interactive windows open overnight, which is the delivery loop this
+under the override would leave the checkout that tracks those `.claude/` files
+dirty forever on a box that keeps interactive windows open overnight, which is the delivery loop this
 job exists to break (plan D3, resolved at implementation 2026-09-13).
 
 Write one reasoning line per repo into the report, for example:
@@ -457,9 +457,10 @@ coord_alert_queue(domain="return_to_main")
     HTTP twin: GET /coord/alerts/queue?domain=return_to_main
 ```
 
-The protocol is stated once, in
-`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`
--> "The agent alert work queue — claim before you act". Under this job's rules:
+The protocol is stated once, in the maintainers' knowledge base
+(`knowledge-base/qontinui-specific/coord-gates-and-access.md` -> "The agent
+alert work queue — claim before you act"); the rules below are what this job
+needs from it. Under this job's rules:
 
 - **Only rows whose `device_id` is THIS device are this job's.** Read the
   row's `device_id` field and compare it to this device's id. Another device's
