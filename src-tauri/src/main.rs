@@ -1627,17 +1627,6 @@ fn main() {
         std::process::exit(code as i32);
     }
 
-    // PTY holder survival spike (plan
-    // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
-    // Phase 0). `--pty-holder-spike` must run BEFORE the single-instance plugin
-    // for the same reason `try_headless_manifest` does — a holder launched
-    // while a GUI runner is open would otherwise be forwarded to that GUI and
-    // hold nothing — and before `install_app_runtime`, because a holder is a
-    // few threads, not a 16-worker runtime. Matches only an exact argv[1].
-    if let Some(code) = qontinui_runner_lib::pty_holder::try_run_spike() {
-        std::process::exit(code);
-    }
-
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 

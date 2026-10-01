@@ -35,10 +35,10 @@ pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
-// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`). In the
-// LIB crate so `main()` can dispatch to it before any Tauri init, exactly like
-// `profile_cli`, and so Phase 1 can grow the spike into the real
-// `--pty-holder` without touching the runner bin's module tree.
+// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
+// runner's door to spawning a pane's holder. In the LIB crate because it needs
+// nothing from the bin; the bin's `terminal::daemon_pane_io` composes it with
+// the bin-only instance scoping.
 pub mod pty_holder;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
 // crate for the same reason as `intercept_core` — the WRITER is the runner bin

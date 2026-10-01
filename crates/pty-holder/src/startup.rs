@@ -2,8 +2,7 @@
 //! first.
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`.
-//! Moved here from the Phase 0 spike (`src-tauri/src/pty_holder/spike.rs`,
-//! which now calls these) when Phase 2 put the PTY into the dedicated holder
+//! Moved here from the Phase 0 spike (deleted later in Phase 2) when Phase 2 put the PTY into the dedicated holder
 //! binary — the Phase 0 hand-off lists each of them as a requirement of the
 //! real holder:
 //!
