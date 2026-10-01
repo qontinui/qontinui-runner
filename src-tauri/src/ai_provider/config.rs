@@ -838,9 +838,13 @@ mod tests {
     /// that was never set up and a runner whose login expired.
     ///
     /// Deliberately `Manual`-only: the `LeastUsage` arms read the process-global
-    /// `RESOLVED_CONFIG_DIR`. The one test that does exercise them
-    /// (`effective_config_dir_follows_the_fleet_mode_unless_pinned`) holds the
-    /// same fleet pin as this one, so the two never interleave.
+    /// `RESOLVED_CONFIG_DIR`. What IS serialized: every test holding
+    /// `pin_account_selection_for_test` — this one,
+    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` (the only
+    /// test that writes `RESOLVED_CONFIG_DIR`), and the `config_report_cmd`
+    /// tests that reach `get_effective_config_dir` through the report. A test
+    /// reading `RESOLVED_CONFIG_DIR` WITHOUT that pin is not serialized
+    /// against the writer.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
         // The mode is resolved against the process-global fleet cache; pin it
@@ -909,18 +913,23 @@ mod tests {
     /// auto arm (the pick `pick_best_account` resolved, else the `config_dir`
     /// fallback) and never the `Manual` arm. A PINNED machine keeps `Manual`.
     ///
-    /// Held under the fleet pin for the whole test, which serializes it against
-    /// every other test that reads the fleet term. `RESOLVED_CONFIG_DIR` is set
-    /// explicitly per arm and restored on drop; no test in this crate writes it
-    /// otherwise.
+    /// Held under the fleet pin for the whole test. That serializes it against
+    /// every test that also takes `pin_account_selection_for_test` — and ONLY
+    /// those: the other tests in this module and the `config_report_cmd` tests
+    /// that reach `get_effective_config_dir`. `RESOLVED_CONFIG_DIR` is set
+    /// explicitly per arm and restored on drop, and the restore guard is
+    /// declared AFTER the temp dirs so it drops FIRST: a deleted path is never
+    /// left published. No other test in this crate writes it.
     #[test]
     fn effective_config_dir_follows_the_fleet_mode_unless_pinned() {
         let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
             AccountSelectionMode::LeastUsage,
         ));
-        let _restore = ResolvedDirRestore(get_resolved_config_dir());
+        // Temp dirs FIRST, restore guard AFTER: locals drop in reverse order,
+        // so the published pick is restored before its directory is deleted.
         let (_manual_guard, manual_dir) = dir_with_live_credentials();
         let (_picked_guard, picked_dir) = dir_with_live_credentials();
+        let _restore = ResolvedDirRestore(get_resolved_config_dir());
 
         let unpinned_manual = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
