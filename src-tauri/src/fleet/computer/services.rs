@@ -344,26 +344,46 @@ pub(crate) struct ServiceScan {
 pub(crate) enum SessionBus {
     /// Answered.
     Ok,
-    /// There has never been a session bus in this process (a system-service
-    /// runner): there are no user units to lose.
+    /// This process has no session bus by design (a system-service runner):
+    /// no `DBUS_SESSION_BUS_ADDRESS` and no `$XDG_RUNTIME_DIR/bus` socket —
+    /// there are no user units to lose.
     AbsentByDesign,
-    /// It answered before, or exists and failed now.
+    /// A session bus exists (or is advertised) and did not answer fully.
     Failed,
 }
 
-/// Which kinds a Linux host scan saw completely (amendment A2). GitHub runner
-/// services live on the SYSTEM bus; `qontinui-runner*` units can be system or
-/// user units, so that kind is complete only when the system bus answered AND
-/// the session bus answered or is absent by design. PURE.
+/// Whether a missing session-bus connection is "absent by design" rather than
+/// a failure: `DBUS_SESSION_BUS_ADDRESS` unset/blank AND no socket at
+/// `$XDG_RUNTIME_DIR/bus`. Anything else is a bus that SHOULD have answered —
+/// a user-unit runner restarted while its bus was unreachable must not claim
+/// its own kind complete and delete its own rows. PURE over its inputs.
+pub(crate) fn session_bus_absent_by_design(
+    dbus_session_bus_address: Option<&str>,
+    xdg_runtime_dir: Option<&Path>,
+) -> bool {
+    let no_address = dbus_session_bus_address.is_none_or(|a| a.trim().is_empty());
+    let no_socket = xdg_runtime_dir.is_none_or(|d| !d.join("bus").exists());
+    no_address && no_socket
+}
+
+/// Which kinds a Linux host scan saw completely (amendment A2). Both watched
+/// patterns are scanned on BOTH buses, so either kind is complete only when the
+/// system bus answered fully AND the session bus answered fully or is absent by
+/// design. PURE.
 pub(crate) fn linux_complete_kinds(system_ok: bool, session: SessionBus) -> Vec<&'static str> {
-    let mut kinds = Vec::new();
-    if system_ok {
-        kinds.push(KIND_GH_ACTIONS_RUNNER);
-        if session != SessionBus::Failed {
-            kinds.push(KIND_QONTINUI_RUNNER);
-        }
+    if system_ok && session != SessionBus::Failed {
+        vec![KIND_GH_ACTIONS_RUNNER, KIND_QONTINUI_RUNNER]
+    } else {
+        Vec::new()
     }
-    kinds
+}
+
+/// Whether a `ListUnitFilesByPatterns` error makes the bus scan partial. It
+/// is the ONLY source of installed-but-unloaded units, so any failure does —
+/// except `UnknownMethod`, an older systemd (< 230) that has no such method,
+/// where `ListUnitsByPatterns` is all the bus can tell. PURE.
+pub(crate) fn unit_files_error_is_partial(dbus_error_name: Option<&str>) -> bool {
+    dbus_error_name != Some("org.freedesktop.DBus.Error.UnknownMethod")
 }
 
 // ---------------------------------------------------------------------------
@@ -393,11 +413,6 @@ pub(crate) mod linux {
     pub(crate) struct Watcher {
         system: Option<zbus::Connection>,
         session: Option<zbus::Connection>,
-        /// Whether a session bus ever answered in this process. A box with no
-        /// session bus at all (a system-service runner) has no user units to
-        /// lose, so its absence does not make a snapshot partial; a session
-        /// bus that answered before and fails now does.
-        session_ever: bool,
     }
 
     type ListedUnit = (
@@ -417,7 +432,7 @@ pub(crate) mod linux {
         pub(crate) async fn scan(&mut self) -> ServiceScan {
             let mut by_unit: BTreeMap<String, UnitProps> = BTreeMap::new();
             let mut system_ok = false;
-            let mut session = SessionBus::AbsentByDesign;
+            let mut session = SessionBus::Failed;
             let mut any_answered = false;
 
             // System bus: GitHub runner services and a system-level runner.
@@ -454,7 +469,6 @@ pub(crate) mod linux {
                 Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
                     Ok(Ok((units, whole))) => {
                         any_answered = true;
-                        self.session_ever = true;
                         session = if whole {
                             SessionBus::Ok
                         } else {
@@ -471,8 +485,10 @@ pub(crate) mod linux {
                     }
                 },
                 None => {
-                    if self.session_ever {
-                        session = SessionBus::Failed;
+                    let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+                    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+                    if super::session_bus_absent_by_design(addr.as_deref(), xdg.as_deref()) {
+                        session = SessionBus::AbsentByDesign;
                     }
                 }
             }
@@ -536,7 +552,8 @@ pub(crate) mod linux {
             .filter(|u| u.2 != "not-found")
             .map(|u| u.0)
             .collect();
-        if let Ok(files) = call::<_, Vec<(String, String)>>(
+        let mut whole = true;
+        let files = match call::<_, Vec<(String, String)>>(
             conn,
             MGR_PATH,
             MGR_IFACE,
@@ -544,6 +561,26 @@ pub(crate) mod linux {
             &(no_states, WATCHED_PATTERNS),
         )
         .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let name = match &e {
+                    zbus::Error::MethodError(n, _, _) => Some(n.as_str().to_string()),
+                    zbus::Error::FDO(f) => match **f {
+                        zbus::fdo::Error::UnknownMethod(_) => {
+                            Some("org.freedesktop.DBus.Error.UnknownMethod".to_string())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if super::unit_files_error_is_partial(name.as_deref()) {
+                    debug!("fleet::computer: ListUnitFilesByPatterns failed: {e}");
+                    whole = false;
+                }
+                Vec::new()
+            }
+        };
         {
             for (path, _state) in files {
                 if let Some(name) = std::path::Path::new(&path)
@@ -559,7 +596,6 @@ pub(crate) mod linux {
         }
 
         let mut out = Vec::with_capacity(names.len());
-        let mut whole = true;
         for name in names {
             let path: OwnedObjectPath =
                 match call(conn, MGR_PATH, MGR_IFACE, "LoadUnit", &(name.as_str(),)).await {
@@ -1170,13 +1206,43 @@ DISPLAY_NAME: Print Spooler\r
             linux_complete_kinds(true, SessionBus::AbsentByDesign),
             vec!["gh_actions_runner", "qontinui_runner"]
         );
-        // A user bus that failed: user `qontinui-runner*` units may be missing.
-        assert_eq!(
-            linux_complete_kinds(true, SessionBus::Failed),
-            vec!["gh_actions_runner"]
-        );
+        // A user bus that failed: both patterns are scanned there too, so
+        // neither kind is known complete.
+        assert!(linux_complete_kinds(true, SessionBus::Failed).is_empty());
         // No system bus: neither kind is known complete.
         assert!(linux_complete_kinds(false, SessionBus::Ok).is_empty());
+    }
+
+    #[test]
+    fn a_session_bus_is_absent_by_design_only_when_nothing_advertises_one() {
+        let dir = std::env::temp_dir().join(format!("qontinui-session-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing advertised: absent by design.
+        assert!(session_bus_absent_by_design(None, None));
+        assert!(session_bus_absent_by_design(Some(" "), Some(&dir)));
+        // An address is set: a bus that should have answered.
+        assert!(!session_bus_absent_by_design(
+            Some("unix:path=/run/user/1000/bus"),
+            None
+        ));
+        // A socket exists in XDG_RUNTIME_DIR: likewise.
+        std::fs::write(dir.join("bus"), b"").unwrap();
+        assert!(!session_bus_absent_by_design(None, Some(&dir)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_unit_file_listing_makes_the_scan_partial_except_on_old_systemd() {
+        assert!(unit_files_error_is_partial(None));
+        assert!(unit_files_error_is_partial(Some(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        )));
+        assert!(unit_files_error_is_partial(Some(
+            "org.freedesktop.DBus.Error.Timeout"
+        )));
+        assert!(!unit_files_error_is_partial(Some(
+            "org.freedesktop.DBus.Error.UnknownMethod"
+        )));
     }
 
     #[test]
