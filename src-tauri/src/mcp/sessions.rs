@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::AiSessionContext;
-use crate::mcp::types::ApiState;
+use crate::mcp::types::{ApiResponse, ApiState};
 use crate::terminal::transcript;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -815,6 +815,131 @@ async fn finish_session(
 }
 
 // =============================================================================
+// /sessions/{id}/stop-reason
+// =============================================================================
+
+/// How long the lifecycle registry keeps a CLOSED record — stated in the 404
+/// so "unknown session" is not read as "never existed". Derived from the
+/// store's own retention so the two cannot drift.
+const CLOSED_RETENTION_HOURS: i64 =
+    crate::session::session_lifecycle_store::CLOSED_RETENTION_MS / 3_600_000;
+
+/// `GET /sessions/{id}/stop-reason` — why this session stopped, or that it
+/// has not: `{code, glossary_terms, next_action, observed_at, source, …}`,
+/// derived by [`crate::session::stop_reason::stop_reason`] from the session's
+/// lifecycle record alone (plan
+/// `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`
+/// C5).
+///
+/// `{id}` is the provider session id, or — for a caller that only knows the
+/// terminal it drove — a terminal id (see [`latest_record_for_terminal`]).
+///
+/// `404` for an id the registry does not hold — never a default reason. The
+/// registry keeps closed records for [`CLOSED_RETENTION_HOURS`] hours; older
+/// sessions are listed by `GET /sessions/history`, which carries no work axis and so cannot back an
+/// honest next action here.
+///
+/// Read-only; no coord round-trip, so it answers on an offline, unpaired box.
+async fn get_stop_reason(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::session::stop_reason::StopReason>, (StatusCode, Json<ApiResponse<()>>)> {
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::error_with_code(
+                    "session lifecycle store unavailable",
+                    "SERVICE_UNAVAILABLE",
+                )),
+            )
+        })?;
+    stop_reason_for(store.inner(), &id, transcript_on_disk).map(Json)
+}
+
+/// The transcript probe behind a resume offer. Only a closed, confirmed,
+/// unfinished record can be offered a resume, so nothing else touches the
+/// filesystem. The probe knows only Claude's transcript layout; for another
+/// provider it answers `true`, so the answer points at the Previous sessions
+/// page (which judges restorability itself) instead of claiming nothing is owed.
+fn transcript_on_disk(
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+) -> bool {
+    if rec.state != "closed" || rec.confirmed_at.is_none() || rec.finished_at.is_some() {
+        return false;
+    }
+    if rec.provider != crate::session::session_lifecycle_store::DEFAULT_PROVIDER {
+        return true;
+    }
+    crate::session::past_sessions::resolve_transcript_path(
+        rec.config_dir.as_deref(),
+        rec.working_dir.as_deref(),
+        &rec.claude_session_id,
+    )
+    .is_some()
+}
+
+/// The record a TERMINAL id names: a caller that drove a session through
+/// `GET /terminals` knows the terminal, not the provider's session id. A
+/// terminal can have hosted several records over time (a provisional row it
+/// superseded, an earlier session it was reused from), so the choice is
+/// stated, not arbitrary: the open record if there is one, else a confirmed
+/// record over an unconfirmed one, else the most recently opened. The chosen
+/// record's id is echoed as `session_id` in the answer.
+fn latest_record_for_terminal(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    terminal_id: &str,
+) -> Option<crate::session::session_lifecycle_store::TerminalSessionRecord> {
+    store
+        .all_records()
+        .into_iter()
+        .filter(|r| r.terminal_id == terminal_id)
+        // The session id is the last key so equal `opened_at`s resolve the
+        // same way every time (the registry is a HashMap).
+        .max_by(|a, b| {
+            (a.state == "open", a.confirmed_at.is_some(), a.opened_at)
+                .cmp(&(b.state == "open", b.confirmed_at.is_some(), b.opened_at))
+                .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+        })
+}
+
+/// The handler's logic over a store, separated so it is testable without an
+/// `AppHandle`. `id` is a session id first; failing that, a terminal id
+/// ([`latest_record_for_terminal`]).
+// The Err IS the handler's response tuple; boxing it would only move the
+// unbox into the caller.
+#[allow(clippy::result_large_err)]
+fn stop_reason_for(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    id: &str,
+    transcript_exists: impl Fn(&crate::session::session_lifecycle_store::TerminalSessionRecord) -> bool,
+) -> Result<crate::session::stop_reason::StopReason, (StatusCode, Json<ApiResponse<()>>)> {
+    match store
+        .get(id)
+        .or_else(|| latest_record_for_terminal(store, id))
+    {
+        Some(rec) => Ok(crate::session::stop_reason::stop_reason(
+            &rec,
+            transcript_exists(&rec),
+        )),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error_with_code(
+                format!(
+                    "no terminal session or terminal `{id}` in the lifecycle registry. Closed \
+                     terminal sessions are kept {CLOSED_RETENTION_HOURS} hours (older ones are \
+                     listed by GET /sessions/history); sessions started by POST /sessions/spawn \
+                     are task runs, which this route does not cover"
+                ),
+                "SESSION_NOT_FOUND",
+            )),
+        )),
+    }
+}
+
+// =============================================================================
 // /sessions/tree-resets
 // =============================================================================
 
@@ -1269,6 +1394,110 @@ mod tests {
         let req: SpawnSessionRequest = serde_json::from_str(r#"{"task_name":"t"}"#).unwrap();
         assert!(req.cwd.is_none());
     }
+
+    // ── /sessions/{id}/stop-reason ──────────────────────────────────────
+
+    /// A store holding one closed record, written as the registry persists it.
+    fn store_with_closed(
+        reason: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let map = serde_json::json!({
+            "known": {
+                "claudeSessionId": "known",
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": "term-known",
+                "openedAt": 1_000,
+                "lastSeenAt": 2_000,
+                "state": "closed",
+                "closedAt": 3_000,
+                "closeReason": reason,
+                "confirmedAt": 1_500
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+        let store =
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(&path).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn stop_reason_reads_the_recorded_close() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "known", |_| true).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+        assert_eq!(
+            r.next_action.target.as_deref(),
+            Some("claude --resume known")
+        );
+    }
+
+    #[test]
+    fn stop_reason_renders_an_unenumerated_reason_as_unknown() {
+        let (_dir, store) = store_with_closed("closed by the cat");
+        let r = stop_reason_for(&store, "known", |_| true).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::Unknown);
+        assert_eq!(r.detail.as_deref(), Some("closed by the cat"));
+    }
+
+    /// No transcript on disk: the recorded close is still reported, but no
+    /// resume is offered.
+    #[test]
+    fn stop_reason_without_a_transcript_offers_no_resume() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "known", |_| false).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+        assert_eq!(
+            r.next_action.kind,
+            qontinui_types::refusal::NextActionKind::NoneTerminal
+        );
+    }
+
+    /// The probe answers without touching the filesystem for a record that
+    /// can never be offered a resume, and defers to the Previous sessions page
+    /// for a provider whose transcript layout it does not know.
+    #[test]
+    fn the_transcript_probe_is_scoped() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let mut rec = store.get("known").unwrap();
+        rec.provider = "gemini".to_string();
+        assert!(transcript_on_disk(&rec));
+        rec.state = "open".to_string();
+        assert!(!transcript_on_disk(&rec));
+        rec.state = "closed".to_string();
+        rec.finished_at = Some(1);
+        assert!(!transcript_on_disk(&rec));
+        rec.finished_at = None;
+        rec.confirmed_at = None;
+        assert!(!transcript_on_disk(&rec));
+    }
+
+    /// A caller that knows only the terminal it drove gets that terminal's
+    /// session, and the answer names which session it chose.
+    #[test]
+    fn stop_reason_resolves_a_terminal_id() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "term-known", |_| true).unwrap();
+        assert_eq!(r.session_id, "known");
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+    }
+
+    /// An id the registry does not hold is a 404 — never a default reason.
+    #[test]
+    fn stop_reason_for_an_unknown_session_is_a_404() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let (status, Json(body)) = stop_reason_for(&store, "nobody", |_| true).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "SESSION_NOT_FOUND");
+        assert!(v["error"].as_str().unwrap().contains("nobody"));
+    }
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -1294,4 +1523,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // and gets no drift guard from one; its contract is covered by the
         // handler tests below instead.
         .route("/sessions/{id}/finish", post(finish_session))
+        // Why a session stopped (or that it has not) — read-only, local.
+        .route("/sessions/{id}/stop-reason", get(get_stop_reason))
 }

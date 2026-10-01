@@ -105,7 +105,7 @@ pub fn snapshot_history_path() -> PathBuf {
 }
 
 /// Closed records older than this are pruned (24h in millis).
-const CLOSED_RETENTION_MS: i64 = 86_400_000;
+pub(crate) const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
@@ -204,6 +204,41 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
         _ => o,
     })
 }
+
+// ---------------------------------------------------------------------------
+// `close_reason` vocabulary — every value a runner writer records.
+//
+// The two FRONTEND reasons arrive through the `terminal_session_record_close`
+// Tauri command (`FrontendSessionCloseReason` in
+// `src/components/terminal/sessionRecordArgs.ts`); the rest are minted by the
+// backend alone. `crate::session::stop_reason` maps each of these to a stop
+// code, a next action and glossary terms, and renders any other string as
+// `unknown` with the raw value — so a writer that records a new reason must
+// add it here AND there, or it surfaces as `unknown`, never as a guess.
+// ---------------------------------------------------------------------------
+
+/// The operator closed the session's tab (frontend).
+pub const CLOSE_REASON_EXPLICIT: &str = "explicit";
+/// The session's process exited while its tab was live (frontend).
+pub const CLOSE_REASON_PTY_EXIT: &str = "pty-exit";
+/// The liveness poll found no agent in the terminal for the full debounce.
+pub const CLOSE_REASON_POLL_DEAD: &str = "poll-dead";
+/// A tile a restore brought back terminal-only idled out with no agent — see
+/// [`close_reason_for_dead_shell`].
+pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = "terminal-only-idle";
+/// A provisional record whose provider never started (a bare shell).
+pub const CLOSE_REASON_NEVER_STARTED: &str = "never-started";
+/// The record's terminal no longer exists (an orphan row).
+pub const CLOSE_REASON_NO_TERMINAL: &str = "no-terminal";
+/// An UNCONFIRMED record evicted when a new session bound its terminal.
+pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+/// A CONFIRMED record retired because its terminal now hosts a newer
+/// confirmed session.
+pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str = "superseded-terminal-reuse";
+/// The orchestration loop could not bind its worker and tore it down
+/// (`orchestration_loop::ai_session_executor::teardown_unbound_worker`).
+pub const CLOSE_REASON_WORKER_BIND_FAILED: &str =
+    "orchestration dispatch could not bind the worker";
 
 /// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
 /// the pane was closed.
@@ -725,8 +760,10 @@ pub struct TerminalSessionRecord {
     /// different statement from "it tried and failed" and must not be collapsed
     /// into it.
     ///
-    /// Sticky, like every field around it. `#[serde(default)]`: every record
-    /// already on disk predates the field.
+    /// Sticky for the life of one run; cleared (with
+    /// [`Self::wind_down_at`]) when a CLOSED record re-opens, because a resumed
+    /// session is a new run. `#[serde(default)]`: every record already on disk
+    /// predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_outcome: Option<String>,
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
@@ -1363,6 +1400,15 @@ impl SessionLifecycleStore {
             if entry.spawn_device_default.is_none() {
                 entry.spawn_device_default = rec.spawn_device_default.or(inherited_spawn_default);
             }
+            // A CLOSED record re-opening (a resume under the same id) starts a
+            // new run: the previous run's wind-down outcome is not this run's,
+            // and leaving it would let a later close read as "wound down".
+            // An already-open record keeps it (`exit_stuck` / `not_attempted`
+            // are recorded on open records).
+            if entry.state == "closed" {
+                entry.wind_down_outcome = None;
+                entry.wind_down_at = None;
+            }
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
@@ -1418,7 +1464,7 @@ impl SessionLifecycleStore {
                     if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded".to_string());
+                        other.close_reason = Some(CLOSE_REASON_SUPERSEDED.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -1432,7 +1478,8 @@ impl SessionLifecycleStore {
                     } else if new_is_confirmed {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        other.close_reason =
+                            Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2762,8 +2809,8 @@ impl SessionLifecycleStore {
                         }
                         if r.state == "closed" {
                             let grace = match r.close_reason.as_deref() {
-                                Some("pty-exit") => Some(RESTORABLE_PTY_EXIT_MS),
-                                Some("poll-dead") => Some(RESTORABLE_POLL_DEAD_MS),
+                                Some(CLOSE_REASON_PTY_EXIT) => Some(RESTORABLE_PTY_EXIT_MS),
+                                Some(CLOSE_REASON_POLL_DEAD) => Some(RESTORABLE_POLL_DEAD_MS),
                                 _ => None,
                             };
                             if let Some(grace_ms) = grace {
@@ -2978,7 +3025,7 @@ impl SessionLifecycleStore {
                     if let Some(rec) = m.get_mut(id.as_str()) {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
-                        rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        rec.close_reason = Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
@@ -3890,9 +3937,9 @@ pub fn classify(
 /// picking a new honest reason here needs no matching change there.
 pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
-        "terminal-only-idle"
+        CLOSE_REASON_TERMINAL_ONLY_IDLE
     } else {
-        "poll-dead"
+        CLOSE_REASON_POLL_DEAD
     }
 }
 
@@ -6031,6 +6078,29 @@ mod tests {
         store.record_open(rec("sess-1"));
         store.record_close("sess-1", "poll-dead");
         assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    /// A resume under the same id starts a new run: the previous run's
+    /// wind-down outcome is cleared when the CLOSED record re-opens, and kept
+    /// when an already-open record is re-recorded.
+    #[test]
+    fn reopening_a_closed_record_clears_its_wind_down_outcome() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("sess-1"));
+        store.set_wind_down_outcome("sess-1", WIND_DOWN_EXIT_STUCK, 1_000);
+        store.record_open(rec("sess-1"));
+        assert_eq!(
+            store.get("sess-1").unwrap().wind_down_outcome.as_deref(),
+            Some(WIND_DOWN_EXIT_STUCK)
+        );
+        store.set_wind_down_outcome("sess-1", WIND_DOWN_CLOSED, 2_000);
+        store.record_close("sess-1", CLOSE_REASON_EXPLICIT);
+        store.record_open(rec("sess-1"));
+        let r = store.get("sess-1").unwrap();
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
     }
 
     #[test]

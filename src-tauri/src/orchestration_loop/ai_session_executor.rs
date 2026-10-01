@@ -854,7 +854,10 @@ fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> 
     if let Some(store) = app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
-        store.record_close(&trid, "orchestration dispatch could not bind the worker");
+        store.record_close(
+            &trid,
+            crate::session::session_lifecycle_store::CLOSE_REASON_WORKER_BIND_FAILED,
+        );
         closed.push("lifecycle record");
     }
     if let Some(registrar) =
