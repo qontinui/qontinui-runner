@@ -13,12 +13,15 @@
 //! Authorization: Bearer <this device's own coord-signed device JWT, expiry tolerated>
 //! ```
 //!
-//! - `200 {"code", "expires_at"}` — redeem the code through the EXISTING
-//!   interactive redeem path ([`crate::commands::web_integration::redeem_pair_code`],
-//!   so persistence, tier promotion, streak retirement and — once
-//!   qontinui-runner#1770 lands — machine-key enrolment all come along
-//!   unchanged), then kick the cloud relay. Without the kick the relay stays
-//!   latched `Idle` for hours (coord finding `6ec70933`).
+//! - `200 {"code", "expires_at"}` — redeem the code with the steps of the
+//!   interactive `redeem_pair_code` command (the same `pair.rs` redeem and
+//!   persist, streak retirement, and the shared
+//!   `web_integration::promote_tier_after_pairing`) EXCEPT its clear of the
+//!   interactive-sign-out marker, which must never run from a background path;
+//!   then kick the cloud relay. Without the kick the relay stays latched
+//!   `Idle` for hours (coord finding `6ec70933`).
+//! - Not at all while the local user is logged out (their withdrawal), nor on
+//!   a runner the refresher holds at `IdleWrongTier` (the user's tier choice).
 //! - `204` — nothing authorized; do nothing.
 //! - anything else — a typed log line and a growing backoff. Never spam web.
 //!
@@ -62,6 +65,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::mcp::device_jwt_refresher::{coord_credential_posture, CoordCredentialPosture};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Minimum spacing between two polls. Just under the refresher's 300 s
 /// `REFRESH_CHECK_INTERVAL` so a pass that lands a few seconds early still
@@ -130,46 +134,21 @@ pub(crate) fn posture_wants_poll(posture: Option<CoordCredentialPosture>) -> boo
     posture.is_some_and(|p| !p.can_answer())
 }
 
-/// Decode a JWT payload WITHOUT verifying it. Web is the verifier; this only
-/// decides which locally held token to present.
-fn jwt_claims(token: &str) -> Option<serde_json::Value> {
-    use base64::Engine as _;
-    let mut parts = token.trim().splitn(3, '.');
-    let _header = parts.next()?;
-    let payload = parts.next()?;
-    let _signature = parts.next()?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Pick the token to present as the trust anchor: a DEVICE token
-/// (`sub_type == "device"`; coord reads an absent `sub_type` as `agent`) whose
-/// `device_id` claim names this device and whose `exp` is within the grace
-/// window. Among several, the latest `exp` wins.
+/// Pick the token to present as the trust anchor: one web's pending-redeem
+/// door accepts as proof of THIS device (the shared rule,
+/// [`crate::secure_storage::pending_redeem_anchor_exp`] — the same one the
+/// store's anchor slot keeps by) whose `exp` is within the grace window. Among
+/// several, the latest `exp` wins.
 pub(crate) fn select_anchor(
     device_id: &str,
     candidates: &[String],
     now_unix: i64,
 ) -> Option<String> {
-    let want = device_id.trim();
     candidates
         .iter()
         .filter_map(|token| {
-            let claims = jwt_claims(token)?;
-            let is_device = claims
-                .get("sub_type")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("device"));
-            let same_device = claims
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|d| d.trim().eq_ignore_ascii_case(want));
-            let exp = claims.get("exp").and_then(|v| v.as_i64())?;
-            (is_device && same_device && now_unix <= exp + ANCHOR_GRACE_SECS)
-                .then(|| (exp, token.trim().to_string()))
+            let exp = crate::secure_storage::pending_redeem_anchor_exp(token, device_id)?;
+            (now_unix <= exp + ANCHOR_GRACE_SECS).then(|| (exp, token.trim().to_string()))
         })
         .max_by_key(|(exp, _)| *exp)
         .map(|(_, token)| token)
@@ -266,9 +245,15 @@ pub(crate) async fn poll_pending_redeem(
 /// The side effects of a claimed redeem, behind a seam so the pass is testable
 /// without a live pairing store or relay.
 pub(crate) trait RedeemEffects {
-    /// Redeem `code` against `web_base` and persist the resulting credential.
-    /// An `Err` may embed the code; the caller redacts it before logging.
-    async fn redeem(&self, web_base: &str, code: &RedeemCode) -> Result<(), String>;
+    /// Redeem `code` against `web_base` for `device_id` — the SAME id the poll
+    /// named, since web binds the code to it — and persist the resulting
+    /// credential. An `Err` may embed the code; the caller redacts it.
+    async fn redeem(
+        &self,
+        web_base: &str,
+        code: &RedeemCode,
+        device_id: &str,
+    ) -> Result<(), String>;
     /// Drop the now-spent pending-redeem anchor (re-seeded from the fresh
     /// credential the redeem stored).
     async fn clear_anchor(&self);
@@ -315,6 +300,12 @@ pub(crate) fn failure_backoff(n: u32) -> Duration {
 pub(crate) enum PassResult {
     /// Posture is not dark (or unknown): no poll.
     NotEligible,
+    /// The runner is deliberately below the account tier (`IdleWrongTier`):
+    /// it does not talk to the cloud, and a redeem would override that choice.
+    WrongTier,
+    /// The local user explicitly logged out of the interactive session. That
+    /// is their withdrawal: a web operator must not re-pair the box over it.
+    LocallySignedOut,
     /// Dark, but the spacing/backoff has not elapsed.
     Throttled,
     /// No qontinui-web base resolved.
@@ -333,28 +324,34 @@ pub(crate) enum PassResult {
     PollFailed,
 }
 
-/// Inputs to one pass. The two loaders run only once the pass has decided to
+/// Inputs to one pass. The loaders run only once the pass has decided to
 /// poll, so an eligible-but-throttled or healthy pass reads no credential store.
-pub(crate) struct PassInputs<'a, D, A>
+pub(crate) struct PassInputs<'a, S, D, A>
 where
+    S: FnOnce() -> bool,
     D: FnOnce() -> Option<String>,
     A: FnOnce(&str) -> Option<String>,
 {
     pub posture: Option<CoordCredentialPosture>,
+    /// The refresher decided `IdleWrongTier` this pass.
+    pub wrong_tier: bool,
     pub web_base: &'a str,
+    /// Has the local user explicitly logged out of the interactive session?
+    pub load_signed_out: S,
     pub load_device_id: D,
     /// Given the device id, return the anchor token (see [`select_anchor`]).
     pub load_anchor: A,
 }
 
 /// One pass: decide, poll, act. Pure apart from the HTTP poll and `effects`.
-pub(crate) async fn run_pass<D, A, E>(
-    inputs: PassInputs<'_, D, A>,
+pub(crate) async fn run_pass<S, D, A, E>(
+    inputs: PassInputs<'_, S, D, A>,
     state: &mut PollState,
     now: Instant,
     effects: &E,
 ) -> PassResult
 where
+    S: FnOnce() -> bool,
     D: FnOnce() -> Option<String>,
     A: FnOnce(&str) -> Option<String>,
     E: RedeemEffects,
@@ -365,11 +362,30 @@ where
         *state = PollState::default();
         return PassResult::NotEligible;
     }
+    if inputs.wrong_tier {
+        return PassResult::WrongTier;
+    }
     if state.next_poll_at.is_some_and(|at| now < at) {
         return PassResult::Throttled;
     }
+    if (inputs.load_signed_out)() {
+        state.schedule(now, MIN_POLL_SPACING);
+        if state.last_warned.as_deref() != Some("signed_out") {
+            state.last_warned = Some("signed_out".to_string());
+            info!(
+                "pending_redeem: credential is dark but the local user logged out — not                  asking web for an operator-authorized redeem until they sign in again"
+            );
+        }
+        return PassResult::LocallySignedOut;
+    }
     if inputs.web_base.trim().is_empty() {
         state.failed(now);
+        if state.last_warned.as_deref() != Some("no_web_base") {
+            state.last_warned = Some("no_web_base".to_string());
+            warn!(
+                "pending_redeem: credential is dark but no qontinui-web base URL resolves —                  cannot ask web for an operator-authorized redeem"
+            );
+        }
         return PassResult::NoWebBase;
     }
     let Some(device_id) = (inputs.load_device_id)() else {
@@ -406,7 +422,7 @@ where
             info!(
                 "pending_redeem: operator authorized a redeem for device {device_id} — redeeming"
             );
-            match effects.redeem(inputs.web_base, &code).await {
+            match effects.redeem(inputs.web_base, &code, &device_id).await {
                 Ok(()) => {
                     effects.clear_anchor().await;
                     effects.kick_relay().await;
@@ -459,23 +475,52 @@ fn describe_failure(outcome: &PollOutcome) -> String {
             "refused HTTP {status} ({})",
             detail_code.as_deref().unwrap_or("no detail.code")
         ),
+        PollOutcome::Unexpected { status: 200 } => "HTTP 200 without a usable code — if an \
+             operator authorized this device the code is now spent; they must click \
+             Authenticate again"
+            .to_string(),
         PollOutcome::Unexpected { status } => format!("unexpected HTTP {status}"),
         PollOutcome::Transport(e) => format!("transport error: {e}"),
         PollOutcome::Pending { .. } | PollOutcome::NothingPending => "ok".to_string(),
     }
 }
 
-/// The live effects: the interactive redeem command, then the relay kick.
+/// The live effects.
 struct LiveEffects;
 
 impl RedeemEffects for LiveEffects {
-    async fn redeem(&self, web_base: &str, code: &RedeemCode) -> Result<(), String> {
-        crate::commands::web_integration::redeem_pair_code(
-            code.expose().to_string(),
-            Some(web_base.to_string()),
-        )
-        .await
-        .map(|_| ())
+    /// The redeem steps of `commands::web_integration::redeem_pair_code`
+    /// MINUS its interactive-sign-out clear. That command is an EXPLICIT local
+    /// acquisition, so it ends a local logout; this is a background path a
+    /// remote operator triggers, and the command's own comment says the clear
+    /// must never run from one (it would silently un-logout the local user).
+    /// [`run_pass`] does not poll while signed out at all; this keeps the
+    /// marker untouched even if that gate is ever bypassed. The device id is
+    /// the one the poll named, never re-resolved.
+    async fn redeem(
+        &self,
+        web_base: &str,
+        code: &RedeemCode,
+        device_id: &str,
+    ) -> Result<(), String> {
+        use qontinui_runner_lib::pair::{pair_with_pair_code, persist_pairing};
+        let (base, code, did) = (web_base.to_string(), code.clone(), device_id.to_string());
+        let resp = spawn_blocking_tracked(move || pair_with_pair_code(&base, code.expose(), &did))
+            .await
+            .map_err(|e| format!("pair-code redeem task panicked: {e}"))??;
+        let tenant_id = resp
+            .tenant_id
+            .as_deref()
+            .and_then(|t| uuid::Uuid::parse_str(t.trim()).ok())
+            .ok_or_else(|| "redeem response carried no usable tenant_id".to_string())?;
+        persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {e}"))?;
+        crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+            tenant_id,
+            crate::auth::default_binding_tenant(),
+        );
+        crate::commands::web_integration::promote_tier_after_pairing("pending_redeem");
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+        Ok(())
     }
 
     async fn clear_anchor(&self) {
@@ -485,9 +530,6 @@ impl RedeemEffects for LiveEffects {
     }
 
     async fn kick_relay(&self) {
-        // `redeem_pair_code` already kicks the relay; kicking again is
-        // idempotent and keeps this door's contract explicit rather than
-        // dependent on the command's internals.
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
     }
 }
@@ -495,16 +537,6 @@ impl RedeemEffects for LiveEffects {
 fn poll_state_cell() -> &'static tokio::sync::Mutex<PollState> {
     static CELL: std::sync::OnceLock<tokio::sync::Mutex<PollState>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| tokio::sync::Mutex::new(PollState::default()))
-}
-
-/// Device id as the refresher resolves it: `QONTINUI_MACHINE_ID`, then
-/// `machine.json`.
-fn resolve_device_id() -> Option<String> {
-    std::env::var("QONTINUI_MACHINE_ID")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok())
 }
 
 /// Every stored device JWT — the retained redeem anchor, the legacy
@@ -532,12 +564,19 @@ fn stored_device_jwts() -> Vec<String> {
 /// Refresher hook: run one pass against the live posture, store and effects.
 /// `web_base` is resolved by the caller exactly as the device-machine-key
 /// exchange resolves it.
-pub(crate) async fn on_refresher_pass(web_base: &str) {
+///
+/// Returns `true` when a redeem landed, so the refresher re-derives its pass
+/// from the fresh credential instead of acting on the decision it took before.
+pub(crate) async fn on_refresher_pass(web_base: &str, wrong_tier: bool) -> bool {
     let mut state = poll_state_cell().lock().await;
     let inputs = PassInputs {
         posture: coord_credential_posture().map(|s| s.posture),
+        wrong_tier,
         web_base,
-        load_device_id: resolve_device_id,
+        // Fails CLOSED on an unreadable store (reads as signed out).
+        load_signed_out: || crate::auth::AuthManager::new().is_interactive_signed_out(),
+        // The ONE resolution the poll, the redeem and the anchor slot share.
+        load_device_id: crate::machine_identity::resolve_device_id,
         // A small synchronous store read, as the refresher's own
         // `probe_access_token` is; it runs only on a dark, un-throttled pass.
         load_anchor: |device_id: &str| {
@@ -548,7 +587,7 @@ pub(crate) async fn on_refresher_pass(web_base: &str) {
             )
         },
     };
-    let _ = run_pass(inputs, &mut state, Instant::now(), &LiveEffects).await;
+    run_pass(inputs, &mut state, Instant::now(), &LiveEffects).await == PassResult::Redeemed
 }
 
 #[cfg(test)]
@@ -576,8 +615,19 @@ mod tests {
         format!("{header}.{payload}.sig-SECRET-anchor")
     }
 
+    const UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    /// The exact shape coord's `issue_device` mints, which web's
+    /// pending-redeem door requires.
     fn device_jwt(device_id: &str, exp: i64) -> String {
-        jwt(serde_json::json!({"sub_type": "device", "device_id": device_id, "exp": exp}))
+        jwt(serde_json::json!({
+            "sub": format!("device:{device_id}"),
+            "sub_type": "device",
+            "device_id": device_id,
+            "user_id": UID,
+            "mint_provenance": "paired",
+            "exp": exp,
+        }))
     }
 
     #[derive(Clone)]
@@ -671,14 +721,21 @@ mod tests {
         calls: Mutex<Vec<&'static str>>,
         redeemed_code: Mutex<Option<String>>,
         redeemed_base: Mutex<Option<String>>,
+        redeemed_device: Mutex<Option<String>>,
         /// When set, `redeem` fails with this message (the code is appended,
         /// as the real redeem path's URL-bearing errors do).
         fail_with: Option<&'static str>,
     }
 
     impl RedeemEffects for FakeEffects {
-        async fn redeem(&self, web_base: &str, code: &RedeemCode) -> Result<(), String> {
+        async fn redeem(
+            &self,
+            web_base: &str,
+            code: &RedeemCode,
+            device_id: &str,
+        ) -> Result<(), String> {
             self.calls.lock().unwrap().push("redeem");
+            *self.redeemed_device.lock().unwrap() = Some(device_id.to_string());
             *self.redeemed_code.lock().unwrap() = Some(code.expose().to_string());
             *self.redeemed_base.lock().unwrap() = Some(web_base.to_string());
             match self.fail_with {
@@ -718,10 +775,26 @@ mod tests {
         now: Instant,
         effects: &FakeEffects,
     ) -> PassResult {
+        pass_with(posture, false, false, web_base, anchor, state, now, effects).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pass_with(
+        posture: Option<CoordCredentialPosture>,
+        wrong_tier: bool,
+        signed_out: bool,
+        web_base: &str,
+        anchor: Option<String>,
+        state: &mut PollState,
+        now: Instant,
+        effects: &FakeEffects,
+    ) -> PassResult {
         run_pass(
             PassInputs {
                 posture,
+                wrong_tier,
                 web_base,
+                load_signed_out: move || signed_out,
                 load_device_id: || Some(DID.to_string()),
                 load_anchor: move |_did: &str| anchor,
             },
@@ -846,6 +919,11 @@ mod tests {
             assert_eq!(
                 fx.redeemed_base.lock().unwrap().as_deref(),
                 Some(web.base.as_str())
+            );
+            assert_eq!(
+                fx.redeemed_device.lock().unwrap().as_deref(),
+                Some(DID),
+                "the redeem names the device the poll named"
             );
         }
     }
@@ -987,9 +1065,37 @@ mod tests {
         let ok_new = device_jwt(DID, now - 3600);
         let other_device = device_jwt(OTHER_DID, now);
         let past_grace = device_jwt(DID, now - 31 * 86_400);
-        let agent = jwt(serde_json::json!({"sub_type": "agent", "device_id": DID, "exp": now}));
-        let no_sub_type = jwt(serde_json::json!({"device_id": DID, "exp": now}));
+        let shaped = |patch: serde_json::Value| {
+            let mut c = serde_json::json!({
+                "sub": format!("device:{DID}"),
+                "sub_type": "device",
+                "device_id": DID,
+                "user_id": UID,
+                "exp": now,
+            });
+            for (k, v) in patch.as_object().unwrap() {
+                if v.is_null() {
+                    c.as_object_mut().unwrap().remove(k);
+                } else {
+                    c[k] = v.clone();
+                }
+            }
+            jwt(c)
+        };
+        let pre_provenance = shaped(serde_json::json!({}));
+        let agent = shaped(serde_json::json!({"sub_type": "agent"}));
+        let no_sub_type = shaped(serde_json::json!({"sub_type": null}));
+        let push_token = shaped(serde_json::json!({"sub": "push:abc", "user_id": null}));
+        let wrong_sub = shaped(serde_json::json!({"sub": format!("device:{OTHER_DID}")}));
+        let no_user = shaped(serde_json::json!({"user_id": null}));
+        let bootstrap = shaped(serde_json::json!({"mint_provenance": "bootstrap"}));
         let opaque = "qontinui_runner_opaque".to_string();
+
+        assert_eq!(
+            select_anchor(DID, std::slice::from_ref(&pre_provenance), now),
+            Some(pre_provenance.clone()),
+            "absent mint_provenance is admitted, as web admits it"
+        );
 
         assert_eq!(
             select_anchor(
@@ -1009,13 +1115,102 @@ mod tests {
             select_anchor(DID, std::slice::from_ref(&ok_old), now),
             Some(ok_old.clone())
         );
-        for rejected in [other_device, past_grace, agent, no_sub_type, opaque] {
+        for rejected in [
+            other_device,
+            past_grace,
+            agent,
+            no_sub_type,
+            push_token,
+            wrong_sub,
+            no_user,
+            bootstrap,
+            opaque,
+        ] {
             assert_eq!(
                 select_anchor(DID, std::slice::from_ref(&rejected), now),
                 None,
                 "{rejected}"
             );
         }
+    }
+
+    /// An explicit local logout is the user's withdrawal: no poll, so no web
+    /// operator can re-pair the box over it.
+    #[tokio::test]
+    async fn a_local_logout_is_respected_and_nothing_is_polled() {
+        let web = spawn_web(StatusCode::OK, Some(serde_json::json!({"code": CODE})));
+        let fx = FakeEffects::default();
+        let mut state = PollState::default();
+        let r = pass_with(
+            Some(CoordCredentialPosture::Expired),
+            false,
+            true,
+            &web.base,
+            Some(device_jwt(DID, now_unix() - 60)),
+            &mut state,
+            Instant::now(),
+            &fx,
+        )
+        .await;
+        assert_eq!(r, PassResult::LocallySignedOut);
+        assert_eq!(web.hits(), 0);
+        assert!(fx.calls().is_empty());
+    }
+
+    /// `IdleWrongTier`: a runner deliberately below the account tier does not
+    /// talk to the cloud, and a redeem would promote it over that choice.
+    #[tokio::test]
+    async fn a_wrong_tier_runner_never_polls() {
+        let web = spawn_web(StatusCode::OK, Some(serde_json::json!({"code": CODE})));
+        let fx = FakeEffects::default();
+        let mut state = PollState::default();
+        let r = pass_with(
+            Some(CoordCredentialPosture::Unrefreshable),
+            true,
+            false,
+            &web.base,
+            Some(device_jwt(DID, now_unix() - 60)),
+            &mut state,
+            Instant::now(),
+            &fx,
+        )
+        .await;
+        assert_eq!(r, PassResult::WrongTier);
+        assert_eq!(web.hits(), 0);
+        assert!(fx.calls().is_empty());
+    }
+
+    /// The live redeem must never clear the interactive-sign-out marker —
+    /// `redeem_pair_code`'s own comment forbids that from a background path. A
+    /// behavioural test cannot drive a network redeem into a real store, so
+    /// this pins it at the source (the technique the refresher's
+    /// `every_in_process_re_pair_path_retires_the_stale_rejection_streak`
+    /// uses), comments stripped so prose cannot satisfy or trip it.
+    #[test]
+    fn the_live_redeem_never_clears_the_sign_out_marker() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/pending_redeem.rs");
+        let text = std::fs::read_to_string(&path).expect("read pending_redeem.rs");
+        let (live, _tests) = text
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        let code: String = live
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("persist_pairing("),
+            "the live redeem persists"
+        );
+        assert!(
+            !code.contains("clear_interactive_signed_out"),
+            "the refresher's redeem must not end a local logout"
+        );
+        assert!(
+            !code.contains("redeem_pair_code("),
+            "the interactive command clears the marker; this path must not call it"
+        );
     }
 
     #[test]

@@ -625,7 +625,8 @@ struct StoredTokens {
     /// themselves.
     #[serde(default)]
     interactive_signed_out: bool,
-    /// The newest coord device JWT this store has held, kept ONLY as the
+    /// The newest device JWT this store has held that web's pending-redeem
+    /// door accepts for THIS device ([`pending_redeem_anchor_exp`]), kept ONLY as the
     /// bearer for web's `GET /api/v1/devices/{device_id}/pending-redeem`
     /// (`mcp::pending_redeem`; plan
     /// `2026-09-26-authenticate-and-perpetually-renew-a-specific-runner-from-qontinui-web`).
@@ -648,11 +649,23 @@ struct StoredTokens {
     redeem_anchor_jwt: Option<String>,
 }
 
-/// `exp` of a DEVICE JWT (`sub_type == "device"` with a `device_id` claim),
-/// decoded without verification; `None` for anything else. Only ranks
-/// candidates for [`refresh_redeem_anchor`] — web is the verifier.
-fn device_jwt_anchor_exp(token: &str) -> Option<i64> {
+/// `exp` of `token` iff it is a token web's pending-redeem door accepts as
+/// proof of THIS device (`device_id`), decoded without verification; `None`
+/// for anything else. Web verifies the signature and expiry; this mirrors the
+/// rest of its rule (qontinui-web `devices.py`, the pending-redeem anchor) so
+/// the store never keeps, and the poll never presents, a token web must refuse:
+///
+/// * `sub_type == "device"` exactly;
+/// * `mint_provenance` absent or `"paired"`;
+/// * `device_id` claim parses as a UUID equal to `device_id`;
+/// * `sub == "device:<that uuid>"` and `user_id` parses as a UUID — the shape
+///   coord's `issue_device` mints (a push token has neither).
+///
+/// The ONE helper both the anchor slot ([`refresh_redeem_anchor`]) and
+/// `mcp::pending_redeem::select_anchor` use.
+pub(crate) fn pending_redeem_anchor_exp(token: &str, device_id: &str) -> Option<i64> {
     use base64::Engine as _;
+    let want = uuid::Uuid::parse_str(device_id.trim()).ok()?;
     let mut parts = token.trim().splitn(3, '.');
     let _header = parts.next()?;
     let payload = parts.next()?;
@@ -662,24 +675,33 @@ fn device_jwt_anchor_exp(token: &str) -> Option<i64> {
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let is_device = claims
-        .get("sub_type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("device"));
-    let has_device_id = claims
-        .get("device_id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|d| !d.trim().is_empty());
-    (is_device && has_device_id)
-        .then(|| claims.get("exp").and_then(|v| v.as_i64()))
-        .flatten()
+    let str_claim = |k: &str| claims.get(k).and_then(|v| v.as_str());
+    let uuid_claim = |k: &str| str_claim(k).and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+    let provenance_ok = match claims.get("mint_provenance") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(v) => v.as_str() == Some("paired"),
+    };
+    let ok = str_claim("sub_type") == Some("device")
+        && provenance_ok
+        && uuid_claim("device_id") == Some(want)
+        && str_claim("sub") == Some(format!("device:{want}").as_str())
+        && uuid_claim("user_id").is_some();
+    if !ok {
+        return None;
+    }
+    claims.get("exp").and_then(|v| v.as_i64())
 }
 
 /// Set `redeem_anchor_jwt` on a serialized [`StoredTokens`] to the newest
-/// device JWT among the current anchor, `access_token` and every per-tenant
-/// slot. A slot that was just cleared is simply not a candidate, so the
-/// previous anchor survives it; a newer token replaces it.
-fn refresh_redeem_anchor(value: &mut serde_json::Value) {
+/// token among the current anchor, `access_token` and every per-tenant slot
+/// that [`pending_redeem_anchor_exp`] accepts for `this_device`. A slot that
+/// was just cleared is simply not a candidate, so a still-valid anchor
+/// survives it; a newer token replaces it; an anchor for another device is
+/// dropped. With `this_device` unresolved nothing is changed.
+fn refresh_redeem_anchor(value: &mut serde_json::Value, this_device: Option<&str>) {
+    let Some(device_id) = this_device else {
+        return;
+    };
     let Some(obj) = value.as_object_mut() else {
         return;
     };
@@ -699,14 +721,19 @@ fn refresh_redeem_anchor(value: &mut serde_json::Value) {
     }
     let newest = candidates
         .into_iter()
-        .filter_map(|t| device_jwt_anchor_exp(&t).map(|exp| (exp, t)))
+        .filter_map(|t| pending_redeem_anchor_exp(&t, device_id).map(|exp| (exp, t)))
         .max_by_key(|(exp, _)| *exp)
         .map(|(_, t)| t);
-    if let Some(t) = newest {
-        obj.insert(
-            "redeem_anchor_jwt".to_string(),
-            serde_json::Value::String(t),
-        );
+    match newest {
+        Some(t) => {
+            obj.insert(
+                "redeem_anchor_jwt".to_string(),
+                serde_json::Value::String(t),
+            );
+        }
+        None => {
+            obj.insert("redeem_anchor_jwt".to_string(), serde_json::Value::Null);
+        }
     }
 }
 
@@ -960,7 +987,10 @@ impl SecureStorage {
         // Every write keeps the pending-redeem anchor current — see
         // `StoredTokens::redeem_anchor_jwt`.
         let mut value = serde_json::to_value(tokens).context("Failed to serialize tokens")?;
-        refresh_redeem_anchor(&mut value);
+        refresh_redeem_anchor(
+            &mut value,
+            crate::machine_identity::resolve_device_id().as_deref(),
+        );
         let json = serde_json::to_vec(&value).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
@@ -1974,7 +2004,14 @@ mod tests {
     fn anchor_test_jwt(device_id: &str, exp: i64, sub_type: &str) -> String {
         use base64::Engine as _;
         let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let claims = serde_json::json!({"sub_type": sub_type, "device_id": device_id, "exp": exp});
+        let claims = serde_json::json!({
+            "sub": format!("device:{device_id}"),
+            "sub_type": sub_type,
+            "device_id": device_id,
+            "user_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "mint_provenance": "paired",
+            "exp": exp,
+        });
         format!(
             "{}.{}.sig",
             enc(br#"{"alg":"RS256"}"#),
@@ -1990,6 +2027,7 @@ mod tests {
     fn test_redeem_anchor_survives_clears_and_tracks_the_newest_device_jwt() {
         let storage = create_test_storage("test_redeem_anchor");
         let did = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        crate::machine_identity::set_test_device_id(Some(did));
         let tenant = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
         let old = anchor_test_jwt(did, 1_000, "device");
         let newer = anchor_test_jwt(did, 2_000, "device");
@@ -2022,9 +2060,16 @@ mod tests {
             Some(newer.as_str())
         );
 
-        // An agent token or an older device token never displaces it.
+        // An agent token, ANOTHER device's token, or an older device token
+        // never displaces it.
         storage
             .store_tenant_device_jwt(&tenant, &anchor_test_jwt(did, 9_999, "agent"))
+            .unwrap();
+        storage
+            .store_tenant_device_jwt(
+                &tenant,
+                &anchor_test_jwt("dddddddd-dddd-4ddd-8ddd-dddddddddddd", 9_999, "device"),
+            )
             .unwrap();
         storage.store_tokens(&old, "").unwrap();
         assert_eq!(
@@ -2059,6 +2104,14 @@ mod tests {
             storage.get_redeem_anchor_jwt().unwrap().as_deref(),
             Some(newest.as_str()),
             "reset re-seeds from the credential the redeem stored"
+        );
+
+        // With this device's id unresolved, a write leaves the anchor alone.
+        crate::machine_identity::set_test_device_id(None);
+        storage.clear_interactive_session().unwrap();
+        assert_eq!(
+            storage.get_redeem_anchor_jwt().unwrap().as_deref(),
+            Some(newest.as_str())
         );
     }
 
