@@ -55,7 +55,12 @@ pub(crate) fn is_reportable_distro(name: &str) -> bool {
 /// `oom_kill` is the same counter in every guest. Reporting it per guest would
 /// count each VM-level kill once per distro; keep it on the first guest of
 /// each `boot_id` (the VM) and drop it from the rest. PURE.
+///
+/// The guests are first sorted by `identity_hash`, so the owner is STABLE
+/// across ticks regardless of `wsl --list` order — an owner that flipped
+/// between guests would turn one counter into two interleaved baselines.
 pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
+    guests.sort_by(|a, b| a.identity_hash.cmp(&b.identity_hash));
     let mut seen = std::collections::BTreeSet::new();
     for g in guests.iter_mut() {
         let vm = g.boot_id.clone().unwrap_or_default();
@@ -328,10 +333,22 @@ PROBE_END\n";
         other.identity_hash = "b".repeat(64);
         let mut second_vm = g.clone();
         second_vm.boot_id = Some("11111111-2222-4333-8444-555555555555".into());
-        let mut guests = vec![g, other, second_vm];
+        // Listed with the higher identity first: ownership still goes to the
+        // lowest identity of each VM, whatever the listing order.
+        let mut guests = vec![other, g, second_vm];
         attribute_vm_oom_once(&mut guests);
-        let ooms: Vec<Option<u64>> = guests.iter().map(|g| g.oom_kill_total).collect();
-        assert_eq!(ooms, vec![Some(3), None, Some(3)]);
+        let got: Vec<(String, Option<u64>)> = guests
+            .iter()
+            .map(|g| (g.identity_hash.chars().take(4).collect(), g.oom_kill_total))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("14c5".to_string(), Some(3)),
+                ("14c5".to_string(), Some(3)),
+                ("bbbb".to_string(), None),
+            ]
+        );
     }
 
     #[test]

@@ -77,6 +77,11 @@ pub(crate) struct ComputerObs {
 
 /// How far two `booted_at` readings may disagree and still be the same boot.
 /// Windows derives boot time from uptime, which jitters by a second or so.
+///
+/// **Blind spot — Windows Fast Startup.** With Fast Startup on (the Windows
+/// default), "Shut down" hibernates the kernel instead of ending it, so a
+/// shutdown + power-on keeps the old boot time and is NOT seen as a reboot.
+/// Only a Restart (or a shutdown with Fast Startup off) moves `booted_at`.
 pub(crate) const BOOTED_AT_TOLERANCE_SECS: i64 = 120;
 
 /// A computer not observed for this long is forgotten (a deleted or renamed
@@ -113,6 +118,11 @@ pub(crate) struct ObsInput<'a> {
     /// `None` = no service information this tick (keep the previous units).
     pub(crate) services: Option<&'a [WatchedUnit]>,
     pub(crate) services_complete: bool,
+    /// Keep the previous `oom_kill_total` when this tick has none. `false`
+    /// for a WSL guest: the VM-wide counter is owned by one guest per VM, and
+    /// a guest that loses ownership must CLEAR its baseline — carrying it would
+    /// produce a bogus delta if it regains ownership later.
+    pub(crate) carry_oom_baseline: bool,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -175,7 +185,18 @@ pub(crate) fn derive(
         let id = if by_boot_id {
             event_id("reboot", &[boot])
         } else {
-            event_id("reboot", &["booted_at", input.booted_at.unwrap_or("")])
+            // Rounded to the tolerance window: Windows derives boot time from
+            // uptime, so two runner processes can read the same boot a second
+            // apart — the id must not differ for that.
+            let bucket = input
+                .booted_at
+                .and_then(parse_ts)
+                .map(|t| {
+                    t.timestamp().div_euclid(BOOTED_AT_TOLERANCE_SECS) * BOOTED_AT_TOLERANCE_SECS
+                })
+                .map(|b| b.to_string())
+                .unwrap_or_default();
+            event_id("reboot", &["booted_at", &bucket])
         };
         events.push(ComputerEvent {
             client_event_id: id,
@@ -391,7 +412,11 @@ pub(crate) fn derive(
         boot_id: input.boot_id.map(str::to_string).or(prev.boot_id.clone()),
         oom_kill_total: input
             .oom_kill_total
-            .or(if rebooted { None } else { prev.oom_kill_total }),
+            .or(if rebooted || !input.carry_oom_baseline {
+                None
+            } else {
+                prev.oom_kill_total
+            }),
         units,
         booted_at: input
             .booted_at
@@ -521,10 +546,27 @@ pub(crate) fn push_pending(state: &mut ObserverState, identity: &str, new: Vec<C
 /// copied aside to `*.json.corrupt` (the queued events in it are evidence)
 /// and logged, and the reporter starts fresh.
 pub(crate) fn load(path: &Path) -> ObserverState {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return ObserverState::default();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ObserverState::default(),
+        Err(e) => {
+            // Exists but unreadable (permissions, I/O, a directory): keep
+            // whatever can be copied and say so — never silently fresh.
+            let aside = path.with_extension("json.corrupt");
+            let kept = std::fs::copy(path, &aside).is_ok();
+            tracing::warn!(
+                "fleet::computer: observer state {} could not be read ({e}); starting fresh{}",
+                path.display(),
+                if kept {
+                    " (a copy is kept as .json.corrupt)"
+                } else {
+                    ""
+                }
+            );
+            return ObserverState::default();
+        }
     };
-    match serde_json::from_str(&text) {
+    match serde_json::from_slice(&bytes) {
         Ok(s) => s,
         Err(e) => {
             let aside = path.with_extension("json.corrupt");
@@ -587,6 +629,7 @@ mod tests {
             oom_kill_total: oom,
             services: Some(units),
             services_complete: true,
+            carry_oom_baseline: true,
         }
     }
 
@@ -732,6 +775,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             oom_kill_total: Some(1),
             services: Some(&units),
             services_complete: true,
+            carry_oom_baseline: true,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -758,6 +802,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             oom_kill_total: Some(2),
             services: Some(&units),
             services_complete: true,
+            carry_oom_baseline: true,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -777,6 +822,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             oom_kill_total: None,
             services: None,
             services_complete: false,
+            carry_oom_baseline: true,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(
@@ -793,10 +839,48 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, "reboot");
         assert_eq!(ev[0].observed_at, "2026-09-30T02:00:00Z");
+        // The id is keyed on the 120 s bucket (1790733600 = 02:00:00Z), so a
+        // second reader of the same boot a second later mints the SAME id.
         assert_eq!(
             ev[0].client_event_id,
-            event_id("reboot", &["booted_at", "2026-09-30T02:00:00Z"])
+            event_id("reboot", &["booted_at", "1790733600"])
         );
+        let (ev2, _) = derive(
+            Some(&o1),
+            &mk("2026-09-30T02:00:01Z"),
+            t("2026-09-30T02:05:00Z"),
+        );
+        assert_eq!(ev2[0].client_event_id, ev[0].client_event_id);
+    }
+
+    /// A guest that loses VM-wide OOM ownership clears its baseline; a host
+    /// keeps its baseline through a tick with no reading.
+    #[test]
+    fn a_guest_that_loses_oom_ownership_clears_its_baseline() {
+        let units = watched(ACTIVE_BEFORE, None);
+        let (_, o0) = derive(None, &input(&units, Some(7)), t("2026-09-30T01:00:00Z"));
+        let lost = ObsInput {
+            oom_kill_total: None,
+            carry_oom_baseline: false,
+            ..input(&units, None)
+        };
+        let (_, o1) = derive(Some(&o0), &lost, t("2026-09-30T01:00:30Z"));
+        assert_eq!(o1.oom_kill_total, None);
+        let host_gap = ObsInput {
+            oom_kill_total: None,
+            ..input(&units, None)
+        };
+        let (_, h1) = derive(Some(&o0), &host_gap, t("2026-09-30T01:00:30Z"));
+        assert_eq!(h1.oom_kill_total, Some(7));
+        // Regaining ownership with the VM counter at 9: no bogus 7→9 delta,
+        // the reading is a fresh baseline.
+        let (ev, o2) = derive(
+            Some(&o1),
+            &input(&units, Some(9)),
+            t("2026-09-30T01:01:00Z"),
+        );
+        assert!(ev.is_empty(), "{ev:?}");
+        assert_eq!(o2.oom_kill_total, Some(9));
     }
 
     #[test]
