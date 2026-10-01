@@ -34,8 +34,9 @@
 //! This module makes the opposite trade, deliberately, and the plan's Design
 //! decision 1 is explicit about it: **the manifest is emitted by the shipped app
 //! binary `qontinui-runner.exe`, not by a twelfth helper bin.**
-//! `tauri.conf.json`'s `bundle.externalBin` ships exactly two sidecars
-//! (`qontinui_profile`, `qontinui-pr`); a new `[[bin]]` would not be in the
+//! `tauri.conf.json`'s `bundle.externalBin` ships exactly three sidecars
+//! (`qontinui_profile`, `qontinui-pr`, and the per-pane `qontinui-pty-holder`);
+//! a new `[[bin]]` would not be in the
 //! installer, so it could not answer the one question that matters. It would
 //! also inherit `config_report`'s blindness — which here is *most of the subject
 //! matter*: every capability in [`CAPABILITY_SPECS`] is resolved by a bin-only
