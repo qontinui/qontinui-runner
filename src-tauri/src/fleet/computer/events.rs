@@ -63,6 +63,30 @@ pub(crate) struct ComputerObs {
     pub(crate) boot_id: Option<String>,
     pub(crate) oom_kill_total: Option<u64>,
     pub(crate) units: BTreeMap<String, UnitObs>,
+    /// Last reported boot time — the reboot signal where the platform has no
+    /// boot id (Windows).
+    #[serde(default)]
+    pub(crate) booted_at: Option<String>,
+    /// When this computer was last observed, for pruning vanished guests.
+    #[serde(default)]
+    pub(crate) last_seen_at: Option<String>,
+    /// `host` | `wsl_guest` | … — set by the reporter.
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+}
+
+/// How far two `booted_at` readings may disagree and still be the same boot.
+/// Windows derives boot time from uptime, which jitters by a second or so.
+pub(crate) const BOOTED_AT_TOLERANCE_SECS: i64 = 120;
+
+/// A computer not observed for this long is forgotten (a deleted or renamed
+/// WSL distro would otherwise keep its state and queue forever).
+pub(crate) const PRUNE_AFTER_SECS: i64 = 7 * 24 * 3600;
+
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// Everything persisted between ticks and across runner restarts.
@@ -132,13 +156,29 @@ pub(crate) fn derive(
     let mut events = Vec::new();
 
     // ---- reboot ---------------------------------------------------------
-    let rebooted = matches!(
+    // By boot id where both readings have one; otherwise (Windows) by a
+    // `booted_at` that moved by more than the uptime jitter.
+    let by_boot_id = matches!(
         (prev.boot_id.as_deref(), input.boot_id),
         (Some(a), Some(b)) if a != b
     );
+    let by_booted_at = (prev.boot_id.is_none() || input.boot_id.is_none())
+        && match (
+            prev.booted_at.as_deref().and_then(parse_ts),
+            input.booted_at.and_then(parse_ts),
+        ) {
+            (Some(a), Some(b)) => (b - a).num_seconds().abs() > BOOTED_AT_TOLERANCE_SECS,
+            _ => false,
+        };
+    let rebooted = by_boot_id || by_booted_at;
     if rebooted {
+        let id = if by_boot_id {
+            event_id("reboot", &[boot])
+        } else {
+            event_id("reboot", &["booted_at", input.booted_at.unwrap_or("")])
+        };
         events.push(ComputerEvent {
-            client_event_id: event_id("reboot", &[boot]),
+            client_event_id: id,
             kind: "reboot".into(),
             observed_at: input.booted_at.map(str::to_string).unwrap_or(now_s.clone()),
             detail: json!({
@@ -312,8 +352,16 @@ pub(crate) fn derive(
     }
 
     // ---- machine-wide OOM kills no watched unit accounts for ------------
-    if !rebooted && !first_ever {
-        if let (Some(a), Some(b)) = (prev.oom_kill_total, input.oom_kill_total) {
+    // After a reboot the counter restarted at 0, so the baseline is 0: kills
+    // between boot and this first tick (an early-boot OOM loop) are reported
+    // rather than silently absorbed into the new baseline.
+    if !first_ever {
+        let baseline = if rebooted {
+            Some(0)
+        } else {
+            prev.oom_kill_total
+        };
+        if let (Some(a), Some(b)) = (baseline, input.oom_kill_total) {
             if b > a {
                 let unattributed = (b - a).saturating_sub(attributed);
                 if unattributed > 0 {
@@ -324,7 +372,7 @@ pub(crate) fn derive(
                         detail: json!({
                             "victim_unit": null,
                             "count": unattributed,
-                            "attribution": "vmstat_delta",
+                            "attribution": if rebooted { "vmstat_since_boot" } else { "vmstat_delta" },
                             "oom_kill_total": b,
                             "previous_oom_kill_total": a,
                         }),
@@ -340,8 +388,36 @@ pub(crate) fn derive(
             .oom_kill_total
             .or(if rebooted { None } else { prev.oom_kill_total }),
         units,
+        booted_at: input
+            .booted_at
+            .map(str::to_string)
+            .or(prev.booted_at.clone()),
+        last_seen_at: Some(now_s),
+        kind: prev.kind.clone(),
     };
     (events, next)
+}
+
+/// Forget computers (and their queues) not observed for
+/// [`PRUNE_AFTER_SECS`], except `keep` (the host). Returns how many went.
+pub(crate) fn prune(state: &mut ObserverState, keep: &str, now: DateTime<Utc>) -> usize {
+    let stale: Vec<String> = state
+        .computers
+        .iter()
+        .filter(|(id, c)| {
+            id.as_str() != keep
+                && c.last_seen_at
+                    .as_deref()
+                    .and_then(parse_ts)
+                    .is_some_and(|t| (now - t).num_seconds() > PRUNE_AFTER_SECS)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &stale {
+        state.computers.remove(id);
+        state.pending.remove(id);
+    }
+    stale.len()
 }
 
 /// A `telemetry_gap` when the gated loop's previous tick is more than 3× the
@@ -433,23 +509,48 @@ pub(crate) fn push_pending(state: &mut ObserverState, identity: &str, new: Vec<C
     }
 }
 
-/// Load the observer state; a missing or unreadable file is a fresh state
-/// (first observation — baselines, no events).
+/// Load the observer state; a missing file is a fresh state (first
+/// observation — baselines, no events).
+///
+/// A file that exists but does not parse is NOT silently replaced: it is
+/// copied aside to `*.json.corrupt` (the queued events in it are evidence)
+/// and logged, and the reporter starts fresh.
 pub(crate) fn load(path: &Path) -> ObserverState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ObserverState::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            let aside = path.with_extension("json.corrupt");
+            let kept = std::fs::copy(path, &aside).is_ok();
+            tracing::warn!(
+                "fleet::computer: observer state {} does not parse ({e}); starting fresh{}",
+                path.display(),
+                if kept {
+                    format!(", the unreadable file is kept at {}", aside.display())
+                } else {
+                    String::new()
+                }
+            );
+            ObserverState::default()
+        }
+    }
 }
 
-/// Atomic write (temp file + rename). Best-effort: a failure costs the
-/// persistence of this tick, which the content-derived ids make safe.
+/// Atomic, durable write: temp file, `fsync`, rename. Best-effort: a failure
+/// costs this tick's persistence, which the content-derived ids make safe.
 pub(crate) fn save(path: &Path, state: &ObserverState) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(state)?)?;
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec(state)?)?;
+        f.sync_all()?;
+    }
     std::fs::rename(tmp, path)
 }
 
@@ -628,13 +729,107 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services_complete: true,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
-        assert_eq!(ev.len(), 1, "{ev:?}");
+        // The reboot, plus the one kill counted since that boot (baseline 0).
+        assert_eq!(ev.len(), 2, "{ev:?}");
         assert_eq!(ev[0].kind, "reboot");
+        assert_eq!(ev[1].detail["attribution"], "vmstat_since_boot");
         assert_eq!(ev[0].observed_at, "2026-09-30T03:00:00Z");
         assert_eq!(ev[0].detail["previous_boot_id"], BOOT);
         assert_eq!(ev[0].client_event_id, event_id("reboot", &[new_boot]));
         assert_eq!(obs1.boot_id.as_deref(), Some(new_boot));
         assert_eq!(obs1.oom_kill_total, Some(1));
+    }
+
+    /// Kills between boot and the first tick are reported, attributed to
+    /// nothing, against a baseline of 0 — not absorbed into the new baseline.
+    #[test]
+    fn after_a_reboot_the_oom_baseline_is_zero() {
+        let units = watched(ACTIVE_BEFORE, None);
+        let (_, obs0) = derive(None, &input(&units, Some(40)), t("2026-09-30T01:00:00Z"));
+        let new_boot = "11111111-2222-4333-8444-555555555555";
+        let inp = ObsInput {
+            boot_id: Some(new_boot),
+            booted_at: Some("2026-09-30T03:00:00Z"),
+            oom_kill_total: Some(2),
+            services: Some(&units),
+            services_complete: true,
+        };
+        let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
+        let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["reboot", "oom_kill"]);
+        assert_eq!(ev[1].detail["count"], 2);
+        assert_eq!(ev[1].detail["attribution"], "vmstat_since_boot");
+        assert_eq!(ev[1].detail["previous_oom_kill_total"], 0);
+    }
+
+    /// Windows: no boot id, so a reboot is a `booted_at` that moved by more
+    /// than the uptime jitter; a jitter-sized move is not one.
+    #[test]
+    fn without_a_boot_id_a_moved_booted_at_is_a_reboot() {
+        let mk = |booted: &'static str| ObsInput {
+            boot_id: None,
+            booted_at: Some(booted),
+            oom_kill_total: None,
+            services: None,
+            services_complete: false,
+        };
+        let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
+        let (jitter, o1) = derive(
+            Some(&o0),
+            &mk("2026-09-29T08:00:02Z"),
+            t("2026-09-30T01:00:30Z"),
+        );
+        assert!(jitter.is_empty());
+        let (ev, _) = derive(
+            Some(&o1),
+            &mk("2026-09-30T02:00:00Z"),
+            t("2026-09-30T02:05:00Z"),
+        );
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].kind, "reboot");
+        assert_eq!(ev[0].observed_at, "2026-09-30T02:00:00Z");
+        assert_eq!(
+            ev[0].client_event_id,
+            event_id("reboot", &["booted_at", "2026-09-30T02:00:00Z"])
+        );
+    }
+
+    #[test]
+    fn vanished_guests_are_pruned_but_the_host_never_is() {
+        let mut st = ObserverState::default();
+        let old = ComputerObs {
+            last_seen_at: Some("2026-09-01T00:00:00Z".into()),
+            ..ComputerObs::default()
+        };
+        let fresh = ComputerObs {
+            last_seen_at: Some("2026-09-29T00:00:00Z".into()),
+            ..ComputerObs::default()
+        };
+        st.computers.insert("host".into(), old.clone());
+        st.computers.insert("gone-guest".into(), old);
+        st.computers.insert("live-guest".into(), fresh);
+        st.pending.insert("gone-guest".into(), vec![]);
+        assert_eq!(prune(&mut st, "host", t("2026-09-30T00:00:00Z")), 1);
+        let left: Vec<&str> = st.computers.keys().map(String::as_str).collect();
+        assert_eq!(left, vec!["host", "live-guest"]);
+        assert!(!st.pending.contains_key("gone-guest"));
+    }
+
+    #[test]
+    fn a_corrupt_state_file_is_kept_aside_not_overwritten_silently() {
+        let dir = std::env::temp_dir().join(format!(
+            "qontinui-computer-observer-corrupt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("computer-observer.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(load(&path), ObserverState::default());
+        assert_eq!(
+            std::fs::read(dir.join("computer-observer.json.corrupt")).unwrap(),
+            b"{not json"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

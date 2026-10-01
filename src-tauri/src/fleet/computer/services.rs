@@ -133,7 +133,7 @@ pub(crate) fn row_from_props(
 }
 
 // ---------------------------------------------------------------------------
-// `systemctl show` text (WSL guests, and the recorded fixtures)
+// `systemctl show` text (WSL guests, and the synthetic fixtures)
 // ---------------------------------------------------------------------------
 
 /// The `-p` list the WSL guest probe asks for. Kept here beside the parser so
@@ -393,12 +393,16 @@ pub(crate) mod linux {
 
             // System bus: GitHub runner services and a system-level runner.
             if self.system.is_none() {
-                self.system = zbus::Connection::system().await.ok();
+                self.system = tokio::time::timeout(BUS_TIMEOUT, zbus::Connection::system())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
             }
             match self.system.as_ref() {
                 Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
-                    Ok(Ok(units)) => {
+                    Ok(Ok((units, whole))) => {
                         any_answered = true;
+                        complete &= whole;
                         for u in units {
                             by_unit.entry(u.unit.clone()).or_insert(u);
                         }
@@ -414,12 +418,16 @@ pub(crate) mod linux {
 
             // Session bus: the runner's own user units.
             if self.session.is_none() {
-                self.session = zbus::Connection::session().await.ok();
+                self.session = tokio::time::timeout(BUS_TIMEOUT, zbus::Connection::session())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
             }
             match self.session.as_ref() {
                 Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
-                    Ok(Ok(units)) => {
+                    Ok(Ok((units, whole))) => {
                         any_answered = true;
+                        complete &= whole;
                         self.session_ever = true;
                         for u in units {
                             by_unit.entry(u.unit.clone()).or_insert(u);
@@ -475,7 +483,17 @@ pub(crate) mod linux {
     /// Every watched unit systemd knows on this bus — loaded units AND
     /// installed-but-unloaded unit files (a stopped runner whose unit was
     /// garbage-collected is exactly the state worth reporting).
-    async fn scan_bus(conn: &zbus::Connection) -> zbus::Result<Vec<UnitProps>> {
+    ///
+    /// Returns the units read plus whether EVERY unit was read: a per-unit
+    /// `LoadUnit`/`GetAll` failure skips that unit and marks the scan partial
+    /// (sent as a delta, deleting nothing) rather than voiding the whole bus.
+    ///
+    /// `LoadUnit` is not a pure read: for an installed-but-unloaded unit file
+    /// it makes systemd load the unit into memory (the unit is not started;
+    /// systemd's own GC unloads it again when nothing references it). It is
+    /// the only unprivileged way to read an unloaded unit's properties, which
+    /// is exactly the state a dead runner service tends to be in.
+    async fn scan_bus(conn: &zbus::Connection) -> zbus::Result<(Vec<UnitProps>, bool)> {
         let no_states: Vec<&str> = Vec::new();
         let listed: Vec<ListedUnit> = call(
             conn,
@@ -513,21 +531,37 @@ pub(crate) mod linux {
         }
 
         let mut out = Vec::with_capacity(names.len());
+        let mut whole = true;
         for name in names {
             let path: OwnedObjectPath =
-                call(conn, MGR_PATH, MGR_IFACE, "LoadUnit", &(name.as_str(),)).await?;
-            let unit: HashMap<String, OwnedValue> = call(
+                match call(conn, MGR_PATH, MGR_IFACE, "LoadUnit", &(name.as_str(),)).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!("fleet::computer: LoadUnit {name} failed: {e}");
+                        whole = false;
+                        continue;
+                    }
+                };
+            let unit: HashMap<String, OwnedValue> = match call(
                 conn,
                 path.as_str(),
                 PROPS_IFACE,
                 "GetAll",
                 &("org.freedesktop.systemd1.Unit",),
             )
-            .await?;
+            .await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    debug!("fleet::computer: GetAll(Unit) {name} failed: {e}");
+                    whole = false;
+                    continue;
+                }
+            };
             if str_prop(&unit, "LoadState").as_deref() == Some("not-found") {
                 continue;
             }
-            let svc: HashMap<String, OwnedValue> = call(
+            let svc: HashMap<String, OwnedValue> = match call(
                 conn,
                 path.as_str(),
                 PROPS_IFACE,
@@ -535,10 +569,17 @@ pub(crate) mod linux {
                 &("org.freedesktop.systemd1.Service",),
             )
             .await
-            .unwrap_or_default();
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("fleet::computer: GetAll(Service) {name} failed: {e}");
+                    whole = false;
+                    continue;
+                }
+            };
             out.push(props_from_maps(name, &unit, &svc));
         }
-        Ok(out)
+        Ok((out, whole))
     }
 
     fn str_prop(m: &HashMap<String, OwnedValue>, k: &str) -> Option<String> {
@@ -669,6 +710,17 @@ pub(crate) fn parse_sc_query(text: &str) -> Vec<ScService> {
     out
 }
 
+/// Whether an `sc query` listing was cut short. `sc` enumerates into a fixed
+/// buffer (4 KiB by default, `bufsize=`) and, when more services exist than
+/// fit, prints only the first page plus `Enum: more data, need N bytes start
+/// resume at index M` (or `More data is available.`). A box with many services
+/// then simply lacks the later ones — so a truncated listing must never be
+/// sent as a complete snapshot (it would DELETE the rows it missed).
+pub(crate) fn sc_query_truncated(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("more data") || t.contains("resume at index")
+}
+
 /// `BINARY_PATH_NAME` from `sc qc <name>`, quotes stripped.
 pub(crate) fn parse_sc_qc_binary_path(text: &str) -> Option<String> {
     text.lines()
@@ -761,7 +813,13 @@ pub(crate) mod windows {
     /// Every `actions.runner.*` Windows service. `units: None` when `sc query`
     /// itself did not answer.
     pub(crate) async fn scan() -> ServiceScan {
-        let Some(listing) = sc(&["query", "type=", "service", "state=", "all"]).await else {
+        // A large buffer so a normal box lists every service in one page; the
+        // truncation check below covers the box that still overflows it.
+        let Some(listing) = sc(&[
+            "query", "type=", "service", "state=", "all", "bufsize=", "262144",
+        ])
+        .await
+        else {
             return ServiceScan {
                 units: None,
                 complete: false,
@@ -786,7 +844,7 @@ pub(crate) mod windows {
         }
         ServiceScan {
             units: Some(units),
-            complete: true,
+            complete: !super::sc_query_truncated(&listing),
         }
     }
 }
@@ -795,8 +853,9 @@ pub(crate) mod windows {
 pub(crate) mod tests {
     use super::*;
 
-    /// The 2026-09-30 incident unit, as `TZ=UTC systemctl show -p …` printed
-    /// it after the kernel OOM killer took the runner's cgroup: `Result=oom-kill`
+    /// The 2026-09-30 incident unit's SHAPE (synthetic unit name, paths and
+    /// numbers), as `TZ=UTC systemctl show -p …` prints a unit after the
+    /// kernel OOM killer took its cgroup: `Result=oom-kill`
     /// with `ExecMainStatus=0` (the main process was SIGKILLed, it did not
     /// exit non-zero), `OOMPolicy=stop`, `Restart=no` — so it stayed dead.
     pub(crate) const INCIDENT_SHOW: &str = "\
@@ -947,7 +1006,7 @@ ActiveState=inactive
         assert_eq!(classify_unit("sshd.service"), "other_watched");
     }
 
-    /// Recorded shape: UTF-8 with a BOM, as `config.sh` writes it.
+    /// Synthetic, in the shape `config.sh` writes: UTF-8 with a BOM.
     const RUNNER_FILE: &str = "\u{feff}{\n  \"agentId\": 22,\n  \"agentName\": \"fleetbox\",\n  \"poolId\": 1,\n  \"poolName\": \"Default\",\n  \"serverUrl\": \"https://pipelines.actions.example.invalid/\",\n  \"gitHubUrl\": \"https://github.com/example-org/example-repo\",\n  \"workFolder\": \"_work\"\n}";
 
     #[test]
@@ -993,7 +1052,7 @@ ActiveState=inactive
         assert_eq!(runner_dir_of(&p), Some(PathBuf::from("/opt/x")));
     }
 
-    /// Recorded shape of `sc query type= service state= all` (two runner
+    /// Synthetic, in the shape of `sc query type= service state= all` (two runner
     /// services and one unrelated service).
     pub(crate) const SC_QUERY: &str = "\r
 SERVICE_NAME: actions.runner.example-org-example-repo.winbox\r
@@ -1046,6 +1105,15 @@ DISPLAY_NAME: Print Spooler\r
         let never = props_from_sc(&svcs[2]);
         assert_eq!(never.active_state.as_deref(), Some("inactive"));
         assert_eq!(never.result.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn a_truncated_sc_listing_is_detected() {
+        assert!(!sc_query_truncated(SC_QUERY));
+        let cut =
+            format!("{SC_QUERY}\r\nEnum: more data, need 5156 bytes start resume at index 79\r\n");
+        assert!(sc_query_truncated(&cut));
+        assert!(sc_query_truncated("[SC] EnumQueryServicesStatus: OpenService FAILED 234:\r\n\r\nMore data is available.\r\n"));
     }
 
     #[test]
