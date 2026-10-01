@@ -1614,7 +1614,23 @@ mod timeout_tests {
         ) {
             ProbeOutcome::Degraded(DegradeReason::SpawnError(failure)) => {
                 assert_eq!(failure.exhaustion, None, "{failure:?}");
-                assert!(failure.os_code.is_some(), "ENOENT carries its code");
+                // The code is whatever the OS supplied. On Unix the exec fails
+                // with ENOENT and std carries it. On Windows std resolves the
+                // program itself before CreateProcessW and, when the search
+                // fails, returns `io::const_error!(NotFound, "program not
+                // found")` — no raw OS code at all (rust-lang/rust 1.95.0,
+                // library/std/src/sys/process/windows.rs, `resolve_exe`).
+                #[cfg(unix)]
+                assert_eq!(
+                    failure.os_code,
+                    Some(libc::ENOENT),
+                    "ENOENT carries its code"
+                );
+                #[cfg(windows)]
+                assert_eq!(
+                    failure.os_code, None,
+                    "std's Windows program search reports NotFound without an OS code"
+                );
             }
             other => panic!("expected a SpawnError degrade, got {other:?}"),
         }

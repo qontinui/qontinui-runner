@@ -2874,8 +2874,20 @@ MemAvailable:   15335424 kB
                  gate's own doc argues it does not pay"
             );
         }
+        // `memory_status` is the recording wrapper (it hands each reading to
+        // the allocation-failure breadcrumb's cache — plan
+        // `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+        // Phase 0): it must make exactly ONE read, so wrapping added no
+        // syscall.
+        assert_eq!(
+            body_of("fn memory_status()")
+                .matches("read_memory_status()")
+                .count(),
+            1,
+            "memory_status must take exactly ONE OS reading"
+        );
         // And the probe itself makes exactly one OS call per platform arm.
-        let probe = body_of("fn memory_status()");
+        let probe = body_of("fn read_memory_status()");
         assert_eq!(
             probe.matches("GlobalMemoryStatusEx(").count(),
             1,
