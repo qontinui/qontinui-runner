@@ -4485,6 +4485,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // on uncertainty), and flips confidently-dead sessions to
                 // `closed`. Detached for the process lifetime; wrapped so a
                 // fallible tick never panics the loop.
+                // Machine-wide live Claude session census (plan
+                // 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account,
+                // Phase 2). A SIBLING of the lifecycle poll below rather than
+                // part of its tick: that tick is 45s and idles without a
+                // process snapshot whenever no record is open, while the census
+                // must run every 60s regardless — it reports the sessions the
+                // runner does NOT host. Primary-only, device-authed,
+                // best-effort; see `session::census`.
+                session::census::spawn_publisher(app.handle().clone());
+
                 let poll_tm = term_for_session.clone();
                 let poll_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
