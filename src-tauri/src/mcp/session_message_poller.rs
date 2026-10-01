@@ -1071,6 +1071,19 @@ fn resolve_target(
     None
 }
 
+/// Does the runner host `session_id` — would [`resolve_target`] route a
+/// message to it right now? The ONE "live local session the runner hosts"
+/// predicate, shared with the session census's `runner_hosted` column so the
+/// census and the poller can never disagree about what this device can push to.
+pub(crate) fn runner_hosts(
+    session_manager: &crate::claude_session::SessionManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    lifecycle_store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    session_id: &str,
+) -> bool {
+    resolve_target(session_manager, registrar, lifecycle_store, session_id).is_some()
+}
+
 /// The envelope's tag name, matched case-insensitively by
 /// [`reminder_close_tag_end`].
 const REMINDER_TAG_NAME: &[u8] = b"system-reminder";
