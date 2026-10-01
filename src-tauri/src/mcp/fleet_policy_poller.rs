@@ -771,11 +771,15 @@ pub(crate) fn pin_account_selection_for_test(
 /// takes them in this order, and no test takes the fleet pin before the
 /// ambient, so the pair cannot deadlock. The ambient points
 /// `QONTINUI_CONFIG_DIR` / `HOME` at an empty temp dir, so the per-instance
-/// roster is empty. The machine-global roster resolves through
-/// `dirs::config_dir()`, which on Linux follows `XDG_CONFIG_HOME` when it is
-/// set — `cargo-guard.sh` points that at a fresh per-run sandbox. The pin
-/// serializes the test against the one test that publishes a temp dir into
-/// `RESOLVED_CONFIG_DIR`.
+/// roster is empty. The machine-global roster is NOT reliably isolated: it
+/// resolves through `dirs::config_dir()`, which is empty only on Linux under
+/// the fixture with `XDG_CONFIG_HOME` unset or pointed at cargo-guard's
+/// per-run sandbox. On Windows (`dirs` ignores HOME/USERPROFILE) or with an
+/// exported `XDG_CONFIG_HOME` under raw cargo, the REAL roster may be read — so
+/// a test that can reach a `RESOLVED_CONFIG_DIR` writer must also hold
+/// `ai_provider::config::ResolvedConfigDirRestore`. The pin serializes the
+/// holder against every other fleet-pin holder, including the test that
+/// publishes a temp dir into `RESOLVED_CONFIG_DIR`.
 ///
 /// Returned as a tuple: fields drop in declaration order, so the ambient is
 /// restored first and the fleet pin is released last.
