@@ -946,8 +946,8 @@ impl AiCoordRegistrar {
         }
     }
 
-    /// R5 — on AI-session end, emit a `Closed` outbox row (`DELETE
-    /// /sessions/:id`) and evict the R4 index entry so coord.sessions doesn't
+    /// R5 — on AI-session end, emit a `Closed` outbox row (`PATCH
+    /// /sessions/:id {state:"closed"}`) and evict the R4 index entry so coord.sessions doesn't
     /// leak a ghost row and the resolver doesn't keep a dangling mapping.
     /// No-op if the session wasn't registered.
     ///
