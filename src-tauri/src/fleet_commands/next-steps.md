@@ -54,7 +54,8 @@ gate; just list it.
   phase_name). The `unit_ready`/`unit_status` predicates carry this UUID, not the
   slug.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
-  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
+  `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`,
@@ -139,8 +140,8 @@ gate; just list it.
   omitting is safe and never a loophole, and a guessed class is worse than none.
   ⚠️ **The old "`agent_non_author` means nobody may attest — this is a ONE-DEVICE
   fleet" warning is SUPERSEDED (re-verified 2026-08-30).** Both premises changed:
-  the fleet has **four** device ids (`eb2155ed4152`, `c79a07d57e40`,
-  `84c0229232cb`, `3e7e4b0475de`), and `non_author_allows_identities` is now a
+  a deployment can register **more than one** device id (count your own rather
+  than assuming one), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
   only in tier 6 — same device, no proven session on either side. So
@@ -167,9 +168,7 @@ gate; just list it.
   with `coord-revive.sh call coord_work_unit_transition '<json>'` rather than
   the tool your session advertises, and verify by read — a zero exit is not
   evidence the write landed. ⚠️ **Never re-allocate to get past
-  `self_attestation_forbidden`**: a fresh allocate issues a NEW agent id the
-  legacy compare would admit, which that refusal itself names *"a known defect
-  being tracked, not a sanctioned route"*. That prohibition is that refusal's
+  `self_attestation_forbidden`**: a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`. The re-allocate prohibition is that refusal's
   alone — `attester_unresolved` wants a device- or agent-identified caller,
   which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
@@ -183,10 +182,10 @@ gate; just list it.
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in → `time_elapsed`; metric →
   `metric_threshold` (explicit `labels` — e.g. `coord_ci_runner_count` MUST filter
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
-  `{work_unit_id, ready_status}` — transition the unit FIRST and set
-  `ready_status` to the status that actually landed (`vetted`, else the Free
-  fallback `vetted_unattested`); a hardcoded Attested value on a unit you own
-  never clears, since an owner may not attest (canonical: `_gate-registration`).
+  `{work_unit_id, ready_status}` — transition the unit FIRST (one `→ vetted`
+  call carrying an `independence` declaration) and key `ready_status` on
+  `vetted`; never on the status a REFUSED transition left, which on a fresh unit
+  is `""` and clears at once; on a refused transition register no `unit_ready` gate (canonical: `_gate-registration`).
   (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
@@ -258,8 +257,17 @@ gate; just list it.
   the cancel "stays operator-only" and that a device session had to reach an
   operator door; that was wrong — it named the unprefixed OPERATOR route, which
   answers an agent 401. It then named a dispatched-only filter, which was wrong
-  the other way.) (canonical spec: `_gate-registration` → "Continuation cancel +
-  refresh", and → "How long you actually have" for the window.)
+  the other way.) **Then WITHDRAW the prior OPEN gate** — never the `unit_ready` record
+  gate you still need cleared — `coord_withdraw_gate`
+  `{gate_id, reason}`, or its HTTP twin `POST .../coord/gates/:gate_id/withdraw`
+  `{reason}` (registrant-only; it also cancels a still-pending continuation, so
+  it alone suffices when you registered the prior gate). A cancel leaves the
+  verdict `open`, so a superseded gate that is only cancelled sits in the open
+  set forever; mute is for noise, not retirement. On a not-the-registrant
+  refusal (MCP error / HTTP 403), cancel + mute and name the gate id in your
+  closeout. (canonical spec:
+  `_gate-registration` → "Continuation cancel + refresh", and → "How long you
+  actually have" for the window.)
 
 **Attest-on-completion (close the loop).** If a next-step item instead COMPLETES
 work that a registered gate was watching (a previously-deferred follow-up now

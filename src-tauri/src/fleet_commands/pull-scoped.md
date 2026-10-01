@@ -111,8 +111,12 @@ is what splits A from B** — empty means Case A, non-empty means Case B.
 This is the only case where we modify the checked-out tree. Action:
 
 ```bash
-# Verify no tracked WIP once more right before acting (multi-agent paranoia)
-[ -z "$(git status --porcelain --untracked-files=no)" ] \
+# Verify no tracked WIP once more right before acting (multi-agent paranoia).
+# The STATUS is tested before the emptiness: a failed `git status` prints
+# nothing, and nothing would otherwise read as "no WIP" and move HEAD.
+wip_now="$(git status --porcelain --untracked-files=no)" \
+    || { echo "git status failed mid-flight; aborting $repo (WIP state UNKNOWN)"; continue; }
+[ -z "$wip_now" ] \
     || { echo "WIP appeared mid-flight; aborting $repo"; continue; }
 
 # Only ff-only — refuse if local has unpushed commits ahead of origin.

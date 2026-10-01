@@ -71,11 +71,8 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
 
    Classify it by the SAME `origin/main` content check the table demands below,
    after a `fetch`: the stamped file's content hash must equal `origin/main`'s
-   blob at its path. That read-back now lives in `scripts/land-plan-stamp.sh`,
-   which `/implement-plan` Step 6 item 3 calls: after a fresh fetch it hashes
-   the blob at the ref and exits 3 on a missing path or a different blob, so a
-   `LANDED` verdict line from it has passed the check — and a `PROPOSED` one has
-   NOT landed, it is on a fresh branch awaiting its PR. An existence check is not enough, because after a stranded
+   blob at its path (`/implement-plan` Step 6 item 3's read-back, with its
+   non-empty guard). An existence check is not enough, because after a stranded
    stamp push an earlier, unstamped version is already at that path. **A plan that is committed and pushed is not thereby LANDED**: a bare
    `git push` lands it on whatever branch the plans checkout was on, and nothing
    opens a PR for that branch or merges it. Measured 2026-09-02 on
@@ -83,6 +80,97 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
    branches, the oldest ~4 months stale. A plan whose read-back fails is
    **DROPPED** — route it to a store in Step 2 by landing it per
    `/implement-plan` Step 6 item 3, which is the durable store for this class.
+6. **On-disk-only state** — what exists only on this box's disk dies with the
+   session, and source 1 reads the committed tree only. First enumerate the
+   TREES: this session's coord allocations (`coord_session_worktrees`), every
+   repo source 1 walks, and any other path the transcript shows this session
+   editing. Then run these checks per tree. Each check is scoped to THAT tree.
+   `refs/heads` and `refs/stash` are one store shared by every linked worktree
+   of a repo, so `git log --branches` and a bare `git stash list` report peers'
+   branches and stashes as yours.
+
+   **A tree that is not one of this session's coord allocations is SHARED**
+   (a primary checkout, or a peer's tree). Its local `main` routinely holds a
+   peer's unpushed commit and its stash stack holds peers' stashes. In a
+   shared tree, count ONLY state this session owns: a path this session wrote,
+   a commit this session made, a stash the transcript shows this session
+   created. Everything else there is **peer state**. Peer state is never a
+   DROPPED unit, and it is never committed, pushed or popped by this session
+   (`git-operations` `shared-checkout-route-around`). It goes on Step 4.9's
+   informational line and nowhere else. A commit's owner is read from its
+   `Session-Id:` trailer: this session's id is this session's; another
+   session's id is peer state. A commit with NO trailer is **unattributed**,
+   and the transcript check is then mandatory. If the transcript does not
+   settle it, and its author email is this session's git identity AND its
+   commit time falls inside this session's window (session start to now), it
+   gets its own `  unattributed (not settled): <tree>: <sha>` line and the
+   headline is UNKNOWN: it may be this session's work. Any other unsettled
+   unattributed commit goes on the peer-state line. The identity is
+   `git -C <tree> config user.email`. The session start is the first
+   `timestamp` in `<config-dir>/projects/*/$CLAUDE_CODE_SESSION_ID.jsonl`,
+   else the coord row's `started_at`; when neither is readable the window is
+   unbounded, so every unsettled commit carrying this identity is UNKNOWN. On
+   a single-author box the email check narrows nothing (every commit carries
+   it), and the window alone decides.
+   - **Uncommitted:** `git -C <tree> status --porcelain --untracked-files=all`.
+     Any untracked path is found (in a shared tree, only paths this session
+     wrote). Untracked files are outside every `refs/wip/` snapshot;
+     `.gitignore`d files are not listed, by design. Classify the tracked
+     changes with
+     `bash <workspace-root>/qontinui-claude-config/scripts/dirty-provenance.sh <tree>`
+     and branch on its EXIT code: 0 clean (every modified file is provisioner
+     residue), 1 found, 3 UNKNOWN, anything else UNKNOWN. In a shared tree the
+     exit code judges every file, peers' included, so run it with `--json`
+     and read `files[]` only for the paths this session wrote. A non-empty
+     top-level `error` makes the whole tree UNKNOWN. Per file, `class:
+     UNKNOWN` is UNKNOWN (it wins over `restorable: false`), then
+     `class: UNIQUE` or `restorable: false` is found, and `restorable: true`
+     is clean. A path of this session's that is absent from `files[]` is clean
+     only when `error` is empty.
+   - **Unpushed commits:** `git -C <tree> fetch --prune` (without `--prune`, a
+     remote branch deleted before it landed still hides the commits it held),
+     then `git -C <tree> rev-list HEAD --not --remotes` (also for a branch this
+     session's allocation reserved, when HEAD is elsewhere). In a shared tree,
+     sort each sha by owner (above) with
+     `git -C <tree> log --no-walk --format='%H %ae %cI %(trailers:key=Session-Id,valueonly)' <sha>...`.
+     A non-empty answer is **not yet found**: coord rebase-lands and reaps the
+     remote branch, so a landed branch's original commits are on no remote.
+     Settle it with
+     `bash <workspace-root>/qontinui-claude-config/scripts/classify-branch-state.sh <tree>`:
+     exit 0 clean, 3 UNKNOWN, 1 / 2 escalate. Escalate through the patch-id
+     rule below the table ("Escalate every patch-id `UNLANDED` to a per-file
+     BLOB comparison"), or through
+     `bash <workspace-root>/qontinui-claude-config/scripts/land-evidence.sh <tree>`:
+     exit 0 clean, 1 / 2 found, 3 / 5 UNKNOWN, anything else UNKNOWN. Never
+     treat 5 as 0. It is found only when an addition is shown missing from
+     `main`; unsettled is UNKNOWN
+     [policy: `verification-and-evidence` `an-unknown-input-must-not-fire-a-detector`].
+     **In a shared tree, neither tool's tree-wide verdict is this session's**
+     unless every ahead commit is this session's. Both judge the whole branch,
+     a peer's commits included, and `classify-branch-state.sh` also forces
+     `UNIQUE_WIP` on uncommitted changes, which in a shared tree are usually a
+     peer's. So run `land-evidence.sh --json <tree>` and read `commits[]` only
+     for this session's shas, by each entry's `verdict` field:
+     `PROVEN_LANDED` is clean only when the
+     top-level `ahead_merge_commits` is exactly 0 (a merge commit on the branch
+     is what patch-level evidence under-reads), `PARTIAL` / `NONE` is found,
+     anything else is UNKNOWN. A session sha absent from `commits[]` is
+     UNKNOWN, never clean. Step 2 then routes only those commits
+     (a fresh branch carrying them), never a push of a `main` that carries a
+     peer's commit.
+   - **Stashes:** `git -C <tree> stash list`, keeping only entries whose
+     `WIP on <branch>:` / `On <branch>:` names this tree's branch. In a shared
+     tree, keep only a stash the transcript shows this session created. When
+     that cannot be established, the stash is peer state.
+   - **Missing directory:** clean only when its branch's PR reads merged
+     (source 2) or its content is proven landed; otherwise UNKNOWN.
+
+   Each found item is a **DROPPED** unit. Step 2 converts it: commit and push
+   it, or record where it lives and why it stays. A check that could not run
+   (a git error, a helper answering UNKNOWN / INCOMPLETE) is UNKNOWN for that
+   tree, never clean. So is an enumeration that could not be read
+   [policy: `verification-and-evidence` `silent-empty-is-unknown`]. Step 4.9
+   re-runs these checks after Step 2's conversions.
 
 Now put **every** unit into exactly one terminal state:
 
@@ -496,7 +584,8 @@ the same, and this command previously told you to look nowhere.
 If a returned finding already covers the condition, **cite it and move on** — do
 not repeat the investigation. If your own evidence *corrects* it, post the
 replacement with `supersedes` set to the stale `finding_id`, so reads return one
-live head rather than two contradictory rows.
+live head rather than two contradictory rows. Then read the collapse back, per 2b
+("After posting a correction with `supersedes`, READ BACK THE COLLAPSE").
 
 **Probe again immediately BEFORE each post — the first probe is not enough.**
 A closeout runs for tens of minutes between reading and writing, and peers close
@@ -699,6 +788,26 @@ session nothing while "X is Y because Z" tells it everything.
 second.** A second row for the same condition splits the evidence between two
 ids that no read can join, and `supersedes` is resolved server-side against your
 own tenant, so a correction chain is cheap and a duplicate is not.
+
+**After posting a correction with `supersedes`, READ BACK THE COLLAPSE.** Re-probe
+the same `topic` (or `resource_keys`) with `coord_recent_findings` and confirm the
+prior head is **gone** from the result and yours is present. The returned
+`finding_id` says the row was WRITTEN; it says nothing about whether the chain
+collapsed, and that read is the only thing distinguishing a retraction from a
+second contradictory row. It is one call. The measured failure: `5a4dfbc1`,
+titled `RETRACTION of 708b7fc1 — …`, was posted with `supersedes: null`, came back
+`posted: true`, and both rows stood as live heads for 8 days (plan
+`2026-09-21-a-retraction-with-no-supersedes-argument-is-accepted-silently-and-never-retracts`).
+That plan's Phase 1 makes coord refuse a retraction-shaped title with no
+`supersedes` once it is deployed; even then a reworded one and a `supersedes` naming the wrong row still pass,
+and the read-back catches both. If the prior head is still listed, the
+correction did not take: say so and fix the edge. **"Gone" is only evidence when
+the page was complete** — `available: false` is UNKNOWN, and a page whose `count`
+equals its `limit` (the default is 20) may simply have cut the prior head off;
+re-read with a larger `limit`, or ask the HTTP door by id
+(`GET /coord/agent-findings?finding_id=<prior>`, which applies the same
+supersede-hiding: an empty page there means collapsed, an id outside your
+tenant, or no such id — check the id you sent is the full one).
 
 **Precondition for a DOOR-SHAPED `status` / `gotcha`** (a finding whose body
 says a route, tool or host is absent, refuses, or cannot be reached by agents):
@@ -1866,6 +1975,84 @@ or, when both variables were absent:
 
 ---
 
+## Step 4.9 — Safe to close?
+
+Step 2's conversions commit and push, which changes the answer Step 1 source 6
+gave. So re-run source 6's checks on every tree now, then declare the hand-offs,
+then emit the verdict. It describes the trees as they are left.
+
+**The verdict: one headline, then one line per tree that is not clean.**
+Precedence is fail-closed, highest first:
+
+- `NOT SAFE TO CLOSE — <k> trees`, when ANY tree has something only on disk,
+  then `  <tree>: <what exists only there>` per such tree;
+- else `UNKNOWN — <k> trees could not be checked`, then `  <tree>: <why>` per
+  tree;
+- else `SAFE TO CLOSE — <n> trees checked, nothing only on disk`.
+
+`SAFE` requires every tree checked AND a complete tree enumeration; an
+unreadable enumeration is `UNKNOWN`. Peer state in a shared tree (source 6) gets one
+informational line, `  peer state (not this session's): <tree>: <what>`,
+under the headline. It never changes the headline. Every headline ends with
+`; hand-off declared for <m>` and, when any declaration failed,
+`; NOT declared for <j>: <tree> (<exit / reason>)`. A failed declaration leaves
+a slot held and loses nothing, so it never changes the headline.
+
+The verdict is the operator's signal to exit. A `NOT SAFE` or `UNKNOWN` line
+names what to resolve first. It never blocks the operator from closing; it
+does block the finished record (Step 5's gate). **Re-print the
+verdict line as the LAST line of this command's output**, after Step 5's line,
+because that is where an operator looks before closing.
+
+### The hand-off declaration — Step 4.9's last action, per tree
+
+For every tree that verified clean in this step and whose branch is pushed:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/worktree-handoff.sh --path <tree> --pr '<owner/repo#n>'   # omit --pr when the tree has no PR
+```
+
+It runs `allocate-worktree.sh --done --path <tree>` **without** `--abandon`,
+and `--path`, never `--branch`: sibling allocations share one branch, and
+`--branch` would stamp them too. It verifies the answer by `matched>=1`. Then it makes sure coord holds this session's transcript,
+and records one `Coord-Handoff-Transcript:` trailer on the PR when there is
+something to say: `not saved: <code>` (a refusal or a failure),
+`not saved: unverified: <code>` (the outcome is UNKNOWN), or
+`saved; older history truncated` (saved, but the runner deliberately capped the
+older prefix). It never forks or guesses this session's coord row. A runner-hosted session
+lets the runner bind its own row. Otherwise, when this device already owns
+active rows and none is provably this session's, the answer is
+`coord_row_unbound` (or `coord_row_split`): a non-save, never a prompt to pick
+one of those rows, which may be a peer's. Its header carries the procedure and the exit codes. Read its three
+output lines:
+
+| `declaration:` | Means |
+|---|---|
+| `declared matched=<n> trigger_signal=agent_done` | counts toward `hand-off declared for <m>`; `matched>=1` is the real check (coord echoes `agent_done` as a constant) |
+| `nothing-to-declare` (`allocate-worktree.sh` exit 5) | a shared checkout or a hand-made worktree; not a failure, not counted |
+| `FAILED` (exit 6 / 7) or `UNKNOWN` | a `NOT declared for` entry |
+
+**What the declaration means — say this, and no more:** the tree stops counting
+toward the device worktree cap once coord's hand-off slot relief lands (pending
+in plan
+`2026-09-28-an-author-session-holds-its-worktree-slot-until-its-pr-lands-so-idle-sessions-starve-coord-fixers`).
+Its build sinks (`target/`, `node_modules/`) become rejunction-eligible now; no
+source is touched. Pin the tree if its private target must stay. Editing the
+tree again re-occupies it. The session still owns its PR branch.
+
+A `transcript:` line other than `saved` is appended under the verdict, beside
+that tree's line. It never changes the headline. With no runner to ask, a
+transcript coord already holds is `UNKNOWN: already_present_unverified`: a
+chunk in coord proves a prefix reached it, not that the transcript is
+complete.
+
+> ⚠️ **In a SUBAGENT, declare only trees the subagent itself allocated.** A
+> subagent inherits its parent's session id and cannot be told apart
+> mechanically (Step 5's subagent arm). A tree the parent allocated is the
+> parent's to hand off, and the parent may still be working in it.
+
+---
+
 ## Step 5 — record the session as finished
 
 The audit is done and reported. This step writes the one durable fact that makes
@@ -1887,12 +2074,18 @@ me"; IMPEDED and DROPPED are not. So:
 
 | Step 1 outcome | Action |
 |---|---|
-| every unit LANDED / WATCHED / RECORDED | **finish** the session |
+| every unit LANDED / WATCHED / RECORDED AND Step 4.9 headline `SAFE TO CLOSE` | **finish** the session |
 | any unit IMPEDED or DROPPED | **leave it unfinished**, and say which items held it open |
+| Step 4.9 headline `NOT SAFE` / `UNKNOWN` | **leave it unfinished**, and name the trees |
 
 A residual DROPPED item you could not convert (Step 2) counts as DROPPED here —
 converting it is what would have cleared the gate, and reporting it as converted
 when it was not is the failure Step 4's honesty rules already forbid.
+
+**The gate also requires Step 4.9's headline to read `SAFE TO CLOSE`.** A
+`NOT SAFE` or `UNKNOWN` headline leaves the session unfinished, with that
+headline as the reason. A session whose trees still hold unrecorded work is
+never recorded as finished.
 
 ### How
 
@@ -1959,7 +2152,11 @@ or, when the gate held:
 
 > **Session left UNFINISHED** — <N> IMPEDED / <M> DROPPED: <the items>.
 
-Both are complete outcomes. A session left unfinished because work genuinely
+or, when Step 4.9 held it:
+
+> **Session left UNFINISHED** — Step 4.9 headline `<NOT SAFE | UNKNOWN>`: <the trees>.
+
+All three are complete outcomes. A session left unfinished because work genuinely
 remains is this step working, not failing.
 
 **Bookkeeping, so it never blocks.** This write is visibility, not correctness.

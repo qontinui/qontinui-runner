@@ -5,12 +5,14 @@ allowed-tools: Read, Glob, Grep, Bash, PowerShell
 
 # /whereami — session context card
 
-Print **two clearly separated blocks**. They answer different questions and are
-true for different lengths of time, so they never share a line:
+Print **clearly separated blocks** — two fixed at spawn, one true only now. They
+answer different questions and are true for different lengths of time, so they
+never share a line:
 
 | Block | Question | Lifetime |
 |---|---|---|
 | **IDENTITY (fixed)** | Who spawned me, as what, where? | Fixed for this session |
+| **SERVED CORPUS (fixed)** | Which `.claude/` was I served, how stale, and is it the build's bundle? | Measured at spawn (Step 1b) |
 | **REACHABILITY (now)** | What answers me at this instant? | True only at probe time |
 
 **The identity predicate is `$QONTINUI_RUNNER_CONTEXT` being non-empty — iff.**
@@ -78,6 +80,22 @@ UNKNOWN arrives as the **value** `unknown` rather than as a missing object. An
 absent `coordCredential` key therefore means a build predating the field, and
 nothing else.
 
+**The SERVED-CORPUS line follows it, and is found by KEY, never by position** —
+`[served-corpus: <canonical .claude>] [checkout: …] [bundle: …] [provisioned: …]
+[cwd: …]` (plan `2026-09-03-served-corpus-provenance-at-spawn`). The runner
+always emits it, so it is line 3 on a spawn with a `live` credential and line 4
+when the credential line above is present. Header lines after line 2 are
+addressed by their `[key: ` prefix; a positional `sed -n '3p'` would read the
+credential line as this one, or this one as the credential line. It says which
+`.claude/` tree this session was served, how far that tree's checkout was
+behind its LOCAL upstream ref (`origin/main` on this fleet) as of that ref's last fetch, and whether the
+files on disk are the spawning build's own bundle — which is how a provisioner
+overwrite of tracked source is told apart from a peer's WIP without a git call
+of your own. Step 1b renders it; the token contract is in
+`knowledge-base/qontinui-specific/runner-development.md` → "The session
+briefing" → "Header lines after line 2". A runner built before that plan emits
+no such line: report `<none>`, and `<n/a>` when the whole variable is unset.
+
 Three things this card exists to stop you concluding:
 
 1. **A `:9876` probe is not an identity test.** It answers "is the runner API up
@@ -105,7 +123,7 @@ Three things this card exists to stop you concluding:
 - **`QONTINUI_RUNNER_ID` names WHICH runner, not WHETHER you are inside one.**
   It is live and stable in a real session (`primary` on this box), but the
   supervisor sets it on the runner process
-  (`qontinui-supervisor/src/process/env_forwarders.rs:810`) and the session
+  (`qontinui-supervisor/src/process/env_forwarders.rs:1058`) and the session
   inherits it — so it carries no attributable build marker and answers a
   different question. Step 1 prints it as context, and it is never the
   predicate. (An earlier note here claimed unit tests could poison it with
@@ -247,6 +265,178 @@ printf 'cwd           : %s\n' "$PWD"
 An unset `QONTINUI_AGENT_TIER` or `QONTINUI_AGENT_WORKTREE_MODE` is normal on an
 interactive pane; report it as `<unset>`, not as a tier of zero.
 
+## Step 1b — SERVED CORPUS (fixed at spawn)
+
+Which `.claude/` this session was served, measured by the SPAWNER before the
+first turn. It is identity, not reachability: it describes the tree as it stood
+at spawn and is not re-measured here — a checkout pulled since then still reads
+as it was, and that is the point, because the bodies already expanded into this
+session are the ones that tree held.
+
+Tokens, in the runner's order (full contract in `runner-development.md` →
+"Header lines after line 2"):
+
+| Token | Says |
+|---|---|
+| `served-corpus` | canonical path of `<workdir>/.claude` (symlinks resolved) |
+| `checkout` | the git checkout holding it: branch@sha, `upstream=` (the LOCAL remote-tracking ref measured against), `behind`/`ahead` of it, `as-of` (the newer of that ref's last `FETCH_HEAD` and its newest reflog entry), and `dirty-claude` (tracked entries only); `none (not a git work tree)` is a stated non-checkout |
+| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and `UNKNOWN(<code>)` — no space, a lowercase-hyphen code — when the count could not be measured, never 0. Codes on both counts (always identical): `no-served-corpus` (no `.claude/`; see `served-corpus`), `checkout-unknown` (git could not locate the checkout; see `checkout`), `outside-work-tree` (the corpus path resolves outside the toplevel git reported). `dirty-bundle` only: `status-unknown` (the checkout's git status was unreadable; see `dirty-claude` in `checkout`). `stamped-tracked` only: `ls-files-failed`, `deadline` (probe budget already spent; git not run), `timed-out` (this `ls-files` run was killed at the budget), `git-unavailable` (git could not be spawned), `output-incomplete` (git exited but its output could not be read in full). A bare `UNKNOWN` is an intermediate build that rendered no reason. Every OTHER token keeps `UNKNOWN (<reason>)` with a space |
+| `bundle` → `served:` | The stamped files split by the rung their stamp names, and how many of them still match their SOURCE. `canonical@<sha12> <c>` files are verified only against the canonical snapshot the runner has loaded (`canonical@unloaded <c>`, with no `fetched`, when none is loaded); `builtin <b>` files against this build's bundle; `account <a>` (`served`/`disk_cache`) are never compared; `unstamped <u>` carry no key. `identical-to-source <i>/<v>` is how many of the `<v>` verifiable files match that source, and `unverifiable=<x>` counts files stamped by a different snapshot or build, which this spawn cannot check. A reader cuts the value at `identical-to-build`, ` stamped=` and ` served: `, never by position |
+| `provisioned` | `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>`: each provisioner's latest pass for this workdir, units written of units expected and one `skipped-<reason>=<n>` per reason (`git-tracked`, `write-failed`, `unresolved`, `rejected`, `repo-authored`); `UNKNOWN (no provision recorded for this workdir)` when the runner's ledger holds no pass |
+| `cwd` | the same checkout probe on the workdir itself, or `same checkout` |
+
+The line is found by KEY in the header run after line 2, never by position (see
+the SERVED-CORPUS paragraph above). Each token is cut at its own first `]`, the
+same rule as the line-2 parser in Step 1 — a value such as
+`UNKNOWN (git timed out after 5s)` carries a space and parentheses but never a
+`]`. Every value is printed verbatim, so an `UNKNOWN (<reason>)` token prints
+its reason; it is never replaced with a default.
+
+```bash
+# Re-derived, not inherited - shell state does not survive between blocks.
+CTX="$(printenv QONTINUI_RUNNER_CONTEXT 2>/dev/null)"
+SERVED=""
+if [ -n "$CTX" ]; then
+  # BY KEY, NEVER BY POSITION. The line is 3 on a spawn whose coord credential
+  # is `live` and 4 when the conditional `[coord-credential: ` line precedes it,
+  # so `sed -n '3p'` is wrong on one of the two shapes. The briefing body opens
+  # with prose, so lines 3-4 bound the header run this line can occupy.
+  SERVED="$(printf '%s\n' "$CTX" | sed -n '3,4p' | grep -m1 '^\[served-corpus: ')"
+fi
+
+echo '=== SERVED CORPUS (fixed at spawn) ==='
+CHECKOUT=""; BUNDLE=""; CWD_TOK=""
+if [ -z "$CTX" ]; then
+  printf 'served corpus : %s\n' '<n/a - no runner context>'
+elif [ -z "$SERVED" ]; then
+  printf 'served corpus : %s\n' '<none - runner predates served-corpus provenance>'
+else
+  # One row per `[key: value]` token, each cut at ITS OWN first `]`. Parsing to
+  # the end of the line would swallow every later token into the first row.
+  REST="$SERVED"
+  while :; do
+    case "$REST" in *"["*"]"*) ;; *) break ;; esac
+    TOK="${REST#*\[}"
+    REST="${TOK#*\]}"
+    TOK="${TOK%%\]*}"
+    KEY="${TOK%%: *}"; VAL="${TOK#*: }"
+    [ "$KEY" = "$TOK" ] && VAL="<unparsed token>"
+    printf '%-13s : %s\n' "$KEY" "$VAL"
+    case "$KEY" in
+      checkout) CHECKOUT="$VAL" ;;
+      bundle)   BUNDLE="$VAL" ;;
+      cwd)      CWD_TOK="$VAL" ;;
+    esac
+  done
+fi
+
+# NAMED inputs, not positionals: a dollar-digit inside an injected body is a
+# harness argument placeholder (lint check #18). The helper reads FIELD_SRC /
+# FIELD_NAME and writes FIELD_RAW - the value after ` <name>=` verbatim, an
+# `UNKNOWN (<why>)` kept whole - and FIELD_OUT, that value when it is a plain
+# count and empty otherwise. `${VAR#pattern}` returns the string UNCHANGED on no
+# match, which is why presence is tested first and every count shape-guarded.
+field() {
+  FIELD_RAW=""; FIELD_OUT=""
+  case " $FIELD_SRC" in
+    *" $FIELD_NAME="*)
+      FIELD_RAW=" $FIELD_SRC"; FIELD_RAW="${FIELD_RAW#*" $FIELD_NAME="}"
+      case "$FIELD_RAW" in
+        "UNKNOWN ("*) FIELD_RAW="${FIELD_RAW%%)*})" ;;
+        *) FIELD_RAW="${FIELD_RAW%% *}" ;;
+      esac ;;
+  esac
+  case "$FIELD_RAW" in ''|*[!0-9]*) ;; *) FIELD_OUT="$FIELD_RAW" ;; esac
+}
+# Why a `stamped-tracked` / `dirty-bundle` value is not a count. Both read `n/a`
+# outside a git work tree and `UNKNOWN(<code>)` (no space, so `field` keeps it
+# whole) when the count could not be measured - never 0 - and are absent on a
+# build predating them. Only the codes that NAME another token point at one; a
+# code this reader does not know is printed verbatim, and a bare `UNKNOWN` is an
+# intermediate build that rendered no reason.
+why_not_counted() {
+  case "$FIELD_RAW" in
+    '')     WHY="the bundle token carries no $FIELD_NAME field - the spawning build predates it" ;;
+    n/a)    WHY="$FIELD_NAME=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" ;;
+    UNKNOWN)
+      WHY="$FIELD_NAME=UNKNOWN - the spawning build rendered no reason for it" ;;
+    "UNKNOWN("*")")
+      CODE="${FIELD_RAW#UNKNOWN(}"; CODE="${CODE%)}"
+      case "$CODE" in
+        no-served-corpus)  WHY="there is no served .claude/ - see the served-corpus row above" ;;
+        checkout-unknown)  WHY="git could not locate the checkout - see the checkout row above" ;;
+        outside-work-tree) WHY="the served .claude resolves outside the toplevel git reported" ;;
+        status-unknown)    WHY="the checkout's git status was unreadable - see dirty-claude in the checkout row above" ;;
+        ls-files-failed)   WHY="git ls-files exited non-zero" ;;
+        deadline)          WHY="the git probe budget was already spent; git ls-files was not run" ;;
+        timed-out)         WHY="this git ls-files run was killed at the probe budget" ;;
+        git-unavailable)   WHY="git could not be spawned" ;;
+        output-incomplete) WHY="git exited but its output could not be read in full" ;;
+        *)                 WHY="reason code '$CODE' is not one this reader knows" ;;
+      esac
+      WHY="$FIELD_NAME=$FIELD_RAW - $WHY" ;;
+    *)      WHY="$FIELD_NAME=$FIELD_RAW - not a count, n/a or UNKNOWN; this reader does not know the value" ;;
+  esac
+}
+
+FIELD_SRC="$CHECKOUT"; FIELD_NAME=dirty-claude; field; DIRTY_CLAUDE="$FIELD_OUT"
+
+B_N=""; B_M=""; B_SHA=""
+case "$BUNDLE" in
+  [0-9]*/[0-9]*" identical-to-build "*)
+    B_N="${BUNDLE%%/*}"
+    B_M="${BUNDLE#*/}"; B_M="${B_M%% *}"
+    case "$B_N$B_M" in *[!0-9]*) B_N=""; B_M="" ;; esac
+    B_SHA="${BUNDLE#* identical-to-build }"; B_SHA="${B_SHA%% *}"
+    ;;
+esac
+
+# The two overwrite verdicts need a MEASURED bundle token; an UNKNOWN one has
+# already printed its reason in the row above and supports no verdict at all.
+if [ -n "$B_M" ]; then
+  FIELD_SRC="$BUNDLE"; FIELD_NAME=stamped; field; STAMPED="$FIELD_OUT"
+  # 1. A stamp is written at PROVISION time and canonical sources never carry
+  #    one, so a stamped file that git TRACKS is a clobber proven by the file
+  #    itself. `stamped-tracked` is exactly that count; nothing else is joined.
+  FIELD_NAME=stamped-tracked; field
+  if [ -z "$FIELD_OUT" ]; then
+    why_not_counted; echo "stamp verdict: none - $WHY"
+  elif [ "$FIELD_OUT" -gt 0 ]; then
+    echo "PROVISIONER OVERWRITE PROVEN BY STAMP - $FIELD_OUT tracked file(s) carry a provisioner stamp: written by the runner, not edited by a peer"
+  elif [ -n "$STAMPED" ] && [ "$STAMPED" -gt 0 ]; then
+    echo "stamped=$STAMPED, stamped-tracked=0 - the stamped files are untracked provisions (normal), not a clobber of source"
+  fi
+  # 2. `dirty-bundle` counts bundle-roster paths with TRACKED changes. When
+  #    every bundled file is byte-identical to this build's copy, those changes
+  #    ARE the bundle. Dirt outside the roster is not provisioner output at all.
+  FIELD_SRC="$BUNDLE"; FIELD_NAME=dirty-bundle; field
+  if [ -z "$FIELD_OUT" ]; then
+    why_not_counted; echo "overwrite verdict: none - $WHY"
+  elif [ "$FIELD_OUT" -gt 0 ] && [ "$B_N" = "$B_M" ]; then
+    echo "PROVISIONER OVERWRITE SIGNATURE - the $FIELD_OUT dirty bundled file(s) are byte-identical to build $B_SHA's bundle - a provisioner write, not peer WIP"
+  elif [ "$FIELD_OUT" -eq 0 ] && [ -n "$DIRTY_CLAUDE" ] && [ "$DIRTY_CLAUDE" -gt 0 ]; then
+    echo "dirty-claude=$DIRTY_CLAUDE, dirty-bundle=0 - the tracked changes under .claude are OUTSIDE the bundle (a settings render, peer WIP, ...), not provisioner output"
+  fi
+fi
+# 3. `behind` is counted against the LOCAL remote-tracking ref the token names
+#    as `upstream=`, which the spawn path never fetches. Print that ref's age
+#    beside the count, so a stale ref is never read as current drift (it may be
+#    further behind now, or not at all).
+for PAIR in "checkout|$CHECKOUT" "cwd|$CWD_TOK"; do
+  WHICH="${PAIR%%|*}"; T="${PAIR#*|}"
+  FIELD_SRC="$T"; FIELD_NAME=behind; field; BEHIND="$FIELD_OUT"
+  if [ -n "$BEHIND" ] && [ "$BEHIND" -gt 0 ]; then
+    FIELD_NAME=upstream; field; UPSTREAM="${FIELD_RAW:-its upstream}"
+    FIELD_NAME=as-of; field; ASOF="${FIELD_RAW:-<no as-of>}"
+    echo "$WHICH is $BEHIND commit(s) behind $UPSTREAM AS OF $ASOF - the local ref's age, not a live count"
+  fi
+done
+```
+
+A `bundle` of `<M` on a FRESH checkout is expected, not an alarm: the canonical
+side is claude-config, so a checkout ahead of the spawning build differs from
+its bundle. Read `bundle` beside `checkout`'s `behind`/`ahead`, never alone.
+
 ## Step 2 — REACHABILITY (now)
 
 **Every block in this file re-derives what it needs.** Each fenced block is a
@@ -280,8 +470,16 @@ PROBE_URL="http://127.0.0.1:$RPORT/health"; probe
 printf 'runner  :%s  %s\n' "$RPORT" "$PROBE_VERDICT"
 RUNNER_VERDICT="$PROBE_VERDICT"
 
-PROBE_URL="http://127.0.0.1:9875/health"; probe
-printf 'supervisor :9875  %s\n' "$PROBE_VERDICT"
+# The dev-only supervisor. The product has none, so this row is CONDITIONAL:
+# probe it only when QONTINUI_RUNNER_ID is set, which the supervisor stamps on
+# every runner it spawns. Unset (outside any runner, or under one no supervisor
+# spawned) - print n/a, never DOWN, since nothing was expected to listen.
+if [ -n "$(printenv QONTINUI_RUNNER_ID 2>/dev/null)" ]; then
+  PROBE_URL="http://127.0.0.1:9875/health"; probe
+  printf 'supervisor (dev)  %s\n' "$PROBE_VERDICT"
+else
+  printf 'supervisor (dev)  n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)\n'
+fi
 ```
 
 ## Step 3 — which `.mcp.json` holds a LIVE coord proxy
@@ -295,14 +493,24 @@ that must not be conflated: its nonce was evicted (the instance is up and says
 Probe each candidate against **its own url** with **its own nonce**.
 
 ```bash
-# Workspace root: $QONTINUI_ROOT wins; else the parent of the MAIN checkout via
-# --git-common-dir (NOT --show-toplevel, which inside a linked worktree names the
-# worktree container and makes this sweep probe nothing); else $PWD.
-ROOT="${QONTINUI_ROOT:-}"
+# Your workspace root: $WORKSPACE_ROOT wins ($QONTINUI_ROOT is accepted too);
+# else the first directory, from the MAIN checkout upward, that holds sibling
+# repo checkouts - a child whose `.git` is a DIRECTORY (a linked worktree's
+# `.git` is a file). The main checkout comes from --git-common-dir, NOT
+# --show-toplevel, which inside a linked worktree names the worktree container
+# and makes this sweep probe nothing. Else the main checkout's parent; else $PWD.
+ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
 if [ -z "$ROOT" ]; then
   GC="$(git rev-parse --git-common-dir 2>/dev/null)"
   [ -n "$GC" ] && GC="$(cd "$GC" 2>/dev/null && pwd)"
-  [ -n "$GC" ] && ROOT="$(dirname "$(dirname "$GC")")"
+  if [ -n "$GC" ]; then
+    MAIN="$(dirname "$GC")"; D="$MAIN"
+    while [ -n "$D" ] && [ "$D" != "/" ] && [ "$D" != "." ]; do
+      for c in "$D"/*/.git; do [ -d "$c" ] && { ROOT="$D"; break 2; }; done
+      D="$(dirname "$D")"
+    done
+    [ -z "$ROOT" ] && ROOT="$(dirname "$MAIN")"
+  fi
 fi
 [ -z "$ROOT" ] || [ "$ROOT" = "." ] && ROOT="$PWD"
 
@@ -337,7 +545,7 @@ hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' 
 # python.exe cannot open an MSYS `/<drive>/...` path, and under an inherited
 # MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL the automatic argv conversion is OFF
 # (verified 2026-08-18: MSYS_NO_PATHCONV=1 -> FileNotFoundError on the MSYS
-# spelling of <workspace-root>/.../.mcp.json; the same call with `cygpath -w`
+# spelling of a `/<drive>/.../.mcp.json` path; the same call with `cygpath -w`
 # returned the url).
 # `2>/dev/null` then swallows the traceback, the url comes back empty, and the
 # candidate is silently skipped - a fabricated negative. So convert, exactly as
@@ -682,15 +890,9 @@ by a runner build carrying qontinui-runner PR #1558):
 | **row** | the tenant the spawn picker / `--tenant` stamped on the session | `tenancy.row.tenantId` |
 | **data plane** | the tenant the runner's own work-scoped coord writes present | `tenancy.dataPlane` |
 | **credential** | the tenant this session's coord-mcp key actually selects — where its memory, prompt-document and gate writes land | `tenancy.credential` |
-| **repo expected** | the tenant the repo in this session's spawn directory belongs to, and the latest verdict of comparing each coord answer's stamped tenant with it (plan `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant` Phase 2) | `tenancy.repoExpected` |
 
 A session labelled B whose credential resolves to A writes to A and gets a
-`201` for it; this card is where that is visible. The fourth leg catches the
-case the first three cannot: all three agree on A while the repo you are
-standing in is tenant B's — `repo expected` names B, and its `verdict` is
-`mismatch` once a coord answer stamped A has come back (the proxy also appends
-`TENANT MISMATCH` to that answer). A build without the leg serves no
-`repoExpected` key: print it as UNKNOWN (absent field), never as agreement. Read it from the runner's own
+`201` for it; this card is where that is visible. Read it from the runner's own
 census, `GET /control/sessions/info`, for the entry whose `identity.terminalId`
 is `$QONTINUI_TERMINAL_ID`, and print what it says **verbatim**, reasons
 included — never pick one tenant as "the" tenant.
@@ -746,8 +948,6 @@ if command -v jq >/dev/null 2>&1; then
         "data plane     \(v($t.dataPlane.status))  tenant \(v($t.dataPlane.tenantId))  reason \(v($t.dataPlane.reason))",
         "credential     \(v($t.credential.status))  tenant \(v($t.credential.tenantId))  slot \(v($t.credential.slot))  reason \(v($t.credential.reason))",
         "slot posture   \(v($t.credential.posture.status))  value \(v($t.credential.posture.value))  canAnswer \(v($t.credential.posture.canAnswer))  reason \(v($t.credential.posture.reason))",
-        (if ($t.repoExpected | type) != "object" then "repo expected  UNKNOWN - no repoExpected leg (runner build predates it; absent field, NOT agreement)"
-         else $t.repoExpected as $r | "repo expected  \(v($r.status))  tenant \(v($r.tenantId)) slug \(v($r.tenantSlug))  repo \(v($r.repo))  source \(v($r.source))  observed \(v($r.observedAt))  reason \(v($r.reason))  named \(v($r.callerNamedTenantId)) [\(v($r.callerNamedSource))]  verdict \(v($r.verdict)) \(v($r.verdictDetail)) at \(v($r.verdictAt))" end),
         (if ($t | has("divergence")) then "divergence     \($t.divergence)"
          else "divergence     unknown (runner predates the divergence field; its diverged=\(v($t.diverged)) cannot say \"could not compare\")" end)
       end
@@ -772,19 +972,12 @@ print("row            tenant %s  spawn-default %s [%s %s]  current-default %s (c
 print("data plane     %s  tenant %s  reason %s" % (v(g(dp,"status")),v(g(dp,"tenantId")),v(g(dp,"reason"))))
 print("credential     %s  tenant %s  slot %s  reason %s" % (v(g(cr,"status")),v(g(cr,"tenantId")),v(g(cr,"slot")),v(g(cr,"reason"))))
 print("slot posture   %s  value %s  canAnswer %s  reason %s" % (v(g(po,"status")),v(g(po,"value")),v(g(po,"canAnswer")),v(g(po,"reason"))))
-re_=t.get("repoExpected")
-print("repo expected  UNKNOWN - no repoExpected leg (runner build predates it; absent field, NOT agreement)" if not isinstance(re_,dict) else "repo expected  %s  tenant %s slug %s  repo %s  source %s  observed %s  reason %s  named %s [%s]  verdict %s %s at %s" % tuple(v(g(re_,k)) for k in ("status","tenantId","tenantSlug","repo","source","observedAt","reason","callerNamedTenantId","callerNamedSource","verdict","verdictDetail","verdictAt")))
 print("divergence     %s" % (t["divergence"] if "divergence" in t else "unknown (runner predates the divergence field; its diverged=%s cannot say \"could not compare\")" % v(t.get("diverged"))))' "$BODYP"  # envelope-ok: the same predicate search as the jq arm
 fi
 ```
 
 Read the rows, do not summarise them away: a `credential` tenant that differs
-from the `row` tenant is the wrong-tenant-write condition itself, a
-`repo expected` verdict of `mismatch` is the wrong-tenant-READ condition (coord
-answered from a tenant other than the repo's — or other than the one the
-session was explicitly named for, shown as `named`), and `expected_unknown` /
-`answer_unstamped` mean the comparison could not be made, not that it passed;
-the leg describes the SPAWN directory, not wherever the session has `cd`'d since, and
+from the `row` tenant is the wrong-tenant-write condition itself, and
 `current-default` is context only (so is Step 4's `default tenant` row: the
 runner's `activeTenantPin`, what a `--tenant`-less `/findings-steward` cycle
 runs against, never this session's tenant) — after an operator switches the device
@@ -795,7 +988,8 @@ anywhere names its reason; carry the reason into the one-sentence summary.
 
 msys `bash` has been observed hanging on this box where PowerShell works — switch
 rather than retrying. This one block carries the **whole** card: Step 1's IDENTITY
-rows, Step 2's port probes and Step 4's build cross-check.
+rows, Step 1b's SERVED CORPUS rows and cross-checks, Step 2's port probes and
+Step 4's build cross-check.
 
 **What it does NOT carry is Step 3's proxy sweep, nor Step 5's tenancy read** — that sweep needs a JSON
 reader, a private header file and a per-candidate POST, and there is no
@@ -812,7 +1006,7 @@ $names = 'QONTINUI_RUNNER_CONTEXT','QONTINUI_RUNNER_ID','QONTINUI_RUNNER_API_POR
          'QONTINUI_TERMINAL_ID','QONTINUI_AGENT_TIER','QONTINUI_AGENT_WORKTREE_MODE','QONTINUI_PLANS_DIR'
 $vals = @{}
 foreach ($n in $names) { $vals[$n] = [Environment]::GetEnvironmentVariable($n) }
-$spawnVer = ''; $spawnSha = ''; $briefing = ''; $clause = ''
+$spawnVer = ''; $spawnSha = ''; $briefing = ''; $clause = ''; $served = ''
 if ($vals['QONTINUI_RUNNER_CONTEXT']) {
   $ctxLines = $vals['QONTINUI_RUNNER_CONTEXT'] -split "`n"
   $marker = $ctxLines[0]
@@ -839,6 +1033,13 @@ if ($vals['QONTINUI_RUNNER_CONTEXT']) {
   if ($ctxLines.Count -ge 2) {
     if ($ctxLines[1] -cmatch '\[briefing: ([^\]]*)\]') { $briefing = $Matches[1] }
     if ($ctxLines[1] -cmatch '\[clause: ([^\]]*)\]')   { $clause   = $Matches[1] }
+  }
+  # SERVED CORPUS, by KEY in lines 3-4 and never by position - Step 1b's
+  # `sed -n '3,4p' | grep -m1 '^\[served-corpus: '`. `StartsWith(…, Ordinal)`,
+  # not `-clike`: `[` opens a wildcard character class in a -like pattern.
+  foreach ($l in @($ctxLines | Select-Object -Skip 2 -First 2)) {
+    $l = $l.TrimEnd("`r")
+    if ($l.StartsWith('[served-corpus: ', [StringComparison]::Ordinal)) { $served = $l; break }
   }
 }
 # Same three states as Step 1, and for the same reason: `<none>` asserts
@@ -868,6 +1069,93 @@ else                                       { $clauseRow = '<n/a - runner predate
 "cwd           : $($PWD.Path)"
 
 ''
+'=== SERVED CORPUS (fixed at spawn) ==='
+$checkoutTok = ''; $bundleTok = ''; $cwdTok = ''
+if (-not $vals['QONTINUI_RUNNER_CONTEXT']) { 'served corpus : <n/a - no runner context>' }
+elseif (-not $served)                      { 'served corpus : <none - runner predates served-corpus provenance>' }
+else {
+  # One row per token, each cut at ITS OWN first `]` - the bash loop in Step 1b.
+  foreach ($m in [regex]::Matches($served, '\[([^\]]*)\]')) {
+    $tok = $m.Groups[1].Value
+    $i = $tok.IndexOf(': ', [StringComparison]::Ordinal)
+    if ($i -lt 0) { $key = $tok; $val = '<unparsed token>' }
+    else          { $key = $tok.Substring(0, $i); $val = $tok.Substring($i + 2) }
+    '{0,-13} : {1}' -f $key, $val
+    if ($key -ceq 'checkout') { $checkoutTok = $val }
+    elseif ($key -ceq 'bundle') { $bundleTok = $val }
+    elseif ($key -ceq 'cwd') { $cwdTok = $val }
+  }
+}
+# The three cross-checks of Step 1b, with the same predicates. Get-ServedRaw is
+# the bash `field` helper: the value after ` <name>=` verbatim, an
+# `UNKNOWN (<why>)` kept whole, or '' when the field is absent.
+function Get-ServedRaw([string]$t, [string]$name) {
+  if (" $t" -cmatch (' ' + [regex]::Escape($name) + '=(UNKNOWN \([^)]*\)|\S*)')) { $Matches[1] } else { '' }
+}
+function Get-ServedNum([string]$t, [string]$name) {
+  $raw = Get-ServedRaw $t $name
+  if ($raw -cmatch '^[0-9]+$') { [int]$raw } else { $null }
+}
+# The bash `why_not_counted`, code for code: `UNKNOWN(<code>)` carries its
+# reason; only the codes that NAME another token point at one; an unknown code
+# is printed verbatim; a bare `UNKNOWN` is a build that rendered no reason.
+$notCountedCodes = @{
+  'no-served-corpus'  = 'there is no served .claude/ - see the served-corpus row above'
+  'checkout-unknown'  = 'git could not locate the checkout - see the checkout row above'
+  'outside-work-tree' = 'the served .claude resolves outside the toplevel git reported'
+  'status-unknown'    = "the checkout's git status was unreadable - see dirty-claude in the checkout row above"
+  'ls-files-failed'   = 'git ls-files exited non-zero'
+  'deadline'          = 'the git probe budget was already spent; git ls-files was not run'
+  'timed-out'         = 'this git ls-files run was killed at the probe budget'
+  'git-unavailable'   = 'git could not be spawned'
+  'output-incomplete' = 'git exited but its output could not be read in full'
+}
+function Get-NotCountedWhy([string]$name, [string]$raw) {
+  if (-not $raw)         { "the bundle token carries no $name field - the spawning build predates it" }
+  elseif ($raw -ceq 'n/a') { "$name=n/a - the served .claude is not in a git work tree, so nothing in it is tracked source" }
+  elseif ($raw -ceq 'UNKNOWN') { "$name=UNKNOWN - the spawning build rendered no reason for it" }
+  elseif ($raw -cmatch '^UNKNOWN\((.*)\)$') {
+    $code = $Matches[1]
+    # A PowerShell hashtable matches keys case-INSENSITIVELY; the bash `case`
+    # does not, so the key is found with -ceq to keep the twins identical.
+    $hit = @($notCountedCodes.Keys | Where-Object { $_ -ceq $code })
+    if ($hit.Count -eq 1) { $what = $notCountedCodes[$hit[0]] }
+    else { $what = "reason code '$code' is not one this reader knows" }
+    "$name=$raw - $what"
+  }
+  else                   { "$name=$raw - not a count, n/a or UNKNOWN; this reader does not know the value" }
+}
+$dirtyClaude = Get-ServedNum $checkoutTok 'dirty-claude'
+if ($bundleTok -cmatch '^([0-9]+)/([0-9]+) identical-to-build (\S+)') {
+  $bN = $Matches[1]; $bM = $Matches[2]; $bSha = $Matches[3]
+  $stamped = Get-ServedNum $bundleTok 'stamped'
+  $stampedTracked = Get-ServedNum $bundleTok 'stamped-tracked'
+  if ($null -eq $stampedTracked) {
+    "stamp verdict: none - $(Get-NotCountedWhy 'stamped-tracked' (Get-ServedRaw $bundleTok 'stamped-tracked'))"
+  } elseif ($stampedTracked -gt 0) {
+    "PROVISIONER OVERWRITE PROVEN BY STAMP - $stampedTracked tracked file(s) carry a provisioner stamp: written by the runner, not edited by a peer"
+  } elseif ($null -ne $stamped -and $stamped -gt 0) {
+    "stamped=$stamped, stamped-tracked=0 - the stamped files are untracked provisions (normal), not a clobber of source"
+  }
+  $dirtyBundle = Get-ServedNum $bundleTok 'dirty-bundle'
+  if ($null -eq $dirtyBundle) {
+    "overwrite verdict: none - $(Get-NotCountedWhy 'dirty-bundle' (Get-ServedRaw $bundleTok 'dirty-bundle'))"
+  } elseif ($dirtyBundle -gt 0 -and $bN -ceq $bM) {
+    "PROVISIONER OVERWRITE SIGNATURE - the $dirtyBundle dirty bundled file(s) are byte-identical to build $bSha's bundle - a provisioner write, not peer WIP"
+  } elseif ($dirtyBundle -eq 0 -and $null -ne $dirtyClaude -and $dirtyClaude -gt 0) {
+    "dirty-claude=$dirtyClaude, dirty-bundle=0 - the tracked changes under .claude are OUTSIDE the bundle (a settings render, peer WIP, ...), not provisioner output"
+  }
+}
+foreach ($pair in @(@('checkout', $checkoutTok), @('cwd', $cwdTok))) {
+  $behind = Get-ServedNum $pair[1] 'behind'
+  if ($null -ne $behind -and $behind -gt 0) {
+    $upstream = Get-ServedRaw $pair[1] 'upstream'; if (-not $upstream) { $upstream = 'its upstream' }
+    $asOf = Get-ServedRaw $pair[1] 'as-of'; if (-not $asOf) { $asOf = '<no as-of>' }
+    "$($pair[0]) is $behind commit(s) behind $upstream AS OF $asOf - the local ref's age, not a live count"
+  }
+}
+
+''
 "=== REACHABILITY (now, $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) ==="
 $port = $vals['QONTINUI_RUNNER_API_PORT']; if (-not $port) { $port = '9876' }
 # Carry the ROLE alongside the port so the body capture below is tied to the
@@ -876,9 +1164,14 @@ $port = $vals['QONTINUI_RUNNER_API_PORT']; if (-not $port) { $port = '9876' }
 # one endpoint - the tag cannot fix that, and the card should be read with the
 # announced port in mind.)
 $runnerBody = ''
-foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor'; Port = '9875' })) {
+# The dev-only supervisor row is CONDITIONAL, as in the bash twin: probed only
+# when QONTINUI_RUNNER_ID shows a supervisor spawned this runner.
+$probes = @(@{ Role = 'runner'; Port = $port })
+if ($vals['QONTINUI_RUNNER_ID']) { $probes += @{ Role = 'supervisor'; Port = '9875' } }
+foreach ($probe in $probes) {
   $p = $probe.Port
-  $row = '{0,-10} :{1}' -f $probe.Role, $p
+  # Row labels match the bash twin exactly: `runner  :<port>`, `supervisor (dev)`.
+  $row = if ($probe.Role -eq 'runner') { "runner  :$p" } else { 'supervisor (dev)' }
   try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$p/health" -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
     if ($probe.Role -eq 'runner') { $runnerBody = $r.Content }
@@ -899,6 +1192,7 @@ foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor';
     else { "$row  UNKNOWN ($st - not evidence of absence)" }
   }
 }
+if (-not $vals['QONTINUI_RUNNER_ID']) { 'supervisor (dev)  n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)' }
 'live coord proxy   not swept (Step 3 has no PowerShell twin - not a verdict)'
 'tenancy            not read (Step 5 has no PowerShell twin - UNKNOWN, not agreement)'
 
@@ -978,13 +1272,13 @@ Two limitations of this block, stated rather than left to be inferred:
   out of a `503` and returns a real verdict — run Step 4 if you need one from a
   wedged-but-answering runner.
 - **`cwd` is spelled differently by the two renders** — msys bash gives the
-  POSIX spelling (`/<drive>/<workspace-root>/…`), PowerShell the native one
-  (`<Drive>:\<workspace-root>\…`). Same directory; not a disagreement.
+  POSIX spelling (`/<drive>/<dir>/…`), PowerShell the native one
+  (`<Drive>:\<dir>\…`). Same directory; not a disagreement.
 
 ## Output shape
 
-Print the two labelled blocks, in this order, with the fixed half first, then
-the TENANCY block from Step 5:
+Print the labelled blocks in this order — the two fixed-at-spawn blocks first,
+then REACHABILITY, then the TENANCY block from Step 5:
 
 ```
 === IDENTITY (fixed for this session) ===
@@ -999,9 +1293,20 @@ worktree mode : <mode or <unset>>
 plans dir     : <path or <unset>>
 cwd           : <path>
 
+=== SERVED CORPUS (fixed at spawn) ===
+served-corpus : <canonical .claude path> | UNKNOWN (<reason>)
+checkout      : <repo> <branch>@<sha12> upstream=<ref> behind=<n> ahead=<m> as-of=<ts> dirty-claude=<k> | none (not a git work tree) | UNKNOWN (<reason>)
+bundle        : <N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t|n/a|UNKNOWN(<code>)> dirty-bundle=<d|n/a|UNKNOWN(<code>)> served: canonical@<sha12|unloaded> <c>[ fetched <ts>], builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x> | UNKNOWN (<reason>)
+provisioned   : commands written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts>; skills written=<w>/<e> [skipped-<reason>=<n> ...] as-of=<ts> | UNKNOWN (no provision recorded for this workdir)
+cwd           : <repo> <branch>@<sha12> behind=<n> as-of=<ts> dirty=<m> | same checkout | UNKNOWN (<reason>)
+[PROVISIONER OVERWRITE PROVEN BY STAMP - ... | stamped=<k>, stamped-tracked=0 - ... | stamp verdict: none - <why>]
+[PROVISIONER OVERWRITE SIGNATURE - ... | dirty-claude=<k>, dirty-bundle=0 - ... | overwrite verdict: none - <why>]
+[<which> is <n> commit(s) behind <upstream> AS OF <ts> - ...]
+(or the single row `served corpus : <none - runner predates served-corpus provenance> | <n/a - no runner context>`)
+
 === REACHABILITY (now, <timestamp>) ===
 runner  :9876       up (HTTP 200)
-supervisor :9875    DOWN (connection refused)
+supervisor (dev)    DOWN (connection refused) | n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)
 live coord proxy    <path/to/.mcp.json>  (nonce#<fp>) | not swept
 build cross-check   AGREE | DISAGREE | UNKNOWN
 default tenant      pinned <uuid> | unpinned (...) | unresolvable - <why> | UNKNOWN - <why>
