@@ -58,9 +58,14 @@ pub(crate) fn is_reportable_distro(name: &str) -> bool {
 ///
 /// And when a runner is ACTIVE inside any guest of a VM, that runner owns the
 /// VM-wide remainder (it has full cgroup attribution, which this probe does
-/// not): the host's probe then reports NO counter for that VM at all. Both
-/// sides use the shared VM-wide event id `oom_kill:[boot, "", total]`, so a
-/// race at the hand-over dedupes in coord for the same computer. PURE.
+/// not): the host's probe then reports NO counter for that VM at all.
+///
+/// Both sides key the remainder `oom_kill:[boot, "", total]`, but coord
+/// dedupes per COMPUTER, so that id merges a hand-over race ONLY when the
+/// host's owner guest for the VM is the very distro the in-guest runner
+/// reports for. With several distros the two reports land on different
+/// computers and a kill in the race window is counted on each — the
+/// remaining, accepted double count. PURE.
 ///
 /// The guests are first sorted by `identity_hash`, so the owner is STABLE
 /// across ticks regardless of `wsl --list` order — an owner that flipped
@@ -90,7 +95,7 @@ pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
 /// command line). `TZ=UTC` pins `StateChangeTimestamp` to a zone the parser
 /// trusts; `.runner` is read without `sudo` (a `0700` home simply yields no
 /// line and the unit-name fallback applies).
-pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; printf 'RUNNER_ACTIVE\t%s\n' "$( { systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null; systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null; } | awk 'NF' | wc -l)"; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); printf 'LIST_RC\t%s\n' "$?"; units=$(printf '%s\n' "$listing" | awk 'NF{print $1}'); printf 'SHOW_BEGIN\n'; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; fi; printf '\nSHOW_END\n'; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
+pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); printf 'LIST_RC\t%s\n' "$?"; units=$(printf '%s\n' "$listing" | awk 'NF{print $1}'); printf 'SHOW_BEGIN\n'; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; fi; printf '\nSHOW_END\n'; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
 
 /// Everything one guest probe produced. Holds the identity HASH, never the
 /// raw machine id — [`parse_guest_probe`] hashes it and drops it.
@@ -115,9 +120,20 @@ pub(crate) struct GuestProbe {
     /// (an empty list means "no runner units", not "could not ask") only when
     /// systemd is PID 1 AND this is `Some(0)`.
     pub(crate) list_rc: Option<i32>,
-    /// A `qontinui-runner*` unit (system, or the default user's) is active
-    /// inside this guest — that runner reports the VM's OOM remainder itself.
-    /// `None` when the probe printed no count.
+    /// A runner is REPORTING from inside this guest — that runner owns the
+    /// VM's OOM remainder. Decided in the guest by either signal:
+    /// * the in-guest reporter's state file
+    ///   (`$HOME/.qontinui/runner/computer-observer.json`, the runner's default
+    ///   state location for the guest's default user) was written within
+    ///   2 × the full-report cadence — it is rewritten every tick;
+    /// * a `qontinui-runner*` unit is active on the system bus or the default
+    ///   user's bus (`XDG_RUNTIME_DIR` defaulted to `/run/user/$(id -u)`).
+    ///
+    /// `Some(false)` only when the file is absent/stale AND both `systemctl`
+    /// queries answered; otherwise the guest prints nothing and this is
+    /// `None` — and the host then reports the remainder (loud over silent).
+    /// A runner whose state dir is moved by `QONTINUI_HOME` is visible only
+    /// through its unit.
     pub(crate) runner_active: Option<bool>,
     pub(crate) units: Vec<UnitProps>,
     pub(crate) runner_files: BTreeMap<String, String>,
@@ -337,6 +353,26 @@ PROBE_END\n";
             .contains_key("actions.runner.example-org-example-repo.wslbox.service"));
         // The raw id appears nowhere in the parsed value.
         assert!(!format!("{g:?}").contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn runner_liveness_is_three_valued_and_matches_the_reporter() {
+        // The script checks the state file the reporter actually writes, at
+        // 2 × the full cadence.
+        assert!(GUEST_SCRIPT.contains("/.qontinui/runner/computer-observer.json"));
+        let window = 2 * crate::fleet::computer::REPORT_FULL_SECS;
+        assert!(GUEST_SCRIPT.contains(&format!("-lt {window} ]")));
+        assert!(GUEST_SCRIPT.contains("XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\""));
+        // Undeterminable: the guest prints an empty value or no line → None.
+        let empty = GUEST_OUTPUT.replace("RUNNER_ACTIVE\t0\n", "RUNNER_ACTIVE\t\n");
+        assert_eq!(parse_guest_probe(&empty).unwrap().runner_active, None);
+        let absent = GUEST_OUTPUT.replace("RUNNER_ACTIVE\t0\n", "");
+        let g = parse_guest_probe(&absent).unwrap();
+        assert_eq!(g.runner_active, None);
+        // ... and None means the host KEEPS the counter (loud over silent).
+        let mut v = vec![g];
+        attribute_vm_oom_once(&mut v);
+        assert_eq!(v[0].oom_kill_total, Some(3));
     }
 
     #[test]

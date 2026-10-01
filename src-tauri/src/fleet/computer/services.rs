@@ -332,10 +332,38 @@ pub(crate) struct ServiceScan {
     /// `None` = no service information this tick (the instrument failed or
     /// does not exist) — coord leaves stored rows untouched.
     pub(crate) units: Option<Vec<WatchedUnit>>,
-    /// `true` only when EVERY source that should have answered did, so a
-    /// missing row is a unit that is really gone. A partial scan is sent as a
-    /// delta and deletes nothing.
-    pub(crate) complete: bool,
+    /// The service KINDS this scan saw completely (contract amendment A2):
+    /// for each kind listed, every source that can host that kind answered,
+    /// so a missing row of that kind is a unit that is really gone. Kinds not
+    /// listed are a delta for that kind and delete nothing.
+    pub(crate) complete_kinds: Vec<&'static str>,
+}
+
+/// How the session (user) bus fared this scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionBus {
+    /// Answered.
+    Ok,
+    /// There has never been a session bus in this process (a system-service
+    /// runner): there are no user units to lose.
+    AbsentByDesign,
+    /// It answered before, or exists and failed now.
+    Failed,
+}
+
+/// Which kinds a Linux host scan saw completely (amendment A2). GitHub runner
+/// services live on the SYSTEM bus; `qontinui-runner*` units can be system or
+/// user units, so that kind is complete only when the system bus answered AND
+/// the session bus answered or is absent by design. PURE.
+pub(crate) fn linux_complete_kinds(system_ok: bool, session: SessionBus) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    if system_ok {
+        kinds.push(KIND_GH_ACTIONS_RUNNER);
+        if session != SessionBus::Failed {
+            kinds.push(KIND_QONTINUI_RUNNER);
+        }
+    }
+    kinds
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +378,7 @@ pub(crate) mod linux {
     use tracing::debug;
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-    use super::{ServiceScan, UnitProps, WATCHED_PATTERNS};
+    use super::{linux_complete_kinds, ServiceScan, SessionBus, UnitProps, WATCHED_PATTERNS};
 
     const DEST: &str = "org.freedesktop.systemd1";
     const MGR_PATH: &str = "/org/freedesktop/systemd1";
@@ -388,7 +416,8 @@ pub(crate) mod linux {
     impl Watcher {
         pub(crate) async fn scan(&mut self) -> ServiceScan {
             let mut by_unit: BTreeMap<String, UnitProps> = BTreeMap::new();
-            let mut complete = true;
+            let mut system_ok = false;
+            let mut session = SessionBus::AbsentByDesign;
             let mut any_answered = false;
 
             // System bus: GitHub runner services and a system-level runner.
@@ -402,7 +431,7 @@ pub(crate) mod linux {
                 Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
                     Ok(Ok((units, whole))) => {
                         any_answered = true;
-                        complete &= whole;
+                        system_ok = whole;
                         for u in units {
                             by_unit.entry(u.unit.clone()).or_insert(u);
                         }
@@ -410,10 +439,9 @@ pub(crate) mod linux {
                     other => {
                         debug!("fleet::computer: system-bus scan failed: {other:?}");
                         self.system = None;
-                        complete = false;
                     }
                 },
-                None => complete = false,
+                None => {}
             }
 
             // Session bus: the runner's own user units.
@@ -427,8 +455,12 @@ pub(crate) mod linux {
                 Some(conn) => match tokio::time::timeout(BUS_TIMEOUT, scan_bus(conn)).await {
                     Ok(Ok((units, whole))) => {
                         any_answered = true;
-                        complete &= whole;
                         self.session_ever = true;
+                        session = if whole {
+                            SessionBus::Ok
+                        } else {
+                            SessionBus::Failed
+                        };
                         for u in units {
                             by_unit.entry(u.unit.clone()).or_insert(u);
                         }
@@ -436,21 +468,18 @@ pub(crate) mod linux {
                     other => {
                         debug!("fleet::computer: session-bus scan failed: {other:?}");
                         self.session = None;
-                        complete = false;
+                        session = SessionBus::Failed;
                     }
                 },
                 None => {
                     if self.session_ever {
-                        complete = false;
+                        session = SessionBus::Failed;
                     }
                 }
             }
 
             if !any_answered {
-                return ServiceScan {
-                    units: None,
-                    complete: false,
-                };
+                return ServiceScan::default();
             }
             let units = by_unit
                 .values()
@@ -458,7 +487,7 @@ pub(crate) mod linux {
                 .collect();
             ServiceScan {
                 units: Some(units),
-                complete,
+                complete_kinds: linux_complete_kinds(system_ok, session),
             }
         }
     }
@@ -798,7 +827,7 @@ pub(crate) mod windows {
 
     use super::{
         parse_sc_qc_binary_path, parse_sc_query, props_from_sc, read_runner_file, row_from_props,
-        sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit,
+        sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit, KIND_GH_ACTIONS_RUNNER,
     };
 
     const SC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -833,10 +862,7 @@ pub(crate) mod windows {
         ])
         .await
         else {
-            return ServiceScan {
-                units: None,
-                complete: false,
-            };
+            return ServiceScan::default();
         };
         let complete = sc_listing_complete(code, &listing);
         if !complete {
@@ -868,7 +894,11 @@ pub(crate) mod windows {
         }
         ServiceScan {
             units: Some(units),
-            complete,
+            complete_kinds: if complete {
+                vec![KIND_GH_ACTIONS_RUNNER]
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -1129,6 +1159,25 @@ DISPLAY_NAME: Print Spooler\r
         let never = props_from_sc(&svcs[2]);
         assert_eq!(never.active_state.as_deref(), Some("inactive"));
         assert_eq!(never.result.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn linux_kinds_are_complete_only_when_every_hosting_bus_answered() {
+        assert_eq!(
+            linux_complete_kinds(true, SessionBus::Ok),
+            vec!["gh_actions_runner", "qontinui_runner"]
+        );
+        assert_eq!(
+            linux_complete_kinds(true, SessionBus::AbsentByDesign),
+            vec!["gh_actions_runner", "qontinui_runner"]
+        );
+        // A user bus that failed: user `qontinui-runner*` units may be missing.
+        assert_eq!(
+            linux_complete_kinds(true, SessionBus::Failed),
+            vec!["gh_actions_runner"]
+        );
+        // No system bus: neither kind is known complete.
+        assert!(linux_complete_kinds(false, SessionBus::Ok).is_empty());
     }
 
     #[test]
