@@ -101,7 +101,7 @@ refusal to answer. The one next action per `code`:
 |---|---|
 | `input_missing` | The snapshot (or frame) lacked what this check needs — re-project with the script above and read its `--stats` line; for a pixel analyzer, check `frame.status` |
 | `needs_multi_frame_input` | The question needs two frames (`animation_settled`, `dynamic`) — use `vision/diff` over two captures |
-| `producer_failed` | The runner could not capture — read `frame.unknown.detail`; confirm the window / `target` |
+| `producer_failed` | The producer OR its capture failed — `frame.unknown.detail` names the capture ("frame capture failed: …"); confirm the window / device |
 | `below_confidence_floor` | OCR text fell under the floor — re-extract with a lower `minConfidence` |
 | any other code | Report it verbatim as UNKNOWN; do not infer a page state |
 
@@ -141,9 +141,10 @@ reads the frame at all, so a runner reporting `frontendState: "window_missing"`
 still answers every geometric question. The capture is reported as ONE
 observation, `frame`: `frame.status: "measured"` carries the frame's
 provenance in `frame.value`; `frame.status: "unknown"` says there were no
-pixels, with `frame.unknown.code` (`input_missing` — no frame source resolved
-for the target; `producer_failed` — the source failed to capture) and the error
-in `frame.unknown.detail`. Read `frame.status` rather than assuming the pixels
+pixels, with `frame.unknown.code: "producer_failed"` (a capture was attempted
+and failed — window gone, device capture error) and the error in
+`frame.unknown.detail`. An unknown `target` never gets this far: it is a
+malformed request, answered HTTP 404. Read `frame.status` rather than assuming the pixels
 agreed. Only `color` and `dynamic` degrade, and they say so with a `skipped`
 finding.
 
@@ -178,9 +179,9 @@ device, not the runner:
 # with geometry, and every element marked interactable by `inferActions`.
 SNAP=$(curl -sS "http://<device-ip>:8087/ui-bridge/control/discover" | jq '.data')
 
-# -sS, not -fsS: read the RESPONSE BODY. An unknown `target` is not an HTTP
-# error: the analysis still runs over the snapshot and `frame.status` is
-# "unknown" with `frame.unknown.detail` = `unknown vision target '<id>'`.
+# -sS, not -fsS: read the RESPONSE BODY. An unknown `target` is a 404 whose
+# body says `unknown vision target '<id>'`; `-f` would discard that and print
+# only curl's exit-22 line, which cannot tell a typo'd id from an offline device.
 curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout", snapshot:$s, target:"<device-id>"}')" \
@@ -193,10 +194,11 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
 ```
 
 `target` resolves against a registered physical device → registered app → adb
-serial, in that order; an unknown id comes back as `frame.status: "unknown"`
-(`frame.unknown.code: "input_missing"`, detail `unknown vision target '<id>'`),
-and a target serving no screenshot is likewise an unknown `frame` rather than a
-silent capture of the runner desktop — `frame.provenance.source.target` names
+serial, in that order; an unknown id is a malformed request — HTTP 404 with
+`unknown vision target '<id>'`, on every vision route — and a target whose
+capture fails (serves no screenshot, unreachable) comes back as
+`frame.status: "unknown"` / `producer_failed` rather than a silent capture of
+the runner desktop — `frame.provenance.source.target` names
 the surface a measured frame came from. Omit `target` for the default runner-desktop behavior.
 
 ## The Five Analyzers
