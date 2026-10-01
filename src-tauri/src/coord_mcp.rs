@@ -5431,15 +5431,19 @@ pub(crate) struct DeviceSessionPinCensus {
 /// registry-shaped maps without racing the process-global ones. Agent
 /// principals present their own JWT and are not counted (they are never graced
 /// either); an expired ephemeral or an expired graced key serves nothing and is
-/// not counted.
+/// not counted. A graced key that is ALSO in the live map is counted once, as
+/// the live binding — that is the one [`proxy_session_pin_for_nonce`] consults
+/// first.
 fn device_session_pin_census_over<'a>(
-    live: impl IntoIterator<Item = &'a NonceBinding>,
-    graced: impl IntoIterator<Item = &'a GracedNonce>,
+    live: impl IntoIterator<Item = (&'a String, &'a NonceBinding)>,
+    graced: impl IntoIterator<Item = (&'a String, &'a GracedNonce)>,
     now: std::time::Instant,
 ) -> DeviceSessionPinCensus {
     use crate::session::tenant_pin::TenantPin;
     let mut census = DeviceSessionPinCensus::default();
-    for binding in live {
+    let mut live_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (key, binding) in live {
+        live_keys.insert(key.as_str());
         if binding.principal != ProxyPrincipal::Device {
             continue;
         }
@@ -5453,8 +5457,8 @@ fn device_session_pin_census_over<'a>(
             TenantPin::Unpinned | TenantPin::Unresolvable => census.follows_machine_pin += 1,
         }
     }
-    for g in graced {
-        if g.expires_at <= now {
+    for (key, g) in graced {
+        if g.expires_at <= now || live_keys.contains(key.as_str()) {
             continue;
         }
         // Mirrors `proxy_session_pin_for_nonce`'s graced arm exactly.
@@ -5466,30 +5470,20 @@ fn device_session_pin_census_over<'a>(
     census
 }
 
-/// [`device_session_pin_census_over`] the process-global registries. The two
-/// locks are taken one after the other, never nested.
+/// [`device_session_pin_census_over`] the process-global registries. The live
+/// map is snapshotted (cloned) under its lock and released BEFORE the graced
+/// lock is taken, so the two locks are never nested; the snapshot is what lets
+/// a graced key that is also live be counted once.
 pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
     let now = std::time::Instant::now();
-    let live = device_session_pin_census_over(
-        proxy_nonces()
-            .lock()
-            .expect("proxy nonce map poisoned")
-            .values(),
-        std::iter::empty(),
-        now,
-    );
-    let graced = device_session_pin_census_over(
-        std::iter::empty(),
-        graced_nonces()
-            .lock()
-            .expect("graced nonce map poisoned")
-            .values(),
-        now,
-    );
-    DeviceSessionPinCensus {
-        pinned_at_creation: live.pinned_at_creation + graced.pinned_at_creation,
-        follows_machine_pin: live.follows_machine_pin + graced.follows_machine_pin,
-    }
+    let live: Vec<(String, NonceBinding)> = proxy_nonces()
+        .lock()
+        .expect("proxy nonce map poisoned")
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let graced = graced_nonces().lock().expect("graced nonce map poisoned");
+    device_session_pin_census_over(live.iter().map(|(k, v)| (k, v)), graced.iter(), now)
 }
 
 #[cfg(test)]
@@ -5572,7 +5566,10 @@ mod device_session_pin_census_tests {
         grace.insert("g-unpinned".into(), graced(later, None));
         grace.insert("g-expired".into(), graced(earlier, None));
 
-        let census = device_session_pin_census_over(live.values(), grace.values(), now);
+        // A key both live and graced (just re-minted) is counted ONCE, as live.
+        grace.insert("unpinned".into(), graced(later, Some(t)));
+
+        let census = device_session_pin_census_over(live.iter(), grace.iter(), now);
         assert_eq!(
             census,
             DeviceSessionPinCensus {
