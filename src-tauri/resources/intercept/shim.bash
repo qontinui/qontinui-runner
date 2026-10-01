@@ -15,6 +15,10 @@
 #     immediately with no runner round-trip.
 #   * RECURSION-GUARD: if QONTINUI_INSTALL_INTERCEPT_GUARD=1 is already set,
 #     this is a nested invocation -> pure passthrough.
+#   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT (mid-
+#     reinstall) is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
+#     (default 3) before the fail-open fall-through; a resolved tool never
+#     waits, and the only output added is on STDERR, on the miss path alone.
 #
 # Gate mode (Phase 3, plan §3 A3/A4/A6 + §4 Phase 3):
 #   When QONTINUI_INSTALL_INTERCEPT_MODE=gate AND the pre-call returns
@@ -73,7 +77,54 @@ resolve_real() {
   return 1
 }
 
-REAL="$(resolve_real || true)"
+# ---------------------------------------------------------------------------
+# Bounded wait on a MISS. A package manager reinstalling the tool (Claude Code's
+# auto-updater runs `npm install --global` of the SAME version, and npm's reify
+# RENAMES `bin/<tool>` and the package dir aside before re-linking) leaves a
+# window of a second or two in which the tool is on no PATH entry at all. One
+# scan inside that window used to fall straight through to `exec "$TOOL"`,
+# which failed `not found` 73 ms after spawn and silently lost a runner-spawned
+# gate continuation (2026-10-01, merytshost). So a miss re-scans with short
+# sleeps for up to QONTINUI_SHIM_RESOLVE_WAIT_SECS (default in
+# resolve_wait_secs; 0 disables) before giving up. A HIT costs nothing extra —
+# the wait is only ever paid by an invocation that would otherwise have failed.
+# One stderr line announces the wait so a genuinely absent tool is not a silent
+# stall. Same mechanism as identity_shim.bash.
+# ---------------------------------------------------------------------------
+resolve_wait_secs() {
+  # 3 s here, not the identity shim's 10: an install-family tool that is simply
+  # not installed (`pip3` on a box with only `pip`) is a common PROBE, and every
+  # probe of an absent tool pays the whole wait. npm's reify window is ~2 s.
+  local w="${QONTINUI_SHIM_RESOLVE_WAIT_SECS:-3}"
+  case "$w" in ''|*[!0-9]*) w=3 ;; esac
+  # Base 10 explicitly: `08` would otherwise be an invalid OCTAL literal in
+  # the $(( )) below, and `010` would mean 8.
+  printf '%s' "$((10#$w))"
+}
+
+resolve_real_waiting() {
+  local found
+  if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
+  local wait_secs; wait_secs="$(resolve_wait_secs)"
+  [ "$wait_secs" -gt 0 ] || return 1
+  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it)\n' \
+    "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
+  local deadline=$((SECONDS + wait_secs))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.25 2>/dev/null || sleep 1
+    if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
+  done
+  return 1
+}
+
+# The last-resort fall-through is about to dispatch by NAME — say plainly what
+# was searched, so a `not found` that follows is diagnosable from the pane.
+report_unresolved() {
+  printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
+    "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
+}
+
+REAL="$(resolve_real_waiting || true)"
 
 # Fail-open: if we cannot even find the real tool, hand control back to the
 # shell's own PATH resolution (without our dir) as a last resort.
@@ -83,12 +134,16 @@ passthrough() {
   fi
   # No resolved real tool: strip our dir from PATH and re-dispatch by name so
   # the shell finds whatever it would have without us.
+  report_unresolved
   local newpath="" d
   local IFS=':'
   for d in $PATH; do
     case "${d%/}" in "${SHIM_DIR%/}") continue ;; esac
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
+  # Whatever answers the name-dispatch below must not wait again: if it is
+  # another shim of ours, the wait was already paid here.
+  export QONTINUI_SHIM_RESOLVE_WAIT_SECS=0
   PATH="$newpath" exec "$TOOL" "$@"
 }
 
@@ -416,7 +471,14 @@ fi
 # so we do NOT exec here — we run it as a child, inheriting stdio.
 # Set the recursion guard for the child.
 # ---------------------------------------------------------------------------
-QONTINUI_INSTALL_INTERCEPT_GUARD=1 "$REAL" "$@"
+# An unresolved REAL must not run as `"" "$@"` (a `command not found` for the
+# EMPTY name): dispatch by name through passthrough's PATH-stripped fall-through
+# in a subshell, so its exec replaces the subshell and we still get the code.
+if [ -n "${REAL:-}" ]; then
+  QONTINUI_INSTALL_INTERCEPT_GUARD=1 "$REAL" "$@"
+else
+  ( QONTINUI_INSTALL_INTERCEPT_GUARD=1; export QONTINUI_INSTALL_INTERCEPT_GUARD; passthrough "$@" )
+fi
 real_code=$?
 
 # ---------------------------------------------------------------------------

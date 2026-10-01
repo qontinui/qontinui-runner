@@ -41,6 +41,23 @@ for %%E in (%TOOL%.cmd %TOOL%.exe %TOOL%.bat) do (
 )
 rem Robust scan: walk PATH entries, skip SHIM_DIR, take first existing
 rem TOOL.cmd/TOOL.exe/TOOL.bat.
+rem Bounded wait on a MISS (same rule as the bash shim and qontinui-shim.exe):
+rem a package manager reinstalling the tool (npm's reify renames the bin aside)
+rem leaves it on NO PATH entry for a second or two, and one scan inside that
+rem window used to fall straight through to a `not found`. Re-scan about once a
+rem second for up to QONTINUI_SHIM_RESOLVE_WAIT_SECS (default 3; 0 disables).
+rem A hit never waits; the only output added is on STDERR, on the miss path.
+rem 3 s here, not the identity shim's 10: probing an install tool that is not
+rem installed is common, and every such probe pays the whole wait.
+set "RESOLVE_WAIT=%QONTINUI_SHIM_RESOLVE_WAIT_SECS%"
+if not defined RESOLVE_WAIT set "RESOLVE_WAIT=3"
+rem Non-numeric (or signed/octal-looking) -> the default. No pipe: a piped
+rem command runs in a child cmd without delayed expansion.
+set "RW_NUM="
+set /a "RW_NUM=RESOLVE_WAIT" >nul 2>nul
+if not "%RW_NUM%"=="%RESOLVE_WAIT%" set "RESOLVE_WAIT=3"
+set "RESOLVE_TRIES=0"
+:resolve_real
 for %%X in (cmd exe bat) do (
   if not defined REAL (
     for %%D in ("%PATH:;=" "%") do (
@@ -53,6 +70,24 @@ for %%X in (cmd exe bat) do (
     )
   )
 )
+if defined REAL goto :resolved
+if !RESOLVE_TRIES! GEQ !RESOLVE_WAIT! goto :unresolved
+if "!RESOLVE_TRIES!"=="0" >&2 echo qontinui shim: !TOOL! not found on PATH ^(excluding !SHIM_DIR!^); waiting up to !RESOLVE_WAIT!s for it to reappear ^(a package-manager reinstall briefly removes it^)
+set /a RESOLVE_TRIES+=1
+ping -n 2 127.0.0.1 >nul 2>nul
+goto :resolve_real
+:unresolved
+rem Whatever answers the bare-name dispatch below may be this very shim (cmd
+rem searches the shim dir again); it must not wait a second time.
+set "QONTINUI_SHIM_RESOLVE_WAIT_SECS=0"
+>&2 echo qontinui shim: the real !TOOL! was not found on PATH after waiting !RESOLVE_WAIT!s; falling back to PATH dispatch. PATH searched ^(excluding !SHIM_DIR!^): !PATH!
+rem Already nested (guard set) and still unresolved: a by-name dispatch could
+rem only re-enter a shim of ours. Command-not-found instead of recursing.
+if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
+  endlocal
+  exit /b 127
+)
+:resolved
 
 rem ---- recursion guard -----------------------------------------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
