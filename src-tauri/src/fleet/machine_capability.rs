@@ -190,8 +190,10 @@ pub(crate) struct PagefileReading {
 /// Writes to the `Memory Management` key within this many seconds of boot are
 /// the boot's OWN writes, not a pending change (300 s).
 ///
-/// The session manager rewrites `ExistingPageFiles` — a value in this very key
-/// — at every boot, so the key's last-write time is ALWAYS a little after boot.
+/// ASSUMPTION, not yet observed on a Windows box: the session manager rewrites
+/// `ExistingPageFiles` — a value in this very key — at every boot, so the key's
+/// last-write time is a little after boot. If that does not hold, the grace
+/// window is simply unused; it never makes a pending change read as live.
 /// Without a grace window every machine would read as "changed since boot".
 /// 300 s is generous for that early-boot write and short enough that an
 /// operator is unlikely to have opened System Properties and changed the
@@ -252,7 +254,13 @@ pub(crate) fn filetime_to_unix_secs(high: u32, low: u32) -> Option<i64> {
 /// - A change made within [`BOOT_WRITE_GRACE_SECS`] of boot that also keeps the
 ///   same paths and a live size inside the new band is not detected.
 /// - The boot time comes from the tick count (`sysinfo::System::boot_time`);
-///   with Fast Startup a "shutdown" is a hibernation that does not reset it.
+///   with Fast Startup a "shutdown" is likely a hibernation that does not reset
+///   it (assumed, not observed here).
+/// - Clock skew: `booted_at` is `now − uptime` on the CORRECTED clock, while the
+///   boot-time write was stamped by the clock as it read during boot. A clock
+///   more than [`BOOT_WRITE_GRACE_SECS`] fast at boot (a dual-boot box keeping
+///   the hardware clock in local time, a restored VM) reads as "changed since
+///   boot" until the next reboot. That also errs toward UNKNOWN only.
 pub(crate) fn assess_pagefile(
     reading: PagefileReading,
 ) -> (Result<u64, String>, Result<Vec<PagefileEntry>, String>) {
