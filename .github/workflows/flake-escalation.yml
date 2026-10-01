@@ -61,7 +61,8 @@ name: Flake escalation
 # (qontinui-dev-notes/plans — a stem does not expire), and at the time of
 # writing by coord finding 1c1b9554-ef5e-4de4-bf16-145b778814a2 (topic
 # `test-flakiness`; findings expire after ~14 days, so trust the plan stem
-# first); the fix is a coord/web index or a horizon-bounded read, never a change to this workflow.
+# first); the fix is a coord/web index or a horizon-bounded read, never a
+# change to this workflow.
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
 # The plan's second escalation arm — "any occurrence on a push to
