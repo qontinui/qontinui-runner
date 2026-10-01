@@ -1117,10 +1117,11 @@ pub(crate) fn runner_hosts(
 /// absent, stale or unreadable census is UNKNOWN; neither is upgraded to
 /// `no_pusher`, both keep the pre-census `target_not_live`.
 ///
-/// Sticky per message: once `no_pusher` has been reported for a message
-/// (`already_no_pusher`), it is never followed by `target_not_live` for the
-/// same message — a census that later goes stale must not make one message
-/// carry both reasons.
+/// Sticky per message, but ONLY through an `Unknown` verdict: once
+/// `no_pusher` has been reported for a message (`already_no_pusher`), a census
+/// that later goes stale or unreadable keeps it `no_pusher` rather than
+/// flipping it to `target_not_live`. A FRESH `NotLive` (the session exited) or
+/// `LiveUnderARunner` (a runner now hosts it) is evidence, and wins.
 ///
 /// [`LocalVerdict::LiveUnhosted`]: crate::session::census::LocalVerdict::LiveUnhosted
 fn unhosted_reason(
@@ -1128,7 +1129,8 @@ fn unhosted_reason(
     already_no_pusher: bool,
 ) -> (BlockReason, &'static str) {
     use crate::session::census::LocalVerdict;
-    if already_no_pusher || verdict == LocalVerdict::LiveUnhosted {
+    let sticky = already_no_pusher && verdict == LocalVerdict::Unknown;
+    if sticky || verdict == LocalVerdict::LiveUnhosted {
         (
             BlockReason::NoPusher,
             "live on this device (session census) and hosted by no runner — no push primitive \
@@ -2298,6 +2300,26 @@ mod tests {
         // No fresh census is UNKNOWN — never upgraded to no_pusher.
         assert_eq!(
             unhosted_reason(LocalVerdict::Unknown, false).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_fresh_not_live_verdict_beats_a_sticky_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        // already_no_pusher = true, but the session has since exited.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::NotLive, true).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_fresh_live_under_a_runner_verdict_beats_a_sticky_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        // already_no_pusher = true, but a runner now hosts the session.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnderARunner, true).0,
             BlockReason::TargetNotLive
         );
     }
