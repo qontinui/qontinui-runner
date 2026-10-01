@@ -262,6 +262,13 @@ impl RemoteAttachGrants {
         self.inner.lock().ok()?.remove(grant_jti)
     }
 
+    /// The row for `grant_jti`, expired or not, WITHOUT admitting anything —
+    /// a read for bookkeeping (the interactivity reporter reads the session
+    /// and source device a just-acked input ran under). Never a gate.
+    pub fn get(&self, grant_jti: &str) -> Option<AttachGrant> {
+        self.inner.lock().ok()?.get(grant_jti).cloned()
+    }
+
     /// True when this jti names a row in the ATTACH table, expired or not.
     ///
     /// Used by the create gate, and only there: a jti coord minted as an
@@ -1849,11 +1856,26 @@ pub const GRANT_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
 /// tested against a recorder that proves a refused frame never reaches it.
+///
+/// Both methods are the seam the out-of-process PTY owner (plan 09-12) would
+/// re-implement: the ack belongs to whichever component performs the write.
 pub trait TerminalInputSink {
     /// Write raw bytes into the named terminal. `Err` for an unknown terminal
     /// or a dead PTY.
     fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Would [`Self::write_input`] be accepted for `terminal_id` right now?
+    /// Answers WITHOUT writing and without recording anything the phantom-turn
+    /// detector reads — the write probe of plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`.
+    /// Same `Err` vocabulary as `write_input`.
+    fn probe_writable(&self, terminal_id: &str) -> Result<(), String>;
 }
+
+/// The error prefix the [`crate::terminal::TerminalManager`] sink answers for
+/// an id it does not host. A const so [`input_ack_error_code`] classifies the
+/// sink's own spelling rather than a copy of it.
+pub const TERMINAL_NOT_FOUND_PREFIX: &str = "Terminal not found:";
 
 impl TerminalInputSink for crate::terminal::TerminalManager {
     fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -1862,13 +1884,124 @@ impl TerminalInputSink for crate::terminal::TerminalManager {
                 bytes,
                 crate::terminal::session::PtyWriteCaller::RemoteTerminalInput,
             ),
-            None => Err(format!("Terminal not found: {terminal_id}")),
+            None => Err(format!("{TERMINAL_NOT_FOUND_PREFIX} {terminal_id}")),
+        }
+    }
+
+    fn probe_writable(&self, terminal_id: &str) -> Result<(), String> {
+        match self.get(terminal_id) {
+            Some(session) => session.probe_writable(),
+            None => Err(format!("{TERMINAL_NOT_FOUND_PREFIX} {terminal_id}")),
         }
     }
 }
 
-/// `terminal_input`, gated. Behaviour for a frame with no `remote` block is
-/// the relay's pre-existing one: decode, write, warn on failure, no reply.
+/// The closed `error` vocabulary of a refused [`input_ack_frame`] (plan
+/// Design table, "writableRemotely"). `input_undecodable` is assigned by the
+/// caller; this classifies a sink `Err`.
+pub const INPUT_ACK_TERMINAL_EXITED: &str = "terminal_exited";
+pub const INPUT_ACK_TERMINAL_NOT_FOUND: &str = "terminal_not_found";
+pub const INPUT_ACK_INPUT_UNDECODABLE: &str = "input_undecodable";
+pub const INPUT_ACK_INPUT_WRITE_FAILED: &str = "input_write_failed";
+
+/// Upper bound, in bytes, of an ack's `error_detail`. The relay caps only
+/// `error`; the detail is a free-form sink message (it can embed a terminal id
+/// and an OS error string), so the target bounds it before it leaves.
+pub const INPUT_ACK_ERROR_DETAIL_MAX_BYTES: usize = 512;
+
+/// Map a [`TerminalInputSink`] error to its closed ack code. The two typed
+/// prefixes are the sink's own constants; everything else is
+/// `input_write_failed`, with the message carried beside it.
+pub fn input_ack_error_code(sink_error: &str) -> &'static str {
+    if sink_error.starts_with(crate::terminal::session::TERMINAL_EXITED) {
+        INPUT_ACK_TERMINAL_EXITED
+    } else if sink_error.starts_with(TERMINAL_NOT_FOUND_PREFIX) {
+        INPUT_ACK_TERMINAL_NOT_FOUND
+    } else {
+        INPUT_ACK_INPUT_WRITE_FAILED
+    }
+}
+
+/// What happened to one admitted remote `terminal_input` — the payload of
+/// its `terminal_input_ack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// Bytes were written (`via: traffic`) or the probe passed (`via: probe`,
+    /// `bytes: 0`).
+    Accepted { bytes: usize },
+    /// Nothing reached the PTY. `code` is the closed vocabulary above;
+    /// `detail` the underlying message.
+    Refused { code: &'static str, detail: String },
+}
+
+/// The `terminal_input_ack` a TARGET returns for an admitted remote input
+/// (wire contract A1). Emitted ONLY for a frame carrying a `remote` block
+/// that passed the grant gate — a gate refusal keeps its typed refusal frame
+/// and gets no ack; the operator path (no block) gets nothing.
+///
+/// - `remote` echoes the incoming block VERBATIM, and `grant_jti` is the
+///   admitted (trimmed) jti, as `refusal_frame` carries it — the relay routes
+///   by these.
+/// - `seq` echoes the source's counter, `null` from a source that predates it.
+/// - `error` is the bare closed code (so a coord observation can carry it as a
+///   `reason` verbatim); `error_detail` carries the message beside it.
+pub fn input_ack_frame(
+    data: &Value,
+    grant_jti: &str,
+    terminal_id: &str,
+    probe: bool,
+    outcome: &InputOutcome,
+) -> Value {
+    let mut frame = json!({
+        "type": "terminal_input_ack",
+        "remote": data.get("remote").cloned().unwrap_or(Value::Null),
+        "grant_jti": grant_jti,
+        "terminal_id": terminal_id,
+        "seq": data.get("seq").and_then(|v| v.as_u64()),
+        "via": if probe { "probe" } else { "traffic" },
+        "accepted_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    });
+    match outcome {
+        InputOutcome::Accepted { bytes } => {
+            frame["accepted"] = json!(true);
+            frame["bytes"] = json!(bytes);
+        }
+        InputOutcome::Refused { code, detail } => {
+            frame["accepted"] = json!(false);
+            frame["bytes"] = json!(0);
+            frame["error"] = json!(code);
+            frame["error_detail"] = json!(crate::str_utils::truncate_str_ellipsis(
+                detail,
+                // The ellipsis adds 3 bytes when it truncates; reserve them so
+                // the result is <= the cap.
+                INPUT_ACK_ERROR_DETAIL_MAX_BYTES - 3,
+            ));
+        }
+    }
+    frame
+}
+
+/// `terminal_input`, gated — and, for a REMOTE frame, acknowledged.
+///
+/// A frame with no `remote` block is the relay's pre-existing operator path:
+/// decode, write, warn on failure, no reply.
+///
+/// A frame WITH a block that passes the grant gate always answers one
+/// `terminal_input_ack` ([`input_ack_frame`]): `accepted: true` on a write
+/// `Ok`, `accepted: false` on a sink `Err` or an undecodable payload — the two
+/// arms that used to be a silent `warn!`, so a source could not tell a
+/// dropped keystroke from a delivered one. A `probe: true` frame calls
+/// [`TerminalInputSink::probe_writable`] and NEVER `write_input`, so a probe
+/// neither types into the session nor lands in `last_input`.
+///
+/// One ack per frame, not coalesced. The ack answers one inbound frame on the
+/// relay's reply lane, whose accounting is exactly that (one reply per
+/// inbound request — `RELAY_REPLY_LANE_CAPACITY`'s own argument), and the
+/// source writes one frame per `write()` call. Coalescing per 50 ms (the plan's
+/// Risks note) would need a deferred send off the serial read loop — a timer
+/// task per grant holding reply state across frames — and would fold a
+/// refused frame into an accepted one's highest `seq`, losing which keystroke
+/// failed. Revisit only if A4's time-to-Ctrl-C measures a regression.
 pub fn apply_terminal_input<S: TerminalInputSink, P: FnOnce() -> AcceptRemoteAttach>(
     sink: &S,
     grants: &RemoteAttachGrants,
@@ -1882,26 +2015,74 @@ pub fn apply_terminal_input<S: TerminalInputSink, P: FnOnce() -> AcceptRemoteAtt
         .unwrap_or("");
     let input_data = data.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
-    if let Err(refusal) = gate_remote_frame(grants, preference, data, Some(terminal_id), now) {
-        warn!(
-            terminal_id,
-            code = refusal.code(),
-            "remote attach: refused terminal_input"
-        );
-        return Some(refusal_frame(refusal, data, Some(terminal_id)));
-    }
+    let admitted = match gate_remote_frame(grants, preference, data, Some(terminal_id), now) {
+        Ok(admitted) => admitted,
+        Err(refusal) => {
+            warn!(
+                terminal_id,
+                code = refusal.code(),
+                "remote attach: refused terminal_input"
+            );
+            return Some(refusal_frame(refusal, data, Some(terminal_id)));
+        }
+    };
 
-    match STANDARD.decode(input_data) {
-        Ok(bytes) => {
-            if let Err(e) = sink.write_input(terminal_id, &bytes) {
-                warn!("Relay: failed to write to terminal {}: {}", terminal_id, e);
+    let Some(grant) = admitted else {
+        // The operator path — unchanged, no reply.
+        match STANDARD.decode(input_data) {
+            Ok(bytes) => {
+                if let Err(e) = sink.write_input(terminal_id, &bytes) {
+                    warn!("Relay: failed to write to terminal {}: {}", terminal_id, e);
+                }
+            }
+            Err(e) => {
+                warn!("Invalid base64 terminal input: {}", e);
             }
         }
-        Err(e) => {
-            warn!("Invalid base64 terminal input: {}", e);
+        return None;
+    };
+
+    let probe = data.get("probe").and_then(|v| v.as_bool()).unwrap_or(false);
+    let outcome = if probe {
+        match sink.probe_writable(terminal_id) {
+            Ok(()) => InputOutcome::Accepted { bytes: 0 },
+            Err(e) => InputOutcome::Refused {
+                code: input_ack_error_code(&e),
+                detail: e,
+            },
         }
+    } else {
+        match STANDARD.decode(input_data) {
+            Ok(bytes) => match sink.write_input(terminal_id, &bytes) {
+                Ok(()) => InputOutcome::Accepted { bytes: bytes.len() },
+                Err(e) => InputOutcome::Refused {
+                    code: input_ack_error_code(&e),
+                    detail: e,
+                },
+            },
+            Err(e) => InputOutcome::Refused {
+                code: INPUT_ACK_INPUT_UNDECODABLE,
+                detail: format!("invalid base64 terminal input: {e}"),
+            },
+        }
+    };
+    if let InputOutcome::Refused { code, detail } = &outcome {
+        warn!(
+            terminal_id,
+            grant_jti = %grant.grant_jti,
+            code,
+            detail = %detail,
+            probe,
+            "remote attach: admitted terminal_input not written — acking accepted=false"
+        );
     }
-    None
+    Some(input_ack_frame(
+        data,
+        &grant.grant_jti,
+        terminal_id,
+        probe,
+        &outcome,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2381,6 +2562,12 @@ impl RemoteAttachClient {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        // A caller that DROPS this future (a cancelled probe sweep, a timeout
+        // wrapped around the attach) must not leave its waiter behind.
+        let _pending = PendingEntryGuard {
+            client: self,
+            request_id: &request_id,
+        };
         if !self.outbound_pump_state().0 {
             self.take_pending(&request_id);
             return Err(relay_not_connected("attach"));
@@ -2421,6 +2608,11 @@ impl RemoteAttachClient {
 
     fn take_pending(&self, request_id: &str) -> Option<PendingAttach> {
         self.pending.lock().ok()?.remove(request_id)
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.lock().map(|p| p.len()).unwrap_or(0)
     }
 
     fn take_pending_create(&self, request_id: &str) -> Option<PendingCreate> {
@@ -2518,6 +2710,10 @@ impl RemoteAttachClient {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
         }
+        let _pending = PendingEntryGuard {
+            client: self,
+            request_id: &request_id,
+        };
         let frame = json!({
             "type": "remote_terminal_buffer",
             "request_id": request_id,
@@ -2690,8 +2886,18 @@ impl RemoteAttachClient {
         }
     }
 
+    /// Stop routing inbound frames to the pane holding `grant_jti` — the
+    /// interactivity probe's pane, which has no tab to close and so no other
+    /// door out of the routing table (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A3). Any pre-registration output slot is discarded with it.
+    pub fn forget_pane(&self, grant_jti: &str) {
+        self.drop_pane(grant_jti);
+        self.discard_pending_output(grant_jti);
+    }
+
     /// Route one inbound frame. Returns `true` when this client consumed it.
-    /// Handles `remote_terminal_created|attached|output|exit|buffer|error` and
+    /// Handles `remote_terminal_created|attached|output|exit|buffer|error|input_ack` and
     /// a generic `error` whose `request_id` names a pending attach.
     ///
     /// `created` was omitted from this list while its arm existed below, and
@@ -2709,6 +2915,7 @@ impl RemoteAttachClient {
                 match request_id {
                     Some(rid) if rid.starts_with(REATTACH_PREFIX) => {
                         if let Some(pane) = self.pane(&reply.grant_jti) {
+                            pane.note_reattached();
                             pane.splice_replay(&reply.ring);
                             info!(
                                 grant_jti = %reply.grant_jti,
@@ -2786,6 +2993,35 @@ impl RemoteAttachClient {
                 }
                 true
             }
+            "remote_terminal_input_ack" => {
+                // The target's answer to one `remote_terminal_input` (plan
+                // `2026-09-20-remote-session-interactivity-…`, A1): routed to
+                // the pane by `grant_jti`. An ack for no live pane (closed
+                // tab, stale grant) has nothing to update and is dropped.
+                // The relay strips the `remote` block and its own keys before
+                // the ack reaches us, so the top-level `grant_jti` routes it and
+                // `terminal_id`, when present, must agree with the pane's.
+                match grant_jti.and_then(|jti| self.pane(jti)) {
+                    Some(pane) => {
+                        let tid = data.get("terminal_id").and_then(|v| v.as_str());
+                        match tid {
+                            Some(tid) if tid != pane.terminal_id() => warn!(
+                                grant_jti = grant_jti.unwrap_or(""),
+                                ack_terminal_id = tid,
+                                pane_terminal_id = pane.terminal_id(),
+                                "remote attach: input ack names a different terminal than the \
+                                 pane its grant routes to — dropped"
+                            ),
+                            _ => pane.record_input_ack(data),
+                        }
+                    }
+                    None => debug!(
+                        grant_jti = grant_jti.unwrap_or(""),
+                        "remote attach: input ack for no live pane — ignored"
+                    ),
+                }
+                true
+            }
             "remote_terminal_buffer" => {
                 let Some(reply) = parse_attached(data) else {
                     warn!("remote attach: malformed remote_terminal_buffer frame: {data}");
@@ -2796,6 +3032,12 @@ impl RemoteAttachClient {
                 // is already past it. Anything else — the target's resync
                 // after a flow resume, an unsolicited ring — splices like a
                 // reattach, from the last byte seen.
+                //
+                // A history answer does NOT stamp `last_frame_received`: that
+                // receipt is "the live stream reached this pane through offset
+                // N", and a history range is older bytes handed to the caller,
+                // never spliced — stamping it would move the read receipt
+                // without the stream having moved.
                 if let Some(tx) = request_id
                     .filter(|rid| rid.starts_with(HISTORY_PREFIX))
                     .and_then(|rid| self.take_pending(rid))
@@ -2971,6 +3213,20 @@ impl RemoteAttachClient {
     }
 }
 
+/// Removes a request's entry from `pending` when the request future ends —
+/// normally a no-op (the reply or the timeout arm already took it), but the
+/// only cleanup when the future is DROPPED mid-wait.
+struct PendingEntryGuard<'a> {
+    client: &'a RemoteAttachClient,
+    request_id: &'a str,
+}
+
+impl Drop for PendingEntryGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.take_pending(self.request_id);
+    }
+}
+
 const REATTACH_PREFIX: &str = "reattach:";
 const HISTORY_PREFIX: &str = "history:";
 
@@ -3090,26 +3346,61 @@ mod tests {
         }
     }
 
-    /// Records every PTY write; `Err` for terminals not in `known`.
+    /// Records every PTY write and every probe. `fail` makes BOTH answer
+    /// that `Err` (and record nothing) — the dead-PTY / unknown-terminal arm.
     #[derive(Default)]
     struct RecordingSink {
         writes: StdMutex<Vec<(String, Vec<u8>)>>,
+        probes: StdMutex<Vec<String>>,
+        fail: Option<String>,
     }
 
     impl TerminalInputSink for RecordingSink {
         fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
+            if let Some(e) = &self.fail {
+                return Err(e.clone());
+            }
             self.writes
                 .lock()
                 .unwrap()
                 .push((terminal_id.to_string(), bytes.to_vec()));
             Ok(())
         }
+
+        fn probe_writable(&self, terminal_id: &str) -> Result<(), String> {
+            self.probes.lock().unwrap().push(terminal_id.to_string());
+            match &self.fail {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
+        }
     }
 
     impl RecordingSink {
+        fn failing(e: &str) -> Self {
+            Self {
+                fail: Some(e.to_string()),
+                ..Self::default()
+            }
+        }
+
         fn writes(&self) -> Vec<(String, Vec<u8>)> {
             self.writes.lock().unwrap().clone()
         }
+
+        fn probes(&self) -> Vec<String> {
+            self.probes.lock().unwrap().clone()
+        }
+    }
+
+    /// Assert `reply` is an ACCEPTED ack for `term-A` under `j1`.
+    fn assert_accepted_ack(reply: Option<Value>, bytes: usize) -> Value {
+        let ack = reply.expect("an admitted remote input answers one ack");
+        assert_eq!(ack["type"], "terminal_input_ack", "{ack}");
+        assert_eq!(ack["accepted"], true, "{ack}");
+        assert_eq!(ack["bytes"], bytes, "{ack}");
+        assert!(ack.get("error").is_none(), "{ack}");
+        ack
     }
 
     fn input_frame(remote: Option<Value>) -> Value {
@@ -3216,7 +3507,7 @@ mod tests {
             &input_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
         );
-        assert!(admitted.is_none(), "an admitted input sends no reply");
+        assert_accepted_ack(admitted, 9);
         assert_eq!(
             sink.writes(),
             vec![("term-A".to_string(), b"rm -rf /\r".to_vec())]
@@ -3240,7 +3531,7 @@ mod tests {
             )),
             NOW,
         );
-        assert!(reply.is_none());
+        assert_accepted_ack(reply, 9);
         assert_eq!(sink.writes().len(), 1);
         assert_eq!(sink.writes()[0].0, "term-A");
     }
@@ -3268,6 +3559,278 @@ mod tests {
         );
         assert!(reply.is_none());
         assert_eq!(sink.writes().len(), 2);
+    }
+
+    // ---- A1: the input ack (plan 2026-09-20-remote-session-interactivity) ----
+
+    fn admitted_table() -> RemoteAttachGrants {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", Some("term-A"), NOW + 600), NOW);
+        table
+    }
+
+    fn remote_input(extra: Value) -> Value {
+        let mut f = input_frame(Some(
+            json!({"grant_jti": "j1", "source_device_id": "src-device"}),
+        ));
+        if let Value::Object(m) = extra {
+            for (k, v) in m {
+                f[k] = v;
+            }
+        }
+        f
+    }
+
+    /// (1) An accepted remote input yields exactly one ack: accepted, the
+    /// source's `seq` echoed, the decoded byte count, `via: traffic`, the
+    /// `remote` block echoed verbatim and the routing jti on top.
+    #[test]
+    fn accepted_remote_input_yields_one_accepted_ack_echoing_seq_and_bytes() {
+        let sink = RecordingSink::default();
+        let table = admitted_table();
+        let frame = remote_input(json!({"seq": 41}));
+        let ack = assert_accepted_ack(
+            apply_terminal_input(&sink, &table, || AcceptRemoteAttach::Tenant, &frame, NOW),
+            9,
+        );
+        assert_eq!(ack["seq"], 41);
+        assert_eq!(ack["via"], "traffic");
+        assert_eq!(ack["terminal_id"], "term-A");
+        assert_eq!(ack["grant_jti"], "j1");
+        assert_eq!(
+            ack["remote"], frame["remote"],
+            "the remote block is echoed verbatim"
+        );
+        let at = ack["accepted_at"].as_str().expect("accepted_at");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+            "accepted_at must be RFC3339, got {at}"
+        );
+        assert_eq!(
+            sink.writes(),
+            vec![("term-A".to_string(), b"rm -rf /\r".to_vec())]
+        );
+        assert!(sink.probes().is_empty(), "a traffic frame never probes");
+    }
+
+    /// A source that predates `seq` still gets its ack, with `seq: null`.
+    #[test]
+    fn an_old_source_without_seq_is_acked_with_a_null_seq() {
+        let sink = RecordingSink::default();
+        let ack = assert_accepted_ack(
+            apply_terminal_input(
+                &sink,
+                &admitted_table(),
+                || AcceptRemoteAttach::Tenant,
+                &remote_input(json!({})),
+                NOW,
+            ),
+            9,
+        );
+        assert!(ack["seq"].is_null(), "{ack}");
+    }
+
+    /// (2) A sink `Err` after the gate passed — silent before A1 — now answers
+    /// `accepted: false` with the closed code and the message beside it.
+    #[test]
+    fn a_sink_error_acks_accepted_false_with_the_typed_code() {
+        for (sink_err, code) in [
+            (
+                "TERMINAL_EXITED: terminal term-A is not writable -- its process exited with code 0.",
+                "terminal_exited",
+            ),
+            ("Terminal not found: term-A", "terminal_not_found"),
+            ("Failed to write to PTY: broken pipe", "input_write_failed"),
+        ] {
+            let sink = RecordingSink::failing(sink_err);
+            let ack = apply_terminal_input(
+                &sink,
+                &admitted_table(),
+                || AcceptRemoteAttach::Tenant,
+                &remote_input(json!({"seq": 7})),
+                NOW,
+            )
+            .expect("a failed write is acked, not silent");
+            assert_eq!(ack["type"], "terminal_input_ack");
+            assert_eq!(ack["accepted"], false, "{ack}");
+            assert_eq!(ack["error"], code, "{ack}");
+            assert_eq!(ack["error_detail"], sink_err, "{ack}");
+            assert_eq!(ack["bytes"], 0);
+            assert_eq!(ack["seq"], 7);
+            assert!(sink.writes().is_empty());
+        }
+    }
+
+    /// (3) An undecodable payload is acked `accepted: false,
+    /// error: input_undecodable` and never reaches the PTY.
+    #[test]
+    fn undecodable_input_acks_input_undecodable() {
+        let sink = RecordingSink::default();
+        let ack = apply_terminal_input(
+            &sink,
+            &admitted_table(),
+            || AcceptRemoteAttach::Tenant,
+            &remote_input(json!({"data": "!!! not base64 !!!", "seq": 3})),
+            NOW,
+        )
+        .expect("an undecodable payload is acked, not silent");
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["error"], "input_undecodable");
+        assert_eq!(ack["seq"], 3);
+        assert!(sink.writes().is_empty());
+    }
+
+    /// (4) The operator path (no `remote` block) answers nothing — even for a
+    /// sink error or an undecodable payload.
+    #[test]
+    fn a_frame_without_a_remote_block_is_never_acked() {
+        let ok = RecordingSink::default();
+        let failing = RecordingSink::failing("Terminal not found: term-A");
+        let table = RemoteAttachGrants::new();
+        let mut bad = input_frame(None);
+        bad["data"] = json!("!!!");
+        for (sink, frame) in [
+            (&ok, input_frame(None)),
+            (&failing, input_frame(None)),
+            (&ok, bad),
+        ] {
+            assert!(
+                apply_terminal_input(sink, &table, || AcceptRemoteAttach::Off, &frame, NOW)
+                    .is_none(),
+                "operator-path frame must not be acked: {frame}"
+            );
+        }
+        // And a probe flag on the operator path is not a probe: it writes.
+        let mut probe_no_remote = input_frame(None);
+        probe_no_remote["probe"] = json!(true);
+        let sink = RecordingSink::default();
+        assert!(apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Off,
+            &probe_no_remote,
+            NOW
+        )
+        .is_none());
+        assert!(sink.probes().is_empty());
+        assert_eq!(sink.writes().len(), 1);
+    }
+
+    /// (5) A `probe: true` frame calls `probe_writable` and NEVER
+    /// `write_input` — 0 bytes reach the recorder — and still acks, with
+    /// `bytes: 0, via: probe`. (The `last_input()`-untouched half is pinned
+    /// against a real `TerminalSession` in `terminal::session` tests,
+    /// `probe_writable_on_a_live_pty_writes_nothing_and_records_nothing`.)
+    #[test]
+    fn a_probe_frame_writes_nothing_and_acks_via_probe() {
+        let sink = RecordingSink::default();
+        let ack = assert_accepted_ack(
+            apply_terminal_input(
+                &sink,
+                &admitted_table(),
+                || AcceptRemoteAttach::Tenant,
+                &remote_input(json!({"data": "", "probe": true, "seq": 12})),
+                NOW,
+            ),
+            0,
+        );
+        assert_eq!(ack["via"], "probe");
+        assert_eq!(ack["seq"], 12);
+        assert!(sink.writes().is_empty(), "a probe must never write");
+        assert_eq!(sink.probes(), vec!["term-A".to_string()]);
+
+        // Even a probe that (wrongly) carries bytes writes none of them.
+        let sink = RecordingSink::default();
+        let frame = remote_input(json!({"probe": true}));
+        apply_terminal_input(
+            &sink,
+            &admitted_table(),
+            || AcceptRemoteAttach::Tenant,
+            &frame,
+            NOW,
+        )
+        .expect("acked");
+        assert!(sink.writes().is_empty());
+
+        // Against a dead PTY the probe acks the typed refusal.
+        let sink = RecordingSink::failing(
+            "TERMINAL_EXITED: terminal term-A is not writable -- its process exited with code 1.",
+        );
+        let ack = apply_terminal_input(
+            &sink,
+            &admitted_table(),
+            || AcceptRemoteAttach::Tenant,
+            &remote_input(json!({"data": "", "probe": true})),
+            NOW,
+        )
+        .expect("acked");
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["error"], "terminal_exited");
+        assert_eq!(ack["via"], "probe");
+    }
+
+    /// Acceptance (4): a probe under an unknown or expired grant gets the
+    /// existing typed refusal and NO ack — and does not probe.
+    #[test]
+    fn a_gate_refusal_is_the_answer_and_carries_no_ack() {
+        let sink = RecordingSink::default();
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j9", Some("term-A"), NOW - 1), NOW - 10);
+        for jti in ["nope", "j9"] {
+            let mut frame = input_frame(Some(json!({"grant_jti": jti})));
+            frame["probe"] = json!(true);
+            let reply =
+                apply_terminal_input(&sink, &table, || AcceptRemoteAttach::Tenant, &frame, NOW)
+                    .expect("a refusal frame");
+            assert_eq!(reply["type"], "error", "{reply}");
+            assert_ne!(reply["type"], "terminal_input_ack");
+        }
+        assert!(sink.probes().is_empty());
+        assert!(sink.writes().is_empty());
+    }
+
+    /// `error_detail` is bounded on the target; `error` stays the bare code.
+    #[test]
+    fn a_long_sink_error_is_bounded_in_error_detail() {
+        let long = format!("Failed to write to PTY: {}", "é".repeat(2_000));
+        let sink = RecordingSink::failing(&long);
+        let ack = apply_terminal_input(
+            &sink,
+            &admitted_table(),
+            || AcceptRemoteAttach::Tenant,
+            &remote_input(json!({})),
+            NOW,
+        )
+        .expect("acked");
+        assert_eq!(ack["error"], "input_write_failed");
+        let detail = ack["error_detail"].as_str().unwrap();
+        assert!(
+            detail.len() <= INPUT_ACK_ERROR_DETAIL_MAX_BYTES,
+            "{}",
+            detail.len()
+        );
+        assert!(detail.ends_with("..."));
+    }
+
+    /// The real sink's `probe_writable` answers `terminal_not_found` for an id
+    /// it does not host, spelled so the classifier maps it.
+    #[test]
+    fn ack_error_codes_classify_the_real_sinks_spellings() {
+        assert_eq!(
+            input_ack_error_code(&format!("{TERMINAL_NOT_FOUND_PREFIX} x")),
+            INPUT_ACK_TERMINAL_NOT_FOUND
+        );
+        assert_eq!(
+            input_ack_error_code(&format!(
+                "{}: terminal x is not writable",
+                crate::terminal::session::TERMINAL_EXITED
+            )),
+            INPUT_ACK_TERMINAL_EXITED
+        );
+        assert_eq!(
+            input_ack_error_code("Writer lock poisoned"),
+            INPUT_ACK_INPUT_WRITE_FAILED
+        );
     }
 
     #[test]
@@ -3529,7 +4092,7 @@ mod tests {
             )),
             NOW,
         );
-        assert!(admitted.is_none());
+        assert_accepted_ack(admitted, 9);
         assert_eq!(sink.writes().len(), 1);
     }
 
@@ -3553,7 +4116,7 @@ mod tests {
             )),
             NOW,
         )
-        .is_none());
+        .is_some_and(|ack| ack["accepted"] == true));
         // Frame side absent or blank: admitted against a table row that has one.
         assert!(apply_terminal_input(
             &sink,
@@ -3562,7 +4125,7 @@ mod tests {
             &input_frame(Some(json!({"grant_jti": "j2"}))),
             NOW,
         )
-        .is_none());
+        .is_some_and(|ack| ack["accepted"] == true));
         assert!(apply_terminal_input(
             &sink,
             &table,
@@ -3570,7 +4133,7 @@ mod tests {
             &input_frame(Some(json!({"grant_jti": "j2", "source_device_id": "  "}))),
             NOW,
         )
-        .is_none());
+        .is_some_and(|ack| ack["accepted"] == true));
         assert_eq!(sink.writes().len(), 3);
     }
 
@@ -4238,6 +4801,97 @@ mod tests {
         resync["type"] = json!("remote_terminal_buffer");
         assert!(client.handle_inbound("remote_terminal_buffer", &resync));
         assert_eq!(pane.remote_offset(), 1_008);
+    }
+
+    /// A cancelled attach or history request (the future dropped mid-wait)
+    /// leaves no waiter behind in `pending`.
+    #[tokio::test]
+    async fn a_dropped_request_future_removes_its_pending_entry() {
+        let client = RemoteAttachClient::new();
+        let _pump = client.lock_outbound().await;
+        let r = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.attach("grant.jwt", 80, 24, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(r.is_err(), "cancelled mid-wait");
+        assert_eq!(client.pending_len(), 0, "attach waiter removed on drop");
+
+        let pane = RemotePaneIo::new(
+            "jti-h",
+            "t",
+            "g",
+            client.sink(),
+            80,
+            24,
+            AttachedRing::default(),
+        );
+        let r = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.request_history(&pane, 5, 5, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(client.pending_len(), 0, "history waiter removed on drop");
+    }
+
+    /// A1 source side: a `remote_terminal_input_ack` is routed to the pane by
+    /// `grant_jti` and updates its `last_input_acked`; an ack naming a jti no
+    /// live pane holds is consumed and changes nothing.
+    #[tokio::test]
+    async fn input_ack_routes_to_the_pane_by_grant_jti_and_unknown_is_ignored() {
+        let client = RemoteAttachClient::new();
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-ack",
+            "remote-term",
+            "grant.jwt",
+            client.sink(),
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        client.register_pane(pane.clone());
+
+        let ack = json!({
+            "type": "remote_terminal_input_ack",
+            "grant_jti": "jti-ack",
+            "terminal_id": "remote-term",
+            "seq": 9,
+            "bytes": 2,
+            "accepted": true,
+            "via": "traffic",
+            "accepted_at": "2026-09-27T12:00:00.000Z",
+            "some_future_field": "kept by the relay, ignored here",
+        });
+        assert!(client.handle_inbound("remote_terminal_input_ack", &ack));
+        let i = pane.interactivity();
+        assert_eq!(i.acks_received, 1);
+        let acked = i.last_input_acked.expect("recorded");
+        assert_eq!(acked.seq, Some(9));
+        assert!(acked.accepted);
+
+        let mut stranger = ack.clone();
+        stranger["grant_jti"] = json!("jti-nobody");
+        stranger["seq"] = json!(10);
+        assert!(client.handle_inbound("remote_terminal_input_ack", &stranger));
+        let i = pane.interactivity();
+        assert_eq!(
+            i.acks_received, 1,
+            "an ack for another jti must not land here"
+        );
+        assert_eq!(i.last_input_acked.clone().unwrap().seq, Some(9));
+
+        // Right jti, WRONG terminal: dropped. Absent terminal_id: accepted.
+        let mut crossed = ack.clone();
+        crossed["terminal_id"] = json!("some-other-term");
+        crossed["seq"] = json!(11);
+        assert!(client.handle_inbound("remote_terminal_input_ack", &crossed));
+        assert_eq!(pane.interactivity().acks_received, 1);
+        let mut bare = ack.clone();
+        bare.as_object_mut().unwrap().remove("terminal_id");
+        bare["seq"] = json!(12);
+        assert!(client.handle_inbound("remote_terminal_input_ack", &bare));
+        assert_eq!(pane.interactivity().last_input_acked.unwrap().seq, Some(12));
     }
 
     /// A refused RE-attach — the backend's bare `error` or the target's

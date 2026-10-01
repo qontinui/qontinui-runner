@@ -3334,17 +3334,7 @@ impl TerminalSession {
         // lives here -- where `write` already documents itself as the SINGLE
         // funnel for terminal input, and where every future write surface
         // inherits it for free.
-        if !self.is_alive() {
-            return Err(format!(
-                "{}: terminal {} is not writable -- its process exited with code {}.",
-                TERMINAL_EXITED,
-                self.id,
-                match self.exit_code() {
-                    Some(code) => code.to_string(),
-                    None => "unknown".to_string(),
-                }
-            ));
-        }
+        self.liveness_gate()?;
         {
             let mut writer = self
                 .writer
@@ -3378,6 +3368,50 @@ impl TerminalSession {
             slot,
         );
         self.observe_input(data);
+        Ok(())
+    }
+
+    /// The liveness gate [`Self::write`] runs before touching the writer:
+    /// `Err` carrying the typed [`TERMINAL_EXITED`] prefix once the process
+    /// behind the PTY has exited.
+    fn liveness_gate(&self) -> Result<(), String> {
+        if self.is_alive() {
+            return Ok(());
+        }
+        Err(format!(
+            "{}: terminal {} is not writable -- its process exited with code {}.",
+            TERMINAL_EXITED,
+            self.id,
+            match self.exit_code() {
+                Some(code) => code.to_string(),
+                None => "unknown".to_string(),
+            }
+        ))
+    }
+
+    /// Would a [`Self::write`] be accepted right now? Answers WITHOUT writing.
+    ///
+    /// Plan `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`
+    /// (A1, the write probe). It runs exactly the liveness gate `write` runs,
+    /// then checks the writer lock is not poisoned (a poisoned lock is the one
+    /// other way `write` refuses before any byte moves). It is as strong as a
+    /// real write's `Ok`: a write to an exited PTY succeeds at the OS layer
+    /// (see `write`'s own comment), so the liveness gate is the only fact about
+    /// the PTY a successful write proves.
+    ///
+    /// It records NOTHING — no `last_input` slot, no `observe_input` — because a
+    /// zero-byte `write` would land a 0-byte observation in `last_write`, which
+    /// the phantom-turn detector reads as operator input: a probe that changed
+    /// the neighbouring measurement. `is_poisoned` never blocks, so the probe
+    /// cannot park the relay's serial read loop behind a slow PTY write.
+    pub fn probe_writable(&self) -> Result<(), String> {
+        self.liveness_gate()?;
+        if self.writer.is_poisoned() {
+            return Err(format!(
+                "terminal {} is not writable -- its PTY writer lock is poisoned.",
+                self.id
+            ));
+        }
         Ok(())
     }
 
@@ -6631,6 +6665,58 @@ mod tests {
             b"echo hi\r",
             "the live write must land on the pty byte-for-byte"
         );
+    }
+
+    /// The write probe (plan `2026-09-20-remote-session-interactivity-…`, A1
+    /// acceptance 2): against a LIVE session it answers `Ok`, puts no byte on
+    /// the PTY, and leaves `last_input()` byte-identical — the phantom-turn
+    /// guard. A zero-byte `write` fails the last two (it records a 0-byte
+    /// `last_write` observation), which is why the probe is its own method.
+    #[test]
+    fn probe_writable_on_a_live_pty_writes_nothing_and_records_nothing() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = LiveTestSession::new(buf.clone());
+        session
+            .write(b"x", PtyWriteCaller::Test)
+            .expect("seed one real write so last_input is non-empty");
+        let before = format!("{:?}", session.last_input());
+        let bytes_before = buf.lock().unwrap().len();
+
+        session
+            .probe_writable()
+            .expect("a live pty must probe writable");
+
+        assert_eq!(
+            format!("{:?}", session.last_input()),
+            before,
+            "the probe must not touch last_input"
+        );
+        assert_eq!(buf.lock().unwrap().len(), bytes_before, "0 bytes written");
+
+        // The falsifier: the rejected design (a zero-byte write) DOES move it.
+        session
+            .write(&[], PtyWriteCaller::Test)
+            .expect("zero-byte write succeeds");
+        assert_ne!(
+            format!("{:?}", session.last_input()),
+            before,
+            "control: a zero-byte write records an observation — the probe must not be one"
+        );
+    }
+
+    /// And against an exited session the probe refuses with the SAME typed
+    /// code `write` does, recording nothing.
+    #[test]
+    fn probe_writable_on_an_exited_pty_is_terminal_exited() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf.clone());
+        let before = format!("{:?}", session.last_input());
+        let err = session
+            .probe_writable()
+            .expect_err("an exited pty must not probe writable");
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert_eq!(format!("{:?}", session.last_input()), before);
+        assert!(buf.lock().unwrap().is_empty());
     }
 
     /// The exit code the waiter recorded must travel in the refusal, so a
