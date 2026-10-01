@@ -1,6 +1,8 @@
 //! The allocation-failure breadcrumb: a `#[global_allocator]` wrapper that
-//! writes ONE line to `wedge-incidents.log` when an allocation returns null,
-//! before the default alloc error handler aborts the process.
+//! writes a line to `wedge-incidents.log` when an allocation returns null (at
+//! most [`MAX_BREADCRUMB_LINES`] per process) — before the default alloc error
+//! handler aborts the process, or before a fallible caller (`try_reserve`)
+//! handles the failure and carries on.
 //!
 //! # Why it exists
 //!
