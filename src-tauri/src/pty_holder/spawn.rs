@@ -31,8 +31,8 @@
 //! Windows a stale client handle keeps the old pipe instance alive and the new
 //! holder's first-instance bind fails.
 //!
-//! Nothing here is wired into terminal creation yet: `DaemonPaneIo` and the
-//! default-OFF `terminal.pty_holder` setting are the second half of Phase 2.
+//! Wired into terminal creation by the bin's `terminal::daemon_pane_io`, behind
+//! the default-OFF `terminal.pty_holder` setting.
 
 use std::path::{Path, PathBuf};
 
