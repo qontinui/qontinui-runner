@@ -838,8 +838,9 @@ mod tests {
     /// that was never set up and a runner whose login expired.
     ///
     /// Deliberately `Manual`-only: the `LeastUsage` arms read the process-global
-    /// `RESOLVED_CONFIG_DIR`, and a test that mutated it would race every other
-    /// test in this crate. The arms exercised here touch no shared state.
+    /// `RESOLVED_CONFIG_DIR`. The one test that does exercise them
+    /// (`effective_config_dir_follows_the_fleet_mode_unless_pinned`) holds the
+    /// same fleet pin as this one, so the two never interleave.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
         // The mode is resolved against the process-global fleet cache; pin it
@@ -867,6 +868,97 @@ mod tests {
         assert_eq!(
             get_effective_config_dir(&dead),
             (None, ClaudeConfigDirSource::RejectedNoCredentials)
+        );
+    }
+
+    /// A config dir with live credentials: a `.credentials.json` expiring a
+    /// day out and carrying no refresh token, so the check is pure (no
+    /// refresh is ever requested) and passes on expiry alone.
+    fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 86_400_000;
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth-test",
+                "refreshToken": "",
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+            }
+        });
+        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    /// Restores the process-global `RESOLVED_CONFIG_DIR` on drop, so a failing
+    /// assertion cannot leak a test's pick into another test.
+    struct ResolvedDirRestore(Option<String>);
+
+    impl Drop for ResolvedDirRestore {
+        fn drop(&mut self) {
+            set_resolved_config_dir(self.0.take());
+        }
+    }
+
+    /// **The half-apply guarantee, pinned at the decision site.** Under a fleet
+    /// auto mode an UNPINNED machine whose local mode is `Manual` must take an
+    /// auto arm (the pick `pick_best_account` resolved, else the `config_dir`
+    /// fallback) and never the `Manual` arm. A PINNED machine keeps `Manual`.
+    ///
+    /// Held under the fleet pin for the whole test, which serializes it against
+    /// every other test that reads the fleet term. `RESOLVED_CONFIG_DIR` is set
+    /// explicitly per arm and restored on drop; no test in this crate writes it
+    /// otherwise.
+    #[test]
+    fn effective_config_dir_follows_the_fleet_mode_unless_pinned() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::LeastUsage,
+        ));
+        let _restore = ResolvedDirRestore(get_resolved_config_dir());
+        let (_manual_guard, manual_dir) = dir_with_live_credentials();
+        let (_picked_guard, picked_dir) = dir_with_live_credentials();
+
+        let unpinned_manual = settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_pinned: false,
+            config_dir: Some(manual_dir.clone()),
+            ..Default::default()
+        };
+        let pinned_manual = settings::ClaudeCliSettings {
+            account_selection_pinned: true,
+            ..unpinned_manual.clone()
+        };
+
+        // (a) Unpinned, with a picker result: the PICK wins, not the manual dir.
+        set_resolved_config_dir(Some(picked_dir.clone()));
+        assert_eq!(
+            get_effective_config_dir(&unpinned_manual),
+            (
+                Some(picked_dir.clone()),
+                ClaudeConfigDirSource::LeastUsageResolved
+            )
+        );
+        // (a') Unpinned, no picker result: the auto arm's fallback — still not
+        // the `Manual` arm, even though it lands on the same dir.
+        set_resolved_config_dir(None);
+        assert_eq!(
+            get_effective_config_dir(&unpinned_manual),
+            (
+                Some(manual_dir.clone()),
+                ClaudeConfigDirSource::LeastUsageConfigDirFallback
+            )
+        );
+
+        // (b) Pinned: the fleet is ignored, the `Manual` arm decides — and a
+        // picker result is ignored with it.
+        set_resolved_config_dir(Some(picked_dir));
+        assert_eq!(
+            get_effective_config_dir(&pinned_manual),
+            (Some(manual_dir), ClaudeConfigDirSource::Manual)
         );
     }
 

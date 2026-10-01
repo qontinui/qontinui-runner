@@ -2509,8 +2509,15 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                     // has no account to spawn on. Said once, loudly, on the
                     // transition, so the operator's PUT is not a silent outage.
                     if mode == Some(AccountSelectionMode::Manual) {
-                        let local_dir = crate::settings::get_ai_settings().claude_cli.config_dir;
-                        if local_dir.as_deref().is_none_or(|d| d.trim().is_empty()) {
+                        // Pin and config_dir from ONE document (the
+                        // roster-overlaid settings): a pinned machine is not
+                        // governed by the fleet, so it has nothing to warn about.
+                        let cli = crate::settings::get_ai_settings().claude_cli;
+                        let no_local_dir = cli
+                            .config_dir
+                            .as_deref()
+                            .is_none_or(|d| d.trim().is_empty());
+                        if !cli.account_selection_pinned && no_local_dir {
                             warn!(
                                 "fleet_policy_poller: the fleet says {ACCOUNT_SELECTION_DOMAIN}=manual \
                                  and this machine is not pinned, but it has NO local config_dir — \
