@@ -576,7 +576,10 @@ mod tests {
             let b = body(v);
             assert!(b.input_truncated, "`{key}: true` must be read");
             let (_, note) = map_from_body(&b);
-            assert!(note.contains("truncated the INPUT id list"), "{key}: {note}");
+            assert!(
+                note.contains("truncated the INPUT id list"),
+                "{key}: {note}"
+            );
         }
         // Absent under either name -> false, and no note.
         let b = body(serde_json::json!({"statuses": {}, "sessionBridgeColumnPresent": true}));

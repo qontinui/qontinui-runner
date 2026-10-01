@@ -1758,20 +1758,36 @@ mod tests {
         .unwrap();
         let whole = CoordOwnership::from_response(resp);
         assert!(matches!(
-            lookup_in_index(&whole, "/w/agent-worktrees/a/qontinui-runner", "qontinui-runner"),
+            lookup_in_index(
+                &whole,
+                "/w/agent-worktrees/a/qontinui-runner",
+                "qontinui-runner"
+            ),
             CoordRowLookup::Matched { .. }
         ));
         assert_eq!(
-            lookup_in_index(&whole, "/w/agent-worktrees/b/qontinui-runner", "qontinui-runner"),
+            lookup_in_index(
+                &whole,
+                "/w/agent-worktrees/b/qontinui-runner",
+                "qontinui-runner"
+            ),
             CoordRowLookup::NoRow
         );
 
         let partial = whole.with_partial(Some("stopped at the page bound".to_string()));
         assert!(matches!(
-            lookup_in_index(&partial, "/w/agent-worktrees/a/qontinui-runner", "qontinui-runner"),
+            lookup_in_index(
+                &partial,
+                "/w/agent-worktrees/a/qontinui-runner",
+                "qontinui-runner"
+            ),
             CoordRowLookup::Matched { .. }
         ));
-        match lookup_in_index(&partial, "/w/agent-worktrees/b/qontinui-runner", "qontinui-runner") {
+        match lookup_in_index(
+            &partial,
+            "/w/agent-worktrees/b/qontinui-runner",
+            "qontinui-runner",
+        ) {
             CoordRowLookup::Unavailable { reason } => assert!(reason.contains("PARTIAL")),
             other => panic!("a miss in a partial index must be UNKNOWN, got {other:?}"),
         }
@@ -1782,11 +1798,17 @@ mod tests {
     #[test]
     fn a_partial_index_goes_stale_sooner_than_a_complete_one() {
         let between = PARTIAL_INDEX_TTL + Duration::from_secs(1);
-        assert!(between < DIAL_TTL, "the partial TTL must be the shorter one");
+        assert!(
+            between < DIAL_TTL,
+            "the partial TTL must be the shorter one"
+        );
         assert!(cached_index_is_fresh(false, between));
         assert!(!cached_index_is_fresh(true, between));
         assert!(cached_index_is_fresh(true, PARTIAL_INDEX_TTL));
-        assert!(!cached_index_is_fresh(false, DIAL_TTL + Duration::from_secs(1)));
+        assert!(!cached_index_is_fresh(
+            false,
+            DIAL_TTL + Duration::from_secs(1)
+        ));
     }
 
     /// A fresh PARTIAL index never replaces a COMPLETE last-known-good one
@@ -1796,18 +1818,33 @@ mod tests {
         let young = DIAL_TTL + Duration::from_secs(1); // refetched, still preferred
         let old = COMPLETE_INDEX_PREFERRED_AGE + Duration::from_secs(1);
         // complete cached, partial fetched, within the preferred age -> keep
-        assert_eq!(choose_index(Some((false, young)), true), IndexChoice::KeepCached);
+        assert_eq!(
+            choose_index(Some((false, young)), true),
+            IndexChoice::KeepCached
+        );
         assert_eq!(
             choose_index(Some((false, COMPLETE_INDEX_PREFERRED_AGE)), true),
             IndexChoice::KeepCached
         );
         // ...past it -> the fresh partial wins
-        assert_eq!(choose_index(Some((false, old)), true), IndexChoice::TakeFetched);
+        assert_eq!(
+            choose_index(Some((false, old)), true),
+            IndexChoice::TakeFetched
+        );
         // a complete fetch always wins
-        assert_eq!(choose_index(Some((false, young)), false), IndexChoice::TakeFetched);
-        assert_eq!(choose_index(Some((true, young)), false), IndexChoice::TakeFetched);
+        assert_eq!(
+            choose_index(Some((false, young)), false),
+            IndexChoice::TakeFetched
+        );
+        assert_eq!(
+            choose_index(Some((true, young)), false),
+            IndexChoice::TakeFetched
+        );
         // partial over partial: the newer one
-        assert_eq!(choose_index(Some((true, young)), true), IndexChoice::TakeFetched);
+        assert_eq!(
+            choose_index(Some((true, young)), true),
+            IndexChoice::TakeFetched
+        );
         // nothing cached: take whatever came back
         assert_eq!(choose_index(None, true), IndexChoice::TakeFetched);
         assert_eq!(choose_index(None, false), IndexChoice::TakeFetched);
