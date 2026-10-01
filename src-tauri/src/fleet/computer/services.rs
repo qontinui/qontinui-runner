@@ -721,6 +721,15 @@ pub(crate) fn sc_query_truncated(text: &str) -> bool {
     t.contains("more data") || t.contains("resume at index")
 }
 
+/// Whether an `sc query` listing may be sent as a COMPLETE snapshot: the
+/// command exited 0 AND shows no truncation notice. The exit code is the
+/// locale-independent signal — a short buffer ends `sc` with
+/// `ERROR_MORE_DATA` (234) — and the notice text is a second check, since it
+/// may be localized. Any other non-zero exit is equally "not the whole list".
+pub(crate) fn sc_listing_complete(exit_code: Option<i32>, text: &str) -> bool {
+    exit_code == Some(0) && !sc_query_truncated(text)
+}
+
 /// `BINARY_PATH_NAME` from `sc qc <name>`, quotes stripped.
 pub(crate) fn parse_sc_qc_binary_path(text: &str) -> Option<String> {
     text.lines()
@@ -789,12 +798,15 @@ pub(crate) mod windows {
 
     use super::{
         parse_sc_qc_binary_path, parse_sc_query, props_from_sc, read_runner_file, row_from_props,
-        windows_runner_dir, ServiceScan, WatchedUnit,
+        sc_listing_complete, windows_runner_dir, ServiceScan, WatchedUnit,
     };
 
     const SC_TIMEOUT: Duration = Duration::from_secs(5);
 
-    async fn sc(args: &[&str]) -> Option<String> {
+    /// `(exit code, stdout)`; `None` only when `sc` could not be run or timed
+    /// out. A non-zero exit still returns its output — a truncated listing
+    /// exits 234 with the first page on stdout.
+    async fn sc(args: &[&str]) -> Option<(Option<i32>, String)> {
         let mut cmd = crate::process_helpers::tokio_no_window("sc.exe");
         cmd.args(args)
             .kill_on_drop(true)
@@ -805,9 +817,10 @@ pub(crate) mod windows {
             .await
             .ok()?
             .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        Some((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ))
     }
 
     /// Every `actions.runner.*` Windows service. `units: None` when `sc query`
@@ -815,7 +828,7 @@ pub(crate) mod windows {
     pub(crate) async fn scan() -> ServiceScan {
         // A large buffer so a normal box lists every service in one page; the
         // truncation check below covers the box that still overflows it.
-        let Some(listing) = sc(&[
+        let Some((code, listing)) = sc(&[
             "query", "type=", "service", "state=", "all", "bufsize=", "262144",
         ])
         .await
@@ -825,6 +838,17 @@ pub(crate) mod windows {
                 complete: false,
             };
         };
+        let complete = sc_listing_complete(code, &listing);
+        if !complete {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "fleet::computer: `sc query` exited {code:?} or was truncated — the Windows \
+                     service list is sent as a partial (delta) scan"
+                );
+            }
+        }
         let mut units = Vec::new();
         for s in parse_sc_query(&listing)
             .into_iter()
@@ -832,10 +856,10 @@ pub(crate) mod windows {
         {
             let props = props_from_sc(&s);
             let runner = match sc(&["qc", s.name.as_str()]).await {
-                Some(qc) => parse_sc_qc_binary_path(&qc)
+                Some((Some(0), qc)) => parse_sc_qc_binary_path(&qc)
                     .and_then(|p| windows_runner_dir(&p))
                     .and_then(|d| read_runner_file(std::path::Path::new(&d))),
-                None => None,
+                _ => None,
             };
             units.push(WatchedUnit {
                 row: row_from_props(&props, runner),
@@ -844,7 +868,7 @@ pub(crate) mod windows {
         }
         ServiceScan {
             units: Some(units),
-            complete: !super::sc_query_truncated(&listing),
+            complete,
         }
     }
 }
@@ -1105,6 +1129,18 @@ DISPLAY_NAME: Print Spooler\r
         let never = props_from_sc(&svcs[2]);
         assert_eq!(never.active_state.as_deref(), Some("inactive"));
         assert_eq!(never.result.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn only_a_clean_exit_without_a_notice_is_a_complete_sc_listing() {
+        assert!(sc_listing_complete(Some(0), SC_QUERY));
+        // ERROR_MORE_DATA with the first page and NO (or a localized) notice.
+        assert!(!sc_listing_complete(Some(234), SC_QUERY));
+        assert!(!sc_listing_complete(Some(5), ""));
+        assert!(!sc_listing_complete(None, SC_QUERY));
+        let cut =
+            format!("{SC_QUERY}Enum: more data, need 5156 bytes start resume at index 79\r\n");
+        assert!(!sc_listing_complete(Some(0), &cut));
     }
 
     #[test]
