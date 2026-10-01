@@ -85,7 +85,8 @@ pub fn account_label_for(config_dir: Option<&str>) -> (String, String) {
 
 /// Discover every Claude Code account home on this machine, in precedence
 /// order: `CLAUDE_CONFIG_DIR` → the injected `configured` roster → a scan of
-/// `C:/claude/.claude-*` → `%USERPROFILE%/.claude` (or `$HOME/.claude`).
+/// `<claude_root>/.claude-*` ([`claude_root_for`]: `C:/claude` on Windows,
+/// `$HOME` elsewhere) → `%USERPROFILE%/.claude` (or `$HOME/.claude`).
 ///
 /// Every candidate must carry a `projects/` subdirectory to count, and the
 /// result is de-duplicated by path in first-seen order.
@@ -152,18 +153,40 @@ pub fn discover_account_homes(
 
 /// [`discover_account_homes`] reading the ambient machine itself.
 ///
-/// `C:/claude` is probed on every platform rather than gated behind
-/// `cfg(windows)`: the check is `is_dir()`, which is false everywhere else, and
-/// a `cfg` here would make the scan untestable on the machine that runs CI.
+/// The `.claude-*` scan root is OS-dependent — see [`claude_root_for`]: the
+/// fleet's Windows boxes keep their account homes under `C:/claude`, while a
+/// POSIX box keeps them beside `~/.claude` in `$HOME` (merytshost: 17 homes,
+/// `~/.claude-{ben,carolin,…,tiohorst}`). Until 2026-10-01 the root was the
+/// literal `C:\claude` on every OS, so a Linux runner saw `~/.claude` alone —
+/// 1 of 17 homes (plan
+/// `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+/// RC5).
 pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome> {
+    // `USERPROFILE` on Windows, `HOME` elsewhere — `dirs` already resolves
+    // both, and the runner's own device-identity code uses the same door.
+    let home = dirs::home_dir();
+    let claude_root = claude_root_for(home.as_deref(), cfg!(windows));
     discover_account_homes(
         std::env::var("CLAUDE_CONFIG_DIR").ok(),
         configured,
-        // `USERPROFILE` on Windows, `HOME` elsewhere — `dirs` already resolves
-        // both, and the runner's own device-identity code uses the same door.
-        dirs::home_dir(),
-        Some(PathBuf::from("C:\\claude")),
+        home,
+        claude_root,
     )
+}
+
+/// The directory whose `.claude-*` children are scanned as account homes.
+///
+/// `C:\claude` on Windows (the fleet's layout there), the home dir itself
+/// everywhere else (`~/.claude-<x>` beside `~/.claude`, the layout
+/// `install-claude-accounts.sh` and `claude-registry-name.sh` use on POSIX).
+/// A pure function of its inputs — `windows` is passed rather than read with
+/// `cfg!` here — so both arms are unit-tested on whichever OS runs CI.
+pub fn claude_root_for(home: Option<&Path>, windows: bool) -> Option<PathBuf> {
+    if windows {
+        Some(PathBuf::from("C:\\claude"))
+    } else {
+        home.map(Path::to_path_buf)
+    }
 }
 
 /// The machine-global Claude account roster's `claude_config_dirs`, or an
@@ -355,6 +378,48 @@ mod tests {
         let labels: Vec<&str> = homes.iter().map(|h| h.label.as_str()).collect();
         assert_eq!(labels, vec!["envpin", "configured", "scanned", "unknown"]);
         let _ = (scanned, default_home);
+    }
+
+    #[test]
+    fn the_scan_root_is_c_claude_on_windows_and_the_home_dir_elsewhere() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            claude_root_for(Some(home), true),
+            Some(PathBuf::from("C:\\claude"))
+        );
+        assert_eq!(claude_root_for(Some(home), false), Some(home.to_path_buf()));
+        // No resolvable home off Windows ⇒ no scan arm, not a guess.
+        assert_eq!(claude_root_for(None, false), None);
+    }
+
+    #[test]
+    fn a_posix_home_yields_every_sibling_account_home_once() {
+        // The merytshost layout: `~/.claude` plus `~/.claude-<x>` siblings,
+        // all directly under `$HOME`. With the POSIX scan root the `.claude-*`
+        // arm and the `$HOME/.claude` arm both run over the SAME directory, so
+        // this is also the dedup proof for that overlap.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        make_home(home, ".claude");
+        make_home(home, ".claude-a");
+        make_home(home, ".claude-b");
+        // Not an account home: no `projects/`.
+        std::fs::create_dir_all(home.join(".claude-nothing")).unwrap();
+
+        let root = claude_root_for(Some(home), false);
+        let homes = discover_account_homes(None, &[], Some(home.to_path_buf()), root);
+
+        let dirs: Vec<PathBuf> = homes.iter().map(|h| h.config_dir.clone()).collect();
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude-a"),
+                home.join(".claude-b"),
+                home.join(".claude"),
+            ]
+        );
+        let labels: Vec<&str> = homes.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(labels, vec!["a", "b", "unknown"]);
     }
 
     #[test]
