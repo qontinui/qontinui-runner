@@ -300,6 +300,54 @@ pub struct GateContinuationPayload {
     /// not a reason to drop the whole continuation.
     #[serde(default, deserialize_with = "deserialize_lenient_brief")]
     pub brief: Option<ContinuationBrief>,
+    /// The worktree allocation coord made for this continuation at dispatch
+    /// time (`gates.rs` `allocate_continuation_claims`): `{agent_id,
+    /// worktrees}`, attached when the continuation names repos. Only
+    /// `agent_id` is read.
+    ///
+    /// This runner still materializes its OWN worktree through
+    /// [`acquire_continuation_workdir`], so coord's rows are never used as a
+    /// cwd. They are coord's record of the dispatch, though, carrying
+    /// `dispatch_source = gate_continuation | unit_continuation`, and they were
+    /// written with no session. After a successful spawn this runner reports
+    /// the pinned Claude session against that `agent_id`
+    /// ([`report_session_launched`]), so coord can bind those rows too (plan
+    /// `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    /// Phase 4).
+    ///
+    /// Lenient like `brief`: a shape this build cannot read degrades to `None`
+    /// and never fails the frame.
+    #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
+    pub allocation: Option<ContinuationAllocation>,
+}
+
+/// The part of coord's dispatch-time continuation `allocation` this runner
+/// reads. See [`GateContinuationPayload::allocation`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ContinuationAllocation {
+    pub agent_id: uuid::Uuid,
+}
+
+/// Parse `allocation` without ever failing the whole continuation frame: an
+/// absent, null or unreadable value is `None`.
+fn deserialize_lenient_allocation<'de, D>(d: D) -> Result<Option<ContinuationAllocation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationAllocation>(value) {
+        Ok(a) => Ok(Some(a)),
+        Err(e) => {
+            tracing::warn!(
+                "gate continuation: `allocation` key is not a shape this runner reads ({e}) — \
+                 coord's dispatch rows for it will not learn their session"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Coord's assembled continuation brief, as published on the spawn frame.
@@ -5502,22 +5550,35 @@ async fn run_gate_continuation_inner(
         .map(|a| format!("gate-continuation:{a}"))
         .unwrap_or_else(|| "gate-continuation".to_string());
 
-    // Phase 1b (plan 2026-06-06-session-scoped-multi-repo-workspace-coordination):
-    // thread a stable per-session UUID discriminator so the worktree claims
-    // are session-keyed in the owner token (machine:session). The
-    // gate-continuation wire payload carries NO Claude session uuid (only
-    // `LaunchPayload` does); the next-best stable id is one DETERMINISTICALLY
-    // derived from the continuation's identity so a retry of the SAME gate
-    // continuation reuses the same owner token (a re-acquire renews rather
-    // than collides). We derive it from `(target_device_id, anchor_key)` via
-    // a UUIDv5 in the URL namespace; when `anchor_key` is absent we fall back
-    // to a fresh v4 (a one-shot continuation with no stable anchor).
-    let continuation_session_id = continuation_session_id(&payload);
+    // The Claude session id this continuation will run under, minted HERE —
+    // after the consume claim and before the worktree allocate — and pinned on
+    // both presentations (`--session-id`). Plan
+    // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    // Phase 4.
+    //
+    // It is also the allocate's `agent_session_id`, which keys the worktree
+    // claims' owner token (`machine:session`, plan
+    // 2026-06-06-session-scoped-multi-repo-workspace-coordination Phase 1b) AND
+    // binds the allocated `agent_worktrees` rows to the session that actually
+    // works in them. This replaced a UUIDv5 synthesized from
+    // `(device, anchor_key)`. That id was stable across retries so a re-acquire
+    // could renew its claim, but it named no session: coord stamped it on the
+    // rows and minted an `agent_sessions` row for it, an attribution that joined
+    // nothing. The renewal it bought is moot. Every allocate mints a fresh
+    // agent_id, the per-directory worktree claim is keyed on that agent's own
+    // path, and the anchor guard above never lets two same-anchor continuations
+    // run at once.
+    //
+    // Minted after the claim on purpose: a skipped or deferred claim mints
+    // nothing. A failed acquire allocates no row, so nothing is bound to a
+    // session that never ran. One fresh id per dispatch, because the CLI
+    // refuses to reuse one.
+    let pinned_session_id = uuid::Uuid::new_v4();
 
     let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
         &payload.repos,
         &intent,
-        continuation_session_id,
+        Some(pinned_session_id),
     )
     .await
     {
@@ -5550,8 +5611,16 @@ async fn run_gate_continuation_inner(
     let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx, reservation)
-                .await
+            run_continuation_terminal(
+                agent_id,
+                &workdir,
+                &payload,
+                device_id,
+                ctx,
+                reservation,
+                pinned_session_id,
+            )
+            .await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5568,12 +5637,27 @@ async fn run_gate_continuation_inner(
                 &payload.initial_prompt,
                 payload.brief.as_ref(),
             );
-            let res =
-                run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
+            let res = run_continuation_headless(
+                agent_id,
+                &workdir,
+                &headless_prompt,
+                reservation,
+                pinned_session_id,
+            )
+            .await;
             drop(ctx);
             res
         }
     };
+
+    // coord's own dispatch-time allocation for this continuation (its
+    // `dispatch_source` rows) learns the session too. The runner's allocation
+    // above was already bound at allocate time.
+    if result.is_ok() {
+        if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
+            report_session_launched(dispatch_agent, pinned_session_id).await;
+        }
+    }
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
@@ -5783,6 +5867,10 @@ async fn run_continuation_terminal(
     // drops it, which releases the anchor; the `Ok` arm hands it to the
     // registry once the live entry exists.
     reservation: AnchorReservation,
+    // The Claude session id to pin, minted by the caller before the worktree
+    // allocate so the allocation is bound to it (see
+    // `run_gate_continuation_inner`).
+    pinned_session_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
 
@@ -5869,8 +5957,8 @@ async fn run_continuation_terminal(
         .unwrap_or_default();
     // Pre-pin the Claude session id (#548 Phase 1): the registry records
     // synchronously at spawn instead of mtime-guessing from transcripts.
-    // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
-    let pinned_session_id = uuid::Uuid::new_v4().to_string();
+    // Fresh per dispatch, minted by the caller (CLI fails loudly on reuse).
+    let pinned_session_id = pinned_session_id.to_string();
 
     // Account selection: pin the most-available (token-bearing) account so the
     // continuation does not spawn under a quota-exhausted default and die
@@ -6776,34 +6864,6 @@ async fn run_condition_check_terminal(
 ///   context, and a fresh correlation UUID; `Err` with a
 ///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
 ///   this device.
-/// Derive a stable per-session UUID discriminator for a gate continuation's
-/// worktree claims (Phase 1b, plan
-/// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
-///
-/// The gate-continuation wire payload ([`GateContinuationPayload`]) carries
-/// NO Claude session uuid (unlike [`LaunchPayload::agent_session_id`]), so
-/// there is no upstream id to thread. We synthesize one that is STABLE
-/// across retries of the same continuation: a UUIDv5 over
-/// `"<target_device_id>:<anchor_key>"` in the URL namespace. Two spawns of
-/// the same gate continuation (same device, same anchor) therefore produce
-/// the same owner-token discriminator, so a re-acquire RENEWS the existing
-/// worktree claim instead of colliding with it. When `anchor_key` is absent
-/// (a one-shot continuation with no stable anchor) we fall back to a fresh
-/// v4 — distinctness is preserved, only cross-retry renewal is lost, which
-/// is acceptable for an anchor-less one-shot.
-fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uuid> {
-    match payload.anchor_key.as_deref() {
-        Some(anchor) if !anchor.is_empty() => {
-            let name = format!("{}:{anchor}", payload.target_device_id);
-            Some(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_URL,
-                name.as_bytes(),
-            ))
-        }
-        _ => Some(uuid::Uuid::new_v4()),
-    }
-}
-
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
@@ -6824,8 +6884,9 @@ async fn acquire_continuation_workdir(
             declared_overlap_paths: None,
             plan_id: None,
             phase: None,
-            // Phase 1b: session-keyed worktree claims for the continuation —
-            // see `continuation_session_id` for how this stable id is derived.
+            // Phase 1b: session-keyed worktree claims for the continuation. The
+            // id is the continuation's pinned Claude session (see
+            // `run_gate_continuation_inner`), so the rows coord writes name it.
             agent_session_id,
             // A gate continuation is coord-spawned: no spawn picker chose a
             // tenant, and its session id resolves its own.
@@ -7066,6 +7127,9 @@ async fn run_continuation_headless(
     // in the continuation registry (headless sessions are outside P3/P4), so
     // it is released the moment the child exists; a spawn `Err` drops it.
     reservation: AnchorReservation,
+    // The Claude session id to pin (`--session-id`), minted by the caller
+    // before the worktree allocate. See `run_gate_continuation_inner`.
+    pinned_session_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -7091,7 +7155,17 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
+    let session_args = pinned_session_args(pinned_session_id);
+    match spawn_claude_child(
+        workdir,
+        initial_prompt,
+        None,
+        coord_mcp,
+        &session_args,
+        false,
+    )
+    .await
+    {
         Ok((mut child, preconditions)) => {
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
@@ -7992,12 +8066,19 @@ async fn run_agent_subprocess(
             final_reason = Some("stopped by operator before (re)spawn".to_string());
             break;
         }
+        // Pin this attempt's Claude session id so coord can be told which
+        // session the dispatch launched (plan
+        // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+        // Phase 4). Fresh per attempt: a restart is a new session, and the CLI
+        // refuses a reused id.
+        let attempt_session_id = uuid::Uuid::new_v4();
+        let session_args = pinned_session_args(attempt_session_id);
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
             pinned_config_dir.as_deref(),
             coord_mcp,
-            &[],
+            &session_args,
             false,
         )
         .await
@@ -8015,6 +8096,10 @@ async fn run_agent_subprocess(
                 if restarts == 0 {
                     report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
                         .await;
+                    // The FIRST session is the one the dispatch launched; coord
+                    // binds the earliest report and never rebinds, so a
+                    // restart's session is not reported.
+                    report_session_launched(payload.agent_id, attempt_session_id).await;
                 } else {
                     info!(
                         "agent_runtime: restart {restarts} succeeded agent_id={}",
@@ -9046,6 +9131,88 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The `claude` CLI flags that pin a HEADLESS child's session id, so the
+/// runner knows the id before the child writes anything. The terminal seam
+/// pins the same flag through `build_continuation_claude_command`; this is
+/// the headless twin, passed as `spawn_claude_child`'s `extra_args`. The id
+/// must be fresh for each spawn attempt, because the CLI refuses to reuse one.
+fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
+    vec!["--session-id".to_string(), session_id.to_string()]
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionReportBody {
+    claude_session_id: uuid::Uuid,
+}
+
+/// Tell coord which Claude session this runner launched for `agent_id`.
+///
+/// Plan `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+/// Phase 4. A coord-dispatched allocation is made before its session exists,
+/// so its `agent_worktrees` rows carry no session. The runner pins the session
+/// id at spawn (`--session-id`) and is the only party that knows it. coord
+/// verifies that the credential speaks for the allocation, records the report,
+/// and binds the rows once the session's own `agent_sessions` row exists on
+/// this device. Nothing is bound on the report alone.
+///
+/// Best-effort, like every lifecycle POST here: the spawn has already
+/// happened, and an undelivered report costs attribution, never work. A
+/// `404`/`405` from a coord that predates the route is debug-level.
+async fn report_session_launched(agent_id: uuid::Uuid, claude_session_id: uuid::Uuid) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/session");
+    // coord-tenant-scope(session-noop): agent_id is a parameter and sits in the
+    // path; coord resolves the tenant from the allocation's own rows and
+    // verifies the DEFAULT binding's device JWT speaks for that allocation
+    // (`spawn_admission::reporter_owns_allocation`). Like spawn-complete, there
+    // is no tenant for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&SessionReportBody { claude_session_id })
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                "agent_runtime: session report posted agent_id={agent_id} \
+                 claude_session_id={claude_session_id}"
+            );
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no session-report route yet ({}) for \
+                 agent_id={agent_id}",
+                resp.status()
+            );
+        }
+        Ok(resp) => warn!(
+            "agent_runtime: session report agent_id={agent_id} \
+             claude_session_id={claude_session_id} returned {}",
+            resp.status()
+        ),
+        Err(e) => warn!("agent_runtime: session report agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// The coord-side dispatch allocation a continuation's session should be
+/// reported against: coord's `allocation.agent_id`, unless it is the very
+/// allocation this runner already bound at allocate time (`own_agent_id`).
+fn continuation_dispatch_allocation(
+    payload: &GateContinuationPayload,
+    own_agent_id: uuid::Uuid,
+) -> Option<uuid::Uuid> {
+    payload
+        .allocation
+        .as_ref()
+        .map(|a| a.agent_id)
+        .filter(|id| *id != own_agent_id)
 }
 
 async fn report_spawn_complete(
@@ -12488,46 +12655,93 @@ mod tests {
         );
     }
 
+    fn continuation_payload_with(allocation: serde_json::Value) -> GateContinuationPayload {
+        serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+            "source": GATE_CONTINUATION_SOURCE,
+            "allocation": allocation,
+        }))
+        .expect("a continuation frame never fails on its allocation key")
+    }
+
+    /// coord's dispatch-time `allocation` is read for its `agent_id` only, and
+    /// an absent, null or unreadable value degrades to `None` instead of
+    /// failing the frame (plan
+    /// 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state
+    /// Phase 4).
     #[test]
-    fn continuation_session_id_is_stable_for_same_anchor_and_device() {
-        // Phase 1b: the synthesized owner-token discriminator must be STABLE
-        // across retries of the same continuation (same device + anchor) so a
-        // re-acquire renews rather than collides, and DISTINCT across anchors.
-        let device = uuid::Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
-        let mk = |anchor: Option<&str>| GateContinuationPayload {
-            target_device_id: device,
-            initial_prompt: "p".to_string(),
-            repos: vec![],
-            presentation: Presentation::Headless,
-            source: GATE_CONTINUATION_SOURCE.to_string(),
-            anchor_key: anchor.map(|s| s.to_string()),
-            gate_id: None,
-            dispatch_id: None,
-            target_instance_name: None,
-            brief: None,
-        };
+    fn continuation_allocation_is_read_leniently() {
+        let agent = uuid::Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let full = continuation_payload_with(serde_json::json!({
+            "agent_id": agent,
+            "worktrees": [{"repo": "qontinui/qontinui-coord", "branch": "agent/x"}],
+        }));
+        assert_eq!(
+            full.allocation,
+            Some(ContinuationAllocation { agent_id: agent })
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::Value::Null).allocation,
+            None
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::json!({"agent_id": "not-a-uuid"})).allocation,
+            None
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::json!("garbage")).allocation,
+            None
+        );
+        let absent: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+        }))
+        .expect("parse");
+        assert_eq!(absent.allocation, None);
+    }
 
-        let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
-        let a2 = continuation_session_id(&mk(Some("gate-7f2358d5")));
-        assert_eq!(a1, a2, "same (device, anchor) → same stable id");
-        assert!(a1.is_some());
+    /// The session is reported against coord's dispatch allocation, never
+    /// against the runner's own allocation (already bound at allocate time),
+    /// and not at all when coord attached none.
+    #[test]
+    fn the_session_is_reported_against_coords_dispatch_allocation_only() {
+        let coords = uuid::Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let own = uuid::Uuid::parse_str("88888888-8888-8888-8888-888888888888").unwrap();
+        let with = continuation_payload_with(serde_json::json!({"agent_id": coords}));
+        assert_eq!(continuation_dispatch_allocation(&with, own), Some(coords));
+        assert_eq!(continuation_dispatch_allocation(&with, coords), None);
+        let without = continuation_payload_with(serde_json::Value::Null);
+        assert_eq!(continuation_dispatch_allocation(&without, own), None);
+    }
 
-        let b = continuation_session_id(&mk(Some("gate-other")));
-        assert_ne!(a1, b, "different anchor → different id");
+    /// The headless pin is exactly the CLI's `--session-id <uuid>` pair, the
+    /// same flag the terminal seam pins, so the id the runner reports is the
+    /// id the child runs under.
+    #[test]
+    fn pinned_session_args_are_the_cli_session_id_pair() {
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        assert_eq!(
+            pinned_session_args(id),
+            vec![
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string()
+            ]
+        );
+    }
 
-        // A different device with the same anchor is also distinct.
-        let other_device = GateContinuationPayload {
-            target_device_id: uuid::Uuid::parse_str("66666666-6666-6666-6666-666666666666")
-                .unwrap(),
-            ..mk(Some("gate-7f2358d5"))
-        };
-        assert_ne!(a1, continuation_session_id(&other_device));
-
-        // Anchor-less → a fresh v4 each call (Some, but non-equal).
-        let n1 = continuation_session_id(&mk(None));
-        let n2 = continuation_session_id(&mk(None));
-        assert!(n1.is_some() && n2.is_some());
-        assert_ne!(n1, n2, "anchor-less continuations get a fresh id each time");
+    /// The session-report body is the one key coord's `SessionReportRequest`
+    /// reads.
+    #[test]
+    fn session_report_body_wire_shape() {
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        assert_eq!(
+            serde_json::to_value(SessionReportBody {
+                claude_session_id: id
+            })
+            .unwrap(),
+            serde_json::json!({"claude_session_id": "99999999-9999-4999-8999-999999999999"})
+        );
     }
 
     /// In a non-Tauri (unit-test) context there is no process-global AppHandle,
@@ -12550,6 +12764,7 @@ mod tests {
             dispatch_id: None,
             target_instance_name: None,
             brief: None,
+            allocation: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -12559,6 +12774,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             None,
             AnchorReservation::none(),
+            uuid::Uuid::new_v4(),
         )
         .await;
         assert!(
@@ -12663,6 +12879,7 @@ mod tests {
             &workdir,
             "echo gate-continuation-proof",
             AnchorReservation::none(),
+            uuid::Uuid::new_v4(),
         )
         .await;
         match prev_tier {
@@ -15119,6 +15336,7 @@ mod tests {
                 // Upstream's dispatch-time continuation brief: irrelevant to
                 // the gate-id discrimination this test pins.
                 brief: None,
+                allocation: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
