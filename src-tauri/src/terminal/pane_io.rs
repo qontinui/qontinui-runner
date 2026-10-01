@@ -243,7 +243,9 @@ impl ExecFault {
 ///   0.8.1's `CommandBuilder::search_path` makes for an absolute program
 ///   before it bails with *"Unable to spawn … because it doesn't exist on the
 ///   filesystem or is not executable"*. It follows symlinks, so a dangling
-///   nvm symlink reads as [`ExecFault::NotFound`].
+///   nvm symlink reads as [`ExecFault::NotFound`]. A directory passes
+///   `access(X_OK)` but `execve` refuses it, so it is reported as
+///   [`ExecFault::PermissionDenied`] (the exec's own EACCES).
 /// - **Windows:** `Path::is_file()`. `CreateProcessW` is the seam there, and the
 ///   callers only hand it `.exe`/`.com` candidates (`resolve_claude_bin`).
 ///
@@ -259,11 +261,16 @@ pub(crate) fn probe_launchable(program: &std::path::Path) -> Result<(), ExecFaul
         };
         // SAFETY: `c_path` is a valid NUL-terminated C string that outlives
         // the call; `access` only reads it.
-        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0 {
-            Ok(())
-        } else {
-            Err(ExecFault::from_io(&std::io::Error::last_os_error()))
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
+            return Err(ExecFault::from_io(&std::io::Error::last_os_error()));
         }
+        // `access(X_OK)` passes a searchable DIRECTORY too, which `execve`
+        // then refuses with EACCES — so a directory is not launchable, and
+        // reports the fault the exec would have.
+        if program.is_dir() {
+            return Err(ExecFault::PermissionDenied);
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
