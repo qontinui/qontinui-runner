@@ -926,7 +926,9 @@ pub fn coord_bound_tenants_at_within(
 /// - **Drop**: local binding entries whose tenant is NOT in `coord_set`
 ///   are removed, and their `device_jwt:<tenant>` slots cleared (coord
 ///   Phase 3's refresh gate would 403 them anyway). Orphan slots with no
-///   binding entry are cleared by the same rule.
+///   binding entry are cleared by the same rule. Only after the tenant has
+///   been missing from [`RECONCILE_DROP_AFTER_OMISSIONS`] CONSECUTIVE echoes
+///   (tracked in `coord_omission_streaks.json`); a single omission is held.
 /// - **Flag**: tenants in `coord_set` the runner holds no USABLE credential
 ///   for are reported (`coord_only`, with each one's slot state) — never
 ///   fabricated locally; pair, or let the refresher re-derive, to heal.
@@ -955,6 +957,122 @@ pub fn reconcile_paired_bindings(
     reconcile_paired_bindings_with(&mgr, &path, coord_set)
 }
 
+/// How many CONSECUTIVE reconciles must omit a tenant from coord's echoed set
+/// before its binding is dropped and its slot cleared. One omitted echo used to
+/// delete a live credential outright (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// D4); a single bad echo is now held, not acted on.
+pub const RECONCILE_DROP_AFTER_OMISSIONS: u32 = 2;
+
+/// An omission counts toward the streak only this long after the previously
+/// COUNTED one. Every runner on a box shares the streak file (it sits beside the
+/// shared `paired_user.json`), so without this a primary and an instance runner
+/// heartbeating through the same coord glitch would each add one within seconds
+/// and turn ONE bad echo into two "consecutive" omissions. Below the 30 s
+/// heartbeat cadence, so a single runner's consecutive heartbeats still count.
+pub const RECONCILE_OMISSION_MIN_SPACING_SECS: i64 = 20;
+
+/// One tenant's run of consecutive omissions from coord's echoed set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreak {
+    consecutive: u32,
+    /// Unix seconds of the first omission in this run (forensics: logged on drop).
+    first_omitted_at: i64,
+    /// Unix seconds of the most recent omission that was COUNTED.
+    #[serde(default)]
+    last_counted_at: i64,
+}
+
+/// `coord_omission_streaks.json`, beside `paired_user.json`: tenant id → streak.
+/// A sidecar for the same reason as `coord_bound_tenants.json` — only the
+/// reconcile writes it, so it never races `persist_pairing`'s rewrite.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreaksFile {
+    #[serde(default)]
+    tenants: std::collections::BTreeMap<String, OmissionStreak>,
+}
+
+fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
+    paired_user.with_file_name("coord_omission_streaks.json")
+}
+
+fn read_omission_streaks(path: &std::path::Path) -> OmissionStreaksFile {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic write under a per-process temp name (several runners share the dir).
+fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
+    let written = serde_json::to_vec_pretty(file)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            let tmp = path.with_extension(format!("json.omission.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        });
+    if let Err(e) = written {
+        tracing::warn!("reconcile: could not persist {}: {e}", path.display());
+    }
+}
+
+/// Advance the streaks for this pass and return the tenants that have now been
+/// omitted [`RECONCILE_DROP_AFTER_OMISSIONS`] times in a row, each with the
+/// unix second its run began (their records are consumed). Every tenant NOT
+/// omitted this pass has its streak reset. An omission closer than
+/// [`RECONCILE_OMISSION_MIN_SPACING_SECS`] to the last counted one is not
+/// counted. An unreadable sidecar reads as empty, and a consumed streak whose
+/// clear then fails restarts at one — both only DELAY a drop, never cause one.
+fn advance_omission_streaks(
+    paired_user: &std::path::Path,
+    omitted: &[uuid::Uuid],
+    now_unix: i64,
+) -> Vec<(uuid::Uuid, i64)> {
+    let path = omission_streaks_path(paired_user);
+    let before = read_omission_streaks(&path);
+    let mut after = OmissionStreaksFile::default();
+    let mut due = Vec::new();
+    for t in omitted {
+        let key = t.to_string();
+        let streak = match before.tenants.get(&key) {
+            Some(prev) if now_unix - prev.last_counted_at < RECONCILE_OMISSION_MIN_SPACING_SECS => {
+                prev.clone()
+            }
+            Some(prev) => OmissionStreak {
+                consecutive: prev.consecutive.saturating_add(1),
+                first_omitted_at: prev.first_omitted_at,
+                last_counted_at: now_unix,
+            },
+            None => OmissionStreak {
+                consecutive: 1,
+                first_omitted_at: now_unix,
+                last_counted_at: now_unix,
+            },
+        };
+        if streak.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS {
+            due.push((*t, streak.first_omitted_at));
+        } else {
+            after.tenants.insert(key, streak);
+        }
+    }
+    if after != before {
+        write_omission_streaks(&path, &after);
+    }
+    due
+}
+
+/// A fresh pairing proves the binding is wanted: forget any omission streak the
+/// tenant had, so a coord echo that lags the pair by one heartbeat cannot drop
+/// the credential just minted. Best-effort.
+fn reset_omission_streak(paired_user: &std::path::Path, tenant: &uuid::Uuid) {
+    let path = omission_streaks_path(paired_user);
+    let mut file = read_omission_streaks(&path);
+    if file.tenants.remove(&tenant.to_string()).is_some() {
+        write_omission_streaks(&path, &file);
+    }
+}
+
 /// Parameterized core of [`reconcile_paired_bindings`] — explicit
 /// `AuthManager` + file path so the unit tests run hermetically against
 /// a temp store, never the operator's real credentials.
@@ -962,6 +1080,17 @@ pub(crate) fn reconcile_paired_bindings_with(
     mgr: &crate::auth::AuthManager,
     path: &std::path::Path,
     coord_set: &[uuid::Uuid],
+) -> Result<BindingReconcileReport, String> {
+    reconcile_paired_bindings_at(mgr, path, coord_set, chrono::Utc::now().timestamp())
+}
+
+/// [`reconcile_paired_bindings_with`] at an explicit clock, so the omission
+/// streak's spacing rule is testable.
+pub(crate) fn reconcile_paired_bindings_at(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
 ) -> Result<BindingReconcileReport, String> {
     let mut report = BindingReconcileReport::default();
 
@@ -986,15 +1115,50 @@ pub(crate) fn reconcile_paired_bindings_with(
     let pf: PairedUserFile =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
 
+    // Hysteresis: a tenant (binding or orphan slot) missing from this echo is
+    // dropped only once it has been missing from RECONCILE_DROP_AFTER_OMISSIONS
+    // consecutive echoes; until then it is held exactly as if coord had echoed it.
+    let bindings = pf.effective_bindings();
+    let mut omitted: Vec<uuid::Uuid> = bindings
+        .iter()
+        .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
+        .chain(mgr.list_tenant_device_jwt_tenants())
+        .filter(|t| !coord_set.contains(t))
+        .collect();
+    omitted.sort();
+    omitted.dedup();
+    let due_runs = advance_omission_streaks(path, &omitted, now_unix);
+    let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
+    let run_began = |t: &uuid::Uuid| {
+        due_runs
+            .iter()
+            .find(|(d, _)| d == t)
+            .map(|(_, since)| *since)
+            .unwrap_or_default()
+    };
+    for t in omitted.iter().filter(|t| !due.contains(t)) {
+        tracing::info!(
+            "reconcile: tenant {t} is missing from coord's echoed set {coord_set:?} — HOLDING its \
+             binding and slot until {RECONCILE_DROP_AFTER_OMISSIONS} consecutive echoes omit it"
+        );
+    }
+    let keeps = |t: &uuid::Uuid| coord_set.contains(t) || !due.contains(t);
+
     // Partition the (migrated) binding set by coord membership. Entries
     // with malformed tenant_id can never match coord and carry no slot —
     // dropped as junk (logged, not reported).
     let mut kept: Vec<PairedBinding> = Vec::new();
     let mut dropped_malformed = false;
-    for b in pf.effective_bindings() {
+    for b in bindings {
         match uuid::Uuid::parse_str(b.tenant_id.trim()) {
-            Ok(t) if coord_set.contains(&t) => kept.push(b),
+            Ok(t) if keeps(&t) => kept.push(b),
             Ok(t) => {
+                tracing::warn!(
+                    "reconcile: DROPPING binding and clearing slot for tenant {t} — omitted from \
+                     {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix {}; \
+                     this echo was {coord_set:?}",
+                    run_began(&t)
+                );
                 report.dropped.push(t);
                 // Designed home of slot deletion: coord no longer has the
                 // binding, so its credential is dead weight. Best-effort.
@@ -1019,7 +1183,13 @@ pub(crate) fn reconcile_paired_bindings_with(
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .collect();
     for t in mgr.list_tenant_device_jwt_tenants() {
-        if !coord_set.contains(&t) && !report.dropped.contains(&t) {
+        if !keeps(&t) && !report.dropped.contains(&t) {
+            tracing::warn!(
+                "reconcile: clearing ORPHAN slot for tenant {t} — omitted from \
+                 {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix {}; \
+                 this echo was {coord_set:?}",
+                run_began(&t)
+            );
             if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
                 tracing::debug!("reconcile: clear orphan slot {t} failed: {e}");
             } else {
@@ -1821,6 +1991,7 @@ pub(crate) fn persist_pairing_with(
     // now-readable store. See `SecureStorage::WriteMode`.
     mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
+    reset_omission_streak(path, &tenant_id);
 
     // 2. Load + migrate the existing file (missing → fresh; unparseable
     //    → start over, same clobber posture the pre-8a writer had).
@@ -2959,8 +3130,15 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp(&ja), ta()).unwrap();
         persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
 
-        // Coord says: A still bound, B gone, C newly bound elsewhere.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tc()]).expect("reconcile");
+        // Coord says: A still bound, B gone, C newly bound elsewhere. The
+        // first omission is held (hysteresis); the second acts.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0).expect("reconcile");
+        assert!(
+            held.dropped.is_empty(),
+            "one omission must not drop: {held:?}"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![tb()]);
         assert_eq!(
@@ -2996,8 +3174,14 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
         assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
 
-        // Coord dropped A (the default); B survives.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[tb()]).expect("reconcile");
+        // Coord dropped A (the default); B survives. Held once, then acted on.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0).expect("reconcile");
+        assert_eq!(
+            held.default_repointed, None,
+            "one omission must not re-point"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(Some(tb())));
@@ -3027,7 +3211,9 @@ mod tests {
         let path = dir.join("paired_user.json");
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[]).expect("reconcile");
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[], T0).expect("reconcile");
+        assert!(!held.changed(), "one empty echo must not drop: {held:?}");
+        let report = reconcile_paired_bindings_at(&mgr, &path, &[], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(None), "default cleared");
@@ -3068,6 +3254,119 @@ mod tests {
             std::fs::read(&path).unwrap(),
             before,
             "steady state must not rewrite the file"
+        );
+    }
+
+    /// Reconcile clock for the hysteresis tests; successive heartbeats are 30 s apart.
+    const T0: i64 = 1_790_000_000;
+
+    /// Two omissions closer together than RECONCILE_OMISSION_MIN_SPACING_SECS
+    /// (e.g. a primary and an instance runner heartbeating through the same coord
+    /// glitch against the SHARED streak file) count once, so nothing is dropped.
+    #[test]
+    fn reconcile_omissions_closer_than_the_spacing_count_once() {
+        let dir = temp_dir_for("reconcile_spacing");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 5).expect("r2");
+        assert!(!r1.changed() && !r2.changed(), "{r1:?} {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+        // A properly spaced second omission does drop.
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r3");
+        assert_eq!(r3.dropped, vec![tb()]);
+    }
+
+    /// Re-pairing a tenant forgets its omission streak: an echo lagging the
+    /// pair by one heartbeat must not drop the credential just minted.
+    #[test]
+    fn repairing_a_tenant_resets_its_omission_streak() {
+        let dir = temp_dir_for("reconcile_repair_resets");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert!(!r1.changed(), "{r1:?}");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b2")), tb()).unwrap();
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "re-pair must reset the streak: {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+    }
+
+    /// D4 hysteresis: ONE echo omitting a tenant keeps its binding and slot;
+    /// the tenant reappearing resets the streak (so a later single omission is
+    /// held again); TWO consecutive omissions drop the binding and clear the
+    /// slot. Orphan slots follow the same rule.
+    #[test]
+    fn reconcile_requires_two_consecutive_omissions_and_reappearance_resets() {
+        let dir = temp_dir_for("reconcile_hysteresis");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        // An orphan slot (no binding entry) for C.
+        mgr.store_tenant_device_jwt(&tc(), &live_jwt("c")).unwrap();
+        let slot_b = mgr.get_tenant_device_jwt(&tb()).unwrap();
+        assert!(slot_b.is_some());
+
+        // 1st omission of B and C: held.
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(!r1.changed(), "one omission must not drop: {r1:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
+        assert_eq!(read_file(&path).bindings.len(), 2);
+
+        // B and C reappear: streaks reset.
+        let r2 =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tb(), tc()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "{r2:?}");
+
+        // Omitted once again after the reset: still held (count restarted at 1).
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 60).expect("r3");
+        assert!(!r3.changed(), "a reset streak must restart at one: {r3:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+
+        // Second CONSECUTIVE omission: dropped and cleared.
+        let r4 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 90).expect("r4");
+        assert_eq!(r4.dropped, vec![tb()]);
+        assert_eq!(r4.dropped_slots, vec![tc()]);
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_some());
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1);
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+    }
+
+    /// Gate of Phase 1: pairing tenant A leaves tenant B's slot BYTE-IDENTICAL
+    /// — through the Fresh (explicit-acquisition) write path `persist_pairing`
+    /// uses — on a readable store.
+    #[test]
+    fn pairing_one_tenant_leaves_another_tenants_slot_byte_identical() {
+        let dir = temp_dir_for("pair_leaves_sibling_slot");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        let jb = live_jwt("b");
+        persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
+        let before = mgr.get_tenant_device_jwt(&tb()).unwrap().expect("B slot");
+        assert_eq!(before, jb);
+
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a2")), ta()).unwrap();
+
+        let after = mgr
+            .get_tenant_device_jwt(&tb())
+            .unwrap()
+            .expect("B slot survives");
+        assert_eq!(
+            after.as_bytes(),
+            before.as_bytes(),
+            "B's slot must be byte-identical"
         );
     }
 
@@ -3336,7 +3635,11 @@ mod tests {
         // Orphan slot for C: no binding entry, and coord doesn't have C.
         mgr.store_tenant_device_jwt(&tc(), "jwt.c.orphan").unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
+        // First omission is held (D4 hysteresis); the second clears.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(held.dropped_slots.is_empty(), "{held:?}");
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped_slots, vec![tc()]);
         assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
