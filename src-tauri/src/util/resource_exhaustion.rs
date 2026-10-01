@@ -305,11 +305,6 @@ struct StderrNeedle {
     digit_bounded: bool,
 }
 
-/// The needles, built once. Built from THIS process's OS: on Windows
-/// `io::Error::to_string()` renders through `FormatMessageW` in the user's
-/// default language — the same call Git for Windows' launcher makes to print
-/// `error launching git: …` — so the German box gets German needles and the
-/// English box English ones, with no language table to keep current.
 /// Build the stderr needles now. Called at startup so the first classification
 /// — which happens under memory pressure by definition — does not also pay for
 /// rendering and allocating them.
@@ -317,6 +312,11 @@ pub fn prewarm_stderr_needles() {
     let _ = stderr_needles();
 }
 
+/// The needles, built once. Built from THIS process's OS: on Windows
+/// `io::Error::to_string()` renders through `FormatMessageW` in the user's
+/// default language — the same call Git for Windows' launcher makes to print
+/// `error launching git: …` — so the German box gets German needles and the
+/// English box English ones, with no language table to keep current.
 fn stderr_needles() -> &'static [StderrNeedle] {
     static NEEDLES: OnceLock<Vec<StderrNeedle>> = OnceLock::new();
     NEEDLES.get_or_init(|| {
@@ -788,15 +788,18 @@ fn emit_opened(kind: ExhaustionKind, evidence: Evidence, os_code: Option<i32>, c
 /// The `wedge-incidents.log` token an episode of this (kind, evidence) opens
 /// with, or `None` for `fd` (kept out of the file — see [`report_exhaustion`]).
 /// Its close is the same token with [`CLOSED_SUFFIX`]. The text-evidenced
-/// commit case keeps "suspected" in the token, so the next-boot harvest can
+/// cases keep "suspected" in the token, so the next-boot harvest can
 /// never render a suspicion as an OS-reported fact.
 pub fn incident_token(kind: ExhaustionKind, evidence: Evidence) -> Option<&'static str> {
     match (kind, evidence) {
         (ExhaustionKind::Fd, _) => None,
         (ExhaustionKind::Commit, Evidence::OsCode) => Some("commit_exhaustion"),
         (ExhaustionKind::Commit, Evidence::ChildStderr) => Some("commit_exhaustion_suspected"),
-        (ExhaustionKind::NoSystemResources | ExhaustionKind::TaskLimit, _) => {
+        (ExhaustionKind::NoSystemResources | ExhaustionKind::TaskLimit, Evidence::OsCode) => {
             Some("resource_exhaustion")
+        }
+        (ExhaustionKind::NoSystemResources | ExhaustionKind::TaskLimit, Evidence::ChildStderr) => {
+            Some("resource_exhaustion_suspected")
         }
     }
 }
@@ -1152,6 +1155,10 @@ mod tests {
         assert_eq!(
             incident_token(ExhaustionKind::TaskLimit, Evidence::OsCode),
             Some("resource_exhaustion")
+        );
+        assert_eq!(
+            incident_token(ExhaustionKind::TaskLimit, Evidence::ChildStderr),
+            Some("resource_exhaustion_suspected")
         );
     }
 

@@ -1052,8 +1052,10 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 /// Phase 3b).
 ///
 /// The exception is `qontinui_runner_lib::alloc_breadcrumb`, which writes the
-/// SAME line format (tokens `alloc_failure`, `commit_exhaustion`,
-/// `resource_exhaustion`) through a handle it opened at startup. It cannot come
+/// SAME line format through a handle it opened at startup — tokens
+/// `alloc_failure`, `commit_exhaustion`, `commit_exhaustion_suspected`,
+/// `resource_exhaustion`, `resource_exhaustion_suspected`, and each episode
+/// token's `_closed` twin (`commit_exhaustion_closed`, …). It cannot come
 /// through here: its `alloc_failure` line is written from inside a failing
 /// allocator, and this function allocates (`format!`, `chrono`). Plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
@@ -1073,7 +1075,9 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 ///
 /// `reason` is the stable, greppable token (`backend_wedged`,
 /// `ui_thread_wedged`, `recovery_wedged`, `coord_unreachable`,
-/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`);
+/// `coord_worker_dead`, `coord_no_leader`, `coord_liveness_unknown`; plus,
+/// through `alloc_breadcrumb`'s own handle, the exhaustion tokens listed
+/// above);
 /// `detail` is the prose after it.
 ///
 /// Best-effort by contract: the process is already sick, so a failure to write

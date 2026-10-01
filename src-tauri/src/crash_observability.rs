@@ -144,6 +144,7 @@ pub fn harvest_boot_crash_evidence(boot: BootClassification) {
             &read_incident_tail(&incidents),
             prior.unwrap_or(0),
             detected_at_ms,
+            std::process::id(),
         );
 
         // 1) Minimal, instant breadcrumb — better than silence, and enough for
@@ -259,11 +260,12 @@ fn write_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
 /// close is the same token + `_closed`. Plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
 /// Phase 0 item 5.
-const EXHAUSTION_TOKENS: [&str; 4] = [
+const EXHAUSTION_TOKENS: [&str; 5] = [
     "alloc_failure",
     "commit_exhaustion",
     "commit_exhaustion_suspected",
     "resource_exhaustion",
+    "resource_exhaustion_suspected",
 ];
 
 /// How much of the incident log's tail the harvest reads. The file is
@@ -309,38 +311,58 @@ fn read_incident_tail(path: &Path) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// The exhaustion lines stamped inside `[since_ms, until_ms]` — the prior
-/// run's life, from its boot (the shutdown marker's `at`) to this boot's
-/// detection — that were still OPEN at the end of it. PURE, so the
-/// attribution window and the pairing are settleable in a test.
+/// The exhaustion lines the DEAD run left inside `[since_ms, until_ms]` — from
+/// its boot (the shutdown marker's `at`) to this boot's detection — that were
+/// still OPEN when it died. PURE, so the attribution is settleable in a test.
 ///
-/// A line outside the window belongs to an EARLIER run and must not be
-/// pinned on this crash: the file is never truncated, so an old
-/// `alloc_failure` would otherwise name every later unrelated death. An
-/// episode whose `<token>_closed` line (same `kind=`) follows its opening line
-/// had ENDED before the process died, so it is dropped too.
+/// Three filters, each for a way the window lies:
+///
+/// - **Time.** A line outside the window belongs to an EARLIER run: the file
+///   is never truncated, so an old `alloc_failure` would otherwise name every
+///   later unrelated death.
+/// - **Process.** Every line ends `(pid N)`. Lines from `own_pid` (THIS boot —
+///   `install_live_crash_writer` runs before the harvest, so this process can
+///   already have written lines) are dropped. The window can also hold lines
+///   from OTHER live processes sharing the dev-logs path, so pairing and "last
+///   line" are judged only among the lines of ONE pid: the pid of the last
+///   remaining in-window line, which is the process that stopped writing
+///   last. The shutdown marker records no pid, so that inference is the best
+///   available; a line with no parseable pid is not attributed.
+/// - **Closure.** An episode whose `<token>_closed` line (same `kind=`, same
+///   pid) follows its opening line had ENDED before the process died.
 pub(crate) fn find_prior_exhaustion(
     log: &str,
     since_ms: i64,
     until_ms: i64,
+    own_pid: u32,
 ) -> Vec<PriorExhaustion> {
-    // (sequence number among in-window lines, entry)
+    let candidates: Vec<(&str, &str, i64, u32)> = log
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.trim();
+            let mut parts = line.splitn(3, ' ');
+            let ts = parts.next()?;
+            let token = parts.next()?;
+            let at_ms = chrono::DateTime::parse_from_rfc3339(ts)
+                .ok()?
+                .timestamp_millis();
+            let pid = line_pid(line)?;
+            ((since_ms..=until_ms).contains(&at_ms) && pid != own_pid)
+                .then_some((line, token, at_ms, pid))
+        })
+        .collect();
+    let Some(&(_, _, _, dead_pid)) = candidates.last() else {
+        return Vec::new();
+    };
+    let dead_lines: Vec<_> = candidates
+        .into_iter()
+        .filter(|&(_, _, _, pid)| pid == dead_pid)
+        .collect();
+    let last_seq = dead_lines.len().checked_sub(1);
+
+    // (sequence number among the dead run's lines, entry)
     let mut found: Vec<(usize, PriorExhaustion)> = Vec::new();
-    let mut last_seq = None;
-    let in_window = log.lines().filter_map(|raw| {
-        let line = raw.trim();
-        let mut parts = line.splitn(3, ' ');
-        let ts = parts.next()?;
-        let token = parts.next()?;
-        let at_ms = chrono::DateTime::parse_from_rfc3339(ts)
-            .ok()?
-            .timestamp_millis();
-        (since_ms..=until_ms)
-            .contains(&at_ms)
-            .then_some((line, token, at_ms))
-    });
-    for (seq, (line, token, at_ms)) in in_window.enumerate() {
-        last_seq = Some(seq);
+    for (seq, &(line, token, at_ms, _)) in dead_lines.iter().enumerate() {
         if let Some(open) = EXHAUSTION_TOKENS.iter().copied().find(|t| *t == token) {
             found.push((
                 seq,
@@ -376,6 +398,11 @@ pub(crate) fn find_prior_exhaustion(
     found
 }
 
+/// The `N` of an incident line's trailing `(pid N)`.
+fn line_pid(line: &str) -> Option<u32> {
+    line.strip_suffix(')')?.rsplit_once("(pid ")?.1.parse().ok()
+}
+
 /// The `kind=` field of an incident line, which pairs an episode's opening
 /// line with its `_closed` line.
 fn kind_field(line: &str) -> Option<&str> {
@@ -383,12 +410,19 @@ fn kind_field(line: &str) -> Option<&str> {
         .find_map(|w| w.strip_prefix("kind="))
 }
 
-/// The most specific exhaustion line: the latest line of the first
-/// [`EXHAUSTION_TOKENS`] entry present.
+/// The line the crash file is headlined by:
+///
+/// 1. an `alloc_failure` that is the dead run's LAST line — the likely cause;
+/// 2. else whatever IS the last line (an episode still open at death) — it
+///    outranks an earlier `alloc_failure`, which a graceful `try_reserve`
+///    failure also writes and the process may have survived;
+/// 3. else the latest line of the first [`EXHAUSTION_TOKENS`] entry present.
 fn headline_exhaustion(found: &[PriorExhaustion]) -> Option<&PriorExhaustion> {
-    EXHAUSTION_TOKENS
-        .iter()
-        .find_map(|t| found.iter().rev().find(|e| e.token == *t))
+    found.iter().find(|e| e.last_in_window).or_else(|| {
+        EXHAUSTION_TOKENS
+            .iter()
+            .find_map(|t| found.iter().rev().find(|e| e.token == *t))
+    })
 }
 
 /// The text after `<timestamp> <token> `, i.e. what the line says.
@@ -507,6 +541,17 @@ pub(crate) fn format_harvest_breadcrumb(
                 .to_string(),
             format!(
                 "post-crash harvest: prior shutdown was unclean while commit exhaustion was \
+                 SUSPECTED (from a failed child's stderr): {}",
+                exhaustion_detail(e)
+            ),
+        ),
+        Some(e) if e.token == "resource_exhaustion_suspected" => (
+            "resource exhaustion (suspected) — the prior run died inside an open episode \
+             evidenced only by child stderr text (resource_exhaustion_suspected breadcrumb, \
+             wedge-incidents.log)"
+                .to_string(),
+            format!(
+                "post-crash harvest: prior shutdown was unclean while resource exhaustion was \
                  SUSPECTED (from a failed child's stderr): {}",
                 exhaustion_detail(e)
             ),
@@ -1085,16 +1130,18 @@ mod tests {
     /// 2026-09-23T00:00:00Z (the prior run's boot) and 01:30:00Z (this boot).
     const PRIOR_BOOT_MS: i64 = 1_790_121_600_000;
     const THIS_BOOT_MS: i64 = 1_790_127_000_000;
+    /// The harvesting process's own pid in these tests.
+    const THIS_PID: u32 = 99;
 
     /// Only the prior run's exhaustion lines are attributed: the earlier run's
     /// `alloc_failure`, the wedge line and the unparseable line are not.
     #[test]
     fn find_prior_exhaustion_keeps_only_this_runs_exhaustion_lines() {
-        let found = find_prior_exhaustion(&incident_log(), PRIOR_BOOT_MS, THIS_BOOT_MS);
+        let found = find_prior_exhaustion(&incident_log(), PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
         let tokens: Vec<_> = found.iter().map(|e| e.token).collect();
         assert_eq!(tokens, vec!["commit_exhaustion", "alloc_failure"]);
         assert!(found[1].line.contains("2097152 bytes"));
-        assert!(find_prior_exhaustion("", PRIOR_BOOT_MS, THIS_BOOT_MS).is_empty());
+        assert!(find_prior_exhaustion("", PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID).is_empty());
     }
 
     /// Plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-
@@ -1104,7 +1151,7 @@ mod tests {
     /// `unknown (WER harvest)`.
     #[test]
     fn an_alloc_failure_breadcrumb_names_commit_exhaustion_in_the_crash_file() {
-        let found = find_prior_exhaustion(&incident_log(), PRIOR_BOOT_MS, THIS_BOOT_MS);
+        let found = find_prior_exhaustion(&incident_log(), PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
         let body = format_harvest_breadcrumb(
             THIS_BOOT_MS,
             Some(PRIOR_BOOT_MS),
@@ -1167,7 +1214,7 @@ mod tests {
              suppressed_repeats=4 duration_ms=100 ended_by=spawn_succeeded (pid 1)",
         ]
         .join("\n");
-        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS);
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
         let tokens: Vec<_> = found.iter().map(|e| e.token).collect();
         assert_eq!(tokens, vec!["resource_exhaustion"]);
         // Not the last line (the close is), so nothing claims last position.
@@ -1185,7 +1232,7 @@ mod tests {
             "2026-09-23T00:30:00.000+00:00 backend_wedged runner backend wedged (pid 1)",
         ]
         .join("\n");
-        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS);
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
         assert_eq!(found.len(), 1);
         assert!(!found[0].last_in_window);
         let body = format_harvest_breadcrumb(
@@ -1209,7 +1256,7 @@ mod tests {
     fn a_suspected_episode_stays_suspected_in_the_crash_file() {
         let log = "2026-09-23T00:10:00.000+00:00 commit_exhaustion_suspected \
                    kind=commit_exhaustion_suspected os_code=1455 caller=\"c\" — x (pid 1)";
-        let found = find_prior_exhaustion(log, PRIOR_BOOT_MS, THIS_BOOT_MS);
+        let found = find_prior_exhaustion(log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
         assert_eq!(found[0].token, "commit_exhaustion_suspected");
         let body = format_harvest_breadcrumb(
             THIS_BOOT_MS,
@@ -1222,6 +1269,64 @@ mod tests {
         assert!(
             location.starts_with("commit exhaustion (suspected)"),
             "{location}"
+        );
+    }
+
+    /// THIS boot's own lines (written before the harvest runs) neither demote
+    /// the dead run's `alloc_failure` from last position nor count as its
+    /// incidents.
+    #[test]
+    fn this_boots_own_lines_do_not_demote_the_dead_runs_alloc_failure() {
+        let log = format!(
+            "{}\n2026-09-23T01:29:00.000+00:00 commit_exhaustion kind=commit os_code=1455 \
+             caller=\"worktree_census: git\" — x (pid {THIS_PID})",
+            incident_log()
+        );
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+        let tokens: Vec<_> = found.iter().map(|e| e.token).collect();
+        assert_eq!(tokens, vec!["commit_exhaustion", "alloc_failure"]);
+        assert!(
+            found[1].last_in_window,
+            "the dead run's last line is still last"
+        );
+        assert!(found.iter().all(|e| e.line.ends_with("(pid 22)")));
+    }
+
+    /// Another live process's `_closed` line does not close the dead run's
+    /// episode, and its lines are not the dead run's.
+    #[test]
+    fn a_foreign_pids_close_does_not_close_the_dead_runs_episode() {
+        let log = [
+            "2026-09-23T00:10:00.000+00:00 resource_exhaustion kind=task_limit os_code=11 \
+             caller=\"a\" — x (pid 7)",
+            "2026-09-23T00:10:00.000+00:00 commit_exhaustion kind=commit os_code=1455 \
+             caller=\"a\" — x (pid 22)",
+            "2026-09-23T00:20:00.000+00:00 commit_exhaustion_closed kind=commit \
+             suppressed_repeats=1 duration_ms=1 ended_by=spawn_succeeded (pid 7)",
+            "2026-09-23T00:21:00.000+00:00 backend_wedged runner backend wedged (pid 22)",
+        ]
+        .join("\n");
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+        let tokens: Vec<_> = found.iter().map(|e| e.token).collect();
+        assert_eq!(tokens, vec!["commit_exhaustion"], "{found:?}");
+        assert!(found[0].line.ends_with("(pid 22)"));
+    }
+
+    /// A still-open episode that is the dead run's last line outranks an
+    /// earlier `alloc_failure` (which a surviving `try_reserve` also writes).
+    #[test]
+    fn a_last_open_episode_outranks_an_earlier_alloc_failure() {
+        let log = [
+            "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation of 64 bytes \
+             failed (alloc, align 8, thread 1) — x (pid 22)",
+            "2026-09-23T00:30:00.000+00:00 commit_exhaustion kind=commit os_code=1455 \
+             caller=\"a\" — x (pid 22)",
+        ]
+        .join("\n");
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+        assert_eq!(
+            headline_exhaustion(&found).unwrap().token,
+            "commit_exhaustion"
         );
     }
 

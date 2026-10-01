@@ -1569,9 +1569,11 @@ fn install_app_runtime() {
 }
 
 /// The process allocator: `std::alloc::System`, observed. On a null return it
-/// writes ONE `alloc_failure` line to `wedge-incidents.log` (through a handle
-/// `crash_observability::install_live_crash_writer` opens) and returns the null
-/// unchanged, so the default handler aborts exactly as before — but the next
+/// writes an `alloc_failure` line to `wedge-incidents.log` — at most 8 per
+/// process, through a handle `crash_observability::install_live_crash_writer`
+/// opens — and returns the null unchanged. A fallible caller (`try_reserve`)
+/// then handles it and the process lives; anywhere else the default handler
+/// aborts exactly as before — but the next
 /// boot's harvest can now say the runner died of an allocation failure, with
 /// the last memory reading, instead of `unknown (WER harvest)`. The success
 /// path is one null check. Plan
