@@ -105,6 +105,28 @@ pub fn get_resolved_config_dir() -> Option<String> {
         .and_then(|cached| cached.clone())
 }
 
+/// Test-only RAII guard: captures `RESOLVED_CONFIG_DIR` when built and writes
+/// it back on drop, so whatever a test (or a production path it drives, such as
+/// the retry loop's rate-limit rotation) publishes there cannot outlive the
+/// test — including when an assertion panics. It restores; it does not
+/// serialize — hold `pin_account_selection_for_test` for that.
+#[cfg(test)]
+pub(crate) struct ResolvedConfigDirRestore(Option<String>);
+
+#[cfg(test)]
+impl ResolvedConfigDirRestore {
+    pub(crate) fn capture() -> Self {
+        Self(get_resolved_config_dir())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResolvedConfigDirRestore {
+    fn drop(&mut self) {
+        set_resolved_config_dir(self.0.take());
+    }
+}
+
 /// Which arm of [`get_effective_config_dir`] decided the answer — including
 /// the two arms that decide there is NO answer.
 ///
@@ -845,8 +867,10 @@ mod tests {
     /// that publishes a dir there), the `config_report_cmd` tests that reach
     /// `get_effective_config_dir` through the report, and
     /// `retry::tests::test_retry_succeeds_on_second_attempt` (whose 429 reaches
-    /// `rotate_account_on_rate_limit`, a writer it keeps inert with an empty
-    /// roster). A test touching `RESOLVED_CONFIG_DIR` WITHOUT that pin is not
+    /// `rotate_account_on_rate_limit`. On Linux under the fixture/cargo-guard
+    /// its roster is empty and rotation writes nothing; elsewhere it may read
+    /// the real roster and rotate, and its restore guard puts the value back).
+    /// A test touching `RESOLVED_CONFIG_DIR` WITHOUT that pin is not
     /// serialized against them.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
@@ -901,16 +925,6 @@ mod tests {
         (dir, path)
     }
 
-    /// Restores the process-global `RESOLVED_CONFIG_DIR` on drop, so a failing
-    /// assertion cannot leak a test's pick into another test.
-    struct ResolvedDirRestore(Option<String>);
-
-    impl Drop for ResolvedDirRestore {
-        fn drop(&mut self) {
-            set_resolved_config_dir(self.0.take());
-        }
-    }
-
     /// **The half-apply guarantee, pinned at the decision site.** Under a fleet
     /// auto mode an UNPINNED machine whose local mode is `Manual` must take an
     /// auto arm (the pick `pick_best_account` resolved, else the `config_dir`
@@ -923,9 +937,11 @@ mod tests {
     /// reaches `rotate_account_on_rate_limit`. `RESOLVED_CONFIG_DIR` is set
     /// explicitly per arm and restored on drop, and the restore guard is
     /// declared AFTER the temp dirs so it drops FIRST: a deleted path is never
-    /// left published. This is the only test that publishes a dir there; the
-    /// retry test reaches the rotation writer, but with an empty roster it
-    /// returns before writing.
+    /// left published. The retry test also reaches a writer (the rate-limit
+    /// rotation): on Linux under the fixture/cargo-guard its roster is empty
+    /// and nothing is written; elsewhere it may read the real roster and
+    /// rotate, which is why it too restores on drop — and the shared fleet pin
+    /// keeps it from running while this test is mid-assertion.
     #[test]
     fn effective_config_dir_follows_the_fleet_mode_unless_pinned() {
         let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
@@ -935,7 +951,7 @@ mod tests {
         // so the published pick is restored before its directory is deleted.
         let (_manual_guard, manual_dir) = dir_with_live_credentials();
         let (_picked_guard, picked_dir) = dir_with_live_credentials();
-        let _restore = ResolvedDirRestore(get_resolved_config_dir());
+        let _restore = ResolvedConfigDirRestore::capture();
 
         let unpinned_manual = settings::ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::Manual,
