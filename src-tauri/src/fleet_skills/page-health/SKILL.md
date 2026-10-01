@@ -74,7 +74,7 @@ now two, and only `measured` is a statement about the page.
 | `unknown.code` | Cause | Next action |
 |---|---|---|
 | `producer_failed` | The `discover` IPC to the page failed (bridge down, timed out) | Check the runner's frontend is up: `curl -s http://127.0.0.1:9876/health`; retry once it answers |
-| `input_missing` | `discover` answered with no `elements` array | The bridge answered in an unexpected shape — capture `discover` directly and report it; do not assess the page |
+| `input_missing` | `discover` answered with no `elements` array (`observedAt: null` — no sample), OR visible elements exist and none carries a `normalizedRect` (nothing for the grid to place) | Capture `discover` directly and report what it returned; for the geometry case, the page's elements carry no layout rects — do not assess the layout |
 | `producer_not_run` | `discover` returned zero elements — nothing is registered yet | The page is not hydrated or not instrumented: wait for load / navigate, then re-run. This is NOT an empty page |
 | any other code | See the contract in `qontinui-schemas/rust-vision-core/src/observation.rs` | Report the code verbatim as UNKNOWN |
 

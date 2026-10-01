@@ -153,10 +153,14 @@ pub async fn run_diagnostic(
     })
 }
 
-/// Build the AI triage prompt from diagnostic evidence.
 /// Whether a `/control/page-health` answer states a healthy page: a
 /// `measured` observation whose report's worst severity is `OK`. Any other
 /// status — `unknown` above all — is not evidence of health.
+///
+/// A DEGRADED measured answer (non-empty `provenance.coverage.unmeasured`,
+/// e.g. some visible elements carry no geometry) with summary `OK` is
+/// accepted: the report stands over what was measured. The case where
+/// NOTHING could be measured is already an `unknown`, never a measured `OK`.
 fn page_health_is_ok(page_health: &serde_json::Value) -> bool {
     page_health.get("status").and_then(|v| v.as_str()) == Some("measured")
         && page_health
@@ -166,6 +170,7 @@ fn page_health_is_ok(page_health: &serde_json::Value) -> bool {
             == Some("OK")
 }
 
+/// Build the AI triage prompt from diagnostic evidence.
 fn build_triage_prompt(
     page_health: &serde_json::Value,
     assertion_results: &[serde_json::Value],
