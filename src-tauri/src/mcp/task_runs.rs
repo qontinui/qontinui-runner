@@ -561,6 +561,8 @@ pub async fn resume_task_run(
         return Err((StatusCode::CONFLICT, format!("{}: {reason}", class.code())));
     }
 
+    crate::admission::record_spawn(origin);
+
     // Get the task run
     let task_run = state
         .app_state
@@ -2374,6 +2376,8 @@ pub async fn create_ai_session(
         };
         return Err((status, refusal));
     }
+
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
 
     let task_run_id = uuid::Uuid::new_v4().to_string();
 

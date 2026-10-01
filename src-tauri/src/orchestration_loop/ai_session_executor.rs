@@ -520,6 +520,7 @@ pub async fn dispatch_subtask(
             });
         }
     };
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Orchestration);
 
     // Minted only now that admission has ADMITTED. It used to be minted at the
     // top of this function, above the check — so every refused attempt burned

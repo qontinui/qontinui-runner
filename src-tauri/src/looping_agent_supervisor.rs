@@ -1030,6 +1030,8 @@ async fn spawn_looping_agent_terminal(
         return Err(refusal);
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::LoopingAgent);
+
     // Spawn-time resource gate, EARLY-OUT arm — the same pre-check
     // `commands::terminal::terminal_create` runs, for the same reason and one
     // extra one. Below the critical floor the PTY seam will refuse this spawn

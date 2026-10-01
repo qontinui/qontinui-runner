@@ -1891,6 +1891,8 @@ pub async fn run_prompt(
         ));
     }
 
+    crate::admission::record_spawn(origin);
+
     // Determine mode and get prompt name + content + orchestrator config
     // Orchestrator config is extracted from saved prompts (system-level setting, not user-controllable)
     let (

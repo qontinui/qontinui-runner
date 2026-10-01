@@ -960,6 +960,8 @@ pub async fn generate_unified_workflow_async(
         ));
     }
 
+    crate::admission::record_spawn(origin);
+
     info!(
         "Generating unified workflow async from description: {}...",
         truncate_str(&request.description, 50)
@@ -1381,6 +1383,8 @@ pub async fn run_unified_workflow(
             Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
+
+    crate::admission::record_spawn(origin);
 
     // Fetch the workflow
     let mut workflow = match state.app_state.pg_db.get_unified_workflow(&id).await {
@@ -1989,6 +1993,8 @@ pub async fn execute_inline_workflow(
         ));
     }
 
+    crate::admission::record_spawn(origin);
+
     // Check for duplicate running error-fix workflows
     // This prevents multiple Quick Fix workflows from targeting the same errors
     if request.name.contains("Fix") && request.name.contains("Error") {
@@ -2578,6 +2584,8 @@ pub async fn run_composed_workflow(
             Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
+
+    crate::admission::record_spawn(origin);
 
     info!(
         "Running composed workflow: {} workflows as stages, stop_on_failure={}",

@@ -996,6 +996,9 @@ async fn materialize(
             "deferred by the coord device drain: {reason}"
         )));
     }
+
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::CoordDispatch);
+
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
 
     let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE)?;

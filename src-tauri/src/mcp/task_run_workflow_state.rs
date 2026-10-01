@@ -907,6 +907,8 @@ pub async fn resume_task_run(
         return Err((StatusCode::CONFLICT, format!("{}: {reason}", class.code())));
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
+
     // Get the task run
     let task_run = pg_get_task_run(&state, &id)
         .await

@@ -67,8 +67,17 @@ const ME_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 // ---------------------------------------------------------------------------
 
 /// Why a session is being spawned — the D7 vocabulary, stamped by the spawner
-/// rather than reconstructed later. The wire values are exactly the contract's
-/// `intent.spawn_origin` vocabulary (C2); coord rejects anything else.
+/// rather than reconstructed later. The wire values are the contract's
+/// `intent.spawn_origin` vocabulary (C2).
+///
+/// Coord does NOT validate this field today: no coord route parses or rejects a
+/// `spawn_origin` value (checked at plan
+/// `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`'s
+/// vet — an earlier version of this comment claimed "coord rejects anything
+/// else", and nothing in coord ever did). The vocabulary is pinned on THIS side
+/// by `spawn_origin_wire_vocabulary_is_exactly_the_contract`; the same wire
+/// values are the `origin` the spawn-admission routes receive
+/// ([`crate::admission`]), where coord gains its own mirror of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnOrigin {
@@ -983,6 +992,13 @@ pub async fn held_until_allowed<F: std::future::Future>(
         stagger_release().await;
         info!("coord_drain_state: releasing {work_key} — autonomous spawns allowed again");
     }
+    // The hold is passed and the launch starts now: count it for coord's live
+    // count. Recorded HERE rather than at each caller because this is the one
+    // point every held launch passes exactly once, and the moment it actually
+    // starts (a held launch counted at its call site would be counted while it
+    // is still waiting out a drain). Every `held_until_allowed` site is therefore
+    // a reporting site — `runner_spawn_sites.rs` treats this call as one.
+    crate::admission::record_spawn(origin);
     fut.await
 }
 
@@ -1030,7 +1046,7 @@ pub enum HeartbeatOutcome {
 /// a MISS — trending to `Unknown`, which defers. Absent stays `NotEnrolled`.
 /// The network direction already had this right: every non-2xx and transport
 /// error is an `Err` from [`read_me_drain`] and folds as a miss.
-enum Enrollment {
+pub(crate) enum Enrollment {
     /// A coord device, with this base.
     Enrolled(String),
     /// Positively NOT a coord device: the file is genuinely absent, or names no
@@ -1043,7 +1059,7 @@ enum Enrollment {
 
 /// Why this runner is not a coord device, the base if it is, or that the local
 /// files could not answer. See [`Enrollment`].
-fn enrollment() -> Enrollment {
+pub(crate) fn enrollment() -> Enrollment {
     use qontinui_runner_lib::ambient::MachineJsonError;
 
     let machine = match qontinui_runner_lib::ambient::try_read_machine_json() {

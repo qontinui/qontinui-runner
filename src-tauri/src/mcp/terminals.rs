@@ -261,6 +261,8 @@ pub async fn create_terminal_handler(
         ));
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
+
     // The other half of D6: a `workingDir` the runner cannot use must come
     // back as a refusal naming the path, not as a 200 whose `workingDir` is
     // somewhere the caller never named. Checked here, on the REQUEST value,

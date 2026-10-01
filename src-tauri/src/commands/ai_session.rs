@@ -514,6 +514,8 @@ pub async fn create_ai_session(
         });
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::OperatorChat);
+
     // 1. Create the task-run record in PG — CONCURRENTLY with the spawn below
     // (Phase 6, B7), not before it. The row is keyed by a `task_run_id` this
     // command already minted, so nothing in the spawn depends on the INSERT
@@ -1994,6 +1996,7 @@ pub async fn resume_ai_sessions(
         let agent_log_emitter = coord_session_id
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
+        crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::BootResume);
         let spawn_result = spawn_blocking_tracked(move || -> Result<(), String> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 

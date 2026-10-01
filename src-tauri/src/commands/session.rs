@@ -112,6 +112,8 @@ pub fn session_start(
     args: StartSessionArgs,
 ) -> Result<CommandResponse, String> {
     let intent: Intent = args.into();
+    // The runner UI's own session start: attended, so reported, never refused.
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::OperatorTerminal);
     match registry.inner().start(intent) {
         Ok(handle) => {
             let id = handle.id();
