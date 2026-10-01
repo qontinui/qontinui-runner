@@ -4664,6 +4664,8 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
     );
     // Outcome counts are aggregated only on the gate-continuations poll; the
     // admission close still applies, so a refusing coord is asked once here too.
+    // Rows held here are therefore counted in NO poll report — the
+    // `log_admission_close` line below is their only trace on this side.
     let (_, held) = replay_with_admission_close(body.pending, |row| {
         // The row's dispatch_id is authoritative; stamp it onto the payload so the
         // shared seam dedupes by dispatch_id + acks the unit consume route even if
@@ -4687,9 +4689,13 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// loaded coord that is N requests per poll for no grant. So the remaining rows
 /// are not dispatched at all — no dedupe claim and no anchor reservation is
 /// taken for them, so there is nothing to release — and are counted as
-/// `AdmissionDeferred`; they stay pending at coord and the admission re-poll
-/// ([`schedule_admission_repoll`]) the first deferral already scheduled lists
-/// them again. Returns every row's outcome and how many were held this way.
+/// `AdmissionDeferred`; they stay pending at coord and are listed again by the
+/// admission re-poll ([`schedule_admission_repoll`]) when the first deferral
+/// scheduled one (its `retry_after` was `Some`), otherwise — nothing will
+/// refill — by the periodic backstop poll. Returns every row's outcome and how
+/// many were held this way. The unit-dispatch poll discards the outcomes, so
+/// rows held there appear in no poll report; only the summary log line names
+/// them.
 async fn replay_with_admission_close<T, F, Fut>(
     rows: Vec<T>,
     mut dispatch: F,
@@ -4719,7 +4725,9 @@ where
 fn log_admission_close(poll: &str, held: usize) {
     if held > 0 {
         info!(
-            "agent_runtime: {poll} poll: spawn admission deferred a row, so {held} more were              left pending without asking — the scheduled admission re-poll lists them again"
+            "agent_runtime: {poll} poll: spawn admission deferred a row, so {held} more were \
+             left pending without asking — the admission re-poll (or, with nothing to refill, \
+             the backstop poll) lists them again"
         );
     }
 }
@@ -5534,17 +5542,48 @@ fn run_single_flight_repoll<C, P, Fut>(
         delay.as_secs()
     );
     handle.spawn(async move {
+        // Frees the gate if this task ends any way OTHER than its own clean
+        // `finish() == None` — a panicking poll unwinds through it, and a
+        // runtime shutdown drops the task with it. Without it the gate stays
+        // `active` forever and every later deferral only records a re-arm that
+        // nothing will ever run: admission re-polls would silently stop for the
+        // process lifetime, leaving only the backstop.
+        let mut guard = RepollGateRelease { gate, armed: true };
         let mut delay = delay;
         loop {
             tokio::time::sleep(delay).await;
             poll().await;
-            match lock_recover(gate, "admission_repoll_gate").finish() {
+            let mut g = lock_recover(gate, "admission_repoll_gate");
+            match g.finish() {
                 Some(next) => delay = clamp(next),
-                None => break,
+                None => {
+                    // `finish` already freed the gate, under this same lock. Disarm
+                    // BEFORE releasing the lock: a request arriving right after may
+                    // start a NEW task, whose `active` this guard must not clear.
+                    guard.armed = false;
+                    break;
+                }
             }
         }
     });
 }
+
+/// Drop guard for the re-poll task — see the comment where it is armed.
+struct RepollGateRelease {
+    gate: &'static std::sync::Mutex<RepollGate>,
+    armed: bool,
+}
+
+impl Drop for RepollGateRelease {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut g = lock_recover(self.gate, "admission_repoll_gate");
+            g.active = false;
+            g.rearm = None;
+        }
+    }
+}
+
 /// Spawn the run task for a gate continuation WITHOUT the coord claim/outcome
 /// handshake (the legacy no-`gate_id` path). Unlike the agent-spawn path, the
 /// device-local resources (worktree, claim, JWT) are NOT supplied by coord —
@@ -13774,6 +13813,61 @@ mod tests {
             !lock_recover(gate, "t").active,
             "the gate is free afterwards"
         );
+    }
+
+    /// A panicking poll must not leave the gate held: the drop guard frees it
+    /// on unwind, so the next deferral starts a fresh re-poll task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_repoll_frees_the_gate_for_the_next_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        static GATE: std::sync::OnceLock<std::sync::Mutex<RepollGate>> = std::sync::OnceLock::new();
+        let gate = GATE.get_or_init(|| std::sync::Mutex::new(RepollGate::default()));
+        let handle = tokio::runtime::Handle::current();
+
+        run_single_flight_repoll(
+            &handle,
+            gate,
+            Duration::from_millis(300),
+            |d| d,
+            || async {
+                panic!("simulated re-poll panic (expected in this test)");
+            },
+        );
+        // A deferral while the doomed task is alive (still in its 300 ms sleep,
+        // long enough that a loaded box cannot let it finish first) records a
+        // re-arm.
+        assert!(!lock_recover(gate, "t").request(Duration::from_millis(5)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock_recover(gate, "t").active && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let g = lock_recover(gate, "t");
+            assert!(!g.active, "the panic freed the gate");
+            assert_eq!(g.rearm, None, "and dropped the re-arm with it");
+        }
+
+        // The next request starts a FRESH task, which actually polls.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        run_single_flight_repoll(
+            &handle,
+            gate,
+            Duration::from_millis(5),
+            |d| d,
+            move || {
+                let p = p.clone();
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while polls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "a fresh re-poll ran");
     }
 
     #[test]
