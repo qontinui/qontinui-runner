@@ -724,12 +724,13 @@ Either way, the second agent stops **before** implementing.
 
 ## See Also
 
-These references live in repos you may not have checked out
-(`qontinui-dev-notes`, `qontinui-coord`); skip any whose repo is absent
-under `<workspace-root>/`.
+The tool-shape reference below lives in a repo you may not have checked out
+(`qontinui-coord`); skip it when that repo is absent under `<workspace-root>/`.
 
-- `<workspace-root>/qontinui-dev-notes/plans/2026-06-13-coord-parallel-duplication-prevention.md` —
-  the source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
+- Qontinui's plan `2026-06-13-coord-parallel-duplication-prevention` — the
+  source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
+  It is held in the maintainers' plan corpus, not yours, and nothing above
+  depends on reading it.
 - `<workspace-root>/qontinui-coord/crates/coord/src/mcp/tools.rs` — `coord_reserve_resource`
   (`:3183`), `coord_conflict_check`, `coord_declare_intent` (single source of
   truth for the tool shapes above).

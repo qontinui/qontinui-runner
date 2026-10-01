@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # coord-pr-label — set a coord:* label on a PR via gh + record in coord.pr_labels.
 #
-# Phase 2 D2.6 of the PR Merge Orchestrator
-# (qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md).
+# Phase 2 D2.6 of the PR Merge Orchestrator (Qontinui's design plan
+# 2026-05-21-pr-merge-orchestrator-design, held in the maintainers' corpus).
 #
 # Validates the label against the `coord:*` namespace, adds the label over
 # the REST issues-labels route (`gh api -X POST repos/<o>/<r>/issues/<n>/labels`
@@ -114,9 +114,9 @@ case "$_coord_url_lc" in ws://*|wss://*) COORD_URL="" ;; esac
 COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
-# Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
-# Keeping the two in sync is a Phase 2 D2.6 requirement; the doc at
-# qontinui-dev-notes/docs/coord/pr-merge-labels.md is the spec.
+# Mirrors qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs::validate_label.
+# Keeping the two in sync is a Phase 2 D2.6 requirement; coord's
+# validate_label is the spec, and this mirror follows it.
 #
 # Last reconciled against coord `origin/main` @ da36d08d (2026-08-22), which
 # closed four drifts this mirror had accumulated. Cite the REF, not a local
