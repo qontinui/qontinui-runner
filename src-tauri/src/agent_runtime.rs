@@ -4749,7 +4749,9 @@ async fn post_continuation_outcome(
                          claude_code_session_id={sent} NOT bound by coord: \
                          claude_code_session_binding={verdict:?}"
                     ),
-                    SessionBinding::Unreported => warn!(
+                    // `info`, not `warn`: until coord's binding field ships
+                    // (coord #2743) every post lands here, and that is expected.
+                    SessionBinding::Unreported => info!(
                         "agent_runtime: continuation-outcome gate_id={gate_id} \
                          claude_code_session_id={sent} — coord's 200 carried no \
                          claude_code_session_binding; binding UNKNOWN (a coord predating \
@@ -5639,9 +5641,12 @@ async fn run_gate_continuation_inner(
     // run at once.
     //
     // Minted after the claim on purpose: a skipped or deferred claim mints
-    // nothing. A failed acquire allocates no row, so nothing is bound to a
-    // session that never ran. One fresh id per dispatch, because the CLI
-    // refuses to reuse one.
+    // nothing, and an acquire failure binds nothing. Accepted gap: a spawn
+    // failure (or a headless child that does not exit cleanly) AFTER a
+    // successful acquire leaves the runner's own allocation naming an id that
+    // never ran a session — the allocate already carried it. The outcome post
+    // and the dispatch-allocation report below do NOT bind it in that case.
+    // One fresh id per dispatch, because the CLI refuses to reuse one.
     let pinned_session_id = uuid::Uuid::new_v4();
 
     let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
@@ -5680,12 +5685,12 @@ async fn run_gate_continuation_inner(
     // running (`spawned`) and `Err(_)` on a spawn failure (`spawn_failed`).
     // `result` carries, on `Ok`, the session id worth BINDING on coord's
     // placeholder row: `Some(pinned_session_id)` for a live session, `None` for
-    // a headless child that exited non-zero (it died; an id for a session that
-    // never did the work must not be bound).
+    // a headless child that did not exit cleanly (not bound). The mapping is
+    // the pure [`presentation_bindable_session`].
     let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(
+            let res = run_continuation_terminal(
                 agent_id,
                 &workdir,
                 &payload,
@@ -5694,8 +5699,8 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
             )
-            .await
-            .map(|()| Some(pinned_session_id))
+            .await;
+            presentation_bindable_session(PresentationResult::Terminal(res), pinned_session_id)
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5724,10 +5729,9 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
             )
-            .await
-            .map(|exit| headless_bindable_session(exit, pinned_session_id));
+            .await;
             drop(ctx);
-            res
+            presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
 
@@ -5735,7 +5739,7 @@ async fn run_gate_continuation_inner(
     // `dispatch_source` rows) learns the session too. The runner's allocation
     // above was already bound at allocate time. Same rule as the outcome's
     // id binding: only a BINDABLE session is reported — a headless child that
-    // exited non-zero died, and its id must not be bound to the row.
+    // did not exit cleanly is not bound.
     if let Some(session) = bindable_session(&result) {
         if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
             tokio::spawn(report_session_launched(dispatch_agent, session));
@@ -5800,6 +5804,28 @@ fn spawn_resolution_outcome(result: &anyhow::Result<Option<uuid::Uuid>>) -> Spaw
     }
 }
 
+/// What a presentation fn returned, before it is reduced to a bindable id.
+enum PresentationResult {
+    Terminal(anyhow::Result<()>),
+    Headless(anyhow::Result<HeadlessExit>),
+}
+
+/// Step 3's pure reduction: a presentation result plus the id pinned for it
+/// (the same id the worktree allocate carried) → the session id coord may
+/// bind. Terminal `Ok` binds the pinned id; headless binds it only on a clean
+/// exit; any `Err` passes through as a spawn failure.
+fn presentation_bindable_session(
+    result: PresentationResult,
+    pinned_session_id: uuid::Uuid,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    match result {
+        PresentationResult::Terminal(r) => r.map(|()| Some(pinned_session_id)),
+        PresentationResult::Headless(r) => {
+            r.map(|exit| headless_bindable_session(exit, pinned_session_id))
+        }
+    }
+}
+
 /// The session id a presentation result lets coord BIND (both the `spawned`
 /// outcome's `claude_code_session_id` and the dispatch-allocation session
 /// report): `Some` only for a live/clean session, never for a failed spawn or a
@@ -5813,8 +5839,8 @@ fn bindable_session(result: &anyhow::Result<Option<uuid::Uuid>>) -> Option<uuid:
 enum HeadlessExit {
     /// Exit code 0 — a session that ran; its pinned id is bindable.
     Clean,
-    /// A non-zero exit — the child died; it still counts as `spawned`, but its
-    /// id is NOT bound on coord.
+    /// A non-zero exit — the child did not exit cleanly; it still counts as
+    /// `spawned`, but its id is NOT bound on coord.
     NonZero,
 }
 
@@ -15456,10 +15482,9 @@ mod tests {
         assert_eq!(text, format!(r#"{{"device_id":"{device}"}}"#));
     }
 
-    /// Step 4's outcome post: `Ok(Some(id))` is `spawned` CARRYING the id, so a
-    /// run_gate_continuation_inner that dropped the id would fail here; `Ok(None)`
-    /// (a headless child that died) is `spawned` with no id; `Err` is
-    /// `spawn_failed` with the first error line and never an id.
+    /// Step 4's outcome post: `Ok(Some(id))` is `spawned` CARRYING the id;
+    /// `Ok(None)` (a headless child that did not exit cleanly) is `spawned` with
+    /// no id; `Err` is `spawn_failed` with the first error line and never an id.
     #[test]
     fn spawn_resolution_outcome_threads_the_pinned_id_onto_spawned_only() {
         let id = uuid::Uuid::new_v4();
@@ -15487,6 +15512,54 @@ mod tests {
                 claude_code_session_id: None,
             }
         );
+    }
+
+    /// One pinned id flows unchanged from the allocate through the presentation
+    /// to the outcome post and the dispatch-allocation report, on both arms; a
+    /// headless non-clean exit or any spawn error binds nothing anywhere.
+    #[test]
+    fn pinned_id_is_the_same_across_allocation_presentation_and_outcome() {
+        let pinned = uuid::Uuid::new_v4();
+        // The id the allocate is handed in run_gate_continuation_inner.
+        let allocated = Some(pinned);
+        for presented in [
+            presentation_bindable_session(PresentationResult::Terminal(Ok(())), pinned),
+            presentation_bindable_session(
+                PresentationResult::Headless(Ok(HeadlessExit::Clean)),
+                pinned,
+            ),
+        ] {
+            let reported = bindable_session(&presented);
+            let outcome = spawn_resolution_outcome(&presented);
+            assert_eq!(reported, allocated, "report binds the allocated id");
+            assert_eq!(outcome.outcome, ContinuationOutcome::Spawned);
+            assert_eq!(
+                outcome.claude_code_session_id,
+                allocated.map(|id| id.to_string()),
+                "outcome carries the allocated id"
+            );
+        }
+        let dead = presentation_bindable_session(
+            PresentationResult::Headless(Ok(HeadlessExit::NonZero)),
+            pinned,
+        );
+        assert_eq!(bindable_session(&dead), None);
+        assert_eq!(spawn_resolution_outcome(&dead).claude_code_session_id, None);
+        for failed in [
+            presentation_bindable_session(
+                PresentationResult::Terminal(Err(anyhow::anyhow!("pty"))),
+                pinned,
+            ),
+            presentation_bindable_session(
+                PresentationResult::Headless(Err(anyhow::anyhow!("spawn"))),
+                pinned,
+            ),
+        ] {
+            assert_eq!(bindable_session(&failed), None);
+            let o = spawn_resolution_outcome(&failed);
+            assert_eq!(o.outcome, ContinuationOutcome::SpawnFailed);
+            assert_eq!(o.claude_code_session_id, None);
+        }
     }
 
     /// The dispatch-allocation session report and the outcome's id binding share
