@@ -995,7 +995,7 @@ async fn do_capture(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(unknown_target_rejection)?;
     let frame = provider
         .frame(state)
         .await
@@ -1212,7 +1212,7 @@ async fn do_multi_capture(
     // against a clone of the same Frame.
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(unknown_target_rejection)?;
     let frame = provider
         .frame(state)
         .await
@@ -1455,7 +1455,7 @@ async fn produce_intermediate_frame(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(unknown_target_rejection)?;
     let frame = provider
         .frame(state)
         .await
@@ -1652,7 +1652,7 @@ async fn vision_raw_handler(
 
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(unknown_target_rejection)?;
     let frame = provider
         .frame(&state)
         .await
@@ -3455,7 +3455,7 @@ async fn vision_baseline_handler(
     // captured from a paired device rather than the runner window.
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(unknown_target_rejection)?;
     let frame = provider
         .frame(&state)
         .await
@@ -5478,5 +5478,34 @@ mod observation_tests {
         assert_eq!(second["value"]["structured"]["status"], "measured");
         assert_eq!(second["value"]["structured"], first["value"]["structured"]);
         assert_eq!(second["value"]["structured"]["value"]["layout"], "grid");
+    }
+
+    /// An unknown `target` is a 404 on EVERY vision route — capture,
+    /// multi-capture, annotate/diff, raw, baseline, extract, describe,
+    /// analyze, assert. Every production call to `resolve_frame_provider` in
+    /// this file must map its error to the 404, never a 500; a scan pins that
+    /// for routes (capture, baseline, …) whose handlers need a live
+    /// `ApiState` to call.
+    #[test]
+    fn every_target_resolution_in_this_file_answers_404() {
+        let src = include_str!("vision_routes.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production half");
+        let mut sites = 0;
+        // Each chunk after a split begins right after one call site.
+        for after in production.split("resolve_frame_provider(").skip(1) {
+            let window: String = after.lines().take(4).collect::<Vec<_>>().join("\n");
+            sites += 1;
+            assert!(
+                window.contains("unknown_target_rejection")
+                    || window.contains("CaptureFailure::Request(StatusCode::NOT_FOUND"),
+                "a resolve_frame_provider call does not map an unknown target to 404:\n{window}"
+            );
+        }
+        assert!(
+            sites >= 7,
+            "expected every vision route's resolution site, found {sites}"
+        );
+        let (status, _) = unknown_target_rejection("unknown vision target 'gone'".into());
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
