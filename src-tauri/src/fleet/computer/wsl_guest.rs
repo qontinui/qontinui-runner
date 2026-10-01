@@ -44,15 +44,32 @@ pub(crate) fn parse_running_distros(raw: &str) -> Vec<String> {
 /// Docker Desktop's utility distros are Docker's VM plumbing, not fleet
 /// computers: no systemd, no watched units, and an identity that is not the
 /// operator's to track.
+///
+/// A name starting with `-` is refused outright: it is passed to
+/// `wsl.exe -d <name>`, where it would be parsed as an option.
 pub(crate) fn is_reportable_distro(name: &str) -> bool {
-    !name.to_ascii_lowercase().starts_with("docker-desktop")
+    !name.starts_with('-') && !name.to_ascii_lowercase().starts_with("docker-desktop")
+}
+
+/// Every WSL2 distro runs in ONE utility VM with one kernel, so `/proc/vmstat`
+/// `oom_kill` is the same counter in every guest. Reporting it per guest would
+/// count each VM-level kill once per distro; keep it on the first guest of
+/// each `boot_id` (the VM) and drop it from the rest. PURE.
+pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
+    let mut seen = std::collections::BTreeSet::new();
+    for g in guests.iter_mut() {
+        let vm = g.boot_id.clone().unwrap_or_default();
+        if !seen.insert(vm) {
+            g.oom_kill_total = None;
+        }
+    }
 }
 
 /// The single in-guest probe. One line on purpose (it crosses a Windows
 /// command line). `TZ=UTC` pins `StateChangeTimestamp` to a zone the parser
 /// trusts; `.runner` is read without `sudo` (a `0700` home simply yields no
 /// line and the unit-name fallback applies).
-pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; units=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null | awk '{print $1}'); printf 'SHOW_BEGIN\n'; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; fi; printf '\nSHOW_END\n'; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
+pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); printf 'LIST_RC\t%s\n' "$?"; units=$(printf '%s\n' "$listing" | awk 'NF{print $1}'); printf 'SHOW_BEGIN\n'; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; fi; printf '\nSHOW_END\n'; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
 
 /// Everything one guest probe produced. Holds the identity HASH, never the
 /// raw machine id — [`parse_guest_probe`] hashes it and drops it.
@@ -71,9 +88,12 @@ pub(crate) struct GuestProbe {
     pub(crate) disk_total_bytes: Option<u64>,
     pub(crate) booted_at: Option<String>,
     pub(crate) oom_kill_total: Option<u64>,
-    /// PID 1 is systemd, so the unit list is authoritative (an empty list
-    /// means "no runner units", not "could not ask").
+    /// PID 1 is systemd.
     pub(crate) systemd: bool,
+    /// Exit status of `systemctl list-units`. The unit list is authoritative
+    /// (an empty list means "no runner units", not "could not ask") only when
+    /// systemd is PID 1 AND this is `Some(0)`.
+    pub(crate) list_rc: Option<i32>,
     pub(crate) units: Vec<UnitProps>,
     pub(crate) runner_files: BTreeMap<String, String>,
 }
@@ -136,6 +156,7 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
             }
             "OOM_KILL" => g.oom_kill_total = v.trim().parse().ok(),
             "PID1" => g.systemd = v.trim() == "systemd",
+            "LIST_RC" => g.list_rc = v.trim().parse().ok(),
             "RUNNERFILE" => {
                 if let Some(json) = parts.next() {
                     g.runner_files.insert(v.to_string(), json.to_string());
@@ -144,7 +165,9 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
             _ => {}
         }
     }
-    g.identity_hash = identity_hash_of(machine_id.as_deref()?)?;
+    // A guest is Linux: the same machine-id(5) rule as the host.
+    let machine_id = machine_id.filter(|m| super::identity::valid_linux_machine_id(m))?;
+    g.identity_hash = identity_hash_of(&machine_id)?;
     g.units = parse_systemctl_show(&show);
     Some(g)
 }
@@ -156,20 +179,29 @@ pub(crate) mod probe {
     };
     use crate::fleet::resource_sample::{decode_utf16le, wsl_probe};
 
+    /// The distros running RIGHT NOW (non-waking read), or `None` when the
+    /// listing itself failed.
+    async fn running() -> Option<Vec<String>> {
+        let list = wsl_probe(&["--list", "--running", "--quiet"]).await?;
+        list.status
+            .success()
+            .then(|| parse_running_distros(&decode_utf16le(&list.stdout)))
+    }
+
     /// Probe every RUNNING, reportable distro. A distro that is not listed as
-    /// running this tick is not touched at all.
+    /// running is not touched at all — and the list is re-read immediately
+    /// before EACH probe, because a guest probe takes seconds and a distro
+    /// that stopped meanwhile would be woken by `wsl -d`.
     pub(crate) async fn collect() -> Vec<GuestProbe> {
-        let Some(list) = wsl_probe(&["--list", "--running", "--quiet"]).await else {
+        let Some(initial) = running().await else {
             return Vec::new();
         };
-        if !list.status.success() {
-            return Vec::new();
-        }
         let mut out = Vec::new();
-        for distro in parse_running_distros(&decode_utf16le(&list.stdout))
-            .into_iter()
-            .filter(|d| is_reportable_distro(d))
-        {
+        for distro in initial.into_iter().filter(|d| is_reportable_distro(d)) {
+            match running().await {
+                Some(now) if now.contains(&distro) => {}
+                _ => continue,
+            }
             let Some(o) =
                 wsl_probe(&["-d", distro.as_str(), "--exec", "sh", "-c", GUEST_SCRIPT]).await
             else {
@@ -180,6 +212,7 @@ pub(crate) mod probe {
                 out.push(g);
             }
         }
+        super::attribute_vm_oom_once(&mut out);
         out
     }
 }
@@ -222,6 +255,8 @@ mod tests {
         assert!(!is_reportable_distro("docker-desktop"));
         assert!(!is_reportable_distro("docker-desktop-data"));
         assert!(is_reportable_distro("Ubuntu-24.04"));
+        assert!(!is_reportable_distro("-d"));
+        assert!(!is_reportable_distro("--exec"));
     }
 
     pub(crate) const GUEST_OUTPUT: &str = "MACHINE_ID\t0123456789abcdef0123456789abcdef\n\
@@ -238,6 +273,7 @@ DISK_TOTAL\t1081101176832\n\
 BTIME\t1790000000\n\
 OOM_KILL\t3\n\
 PID1\tsystemd\n\
+LIST_RC\t0\n\
 SHOW_BEGIN\n\
 Id=actions.runner.example-org-example-repo.wslbox.service\n\
 ActiveState=failed\n\
@@ -277,10 +313,34 @@ PROBE_END\n";
     }
 
     #[test]
+    fn a_failed_unit_listing_is_recorded() {
+        assert_eq!(parse_guest_probe(GUEST_OUTPUT).unwrap().list_rc, Some(0));
+        let failed = GUEST_OUTPUT.replace("LIST_RC\t0", "LIST_RC\t1");
+        assert_eq!(parse_guest_probe(&failed).unwrap().list_rc, Some(1));
+        let absent = GUEST_OUTPUT.replace("LIST_RC\t0\n", "");
+        assert_eq!(parse_guest_probe(&absent).unwrap().list_rc, None);
+    }
+
+    #[test]
+    fn a_vm_level_oom_counter_is_reported_once_per_vm() {
+        let g = parse_guest_probe(GUEST_OUTPUT).unwrap();
+        let mut other = g.clone();
+        other.identity_hash = "b".repeat(64);
+        let mut second_vm = g.clone();
+        second_vm.boot_id = Some("11111111-2222-4333-8444-555555555555".into());
+        let mut guests = vec![g, other, second_vm];
+        attribute_vm_oom_once(&mut guests);
+        let ooms: Vec<Option<u64>> = guests.iter().map(|g| g.oom_kill_total).collect();
+        assert_eq!(ooms, vec![Some(3), None, Some(3)]);
+    }
+
+    #[test]
     fn a_truncated_or_unidentifiable_probe_is_no_reading() {
         let truncated = GUEST_OUTPUT.replace("PROBE_END\n", "");
         assert_eq!(parse_guest_probe(&truncated), None);
         let no_id = GUEST_OUTPUT.replace("0123456789abcdef0123456789abcdef", "");
         assert_eq!(parse_guest_probe(&no_id), None);
+        let uninit = GUEST_OUTPUT.replace("0123456789abcdef0123456789abcdef", "uninitialized");
+        assert_eq!(parse_guest_probe(&uninit), None);
     }
 }

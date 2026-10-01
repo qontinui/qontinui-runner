@@ -22,10 +22,21 @@
 //!
 //! ## An older coord
 //!
-//! Until coord's Phase 3 route deploys, the POST answers 404/405. That is
-//! expected, logged ONCE at info, and backs off to the full-snapshot cadence;
-//! events stay queued (bounded) and are delivered once the route exists. The
-//! sampler is never blocked by it.
+//! Until coord's Phase 3 route deploys, the POST answers 404/405 (or 503
+//! `schema_pending` before its migration is applied). That is expected,
+//! logged ONCE at info, and backs off to the full-snapshot cadence; events stay
+//! queued (bounded) and are delivered once the route exists. The sampler is
+//! never blocked by it.
+//!
+//! ## coord's validation is the source of truth
+//!
+//! coord refuses a report WHOLE (422) on any invalid member, so every value
+//! coord validates is pre-checked here with coord's own rule (hostname, access
+//! facts, machine-id shape, the report bounds). A 422 that still happens is
+//! logged once; the events it names are quarantined behind a `telemetry_gap`
+//! marker, and repeated unexplained refusals quarantine the queue — no single
+//! event can wedge the reporter. A 200 whose outcome says `identity_conflict`
+//! keeps that computer's events queued (coord did not store them).
 
 pub(crate) mod access;
 pub(crate) mod events;
@@ -136,7 +147,7 @@ pub(crate) fn host_report(
         kind: kind.to_string(),
         parent_identity_hash: None,
         attach_device: true,
-        hostname: facts.hostname.clone(),
+        hostname: identity::safe_hostname(facts.hostname.clone()),
         os: facts.os.clone(),
         os_version: facts.os_version.clone(),
         kernel: facts.kernel.clone(),
@@ -177,7 +188,7 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             kind: "wsl_guest".to_string(),
             parent_identity_hash: Some(parent.to_string()),
             attach_device: false,
-            hostname: g.hostname.clone(),
+            hostname: identity::safe_hostname(g.hostname.clone()),
             os: g.os.clone(),
             os_version: g.os_version.clone(),
             kernel: g.kernel.clone(),
@@ -197,10 +208,13 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
         oom_kill_total: g.oom_kill_total,
         // Without systemd as PID 1 there was no one to ask: no information,
         // not "no units".
+        // The list is authoritative only when `systemctl list-units` itself
+        // exited 0; a failed listing is a partial (delta) scan, never a
+        // snapshot that would delete the rows it missed.
         scan: if g.systemd {
             ServiceScan {
                 units: Some(units),
-                complete: true,
+                complete: g.list_rc == Some(0),
             }
         } else {
             ServiceScan::default()
@@ -239,20 +253,180 @@ pub(crate) fn plan_computer(
     (c.services.is_some() || !c.events.is_empty()).then_some(c)
 }
 
+/// coord's bounds on one report (`computers.rs` `MAX_*`); a report over them
+/// is refused whole, so the reporter never builds one.
+pub(crate) const MAX_COMPUTERS_PER_REPORT: usize = 16;
+pub(crate) const MAX_EVENTS_PER_COMPUTER: usize = 500;
+pub(crate) const MAX_EVENTS_PER_REPORT: usize = 1_000;
+
+/// Consecutive 422s after which the whole queue of every computer in the
+/// refused report is quarantined (replaced by one `telemetry_gap` marker each)
+/// — the escape from a refusal the problem list did not pin on an event.
+pub(crate) const QUARANTINE_AFTER_REJECTIONS: u32 = 3;
+
+/// Keep the first observation of each identity (the host is first), so two
+/// cloned WSL distros sharing a machine-id cannot put one identity in a report
+/// twice — coord refuses that report whole. Returns the dropped count. PURE.
+pub(crate) fn dedupe_observed(observed: Vec<Observed>) -> (Vec<Observed>, usize) {
+    let mut seen = std::collections::BTreeSet::new();
+    let before = observed.len();
+    let kept: Vec<Observed> = observed
+        .into_iter()
+        .filter(|o| seen.insert(o.base.identity_hash.clone()))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
+/// Enforce coord's report bounds: at most [`MAX_COMPUTERS_PER_REPORT`]
+/// computers (the host is first and therefore always kept), at most
+/// [`MAX_EVENTS_PER_COMPUTER`] events each and [`MAX_EVENTS_PER_REPORT`] in
+/// all — OLDEST first (the queue is in arrival order); the rest stay queued
+/// for the next tick. PURE.
+pub(crate) fn cap_report(mut computers: Vec<ComputerReport>) -> Vec<ComputerReport> {
+    computers.truncate(MAX_COMPUTERS_PER_REPORT);
+    let mut budget = MAX_EVENTS_PER_REPORT;
+    for c in &mut computers {
+        let take = c.events.len().min(MAX_EVENTS_PER_COMPUTER).min(budget);
+        c.events.truncate(take);
+        budget -= take;
+    }
+    computers
+}
+
+/// The per-computer `identity_conflict` flags from a 200 response, or `None`
+/// when the body is not the documented shape (then every computer counts as
+/// delivered, the pre-outcome behaviour). PURE.
+pub(crate) fn parse_outcomes(body: &str) -> Option<BTreeMap<String, bool>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = v.get("computers")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|c| {
+                let id = c.get("identity_hash")?.as_str()?.to_string();
+                let conflict = c
+                    .get("identity_conflict")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Some((id, conflict))
+            })
+            .collect(),
+    )
+}
+
+/// coord's 422 `problems` list. PURE.
+pub(crate) fn parse_problems(body: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("problems")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// The events a 422 names (`computers[i].events[j]…`), as
+/// `identity_hash → client_event_ids`, resolved against the body that was
+/// sent. A problem that names no event (a computer- or service-level field)
+/// contributes nothing. PURE.
+pub(crate) fn rejected_events(
+    problems: &[String],
+    sent: &ComputerReportReq,
+) -> BTreeMap<String, Vec<String>> {
+    static RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some(re) = RE
+        .get_or_init(|| regex::Regex::new(r"computers\[(\d+)\]\.events\[(\d+)\]").ok())
+        .as_ref()
+    else {
+        return out;
+    };
+    for p in problems {
+        for cap in re.captures_iter(p) {
+            let (Some(i), Some(j)) = (
+                cap.get(1).and_then(|m| m.as_str().parse::<usize>().ok()),
+                cap.get(2).and_then(|m| m.as_str().parse::<usize>().ok()),
+            ) else {
+                continue;
+            };
+            if let Some(e) = sent.computers.get(i).and_then(|c| c.events.get(j)) {
+                let ids = out
+                    .entry(sent.computers[i].identity_hash.clone())
+                    .or_default();
+                if !ids.contains(&e.client_event_id) {
+                    ids.push(e.client_event_id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Remove `ids` (all of the queue when `ids` is `None`) from one computer's
+/// queue and leave ONE `telemetry_gap` marker saying how many coord refused
+/// and why — never a silent drop. Returns how many were removed.
+pub(crate) fn quarantine(
+    state: &mut ObserverState,
+    identity: &str,
+    ids: Option<&[String]>,
+    problems: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some(q) = state.pending.get_mut(identity) else {
+        return 0;
+    };
+    let before = q.len();
+    q.retain(|e| match ids {
+        Some(ids) => !ids.contains(&e.client_event_id),
+        None => false,
+    });
+    let removed = before - q.len();
+    if removed > 0 {
+        let at = events::rfc3339(now);
+        q.push(ComputerEvent {
+            client_event_id: events::event_id(
+                "telemetry_gap",
+                &["rejected", identity, &at, &removed.to_string()],
+            ),
+            kind: "telemetry_gap".into(),
+            observed_at: at,
+            detail: serde_json::json!({
+                "reason": "rejected_by_coord",
+                "dropped_events": removed,
+                "problems": problems.iter().take(5).collect::<Vec<_>>(),
+            }),
+        });
+    }
+    removed
+}
+
 /// The per-process reporter, owned by the sampler loop's closure.
 pub(crate) struct Reporter {
     state: Option<ObserverState>,
     state_path: Option<PathBuf>,
     last_full: Option<tokio::time::Instant>,
+    /// When static facts and access facts were last collected — separate from
+    /// `last_full`, which only advances on a DELIVERED full snapshot, so a
+    /// failing coord does not make every tick re-enumerate disks and fork
+    /// `tailscale`.
+    last_facts_at: Option<tokio::time::Instant>,
     /// Row state keys coord last acknowledged, per identity hash.
     last_sent: BTreeMap<String, BTreeMap<String, StateKey>>,
-    /// Backoff after a 404/405 from a coord that predates the route.
+    /// Backoff after a 404/405/503 (an older coord, or one whose schema is not
+    /// applied yet) or an unexplained 422.
     route_absent_until: Option<tokio::time::Instant>,
     route_absent_logged: bool,
+    rejected_logged: bool,
+    conflict_logged: bool,
+    dedupe_logged: bool,
+    consecutive_rejections: u32,
     failures_logged: u32,
     no_identity_logged: bool,
     facts: Option<StaticFacts>,
-    access: Option<Access>,
+    access: Access,
     #[cfg(target_os = "linux")]
     watcher: services::linux::Watcher,
 }
@@ -270,13 +444,18 @@ impl Reporter {
             state_path: qontinui_runner_lib::ambient::runner_dir()
                 .map(|d| d.join("computer-observer.json")),
             last_full: None,
+            last_facts_at: None,
             last_sent: BTreeMap::new(),
             route_absent_until: None,
             route_absent_logged: false,
+            rejected_logged: false,
+            conflict_logged: false,
+            dedupe_logged: false,
+            consecutive_rejections: 0,
             failures_logged: 0,
             no_identity_logged: false,
             facts: None,
-            access: None,
+            access: Access::default(),
             #[cfg(target_os = "linux")]
             watcher: services::linux::Watcher::default(),
         }
@@ -305,6 +484,11 @@ impl Reporter {
         }
     }
 
+    fn back_off(&mut self) {
+        self.route_absent_until =
+            Some(tokio::time::Instant::now() + Duration::from_secs(REPORT_FULL_SECS));
+    }
+
     /// One tick. Best-effort end to end: every failure returns quietly.
     pub(crate) async fn tick(&mut self) {
         let now = chrono::Utc::now();
@@ -312,7 +496,7 @@ impl Reporter {
         let Some(host_id) = identity::host_identity_hash() else {
             if !self.no_identity_logged {
                 self.no_identity_logged = true;
-                info!("fleet::computer: no OS machine id readable — this computer cannot be identified, so it is not reported");
+                info!("fleet::computer: no valid OS machine id — this computer cannot be identified, so it is not reported");
             }
             return;
         };
@@ -359,11 +543,15 @@ impl Reporter {
         let full = self
             .last_full
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(REPORT_FULL_SECS));
-        if full || self.facts.is_none() {
+        let facts_due = self
+            .last_facts_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(REPORT_FULL_SECS));
+        if facts_due || self.facts.is_none() {
             self.facts = tokio::task::spawn_blocking(identity::collect_static)
                 .await
                 .ok();
             self.access = access::collect().await;
+            self.last_facts_at = Some(tokio::time::Instant::now());
         }
         let facts = self.facts.clone().unwrap_or_default();
 
@@ -374,14 +562,35 @@ impl Reporter {
                 identity::host_kind(),
                 &facts,
                 axes.boot_id.clone(),
-                self.access.clone(),
+                Some(self.access.clone()),
             ),
             oom_kill_total: axes.oom_kill_total,
             scan: self.scan_host_services().await,
         }];
+        // Guests cost a `wsl.exe` fork each, so they are probed at the
+        // full-snapshot cadence — or sooner when one has events waiting.
         #[cfg(windows)]
-        for g in wsl_guest::probe::collect().await {
-            observed.push(guest_observed(&g, &host_id));
+        {
+            let guest_pending = self.state.as_ref().is_some_and(|s| {
+                s.pending.iter().any(|(id, q)| {
+                    id != &host_id
+                        && !q.is_empty()
+                        && s.computers.get(id).and_then(|c| c.kind.as_deref()) == Some("wsl_guest")
+                })
+            });
+            if full || guest_pending {
+                for g in wsl_guest::probe::collect().await {
+                    observed.push(guest_observed(&g, &host_id));
+                }
+            }
+        }
+        let (observed, dup) = dedupe_observed(observed);
+        if dup > 0 && !self.dedupe_logged {
+            self.dedupe_logged = true;
+            warn!(
+                "fleet::computer: {dup} observed computer(s) share an identity with another \
+                 (cloned WSL distros share /etc/machine-id); only the first is reported"
+            );
         }
 
         // ---- derive events --------------------------------------------
@@ -395,11 +604,16 @@ impl Reporter {
                 services: o.scan.units.as_deref(),
                 services_complete: o.scan.complete,
             };
-            let (evs, next) = events::derive(state.computers.get(id), &input, now);
+            let (evs, mut next) = events::derive(state.computers.get(id), &input, now);
+            next.kind = Some(o.base.kind.clone());
             state.computers.insert(id.clone(), next);
             if !evs.is_empty() {
                 events::push_pending(state, id, evs);
             }
+        }
+        let pruned = events::prune(state, &host_id, now);
+        if pruned > 0 {
+            debug!("fleet::computer: forgot {pruned} computer(s) unseen for a week");
         }
         // Persist BEFORE the POST: a crash mid-send must not lose events.
         self.persist();
@@ -420,6 +634,7 @@ impl Reporter {
                 plan_computer(o, full, self.last_sent.get(id), pending)
             })
             .collect();
+        let computers = cap_report(computers);
         if computers.is_empty() {
             return;
         }
@@ -439,50 +654,119 @@ impl Reporter {
         // coord-auth-exempt(device-jwt-required): resolves through
         // `coord_mcp::read_usable_device_jwt` above and returns early without
         // one, so a report is skipped rather than sent anonymously.
-        match client
+        let resp = match client
             .post(&url)
             .bearer_auth(bearer)
             .json(&body)
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(r) => r,
+            Err(e) => {
+                self.log_failure(format!("POST {url} failed: {e}"));
+                return;
+            }
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        match status.as_u16() {
+            200..=299 => {
                 debug!(
                     "fleet::computer: reported {} computer(s) ({})",
                     body.computers.len(),
                     if full { "full" } else { "delta" }
                 );
                 self.route_absent_until = None;
-                self.on_delivered(&body, full);
+                self.consecutive_rejections = 0;
+                let outcomes = parse_outcomes(&text);
+                self.on_delivered(&body, full, outcomes.as_ref());
             }
-            Ok(resp)
-                if resp.status() == reqwest::StatusCode::NOT_FOUND
-                    || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
-            {
+            404 | 405 | 503 => {
                 if !self.route_absent_logged {
                     self.route_absent_logged = true;
                     info!(
-                        "fleet::computer: coord answered HTTP {} for /coord/computers/report — this coord predates \
-                         the computers route; events stay queued and the report retries every {REPORT_FULL_SECS}s",
-                        resp.status()
+                        "fleet::computer: coord answered HTTP {status} for /coord/computers/report — \
+                         the route or its schema is not live on this coord yet; events stay queued \
+                         and the report retries every {REPORT_FULL_SECS}s"
                     );
                 }
-                self.route_absent_until =
-                    Some(tokio::time::Instant::now() + Duration::from_secs(REPORT_FULL_SECS));
+                self.back_off();
             }
-            Ok(resp) => self.log_failure(format!("POST {url} -> HTTP {}", resp.status())),
-            Err(e) => self.log_failure(format!("POST {url} failed: {e}")),
+            422 => self.on_rejected(&body, &text, now),
+            _ => self.log_failure(format!("POST {url} -> HTTP {status}")),
+        }
+    }
+
+    /// coord refused the report (422). Log the problems once; quarantine the
+    /// events it named; after [`QUARANTINE_AFTER_REJECTIONS`] consecutive
+    /// refusals quarantine every queue in the report, so no event can wedge
+    /// the reporter forever.
+    fn on_rejected(
+        &mut self,
+        body: &ComputerReportReq,
+        text: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let problems = parse_problems(text);
+        self.consecutive_rejections = self.consecutive_rejections.saturating_add(1);
+        if !self.rejected_logged {
+            self.rejected_logged = true;
+            warn!(
+                "fleet::computer: coord refused the computers report (422): {}",
+                problems
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        let named = rejected_events(&problems, body);
+        let mut removed = 0;
+        if let Some(state) = self.state.as_mut() {
+            for (id, ids) in &named {
+                removed += quarantine(state, id, Some(ids), &problems, now);
+            }
+            if removed == 0 && self.consecutive_rejections >= QUARANTINE_AFTER_REJECTIONS {
+                for c in &body.computers {
+                    removed += quarantine(state, &c.identity_hash, None, &problems, now);
+                }
+                self.consecutive_rejections = 0;
+            }
+        }
+        if removed > 0 {
+            self.persist();
+        } else {
+            // Nothing this reporter can remove explains the refusal; do not
+            // hammer coord with the same body every tick.
+            self.back_off();
         }
     }
 
     /// coord accepted `body`: drop the delivered events and remember what it
-    /// now holds.
-    fn on_delivered(&mut self, body: &ComputerReportReq, full: bool) {
+    /// now holds — except for a computer coord reported as an
+    /// `identity_conflict`, whose services and events it did NOT store; those
+    /// stay queued.
+    fn on_delivered(
+        &mut self,
+        body: &ComputerReportReq,
+        full: bool,
+        outcomes: Option<&BTreeMap<String, bool>>,
+    ) {
         if full {
             self.last_full = Some(tokio::time::Instant::now());
         }
+        let mut conflicted = 0;
         if let Some(state) = self.state.as_mut() {
             for c in &body.computers {
+                if outcomes
+                    .and_then(|o| o.get(&c.identity_hash))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    conflicted += 1;
+                    continue;
+                }
                 if let Some(q) = state.pending.get_mut(&c.identity_hash) {
                     q.retain(|e| {
                         !c.events
@@ -501,6 +785,13 @@ impl Reporter {
                 }
             }
             state.pending.retain(|_, q| !q.is_empty());
+        }
+        if conflicted > 0 && !self.conflict_logged {
+            self.conflict_logged = true;
+            warn!(
+                "fleet::computer: coord reported an identity_conflict for {conflicted} computer(s) \
+                 (another live reporter shares the machine id); their events stay queued"
+            );
         }
         self.persist();
     }
@@ -753,10 +1044,15 @@ mod tests {
     #[test]
     fn a_guest_reports_as_a_child_of_its_host_and_never_attaches_the_device() {
         let g = wsl_guest::parse_guest_probe(
-            "MACHINE_ID\tguest-machine-id-1\nPID1\tsystemd\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
+            "MACHINE_ID\tfedcba9876543210fedcba9876543210\nHOSTNAME\tbad host;id\nPID1\tsystemd\nLIST_RC\t0\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
         )
         .unwrap();
         let o = guest_observed(&g, HOST_ID);
+        assert_eq!(
+            o.base.hostname, None,
+            "a hostname coord would refuse is null"
+        );
+        assert_eq!(o.base.access, None, "guests carry no access facts");
         assert_eq!(o.base.kind, "wsl_guest");
         assert_eq!(o.base.parent_identity_hash.as_deref(), Some(HOST_ID));
         assert!(!o.base.attach_device);
@@ -767,13 +1063,144 @@ mod tests {
         );
 
         let no_systemd = wsl_guest::parse_guest_probe(
-            "MACHINE_ID\tguest-machine-id-1\nPID1\tinit\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
+            "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tinit\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
         )
         .unwrap();
         assert_eq!(
             guest_observed(&no_systemd, HOST_ID).scan,
             ServiceScan::default()
         );
+
+        // systemd is PID 1 but `list-units` failed: rows (none) are sent as a
+        // partial scan, which deletes nothing.
+        let list_failed = wsl_guest::parse_guest_probe(
+            "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t1\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
+        )
+        .unwrap();
+        let o = guest_observed(&list_failed, HOST_ID);
+        assert!(!o.scan.complete);
+        let c = plan_computer(&o, true, None, &[]).unwrap();
+        assert!(!c.services_complete);
+    }
+
+    fn ev(id: &str) -> ComputerEvent {
+        ComputerEvent {
+            client_event_id: id.into(),
+            kind: "oom_kill".into(),
+            observed_at: "2026-09-30T01:48:16Z".into(),
+            detail: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn duplicate_identities_keep_the_first_observation() {
+        let host = observed(svc::HEALTHY_SHOW);
+        let mut clone_a = observed(svc::HEALTHY_SHOW);
+        clone_a.base.identity_hash = "c".repeat(64);
+        clone_a.base.kind = "wsl_guest".into();
+        let mut clone_b = clone_a.clone();
+        clone_b.base.hostname = Some("second-clone".into());
+        let (kept, dropped) = dedupe_observed(vec![host, clone_a, clone_b]);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].base.identity_hash, HOST_ID);
+        assert_eq!(kept[1].base.hostname.as_deref(), Some("fleetbox"));
+    }
+
+    #[test]
+    fn a_report_is_capped_at_coords_bounds_oldest_events_first() {
+        let mk = |i: usize, n: usize| {
+            let mut c = host_report(format!("{i:064}"), "wsl_guest", &facts(), None, None);
+            c.events = (0..n).map(|j| ev(&format!("{i}-{j}"))).collect();
+            c
+        };
+        let computers: Vec<ComputerReport> = vec![mk(0, 600), mk(1, 450), mk(2, 10)]
+            .into_iter()
+            .chain((3..20).map(|i| mk(i, 0)))
+            .collect();
+        let capped = cap_report(computers);
+        assert_eq!(capped.len(), MAX_COMPUTERS_PER_REPORT);
+        assert_eq!(capped[0].events.len(), 500, "per-computer bound");
+        assert_eq!(capped[0].events[0].client_event_id, "0-0", "oldest first");
+        assert_eq!(capped[1].events.len(), 450);
+        assert_eq!(capped[2].events.len(), 10);
+        let total: usize = capped.iter().map(|c| c.events.len()).sum();
+        assert!(total <= MAX_EVENTS_PER_REPORT);
+
+        let big: Vec<ComputerReport> = vec![mk(0, 500), mk(1, 500), mk(2, 500)];
+        let capped = cap_report(big);
+        let per: Vec<usize> = capped.iter().map(|c| c.events.len()).collect();
+        assert_eq!(per, vec![500, 500, 0], "the report-wide bound of 1000");
+    }
+
+    #[test]
+    fn a_200_outcome_names_identity_conflicts() {
+        let body = format!(
+            r#"{{"computers":[{{"identity_hash":"{HOST_ID}","computer_id":"00000000-0000-4000-8000-000000000001","services_upserted":1,"services_deleted":0,"events_inserted":0,"events_duplicate":0,"identity_conflict":true}}]}}"#
+        );
+        let o = parse_outcomes(&body).unwrap();
+        assert_eq!(o.get(HOST_ID), Some(&true));
+        assert_eq!(parse_outcomes("not json"), None);
+    }
+
+    #[test]
+    fn a_422_quarantines_exactly_the_events_it_names() {
+        let mut c = host_report(HOST_ID.into(), "host", &facts(), None, None);
+        c.events = vec![ev("good-1"), ev("bad-1"), ev("good-2")];
+        let sent = ComputerReportReq {
+            device_id: "d".into(),
+            computers: vec![c.clone()],
+        };
+        let body = r#"{"error":"invalid computer report","problems":["computers[0].events[1].observed_at: 2027-01-01 is more than 300s in the future (reporter clock?)"]}"#;
+        let problems = parse_problems(body);
+        assert_eq!(problems.len(), 1);
+        let named = rejected_events(&problems, &sent);
+        assert_eq!(named.get(HOST_ID), Some(&vec!["bad-1".to_string()]));
+
+        let mut st = ObserverState::default();
+        st.pending.insert(HOST_ID.into(), c.events.clone());
+        let t = chrono::DateTime::parse_from_rfc3339("2026-09-30T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            quarantine(
+                &mut st,
+                HOST_ID,
+                named.get(HOST_ID).map(Vec::as_slice),
+                &problems,
+                t
+            ),
+            1
+        );
+        let q: Vec<&str> = st.pending[HOST_ID]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(q, vec!["oom_kill", "oom_kill", "telemetry_gap"]);
+        let marker = st.pending[HOST_ID].last().unwrap();
+        assert_eq!(marker.detail["reason"], "rejected_by_coord");
+        assert_eq!(marker.detail["dropped_events"], 1);
+
+        // A problem naming no event (a computer-level field) names nothing.
+        let other = vec!["computers[0].hostname: \"x y\" must be ...".to_string()];
+        assert!(rejected_events(&other, &sent).is_empty());
+        // The whole-queue quarantine leaves only the marker.
+        assert_eq!(quarantine(&mut st, HOST_ID, None, &other, t), 3);
+        assert_eq!(st.pending[HOST_ID].len(), 1);
+        assert_eq!(st.pending[HOST_ID][0].detail["dropped_events"], 3);
+    }
+
+    #[test]
+    fn not_opted_in_sends_an_empty_access_object() {
+        let c = host_report(
+            HOST_ID.into(),
+            "host",
+            &facts(),
+            None,
+            Some(Access::default()),
+        );
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["access"], serde_json::json!({}));
     }
 
     /// Production source of `fleet.rs`, test module split off.

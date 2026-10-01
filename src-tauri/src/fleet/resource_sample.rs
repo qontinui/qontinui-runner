@@ -1944,8 +1944,8 @@ SwapFree:        8036352 kB
     }
 
     /// Plan 2026-09-30 §3.4 / contract §2: the new axes use coord's exact
-    /// column names, and the manifest rides beside them. Built from recorded
-    /// fleet-host procfs text, with the cpu PSI file unreadable.
+    /// column names, and the manifest rides beside them. Built from synthetic
+    /// procfs text in the kernel's line shape, with the cpu PSI file unreadable.
     #[test]
     fn the_pressure_axes_use_the_contract_wire_names() {
         let axes = crate::fleet::host_axes::linux_axes_from(

@@ -23,7 +23,7 @@
 //! them, and a `0` would read as "no pressure" — served policy
 //! `verification-and-evidence` `unknown-must-not-render-as-a-default`.
 //!
-//! Every function here is either a pure parser (unit-tested against recorded
+//! Every function here is either a pure parser (unit-tested against synthetic
 //! procfs text) or a thin file read around one.
 
 use std::collections::BTreeMap;
@@ -304,7 +304,7 @@ pub(crate) fn collect() -> HostAxes {
 mod tests {
     use super::*;
 
-    /// Recorded on a fleet host (synthetic values in the recorded shape).
+    /// Synthetic values in the exact procfs line shape.
     const PSI_MEMORY: &str = "some avg10=2.12 avg60=7.81 avg300=2.78 total=28433288250\n\
                               full avg10=1.95 avg60=7.18 avg300=2.56 total=25269186748\n";
     const PSI_CPU: &str = "some avg10=0.96 avg60=0.96 avg300=1.36 total=40931471255\n\

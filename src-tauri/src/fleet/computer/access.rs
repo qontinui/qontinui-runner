@@ -6,19 +6,26 @@
 //! Plan §6 makes access reporting opt-in per tenant. No tenant opt-in
 //! plumbing exists yet (no coord setting, no runner setting carries it), so
 //! the only switch today is the per-machine env var
-//! [`ACCESS_FACTS_ENV`] = `1`. Unset or any other value reports `access: null`
-//! — tailnet addresses and usernames are not sent by default.
+//! [`ACCESS_FACTS_ENV`] = `1`. Unset or any other value reports `access: {}`
+//! — tailnet addresses and usernames are not sent by default, and the empty
+//! object (rather than `null`, which coord reads as "no information") makes
+//! coord overwrite any facts stored while the machine WAS opted in, so turning
+//! the switch off actually withdraws them.
 
 use serde::Serialize;
 
 /// Per-machine opt-in. Exactly `1` enables it.
 pub(crate) const ACCESS_FACTS_ENV: &str = "QONTINUI_REPORT_ACCESS_FACTS";
 
-/// `access` on the wire (contract §3).
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// `access` on the wire (contract §3). An unknown or refused fact is
+/// OMITTED, so a machine with none serializes as `{}`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub(crate) struct Access {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tailnet_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tailnet_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh_user: Option<String>,
 }
 
@@ -93,27 +100,23 @@ async fn tailscale_status_json() -> Option<String> {
     None
 }
 
-/// OpenSSH's `valid_ruser` rule for a remote user name — the value lands in
-/// an operator's `~/.ssh/config` (`User …`) and on an `ssh` command line, so
-/// anything that could smuggle an option or a shell metacharacter is refused:
-/// empty, longer than 64, a leading `-`, any of `` '`";&<>|(){}$% `` or the
-/// path/glob/history characters `` /*?[]~#! ``, a whitespace char followed by
-/// `-`, a trailing `\`, or any control char.
+/// coord's `is_safe_ssh_user` (`computers.rs`), mirrored exactly — coord
+/// refuses anything else with a 422, so the two must agree: 1..=64 CHARS; no
+/// leading `-`; none of `` `'";&<>|(){}$% `` nor `` /*?[]~#! ``; no whitespace
+/// at all; no trailing `\`; no control character. The value lands in an
+/// operator's `~/.ssh/config` and on an `ssh` command line.
 pub(crate) fn valid_ssh_user(u: &str) -> bool {
     const BAD: &[char] = &[
-        '\'', '`', '"', ';', '&', '<', '>', '|', '(', ')', '{', '}', '$', '%', '/', '*', '?', '[',
+        '`', '\'', '"', ';', '&', '<', '>', '|', '(', ')', '{', '}', '$', '%', '/', '*', '?', '[',
         ']', '~', '#', '!',
     ];
-    if u.is_empty() || u.len() > 64 || u.starts_with('-') || u.ends_with('\\') {
-        return false;
-    }
-    if u.chars().any(|c| c.is_control() || BAD.contains(&c)) {
-        return false;
-    }
-    let chars: Vec<char> = u.chars().collect();
-    !chars
-        .windows(2)
-        .any(|w| w[0].is_whitespace() && w[1] == '-')
+    let n = u.chars().count();
+    (1..=64).contains(&n)
+        && !u.starts_with('-')
+        && !u.ends_with('\\')
+        && !u
+            .chars()
+            .any(|c| BAD.contains(&c) || c.is_whitespace() || c.is_control())
 }
 
 /// A tailnet DNS name: an FQDN of at least two labels (the trailing dot
@@ -140,9 +143,9 @@ pub(crate) fn valid_tailnet_ip(ip: &str) -> bool {
 }
 
 /// Drop every field that fails its rule (coord refuses such values with a 422,
-/// and one bad field must not poison the whole report), and the whole
-/// `access` when nothing survives. Returns the names of the dropped fields.
-pub(crate) fn sanitize(a: Access) -> (Option<Access>, Vec<&'static str>) {
+/// and one bad field must not poison the whole report). Nothing surviving is
+/// `{}`, never `null` — see the module docs. Returns the dropped field names.
+pub(crate) fn sanitize(a: Access) -> (Access, Vec<&'static str>) {
     let mut dropped = Vec::new();
     let tailnet_name = a.tailnet_name.filter(|n| {
         let ok = valid_tailnet_name(n);
@@ -165,21 +168,20 @@ pub(crate) fn sanitize(a: Access) -> (Option<Access>, Vec<&'static str>) {
         }
         ok
     });
-    let any = tailnet_name.is_some() || tailnet_ip.is_some() || ssh_user.is_some();
     (
-        any.then_some(Access {
+        Access {
             tailnet_name,
             tailnet_ip,
             ssh_user,
-        }),
+        },
         dropped,
     )
 }
 
-/// Collect access facts, or `None` when not opted in (or nothing valid).
-pub(crate) async fn collect() -> Option<Access> {
+/// Collect access facts: `{}` when not opted in.
+pub(crate) async fn collect() -> Access {
     if !opted_in(std::env::var(ACCESS_FACTS_ENV).ok().as_deref()) {
-        return None;
+        return Access::default();
     }
     let (tailnet_name, tailnet_ip) = match tailscale_status_json().await {
         Some(j) => parse_tailscale_status(&j),
@@ -216,7 +218,7 @@ mod tests {
 
     #[test]
     fn ssh_user_follows_openssh_valid_ruser() {
-        for good in ["runner", "runner", "first.last", "a_b-c", "DOMAIN\\user"] {
+        for good in ["runner", "ops-user", "first.last", "a_b-c", "DOMAIN\\user"] {
             assert!(valid_ssh_user(good), "{good}");
         }
         for bad in [
@@ -245,15 +247,22 @@ mod tests {
             "~root",
             "a#b",
             "a!b",
+            "a b",
+            "tab\there",
+            "nbsp\u{a0}user",
         ] {
             assert!(!valid_ssh_user(bad), "{bad:?} must be refused");
         }
         assert!(valid_ssh_user(&"a".repeat(64)));
         assert!(!valid_ssh_user(&"a".repeat(65)));
+        // Length is counted in CHARS, as coord counts it: 64 two-byte chars
+        // (128 bytes) is still a legal length.
+        assert!(valid_ssh_user(&"é".repeat(64)));
+        assert!(!valid_ssh_user(&"é".repeat(65)));
     }
 
     #[test]
-    fn a_bad_field_is_dropped_alone_and_all_bad_drops_access() {
+    fn a_bad_field_is_dropped_alone_and_all_bad_is_an_empty_object() {
         let (a, dropped) = sanitize(Access {
             tailnet_name: Some("fleetbox.tailnet-x.ts.net".into()),
             tailnet_ip: Some("100.64.0.10".into()),
@@ -263,8 +272,7 @@ mod tests {
             serde_json::to_value(&a).unwrap(),
             serde_json::json!({
                 "tailnet_name": "fleetbox.tailnet-x.ts.net",
-                "tailnet_ip": "100.64.0.10",
-                "ssh_user": null
+                "tailnet_ip": "100.64.0.10"
             })
         );
         assert_eq!(dropped, vec!["ssh_user"]);
@@ -274,8 +282,15 @@ mod tests {
             tailnet_ip: Some("100.64.0".into()),
             ssh_user: Some("a b -c".into()),
         });
-        assert_eq!(a, None);
+        // Nothing survives: `{}`, which clears coord's stored facts, never
+        // `null`, which would leave stale ones in place.
+        assert_eq!(serde_json::to_value(&a).unwrap(), serde_json::json!({}));
         assert_eq!(dropped, vec!["tailnet_name", "tailnet_ip", "ssh_user"]);
+        // Not opted in serializes identically.
+        assert_eq!(
+            serde_json::to_value(Access::default()).unwrap(),
+            serde_json::json!({})
+        );
 
         assert!(valid_tailnet_ip("fd7a:115c:a1e0::10"));
         assert!(valid_tailnet_ip("100.64.0.10"));
@@ -299,9 +314,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
             serde_json::json!({
-                "tailnet_name": "fleetbox.tailnet-x.ts.net",
-                "tailnet_ip": null,
-                "ssh_user": null
+                "tailnet_name": "fleetbox.tailnet-x.ts.net"
             })
         );
         assert_eq!(dropped, vec!["tailnet_ip", "ssh_user"]);

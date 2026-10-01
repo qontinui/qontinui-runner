@@ -31,6 +31,47 @@ pub(crate) fn identity_hash_of(raw_machine_id: &str) -> Option<String> {
     Some(hex::encode(mac.finalize().into_bytes()))
 }
 
+/// A Linux `machine-id` as machine-id(5) defines it: exactly 32 lowercase hex
+/// characters. systemd writes the literal `uninitialized` during first boot,
+/// and an image built without one ships an empty file — hashing either would
+/// give every such machine the SAME identity, the silent merge §6 forbids. A
+/// box whose id does not pass is not identifiable, so it is not reported.
+pub(crate) fn valid_linux_machine_id(raw: &str) -> bool {
+    let t = raw.trim();
+    t.len() == 32
+        && t.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// coord's `is_safe_hostname` (`computers.rs`), mirrored exactly — coord
+/// refuses the whole report (422) on a hostname that fails it, because other
+/// machines' tooling may use it as an ssh alias: `[A-Za-z0-9._-]`, 1..=253
+/// chars, not starting with `-` or `.`, at least one alphanumeric.
+pub(crate) fn is_safe_hostname(s: &str) -> bool {
+    (1..=253).contains(&s.len())
+        && !s.starts_with('-')
+        && !s.starts_with('.')
+        && s.chars().any(|c| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// A hostname coord will accept, or `None` (UNKNOWN) — logged once, because a
+/// refused hostname otherwise costs the whole report.
+pub(crate) fn safe_hostname(h: Option<String>) -> Option<String> {
+    let h = h?;
+    if is_safe_hostname(&h) {
+        return Some(h);
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "fleet::computer: a hostname fails coord's hostname rule and is reported as null"
+        );
+    }
+    None
+}
+
 /// Parse `ioreg -rd1 -c IOPlatformExpertDevice` for `IOPlatformUUID`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_ioreg_platform_uuid(text: &str) -> Option<String> {
@@ -47,8 +88,8 @@ fn raw_machine_id() -> Option<String> {
     {
         ["/etc/machine-id", "/var/lib/dbus/machine-id"]
             .iter()
-            .find_map(|p| std::fs::read_to_string(p).ok())
-            .filter(|s| !s.trim().is_empty())
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .find(|s| valid_linux_machine_id(s))
     }
     #[cfg(windows)]
     {
@@ -217,6 +258,28 @@ mod tests {
     fn a_blank_machine_id_has_no_identity() {
         assert_eq!(identity_hash_of(""), None);
         assert_eq!(identity_hash_of(" \n"), None);
+    }
+
+    #[test]
+    fn only_a_real_linux_machine_id_is_an_identity() {
+        assert!(valid_linux_machine_id("0123456789abcdef0123456789abcdef\n"));
+        assert!(!valid_linux_machine_id("uninitialized\n"));
+        assert!(!valid_linux_machine_id(""));
+        assert!(!valid_linux_machine_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!valid_linux_machine_id("0123456789abcdef0123456789abcde"));
+    }
+
+    #[test]
+    fn hostnames_follow_coords_rule() {
+        for ok in ["fleetbox", "fleet-box.example", "_svc", "a"] {
+            assert!(is_safe_hostname(ok), "{ok}");
+            assert_eq!(safe_hostname(Some(ok.into())).as_deref(), Some(ok));
+        }
+        for bad in ["", "-x", ".x", ".", "-.-", "a b", "host;id", "héte"] {
+            assert!(!is_safe_hostname(bad), "{bad:?}");
+            assert_eq!(safe_hostname(Some(bad.into())), None);
+        }
+        assert!(!is_safe_hostname(&"a".repeat(254)));
     }
 
     #[test]
