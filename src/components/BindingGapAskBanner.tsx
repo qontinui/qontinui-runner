@@ -35,11 +35,11 @@ import {
   gapsCleared,
   GET_BINDING_GAP_ASKS_CMD,
   normalizeBindingGapAsks,
-  pairResultLabel,
   type BindingGapAsk,
   type BindingGapBannerEntry,
 } from "./binding-gap-ask-logic";
 import { shortTenantId } from "./terminal/SpawnTenantPicker";
+import { PairAllProgress } from "./PairAllProgress";
 import { useBindingGapView, usePairAllTenants } from "./useBindingGaps";
 
 /** How long the result rows stay up once every gap has cleared. */
@@ -105,7 +105,7 @@ function GapRow({
 export function BindingGapAskBanner() {
   const { tier } = useRunnerTier();
   const { view, refresh } = useBindingGapView();
-  const { phase, results, error, connect, reset } = usePairAllTenants(refresh);
+  const { phase, results, error, connectLink, connect, cancel, reset } = usePairAllTenants(refresh);
   const [asks, setAsks] = useState<BindingGapAsk[] | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
   const [showTerminal, setShowTerminal] = useState(false);
@@ -279,21 +279,14 @@ export function BindingGapAskBanner() {
             {phase === "waiting" ? "Waiting for browser…" : "Workspace connection"}
           </div>
         )}
-        {results && results.length > 0 ? (
-          <ul
-            data-ui-id="binding-gap-results"
-            style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}
-          >
-            {results.map((r) => (
-              <li key={r.tenantId}>
-                <span title={r.tenantId} style={{ fontFamily: "monospace" }}>
-                  {shortTenantId(r.tenantId)}
-                </span>
-                : {pairResultLabel(r)}
-              </li>
-            ))}
-          </ul>
-        ) : null}
+        <PairAllProgress
+          idPrefix="binding-gap"
+          phase={phase}
+          connectLink={connectLink}
+          results={results}
+          view={view}
+          onCancel={() => void cancel()}
+        />
         {phase === "done" && cleared ? <div>All workspaces are connected.</div> : null}
         {error ? (
           <div style={{ color: "var(--error, #f87171)" }}>Could not connect: {error}</div>

@@ -46,9 +46,13 @@ const FORBIDDEN: &[&str] = &[
 /// `(file under src/, fn name)` — every function the multi-tenant flow runs.
 const FLOW: &[(&str, &str)] = &[
     ("commands/web_integration.rs", "pair_all_tenants"),
-    ("commands/web_integration.rs", "default_pair_selection"),
+    ("commands/web_integration.rs", "run_pair_all_tenants"),
+    ("commands/web_integration.rs", "select_pair_tenants"),
+    ("commands/web_integration.rs", "cancel_pair_all_tenants"),
     ("commands/web_integration.rs", "finish_explicit_pairing"),
     ("pair.rs", "pair_via_browser_multi"),
+    ("pair.rs", "connect_all_start_inputs"),
+    ("pair.rs", "persist_one_collected"),
     ("pair.rs", "browser_pair_round_trip"),
     ("pair.rs", "pair_start_multi_request_body"),
     ("pair.rs", "pair_collect"),
@@ -125,17 +129,14 @@ fn the_multi_tenant_pair_flow_never_names_a_home_repointing_door() {
     );
 }
 
-/// The flow sends no `home_tenant_id` from the in-app command: coord moves the
-/// home pointer only when one is named, and "Connect all my workspaces" never
-/// names one.
+/// The in-app command builds its `pair-start` inputs through
+/// `pair::connect_all_start_inputs`, whose "never a home tenant" property is
+/// unit-tested in `pair.rs` on the body it produces.
 #[test]
-fn pair_all_tenants_never_names_a_home_tenant() {
+fn run_pair_all_tenants_builds_its_start_inputs_through_the_tested_helper() {
     let src = std::fs::read_to_string(src_root().join("commands/web_integration.rs")).unwrap();
-    let body = fn_body(&code_only(&src), "pair_all_tenants").expect("pair_all_tenants");
-    assert!(
-        body.contains("pair_via_browser_multi(&coord_base, &for_blocking, None)"),
-        "pair_all_tenants must call pair_via_browser_multi with home_tenant_id = None"
-    );
+    let body = fn_body(&code_only(&src), "run_pair_all_tenants").expect("run_pair_all_tenants");
+    assert!(body.contains("connect_all_start_inputs("));
 }
 
 /// The scanner itself: a forbidden token in CODE is caught, in a comment is not.

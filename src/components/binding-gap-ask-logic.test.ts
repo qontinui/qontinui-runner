@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   bannerGapEntries,
+  displayNameFor,
+  normalizePairAllProgress,
   credentialStateLabel,
   dismissKey,
   gapsCleared,
@@ -121,7 +123,7 @@ describe("normalizeBindingGapView", () => {
 });
 
 describe("rowsNeedingConnect / gapsCleared", () => {
-  it("offers every row that is not connected, unknown included", () => {
+  it("offers ONLY no_credential rows — never unknown, never connected", () => {
     const view = normalizeBindingGapView({
       status: "measured",
       rows: [
@@ -130,8 +132,17 @@ describe("rowsNeedingConnect / gapsCleared", () => {
         { tenant_id: T, state: "no_credential" },
       ],
     });
-    expect(rowsNeedingConnect(view).map((r) => r.tenantId)).toEqual([B, T]);
+    expect(rowsNeedingConnect(view).map((r) => r.tenantId)).toEqual([T]);
     expect(rowsNeedingConnect(null)).toEqual([]);
+  });
+
+  it("offers nothing on an UNKNOWN view", () => {
+    const view = normalizeBindingGapView({
+      status: "unknown",
+      reason: "coord_bound_tenants.json is stale",
+      rows: [{ tenant_id: T, state: "no_credential" }],
+    });
+    expect(rowsNeedingConnect(view)).toEqual([]);
   });
 
   it("is cleared only on a MEASURED view with no gap", () => {
@@ -206,5 +217,45 @@ describe("normalizePairAllResults", () => {
     ]);
     expect(normalizePairAllResults(null)).toBeNull();
     expect(normalizePairAllResults({})).toBeNull();
+  });
+});
+
+describe("displayNameFor", () => {
+  it("takes the name from the view, else null", () => {
+    const view = normalizeBindingGapView(measured);
+    expect(displayNameFor(view, T)).toBe("Acme");
+    expect(displayNameFor(view, A)).toBeNull();
+    expect(displayNameFor(null, T)).toBeNull();
+  });
+});
+
+describe("normalizePairAllProgress", () => {
+  it("maps every phase", () => {
+    expect(normalizePairAllProgress({ phase: "waiting", tenant_ids: [T] })).toEqual({
+      phase: "waiting",
+    });
+    expect(
+      normalizePairAllProgress({ phase: "browser", connect_url: "https://x/c", launched: false }),
+    ).toEqual({ phase: "browser", connectUrl: "https://x/c", launched: false });
+    expect(
+      normalizePairAllProgress({
+        phase: "done",
+        results: [{ tenant_id: T, status: "connected" }],
+      }),
+    ).toEqual({
+      phase: "done",
+      results: [{ tenantId: T, status: "connected", skippedReason: null }],
+    });
+    expect(normalizePairAllProgress({ phase: "error", error: "boom" })).toEqual({
+      phase: "error",
+      error: "boom",
+    });
+    expect(normalizePairAllProgress({ phase: "cancelled" })).toEqual({ phase: "cancelled" });
+  });
+
+  it("rejects malformed payloads", () => {
+    expect(normalizePairAllProgress(null)).toBeNull();
+    expect(normalizePairAllProgress({ phase: "browser" })).toBeNull();
+    expect(normalizePairAllProgress({ phase: "nope" })).toBeNull();
   });
 });

@@ -17,11 +17,11 @@ import { AlertTriangle, CheckCircle2, HelpCircle, Loader2, XCircle } from "lucid
 
 import {
   credentialStateLabel,
-  pairResultLabel,
   rowsNeedingConnect,
   type BindingGapRow,
   type TenantCredentialState,
 } from "../binding-gap-ask-logic";
+import { PairAllProgress } from "../PairAllProgress";
 import { shortTenantId } from "../terminal/SpawnTenantPicker";
 import { useBindingGapView, usePairAllTenants } from "../useBindingGaps";
 
@@ -55,7 +55,7 @@ function WorkspaceRow({ row }: { row: BindingGapRow }) {
 
 export function WorkspacesCredentialSection() {
   const { view, refresh } = useBindingGapView();
-  const { phase, results, error, connect } = usePairAllTenants(refresh);
+  const { phase, results, error, connectLink, connect, cancel } = usePairAllTenants(refresh);
   const { ref: sectionRef } = useUIElement({
     id: "settings-workspaces",
     label: "Workspaces credential state",
@@ -82,7 +82,7 @@ export function WorkspacesCredentialSection() {
           {view.status === "unknown" ? (
             <p className="text-[11px] text-muted-foreground flex items-start gap-1">
               <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
-              <span>Unknown: {view.reason}</span>
+              <span>Unknown: {view.reason}. Connecting is offered once this is known.</span>
             </p>
           ) : null}
           {view.rows.length === 0 ? (
@@ -113,23 +113,19 @@ export function WorkspacesCredentialSection() {
             {busy ? "Waiting for browser…" : "Connect all my workspaces"}
           </button>
           <p className="text-[11px] text-muted-foreground">
-            One browser sign-in connects every workspace listed above. Your home workspace does not
-            change.
+            One browser sign-in connects every workspace above that has no credential. Your home
+            workspace does not change.
           </p>
         </div>
       ) : null}
-      {results && results.length > 0 ? (
-        <ul className="space-y-0.5 text-[11px]" data-ui-id="settings-workspaces-results">
-          {results.map((r) => (
-            <li key={r.tenantId}>
-              <span className="font-mono" title={r.tenantId}>
-                {shortTenantId(r.tenantId)}
-              </span>
-              : {pairResultLabel(r)}
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      <PairAllProgress
+        idPrefix="settings-workspaces"
+        phase={phase}
+        connectLink={connectLink}
+        results={results}
+        view={view}
+        onCancel={() => void cancel()}
+      />
       {error ? (
         <p className="text-[11px] text-destructive flex items-center gap-1">
           <AlertTriangle className="w-3 h-3 shrink-0" /> Could not connect: {error}

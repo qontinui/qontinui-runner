@@ -996,8 +996,19 @@ pub struct PairAllTenantsResponse {
     pub results: Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
 }
 
+/// Progress of the ONE in-flight [`pair_all_tenants`] flow, emitted so every
+/// surface (the banner and the Settings card) shows the same state, and so a
+/// failed browser launch can be answered with an "Open this link" fallback.
+/// Payload `{phase, …}`: `waiting {tenant_ids}`, `browser {connect_url,
+/// launched}`, `done {results}`, `error {error}`, `cancelled`.
+pub const PAIR_ALL_PROGRESS_EVENT: &str = "pair-all-tenants-progress";
+
 static PAIR_ALL_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Set by [`cancel_pair_all_tenants`]; read by the browser round-trip's wait
+/// loop. Cleared whenever a new flow starts.
+static PAIR_ALL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII claim on the single in-flight [`pair_all_tenants`] flow.
 struct PairAllInFlight;
@@ -1007,7 +1018,10 @@ impl PairAllInFlight {
         use std::sync::atomic::Ordering;
         PAIR_ALL_IN_FLIGHT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| PairAllInFlight)
+            .map(|_| {
+                PAIR_ALL_CANCEL.store(false, Ordering::Release);
+                PairAllInFlight
+            })
             .map_err(|_| {
                 "a workspace sign-in is already in progress — finish it in your browser first"
                     .to_string()
@@ -1021,46 +1035,116 @@ impl Drop for PairAllInFlight {
     }
 }
 
-/// Pure: the default selection when the caller names no tenants — the
-/// tenants the published binding-gap view says are bound with no credential.
-/// An UNKNOWN view selects nothing and says why: the runner does not guess
-/// which workspaces to pair.
-pub(crate) fn default_pair_selection(
+fn emit_pair_all_progress<R: Runtime>(app: &AppHandle<R>, payload: serde_json::Value) {
+    if let Err(e) = app.emit(PAIR_ALL_PROGRESS_EVENT, payload) {
+        warn!("pair_all_tenants: progress event failed: {e}");
+    }
+}
+
+/// Pure: which tenants this flow may pair, and the rows it refuses.
+///
+/// Only a MEASURED view may drive a pairing: an unknown view cannot tell a
+/// bound-without-credential tenant from one coord has since unbound, and
+/// pairing the latter re-creates a binding coord removed. So:
+///
+/// - an unknown view refuses the whole call, with its reason;
+/// - no explicit ids → every `no_credential` row (none → refused);
+/// - explicit ids → only those whose row is `no_credential` or `connected`
+///   (a re-pair of a working tenant is harmless); every other id is returned
+///   as a `skipped` row naming why, and is never sent to coord.
+///
+/// Adding a workspace this device is not bound to yet needs a tenant picker —
+/// deferred to a follow-up (plan D1 step 2); this function never offers one.
+pub(crate) fn select_pair_tenants(
     view: &crate::mcp::device_jwt_refresher::BindingGapView,
-) -> Result<Vec<uuid::Uuid>, String> {
-    use crate::mcp::device_jwt_refresher::TenantCredentialState;
+    explicit: &[uuid::Uuid],
+) -> Result<
+    (
+        Vec<uuid::Uuid>,
+        Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
+    ),
+    String,
+> {
+    use crate::mcp::device_jwt_refresher::TenantCredentialState as S;
+    use qontinui_runner_lib::pair::{TenantPairOutcome, TenantPairStatus};
     if view.status != "measured" {
         return Err(format!(
-            "which workspaces lack a credential is UNKNOWN ({}) — name the tenants to connect",
+            "which workspaces lack a credential is UNKNOWN ({}) — nothing is paired until it is known",
             view.reason.as_deref().unwrap_or("no reason recorded")
         ));
     }
-    let gaps: Vec<uuid::Uuid> = view
-        .rows
-        .iter()
-        .filter(|r| r.state == TenantCredentialState::NoCredential)
-        .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
-        .collect();
-    if gaps.is_empty() {
-        return Err("every workspace this device is bound to already has a credential".to_string());
+    let state_of = |t: &uuid::Uuid| {
+        view.rows
+            .iter()
+            .find(|r| uuid::Uuid::parse_str(&r.tenant_id).ok() == Some(*t))
+            .map(|r| r.state)
+    };
+    if explicit.is_empty() {
+        let gaps: Vec<uuid::Uuid> = view
+            .rows
+            .iter()
+            .filter(|r| r.state == S::NoCredential)
+            .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
+            .collect();
+        if gaps.is_empty() {
+            return Err(
+                "every workspace this device is bound to already has a credential".to_string(),
+            );
+        }
+        return Ok((gaps, Vec::new()));
     }
-    Ok(gaps)
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    for t in explicit {
+        match state_of(t) {
+            Some(S::NoCredential) | Some(S::Connected) => {
+                if !allowed.contains(t) {
+                    allowed.push(*t)
+                }
+            }
+            other => refused.push(TenantPairOutcome {
+                tenant_id: t.to_string(),
+                status: TenantPairStatus::Skipped,
+                skipped_reason: Some(match other {
+                    Some(_) => "not_offered: this workspace's credential state is unknown, \
+                                so pairing it could re-create a binding coord removed"
+                        .to_string(),
+                    None => "not_offered: this device is not bound to this workspace".to_string(),
+                }),
+            }),
+        }
+    }
+    if allowed.is_empty() {
+        return Err(format!(
+            "none of the requested workspaces can be paired here: {}",
+            refused
+                .iter()
+                .map(|r| format!(
+                    "{} ({})",
+                    r.tenant_id,
+                    r.skipped_reason.as_deref().unwrap_or("")
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    Ok((allowed, refused))
 }
 
 /// "Connect all my workspaces": ONE attended browser sign-in that mints a
 /// device JWT for every selected tenant and persists each into its own slot.
 ///
-/// - `tenant_ids` omitted or empty → the binding-gap tenants
-///   ([`default_pair_selection`]).
+/// - Selection: [`select_pair_tenants`] over the published binding-gap view —
+///   a measured view only; `tenant_ids` omitted or empty means every gap.
 /// - Goes through coord's `pair-start` / `pair-complete` / `pair-collect`
 ///   ([`qontinui_runner_lib::pair::pair_via_browser_multi`]) — never web
-///   `pair-cli` and never `machine-credential/exchange`, so the device's HOME
-///   tenant does not move and its machine key is not rotated (no
-///   `home_tenant_id` is sent).
-/// - Persistence is additive ([`qontinui_runner_lib::pair::persist_collected_pairings`]):
-///   bindings are appended and an established default is never moved.
-/// - A tenant coord declines (e.g. `not_a_member`) is a `skipped` row, not an
-///   error for the whole batch.
+///   `pair-cli` and never `machine-credential/exchange`, and never names a
+///   home tenant ([`qontinui_runner_lib::pair::connect_all_start_inputs`]), so
+///   the device's HOME tenant does not move and its machine key is not rotated.
+/// - Persistence is additive ([`qontinui_runner_lib::pair::persist_collected_pairings`]);
+///   on a device with no local default, coord's home tenant is preferred.
+/// - One flow at a time; [`cancel_pair_all_tenants`] ends it; progress is
+///   emitted as [`PAIR_ALL_PROGRESS_EVENT`].
 ///
 /// Afterwards: the shared post-pairing steps (rejection streaks retired per
 /// tenant, relay + refresher kicked), the binding-gap cell republished from
@@ -1071,14 +1155,31 @@ pub async fn pair_all_tenants<R: Runtime>(
     app: AppHandle<R>,
     tenant_ids: Option<Vec<String>>,
 ) -> Result<PairAllTenantsResponse, String> {
-    use qontinui_runner_lib::pair::{
-        pair_via_browser_multi, persist_collected_pairings, read_device_id_from_disk,
-        TenantPairStatus,
-    };
-
     // One browser flow at a time, process-wide: the banner and the Settings
     // card each own a button, and two concurrent flows would open two sign-ins.
     let _in_flight = PairAllInFlight::acquire()?;
+    let result = run_pair_all_tenants(&app, tenant_ids).await;
+    match &result {
+        Ok(resp) => emit_pair_all_progress(
+            &app,
+            serde_json::json!({"phase": "done", "results": resp.results}),
+        ),
+        Err(e) if e == "cancelled" => {
+            emit_pair_all_progress(&app, serde_json::json!({"phase": "cancelled"}))
+        }
+        Err(e) => emit_pair_all_progress(&app, serde_json::json!({"phase": "error", "error": e})),
+    }
+    result
+}
+
+async fn run_pair_all_tenants<R: Runtime>(
+    app: &AppHandle<R>,
+    tenant_ids: Option<Vec<String>>,
+) -> Result<PairAllTenantsResponse, String> {
+    use qontinui_runner_lib::pair::{
+        connect_all_start_inputs, pair_via_browser_multi, persist_collected_pairings,
+        read_device_id_from_disk, BrowserPairHooks, TenantPairStatus,
+    };
 
     let explicit: Vec<uuid::Uuid> = tenant_ids
         .unwrap_or_default()
@@ -1087,18 +1188,12 @@ pub async fn pair_all_tenants<R: Runtime>(
             uuid::Uuid::parse_str(t.trim()).map_err(|e| format!("malformed tenant id {t:?}: {e}"))
         })
         .collect::<Result<_, _>>()?;
-    let selection = if explicit.is_empty() {
-        let view = spawn_blocking_tracked(|| {
-            crate::mcp::device_jwt_refresher::current_binding_gap_view(
-                &crate::auth::AuthManager::new(),
-            )
-        })
-        .await
-        .map_err(|e| format!("binding-gap read panicked: {e}"))?;
-        default_pair_selection(&view)?
-    } else {
-        explicit
-    };
+    let view = spawn_blocking_tracked(|| {
+        crate::mcp::device_jwt_refresher::current_binding_gap_view(&crate::auth::AuthManager::new())
+    })
+    .await
+    .map_err(|e| format!("binding-gap read panicked: {e}"))?;
+    let (selection, refused) = select_pair_tenants(&view, &explicit)?;
 
     let coord_base = qontinui_runner_lib::profiles::connected_coord_base()
         .ok_or_else(|| "this runner is not connected to a coordinator".to_string())?;
@@ -1110,21 +1205,44 @@ pub async fn pair_all_tenants<R: Runtime>(
         selection.len(),
         selection
     );
+    emit_pair_all_progress(
+        app,
+        serde_json::json!({
+            "phase": "waiting",
+            "tenant_ids": selection.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        }),
+    );
     let for_blocking = selection.clone();
-    let device_for_blocking = device_id.clone();
-    let results = spawn_blocking_tracked(move || {
-        let collected = pair_via_browser_multi(&coord_base, &for_blocking, None)?;
+    let app_for_blocking = app.clone();
+    let mut results = spawn_blocking_tracked(move || {
+        let on_connect_url = |url: &str, launched: bool| {
+            emit_pair_all_progress(
+                &app_for_blocking,
+                serde_json::json!({"phase": "browser", "connect_url": url, "launched": launched}),
+            );
+        };
+        let hooks = BrowserPairHooks {
+            on_connect_url: Some(&on_connect_url),
+            cancel: Some(&PAIR_ALL_CANCEL),
+        };
+        let (ids, home) = connect_all_start_inputs(&for_blocking);
+        let collected = pair_via_browser_multi(&coord_base, &ids, home, &hooks)?;
         // The flow was bound to THIS device's machine.json id at pair-start;
         // persist under that id, never under an echo that disagrees with it.
         if let Some(echoed) = collected.device_id.as_deref() {
-            if echoed.trim() != device_for_blocking {
+            if echoed.trim() != device_id {
                 warn!(
                     "pair_all_tenants: coord echoed device_id {echoed} but this flow \
-                     was started for {device_for_blocking} — keeping the local id"
+                     was started for {device_id} — keeping the local id"
                 );
             }
         }
-        persist_collected_pairings(&collected, &for_blocking, &device_for_blocking)
+        persist_collected_pairings(
+            &collected,
+            &ids,
+            &device_id,
+            qontinui_runner_lib::pair::coord_home_tenant(),
+        )
     })
     .await
     .map_err(|e| format!("pair_all_tenants task panicked: {e}"))??;
@@ -1134,6 +1252,7 @@ pub async fn pair_all_tenants<R: Runtime>(
         .filter(|r| r.status == TenantPairStatus::Connected)
         .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
         .collect();
+    results.extend(refused);
     for r in &results {
         info!(
             "pair_all_tenants: tenant {} -> {:?}{}",
@@ -1176,6 +1295,20 @@ pub async fn pair_all_tenants<R: Runtime>(
     Ok(PairAllTenantsResponse { results })
 }
 
+/// End the in-flight [`pair_all_tenants`] flow (an abandoned browser tab
+/// otherwise holds it for up to 5 minutes). Returns whether a flow was
+/// running. The flow ends with `Err("cancelled")` within ~200 ms and its
+/// loopback server shuts down.
+#[tauri::command]
+pub async fn cancel_pair_all_tenants() -> bool {
+    use std::sync::atomic::Ordering;
+    let running = PAIR_ALL_IN_FLIGHT.load(Ordering::Acquire);
+    if running {
+        PAIR_ALL_CANCEL.store(true, Ordering::Release);
+    }
+    running
+}
+
 /// Tauri plugin exposing all web-integration commands.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_web_integration")
@@ -1186,6 +1319,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             test_web_integration_connection,
             redeem_pair_code,
             pair_all_tenants,
+            cancel_pair_all_tenants,
         ])
         .build()
 }
@@ -1452,5 +1586,79 @@ mod ipc_wire_contract_tests {
         }
         assert!(health.ends_with("/api/v1/health/live"));
         assert!(me.ends_with("/api/v1/devices/me"));
+    }
+}
+
+/// `pair_all_tenants`' selection: only a measured view, only gaps by default,
+/// and never an unknown or unbound tenant.
+#[cfg(test)]
+mod select_pair_tenants_tests {
+    use super::select_pair_tenants;
+    use crate::mcp::device_jwt_refresher::{BindingGapRow, BindingGapView, TenantCredentialState};
+    use qontinui_runner_lib::pair::TenantPairStatus;
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    fn view(status: &'static str, rows: &[(u8, TenantCredentialState)]) -> BindingGapView {
+        BindingGapView {
+            status,
+            reason: (status != "measured").then(|| "sidecar stale".to_string()),
+            rows: rows
+                .iter()
+                .map(|(n, state)| BindingGapRow {
+                    tenant_id: t(*n).to_string(),
+                    display_name: None,
+                    state: *state,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_view_pairs_nothing() {
+        let v = view("unknown", &[(1, TenantCredentialState::Unknown)]);
+        let err = select_pair_tenants(&v, &[]).unwrap_err();
+        assert!(
+            err.contains("UNKNOWN") && err.contains("sidecar stale"),
+            "{err}"
+        );
+        assert!(select_pair_tenants(&v, &[t(1)]).is_err());
+    }
+
+    #[test]
+    fn the_default_is_the_gaps_only() {
+        use TenantCredentialState::*;
+        let v = view(
+            "measured",
+            &[(1, Connected), (2, NoCredential), (3, Unknown)],
+        );
+        assert_eq!(select_pair_tenants(&v, &[]).unwrap(), (vec![t(2)], vec![]));
+        let none = view("measured", &[(1, Connected), (3, Unknown)]);
+        assert!(select_pair_tenants(&none, &[]).is_err());
+    }
+
+    #[test]
+    fn explicit_ids_are_intersected_with_gap_and_connected_rows() {
+        use TenantCredentialState::*;
+        let v = view(
+            "measured",
+            &[(1, Connected), (2, NoCredential), (3, Unknown)],
+        );
+        let (allowed, refused) = select_pair_tenants(&v, &[t(2), t(1), t(3), t(9), t(2)]).unwrap();
+        assert_eq!(allowed, vec![t(2), t(1)]);
+        assert_eq!(
+            refused
+                .iter()
+                .map(|r| r.tenant_id.clone())
+                .collect::<Vec<_>>(),
+            vec![t(3).to_string(), t(9).to_string()]
+        );
+        assert!(refused.iter().all(|r| r.status == TenantPairStatus::Skipped
+            && r.skipped_reason
+                .as_deref()
+                .is_some_and(|w| w.starts_with("not_offered"))));
+        assert!(select_pair_tenants(&v, &[t(3), t(9)]).is_err());
     }
 }

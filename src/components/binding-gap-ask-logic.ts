@@ -139,11 +139,19 @@ export function credentialStateLabel(state: TenantCredentialState): string {
 }
 
 /**
- * Rows the Settings card's "Connect all my workspaces" would pair: every row
- * that is not `connected` — a gap, or a tenant whose state is unknown.
+ * Rows "Connect all my workspaces" pairs: ONLY `no_credential` rows of a
+ * MEASURED view. An `unknown` row is never offered — it cannot be told apart
+ * from a workspace coord has since unbound, and pairing that would re-create
+ * the binding. An unknown view offers nothing; the card shows its reason.
  */
 export function rowsNeedingConnect(view: BindingGapView | null): BindingGapRow[] {
-  return view === null ? [] : view.rows.filter((r) => r.state !== "connected");
+  if (view === null || view.status !== "measured") return [];
+  return view.rows.filter((r) => r.state === "no_credential");
+}
+
+/** The display label for a tenant: its name from the view when known, else null. */
+export function displayNameFor(view: BindingGapView | null, tenantId: string): string | null {
+  return view?.rows.find((r) => r.tenantId === tenantId)?.displayName ?? null;
 }
 
 /** True only on a MEASURED view with no gap — the banner's auto-dismiss test. */
@@ -235,5 +243,42 @@ export function pairResultLabel(r: TenantPairResult): string {
         : `skipped${r.skippedReason ? ` — ${r.skippedReason}` : ""}`;
     case "failed":
       return `failed${r.skippedReason ? ` — ${r.skippedReason}` : ""}`;
+  }
+}
+
+/** Event the runner emits for the ONE in-flight `pair_all_tenants` flow. */
+export const PAIR_ALL_PROGRESS_EVENT = "pair-all-tenants-progress";
+
+/** Tauri command ending the in-flight flow. */
+export const CANCEL_PAIR_ALL_TENANTS_CMD = "cancel_pair_all_tenants";
+
+export type PairAllProgress =
+  | { phase: "waiting" }
+  | { phase: "browser"; connectUrl: string; launched: boolean }
+  | { phase: "done"; results: TenantPairResult[] }
+  | { phase: "error"; error: string }
+  | { phase: "cancelled" };
+
+/** Coerce one progress event payload; `null` when it is not one. */
+export function normalizePairAllProgress(raw: unknown): PairAllProgress | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  switch (o.phase) {
+    case "waiting":
+      return { phase: "waiting" };
+    case "browser": {
+      const connectUrl = str(o.connect_url);
+      return connectUrl === null
+        ? null
+        : { phase: "browser", connectUrl, launched: o.launched === true };
+    }
+    case "done":
+      return { phase: "done", results: normalizePairAllResults(o) ?? [] };
+    case "error":
+      return { phase: "error", error: str(o.error) ?? "unknown error" };
+    case "cancelled":
+      return { phase: "cancelled" };
+    default:
+      return null;
   }
 }

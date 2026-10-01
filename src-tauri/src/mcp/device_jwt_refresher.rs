@@ -2302,8 +2302,10 @@ pub struct BindingGapView {
 /// names — and the current reads only supply the row UNIVERSE. Where the two
 /// cannot both be trusted the row is `unknown`, never `connected`:
 ///
-/// * the report is UNKNOWN, or the bound set cannot be read now → every row
-///   is unknown (a stale or unreadable `coord_bound_tenants.json` lands here);
+/// * the report is UNKNOWN, or the current reads cannot establish what a
+///   report needs (a stale or unreadable `coord_bound_tenants.json`, an
+///   unreadable slot store, an unreadable default binding) → every row is
+///   unknown;
 /// * a tenant the report does not name as a gap but which this box holds no
 ///   credential for (coord bound it after the report was published) → unknown;
 /// * a tenant the report names as a gap that the current bound set no longer
@@ -2328,12 +2330,19 @@ pub(crate) fn binding_gap_view(
         covered.insert(t);
     }
 
-    let unknown_reason = match (report, bound) {
-        (BindingGapReport::Unknown(why), _) => Some(why.clone()),
-        (_, qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown(why)) => {
-            Some((*why).to_string())
+    // UNKNOWN when the published report is, OR when the CURRENT reads could
+    // not establish what a report needs — an unreadable/stale sidecar, an
+    // unreadable slot store (`None`), an unreadable default binding. The
+    // current reads are judged by `resolve_binding_gaps` itself, so the
+    // reasons are the report's own words, not a second copy of them.
+    let unknown_reason = match report {
+        BindingGapReport::Unknown(why) => Some(why.clone()),
+        BindingGapReport::Gaps(_) => {
+            match resolve_binding_gaps(tenant_slots, default_binding, bound) {
+                BindingGapReport::Unknown(why) => Some(why),
+                BindingGapReport::Gaps(_) => None,
+            }
         }
-        _ => None,
     };
     let row = |t: &uuid::Uuid, state| BindingGapRow {
         tenant_id: t.to_string(),
@@ -9186,7 +9195,7 @@ mod tenant_slot_refresh_tests {
             ),
             (
                 "src/commands/web_integration.rs",
-                "pub async fn pair_all_tenants<",
+                "async fn run_pair_all_tenants<",
                 "persist_collected_pairings(",
                 &[RETIRE, SHARED][..],
             ),
@@ -11335,6 +11344,29 @@ mod binding_gap_view_tests {
             states(&view),
             vec![(gone.to_string(), TenantCredentialState::Unknown)]
         );
+    }
+
+    /// An unreadable slot store or default binding NOW makes the view unknown
+    /// even over a measured report — no row may read as connected.
+    #[test]
+    fn an_unreadable_store_or_default_now_is_unknown_over_a_measured_report() {
+        let (home, other) = (tenant(1), tenant(2));
+        let bound = CoordBoundTenantsRead::Known(vec![home, other]);
+        let report = BindingGapReport::Gaps(vec![other.to_string()]);
+        for (slots, default) in [
+            (None, crate::auth::BindingTenantRead::Bound(home)),
+            (Some(&[][..]), crate::auth::BindingTenantRead::Unknown),
+        ] {
+            let view = binding_gap_view(&report, &bound, slots, default);
+            assert_eq!(view.status, "unknown");
+            assert!(view.reason.is_some());
+            assert!(
+                view.rows
+                    .iter()
+                    .all(|r| r.state != TenantCredentialState::Connected),
+                "{view:?}"
+            );
+        }
     }
 
     /// The wire shape the frontend parses.
