@@ -2000,9 +2000,17 @@ enum OutcomeAck {
 ///   attempt resolves (`spawned` / `spawn_failed`) or after the spawned
 ///   session's PTY exits without reporting (`work_unreported`).
 ///
-/// `outcome`/`detail` are `skip_serializing_if = Option::is_none` so the claim
-/// post serializes to exactly `{device_id}` (byte-identical to the pre-restructure
-/// body coord already accepts as the claim).
+/// `outcome`/`detail`/`claude_code_session_id` are
+/// `skip_serializing_if = Option::is_none` so the claim post serializes to
+/// exactly `{device_id}` (byte-identical to the pre-restructure body coord
+/// already accepts as the claim).
+///
+/// `claude_code_session_id` is the Claude Code session uuid this runner PINNED
+/// for the spawned continuation (`--session-id <uuid>`). It rides the `spawned`
+/// OUTCOME post — never the claim — and coord stamps it onto the continuation's
+/// placeholder `coord.sessions` row (plan
+/// `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+/// Phase 1). A coord that predates the field ignores it (serde default).
 #[derive(Debug, Clone, Serialize)]
 struct ContinuationConsumedBody {
     device_id: uuid::Uuid,
@@ -2010,6 +2018,8 @@ struct ContinuationConsumedBody {
     outcome: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_code_session_id: Option<String>,
 }
 
 impl ContinuationConsumedBody {
@@ -2019,21 +2029,28 @@ impl ContinuationConsumedBody {
             device_id,
             outcome: None,
             detail: None,
+            claude_code_session_id: None,
         }
     }
 
     /// The OUTCOME body — one [`ContinuationOutcome`] token plus an optional
     /// first-line detail. Posted after the spawn attempt resolves, or after the
     /// spawned session's PTY exits without having reported.
+    ///
+    /// `claude_code_session_id` is the pinned Claude session uuid; callers pass
+    /// `Some` only on the [`ContinuationOutcome::Spawned`] post (the one moment
+    /// it is both known and meaningful), `None` everywhere else.
     fn outcome(
         device_id: uuid::Uuid,
         outcome: ContinuationOutcome,
         detail: Option<String>,
+        claude_code_session_id: Option<String>,
     ) -> Self {
         Self {
             device_id,
             outcome: Some(outcome.wire()),
             detail,
+            claude_code_session_id,
         }
     }
 }
@@ -3691,6 +3708,7 @@ async fn post_work_unreported_fallback(
         device_id,
         ContinuationOutcome::WorkUnreported,
         None,
+        None,
     )
     .await
     {
@@ -4693,6 +4711,7 @@ async fn post_continuation_outcome(
     device_id: uuid::Uuid,
     outcome: ContinuationOutcome,
     detail: Option<String>,
+    claude_code_session_id: Option<String>,
 ) -> OutcomeAck {
     let Some(base) = connected_coord_base() else {
         return OutcomeAck::NoVerdict;
@@ -4703,8 +4722,9 @@ async fn post_continuation_outcome(
         return OutcomeAck::NoVerdict;
     };
     let token = outcome.wire();
-    let body = ContinuationConsumedBody::outcome(device_id, outcome, detail);
-    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..) (:2438); same device-keyed route, no session id anywhere in scope.
+    let body =
+        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id);
+    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..); same device-keyed route — coord resolves the gate row from the path gate_id plus the verified claiming device, and the optional claude_code_session_id is a value it STAMPS onto that row, never a key it scopes or looks up by.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4718,6 +4738,25 @@ async fn post_continuation_outcome(
                 "agent_runtime: continuation-outcome posted gate_id={gate_id} \
                  outcome={token} ack={ack:?}"
             );
+            if let Some(sent) = body.claude_code_session_id.as_deref() {
+                match classify_session_binding(&text) {
+                    SessionBinding::Bound(verdict) => debug!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} binding={verdict}"
+                    ),
+                    SessionBinding::NotBound(verdict) => warn!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} NOT bound by coord: \
+                         claude_code_session_binding={verdict:?}"
+                    ),
+                    SessionBinding::Unreported => warn!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} — coord's 200 carried no \
+                         claude_code_session_binding; binding UNKNOWN (a coord predating \
+                         the field ignores it)"
+                    ),
+                }
+            }
             ack
         }
         Ok(resp) => {
@@ -4735,6 +4774,34 @@ async fn post_continuation_outcome(
             );
             OutcomeAck::NoVerdict
         }
+    }
+}
+
+/// What coord said it did with a `claude_code_session_id` the runner sent on an
+/// outcome post — its `claude_code_session_binding` response field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionBinding {
+    /// `bound` / `already_bound`: the placeholder row carries the id.
+    Bound(String),
+    /// Any other verdict coord named (`no_placeholder`, `device_mismatch`,
+    /// `claim_arm`, …) — the id did NOT land.
+    NotBound(String),
+    /// No such field (or not a string): coord did not say. UNKNOWN, never bound.
+    Unreported,
+}
+
+/// Pure over coord's 200 body so every arm is unit-testable without coord.
+fn classify_session_binding(body: &str) -> SessionBinding {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return SessionBinding::Unreported;
+    };
+    match v
+        .get("claude_code_session_binding")
+        .and_then(|b| b.as_str())
+    {
+        Some(b @ ("bound" | "already_bound")) => SessionBinding::Bound(b.to_string()),
+        Some(other) => SessionBinding::NotBound(other.to_string()),
+        None => SessionBinding::Unreported,
     }
 }
 
@@ -4778,9 +4845,11 @@ async fn post_spawn_outcome(
     device_id: uuid::Uuid,
     outcome: ContinuationOutcome,
     detail: Option<String>,
+    // The pinned Claude session uuid — `Some` only on a `Spawned` outcome.
+    claude_code_session_id: Option<String>,
 ) {
     if let OutcomeAck::Superseded(standing) =
-        post_continuation_outcome(gate_id, device_id, outcome, detail).await
+        post_continuation_outcome(gate_id, device_id, outcome, detail, claude_code_session_id).await
     {
         warn!(
             "agent_runtime: continuation-outcome gate_id={gate_id} REFUSED — posted {} but \
@@ -5597,6 +5666,7 @@ async fn run_gate_continuation_inner(
                     Some(first_line(&continuation_acquire_failure_detail(
                         &e.to_string(),
                     ))),
+                    None,
                 )
                 .await;
             }
@@ -5606,9 +5676,13 @@ async fn run_gate_continuation_inner(
 
     // Step 3 (dispatch) + Step 4 (outcome): dispatch on presentation, then POST
     // the honest outcome sourced from the REAL spawn result. The presentation
-    // fns return `Ok(())` once the terminal/subprocess is actually created and
+    // fns return `Ok(_)` once the terminal/subprocess is actually created and
     // running (`spawned`) and `Err(_)` on a spawn failure (`spawn_failed`).
-    let result = match payload.presentation {
+    // `result` carries, on `Ok`, the session id worth BINDING on coord's
+    // placeholder row: `Some(pinned_session_id)` for a live session, `None` for
+    // a headless child that exited non-zero (it died; an id for a session that
+    // never did the work must not be bound).
+    let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
             run_continuation_terminal(
@@ -5621,6 +5695,7 @@ async fn run_gate_continuation_inner(
                 pinned_session_id,
             )
             .await
+            .map(|()| Some(pinned_session_id))
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5637,6 +5712,11 @@ async fn run_gate_continuation_inner(
                 &payload.initial_prompt,
                 payload.brief.as_ref(),
             );
+            // Known lag, accepted: the headless fn returns only after the child
+            // EXITS, so on this presentation the `spawned` outcome — and the
+            // session id with it — reaches coord at exit rather than at spawn.
+            // Headless continuations are rare and the binding is still correct,
+            // just late; when `spawned` is posted is deliberately unchanged.
             let res = run_continuation_headless(
                 agent_id,
                 &workdir,
@@ -5644,7 +5724,8 @@ async fn run_gate_continuation_inner(
                 reservation,
                 pinned_session_id,
             )
-            .await;
+            .await
+            .map(|exit| headless_bindable_session(exit, pinned_session_id));
             drop(ctx);
             res
         }
@@ -5652,29 +5733,28 @@ async fn run_gate_continuation_inner(
 
     // coord's own dispatch-time allocation for this continuation (its
     // `dispatch_source` rows) learns the session too. The runner's allocation
-    // above was already bound at allocate time.
-    if result.is_ok() {
+    // above was already bound at allocate time. Same rule as the outcome's
+    // id binding: only a BINDABLE session is reported — a headless child that
+    // exited non-zero died, and its id must not be bound to the row.
+    if let Some(session) = bindable_session(&result) {
         if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
-            tokio::spawn(report_session_launched(dispatch_agent, pinned_session_id));
+            tokio::spawn(report_session_launched(dispatch_agent, session));
         }
     }
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
-        ConsumeTarget::Gate(gate_id) => match &result {
-            Ok(()) => {
-                post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
-            }
-            Err(e) => {
-                post_spawn_outcome(
-                    gate_id,
-                    device_id,
-                    ContinuationOutcome::SpawnFailed,
-                    Some(first_line(&e.to_string())),
-                )
-                .await
-            }
-        },
+        ConsumeTarget::Gate(gate_id) => {
+            let resolution = spawn_resolution_outcome(&result);
+            post_spawn_outcome(
+                gate_id,
+                device_id,
+                resolution.outcome,
+                resolution.detail,
+                resolution.claude_code_session_id,
+            )
+            .await
+        }
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
         // dispatch on the next reconnect (at-least-once).
@@ -5690,7 +5770,60 @@ async fn run_gate_continuation_inner(
         }
         ConsumeTarget::None => {}
     }
-    result
+    result.map(|_bindable_session| ())
+}
+
+/// The Step-4 outcome post a presentation result maps to: which token, which
+/// detail, and which pinned Claude session id rides along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnResolution {
+    outcome: ContinuationOutcome,
+    detail: Option<String>,
+    claude_code_session_id: Option<String>,
+}
+
+/// Pure map from the presentation result to the Step-4 outcome post. `Ok` is
+/// `spawned` carrying the bindable session id (if any); `Err` is `spawn_failed`
+/// with the first error line and never an id.
+fn spawn_resolution_outcome(result: &anyhow::Result<Option<uuid::Uuid>>) -> SpawnResolution {
+    match result {
+        Ok(_) => SpawnResolution {
+            outcome: ContinuationOutcome::Spawned,
+            detail: None,
+            claude_code_session_id: bindable_session(result).map(|id| id.to_string()),
+        },
+        Err(e) => SpawnResolution {
+            outcome: ContinuationOutcome::SpawnFailed,
+            detail: Some(first_line(&e.to_string())),
+            claude_code_session_id: None,
+        },
+    }
+}
+
+/// The session id a presentation result lets coord BIND (both the `spawned`
+/// outcome's `claude_code_session_id` and the dispatch-allocation session
+/// report): `Some` only for a live/clean session, never for a failed spawn or a
+/// headless child that exited non-zero.
+fn bindable_session(result: &anyhow::Result<Option<uuid::Uuid>>) -> Option<uuid::Uuid> {
+    result.as_ref().ok().copied().flatten()
+}
+
+/// How a headless continuation child ended, as far as binding its session goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessExit {
+    /// Exit code 0 — a session that ran; its pinned id is bindable.
+    Clean,
+    /// A non-zero exit — the child died; it still counts as `spawned`, but its
+    /// id is NOT bound on coord.
+    NonZero,
+}
+
+/// The session id the `spawned` outcome may bind for a headless child.
+fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<uuid::Uuid> {
+    match exit {
+        HeadlessExit::Clean => Some(pinned),
+        HeadlessExit::NonZero => None,
+    }
 }
 
 /// Zone ceiling for a continuation page before it is considered "full".
@@ -7119,6 +7252,9 @@ fn headless_continuation_bound_port(resolve: impl FnOnce() -> Option<u16>) -> Op
 /// subprocess flow), posting `spawn-complete` on first successful spawn and
 /// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
 /// lifecycle posts so a continuation is observable on coord the same way.
+///
+/// `Ok` says how the child ended ([`HeadlessExit`]) so the caller binds the
+/// pinned session id on coord only for a child that exited cleanly.
 async fn run_continuation_headless(
     agent_id: uuid::Uuid,
     workdir: &str,
@@ -7130,7 +7266,7 @@ async fn run_continuation_headless(
     // The Claude session id to pin (`--session-id`), minted by the caller
     // before the worktree allocate. See `run_gate_continuation_inner`.
     pinned_session_id: uuid::Uuid,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
     // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
@@ -7197,7 +7333,7 @@ async fn run_continuation_headless(
                         "agent_runtime: gate-continuation agent_id={agent_id} exited cleanly \
                          (code=0)"
                     );
-                    Ok(())
+                    Ok(HeadlessExit::Clean)
                 }
                 Ok(code) => {
                     report_spawn_failed(
@@ -7208,7 +7344,7 @@ async fn run_continuation_headless(
                         None,
                     )
                     .await;
-                    Ok(())
+                    Ok(HeadlessExit::NonZero)
                 }
                 Err(e) => {
                     report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
@@ -12903,7 +13039,8 @@ mod tests {
     /// Drives the gate-continuation HEADLESS dispatch through the REAL
     /// `spawn_claude_child` + `pump_subprocess` path with a fake `claude` bin
     /// (a portable shell that prints + exits 0). Proves the arm spawns a child
-    /// and returns `Ok(())` end-to-end. The coord lifecycle POSTs
+    /// with `--session-id <the pinned id>` and returns `Ok(HeadlessExit::Clean)`
+    /// end-to-end. The coord lifecycle POSTs
     /// (`spawn-complete`/`spawn-failed`) no-op gracefully here because no
     /// `coord_url` profile is configured in the test env (`connected_coord_base()`
     /// returns `None`), so this asserts the SPAWN path, not the HTTP posts.
@@ -12918,15 +13055,33 @@ mod tests {
             return;
         }
         // Use a portable shell as the fake `claude`: prints a line, exits 0.
+        // The headless arm passes `--session-id <uuid>`, which a bare `sh`
+        // rejects as an illegal option, so on Unix the fake is a tiny script
+        // that RECORDS its argv (one arg per line) and runs stdin through `sh`.
         let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
-        std::env::set_var(
-            "QONTINUI_CLAUDE_BIN",
-            if cfg!(target_os = "windows") {
-                "cmd"
-            } else {
-                "sh"
-            },
-        );
+        let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
+        let argv_file = fake_dir.path().join("argv");
+        let fake_bin = if cfg!(target_os = "windows") {
+            "cmd".to_string()
+        } else {
+            let path = fake_dir.path().join("fake-claude");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sh\n",
+                    argv_file.display()
+                ),
+            )
+            .expect("write fake claude");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod fake claude");
+            }
+            path.to_string_lossy().to_string()
+        };
+        std::env::set_var("QONTINUI_CLAUDE_BIN", &fake_bin);
         // On Windows the bin is `cmd`; spawn_claude_child passes the prompt on
         // stdin and closes it — `cmd` with no args reads stdin then exits. On
         // Unix, `sh` reads stdin commands then exits. Either way the child
@@ -12941,12 +13096,13 @@ mod tests {
         let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
+        let pinned = uuid::Uuid::new_v4();
         let res = run_continuation_headless(
             agent_id,
             &workdir,
             "echo gate-continuation-proof",
             AnchorReservation::none(),
-            uuid::Uuid::new_v4(),
+            pinned,
         )
         .await;
         match prev_tier {
@@ -12957,6 +13113,21 @@ mod tests {
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
         );
+        assert_eq!(res.unwrap(), HeadlessExit::Clean);
+        if cfg!(unix) {
+            let argv = std::fs::read_to_string(&argv_file).expect("fake claude recorded argv");
+            let args: Vec<&str> = argv.lines().collect();
+            let at = args
+                .iter()
+                .position(|a| *a == "--session-id")
+                .unwrap_or_else(|| panic!("child argv carries --session-id: {args:?}"));
+            let pinned_text = pinned.to_string();
+            assert_eq!(
+                args.get(at + 1).copied(),
+                Some(pinned_text.as_str()),
+                "the child runs under the pinned id the spawned outcome binds"
+            );
+        }
 
         match prev {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
@@ -15229,6 +15400,154 @@ mod tests {
         assert_eq!(p.target_device_id, device);
     }
 
+    /// The `spawned` OUTCOME carries the pinned Claude session uuid under the
+    /// exact wire name coord's `ConsumeContinuationRequest` reads,
+    /// `claude_code_session_id` — and nothing else changes shape.
+    #[test]
+    fn continuation_spawned_outcome_carries_claude_code_session_id() {
+        let device = uuid::Uuid::now_v7();
+        let pinned = uuid::Uuid::new_v4().to_string();
+        let v = serde_json::to_value(ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::Spawned,
+            None,
+            Some(pinned.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": device,
+                "outcome": "spawned",
+                "claude_code_session_id": pinned,
+            })
+        );
+    }
+
+    /// `None` OMITS the key entirely (not `null`): an outcome with no pinned id
+    /// must be byte-identical to the pre-field body.
+    #[test]
+    fn continuation_outcome_without_session_id_omits_the_key() {
+        let device = uuid::Uuid::now_v7();
+        let text = serde_json::to_string(&ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::Spawned,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            !text.contains("claude_code_session_id"),
+            "None must omit the key, got {text}"
+        );
+        assert_eq!(
+            text,
+            format!(r#"{{"device_id":"{device}","outcome":"spawned"}}"#)
+        );
+    }
+
+    /// The CLAIM stays byte-identical `{"device_id":"<uuid>"}` on the wire —
+    /// asserted on the serialized STRING, so a new `null`-serialized field (or a
+    /// session id leaking onto the claim) fails here, not just at coord.
+    #[test]
+    fn continuation_claim_body_is_byte_identical_device_id_only() {
+        let device = uuid::Uuid::now_v7();
+        let text = serde_json::to_string(&ContinuationConsumedBody::claim(device)).unwrap();
+        assert_eq!(text, format!(r#"{{"device_id":"{device}"}}"#));
+    }
+
+    /// Step 4's outcome post: `Ok(Some(id))` is `spawned` CARRYING the id, so a
+    /// run_gate_continuation_inner that dropped the id would fail here; `Ok(None)`
+    /// (a headless child that died) is `spawned` with no id; `Err` is
+    /// `spawn_failed` with the first error line and never an id.
+    #[test]
+    fn spawn_resolution_outcome_threads_the_pinned_id_onto_spawned_only() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            spawn_resolution_outcome(&Ok(Some(id))),
+            SpawnResolution {
+                outcome: ContinuationOutcome::Spawned,
+                detail: None,
+                claude_code_session_id: Some(id.to_string()),
+            }
+        );
+        assert_eq!(
+            spawn_resolution_outcome(&Ok(None)),
+            SpawnResolution {
+                outcome: ContinuationOutcome::Spawned,
+                detail: None,
+                claude_code_session_id: None,
+            }
+        );
+        assert_eq!(
+            spawn_resolution_outcome(&Err(anyhow::anyhow!("pty create failed\nmore"))),
+            SpawnResolution {
+                outcome: ContinuationOutcome::SpawnFailed,
+                detail: Some("pty create failed".to_string()),
+                claude_code_session_id: None,
+            }
+        );
+    }
+
+    /// The dispatch-allocation session report and the outcome's id binding share
+    /// one rule: report only a bindable session — never a dead headless child
+    /// (`Ok(None)`) or a failed spawn.
+    #[test]
+    fn bindable_session_gates_the_session_report() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(bindable_session(&Ok(Some(id))), Some(id));
+        assert_eq!(bindable_session(&Ok(None)), None);
+        assert_eq!(bindable_session(&Err(anyhow::anyhow!("boom"))), None);
+        assert_eq!(
+            bindable_session(&Ok(headless_bindable_session(HeadlessExit::NonZero, id))),
+            None
+        );
+    }
+
+    /// A headless child that exited cleanly binds its pinned id; one that exited
+    /// non-zero (died) binds nothing.
+    #[test]
+    fn headless_bindable_session_only_for_a_clean_exit() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(headless_bindable_session(HeadlessExit::Clean, id), Some(id));
+        assert_eq!(headless_bindable_session(HeadlessExit::NonZero, id), None);
+    }
+
+    /// coord's `claude_code_session_binding` verdicts: `bound`/`already_bound`
+    /// are bound; any other named verdict is NOT bound; a missing or non-string
+    /// field (or an unparseable body) is UNKNOWN, never bound.
+    #[test]
+    fn classify_session_binding_arms() {
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"bound"}"#),
+            SessionBinding::Bound("bound".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"already_bound"}"#),
+            SessionBinding::Bound("already_bound".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"no_placeholder"}"#),
+            SessionBinding::NotBound("no_placeholder".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"device_mismatch"}"#),
+            SessionBinding::NotBound("device_mismatch".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"outcome_recorded":"spawned"}"#),
+            SessionBinding::Unreported
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":null}"#),
+            SessionBinding::Unreported
+        );
+        assert_eq!(
+            classify_session_binding("not json"),
+            SessionBinding::Unreported
+        );
+    }
+
     /// The CLAIM body serializes to the FIXED wire contract coord accepts as a
     /// claim: EXACTLY `{"device_id": "<uuid>"}` (no `outcome`/`detail` keys —
     /// `skip_serializing_if` must elide them so the claim is byte-identical to
@@ -15252,6 +15571,7 @@ mod tests {
             device,
             ContinuationOutcome::Spawned,
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -15263,6 +15583,7 @@ mod tests {
             device,
             ContinuationOutcome::SpawnFailed,
             Some("terminal session create failed".to_string()),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -15279,6 +15600,7 @@ mod tests {
         let unreported = serde_json::to_value(ContinuationConsumedBody::outcome(
             device,
             ContinuationOutcome::WorkUnreported,
+            None,
             None,
         ))
         .unwrap();
