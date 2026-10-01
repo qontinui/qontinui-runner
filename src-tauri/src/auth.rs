@@ -403,6 +403,7 @@ where
 /// Storage strategy:
 /// 1. Primary: Encrypted file storage (reliable on all platforms)
 /// 2. Fallback: OS keychain (for migration from existing installations)
+#[derive(Clone)]
 pub struct AuthManager {
     secure_storage: SecureStorage,
     service_name: String,
@@ -1448,6 +1449,19 @@ impl AuthManager {
         self.secure_storage
             .clear_tenant_device_jwt(tenant_id)
             .context("Failed to clear per-tenant device JWT from secure storage")
+    }
+
+    /// Remove one tenant's slot only if it still holds `observed` (compare and
+    /// remove under one store lock). Returns whether it was removed.
+    #[track_caller]
+    pub fn clear_tenant_device_jwt_if_unchanged(
+        &self,
+        tenant_id: &Uuid,
+        observed: &str,
+    ) -> Result<bool> {
+        self.secure_storage
+            .clear_tenant_device_jwt_if_unchanged(tenant_id, observed)
+            .context("Failed to conditionally clear per-tenant device JWT")
     }
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in

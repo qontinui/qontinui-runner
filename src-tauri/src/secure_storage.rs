@@ -89,11 +89,11 @@ const STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const STORE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(15);
 
 thread_local! {
-    /// Lock files this THREAD already holds, so a nested read-modify-write on
-    /// the same store (none exists today) re-enters instead of deadlocking
-    /// against its own advisory lock — `flock`/`LockFileEx` conflict per open
-    /// handle, not per process.
-    static HELD_STORE_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+    /// Lock files this THREAD currently holds. Used only to REFUSE a nested
+    /// acquisition: `flock`/`LockFileEx` conflict per open handle, so a nested
+    /// lock on the same file from the same thread would otherwise wait out the
+    /// whole timeout against itself.
+    static HELD_FILE_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
@@ -112,20 +112,128 @@ pub(crate) fn process_attribution() -> String {
     format!("pid={} exe={exe}", std::process::id())
 }
 
-/// Held for the span of one read-modify-write of the store. Dropping it
-/// releases the advisory lock (closing the handle unlocks it).
-struct StoreLockGuard {
-    /// `None` when this thread already held the lock (re-entrant no-op).
-    held: Option<(fs::File, PathBuf)>,
+/// An exclusive advisory lock on one lock file; dropping it releases the lock
+/// (closing the handle unlocks it).
+pub(crate) struct FileLockGuard {
+    file: fs::File,
+    path: PathBuf,
 }
 
-impl Drop for StoreLockGuard {
+impl Drop for FileLockGuard {
     fn drop(&mut self) {
-        if let Some((file, path)) = self.held.take() {
-            let _ = file.unlock();
-            HELD_STORE_LOCKS.with(|h| h.borrow_mut().remove(&path));
+        let _ = self.file.unlock();
+        HELD_FILE_LOCKS.with(|h| h.borrow_mut().remove(&self.path));
+    }
+}
+
+/// `<path>.lock` with the parent directory canonicalized, so two spellings of
+/// one directory (a symlink, a relative path) cannot yield two different locks.
+/// Resolve it ONCE per store / per reconcile and reuse it.
+pub(crate) fn lock_path_for(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let parent = path
+        .parent()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_default();
+    parent.join(name)
+}
+
+/// `true` under `cfg(test)` when `QONTINUI_TEST_DISABLE_STORE_LOCK=1`: the
+/// mutation switch the concurrency tests are checked against (they must FAIL
+/// with locking disabled). Compiled out of every non-test build.
+#[cfg(test)]
+fn locking_disabled_for_mutation_check() -> bool {
+    std::env::var("QONTINUI_TEST_DISABLE_STORE_LOCK").as_deref() == Ok("1")
+}
+#[cfg(not(test))]
+fn locking_disabled_for_mutation_check() -> bool {
+    false
+}
+
+/// Take an exclusive cross-process advisory lock on `lock_path`, waiting at
+/// most [`STORE_LOCK_TIMEOUT`].
+///
+/// - The lock file is created owner-only (`0600` on Unix).
+/// - The holder's `pid`/`exe` go to a SEPARATE, never-locked `<lock>.holder`
+///   file, because on Windows a waiter cannot read a file whose bytes another
+///   handle has locked. A waiter that times out names that holder.
+/// - A NESTED acquisition of the same lock on the same thread is a bug and
+///   fails immediately (and trips a `debug_assert!`) instead of deadlocking.
+///
+/// BLOCKING: under contention it sleeps on the calling thread, so async
+/// callers run the locked work through `spawn_blocking`.
+pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLockGuard> {
+    let path = lock_path.to_path_buf();
+    if HELD_FILE_LOCKS.with(|h| h.borrow().contains(&path)) {
+        let msg = format!(
+            "nested acquisition of lock {} on the same thread — a lock-holding section \
+             re-entered a locked mutator",
+            path.display()
+        );
+        debug_assert!(false, "{msg}");
+        anyhow::bail!(msg);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("Failed to create lock directory")?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(&path)
+        .with_context(|| format!("Failed to open lock {}", path.display()))?;
+    let mut holder_path = path.clone().into_os_string();
+    holder_path.push(".holder");
+    let holder_path = PathBuf::from(holder_path);
+    let deadline = std::time::Instant::now() + STORE_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    let holder = fs::read_to_string(&holder_path)
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    anyhow::bail!(
+                        "lock {} is still held after {:?} (last holder: {holder}); refusing to \
+                         write without it (a lock-free read-modify-write can silently drop \
+                         another tenant's credential slot) [waiter {}]",
+                        path.display(),
+                        STORE_LOCK_TIMEOUT,
+                        process_attribution()
+                    );
+                }
+                std::thread::sleep(STORE_LOCK_POLL);
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("Failed to lock {}", path.display()))
+                );
+            }
         }
     }
+    // Best-effort: the lock, not this text, is the exclusion.
+    {
+        let mut hopts = fs::OpenOptions::new();
+        hopts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            hopts.mode(0o600);
+        }
+        if let Ok(mut h) = hopts.open(&holder_path) {
+            use std::io::Write;
+            let _ = h.write_all(process_attribution().as_bytes());
+        }
+    }
+    HELD_FILE_LOCKS.with(|h| h.borrow_mut().insert(path.clone()));
+    Ok(FileLockGuard { file, path })
 }
 
 /// Stored token data structure
@@ -558,8 +666,11 @@ pub enum StoredTokenRead {
 /// tokens to this machine/user. See the module docs for the honest guarantee:
 /// this is same-machine binding + tamper evidence, NOT confidentiality
 /// against a local same-user reader.
+#[derive(Clone)]
 pub struct SecureStorage {
     storage_path: PathBuf,
+    /// `auth_tokens.enc.lock`, resolved once at construction ([`lock_path_for`]).
+    lock_file: PathBuf,
 }
 
 impl SecureStorage {
@@ -580,7 +691,11 @@ impl SecureStorage {
         let storage_path = data_dir.join(STORAGE_FILE);
         debug!("SecureStorage initialized at: {:?}", storage_path);
 
-        let storage = Self { storage_path };
+        let lock_file = lock_path_for(&storage_path);
+        let storage = Self {
+            storage_path,
+            lock_file,
+        };
         // Best-effort boot sweep of crash-orphaned atomic-write temp files
         // (older than 5 min so we never race a live writer). Never fatal.
         storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
@@ -596,7 +711,11 @@ impl SecureStorage {
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).context("Failed to create data directory")?;
         }
-        Ok(Self { storage_path })
+        let lock_file = lock_path_for(&storage_path);
+        Ok(Self {
+            storage_path,
+            lock_file,
+        })
     }
 
     /// Derives an encryption key from machine-specific identifiers.
@@ -745,12 +864,10 @@ impl SecureStorage {
 
     /// The advisory lock file beside the store: `auth_tokens.enc.lock`.
     fn lock_path(&self) -> PathBuf {
-        let mut os = self.storage_path.clone().into_os_string();
-        os.push(".lock");
-        PathBuf::from(os)
+        self.lock_file.clone()
     }
 
-    /// Take the CROSS-PROCESS store lock, waiting at most [`STORE_LOCK_TIMEOUT`].
+    /// Take the CROSS-PROCESS store lock ([`lock_file_exclusive`]).
     ///
     /// [`Self::save_tokens`] is atomic but a read-modify-write is not: two
     /// processes (the primary, the CLI, an instance runner, a test binary)
@@ -759,70 +876,13 @@ impl SecureStorage {
     /// clear line anywhere (plan `2026-09-30-runner-says-connected-…` F2/D4).
     /// Every mutator therefore runs load → modify → save under this lock via
     /// [`Self::locked_rmw`]. Readers stay lock-free: the atomic rename already
-    /// guarantees they see a whole file.
-    ///
-    /// Re-entrant per thread (see [`HELD_STORE_LOCKS`]).
-    ///
-    /// BLOCKING: under contention this sleeps (up to the timeout) on the calling
-    /// thread. Every mutator was already blocking file I/O plus AES; a healthy
-    /// hold is milliseconds, and the bound keeps a wedged peer from stalling an
-    /// async worker indefinitely.
-    fn lock_store(&self) -> Result<StoreLockGuard> {
-        let path = self.lock_path();
-        if HELD_STORE_LOCKS.with(|h| h.borrow().contains(&path)) {
-            return Ok(StoreLockGuard { held: None });
+    /// guarantees they see a whole file. NOT re-entrant: no mutator may call
+    /// another mutator while holding it.
+    fn lock_store(&self) -> Result<Option<FileLockGuard>> {
+        if locking_disabled_for_mutation_check() {
+            return Ok(None);
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("Failed to create data directory")?;
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("Failed to open store lock {}", path.display()))?;
-        let deadline = std::time::Instant::now() + STORE_LOCK_TIMEOUT;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        let holder = fs::read_to_string(&path)
-                            .ok()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| "<unreadable>".to_string());
-                        anyhow::bail!(
-                            "secure storage lock {} is still held after {:?} (holder: {holder}); \
-                             refusing to write without it (a lock-free read-modify-write can \
-                             silently drop another tenant's credential slot) [waiter {}]",
-                            path.display(),
-                            STORE_LOCK_TIMEOUT,
-                            process_attribution()
-                        );
-                    }
-                    std::thread::sleep(STORE_LOCK_POLL);
-                }
-                Err(fs::TryLockError::Error(e)) => {
-                    return Err(
-                        anyhow::Error::new(e).context(format!("Failed to lock {}", path.display()))
-                    );
-                }
-            }
-        }
-        // Name the holder inside the lock file so a peer that times out can say
-        // WHO held it. Best-effort: the lock, not this text, is the exclusion.
-        {
-            use std::io::{Seek, Write};
-            let mut f = &file;
-            let _ = f.set_len(0);
-            let _ = f.seek(std::io::SeekFrom::Start(0));
-            let _ = f.write_all(process_attribution().as_bytes());
-        }
-        HELD_STORE_LOCKS.with(|h| h.borrow_mut().insert(path.clone()));
-        Ok(StoreLockGuard {
-            held: Some((file, path)),
-        })
+        lock_file_exclusive(&self.lock_file).map(Some)
     }
 
     /// One locked read-modify-write: take the store lock, `load`, apply
@@ -1560,6 +1620,39 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// Remove one tenant's slot ONLY if it still holds `observed` — the token
+    /// the caller saw when it DECIDED to clear. Compare and remove happen under
+    /// one store lock, so a slot rewritten in between (a re-pair, a refresher
+    /// re-mint) survives. Returns whether the slot was removed.
+    #[track_caller]
+    pub fn clear_tenant_device_jwt_if_unchanged(
+        &self,
+        tenant_id: &uuid::Uuid,
+        observed: &str,
+    ) -> Result<bool> {
+        let caller = std::panic::Location::caller();
+        let key = Self::tenant_device_jwt_key(tenant_id);
+        let _guard = self.lock_store()?;
+        let mut tokens = self.load_tokens_for_write()?;
+        if tokens.tenant_device_jwts.get(&key).map(String::as_str) != Some(observed) {
+            warn!(
+                "Per-tenant device JWT for tenant {tenant_id} NOT cleared: the slot changed \
+                 since the clear was decided (caller={caller} {})",
+                process_attribution()
+            );
+            return Ok(false);
+        }
+        tokens.tenant_device_jwts.remove(&key);
+        let slots_after = tokens.tenant_device_jwts.len();
+        self.save_tokens(&tokens)?;
+        warn!(
+            "Per-tenant device JWT cleared for tenant {tenant_id} (conditional; \
+             slots_after={slots_after} caller={caller} {})",
+            process_attribution()
+        );
+        Ok(true)
+    }
+
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
     /// deterministic (BTreeMap key) order. Unreadable stores and malformed
     /// keys yield an empty / filtered list — enumeration is never fatal.
@@ -2168,10 +2261,13 @@ mod tests {
         let storage = create_test_storage("concurrent_tenant_writers");
         let path = storage.storage_path.clone();
         let _ = fs::remove_file(storage.lock_path());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let writer = |base: u128| {
             let path = path.clone();
+            let barrier = barrier.clone();
             std::thread::spawn(move || {
                 let s = SecureStorage::with_path(path).unwrap();
+                barrier.wait();
                 for i in 0..N {
                     s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
                         .unwrap();
@@ -2219,6 +2315,13 @@ mod tests {
     /// Distinct tenant slots each child adds.
     const LOCK_CHILD_WRITES: u128 = 120;
 
+    /// A barrier marker file beside the child-test store.
+    fn lock_child_marker(store: &std::path::Path, tag: &str) -> PathBuf {
+        let mut os = store.as_os_str().to_os_string();
+        os.push(format!(".{tag}"));
+        PathBuf::from(os)
+    }
+
     /// Child half of the two-PROCESS test below: a no-op in a normal run; when
     /// the parent re-invokes this test binary with the env vars set, it
     /// hammers one tenant slot of the shared store.
@@ -2231,7 +2334,17 @@ mod tests {
             return;
         };
         let base: u128 = tenant.parse().unwrap();
-        let s = SecureStorage::with_path(PathBuf::from(store)).unwrap();
+        let store = PathBuf::from(store);
+        let s = SecureStorage::with_path(store.clone()).unwrap();
+        // Start barrier: announce readiness, then wait for the parent's GO so
+        // both children's write loops genuinely overlap.
+        fs::write(lock_child_marker(&store, &format!("ready.{base}")), b"").unwrap();
+        let go = lock_child_marker(&store, "go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !go.exists() {
+            assert!(std::time::Instant::now() < deadline, "parent never said GO");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         for i in 0..LOCK_CHILD_WRITES {
             s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
                 .unwrap();
@@ -2261,8 +2374,29 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
+        let go = lock_child_marker(&storage.storage_path, "go");
+        let _ = fs::remove_file(&go);
+        for base in [0xA000u128, 0xB000] {
+            let _ = fs::remove_file(lock_child_marker(
+                &storage.storage_path,
+                &format!("ready.{base}"),
+            ));
+        }
         let a = spawn(0xA000);
         let b = spawn(0xB000);
+        // Release both children together once each has reported ready.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while ![0xA000u128, 0xB000]
+            .iter()
+            .all(|base| lock_child_marker(&storage.storage_path, &format!("ready.{base}")).exists())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "children never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(&go, b"").unwrap();
         for child in [a, b] {
             let out = child.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2287,22 +2421,52 @@ mod tests {
         let _ = fs::remove_file(&storage.storage_path);
     }
 
-    /// The store lock is re-entrant on one thread (no self-deadlock) and is
-    /// released on drop, so a subsequent writer is not blocked.
+    /// A nested acquisition of the store lock on one thread is refused at
+    /// once (it would otherwise wait out the timeout against itself); in a
+    /// debug build it trips the debug_assert.
     #[test]
-    fn test_store_lock_is_reentrant_and_released() {
-        let storage = create_test_storage("store_lock_reentrant");
-        {
-            let _outer = storage.lock_store().unwrap();
-            let _inner = storage.lock_store().unwrap();
-            storage
-                .store_tenant_device_jwt(&uuid::Uuid::from_u128(1), "x")
-                .unwrap();
-        }
-        let other = SecureStorage::with_path(storage.storage_path.clone()).unwrap();
-        let _g = other.lock_store().unwrap();
-        drop(_g);
+    #[should_panic(expected = "nested acquisition")]
+    fn test_nested_store_lock_on_one_thread_is_refused() {
+        let storage = create_test_storage("store_lock_nested");
+        let _outer = storage.lock_store().unwrap();
+        let _ = storage.lock_store();
+    }
+
+    /// The conditional clear removes the slot only while it still holds the
+    /// observed token; a slot rewritten since the decision survives.
+    #[test]
+    fn test_conditional_clear_spares_a_rewritten_slot() {
+        let storage = create_test_storage("conditional_clear");
+        let t = uuid::Uuid::from_u128(7);
+        storage.store_tenant_device_jwt(&t, "old").unwrap();
+        storage.store_tenant_device_jwt(&t, "new").unwrap();
+        assert!(!storage
+            .clear_tenant_device_jwt_if_unchanged(&t, "old")
+            .unwrap());
+        assert_eq!(
+            storage.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(storage
+            .clear_tenant_device_jwt_if_unchanged(&t, "new")
+            .unwrap());
+        assert!(storage.get_tenant_device_jwt(&t).unwrap().is_none());
         let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// The lock file is owner-only on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_store_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let storage = create_test_storage("store_lock_mode");
+        let _ = fs::remove_file(storage.lock_path());
+        drop(storage.lock_store().unwrap());
+        let mode = fs::metadata(storage.lock_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "lock file mode {mode:o}");
     }
 
     /// The boot sweep unlinks crash-orphaned `*.enc.tmp.<...>` files older than
