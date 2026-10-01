@@ -23,6 +23,7 @@ use qontinui_pty_holder::pane::{lock_path, PaneId};
 use qontinui_pty_holder::protocol::{
     parse_reply, to_payload, RejectReason, Reply, Request, PROTOCOL_VERSIONS,
 };
+use qontinui_pty_holder::spec::{write_spec, ChildSpec};
 
 const BIN: &str = env!("CARGO_BIN_EXE_qontinui-pty-holder");
 
@@ -82,8 +83,26 @@ impl Drop for Spawned {
     }
 }
 
-/// Spawn a holder and wait for its one-line report.
+/// The long-lived, inert child every transport test's holder runs. Since
+/// Phase 2 a holder always owns a PTY child; these tests are about the
+/// transport, so the child just sleeps (and dies with its holder: the holder's
+/// death hangs up the PTY).
+fn inert_child() -> ChildSpec {
+    #[cfg(windows)]
+    let argv = ["cmd.exe", "/c", "timeout", "/t", "3600", "/nobreak"];
+    #[cfg(not(windows))]
+    let argv = ["sleep", "3600"];
+    let mut spec = ChildSpec::new(argv.iter().map(Into::into).collect());
+    spec.env = std::env::vars_os().collect();
+    spec
+}
+
+/// Spawn a holder and wait for its one-line report. Writes the pane's child
+/// spec first, as the runner does.
 fn spawn_holder(dir: &Path, pane: &str) -> (Spawned, String) {
+    // Best effort: a test of a REFUSED pane dir must still reach the holder,
+    // which refuses it itself (write_spec refuses it first, writing nothing).
+    let _ = write_spec(dir, &pid(pane), &inert_child());
     let mut child = Command::new(BIN)
         .arg("--pane-dir")
         .arg(dir)
@@ -177,7 +196,7 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
     let ack = c.hello_ack().clone();
     assert_eq!(ack.version, *PROTOCOL_VERSIONS.iter().max().unwrap());
     assert_eq!(ack.holder_pid, h.pid());
-    assert_eq!(ack.child_pid, None, "no PTY in Phase 1");
+    assert!(ack.child_pid.is_some(), "a Phase 2 holder owns a child");
     c.ping(soon()).unwrap();
     let cen = c.census(soon()).unwrap();
     assert_eq!(cen.pane_id, "p1");
@@ -195,7 +214,7 @@ fn pty_holder_handshake_ping_census_and_lock_record() {
     let rec = read_record(&lock_path(&dir, &pid("p1"))).expect("lock record");
     assert_eq!(rec.holder_pid, h.pid());
     assert_eq!(rec.versions, PROTOCOL_VERSIONS.to_vec());
-    assert_eq!(rec.child_pid, None);
+    assert_eq!(rec.child_pid, ack.child_pid, "the lock names the child too");
     assert!(rec.started_at_unix_ms > 0);
 
     match probe(&dir, &pid("p1"), soon()) {
@@ -274,8 +293,16 @@ fn pty_holder_refusals_before_and_after_handshake() {
     r.send_frame(KIND_CONTROL, &[0xC3, 0x28], soon()).unwrap();
     expect_rejected(r.recv_frame(soon()).unwrap(), RejectReason::Malformed);
 
-    // A data frame after a good handshake.
+    // A data frame after a good handshake, before attach: input is
+    // accepted on an attached connection only.
     let mut c = connect(&dir, &pane, soon()).unwrap();
+    c.send_raw_frame(KIND_DATA, b"x", soon()).unwrap();
+    expect_rejected(
+        c.recv_raw_frame(soon()).unwrap(),
+        RejectReason::NotAttached,
+    );
+    // …and on a version-1 connection a data frame is not a thing at all.
+    let mut c = connect_with_versions(&dir, &pane, soon(), &[1]).unwrap();
     c.send_raw_frame(KIND_DATA, b"x", soon()).unwrap();
     expect_rejected(
         c.recv_raw_frame(soon()).unwrap(),

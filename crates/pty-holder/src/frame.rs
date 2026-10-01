@@ -10,7 +10,7 @@
 //! so it is never zero. A `len` of zero or above [`MAX_FRAME_LEN`] is a protocol
 //! error, not a frame.
 //!
-//! Two kinds are defined:
+//! Three kinds are defined:
 //!
 //! - [`KIND_CONTROL`] — the payload is one JSON object (see `protocol`).
 //! - [`KIND_DATA`] — the payload is RAW BYTES, carried as-is. Never re-encoded
@@ -18,6 +18,13 @@
 //!   costs ~4x on the hot path, plan Phase 1). Pane output is not UTF-8 in
 //!   general — a multibyte character can straddle a read boundary, and a TUI may
 //!   emit arbitrary bytes — so any text conversion on this path is a corruption.
+//!   Runner → holder: the pane's INPUT (protocol version 2, attached
+//!   connections only).
+//! - [`KIND_OUTPUT`] (protocol version 2) — holder → runner pane OUTPUT: an
+//!   8-byte big-endian ABSOLUTE offset of the first byte, then the raw bytes.
+//!   The offset is the pane's stream position since the child started, the
+//!   same coordinate the runner's `remote_offset` / `AttachedRing` arithmetic
+//!   works in, so a reconnect can resume exactly where it stopped.
 //!
 //! The frame layer does not interpret `kind`: it round-trips every tag value,
 //! and the SERVER decides which tags it accepts (a positive allowlist,
@@ -32,6 +39,11 @@ use std::io::{self, Read, Write};
 pub const KIND_CONTROL: u8 = 0x01;
 /// A data frame: the payload is raw bytes, byte-exact.
 pub const KIND_DATA: u8 = 0x02;
+/// An output frame: `u64` BE absolute offset, then raw bytes (protocol v2).
+pub const KIND_OUTPUT: u8 = 0x03;
+
+/// Length of [`KIND_OUTPUT`]'s offset header.
+pub const OUTPUT_OFFSET_LEN: usize = 8;
 
 /// Length of the big-endian `u32` prefix.
 pub const PREFIX_LEN: usize = 4;
@@ -68,6 +80,27 @@ impl Frame {
             payload,
         }
     }
+}
+
+/// The payload of a [`KIND_OUTPUT`] frame: `offset` (u64 BE), then `bytes`
+/// verbatim.
+pub fn output_payload(offset: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
+    p.extend_from_slice(&offset.to_be_bytes());
+    p.extend_from_slice(bytes);
+    p
+}
+
+/// Split a [`KIND_OUTPUT`] payload into `(offset, bytes)`. `None` when it is
+/// shorter than the offset header — a malformed frame, never "zero bytes".
+pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {
+    if payload.len() < OUTPUT_OFFSET_LEN {
+        return None;
+    }
+    let (head, bytes) = payload.split_at(OUTPUT_OFFSET_LEN);
+    let mut be = [0u8; OUTPUT_OFFSET_LEN];
+    be.copy_from_slice(head);
+    Some((u64::from_be_bytes(be), bytes))
 }
 
 /// Encode one frame into its exact wire bytes.
@@ -250,6 +283,23 @@ mod tests {
             assert_eq!(f.payload, all_256());
             assert!(read_frame(&mut r).unwrap().is_none(), "clean EOF");
         }
+    }
+
+    /// WIRE SHAPE of the v2 output frame: prefix, kind 0x03, 8-byte BE
+    /// offset, raw bytes — and every byte value survives the header split.
+    #[test]
+    fn pty_holder_wire_shape_output_frame() {
+        let bytes = encode_frame(KIND_OUTPUT, &output_payload(0x0102, &[0x00, 0xFF])).unwrap();
+        assert_eq!(
+            bytes,
+            vec![0, 0, 0, 11, 0x03, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x00, 0xFF]
+        );
+        let p = output_payload(u64::MAX - 1, &all_256());
+        let (off, b) = parse_output(&p).unwrap();
+        assert_eq!(off, u64::MAX - 1);
+        assert_eq!(b, &all_256()[..]);
+        assert_eq!(parse_output(&output_payload(7, &[])), Some((7, &[][..])));
+        assert_eq!(parse_output(&[0u8; 7]), None, "short header is malformed");
     }
 
     #[test]

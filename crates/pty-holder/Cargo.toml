@@ -28,6 +28,10 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Phase 2: the holder OWNS its pane's PTY. The same version src-tauri uses
+# (`src-tauri/Cargo.toml`), so the runner's in-process `LocalPty` and the
+# holder drive one PTY implementation, not two.
+portable-pty = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -36,13 +40,18 @@ libc = "0.2"
 # plain `windows-sys` dependency takes default features and resolves none of
 # these call sites.
 [target.'cfg(windows)'.dependencies]
+# The RUNNER-side spawner (`spawn`) decides the holder's job-breakaway route
+# through runner-win32's `holder_spawn` (plan D4 as corrected 2026-09-27). The
+# holder binary itself never calls it, so it costs the per-pane process nothing.
+qontinui-runner-win32 = { path = "../runner-win32" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     # SECURITY_ATTRIBUTES, TOKEN_USER, GetTokenInformation — the pipe DACL.
     "Win32_Security",
     # ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW.
     "Win32_Security_Authorization",
-    # CreateFileW, ReadFile, WriteFile, LockFileEx, PIPE_ACCESS_DUPLEX, FILE_FLAG_*.
+    # CreateFileW, ReadFile, WriteFile, LockFileEx, FlushFileBuffers,
+    # PIPE_ACCESS_DUPLEX, FILE_FLAG_*.
     "Win32_Storage_FileSystem",
     # OVERLAPPED, GetOverlappedResult, CancelIoEx.
     "Win32_System_IO",
