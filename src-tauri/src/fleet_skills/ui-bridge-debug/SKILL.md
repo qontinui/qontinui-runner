@@ -155,9 +155,11 @@ report the frame as a `frame` observation. Rules for reading any of them:
   statement). `unknown` → the producer **could not look**; `unknown.code` says
   why. An `unknown` is **never** reported as a clean page or as a broken one.
 - **Branch on `unknown.code`, not on `unknown.detail`** (prose, for humans):
-  `app_unreachable` / `producer_failed` → check the bridge or model endpoint is
-  up; `input_missing` → the input (frame, `elements`, bbox) was absent — fix
-  the target or re-capture; `producer_not_run` → nothing registered yet — wait
+  `app_unreachable` / `producer_failed` → the producer OR its capture failed
+  (`unknown.detail` says which) — check the bridge, window or model endpoint is
+  up; `input_missing` → an input the page or caller did not supply (`elements`,
+  bbox, geometry) — re-capture the snapshot; an unknown `target` is not an
+  observation at all but a 404; `producer_not_run` → nothing registered yet — wait
   for the page to hydrate; `below_confidence_floor` → lower `minConfidence`;
   `model_reply_unparseable` → retry with `"force": true`;
   `needs_multi_frame_input` → use `vision/diff` over two captures.

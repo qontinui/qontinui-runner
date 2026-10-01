@@ -94,12 +94,14 @@ curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
 
 `target` resolves, in order, against: a registered physical device (its proxy
 url), a registered app (its base url), then an adb serial / `emulator-NNNN`.
-An unknown id answers `status: "unknown"` with `unknown.code: "input_missing"`
-and the reason (`unknown vision target '<id>'`) in `unknown.detail`. If the
-target is reachable but serves no screenshot (no `screenshotProvider` wired),
-the answer is the same `input_missing` unknown rather than a silent fallback to
-the runner desktop — so a `measured` answer always reflects the intended
-surface, and `provenance.source.target` names it. `target` is part of the cache key, so device frames never collide with
+An unknown id is a **malformed request**, exactly like an unknown `element`:
+HTTP **404** with `unknown vision target '<id>'` in `error` — the same on every
+vision route. If the target resolves but its capture fails (no
+`screenshotProvider` wired, the device is unreachable), the capture was
+attempted and failed: `status: "unknown"`, `unknown.code: "producer_failed"`,
+with `unknown.detail` naming the capture — never a silent fallback to the
+runner desktop. So a `measured` answer always reflects the intended surface,
+and `provenance.source.target` names it. `target` is part of the cache key, so device frames never collide with
 desktop frames. Omit `target` for the default runner-desktop behavior.
 
 ## Response Shapes — the Observation envelope
@@ -111,7 +113,7 @@ its three states:
 | `status` | Meaning | What to report |
 |---|---|---|
 | `measured` | The model looked and saw something; `value` holds it | The text / caption, with its age (below) |
-| `absent` | The model looked, with **full coverage**, and saw no text | "No text in this region" — a real statement about the page |
+| `absent` | The model looked, with **full coverage**, and saw no text (it returned no blocks, or only whitespace-only / duplicate ones) | "No text in this region" — a real statement about the page |
 | `unknown` | The producer **could not look**; `unknown.code` says why | "Could not read the screen: `<code>`" — **never** "the page is empty", **never** "the page is broken" |
 
 An `unknown` is not a clean page and not a broken page. It says nothing about
@@ -156,10 +158,13 @@ non-zero `dropped.belowConfidence` beside kept blocks is the DEGRADED case: the
 answer stands, and `provenance.coverage.unmeasured` names the text the model saw
 and was not sure of — a `contains` miss over it is not proof of absence.
 
-The fixed rules: model returned no blocks → `absent`; every block carrying text
-scored under `minConfidence` → `unknown` / `below_confidence_floor`; reply not
-parseable → `unknown` / `model_reply_unparseable`; endpoint unreachable or
-non-2xx → `unknown` / `producer_failed`; no frame → `unknown` / `input_missing`.
+The fixed rules: model returned no blocks — or only whitespace-only or duplicate
+blocks, which post-processing drops (see `dropped`) — → `absent`; every block
+carrying text scored under `minConfidence` → `unknown` / `below_confidence_floor`;
+reply not parseable → `unknown` / `model_reply_unparseable`; endpoint unreachable
+or non-2xx → `unknown` / `producer_failed`; the frame capture was attempted and
+failed (window gone, device capture error) → `unknown` / `producer_failed`,
+with `unknown.detail` saying it was the capture.
 
 An unknown answer:
 
@@ -244,8 +249,7 @@ the OUTER observation `unknown` with the matching code.
 
 | `unknown.code` | Cause | Next action |
 |---|---|---|
-| `input_missing` | No frame: the window is absent, the `target` did not resolve or served no screenshot | Check `unknown.detail`; fix the `target`, or confirm the runner window exists (`GET http://127.0.0.1:9876/health`) |
-| `producer_failed` | The OCR/VLM endpoint was unreachable, timed out, or answered non-2xx | Check the model endpoint (`QONTINUI_VISION_*_ENDPOINT`, llama-swap `http://127.0.0.1:8100`); fall back to `discover` for text |
+| `producer_failed` | The producer OR its capture failed — `unknown.detail` says which: *"frame capture failed …"* (window gone, device served no screenshot) or *"OCR/VLM call to model …"* (endpoint unreachable, timed out, non-2xx) | Capture: confirm the runner window / device (`GET http://127.0.0.1:9876/health`). Model: check `QONTINUI_VISION_*_ENDPOINT` (llama-swap `http://127.0.0.1:8100`); fall back to `discover` for text |
 | `model_reply_unparseable` | The model answered with something that is not the requested JSON | Retry with `"force": true`; if it persists the model alias is wrong for the task |
 | `below_confidence_floor` | The model saw text and scored all of it under `minConfidence` | Retry with a lower `minConfidence`, or a tighter `region` / `element` |
 | any other code | See the contract table in `qontinui-schemas/rust-vision-core/src/observation.rs` | Report the code verbatim; do not infer a page state |
