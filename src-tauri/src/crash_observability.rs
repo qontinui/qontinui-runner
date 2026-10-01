@@ -255,7 +255,7 @@ fn write_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
 /// `wedge-incidents.log` tokens that name a resource exhaustion, most specific
 /// first. `alloc_failure` is written by the allocator wrapper when an
 /// allocation returns null (which a graceful `try_reserve` also does, so the
-/// line alone is not proof of the abort); the other three open a spawn-failure
+/// line alone is not proof of the abort); the other four open a spawn-failure
 /// episode (`util::resource_exhaustion::incident_token`), and each episode's
 /// close is the same token + `_closed`. Plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
@@ -320,23 +320,35 @@ fn read_incident_tail(path: &Path) -> String {
 /// - **Time.** A line outside the window belongs to an EARLIER run: the file
 ///   is never truncated, so an old `alloc_failure` would otherwise name every
 ///   later unrelated death.
-/// - **Process.** Every line ends `(pid N)`. Lines from `own_pid` (THIS boot —
-///   `install_live_crash_writer` runs before the harvest, so this process can
-///   already have written lines) are dropped. The window can also hold lines
-///   from OTHER live processes sharing the dev-logs path, so pairing and "last
-///   line" are judged only among the lines of ONE pid: the pid of the last
-///   remaining in-window line, which is the process that stopped writing
-///   last. The shutdown marker records no pid, so that inference is the best
-///   available; a line with no parseable pid is not attributed.
+/// - **Process.** Every writer ends its line `(pid N)`. Lines from `own_pid`
+///   (THIS boot — `install_live_crash_writer` runs before the harvest, so this
+///   process can already have written lines) are dropped. The window can also
+///   hold lines from OTHER live processes sharing the dev-logs path, so
+///   pairing and "last line" are judged only among the lines of ONE pid: the
+///   pid of the last in-window line that HAS a pid — the process that stopped
+///   writing last.
+/// - **Unattributable lines are barriers.** A timestamped in-window line with
+///   no parseable pid (a garbled line, or one from a build whose writer
+///   predates the trailing pid) is never an entry — it cannot be attributed —
+///   but it does prove something was written after what precedes it, so it
+///   demotes the "last line" claim of every earlier entry.
 /// - **Closure.** An episode whose `<token>_closed` line (same `kind=`, same
 ///   pid) follows its opening line had ENDED before the process died.
+///
+/// Documented limits: the shutdown marker records no pid, so "the dead run's
+/// pid" is inferred from the last pid-bearing line — if another live process
+/// sharing the path wrote last, its pid is chosen, and nothing here probes
+/// whether that pid is still alive. A pid the OS reused between the two runs
+/// is indistinguishable from the dead run's.
 pub(crate) fn find_prior_exhaustion(
     log: &str,
     since_ms: i64,
     until_ms: i64,
     own_pid: u32,
 ) -> Vec<PriorExhaustion> {
-    let candidates: Vec<(&str, &str, i64, u32)> = log
+    // Every timestamped in-window line, with its pid where one parses; this
+    // boot's own lines are gone.
+    let candidates: Vec<(&str, &str, i64, Option<u32>)> = log
         .lines()
         .filter_map(|raw| {
             let line = raw.trim();
@@ -346,23 +358,29 @@ pub(crate) fn find_prior_exhaustion(
             let at_ms = chrono::DateTime::parse_from_rfc3339(ts)
                 .ok()?
                 .timestamp_millis();
-            let pid = line_pid(line)?;
-            ((since_ms..=until_ms).contains(&at_ms) && pid != own_pid)
+            let pid = line_pid(line);
+            ((since_ms..=until_ms).contains(&at_ms) && pid != Some(own_pid))
                 .then_some((line, token, at_ms, pid))
         })
         .collect();
-    let Some(&(_, _, _, dead_pid)) = candidates.last() else {
+    let Some(dead_pid) = candidates.iter().rev().find_map(|&(_, _, _, pid)| pid) else {
         return Vec::new();
     };
+    // The dead run's lines plus the unattributable barriers, in order; other
+    // processes' lines say nothing about the dead run.
     let dead_lines: Vec<_> = candidates
         .into_iter()
-        .filter(|&(_, _, _, pid)| pid == dead_pid)
+        .filter(|&(_, _, _, pid)| pid.is_none() || pid == Some(dead_pid))
         .collect();
     let last_seq = dead_lines.len().checked_sub(1);
 
     // (sequence number among the dead run's lines, entry)
     let mut found: Vec<(usize, PriorExhaustion)> = Vec::new();
-    for (seq, &(line, token, at_ms, _)) in dead_lines.iter().enumerate() {
+    for (seq, &(line, token, at_ms, pid)) in dead_lines.iter().enumerate() {
+        if pid.is_none() {
+            // A barrier: counted for "last line", never an entry or a close.
+            continue;
+        }
         if let Some(open) = EXHAUSTION_TOKENS.iter().copied().find(|t| *t == token) {
             found.push((
                 seq,
@@ -569,8 +587,11 @@ pub(crate) fn format_harvest_breadcrumb(
         None => (module.to_string(), panic_message),
     };
     let exhaustion_section = if exhaustion.is_empty() {
-        "none — the prior run left no alloc_failure line and no open commit_exhaustion / \
-         commit_exhaustion_suspected / resource_exhaustion episode in wedge-incidents.log"
+        "none attributed — no alloc_failure line and no still-open commit_exhaustion / \
+         commit_exhaustion_suspected / resource_exhaustion / resource_exhaustion_suspected \
+         episode in wedge-incidents.log could be attributed to the prior run. That is not \
+         proof it wrote none: lines with no parseable (pid N), lines from this boot and \
+         lines from other processes are never attributed, and a closed episode is not listed"
             .to_string()
     } else {
         exhaustion
@@ -1330,6 +1351,85 @@ mod tests {
         );
     }
 
+    /// The watchdog's line (and any line with no parseable pid) written after
+    /// a survived `alloc_failure` proves the run went on: the allocation
+    /// failure is NOT the likely cause.
+    #[test]
+    fn a_watchdog_line_after_an_alloc_failure_demotes_it() {
+        for watchdog in [
+            // Current format: trailing pid, same run.
+            "2026-09-23T00:40:00.000+00:00 WATCHDOG backend_silent — pid 22, probe heartbeat \
+             90s old. Written by the runtime-independent watchdog thread. (pid 22)",
+            // Old format: no trailing pid — an unattributable barrier.
+            "2026-09-23T00:40:00.000+00:00 WATCHDOG backend_silent — pid 22, probe heartbeat \
+             90s old. Written by the runtime-independent watchdog thread.",
+        ] {
+            let log = format!(
+                "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation of 64 bytes \
+                 failed (alloc, align 8, thread 1) — x (pid 22)\n{watchdog}"
+            );
+            let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+            assert_eq!(found.len(), 1);
+            assert!(!found[0].last_in_window, "{watchdog}");
+            let body = format_harvest_breadcrumb(
+                THIS_BOOT_MS,
+                Some(PRIOR_BOOT_MS),
+                &CrashEvidence::empty(),
+                &found,
+            );
+            assert!(!body.contains("likely cause"), "{body}");
+        }
+    }
+
+    /// A garbled or missing `(pid N)` is never attributed — even on an
+    /// exhaustion token — and a lone such line yields nothing.
+    #[test]
+    fn a_line_without_a_parseable_pid_is_never_attributed() {
+        for bad in [
+            "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation of 64 bytes failed",
+            "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation (pid twelve)",
+            "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation (pid 12",
+        ] {
+            assert!(
+                find_prior_exhaustion(bad, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID).is_empty(),
+                "{bad}"
+            );
+        }
+        assert_eq!(line_pid("x (pid 12)"), Some(12));
+        assert_eq!(line_pid("x (pid 12) trailing"), None);
+    }
+
+    /// When the dead run's last line is a `_closed` line, its episode is gone
+    /// and the earlier `alloc_failure` is not last.
+    #[test]
+    fn a_closed_line_as_the_last_line_closes_and_demotes() {
+        let log = [
+            "2026-09-23T00:10:00.000+00:00 alloc_failure memory allocation of 64 bytes \
+             failed (alloc, align 8, thread 1) — x (pid 22)",
+            "2026-09-23T00:20:00.000+00:00 commit_exhaustion kind=commit os_code=1455 \
+             caller=\"a\" — x (pid 22)",
+            "2026-09-23T00:30:00.000+00:00 commit_exhaustion_closed kind=commit \
+             suppressed_repeats=0 duration_ms=0 ended_by=spawn_succeeded (pid 22)",
+        ]
+        .join("\n");
+        let found = find_prior_exhaustion(&log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+        let tokens: Vec<_> = found.iter().map(|e| e.token).collect();
+        assert_eq!(tokens, vec!["alloc_failure"]);
+        assert!(!found[0].last_in_window);
+    }
+
+    /// A caller label that itself contains `(pid` does not confuse the pid
+    /// parse: only the TRAILING `(pid N)` counts.
+    #[test]
+    fn a_caller_label_containing_pid_text_does_not_confuse_attribution() {
+        let log = "2026-09-23T00:10:00.000+00:00 commit_exhaustion kind=commit os_code=1455 \
+                   caller=\"probe (pid 7) helper\" — x (pid 22)";
+        let found = find_prior_exhaustion(log, PRIOR_BOOT_MS, THIS_BOOT_MS, THIS_PID);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].last_in_window);
+        assert_eq!(line_pid(log), Some(22));
+    }
+
     /// The boilerplate no longer implies the tao data race for every
     /// 0xc0000409: it names the allocation-failure member of the family and
     /// says the exit code alone names no cause.
@@ -1339,7 +1439,8 @@ mod tests {
         assert!(body.contains("That exit code does NOT name a"));
         assert!(body.contains("handle_alloc_error"));
         assert!(!body.contains("root-cause is tracked separately"));
-        assert!(body.contains("=== RESOURCE EXHAUSTION BREADCRUMBS ===\nnone"));
+        assert!(body.contains("=== RESOURCE EXHAUSTION BREADCRUMBS ===\nnone attributed"));
+        assert!(!body.contains("left no"));
         assert!(!body.contains("aborted on"));
     }
 
