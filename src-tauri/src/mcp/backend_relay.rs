@@ -2670,6 +2670,12 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
     "remote_terminal_exit",
     "remote_terminal_buffer",
     "remote_terminal_error",
+    // The target's answer to one input frame (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A1). The relay retypes `terminal_input_ack` to this and copies the rest
+    // of the frame — including, possibly, the target's `remote` echo — so
+    // unlike its siblings this entry may be load-bearing, not only a hedge.
+    "remote_terminal_input_ack",
     // The backend refuses a `remote_terminal_attach` as a bare `error`,
     // correlated by request_id — see the dispatch arm below.
     "error",
@@ -2955,10 +2961,11 @@ async fn handle_relay_command(
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
-        | "remote_terminal_error" => {
+        | "remote_terminal_error"
+        | "remote_terminal_input_ack" => {
             // The return is "did this client CONSUME the frame"
             // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
-            // arm for these six returns `true` unconditionally, warning
+            // arm for these seven returns `true` unconditionally, warning
             // internally on the no-waiter path. So there is nothing to branch
             // on here, and a check would be dead code. The sibling `error` arm
             // below checks it because `handle_inbound` genuinely can return
@@ -4549,7 +4556,8 @@ async fn register_remote_created_session(
             // leaving a ghost for coord's stale watcher to reap. Same
             // idempotent door the explicit close uses.
             let close_registry = registry.clone();
-            session.set_on_exit(Box::new(move |id| {
+            let exit_pinned_session_id = session.pinned_session_id().to_string();
+            session.set_on_exit(Box::new(move |id, exit_code| {
                 if let Err(e) = close_registry.close_by_id(id) {
                     warn!(
                         coord_session = %id,
@@ -4557,6 +4565,15 @@ async fn register_remote_created_session(
                         "remote create: coord session close failed on PTY exit"
                     );
                 }
+                // Trigger 4 (session_exit) — plan
+                // 2026-08-27-operator-touch-observation-runner-emitter,
+                // Phase B2 §2b/§2c.
+                crate::session::operator_touch::emit_session_exit_if_nonzero(
+                    &close_registry,
+                    id,
+                    Some(&exit_pinned_session_id),
+                    exit_code,
+                );
             }));
             if !session.is_alive() {
                 return Err(terminal_gone_after_confirm(&registry, coord_id));
@@ -5838,8 +5855,8 @@ mod tests {
         // failure, which is what it is for.
         assert_eq!(
             known.len(),
-            6,
-            "expected 6 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+            7,
+            "expected 7 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
              type was genuinely added or removed, update this count deliberately"
         );
 
@@ -7650,6 +7667,7 @@ mod remote_admission_tests {
             "remote_terminal_exit",
             "remote_terminal_buffer",
             "remote_terminal_error",
+            "remote_terminal_input_ack",
             "error",
         ] {
             assert!(
@@ -7818,6 +7836,57 @@ mod relay_routing_tests {
         echoed["remote"] = attach_block();
         let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_created", &echoed));
         assert_eq!(msg_type, "remote_terminal_created");
+    }
+
+    /// The A1 input ack, relay-shaped (the relay strips `remote`, `request_id`
+    /// and `code` and retypes it) and with the target's echo left on, is
+    /// dispatched unchanged — and the dispatched frame, handed to the same
+    /// `handle_inbound` the `remote_terminal_input_ack` arm calls, lands on the
+    /// pane. `handle_relay_command` itself needs an `ApiState` (a live
+    /// `tauri::AppHandle`) and cannot be built in a unit test; the arm's
+    /// presence is pinned textually by
+    /// `every_reply_handle_inbound_knows_passes_both_inbound_gates`.
+    #[test]
+    fn a_relay_shaped_input_ack_is_dispatched_unchanged_and_reaches_the_pane() {
+        use crate::mcp::remote_terminal::RemoteAttachClient;
+        use crate::terminal::remote_pane_io::{AttachedRing, RemotePaneIo};
+        let relay_shaped = json!({
+            "type": "remote_terminal_input_ack",
+            "grant_jti": "jti-a1",
+            "terminal_id": "t1",
+            "seq": 3,
+            "bytes": 1,
+            "accepted": true,
+            "via": "traffic",
+            "accepted_at": "2026-09-27T00:00:00.000Z",
+        });
+        let (msg_type, data) = dispatched(route_relay_frame(
+            "remote_terminal_input_ack",
+            &relay_shaped,
+        ));
+        assert_eq!(msg_type, "remote_terminal_input_ack");
+        assert_eq!(data, relay_shaped, "routing must not reshape the frame");
+        let mut echoed = relay_shaped.clone();
+        echoed["remote"] = attach_block();
+        let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_input_ack", &echoed));
+        assert_eq!(msg_type, "remote_terminal_input_ack");
+
+        let client = RemoteAttachClient::new();
+        let pane = std::sync::Arc::new(RemotePaneIo::new(
+            "jti-a1",
+            "t1",
+            "g",
+            client.sink(),
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        client.register_pane(pane.clone());
+        assert!(client.handle_inbound(&msg_type, &data));
+        assert_eq!(
+            pane.interactivity().last_input_acked.map(|a| a.seq),
+            Some(Some(3))
+        );
     }
 
     /// **The finding-1 scenario-B frame.** An ATTACH block on the envelope over

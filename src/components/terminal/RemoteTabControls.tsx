@@ -9,12 +9,14 @@ import {
   attachWaitingMessage,
   decodeHistoryBase64,
   remoteBadgeLabel,
+  remoteInteractivityFooter,
   sessionLabelFromTitle,
   REMOTE_HISTORY_EVENT,
   type RemoteHistoryDetail,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
 import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
+import { useRemoteInteractivity } from "./useRemoteInteractivity";
 
 /**
  * Zone-header controls for a REMOTE tab (plan
@@ -30,6 +32,12 @@ import { useRemoteAttachWaiting } from "./useRemoteAttachWaiting";
  *   `(deviceId, sessionId)`, then closes the dead tab. A live tab whose relay
  *   merely dropped needs none of this: the Rust pane keeps the session open,
  *   writes an in-band notice, and reattaches by itself on reconnect.
+ *
+ * - the interactivity footer (plan
+ *   `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ *   A1) — "last output received Ns ago · last keystroke accepted Ns ago", from
+ *   the pane's own receipts and the target's input acks; an unacked keystroke
+ *   past the deadline, or a refused one, is called out inline.
  *
  * Renders nothing for a local tab. Every action acknowledges itself — busy
  * state while pending, the outcome shown inline and kept until the next
@@ -186,6 +194,14 @@ export function RemoteTabControls({
           {waitingLine}
         </span>
       )}
+      {/* Mounted only for a live remote tab, so its 1 Hz poll re-renders
+          just this footer and never a local tab's controls. */}
+      {tab.isAlive && (
+        <RemoteInteractivityFooter
+          terminalId={tab.id}
+          deviceLabel={remote.deviceLabel.trim() || remote.deviceId.slice(0, 8)}
+        />
+      )}
       {note && !(busy === "reattach" && waitingLine) && (
         <span
           data-ui-bridge-id={`terminal.remote-note.${tab.id}`}
@@ -193,6 +209,48 @@ export function RemoteTabControls({
           title={note}
         >
           {note}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * The interactivity footer of a live remote tab (plan
+ * `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+ * A1): "last output received Ns ago · last keystroke accepted Ns ago", plus an
+ * inline note when input is not getting through or its fate is unknown.
+ */
+function RemoteInteractivityFooter({
+  terminalId,
+  deviceLabel,
+}: {
+  terminalId: string;
+  deviceLabel: string;
+}) {
+  const [snapshot, nowMs] = useRemoteInteractivity(terminalId);
+  if (!snapshot) return null;
+  const footer = remoteInteractivityFooter(snapshot, nowMs, deviceLabel);
+  return (
+    <>
+      <span
+        data-ui-bridge-id={`terminal.remote-interactivity.${terminalId}`}
+        className="text-[8px] text-[#565f89] truncate max-w-[18rem]"
+        title={footer.summary}
+        role="status"
+      >
+        {footer.summary}
+      </span>
+      {footer.note && (
+        <span
+          data-ui-bridge-id={`terminal.remote-input-note.${terminalId}`}
+          className={`text-[8px] truncate max-w-[14rem] ${
+            footer.noteKind === "warning" ? "text-[#f7768e]" : "text-[#e0af68]"
+          }`}
+          title={footer.note}
+          role={footer.noteKind === "warning" ? "alert" : "status"}
+        >
+          {footer.note}
         </span>
       )}
     </>

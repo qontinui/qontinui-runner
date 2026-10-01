@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
@@ -67,6 +68,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
 pub mod past_sessions;
@@ -362,6 +364,46 @@ pub enum SessionEventKind {
     ///
     /// Best-effort, same posture as [`Self::FindingPosted`].
     AgentNotification,
+    /// One operator touch — the runner-observed half of *"how often does an
+    /// agent stop short and make a human do something?"* (plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter`, Phase B2, the
+    /// runner emitter targeting the coord write route Phase B1 shipped as
+    /// qontinui-coord#2288). Producers: [`crate::session::operator_touch`]
+    /// (the shared idempotency-key + payload builder), called from the
+    /// waiter-thread exit hooks (`session_exit`) and
+    /// [`crate::terminal::operator_touch_watch`] (`idle_at_prompt`, riding the
+    /// same grid-scan tick as [`crate::terminal::context_watcher`]) and the
+    /// `Notification`-hook landing pad (`permission_prompt`).
+    ///
+    /// Drained to `POST /coord/sessions/operator-touch`. The payload is built
+    /// by the producer and forwarded VERBATIM as the body — coord's
+    /// `OperatorTouchBody` validates four closed vocabularies
+    /// (`kind`/`policy_authorized`/`resolution`/`source`) plus the open
+    /// `reason_code`, and NEVER reads `tenant_id` from the body (it comes from
+    /// the verified device JWT). The runner only ever sends the three
+    /// runner-observable `kind`s — `permission_prompt`, `idle_at_prompt`,
+    /// `session_exit` — never `question`/`gate`, which are coord's own.
+    ///
+    /// `idempotency_key` is REQUIRED and caller-derived:
+    /// `<coord_session_id>:<kind>:<epoch-bucket>`, bucket width 60s
+    /// ([`crate::session::operator_touch::BUCKET_WIDTH_SECS`]) — see that
+    /// module for why. coord stores `ON CONFLICT (idempotency_key) DO
+    /// NOTHING`, so a repeat within one bucket collapses to one row rather
+    /// than inflating the count; this producer ALSO holds a per-terminal
+    /// once-per-episode latch at the source so a wedged session does not even
+    /// spend the HTTP round trip on every tick.
+    ///
+    /// Best-effort, same posture as [`Self::HelperTaskCreated`]: a failure
+    /// here must never block or slow a session (the whole point is
+    /// observability, not gating), and coord's route is itself fail-open on
+    /// every DB error (200 `recorded: false`) for the same reason.
+    ///
+    /// ⚠️ Like [`Self::CoordTransportRung`], a kind with no [`coord_sync`]
+    /// `push_record` arm is ACK-DROPPED silently by that function's
+    /// catch-all. This kind HAS an arm; never remove one without the other —
+    /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
+    #[serde(rename = "operator_touch")]
+    OperatorTouch,
 }
 
 impl SessionEventKind {
@@ -385,6 +427,7 @@ impl SessionEventKind {
             SessionEventKind::Finished => "finished",
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
+            SessionEventKind::OperatorTouch => "operator_touch",
         }
     }
 }

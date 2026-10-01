@@ -38,7 +38,7 @@ the effective coordinator base URL and which of the five resolution arms produce
 
 ## 5. Endpoint registry — qontinui-web backend base URL (`api_endpoint_registry`)
 
-the single source of truth for the web-backend base across every runner subsystem, resolved over a documented four-rung order (env `QONTINUI_WEB_BACKEND_URL`, env `QONTINUI_API_URL`, the persisted paired backend, the build default)
+the single source of truth for the web-backend base across every runner subsystem, resolved over a documented five-rung order (env `QONTINUI_WEB_BACKEND_URL`, env `QONTINUI_API_URL`, the active profile's `api_url` in profiles.json, the persisted paired backend, the build default)
 
 - Resolved by: `api_config::resolve_api_base_url`
 - Owned by: bin

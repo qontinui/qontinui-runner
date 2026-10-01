@@ -1404,7 +1404,14 @@ pub struct TerminalSession {
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
     /// `SessionRegistry::close` is itself idempotent.
-    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>>,
+    /// Widened from `Fn(uuid::Uuid)` to also carry the exit code (plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c,
+    /// Phase B2): the coord-close callback still receives the coord session
+    /// id, and now also the PTY's real exit code (recovered by the §2b
+    /// `pane_io` fix), which the `session_exit` operator-touch trigger needs
+    /// and which the low-level waiter thread has no other route to hand to
+    /// its callers.
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>>,
     /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When the session declared edit intent on a registered repo and
     /// `worktree_mode_enabled()` was true at spawn time, this carries
@@ -2154,7 +2161,7 @@ impl TerminalSession {
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn. (`coord_session_id` itself is
         // declared above the reader thread, which also needs a clone of it.)
-        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>> =
+        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
         // Spawn waiter thread: detects process exit
@@ -2187,7 +2194,11 @@ impl TerminalSession {
                 if let Ok(mut ec) = waiter_exit.lock() {
                     *ec = code;
                 }
-                waiter_alive.store(false, Ordering::Relaxed);
+                // `swap` reports whether a runner-initiated close (`close_inner`
+                // / `close_kill_only`) had already cleared `is_alive` before its
+                // kill — in which case the exit code is the KILL's, not the
+                // agent's (see `on_exit_hook_code`).
+                let runner_initiated = mark_exited_was_runner_initiated(&waiter_alive);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2229,7 +2240,7 @@ impl TerminalSession {
                                 coord_session = %coord_id,
                                 "terminal exit — closing coord session mirror"
                             );
-                            cb(coord_id);
+                            cb(coord_id, on_exit_hook_code(code, runner_initiated));
                         }
                     }
                 }
@@ -3334,17 +3345,7 @@ impl TerminalSession {
         // lives here -- where `write` already documents itself as the SINGLE
         // funnel for terminal input, and where every future write surface
         // inherits it for free.
-        if !self.is_alive() {
-            return Err(format!(
-                "{}: terminal {} is not writable -- its process exited with code {}.",
-                TERMINAL_EXITED,
-                self.id,
-                match self.exit_code() {
-                    Some(code) => code.to_string(),
-                    None => "unknown".to_string(),
-                }
-            ));
-        }
+        self.liveness_gate()?;
         {
             let mut writer = self
                 .writer
@@ -3378,6 +3379,50 @@ impl TerminalSession {
             slot,
         );
         self.observe_input(data);
+        Ok(())
+    }
+
+    /// The liveness gate [`Self::write`] runs before touching the writer:
+    /// `Err` carrying the typed [`TERMINAL_EXITED`] prefix once the process
+    /// behind the PTY has exited.
+    fn liveness_gate(&self) -> Result<(), String> {
+        if self.is_alive() {
+            return Ok(());
+        }
+        Err(format!(
+            "{}: terminal {} is not writable -- its process exited with code {}.",
+            TERMINAL_EXITED,
+            self.id,
+            match self.exit_code() {
+                Some(code) => code.to_string(),
+                None => "unknown".to_string(),
+            }
+        ))
+    }
+
+    /// Would a [`Self::write`] be accepted right now? Answers WITHOUT writing.
+    ///
+    /// Plan `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`
+    /// (A1, the write probe). It runs exactly the liveness gate `write` runs,
+    /// then checks the writer lock is not poisoned (a poisoned lock is the one
+    /// other way `write` refuses before any byte moves). It is as strong as a
+    /// real write's `Ok`: a write to an exited PTY succeeds at the OS layer
+    /// (see `write`'s own comment), so the liveness gate is the only fact about
+    /// the PTY a successful write proves.
+    ///
+    /// It records NOTHING — no `last_input` slot, no `observe_input` — because a
+    /// zero-byte `write` would land a 0-byte observation in `last_write`, which
+    /// the phantom-turn detector reads as operator input: a probe that changed
+    /// the neighbouring measurement. `is_poisoned` never blocks, so the probe
+    /// cannot park the relay's serial read loop behind a slow PTY write.
+    pub fn probe_writable(&self) -> Result<(), String> {
+        self.liveness_gate()?;
+        if self.writer.is_poisoned() {
+            return Err(format!(
+                "terminal {} is not writable -- its PTY writer lock is poisoned.",
+                self.id
+            ));
+        }
         Ok(())
     }
 
@@ -4031,8 +4076,13 @@ impl TerminalSession {
     /// (the runner no longer self-closes abandoned sessions; coord_sync A3).
     /// The callback receives the coord session id and must be idempotent
     /// (it shares the close path with the frontend `terminal_close`
-    /// command — `SessionRegistry::close_by_id` is already idempotent).
-    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid) + Send + Sync>) {
+    /// command — `SessionRegistry::close_by_id` is already idempotent). It
+    /// also receives the PTY's real exit code (plan
+    /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c) —
+    /// `None` when the waiter itself failed to observe a status, or when the
+    /// exit was caused by a runner-initiated close's kill (see
+    /// `on_exit_hook_code`) — never a synthesized value.
+    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, Option<i32>) + Send + Sync>) {
         if let Ok(mut slot) = self.on_exit.lock() {
             *slot = Some(hook);
         }
@@ -4347,7 +4397,10 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
-        self.is_alive.store(false, Ordering::Relaxed);
+        // SeqCst, and BEFORE the kill: the waiter classifies the exit the kill
+        // causes as runner-initiated by seeing this store (see
+        // `mark_exited_was_runner_initiated`).
+        self.is_alive.store(false, Ordering::SeqCst);
 
         // Phase 2 — drop the isolated edit context first so the
         // claim-release fire-and-forget posts ahead of the PTY teardown
@@ -4518,11 +4571,36 @@ impl TerminalSession {
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
         );
-        self.is_alive.store(false, Ordering::Relaxed);
+        // SeqCst, before the kill — see `mark_exited_was_runner_initiated`.
+        self.is_alive.store(false, Ordering::SeqCst);
 
         if let Err(e) = self.io.kill(KILL_FLOOR) {
             warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
+    }
+}
+
+/// Called by the waiter once the child has exited: clears `is_alive` and
+/// reports whether a runner-initiated close (`close_inner` /
+/// `close_kill_only`, which clear it with SeqCst BEFORE they kill the child)
+/// got there first — i.e. whether this exit was caused by the runner's kill.
+fn mark_exited_was_runner_initiated(is_alive: &AtomicBool) -> bool {
+    !is_alive.swap(false, Ordering::SeqCst)
+}
+
+/// The exit code handed to the `on_exit` hook.
+///
+/// A close the RUNNER started (tab close, remote close, `close_all` at
+/// shutdown) kills the child — SIGTERM on unix, `taskkill /F` on Windows — so
+/// the child's non-zero status reports the kill, not an agent stopping short.
+/// Such an exit is reported as `None` ("no observed agent exit code"), which the
+/// operator-touch `session_exit` trigger ignores, so an ordinary close never
+/// inflates that metric. The pane's own recorded exit code is unaffected.
+fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
+    if runner_initiated {
+        None
+    } else {
+        code
     }
 }
 
@@ -4639,6 +4717,93 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runner_initiated_close_hands_the_hook_no_exit_code() {
+        // The kill's SIGTERM / taskkill status must never read as an agent's
+        // non-zero exit (operator-touch `session_exit` inflation).
+        assert_eq!(on_exit_hook_code(Some(1), true), None);
+        assert_eq!(on_exit_hook_code(Some(0), true), None);
+        assert_eq!(on_exit_hook_code(Some(1), false), Some(1));
+        assert_eq!(on_exit_hook_code(Some(0), false), Some(0));
+        assert_eq!(on_exit_hook_code(None, false), None);
+    }
+
+    #[test]
+    fn a_natural_exit_is_not_classified_as_runner_initiated() {
+        let alive = AtomicBool::new(true);
+        assert!(!mark_exited_was_runner_initiated(&alive));
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    /// A pane that records whether `is_alive` was already cleared at the
+    /// moment it was killed.
+    struct AliveAtKillPaneIo {
+        alive: Arc<AtomicBool>,
+        alive_at_kill: Mutex<Option<bool>>,
+    }
+
+    impl crate::terminal::pane_io::PaneIo for AliveAtKillPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(1)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            *self.alive_at_kill.lock().unwrap() = Some(self.alive.load(Ordering::SeqCst));
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The load-bearing ordering: both runner close paths clear `is_alive`
+    /// BEFORE killing the child, so the waiter that wakes on the kill sees a
+    /// runner-initiated exit and hands the hook `None`. Reordering a close
+    /// path (or adding a kill that does not clear the flag) fails this.
+    #[test]
+    fn both_runner_close_paths_clear_is_alive_before_the_kill() {
+        for kill_only in [false, true] {
+            let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+            session.is_alive.store(true, Ordering::SeqCst);
+            let io = Arc::new(AliveAtKillPaneIo {
+                alive: session.is_alive.clone(),
+                alive_at_kill: Mutex::new(None),
+            });
+            let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+            session.io = pane;
+            if kill_only {
+                session.close_kill_only();
+            } else {
+                session.close();
+            }
+            assert_eq!(
+                *io.alive_at_kill.lock().unwrap(),
+                Some(false),
+                "kill_only={kill_only}: is_alive must be cleared before the kill"
+            );
+            // The waiter waking on that kill classifies it as runner-initiated.
+            assert!(mark_exited_was_runner_initiated(&session.is_alive));
+            assert_eq!(on_exit_hook_code(Some(1), true), None);
+        }
+    }
 
     // =======================================================================
     // PTY spawn seam — production call-site coverage for the credential scrub
@@ -6631,6 +6796,58 @@ mod tests {
             b"echo hi\r",
             "the live write must land on the pty byte-for-byte"
         );
+    }
+
+    /// The write probe (plan `2026-09-20-remote-session-interactivity-…`, A1
+    /// acceptance 2): against a LIVE session it answers `Ok`, puts no byte on
+    /// the PTY, and leaves `last_input()` byte-identical — the phantom-turn
+    /// guard. A zero-byte `write` fails the last two (it records a 0-byte
+    /// `last_write` observation), which is why the probe is its own method.
+    #[test]
+    fn probe_writable_on_a_live_pty_writes_nothing_and_records_nothing() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = LiveTestSession::new(buf.clone());
+        session
+            .write(b"x", PtyWriteCaller::Test)
+            .expect("seed one real write so last_input is non-empty");
+        let before = format!("{:?}", session.last_input());
+        let bytes_before = buf.lock().unwrap().len();
+
+        session
+            .probe_writable()
+            .expect("a live pty must probe writable");
+
+        assert_eq!(
+            format!("{:?}", session.last_input()),
+            before,
+            "the probe must not touch last_input"
+        );
+        assert_eq!(buf.lock().unwrap().len(), bytes_before, "0 bytes written");
+
+        // The falsifier: the rejected design (a zero-byte write) DOES move it.
+        session
+            .write(&[], PtyWriteCaller::Test)
+            .expect("zero-byte write succeeds");
+        assert_ne!(
+            format!("{:?}", session.last_input()),
+            before,
+            "control: a zero-byte write records an observation — the probe must not be one"
+        );
+    }
+
+    /// And against an exited session the probe refuses with the SAME typed
+    /// code `write` does, recording nothing.
+    #[test]
+    fn probe_writable_on_an_exited_pty_is_terminal_exited() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf.clone());
+        let before = format!("{:?}", session.last_input());
+        let err = session
+            .probe_writable()
+            .expect_err("an exited pty must not probe writable");
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert_eq!(format!("{:?}", session.last_input()), before);
+        assert!(buf.lock().unwrap().is_empty());
     }
 
     /// The exit code the waiter recorded must travel in the refusal, so a

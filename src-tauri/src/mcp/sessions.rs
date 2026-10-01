@@ -1065,6 +1065,41 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 }
 
 // =============================================================================
+// /sessions/<id>/notification
+// =============================================================================
+
+/// `POST /sessions/{id}/notification` — the Claude Code `Notification` hook's
+/// landing pad (plan `2026-08-27-operator-touch-observation-runner-emitter`,
+/// Phase B2, §2a4's resolution: ship via the `qontinui-claude-config`
+/// installer, landing HERE rather than in the runner's own bundled
+/// `--settings`). `{id}` is the runner terminal id the hook script sends
+/// (`QONTINUI_TERMINAL_ID`) and is looked up as an exact terminal id — there
+/// is NO Claude-session-id fallback here (unlike `/sessions/{id}/context-low`,
+/// which resolves its key as a terminal id but degrades rather than refusing
+/// on a miss): an unknown key answers
+/// `recorded:false`, so the hook stands down when it has no terminal id
+/// (plan vet 2026-09-24, D1). Body = the raw Claude
+/// `Notification` hook payload (parsed LENIENTLY — empty/non-JSON reads as
+/// `{}` so a curl probe works). Always 200: fail-open by design (a broken
+/// watcher must never break a hook), and all policy lives in
+/// `terminal::operator_touch_watch::on_notification_signal` (kill-switched by
+/// `QONTINUI_OPERATOR_TOUCH_HOOK`, default ARMED).
+async fn operator_touch_notification(
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Json<serde_json::Value> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let outcome = crate::terminal::operator_touch_watch::on_notification_signal(&id, &payload);
+    Json(serde_json::json!({
+        "recorded": outcome.recorded,
+        "kind": outcome.kind,
+        "reason": outcome.reason,
+        "session": id,
+    }))
+}
+
+// =============================================================================
 // /sessions/compliance-coverage
 // =============================================================================
 
@@ -1285,6 +1320,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(continuation_verdict),
         )
         .route("/sessions/{id}/context-low", post(context_low))
+        .route(
+            "/sessions/{id}/notification",
+            post(operator_touch_notification),
+        )
         .route("/sessions/{id}/policy-context", get(policy_context))
         .route("/sessions/policy-context-stats", get(policy_context_stats))
         // Mark a session's WORK finished (or unmark it). NOTE: this family has

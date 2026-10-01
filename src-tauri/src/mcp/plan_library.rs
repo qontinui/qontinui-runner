@@ -89,6 +89,7 @@
 //! POST /plan-library/artifacts  |  POST /plan-library/links
 //!   ├─ Authorization: Bearer <nonce> / X-Coord-Mcp-Proxy-Key resolves a principal?  ──no──> 401 COORD_MCP_PROXY_UNAUTHORIZED
 //!   ├─ QONTINUI_PLAN_LIBRARY_WRITE != "0"  (absent ⇒ enabled)                        ──no──> 403 PLAN_LIBRARY_WRITE_KILLED
+//!   ├─ coord has answered this process's plan_capture poll                           ──no──> 403 PLAN_LIBRARY_DIAL_UNANSWERED
 //!   └─ effective_plan_capture_level() == "record"                                     ──no──> 403 PLAN_LIBRARY_DIAL_OFF
 //!
 //! nonce = authorization       flag = machine kill switch (default on)       dial = tenant policy authority
@@ -212,16 +213,24 @@ pub const CODE_PROXY_UNAUTHORIZED: &str = "COORD_MCP_PROXY_UNAUTHORIZED";
 pub const CODE_WRITE_KILLED: &str = "PLAN_LIBRARY_WRITE_KILLED";
 /// `code` on the 403 the tenant dial answers.
 pub const CODE_DIAL_OFF: &str = "PLAN_LIBRARY_DIAL_OFF";
+/// `code` on the 403 a runner answers before coord has answered its first
+/// plan_capture poll — a different reason from [`CODE_DIAL_OFF`], so a driver
+/// can tell "the tenant said off" from "the runner has not heard yet".
+pub const CODE_DIAL_UNANSWERED: &str = "PLAN_LIBRARY_DIAL_UNANSWERED";
 
 /// The tenant's `plan_capture` level as the poller currently caches it —
-/// `record` or `off`; `off` until the first successful poll.
+/// `record` or `off`; the domain default `record` until the first successful
+/// poll (writes additionally wait for that poll — see [`dial_verdict`]).
 fn dial_level() -> String {
     crate::mcp::fleet_policy_poller::effective_plan_capture_level()
 }
 
-/// Whether the tenant dial authorizes capture right now.
-fn dial_open(level: &str) -> bool {
-    level == crate::mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
+/// What the tenant dial says about a WRITE right now: `Open` only for `record`
+/// AND an authoritative answer, so the cold-start `record` default cannot
+/// publish a tenant's plans before an explicit `off` arrives. Reads the
+/// answered flag first, then the level (poison ⇒ `off`).
+fn dial_verdict() -> crate::mcp::fleet_policy_poller::CaptureVerdict {
+    crate::mcp::fleet_policy_poller::plan_capture_verdict()
 }
 
 /// The identity a write is attributed to, resolved from the request's proxy
@@ -328,11 +337,29 @@ fn dial_off_error(level: &str) -> (StatusCode, Json<ApiResponse<()>>) {
         format!(
             "the tenant's plan_capture fleet dial reads `{level}`, not `record`, so plan \
              capture is not authorized for this tenant (the dial is the policy authority; \
-             a runner that has not yet completed a poll reads `off`). Set it at \
+             this is coord's answer, not a default). Set it at \
              /admin/coord/plan-library — it is re-polled every 45s, no restart needed. \
              GET /plan-library/search and GET /plan-library/candidates work regardless and \
              advertise the level."
         ),
+    )
+}
+
+/// Layer 3 refused BEFORE the dial could be read: coord has not yet answered
+/// this runner's plan_capture poll. The level's default is `record`, but a
+/// write on that guess could publish a tenant's plans before an explicit `off`
+/// arrives, so writes wait — and say so, rather than claiming the dial is off.
+fn dial_unanswered_error() -> (StatusCode, Json<ApiResponse<()>>) {
+    coded_error(
+        StatusCode::FORBIDDEN,
+        CODE_DIAL_UNANSWERED,
+        "coord has not yet answered this runner's plan_capture poll, so plan-library writes \
+         are held: the dial defaults to `record`, but an explicit `off` must be able to win \
+         before anything is published. This is NOT the tenant turning capture off — it clears \
+         on the first successful poll (every 45s; it needs a live coord device credential). \
+         GET /plan-library/search and GET /plan-library/candidates work regardless and \
+         advertise `writeDialAnswered`."
+            .to_string(),
     )
 }
 
@@ -360,9 +387,11 @@ fn authorize_write(
     if !write_enabled() {
         return Err(write_killed_error());
     }
-    let level = dial_level();
-    if !dial_open(&level) {
-        return Err(dial_off_error(&level));
+    use crate::mcp::fleet_policy_poller::CaptureVerdict;
+    match dial_verdict() {
+        CaptureVerdict::Open => {}
+        CaptureVerdict::Unanswered => return Err(dial_unanswered_error()),
+        CaptureVerdict::Closed => return Err(dial_off_error(&dial_level())),
     }
     Ok(WritePrincipal::from_nonce(
         nonce.as_deref().unwrap_or_default(),
@@ -399,8 +428,12 @@ fn parse_write_body<T: serde::de::DeserializeOwned>(
 /// nonce is per request, and `writeRequiresNonce` says so.
 fn write_capability() -> serde_json::Map<String, Value> {
     let flag_on = write_enabled();
+    // Verdict FIRST (it reads the answered flag before the level, as
+    // `authorize_write` does), then the level for display.
+    let verdict = dial_verdict();
+    let answered = verdict != crate::mcp::fleet_policy_poller::CaptureVerdict::Unanswered;
+    let dial = verdict.is_open();
     let level = dial_level();
-    let dial = dial_open(&level);
     let scope = crate::mcp::fleet_policy_poller::effective_plan_capture_scope();
     let enabled = flag_on && dial;
     let instruction = if enabled {
@@ -418,13 +451,20 @@ fn write_capability() -> serde_json::Map<String, Value> {
              environment (the machine kill switch; absent means on). Unset it — it is read per \
              request, no restart needed. These read routes work regardless."
         )
+    } else if !answered {
+        format!(
+            "POST /plan-library/artifacts and POST /plan-library/links are HELD and will 403 \
+             {CODE_DIAL_UNANSWERED}: coord has not yet answered this runner's plan_capture \
+             poll (the dial defaults to `{level}`, but writes wait for coord so an explicit \
+             `off` can win). It clears on the first successful poll. These read routes work \
+             regardless."
+        )
     } else {
         format!(
             "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
              403 {CODE_DIAL_OFF}: the tenant's plan_capture fleet dial reads `{level}`, not \
-             `record` (a runner that has not completed a poll reads `off`). Set it at \
-             /admin/coord/plan-library; it is re-polled every 45s. These read routes work \
-             regardless."
+             `record`. Set it at /admin/coord/plan-library; it is re-polled every 45s. These \
+             read routes work regardless."
         )
     };
     let mut m = serde_json::Map::new();
@@ -436,6 +476,7 @@ fn write_capability() -> serde_json::Map<String, Value> {
     );
     m.insert("writeKillSwitchEngaged".to_string(), Value::Bool(!flag_on));
     m.insert("writeDialLevel".to_string(), Value::String(level));
+    m.insert("writeDialAnswered".to_string(), Value::Bool(answered));
     m.insert(
         "writeDialScope".to_string(),
         scope.map(Value::String).unwrap_or(Value::Null),
@@ -1992,6 +2033,16 @@ mod tests {
         assert!(msg.contains(CODE_WRITE_KILLED), "{msg}");
         assert!(msg.contains(PLAN_LIBRARY_WRITE_FLAG), "{msg}");
 
+        // Not yet answered: held, with its OWN code — not "the dial is off".
+        pin.set_unanswered();
+        let held = with_flag(None, || with_write_capability(serde_json::json!({})));
+        assert_eq!(held["writeEnabled"], serde_json::json!(false));
+        assert_eq!(held["writeDialAnswered"], serde_json::json!(false));
+        assert_eq!(held["writeDialLevel"], serde_json::json!("record"));
+        let msg = held["writeInstruction"].as_str().unwrap();
+        assert!(msg.contains(CODE_DIAL_UNANSWERED), "{msg}");
+        assert!(!msg.contains(CODE_DIAL_OFF), "{msg}");
+
         // Dial closed: off, and the instruction names the level and the dial.
         pin.set("off");
         let dial = with_flag(None, || with_write_capability(serde_json::json!({})));
@@ -2155,6 +2206,13 @@ mod tests {
         assert!(msg.contains("`off`"), "{msg}");
         assert!(msg.contains("/admin/coord/plan-library"), "{msg}");
         assert!(msg.contains("/plan-library/search"), "{msg}");
+        assert!(!msg.contains("not yet completed a poll"), "{msg}");
+
+        let (code, body) = dial_unanswered_error();
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body.0.code.as_deref(), Some(CODE_DIAL_UNANSWERED));
+        let msg = body.0.error.clone().unwrap();
+        assert!(msg.contains("NOT the tenant turning capture off"), "{msg}");
     }
 
     /// **The 401's two arms say different things**, because a request that sent
@@ -4325,7 +4383,7 @@ mod tests {
     /// the door would otherwise have accepted the shape.
     #[tokio::test]
     async fn the_gate_precedes_validation_at_every_layer() {
-        let _pin = pin("off");
+        let pin = pin("off");
         let _guard = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
         let malformed = r#"{"kind": "", "slug": ""}"#;
@@ -4357,5 +4415,18 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], serde_json::json!(CODE_DIAL_OFF));
+
+        // Coord not yet answered (cold start), level at its `record` default:
+        // 403 DIAL_UNANSWERED — the default alone never opens the write door.
+        pin.set("record");
+        pin.set_unanswered();
+        let (status, body) = post_raw(
+            "/plan-library/artifacts",
+            &[("authorization", &bearer)],
+            malformed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], serde_json::json!(CODE_DIAL_UNANSWERED));
     }
 }
