@@ -284,8 +284,8 @@ until a human clicks it.
   the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, or `Authorization: Bearer <nonce>` on configs
   written after the Phase 2 header move, a `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}`
-  value expanded from your own environment first — `mcp_expand_env_ref`,
-  `scripts/lib/mcp-env-ref.sh`, never sent literally — no body bearer; maskless fallback), then the
+  value expanded from your own environment first, with `${VAR:-default}` shell
+  semantics and never sent literally — no body bearer; maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
   gate with `clearance_audience = 'agent'` in the caller's own tenant; coord flips
