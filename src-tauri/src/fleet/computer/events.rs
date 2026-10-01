@@ -78,6 +78,16 @@ pub(crate) struct ComputerObs {
 /// How far two `booted_at` readings may disagree and still be the same boot.
 /// Windows derives boot time from uptime, which jitters by a second or so.
 ///
+/// **Reboot-id precision (Windows).** The id is the boot time rounded to this
+/// window. sysinfo derives it from uptime, which jitters by about a second, so
+/// a boot whose true time sits within that jitter of a bucket edge can be
+/// read into two buckets: roughly 1 boot in 120 yields two `reboot` events
+/// with different ids. Conversely two restarts less than this window apart
+/// read as ONE boot and the second is not reported. A stable source
+/// (`Win32_OperatingSystem.LastBootUpTime`) needs a WMI query — a COM call or
+/// a PowerShell fork per tick — which is not cheap on this path, so the
+/// rounding is the documented trade-off.
+///
 /// **Blind spot — Windows Fast Startup.** With Fast Startup on (the Windows
 /// default), "Shut down" hibernates the kernel instead of ending it, so a
 /// shutdown + power-on keeps the old boot time and is NOT seen as a reboot.
@@ -123,6 +133,12 @@ pub(crate) struct ObsInput<'a> {
     /// a guest that loses ownership must CLEAR its baseline — carrying it would
     /// produce a bogus delta if it regains ownership later.
     pub(crate) carry_oom_baseline: bool,
+    /// Emit the UNATTRIBUTED remainder of an `oom_kill` delta. `false` for a
+    /// runner whose own computer is a WSL guest: its `/proc/vmstat` counter
+    /// is VM-wide, and the VM-wide remainder belongs to the Windows host's
+    /// guest probe — reporting it from inside too would count each kill once
+    /// per in-guest runner. Unit-attributed kills are still reported.
+    pub(crate) report_unattributed_oom: bool,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -385,7 +401,7 @@ pub(crate) fn derive(
         if let (Some(a), Some(b)) = (baseline, input.oom_kill_total) {
             if b > a {
                 let unattributed = (b - a).saturating_sub(attributed);
-                if unattributed > 0 {
+                if unattributed > 0 && input.report_unattributed_oom {
                     let how = if rebooted {
                         "vmstat_since_boot"
                     } else {
@@ -504,9 +520,12 @@ pub(crate) fn push_pending(state: &mut ObserverState, identity: &str, new: Vec<C
         let dropped_total: u64 = dropped
             .iter()
             .map(|e| {
-                if e.detail.get("reason").and_then(|r| r.as_str())
-                    == Some("pending_event_buffer_full")
-                {
+                // Both marker kinds carry a running total: an earlier
+                // buffer-full marker and a `rejected_by_coord` marker.
+                if matches!(
+                    e.detail.get("reason").and_then(|r| r.as_str()),
+                    Some("pending_event_buffer_full" | "rejected_by_coord")
+                ) {
                     e.detail
                         .get("dropped_events")
                         .and_then(|n| n.as_u64())
@@ -630,6 +649,7 @@ mod tests {
             services: Some(units),
             services_complete: true,
             carry_oom_baseline: true,
+            report_unattributed_oom: true,
         }
     }
 
@@ -776,6 +796,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             services_complete: true,
             carry_oom_baseline: true,
+            report_unattributed_oom: true,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -803,6 +824,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             services_complete: true,
             carry_oom_baseline: true,
+            report_unattributed_oom: true,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -823,6 +845,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: None,
             services_complete: false,
             carry_oom_baseline: true,
+            report_unattributed_oom: true,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(
@@ -862,6 +885,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         let lost = ObsInput {
             oom_kill_total: None,
             carry_oom_baseline: false,
+            report_unattributed_oom: true,
             ..input(&units, None)
         };
         let (_, o1) = derive(Some(&o0), &lost, t("2026-09-30T01:00:30Z"));
@@ -986,6 +1010,74 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         )
         .is_none());
         assert!(telemetry_gap(None, None, t("2026-09-30T01:16:23Z"), 30, None, None).is_none());
+    }
+
+    /// A runner inside a WSL guest reports the unit-attributed kill but not
+    /// the VM-wide remainder (the Windows host's guest probe owns that).
+    #[test]
+    fn a_runner_inside_a_guest_reports_only_attributed_kills() {
+        let before = watched(ACTIVE_BEFORE, Some(0));
+        let after = watched(svc::INCIDENT_SHOW, None);
+        let (_, o0) = derive(
+            None,
+            &ObsInput {
+                report_unattributed_oom: false,
+                ..input(&before, Some(5))
+            },
+            t("2026-09-30T01:40:00Z"),
+        );
+        // vmstat 5 → 8: one kill is the unit's, two are elsewhere in the VM.
+        let (ev, _) = derive(
+            Some(&o0),
+            &ObsInput {
+                report_unattributed_oom: false,
+                ..input(&after, Some(8))
+            },
+            t("2026-09-30T01:48:40Z"),
+        );
+        let attributions: Vec<&str> = ev
+            .iter()
+            .filter(|e| e.kind == "oom_kill")
+            .filter_map(|e| e.detail["attribution"].as_str())
+            .collect();
+        assert_eq!(attributions, vec!["unit_result"]);
+        // The same observation from the host's probe reports the remainder.
+        let (ev_host, _) = derive(
+            Some(&o0),
+            &input(&after, Some(8)),
+            t("2026-09-30T01:48:40Z"),
+        );
+        let remainder: Vec<u64> = ev_host
+            .iter()
+            .filter(|e| e.detail["attribution"] == "vmstat_delta")
+            .filter_map(|e| e.detail["count"].as_u64())
+            .collect();
+        assert_eq!(remainder, vec![2]);
+    }
+
+    #[test]
+    fn overflow_carries_a_rejection_markers_total_forward() {
+        let mut st = ObserverState::default();
+        let marker = ComputerEvent {
+            client_event_id: "telemetry_gap:rejected".into(),
+            kind: "telemetry_gap".into(),
+            observed_at: "t".into(),
+            detail: json!({"reason": "rejected_by_coord", "dropped_events": 7}),
+        };
+        let mk = |i: usize| ComputerEvent {
+            client_event_id: format!("e{i}"),
+            kind: "oom_kill".into(),
+            observed_at: format!("t{i}"),
+            detail: json!({}),
+        };
+        let mut evs = vec![marker];
+        evs.extend((0..MAX_PENDING_PER_COMPUTER).map(mk));
+        push_pending(&mut st, "h", evs);
+        let q = &st.pending["h"];
+        assert_eq!(q.len(), MAX_PENDING_PER_COMPUTER);
+        // Dropped: the rejection marker (7) + e0 (1) = 8.
+        assert_eq!(q[0].detail["reason"], "pending_event_buffer_full");
+        assert_eq!(q[0].detail["dropped_events"], 8);
     }
 
     #[test]

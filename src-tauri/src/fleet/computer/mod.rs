@@ -541,9 +541,89 @@ pub(crate) fn stripped(c: &ComputerReport) -> ComputerReport {
     c
 }
 
-/// Exponential back-off for repeated 5xx: 30 s doubling, capped at 30 min.
+/// Exponential back-off for repeated 5xx: 30 s doubling, capped at the
+/// full-snapshot cadence ([`REPORT_FULL_SECS`]) — a longer wait would leave a
+/// recovered coord without this machine's state for longer than a missed
+/// snapshot does. The caller adds ±20% jitter so a fleet that saw one coord
+/// outage together does not retry in lockstep.
 pub(crate) fn server_error_backoff(consecutive: u32) -> Duration {
-    Duration::from_secs((30u64 << consecutive.min(6)).min(1800))
+    Duration::from_secs((30u64 << consecutive.min(6)).min(REPORT_FULL_SECS))
+}
+
+/// Smoothing weight for the coord clock-offset estimate (EWMA). One
+/// response's `Date` header has 1 s resolution plus network latency, so a
+/// single sample is noisy; a few agree quickly.
+pub(crate) const OFFSET_SMOOTHING: f64 = 0.3;
+
+/// An HTTP `Date` header (`Wed, 30 Sep 2026 02:00:00 GMT`, RFC 7231 — the
+/// RFC 2822 shape with a `GMT` zone). PURE.
+pub(crate) fn parse_http_date(v: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc2822(v.trim())
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Fold one `coord − local` sample (seconds) into the smoothed estimate. PURE.
+pub(crate) fn smooth_offset(prev: Option<f64>, sample: f64) -> f64 {
+    match prev {
+        Some(p) => p + OFFSET_SMOOTHING * (sample - p),
+        None => sample,
+    }
+}
+
+/// The clock timestamps are checked and stamped against: the EARLIER of this
+/// machine's clock and coord's (estimated from its `Date` headers). coord
+/// refuses a timestamp more than 300 s ahead of ITS clock, so when coord is
+/// behind, coord's clock is the bound; when coord is ahead, ours already is.
+/// PURE.
+pub(crate) fn effective_now(
+    local: chrono::DateTime<chrono::Utc>,
+    coord_offset_secs: Option<f64>,
+) -> chrono::DateTime<chrono::Utc> {
+    match coord_offset_secs {
+        Some(o) if o < 0.0 => local + chrono::Duration::milliseconds((o * 1000.0) as i64),
+        _ => local,
+    }
+}
+
+/// A 422 problem's PATH with its value stripped
+/// (`computers[0].events[3].observed_at: 2027-… is more than …` →
+/// `computers[0].events[3].observed_at`), so a refusal whose VALUE changes
+/// every tick is still the same refusal and is not re-logged. PURE.
+pub(crate) fn problem_paths(problems: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = problems
+        .iter()
+        .map(|p| p.split(':').next().unwrap_or(p).trim().to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Re-stamp the named events at `now` (the reference clock), keeping their
+/// `client_event_id` (so coord still dedupes them) and the original time in
+/// `detail.reported_observed_at` (set once — a second re-stamp keeps the
+/// first original). Returns how many were re-stamped.
+pub(crate) fn restamp(
+    state: &mut ObserverState,
+    identity: &str,
+    ids: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some(q) = state.pending.get_mut(identity) else {
+        return 0;
+    };
+    let at = events::rfc3339(now);
+    let mut n = 0;
+    for e in q.iter_mut().filter(|e| ids.contains(&e.client_event_id)) {
+        if let Some(d) = e.detail.as_object_mut() {
+            d.entry("reported_observed_at")
+                .or_insert_with(|| e.observed_at.clone().into());
+        }
+        e.observed_at = at.clone();
+        n += 1;
+    }
+    n
 }
 
 /// The per-process reporter, owned by the sampler loop's closure.
@@ -564,6 +644,9 @@ pub(crate) struct Reporter {
     route_absent_logged: bool,
     /// The last 422 problem list logged — a CHANGED list is logged again.
     last_problems: Vec<String>,
+    /// Smoothed `coord − local` clock offset in seconds, from the `Date`
+    /// header of every coord response. `None` until coord has answered.
+    coord_offset_secs: Option<f64>,
     skew_logged: bool,
     /// After a 422 naming no event: send stripped reports until this instant.
     strip_until: Option<tokio::time::Instant>,
@@ -597,6 +680,7 @@ impl Reporter {
             route_absent_until: None,
             route_absent_logged: false,
             last_problems: Vec::new(),
+            coord_offset_secs: None,
             skew_logged: false,
             strip_until: None,
             server_errors: 0,
@@ -756,7 +840,11 @@ impl Reporter {
                 // A guest's VM-wide counter moves between guests (see
                 // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
                 // owner this tick must not keep a baseline it no longer tracks.
-                carry_oom_baseline: o.base.kind != "wsl_guest",
+                carry_oom_baseline: !(o.base.kind == "wsl_guest" && !o.base.attach_device),
+                // A runner INSIDE a WSL guest (its own computer is the guest)
+                // reports only unit-attributed kills; the VM-wide remainder is
+                // the Windows host's to report.
+                report_unattributed_oom: !(o.base.kind == "wsl_guest" && o.base.attach_device),
             };
             let (evs, mut next) = events::derive(state.computers.get(id), &input, now);
             next.kind = Some(o.base.kind.clone());
@@ -789,17 +877,21 @@ impl Reporter {
             })
             .collect();
         let mut computers = cap_report(computers);
+        let ref_now = effective_now(now, self.coord_offset_secs);
         if computers.is_empty() {
             return;
         }
         let mut skewed = false;
         for c in &mut computers {
-            skewed |= presanitize(c, now);
+            skewed |= presanitize(c, ref_now);
         }
         if skewed && !self.skew_logged {
             self.skew_logged = true;
             warn!(
-                "fleet::computer: timestamps more than {MAX_FUTURE_SKEW_SECS}s in the future were                  nulled or re-stamped — this machine's clock appears to run ahead"
+                "fleet::computer: timestamps more than {MAX_FUTURE_SKEW_SECS}s ahead of the reference \
+                 clock ({}) were nulled or re-stamped — this machine's clock and the reference \
+                 disagree",
+                self.clock_description()
             );
         }
         let strip = self
@@ -838,6 +930,15 @@ impl Reporter {
             }
         };
         let status = resp.status();
+        if let Some(coord_now) = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_http_date)
+        {
+            let sample = (coord_now - chrono::Utc::now()).num_milliseconds() as f64 / 1000.0;
+            self.coord_offset_secs = Some(smooth_offset(self.coord_offset_secs, sample));
+        }
         let text = resp.text().await.unwrap_or_default();
         match status.as_u16() {
             200..=299 => {
@@ -862,13 +963,18 @@ impl Reporter {
                 }
                 self.back_off();
             }
-            422 => self.on_rejected(&body, &text, now, strip),
+            422 => {
+                let ref_now = effective_now(now, self.coord_offset_secs);
+                self.on_rejected(&body, &text, ref_now, strip)
+            }
             401 | 403 => {
                 self.log_failure(format!("POST {url} -> HTTP {status} (credential refused)"));
                 self.back_off();
             }
             500..=599 => {
-                let wait = server_error_backoff(self.server_errors);
+                let wait = crate::fleet::resource_sample::jittered_sleep(
+                    server_error_backoff(self.server_errors).as_secs(),
+                );
                 self.server_errors = self.server_errors.saturating_add(1);
                 self.log_failure(format!(
                     "POST {url} -> HTTP {status}; backing off {}s",
@@ -897,7 +1003,8 @@ impl Reporter {
         was_stripped: bool,
     ) {
         let problems = parse_problems(text);
-        if problems != self.last_problems {
+        let paths = problem_paths(&problems);
+        if paths != self.last_problems {
             warn!(
                 "fleet::computer: coord refused the computers report (422): {}",
                 problems
@@ -907,24 +1014,37 @@ impl Reporter {
                     .collect::<Vec<_>>()
                     .join("; ")
             );
-            self.last_problems = problems.clone();
+            self.last_problems = paths;
         }
         if !self.skew_logged && problems.iter().any(|p| p.contains("in the future")) {
             self.skew_logged = true;
             warn!(
-                "fleet::computer: coord says a timestamp is in the future — this machine's clock                  appears to run ahead of coord's"
+                "fleet::computer: coord refused a timestamp as in the future — this machine's \
+                 clock and coord's disagree ({}); the events are re-stamped, not dropped",
+                self.clock_description()
             );
         }
-        let named = rejected_events(&problems, body);
+        // A future-timestamp refusal is a CLOCK disagreement, not a bad
+        // event: re-stamp those events at the reference clock (same id,
+        // original kept) and retry; quarantine only the others.
+        let (future, other): (Vec<String>, Vec<String>) = problems
+            .iter()
+            .cloned()
+            .partition(|p| p.contains("in the future"));
+        let mut restamped = 0;
+        let named = rejected_events(&other, body);
         let mut q = Quarantined::default();
         if let Some(state) = self.state.as_mut() {
+            for (id, ids) in &rejected_events(&future, body) {
+                restamped += restamp(state, id, ids, now);
+            }
             for (id, ids) in &named {
                 let r = quarantine(state, id, Some(ids), &problems, now);
                 q.events += r.events;
                 q.markers += r.markers;
             }
         }
-        if q.events > 0 {
+        if restamped > 0 || q.events > 0 {
             self.persist();
             return;
         }
@@ -999,6 +1119,18 @@ impl Reporter {
             );
         }
         self.persist();
+    }
+
+    /// Which clock disagrees, for the skew warnings.
+    fn clock_description(&self) -> String {
+        match self.coord_offset_secs {
+            Some(o) if o < -1.0 => {
+                format!("coord's clock is about {:.0}s BEHIND this machine's", -o)
+            }
+            Some(o) if o > 1.0 => format!("coord's clock is about {o:.0}s AHEAD of this machine's"),
+            Some(_) => "the two clocks agree to within a second".to_string(),
+            None => "coord's clock is not known yet".to_string(),
+        }
     }
 
     fn log_failure(&mut self, msg: String) {
@@ -1090,6 +1222,7 @@ mod tests {
                 services: o.scan.units.as_deref(),
                 services_complete: true,
                 carry_oom_baseline: true,
+                report_unattributed_oom: true,
             }
         }
         let (_, obs0) = events::derive(None, &inp(&before, 5), t("2026-09-30T01:40:00Z"));
@@ -1482,7 +1615,92 @@ mod tests {
     #[test]
     fn server_errors_back_off_exponentially_and_cap() {
         let secs: Vec<u64> = (0..9).map(|n| server_error_backoff(n).as_secs()).collect();
-        assert_eq!(secs, vec![30, 60, 120, 240, 480, 960, 1800, 1800, 1800]);
+        // Capped at the 300 s full-snapshot cadence.
+        assert_eq!(secs, vec![30, 60, 120, 240, 300, 300, 300, 300, 300]);
+        // The jitter the caller applies stays inside ±20%.
+        for _ in 0..50 {
+            let j = crate::fleet::resource_sample::jittered_sleep(300).as_secs();
+            assert!((240..=360).contains(&j), "{j}");
+        }
+    }
+
+    #[test]
+    fn the_reference_clock_is_the_earlier_of_ours_and_coords() {
+        let date = parse_http_date("Wed, 30 Sep 2026 02:00:00 GMT").unwrap();
+        assert_eq!(date, at("2026-09-30T02:00:00Z"));
+        assert_eq!(parse_http_date("yesterday"), None);
+
+        // Smoothing: the first sample is taken as is, later ones move 30%.
+        let o = smooth_offset(None, -600.0);
+        assert_eq!(o, -600.0);
+        assert_eq!(smooth_offset(Some(o), -500.0), -570.0);
+
+        let local = at("2026-09-30T02:10:00Z");
+        // coord 600 s behind: its clock is the bound.
+        assert_eq!(
+            effective_now(local, Some(-600.0)),
+            at("2026-09-30T02:00:00Z")
+        );
+        // coord ahead, or unknown: ours.
+        assert_eq!(effective_now(local, Some(42.0)), local);
+        assert_eq!(effective_now(local, None), local);
+
+        // An event 400 s ahead of coord is re-stamped when checked against
+        // coord's clock, though it is only 200 s ahead of ours.
+        let mut c = host_report(HOST_ID.into(), "host", &facts(), None, None);
+        let mut e = ev("ahead");
+        e.observed_at = "2026-09-30T02:06:40Z".into();
+        c.events = vec![e];
+        assert!(!presanitize(&mut c.clone(), local));
+        assert!(presanitize(&mut c, effective_now(local, Some(-600.0))));
+        assert_eq!(c.events[0].observed_at, "2026-09-30T02:00:00Z");
+    }
+
+    #[test]
+    fn a_future_refusal_restamps_with_the_same_id() {
+        let mut st = ObserverState::default();
+        let mut e = ev("future-1");
+        e.observed_at = "2026-09-30T02:30:00Z".into();
+        st.pending.insert(HOST_ID.into(), vec![e, ev("other")]);
+        let t = at("2026-09-30T02:00:00Z");
+        assert_eq!(restamp(&mut st, HOST_ID, &["future-1".to_string()], t), 1);
+        let q = &st.pending[HOST_ID];
+        assert_eq!(q.len(), 2, "re-stamped, not dropped");
+        assert_eq!(q[0].client_event_id, "future-1");
+        assert_eq!(q[0].observed_at, "2026-09-30T02:00:00Z");
+        assert_eq!(q[0].detail["reported_observed_at"], "2026-09-30T02:30:00Z");
+        // A second re-stamp keeps the FIRST original.
+        restamp(
+            &mut st,
+            HOST_ID,
+            &["future-1".to_string()],
+            at("2026-09-30T02:01:00Z"),
+        );
+        assert_eq!(
+            st.pending[HOST_ID][0].detail["reported_observed_at"],
+            "2026-09-30T02:30:00Z"
+        );
+        assert_eq!(st.pending[HOST_ID][1].observed_at, "2026-09-30T01:48:16Z");
+    }
+
+    #[test]
+    fn problems_compare_by_path_not_value() {
+        let a = vec![
+            "computers[0].events[1].observed_at: 2027-01-01T00:00:00Z is more than 300s in the future".to_string(),
+            "computers[0].hostname: \"x y\" must be 1-253 chars".to_string(),
+        ];
+        let b = vec![
+            "computers[0].hostname: \"x z\" must be 1-253 chars".to_string(),
+            "computers[0].events[1].observed_at: 2027-01-01T00:00:30Z is more than 300s in the future".to_string(),
+        ];
+        assert_eq!(problem_paths(&a), problem_paths(&b));
+        assert_eq!(
+            problem_paths(&a),
+            vec![
+                "computers[0].events[1].observed_at".to_string(),
+                "computers[0].hostname".to_string()
+            ]
+        );
     }
 
     #[test]
