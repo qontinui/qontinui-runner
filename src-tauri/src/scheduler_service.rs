@@ -2069,14 +2069,18 @@ impl SchedulerService {
         }
 
         let record = condition_timeout_record(task);
-        if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
-            error!("Failed to record condition timeout: {}", e);
-        }
-        if let Err(e) = pg
-            .update_task_last_run(&task.id, Some(&record.execution_id))
-            .await
-        {
-            error!("Failed to update task last_run: {}", e);
+        // last_run points at the history row, so it moves only when that row
+        // exists — otherwise it would name an execution id with no record.
+        match pg.insert_execution_record(&task.id, &record).await {
+            Ok(_) => {
+                if let Err(e) = pg
+                    .update_task_last_run(&task.id, Some(&record.execution_id))
+                    .await
+                {
+                    error!("Failed to update task last_run: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to record condition timeout: {}", e),
         }
 
         // Update next_run
