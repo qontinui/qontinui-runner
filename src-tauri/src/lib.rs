@@ -34,6 +34,12 @@ pub mod observable_bridge;
 pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
+// Out-of-process PTY holder (plan
+// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`). In the
+// LIB crate so `main()` can dispatch to it before any Tauri init, exactly like
+// `profile_cli`, and so Phase 1 can grow the spike into the real
+// `--pty-holder` without touching the runner bin's module tree.
+pub mod pty_holder;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
 // crate for the same reason as `intercept_core` — the WRITER is the runner bin
 // (the bind-success arm of `mcp_api::start_server`, right after

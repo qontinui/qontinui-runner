@@ -68,10 +68,11 @@ omitted-argument fallback above:
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
->   never a requirement — no tenant needs a git repo to author, vet or ship a
->   plan. Which directory THIS fleet writes new plans to is a local operating
->   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **A git repo holding the plans directory is an OPTIONAL export target as a
+>   product matter**, never a requirement — no tenant needs a git repo to
+>   author, vet or ship a plan. Which directory a deployment writes new plans
+>   to is that deployment's own operating rule (its `CLAUDE.md`, where it has
+>   one), not a product one.
 > * **Read the corpus through these doors, in this order** *(plan
 >   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
 >   1. **The runner door — no credential.**
@@ -81,13 +82,28 @@ omitted-argument fallback above:
 >      JWT; the caller presents nothing. A non-2xx names the host the runner
 >      dialled — that is the runner's configured web base, and the answer is an
 >      observation about that base, never about the corpus.
->   2. **The git doors — no credential, no service.**
->      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
->      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
->      enumerate. Authoring layer only (a plan authored through the web UI is
+>   2. **The git doors — no credential, no service; only where the plans
+>      directory is a git checkout.** Resolve the repo that holds it and the
+>      directory's path inside that repo:
+>      `REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)` and
+>      `DIR=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix)` (ends in
+>      `/`; empty when the plans directory is the repo root). When
+>      `$QONTINUI_PLANS_DIR` is unset or EMPTY, do not run them at all —
+>      `git -C ""` succeeds against whatever repo the shell stands in, so its
+>      answer is not the plans repo. Unset, empty, or either command exiting
+>      non-zero: there is no git door on this machine — that is an absent
+>      door, not a miss. So is a plans directory git does not TRACK in
+>      that repo (one sitting gitignored, or untracked, inside an unrelated
+>      work tree): after the fetch below, an EMPTY
+>      `ls-tree --name-only origin/main "${DIR:-.}"` is an absent door,
+>      never a miss.
+>      Otherwise `git -C "$REPO" show "origin/main:${DIR}<stem>.md"` for a
+>      body, `git -C "$REPO" ls-tree --name-only origin/main "${DIR:-.}"` to
+>      enumerate (substitute the remote's default branch throughout if it is
+>      not `main`). Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
 >      so fetch first:
->      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      `git -C "$REPO" fetch origin +refs/heads/main:refs/remotes/origin/main`,
 >      exit code read unpiped (a bare `fetch origin main` in a clone whose
 >      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
 >      When that fetch was skipped or exited non-zero, a git-door MISS is
@@ -97,8 +113,8 @@ omitted-argument fallback above:
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
 >      claim the route requires; the agent token `/agents/allocate` mints does
->      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
->      door; whatever it answers is an observation about that process.
+>      not. A per-box dev backend on loopback is not a discovery door;
+>      whatever it answers is an observation about that process.
 >
 >   On every list result **check that the returned `slug` equals the stem** — a
 >   backend predating the `slug` filter ignores the parameter and returns an
@@ -123,8 +139,9 @@ omitted-argument fallback above:
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
->   the key `<repo>/plans`.
+>   so a hit on `origin/main:${DIR}<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>${DIR:+/${DIR%/}}` — the bare `<repo>` when the plans
+>   directory is the repo root.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
 >     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
 >     and even then it speaks for the authoring layer only.
@@ -132,7 +149,7 @@ omitted-argument fallback above:
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
 >     then always `false`); (b) after a `git fetch`,
->     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     `git -C "$REPO" cat-file -e "<ref_sha>:${DIR}<stem>.md"` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
 >     `least_behind_device_ids` (they share it); that row's own `state` may
@@ -167,10 +184,10 @@ omitted-argument fallback above:
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
 >     the runner's write door, `qontinui-pr plan-library-backfill`, a
 >     secondary or temp runner instance, a runner build predating the report.
-> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
->   PowerShell interpreter (`pwsh` on Linux via
->   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
->   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+> * **The cache is one line.** A local plan cache exists only where your
+>   deployment provides one; where its renderer cannot run on this machine it
+>   is INOPERATIVE, not a degraded arm. When you read
+>   `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
 >   say so and quote its `Rendered:` stamp with the `api_base` beside it and
 >   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
@@ -196,64 +213,52 @@ the most-recently-modified fallback above, confirmed with the user). Hold this
 resolved absolute path; both downstream skills receive the **same** path so the
 vet stamp and the implement run can never drift onto different files.
 
-If that file is still untracked in git, publish it — stamped `DRAFT` — before
-Step 2, with the shared helper (below), never by committing in the
-primary/shared checkout. `/vet-plan`
+If that file is still untracked in git, commit and push it — stamped `DRAFT`,
+from a worktree, never the primary/shared checkout — before Step 2. `/vet-plan`
 documents the same precondition: `VETTED` is an attested status a non-owner
 session must be able to read, so vetting a file no peer can see defeats the
-attestation. **That publication is a mutation, so it happens AFTER Step 1.1's
+attestation. **That commit-and-push is a mutation, so it happens AFTER Step 1.1's
 reserve, not here** — resolve the path in this step, reserve in Step 1.1, then
-publish.
+push.
 
-⚠️ **Where you commit does not decide where the plan LANDS, and only the second
-one satisfies the reason above.** A worktree sits on its own branch, so a bare
-`git push` there puts the plan on that branch and nowhere else — still a file
-no peer can see, which is precisely the failure this precondition exists to
-prevent. Publish it with:
+⚠️ **"From a worktree" decides WHERE YOU COMMIT; it does not decide where the
+plan LANDS, and only the second one satisfies the reason above.** A worktree
+sits on its own branch, so a bare `git push` there puts the plan on that branch
+and nowhere else — still a file no peer can see, which is precisely the failure
+this precondition exists to prevent. Land it on `origin/main` and **read it
+back** before treating the precondition as met. The read-back is a content
+comparison: the file's hash must equal `origin/main`'s blob at its path, as in
+`/implement-plan` Step 6 item 3's read-back with its non-empty guard. Existence
+alone passes on an earlier version already at that path. Use the same
+throwaway-worktree recipe
+`/implement-plan` Step 6 item 3 spells out, which also carries the
+`closeout-push` authority and the non-fast-forward retry. A plan that fails the
+read-back is not vettable yet — say so rather than proceeding to Step 2.
 
-```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
-  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
-  "docs: add <plan-stem> (DRAFT)"
-```
-
-The helper is the one implementation of what this step used to spell out by
-hand: it fetches the default branch with an explicit refspec, builds the commit
-by plumbing on a separate index against a base resolved once (so the shared
-tree, index and worktree list are never touched), pushes without force with a
-non-fast-forward retry, and **reads the file back** — a content comparison of
-the file's hash against the default branch's blob at its path, with the
-non-empty guard, because existence alone passes on an earlier version already
-at that path. Its single stdout line — `LANDED <commit|unchanged> <blob>` or
-`PROPOSED <pr-url|branch> <branch>` — is the evidence the plan is published.
-`/implement-plan` Step 6 item 3 carries the `closeout-push` authority for it. A
-non-zero exit means the plan is NOT published and not vettable yet — say so
-rather than proceeding to Step 2.
-
-**Whether the plans repo needs a PR is decided by the helper's ruleset probe,
-not by this command.** With no PR-requiring rule on the default branch it lands
-directly; with one, or when the probe cannot tell, it cuts a FRESH branch, opens
-a NEW PR with `gh pr create` (the only opener it runs; a line-anchored
-`Plan: <stem>` marker ends the body) and prints `PROPOSED`. To open it with
-`coord_create_pr` instead, run the helper with `LAND_PLAN_STAMP_NO_PR=1` — it
-pushes and reads back the branch, prints it, and opens nothing — then open the
-PR with `coord_create_pr`, falling back to `gh pr create`. It never pushes to an existing
-branch, so a later stamp cannot ride a branch whose PR coord already landed
-(plan `2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
-A pushed branch with no pull request never reaches `main`: measured
-2026-09-02, **9** plan stems were pushed to `origin` and never proposed at all —
-no PR in any state, on any branch carrying the stem. So on the `PROPOSED` arm,
-read the PR back with
+**Where the plan repo is itself coord-merge-authority, the direct land is not
+available and a PR is the only route — then the assertion is that a PR
+carries each push, re-checked before and after it** (per the
+`coord-ff-lands.md` section named below). A pushed branch with no pull request
+never reaches `main`, so the plan is on `origin` and still invisible to every
+`origin/main` reader. Measured 2026-09-02, **9** plan stems were pushed to
+`origin` and never proposed at all — no PR in any state, on any branch carrying
+the stem. A PR that existed at Step 1 is not enough either: coord can land it
+mid-chain and leave it CLOSED, MERGED or even OPEN, stranding every later push
+to the same branch. So before each push, and again after it, apply
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
+whose PR may already have landed", reading the PR with
 `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`.
-Every NON-stamp push to an existing branch — the implementation PRs this chain
-opens — stays governed by `knowledge-base/qontinui-specific/coord-ff-lands.md` →
-"Pushing to a branch whose PR may already have landed": before each such push,
-and again after it, and when it says no PR carries the push, take its
+When it says no PR carries the push and commits remain unlanded, take its
 fresh-branch path and open the new PR — **`coord_create_pr` first, then
 `gh pr create`** — with a line-anchored `Plan: <stem>` marker in the body,
 carrying the DELIVERY SCOPE for the phases this PR actually implements
 (`Plan: <stem> phases: 2,3` — `/implement-plan` Step 4.5 has the grammar and the
-reason). **Where this skill used to WITHHOLD a citation because the PRs deliver
+reason). Open it in `/implement-plan` Step 4.5b's served door order (the
+runner's loopback door sits between the coord door and the `gh` fallback), then
+READ it back — `gh pr list --repo <owner/repo> --head <branch> --state all
+--json number,url,state,headRefOid` — and take the PR number only from a row
+whose `headRefOid` is the head you pushed, never from the create call's exit
+status or output. **Where this skill used to WITHHOLD a citation because the PRs deliver
 only part of the plan, cite it with a scope instead.** Withholding never worked:
 the webhook auto-captures the `Plan:` marker from the PR body and those captures
 are not removable, so a withheld citation was recorded anyway — measured
@@ -630,6 +635,21 @@ chain on its own plan reserves a key the parent never took and gets `granted`
 (measured 2026-09-04). Plan
 `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
+⚠️ **`stop` — and a `remove` of the last row, which returns `stop`'s exit
+code — reports what it OBSERVED, and two more exits are not "stopped".**
+`9`: the loop is still alive after TERM and then KILL, or the signal was refused;
+the pidfile is kept. `10`: UNKNOWN — the pidfile names a live pid whose command
+line cannot be read; there is no usable pidfile and the process table is
+unreadable; or the pidfile's loop WAS stopped (a `stopped pid=…` line comes
+first) but the unreadable table cannot rule out a second loop. On either exit,
+quote the `stop-failed …` / `unknown=1 …` line in your report and never record
+the loop as stopped. Still run the release below, because the release is what
+coord reads. A loop that is still running with its rows gone (a refused signal,
+or an UNKNOWN) ends by itself at its next pass over the empty ledger. A loop
+that outlived KILL will NOT end by itself, so name its pid as left behind.
+`--force` changes neither answer. What each line means: `scripts/README.md` →
+"`stop` reports only what it observes".
+
 Then release:
 
 ```bash
@@ -776,7 +796,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 > holds only while the unit is at its vetted status with no unmuted sibling
 > open. The net above is registered on the same `work_unit_id` seconds later
 > and pins it `Open`; `/implement-plan` Step 0.5 then transitions the unit to
-> `in_progress` **before** it mutes that net — so the window in which the record
+> `in_progress` **before** it withdraws that net — so the window in which the record
 > gate could clear is closed by this chain's own next step, and the gate fails
 > **OPEN** with no alert until the 7-day stale sweep. Measured 2026-09-04 over
 > 26 work units: **6 of 25 `unit_ready` gates (24%) ended unclearable**; the rest
@@ -795,7 +815,7 @@ fresh visible session to implement the plan instead of leaving it stranded.
 >
 > ⛔ **But `all_unit_gates_cleared` is `total > 0 && total == cleared`, and the
 > first conjunct matters.** The query now excludes archived, muted AND withdrawn
-> rows (`work_unit_derive_worker.rs:752` — the old `:337-353` citation had
+> rows (`work_unit_derive_worker.rs:1077` — the old `:337-353` citation had
 > drifted), so withdrawal REMOVES the row: withdraw the last counted gate and
 > `total = 0`, which is **vacuously false**. Coord's own regression test only
 > demonstrates the fix on a unit that keeps another cleared gate. So withdrawal
@@ -812,8 +832,8 @@ fresh visible session to implement the plan instead of leaving it stranded.
 
 > ⚠️ **Do not "simplify" this back into one gate with a continuation on
 > `unit_ready`. That configuration cannot work, and coord now refuses it at the
-> door.** `/vet-plan` §5.4 mandates transitioning the unit to its vetted status
-> *before* registering the record gate keyed on the status that landed, and
+> door.** `/vet-plan` §5.4 mandates transitioning the unit to `vetted`
+> *before* registering the record gate keyed on `vetted`, and
 > `ready_verdict` is a bare `status != ready_status` compare — so
 > `status == ready_status` **by construction** and a freshly-upserted unit has no
 > open siblings. `Cleared` is the only reachable verdict from the first
@@ -838,19 +858,33 @@ The net's window is genuinely unsatisfied for its whole 30 minutes, which is the
 property `unit_ready` could not provide: it is false the instant it is armed and
 becomes true only if nobody picks the plan up.
 
-`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS —
-**cancel, then mute**, on the `"vet→implement safety net"` gate specifically
-(`coord_cancel_continuation {gate_id, reason}`, or the REST twin
-`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`; then
-mute, or the record gate stays pinned `Open` on it as a sibling —
-`coord_withdraw_gate` is the one-call equivalent and is LIVE). At that stamp the
+`/implement-plan` Step 0.5 retires the net when it stamps IN PROGRESS — by
+**withdrawing** the `"vet→implement safety net"` gate specifically:
+`coord_withdraw_gate {gate_id, reason}`, or its HTTP twin, the bare device-authed
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}` (no `/agent/`
+infix exists for withdraw), with reason
+`safety net retired: implementation taken over by session <id>`. One call sets
+the terminal, non-clear, non-paging `withdrawn` verdict, cancels a
+dispatched-but-unconsumed continuation itself, and takes the row out of the open
+set (`withdraw_gate_core`, qontinui-coord `gates.rs:9131`). It replaced *cancel,
+then mute* on 2026-09-27: for `open_sibling_gates` and `all_unit_gates_cleared`
+the two are identical, but a muted gate stays `open` and the sweep skips it, so
+it never clears — **mute is for noise, not retirement** (plan
+`2026-09-27-gate-backlog-is-unretired-gates-not-slow-spawns`). The pre-dispatch
+cancel (`coord_cancel_continuation {gate_id, reason}`, or the REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/continuation-cancel`) may
+precede the withdraw as a race optimisation; and when the withdraw answers
+`NotRegistrant` (not the registrant — MCP error or HTTP 403; causes: `_gate-registration` → "Continuation cancel + refresh", point 2) Step 0.5 falls back to that
+cancel plus `coord_mute_gate {gate_id}` (REST twin
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute`) and names the gate id in
+its closeout. At that stamp the
 **expected** row state is `continuation_spawn != null ∧ dispatched_at == null`
 — pre-dispatch and armed, which is precisely what a 30-minute window exists to
-produce, and `cancel_continuation` deliberately omits the
-`continuation_dispatched_at IS NOT NULL` guard (*"the pre-dispatch stamp is the
-whole point"*). A `409 already_consumed` now means the chain took **longer than
-the window** to reach Step 0.5, not that the race is unwinnable; the residual is
-then a **visible** redundant terminal that should stand down at
+produce; a withdrawn gate never clears, so it never dispatches. A consumed
+continuation (the optional cancel's `409 already_consumed`) now means the chain
+took **longer than the window** to reach Step 0.5, not that the race is
+unwinnable; the withdraw still follows, and the residual is then a **visible**
+redundant terminal that should stand down at
 `/implement-plan` Step 0.45 / Step 0.6 — never a silent strand.
 
 This is a **backstop, not a licence to stop here**: a stalled chain that gets
@@ -1166,6 +1200,14 @@ Step 2 just stamped the plan VETTED in this same session, `/implement-plan`'s
 Step 0.5 will see a fresh VETTED block and start cleanly — it will NOT warn that
 the plan was never vetted.
 
+**Once `/implement-plan` returns with its PRs open and their branches pushed,
+declare each PR worktree's hand-off** — `/unattended` Step 4.9's declaration
+step, one call per worktree:
+`bash <workspace-root>/qontinui-claude-config/scripts/worktree-handoff.sh --path <worktree> --pr <owner/repo#n>`.
+It releases the worktree slot early (once coord's relief lands) and saves this
+session's transcript to coord for a later fixer. Report its three output lines
+in Step 5. In a subagent, declare only worktrees the subagent itself allocated.
+
 ### Step 5 — Final session name + report
 
 First, derive the **final session name** by invoking the `/name` command via the
@@ -1249,8 +1291,8 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   CONTRADICTION also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh pr edit <n> --body-file <file>`, `/implement-plan`
-  Step 4.5) as well as re-record.
+  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
   its `COORD_REVIVE_CALL_TIMEOUT` total bound; `unknown_budget_expired` — this

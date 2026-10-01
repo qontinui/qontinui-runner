@@ -276,6 +276,25 @@ decision inline with one sentence naming the deciding priority (mirrors
 the fact). Leave a question genuinely **open** only when it's a
 product/scope/stakeholder call nobody but the operator can make.
 
+**Difficulty — decide whether to stamp, and default to NOT stamping.** Every
+captured plan is rated by a lexical rubric (qontinui-web
+`backend/app/services/plan_difficulty.py`) that routes it to a model tier. A
+`**Difficulty:** <level>` line in the plan's header overrides that rating — and
+it is a pin that is re-derived from the body on every re-rate, so it also stops
+the plan's level moving with any future rubric improvement. At authoring time
+the plan is not in the library yet, so you cannot see what the rubric will say.
+Write the line **only** when you have positive reason to expect the rubric to be
+wrong, under one of two named triggers:
+
+- **deceptively small** → `high`: little prose, subtle design — concurrency and
+  ordering, a migration's consistency window, a security or tenancy boundary.
+- **large but mechanical** → `low`: many phases and files, no design risk. The
+  rubric tops a mechanical plan out at `medium`, so this trigger is mainly what
+  buys `low`.
+
+Name which trigger applies in one clause on the same line. Neither applies →
+**write no Difficulty line at all**; the rubric rates the plan on capture.
+
 ### 5. Write the plan file
 
 **Filename:** `$QONTINUI_PLANS_DIR/<YYYY-MM-DD>-<slug>.md`. Get today's
@@ -301,6 +320,9 @@ the existing corpus in `plans/*.md`).
 
 > **Repo(s):** <repo1>[, <repo2>...]
 
+<!-- OPTIONAL: write the Difficulty line only on a Step 4 difficulty trigger; otherwise omit it and this comment. -->
+**Difficulty:** <high|medium|low> — <deceptively small | large but mechanical>: <one clause>
+
 ## Why
 <the motivating problem, pulled from the prompt + your own research —
 not a copy-paste of the prompt>
@@ -321,6 +343,8 @@ deciding priority>
 **Phase 1 — <name>**
 - Concrete steps, each citing `file:line` where it applies.
 - Gate: <the repo's actual test/CI command, e.g. `cargo test -p qontinui-coord`>
+- Arming: <seam_class> | <what is observed to change> | <entry point the population uses>
+  (or `Arming: none — <reason>`)
 
 **Phase 2 — <name>**
 - ...
@@ -335,6 +359,31 @@ deciding priority>
 ## Related
 - `[[other-plan-stem]]` / memory names this plan builds on or supersedes.
 ```
+
+**Where the `**Difficulty:**` line goes, when Step 4 says to write one.** On
+its own line, below `> **Repo(s):**`, and **above the first `##`–`######`
+heading** — never inside a blockquote's body text and never under a section.
+The rubric reads a declared stamp only from the header region, which is
+everything before the first sub-H1 heading (`_declared`, qontinui-web
+`backend/app/services/plan_difficulty.py`); a stamp below `## Why` is dead text
+that silently loses to the computed rating. Put the level token
+directly after the colon — `**Difficulty:** high — deceptively small: …` — and
+delete the template's `<!-- OPTIONAL … -->` comment either way.
+
+**Every phase carries an `Arming:` line beside `Gate:`.** *(Plan
+`2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
+Phase 4.)* `Gate:` says the code is correct; `Arming:` says what will be
+OBSERVED to change when it runs on the population it was written for, and
+through which entry point. The value is three `|`-separated fields,
+`<seam_class> | <what is observed to change> | <entry point>`, where
+`seam_class` is one of `gate`, `sentinel`, `sweep_narrowing`, `convention`,
+`detect_deliver`, `counter` — or the whole value is `none — <reason>` for a
+phase that changes no behaviour (docs, a plan edit). Name the entry point the
+population actually calls, not the function the phase changes: a test that
+enters through the changed function is the dossier
+`shipped-fix-inert-on-its-population`. `/vet-plan` treats a phase without a
+parseable `Arming:` line as a **Missing** defect and writes one; a corpus
+measurement (check #75, report-only) counts how many new plans carry it.
 
 **Do not add a `## Gates` section.** That block (`<!-- GATE-SWEEP:BEGIN -->`)
 is machine-managed by `/gate-sweep`, and the `unit_ready` coord gate itself
@@ -352,36 +401,35 @@ status; the order is write → commit → vet. (If the plans directory is not a 
 repo — see [Plan directories](#plan-directories) — the file on disk is the whole
 ritual.)
 
-**A push is not the publication — land the plan with the helper.** A branch
-pushed with no pull request, onto a repo that needs one, never reaches `main`:
-the plan is published to `origin` and permanently invisible to every
-`origin/main` reader, which is the population a peer vetter, `/preflight` and
-the plan registry all read. Measured 2026-09-02, **9** plan
+**The push is not the publication — assert a PR carries the branch's push.**
+Where the plans repository is a coord-merge-authority repo, a branch pushed with
+no pull request never reaches `main`: the plan is published to `origin` and
+permanently invisible to every `origin/main` reader, which is the population a
+peer vetter, `/preflight` and the plan registry all read. Measured 2026-09-02, **9** plan
 stems were pushed to `origin` and never proposed at all — no PR in any state, on
 any branch carrying the stem — one of them a plan authored the day before by this
-very step. So publish the new plan with:
+very step. So after the push:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
-  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
-  "docs: add <plan-stem> (DRAFT)"
+gh pr list --repo <owner/repo> --head "$(git rev-parse --abbrev-ref HEAD)" \
+  --state all --json number,state,headRefOid,url \
+  --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
 ```
 
-Whether the plans repo needs a PR is decided by the helper's ruleset probe of
-its default branch, not asserted here. With no PR-requiring rule it lands the
-blob directly and prints `LANDED <commit|unchanged> <blob>`; with one, or when
-the probe cannot tell, it cuts a fresh branch, opens a new PR with
-**`gh pr create`** — the only opener it runs — with a line-anchored
-`Plan: <stem>` marker in the body, and prints `PROPOSED <pr-url|branch> <branch>`.
-To open it with `coord_create_pr` instead, set `LAND_PLAN_STAMP_NO_PR=1`: the
-helper pushes and reads back the branch, prints it, and opens nothing; then open
-the PR with `coord_create_pr`, falling back to `gh pr create`.
-It never pushes to an existing branch. A non-zero exit means the plan is NOT
-published; report it. On `PROPOSED`, read the PR back with
-`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`
-— `--state all`, not `--state open`: an empty open-only answer cannot tell
-"never proposed" from "closed under you". **Never `gh pr merge`, never
-`--admin`** — coord is the sole merge authority. Runbook:
+Use `--state all`, not `--state open`: an empty open-only answer cannot tell
+"never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
+proposed, but it carries nothing pushed after its close. So apply
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
+whose PR may already have landed". When it says no PR carries the push and
+commits remain unlanded, take its fresh-branch path and open the new PR:
+**`coord_create_pr` first, then `gh pr create`**, with a line-anchored
+`Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`** —
+coord is the sole merge authority. Open it in `/implement-plan` Step 4.5b's
+served door order (the runner's loopback door sits between the coord door and
+the `gh` fallback), then READ it back — the same `gh pr list --repo <owner/repo>
+--head <branch> --state all` read as above — and take the PR number only from a
+row whose `headRefOid` is the head you pushed, never from the create call's exit
+status or output. Runbook:
 `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 Note what publishing the plan does **not** by itself buy you: it does not make the
@@ -423,10 +471,8 @@ your session advertises, and verify by read — a zero exit is not evidence the
 write landed. The declaration is STORED on the unit, so one you did not earn is
 a false witness statement with your actor key beside it.
 
-⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a fresh
-allocate issues a NEW agent id the legacy compare would admit, which that
-refusal itself names *"a known defect being tracked, not a sanctioned route"*.
-That prohibition is that refusal's alone: `attester_unresolved` wants a device-
+⚠️ **Never re-allocate to get past `self_attestation_forbidden`** — a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`.
+The re-allocate prohibition is that refusal's alone: `attester_unresolved` wants a device-
 or agent-identified caller, which is a credential remedy rather than a route
 around a control.
 
