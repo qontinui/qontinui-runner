@@ -3838,6 +3838,19 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
 /// `tenant`, and seeding either slot with that credential would be the exact
 /// cross-tenant substitution `select_device_bearer` refuses by design. A
 /// `None` return (mismatch, or any other failure) leaves this slot cleared.
+/// Run one blocking credential-store write OFF the async worker: every store
+/// mutation takes the cross-process store lock, which may wait up to 10 s under
+/// contention (plan `2026-09-30-runner-says-connected-…` D4).
+async fn store_write_off_runtime<R: Send + 'static>(
+    auth_manager: &crate::auth::AuthManager,
+    write: impl FnOnce(&crate::auth::AuthManager) -> anyhow::Result<R> + Send + 'static,
+) -> anyhow::Result<R> {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || write(&mgr))
+        .await
+        .map_err(|e| anyhow::anyhow!("credential-store write task failed: {e}"))?
+}
+
 async fn clear_and_rederive_tenant_slot(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
@@ -3847,7 +3860,10 @@ async fn clear_and_rederive_tenant_slot(
     evidence: &str,
 ) -> TenantSlotOutcome {
     use std::sync::atomic::Ordering;
-    if let Err(e) = auth_manager.clear_tenant_device_jwt(tenant) {
+    let t = *tenant;
+    if let Err(e) =
+        store_write_off_runtime(auth_manager, move |m| m.clear_tenant_device_jwt(&t)).await
+    {
         warn!(
             "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
              as-is ({evidence})"
@@ -3893,12 +3909,13 @@ async fn clear_and_rederive_tenant_slot(
             rederived: false,
         };
     };
-    match auth_manager.store_tenant_device_jwt(tenant, &jwt) {
+    let jwt_len = jwt.len();
+    match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &jwt)).await
+    {
         Ok(()) => {
             info!(
                 "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
-                 device-machine-key exchange (len={})",
-                jwt.len()
+                 device-machine-key exchange (len={jwt_len})"
             );
             // M1 — see [`reset_upstream_rejections_for`]. This is the arm that
             // LATCHED: re-derive succeeds, rung 1 says `live`, and the next
@@ -4164,7 +4181,10 @@ pub(crate) async fn refresh_tenant_slots(
             outcomes.push((tenant, o));
             continue;
         }
-        match auth_manager.store_tenant_device_jwt(&tenant, &body.token) {
+        let (t, token) = (tenant, body.token.clone());
+        match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &token))
+            .await
+        {
             Ok(()) => {
                 info!(
                     "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",

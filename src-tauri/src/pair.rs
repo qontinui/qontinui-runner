@@ -644,6 +644,11 @@ pub struct BindingReconcileReport {
     /// re-pointed (`Some(tenant)`) or cleared entirely (`None` — no
     /// bindings remain).
     pub default_repointed: Option<Option<uuid::Uuid>>,
+    /// Tenants missing from this echo that were KEPT (binding and slot), each
+    /// with its current consecutive-omission count. A count of 0 means the
+    /// drop was due but the slot had changed since the decision, so it was
+    /// spared. Observability only — never part of [`Self::changed`].
+    pub held: Vec<(uuid::Uuid, u32)>,
 }
 
 impl BindingReconcileReport {
@@ -984,8 +989,10 @@ struct OmissionStreak {
 }
 
 /// `coord_omission_streaks.json`, beside `paired_user.json`: tenant id → streak.
-/// A sidecar for the same reason as `coord_bound_tenants.json` — only the
-/// reconcile writes it, so it never races `persist_pairing`'s rewrite.
+/// Written by the reconcile (advance) and by `persist_pairing_with` (reset on a
+/// fresh pairing). Both do so only while holding the binding-reconcile lock
+/// ([`lock_binding_reconcile`]), which serializes them across threads and
+/// processes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct OmissionStreaksFile {
     #[serde(default)]
@@ -996,6 +1003,25 @@ fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
     paired_user.with_file_name("coord_omission_streaks.json")
 }
 
+/// The cross-process lock (`coord_omission_streaks.json.lock`) held for a whole
+/// reconcile pass AND a whole `persist_pairing_with`, so a pairing can never
+/// land between a reconcile's decision and its clears, and the streak file is
+/// never read-modify-written by two writers at once.
+fn lock_binding_reconcile(
+    paired_user: &std::path::Path,
+) -> Result<crate::secure_storage::FileLockGuard, String> {
+    let lock = crate::secure_storage::lock_path_for(&omission_streaks_path(paired_user));
+    crate::secure_storage::lock_file_exclusive(&lock).map_err(|e| format!("{e:#}"))
+}
+
+// Test hook run after a reconcile has decided what to drop and read the slots
+// it will clear, and before it clears them.
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECONCILE_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn read_omission_streaks(path: &std::path::Path) -> OmissionStreaksFile {
     std::fs::read(path)
         .ok()
@@ -1003,12 +1029,16 @@ fn read_omission_streaks(path: &std::path::Path) -> OmissionStreaksFile {
         .unwrap_or_default()
 }
 
-/// Atomic write under a per-process temp name (several runners share the dir).
+/// Atomic write under a temp name unique per process AND per call (callers hold
+/// the reconcile lock, but a unique name costs nothing and survives a lock bug).
 fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let written = serde_json::to_vec_pretty(file)
         .map_err(|e| e.to_string())
         .and_then(|body| {
-            let tmp = path.with_extension(format!("json.omission.{}.tmp", std::process::id()));
+            let tmp =
+                path.with_extension(format!("json.omission.{}.{seq}.tmp", std::process::id()));
             std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
             std::fs::rename(&tmp, path).map_err(|e| e.to_string())
         });
@@ -1022,21 +1052,29 @@ fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
 /// unix second its run began (their records are consumed). Every tenant NOT
 /// omitted this pass has its streak reset. An omission closer than
 /// [`RECONCILE_OMISSION_MIN_SPACING_SECS`] to the last counted one is not
-/// counted. An unreadable sidecar reads as empty, and a consumed streak whose
-/// clear then fails restarts at one — both only DELAY a drop, never cause one.
+/// counted; a NEGATIVE gap (the clock moved back) does count, and restamps.
+/// An unreadable sidecar reads as empty, and a consumed streak whose clear then
+/// fails restarts at one — both only DELAY a drop, never cause one.
+/// Returns `(due, held)`: due tenants with the unix second their run began, and
+/// held tenants with their current count. Caller holds the reconcile lock.
+#[allow(clippy::type_complexity)]
 fn advance_omission_streaks(
     paired_user: &std::path::Path,
     omitted: &[uuid::Uuid],
     now_unix: i64,
-) -> Vec<(uuid::Uuid, i64)> {
+) -> (Vec<(uuid::Uuid, i64)>, Vec<(uuid::Uuid, u32)>) {
     let path = omission_streaks_path(paired_user);
     let before = read_omission_streaks(&path);
     let mut after = OmissionStreaksFile::default();
     let mut due = Vec::new();
+    let mut held = Vec::new();
     for t in omitted {
         let key = t.to_string();
         let streak = match before.tenants.get(&key) {
-            Some(prev) if now_unix - prev.last_counted_at < RECONCILE_OMISSION_MIN_SPACING_SECS => {
+            Some(prev)
+                if (0..RECONCILE_OMISSION_MIN_SPACING_SECS)
+                    .contains(&(now_unix - prev.last_counted_at)) =>
+            {
                 prev.clone()
             }
             Some(prev) => OmissionStreak {
@@ -1053,18 +1091,19 @@ fn advance_omission_streaks(
         if streak.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS {
             due.push((*t, streak.first_omitted_at));
         } else {
+            held.push((*t, streak.consecutive));
             after.tenants.insert(key, streak);
         }
     }
     if after != before {
         write_omission_streaks(&path, &after);
     }
-    due
+    (due, held)
 }
 
 /// A fresh pairing proves the binding is wanted: forget any omission streak the
 /// tenant had, so a coord echo that lags the pair by one heartbeat cannot drop
-/// the credential just minted. Best-effort.
+/// the credential just minted. Best-effort. Caller holds the reconcile lock.
 fn reset_omission_streak(paired_user: &std::path::Path, tenant: &uuid::Uuid) {
     let path = omission_streaks_path(paired_user);
     let mut file = read_omission_streaks(&path);
@@ -1092,6 +1131,9 @@ pub(crate) fn reconcile_paired_bindings_at(
     coord_set: &[uuid::Uuid],
     now_unix: i64,
 ) -> Result<BindingReconcileReport, String> {
+    // One pass is one critical section: decide, then clear, with no pairing
+    // able to interleave (persist_pairing_with takes the same lock).
+    let _reconcile_lock = lock_binding_reconcile(path)?;
     let mut report = BindingReconcileReport::default();
 
     let bytes = match std::fs::read(path) {
@@ -1127,7 +1169,8 @@ pub(crate) fn reconcile_paired_bindings_at(
         .collect();
     omitted.sort();
     omitted.dedup();
-    let due_runs = advance_omission_streaks(path, &omitted, now_unix);
+    let (due_runs, held) = advance_omission_streaks(path, &omitted, now_unix);
+    report.held = held;
     let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
     let run_began = |t: &uuid::Uuid| {
         due_runs
@@ -1142,6 +1185,30 @@ pub(crate) fn reconcile_paired_bindings_at(
              binding and slot until {RECONCILE_DROP_AFTER_OMISSIONS} consecutive echoes omit it"
         );
     }
+    // The exact token each due tenant's slot held when the drop was decided.
+    // Clears are conditional on it, so a slot rewritten since (a refresher
+    // re-mint) is spared rather than deleted.
+    let observed: std::collections::HashMap<uuid::Uuid, String> = due
+        .iter()
+        .filter_map(|t| match mgr.get_tenant_device_jwt(t) {
+            Ok(Some(tok)) => Some((*t, tok)),
+            _ => None,
+        })
+        .collect();
+    #[cfg(test)]
+    if let Some(hook) = AFTER_RECONCILE_DECISION.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    // `Ok(true)` = the slot was cleared or there was none to clear; `Ok(false)`
+    // = it changed since the decision and was spared.
+    let clear_as_observed = |t: &uuid::Uuid| -> Result<bool, String> {
+        match observed.get(t) {
+            Some(tok) => mgr
+                .clear_tenant_device_jwt_if_unchanged(t, tok)
+                .map_err(|e| format!("{e:#}")),
+            None => Ok(true),
+        }
+    };
     let keeps = |t: &uuid::Uuid| coord_set.contains(t) || !due.contains(t);
 
     // Partition the (migrated) binding set by coord membership. Entries
@@ -1152,20 +1219,30 @@ pub(crate) fn reconcile_paired_bindings_at(
     for b in bindings {
         match uuid::Uuid::parse_str(b.tenant_id.trim()) {
             Ok(t) if keeps(&t) => kept.push(b),
-            Ok(t) => {
-                tracing::warn!(
-                    "reconcile: DROPPING binding and clearing slot for tenant {t} — omitted from \
-                     {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix {}; \
-                     this echo was {coord_set:?}",
-                    run_began(&t)
-                );
-                report.dropped.push(t);
-                // Designed home of slot deletion: coord no longer has the
-                // binding, so its credential is dead weight. Best-effort.
-                if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                    tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
+            Ok(t) => match clear_as_observed(&t) {
+                Ok(false) => {
+                    tracing::warn!(
+                        "reconcile: tenant {t} was due to drop but its slot changed since the \
+                         decision — KEEPING binding and slot; this echo was {coord_set:?}"
+                    );
+                    report.held.push((t, 0));
+                    kept.push(b);
                 }
-            }
+                cleared => {
+                    tracing::warn!(
+                        "reconcile: DROPPING binding and clearing slot for tenant {t} — omitted \
+                         from {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since \
+                         unix {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped.push(t);
+                    // Designed home of slot deletion: coord no longer has the
+                    // binding, so its credential is dead weight. Best-effort.
+                    if let Err(e) = cleared {
+                        tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
+                    }
+                }
+            },
             Err(_) => {
                 tracing::warn!(
                     "reconcile: dropping paired_user.json binding with malformed tenant_id {:?}",
@@ -1182,18 +1259,24 @@ pub(crate) fn reconcile_paired_bindings_at(
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .collect();
-    for t in mgr.list_tenant_device_jwt_tenants() {
-        if !keeps(&t) && !report.dropped.contains(&t) {
-            tracing::warn!(
-                "reconcile: clearing ORPHAN slot for tenant {t} — omitted from \
-                 {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix {}; \
-                 this echo was {coord_set:?}",
-                run_began(&t)
-            );
-            if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                tracing::debug!("reconcile: clear orphan slot {t} failed: {e}");
-            } else {
-                report.dropped_slots.push(t);
+    // Only slots OBSERVED at decision time: a slot that appeared since is not
+    // one this pass decided about.
+    let mut orphans: Vec<uuid::Uuid> = observed.keys().copied().collect();
+    orphans.sort();
+    for t in orphans {
+        if !keeps(&t) && !report.dropped.contains(&t) && !kept_tenants.contains(&t) {
+            match clear_as_observed(&t) {
+                Ok(true) => {
+                    tracing::warn!(
+                        "reconcile: cleared ORPHAN slot for tenant {t} — omitted from \
+                         {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix \
+                         {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped_slots.push(t);
+                }
+                Ok(false) => report.held.push((t, 0)),
+                Err(e) => tracing::debug!("reconcile: clear orphan slot {t} failed: {e}"),
             }
         }
     }
@@ -1989,6 +2072,10 @@ pub(crate) fn persist_pairing_with(
     // methods). This is the FIRST write of the sequence, so on an undecryptable
     // `.enc` it heals the store and every write below then merges over the
     // now-readable store. See `SecureStorage::WriteMode`.
+    // Serialize with the heartbeat reconcile for the whole pairing, so a
+    // reconcile can neither decide against a half-written pairing nor clear the
+    // slot this pairing is about to write.
+    let _reconcile_lock = lock_binding_reconcile(path)?;
     mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
     reset_omission_streak(path, &tenant_id);
@@ -3278,6 +3365,49 @@ mod tests {
         // A properly spaced second omission does drop.
         let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r3");
         assert_eq!(r3.dropped, vec![tb()]);
+    }
+
+    /// MAJOR 1: a slot rewritten AFTER the reconcile decided to drop its
+    /// tenant (here by the test hook, standing in for a refresher re-mint) is
+    /// spared — the clear is conditional on the token observed at decision —
+    /// and the binding is kept and reported as held.
+    #[test]
+    fn reconcile_spares_a_slot_rewritten_after_the_decision() {
+        let dir = temp_dir_for("reconcile_toctou");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+
+        let fresh = live_jwt("b-remint");
+        let (m2, f2) = (mgr.clone(), fresh.clone());
+        AFTER_RECONCILE_DECISION.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                m2.store_tenant_device_jwt(&tb(), &f2).unwrap();
+            }))
+        });
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(r2.dropped.is_empty(), "{r2:?}");
+        assert_eq!(r2.held, vec![(tb(), 0)]);
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), Some(fresh));
+        assert_eq!(read_file(&path).bindings.len(), 2);
+    }
+
+    /// S8: a negative gap (the clock moved back) counts as an omission and
+    /// restamps, rather than freezing the streak until the clock catches up.
+    #[test]
+    fn reconcile_a_backwards_clock_still_counts_the_omission() {
+        let dir = temp_dir_for("reconcile_clock_back");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 1000).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r2");
+        assert_eq!(r2.dropped, vec![tb()]);
     }
 
     /// Re-pairing a tenant forgets its omission streak: an echo lagging the
