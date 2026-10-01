@@ -154,7 +154,7 @@ jobs:
       cancel-in-progress: false
 
     # `contents: write` pushes the bump branch; `pull-requests: write` lets the
-    # bump step list/edit/reopen/comment on its PR and convert it back to a
+    # bump step list/create/edit/comment on its PR and convert it back to a
     # draft, and lets the sweep mark it ready and page on it. `checks: read` is
     # what scripts/ci/ready-bot-draft-pr.sh reads the head's check runs with.
     #
@@ -705,8 +705,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # EVERY PR-mutating gh call routes through this — create, edit, reopen
-          # and comment alike — because ONE permission gates all four, and when
+          # EVERY PR-mutating gh call routes through this — create, edit and
+          # comment alike — because ONE permission gates all three, and when
           # it is missing the push still SUCCEEDS and only the PR call fails.
           # That reads as an unrelated infra blip rather than as a one-line
           # settings fix.
@@ -725,7 +725,7 @@ jobs:
             echo "::error::$1 failed for '$BRANCH'. The bumped pins ARE committed and pushed to that branch — the bump itself worked."
             echo "::error::This is almost always PERMISSIONS, not the bump. Fix EITHER of:"
             echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
-            echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO — it needs that IN ADDITION to 'Contents: write', and one fine-grained 'Pull requests' permission covers create, edit, reopen and comment together."
+            echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO — it needs that IN ADDITION to 'Contents: write', and one fine-grained 'Pull requests' permission covers create, edit and comment together."
             echo "::error::Option (b) is the narrower fix: (a) also lets every workflow APPROVE pull requests, which weakens the review boundary an auto-merging fleet depends on."
             echo "::error::Meanwhile, open or update the PR by hand from '$BRANCH' — the bump is already committed there."
             echo "::error::gh's own error above is the authoritative reason (other causes exist: a >65536-char body, a branch-protection refusal)."
@@ -933,48 +933,20 @@ jobs:
           EOF
           } > "$body"
 
-          if [ -z "$existing_num" ]; then
-            # A CLOSED (not merged) PR would otherwise let `gh pr create`
-            # succeed every day — GitHub allows a new PR for a head whose
-            # previous PR was closed — turning "one PR" into one per day.
-            # Reopen the maintainer's PR instead. `mergedAt` is the
-            # discriminator: gh reports state CLOSED for merged PRs too, and a
-            # merged one must never be reopened. `first`, not `last`: gh returns
-            # newest-first. No `|| true`, same reason as the open lookup above.
-            existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
-              --json number,mergedAt,isCrossRepository --jq 'map(select(.mergedAt == null and .isCrossRepository == false)) | first | .number // empty')"
-            # A PR that scripts/ci/ready-bot-draft-pr.sh closed as OBSOLETE
-            # is NOT the maintainer-closed case above. The bot closed it
-            # because a sweep found main already current (no pin to move), so
-            # the change it carried was not needed; this is a NEW, genuine
-            # move, and it gets a fresh PR rather than a resurrected one.
-            # Recognised by the hidden marker that script's close comment
-            # carries — read from the script itself, so there is one
-            # definition. Comments are read via REST --paginate into a file
-            # (no page cap; no `gh | grep -q` SIGPIPE), with no `|| true`.
-            #
-            # Unverified, and pre-existing for the maintainer-closed path
-            # below (tracked separately): GitHub MAY refuse to reopen a PR
-            # whose branch changed after it was closed, and this step has
-            # already force-pushed the branch by the time it reopens.
-            if [ -n "$existing_num" ]; then
-              close_marker="$(bash scripts/ci/ready-bot-draft-pr.sh --print-close-marker)"
-              if ! gh api --paginate "repos/$REPO/issues/$existing_num/comments" \
-                  --jq '.[].body' > "$RUNNER_TEMP/closed-pr-comments.txt"; then
-                pr_write_failed "reading the comments of closed bump PR #$existing_num"
-              fi
-              if grep -qF "$close_marker" "$RUNNER_TEMP/closed-pr-comments.txt"; then
-                echo "Closed bump PR #$existing_num was closed as obsolete by ready-bot-draft-pr.sh; opening a fresh PR instead of reopening it."
-                existing_num=""
-              fi
-            fi
-            if [ -n "$existing_num" ]; then
-              echo "Reopening previously closed bump PR #$existing_num."
-              gh pr reopen "$existing_num" --repo "$REPO" \
-                || pr_write_failed "gh pr reopen #$existing_num"
-            fi
-          fi
-
+          # No open PR => a FRESH draft PR, always. A closed bump PR is never
+          # reopened, for two independent reasons:
+          #   - coord ff-lands by rebase + close, so a LANDED bump PR reads
+          #     closed with `mergedAt == null` — indistinguishable from a
+          #     rejected one. Reopening it resurrects landed work (the defect
+          #     schema-pg-sql-freshness-nightly.yml's step guards were written
+          #     against; scripts/tests/test_schema_pr_step_guards.sh).
+          #   - the branch was force-pushed above, and GitHub can refuse to
+          #     reopen a PR whose head branch was force-pushed or recreated
+          #     after it was closed — a reopen here would red the run nightly.
+          #     (Not measured here; the first reason alone is decisive.)
+          # A fresh PR per closed one is bounded: once open, later runs update
+          # it in place (the open lookup above), so this is one PR per close
+          # event, never one per day.
           if [ -n "$existing_num" ]; then
             gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body" \
               || pr_write_failed "gh pr edit #$existing_num"
