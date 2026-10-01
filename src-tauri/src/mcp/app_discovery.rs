@@ -1182,9 +1182,17 @@ async fn dispatch_to_app_inner(
         .dispatch(app_id, &req.action, Method::POST, "/dispatch", payload)
         .await
     {
-        // This handler wraps in its own `ApiResponse`, so it takes the body
-        // raw (the HTTP arm's envelope stays nested, as it always has).
-        Ok(data) => (StatusCode::OK, ApiResponse::success(data.into_raw())),
+        // This handler wraps in its own `ApiResponse`. The WS arm's outcome
+        // object decides success (a `{success:false}` is a failed response,
+        // not success around a failure); the HTTP arm's body stays nested,
+        // as it always has.
+        Ok(crate::mcp::app_dispatch::Dispatched::Websocket(v)) => (
+            StatusCode::OK,
+            crate::mcp::app_dispatch::ws_result_api_response(v),
+        ),
+        Ok(crate::mcp::app_dispatch::Dispatched::Http(v)) => {
+            (StatusCode::OK, ApiResponse::success(v))
+        }
         Err(DispatchError::NotRegistered(_)) => (
             StatusCode::NOT_FOUND,
             ApiResponse::error("app not registered"),
@@ -1662,6 +1670,73 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.success);
         assert_eq!(body.data, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_app_inner_ws_failed_outcome_is_not_success() {
+        use crate::mcp::app_dispatch::AppDispatcher;
+        use crate::mcp::command_relay::{CommandRelay, CommandResponse};
+        use crate::mcp::ws_relay::WsConnectionManager;
+        use std::time::Duration;
+
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        let req = AppDispatchRequest {
+            action: "doThing".into(),
+            params: serde_json::json!({"x": 1}),
+        };
+
+        // Drive the dispatch on a separate task so we can play the role of
+        // the wrapper and pull the outbound frame off the channel.
+        let registry_for_task = registry.clone();
+        let dispatcher_for_task = dispatcher.clone();
+        let handle = tokio::spawn(async move {
+            dispatch_to_app_inner(&registry_for_task, &dispatcher_for_task, "wapp", &req).await
+        });
+
+        let frame = outbound_rx
+            .recv()
+            .await
+            .expect("relay must send an outbound frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let command_id = v["commandId"].as_str().unwrap().to_string();
+        // WS-transport: action goes in the frame's `action` field, the
+        // user's `params` go verbatim into `payload` (NOT wrapped).
+        assert_eq!(v["action"], "doThing");
+        assert_eq!(v["payload"], serde_json::json!({"x": 1}));
+
+        relay
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(serde_json::json!({"success": false, "error": "no such action", "code": "ACTION_NOT_FOUND"})),
+                    error: None,
+                },
+            )
+            .await;
+
+        let (status, body) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        // The outcome's own failure is the response's failure.
+        assert!(!body.success);
+        assert_eq!(body.error.as_deref(), Some("no such action"));
+        assert_eq!(body.code.as_deref(), Some("ACTION_NOT_FOUND"));
     }
 
     #[tokio::test]

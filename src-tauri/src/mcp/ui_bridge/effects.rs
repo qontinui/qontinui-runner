@@ -141,15 +141,23 @@ pub async fn ui_bridge_predict_component_action_handler(
     )
     .await
     {
-        return match ws_outcome {
-            Ok(value) => Json(value),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-        };
+        return Json(predict_ws_answer(ws_outcome));
     }
 
     match ui_bridge_request_sync(&state, "predict_component_action", ipc_payload).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// The predict route's answer for a WS-transport app. The WS arm delivers the
+/// wrapper's bare result; it is enveloped like the `/sdk/*` proxies
+/// ([`crate::mcp::app_dispatch::ws_result_envelope`]) so a client reading
+/// `success` sees one shape on both transports.
+fn predict_ws_answer(outcome: Result<serde_json::Value, String>) -> serde_json::Value {
+    match outcome {
+        Ok(value) => crate::mcp::app_dispatch::ws_result_envelope(value),
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
     }
 }
 
@@ -244,6 +252,25 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WS arm of predict answers the `{success, data}` envelope — a bare
+    /// result with no `success` key is what a strict client reads as failure.
+    #[test]
+    fn predict_ws_answer_is_enveloped() {
+        assert_eq!(
+            predict_ws_answer(Ok(serde_json::json!({"effectClass": "read"}))),
+            serde_json::json!({"success": true, "data": {"effectClass": "read"}})
+        );
+        let failed = predict_ws_answer(Ok(serde_json::json!({
+            "success": false, "error": "unknown action", "code": "ACTION_NOT_FOUND"
+        })));
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["code"], "ACTION_NOT_FOUND");
+        assert_eq!(
+            predict_ws_answer(Err("disconnected".into())),
+            serde_json::json!({"success": false, "error": "disconnected"})
+        );
+    }
 
     #[test]
     fn route_entries_lists_recent_effects() {
