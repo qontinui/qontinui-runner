@@ -1291,10 +1291,20 @@ async fn finalize_signed_in(
         .unwrap_or(uuid::Uuid::nil());
 
     // 5. Persist the device JWT + paired-user file.
-    persist_pairing(&pair_resp, tenant_id).map_err(|e| {
-        error!("finalize_signed_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}");
-        AppError::Raw(format!("persist pairing: {e}"))
-    })?;
+    //    Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
+    let pair_resp_for_persist = pair_resp.clone();
+    spawn_blocking_tracked(move || persist_pairing(&pair_resp_for_persist, tenant_id))
+        .await
+        .map_err(|e| {
+            error!("finalize_signed_in: persist_pairing task panicked: {e}");
+            AppError::Raw(format!("persist pairing task panicked: {e}"))
+        })?
+        .map_err(|e| {
+            error!(
+                "finalize_signed_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}"
+            );
+            AppError::Raw(format!("persist pairing: {e}"))
+        })?;
 
     // 5a. A NEW credential is in `tenant_id`'s slot (and in the legacy slot when
     //     that tenant is the default), so every rejection coord recorded

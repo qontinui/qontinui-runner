@@ -1451,17 +1451,16 @@ impl AuthManager {
             .context("Failed to clear per-tenant device JWT from secure storage")
     }
 
-    /// Remove one tenant's slot only if it still holds `observed` (compare and
-    /// remove under one store lock). Returns whether it was removed.
+    /// Remove each listed tenant's slot only if it still holds its observed
+    /// token, all under one store lock. Returns per tenant whether it was removed.
     #[track_caller]
-    pub fn clear_tenant_device_jwt_if_unchanged(
+    pub fn clear_tenant_device_jwts_if_unchanged(
         &self,
-        tenant_id: &Uuid,
-        observed: &str,
-    ) -> Result<bool> {
+        expected: &[(Uuid, String)],
+    ) -> Result<Vec<(Uuid, bool)>> {
         self.secure_storage
-            .clear_tenant_device_jwt_if_unchanged(tenant_id, observed)
-            .context("Failed to conditionally clear per-tenant device JWT")
+            .clear_tenant_device_jwts_if_unchanged(expected)
+            .context("Failed to conditionally clear per-tenant device JWTs")
     }
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
