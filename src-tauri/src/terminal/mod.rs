@@ -16,6 +16,7 @@ pub mod claude_resume_sniff;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
+pub mod daemon_pane_io;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;

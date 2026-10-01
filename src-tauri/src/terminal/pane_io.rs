@@ -70,6 +70,16 @@ pub enum CredentialScrub {
     /// The implementation launches no child and hands no environment to
     /// anything. Only an in-memory double can honestly answer this.
     NoChildEnv,
+    /// The child's environment was assembled in THIS process and passed
+    /// through [`super::scrub_credential_env_pty`] — witnessed by
+    /// [`ScrubbedCommand`] — and then shipped, complete, to an OUT-OF-PROCESS
+    /// PTY holder that spawns the child with exactly that environment and
+    /// nothing else (`qontinui-pty-holder` clears its own environment first).
+    /// [`ScrubbedCommand::to_holder_spec`] is the only constructor of a holder
+    /// spec from a runner command, so the proof travels in the type (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27). `DaemonPaneIo` answers this.
+    ScrubbedOutOfProcess,
 }
 
 /// A byte source and sink for one terminal pane.
@@ -125,6 +135,27 @@ pub trait PaneIo: Send + Sync {
     /// The OS pid of the pane's process, when there is one in THIS process's
     /// pid namespace.
     fn pid(&self) -> Option<u32>;
+
+    /// The pid the runner's own crash-safety reaping (the Windows
+    /// `KILL_ON_JOB_CLOSE` Job Object, `TerminalSession::spawn_with_io`) may
+    /// enroll — by default [`Self::pid`]. A pane whose child is owned by an
+    /// out-of-process holder answers `None`: enrolling it would end the child
+    /// exactly when the runner exits, the event the holder exists to survive,
+    /// and reaping is the holder's job (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D8).
+    fn job_enroll_pid(&self) -> Option<u32> {
+        self.pid()
+    }
+
+    /// Whether `WireFlow` should pause this source while NO pane renders the
+    /// terminal (the `Unwatched` tier). True by default — a remote pane's
+    /// state is tracked on its target, so nothing here needs the bytes. A pane
+    /// whose state tracking (grid, auto-response, needs-input) happens in THIS
+    /// runner answers `false`: pausing it would starve those readers. Only
+    /// the emission gate's backpressure is projected onto such a source.
+    fn unwatched_pauses_source(&self) -> bool {
+        true
+    }
 
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
