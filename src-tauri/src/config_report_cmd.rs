@@ -2035,6 +2035,11 @@ mod tests {
     #[test]
     fn config_report_never_reaches_the_settings_writer() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         use crate::settings::settings_full_load_count;
 
         // (1) CONTROL — the instrument fires. Without this the whole test could
@@ -2442,6 +2447,11 @@ mod tests {
     #[test]
     fn config_report_live_command_injects_every_bin_layer() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let report = config_report_run();
         let specs: Vec<&LayerSpec> = report.rows.iter().map(|r| r.spec).collect();
         assert_eq!(specs.len(), 15, "every layer gets a row");
@@ -3692,6 +3702,11 @@ mod tests {
     #[test]
     fn config_report_live_command_injects_every_phase_4_layer() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let report = config_report_run();
 
         for (name, expected_source_fragment) in [
@@ -3942,6 +3957,11 @@ mod tests {
     #[test]
     fn config_report_live_command_injects_the_settings_struct_layer() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let report = config_report_run();
         match &report.row("settings_struct").expect("row present").reading {
             LayerReading::Known { value, source, .. } => {
@@ -3980,6 +4000,11 @@ mod tests {
     #[test]
     fn config_report_live_render_carries_no_settings_field_value() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         // The NON-MUTATING reader, deliberately: this test used to call
         // `load_settings_full`, which mints a `local_user_id` and persists it —
         // a test that writes the operator's settings.json to check that the
@@ -4375,6 +4400,11 @@ mod tests {
     #[test]
     fn config_report_live_command_writes_nothing_it_reports_on() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         fn fingerprint(
             path: &std::path::Path,
         ) -> (bool, Option<u64>, Option<std::time::SystemTime>) {
@@ -4474,6 +4504,11 @@ mod tests {
     #[test]
     fn config_report_live_full_render_leaks_no_credential_value() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         let rendered = config_report_run().render();
         let mut checked = 0usize;
         // `vars_os` + lossy, not `vars()`: the leak check must not itself
@@ -4571,6 +4606,11 @@ mod tests {
     #[test]
     fn config_report_planted_credential_urls_never_reach_the_render() {
         let _amb = crate::test_env::isolated_ambient();
+        // Lock order: ambient, THEN the fleet pin (never the reverse). The
+        // report reaches `get_effective_config_dir`, which reads the fleet term
+        // and `RESOLVED_CONFIG_DIR`; holding the pin serializes it against the
+        // `ai_provider::config` test that publishes a temp dir there.
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
         use qontinui_runner_lib::env_generations::{classify_env_var, WithholdReason};
 
         // (name, value, the substring that must not survive anywhere)
