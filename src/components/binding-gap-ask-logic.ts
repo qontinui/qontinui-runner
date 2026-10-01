@@ -291,8 +291,8 @@ export const GET_PAIR_ALL_STATUS_CMD = "get_pair_all_status";
 
 export interface PairAllStatus {
   inFlight: boolean;
-  /** `waiting` and `browser` are cancellable; `collecting` is not. */
-  phase: "idle" | "waiting" | "browser" | "collecting";
+  /** `waiting` and `browser` are cancellable; `cancelling` and `collecting` are not. */
+  phase: "idle" | "waiting" | "browser" | "cancelling" | "collecting";
   connectUrl: string | null;
   launched: boolean;
 }
@@ -303,7 +303,12 @@ export function normalizePairAllStatus(raw: unknown): PairAllStatus | null {
   const o = raw as Record<string, unknown>;
   if (typeof o.in_flight !== "boolean") return null;
   const phase =
-    o.phase === "waiting" || o.phase === "browser" || o.phase === "collecting" ? o.phase : "idle";
+    o.phase === "waiting" ||
+    o.phase === "browser" ||
+    o.phase === "cancelling" ||
+    o.phase === "collecting"
+      ? o.phase
+      : "idle";
   return {
     inFlight: o.in_flight,
     phase: o.in_flight ? phase : "idle",
@@ -315,4 +320,25 @@ export function normalizePairAllStatus(raw: unknown): PairAllStatus | null {
 /** True when the runner refused a second flow because one is already running. */
 export function isAlreadyInProgress(error: string): boolean {
   return error.includes("already in progress");
+}
+
+/**
+ * Orders a status PULL against the progress EVENTS. Every event bumps the
+ * sequence; a pull captures it before invoking and applies its answer only if
+ * no event arrived meanwhile — so a read taken mid-flow can never overwrite a
+ * `done` / `error` / `cancelled` the event stream delivered after it.
+ */
+export function createProgressSequence(): {
+  bump: () => void;
+  capture: () => number;
+  isCurrent: (captured: number) => boolean;
+} {
+  let seq = 0;
+  return {
+    bump: () => {
+      seq += 1;
+    },
+    capture: () => seq,
+    isCurrent: (captured) => captured === seq,
+  };
 }

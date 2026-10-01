@@ -6,12 +6,13 @@
  * disagree about which workspaces lack a credential.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import {
   BINDING_GAP_NUDGE_EVENT,
+  createProgressSequence,
   GET_PAIR_ALL_STATUS_CMD,
   isAlreadyInProgress,
   normalizePairAllStatus,
@@ -103,14 +104,19 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
   const [error, setError] = useState<string | null>(null);
   const [connectLink, setConnectLink] = useState<{ url: string; launched: boolean } | null>(null);
   const [cancellable, setCancellable] = useState(true);
+  // Orders status pulls against progress events (see createProgressSequence).
+  const progressSeq = useRef(createProgressSequence());
 
   /** Adopt the runner's view of the ONE flow (mount, or a refused 2nd start). */
   const adoptStatus = useCallback(async () => {
     try {
+      const captured = progressSeq.current.capture();
       const st = normalizePairAllStatus(await invoke<unknown>(GET_PAIR_ALL_STATUS_CMD));
+      // An event arrived while the read was in flight: it is newer — keep it.
+      if (!progressSeq.current.isCurrent(captured)) return;
       if (st === null || !st.inFlight) return;
       setPhase("waiting");
-      setCancellable(st.phase !== "collecting");
+      setCancellable(st.phase === "waiting" || st.phase === "browser");
       setConnectLink(st.connectUrl ? { url: st.connectUrl, launched: st.launched } : null);
     } catch {
       /* an older runner without the command: nothing to adopt */
@@ -127,6 +133,7 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
     const unlisten = listen<unknown>(PAIR_ALL_PROGRESS_EVENT, (ev) => {
       const p = normalizePairAllProgress(ev.payload);
       if (p === null) return;
+      progressSeq.current.bump();
       switch (p.phase) {
         case "waiting":
           setPhase("waiting");

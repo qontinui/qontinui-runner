@@ -2043,12 +2043,40 @@ pub struct BrowserPairHooks<'a> {
     /// Called once with the URL the browser should open, and whether the
     /// automatic launch succeeded.
     pub on_connect_url: Option<&'a (dyn Fn(&str, bool) + Sync)>,
-    /// Checked by the wait loop every 200 ms; once set the flow ends with
-    /// `Err("cancelled")` and the loopback server shuts down.
+    /// Checked after `pair-start` answers, again just before the browser is
+    /// launched, and by the wait loop every 200 ms; once set the flow ends
+    /// with `Err("cancelled")` (without launching the browser, if it is not
+    /// open yet) and the loopback server shuts down.
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
-    /// Called once when the browser callback was captured — the point after
-    /// which `cancel` is no longer consulted.
-    pub on_callback: Option<&'a (dyn Fn() + Sync)>,
+    /// THE ARBITER of capture vs cancel: called the moment the wait loop sees
+    /// the browser callback, BEFORE the server shutdown. `true` = this capture
+    /// won and the flow proceeds; `false` = a cancel already won, and the flow
+    /// ends with `Err("cancelled")` even though the browser called back. The
+    /// caller makes the decision atomically against its own cancel path.
+    pub claim_capture: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+impl BrowserPairHooks<'_> {
+    fn cancel_requested(&self) -> bool {
+        self.cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// Pure: settle a wait-loop outcome against the capture arbiter
+/// ([`BrowserPairHooks::claim_capture`]). A capture the arbiter refuses is a
+/// cancel.
+fn settle_capture(
+    hooks: &BrowserPairHooks<'_>,
+    outcome: Result<CallbackCapture, String>,
+) -> Result<CallbackCapture, String> {
+    match outcome {
+        Ok(capture) => match hooks.claim_capture {
+            Some(claim) if !claim() => Err("cancelled".to_string()),
+            _ => Ok(capture),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// What one completed browser round-trip produced.
@@ -2144,6 +2172,10 @@ fn browser_pair_round_trip(
         .map_err(|e| format!("decode pair-start response failed: {e}"))?;
 
     let state_nonce = pair_start_resp.state;
+    // Cancelled while pair-start was in flight: stop before any browser opens.
+    if hooks.cancel_requested() {
+        return Err("cancelled".to_string());
+    }
 
     // Append device_id to the coord-provided redirect_url so the web
     // page can forward it to pair-complete.
@@ -2227,54 +2259,63 @@ fn browser_pair_round_trip(
         })
     });
 
-    println!(
-        "opening browser to {} (callback {})",
-        connect_url, callback_url
-    );
-    let launched = match open::that(&connect_url) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!(
-                "warning: failed to open browser ({}). Open this URL manually:\n  {}",
-                e, connect_url
-            );
-            false
-        }
-    };
-    if let Some(on_connect_url) = hooks.on_connect_url {
-        on_connect_url(&connect_url, launched);
-    }
-
-    // Poll the received slot up to 5 minutes. The axum runtime is on a
-    // background thread; we just block here until we see the slot fill, the
-    // caller cancels, or the server-done signal arrives.
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     let mut server_finished = false;
-    let outcome = loop {
-        if let Some(c) = received.lock().expect("mutex").clone() {
-            break Ok(c);
+    // Last chance before the browser opens: a cancel that landed during the
+    // server spawn ends the flow here, with no browser launched.
+    let outcome = if hooks.cancel_requested() {
+        Err("cancelled".to_string())
+    } else {
+        println!(
+            "opening browser to {} (callback {})",
+            connect_url, callback_url
+        );
+        let launched = match open::that(&connect_url) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to open browser ({}). Open this URL manually:\n  {}",
+                    e, connect_url
+                );
+                false
+            }
+        };
+        if let Some(on_connect_url) = hooks.on_connect_url {
+            on_connect_url(&connect_url, launched);
         }
-        if hooks
-            .cancel
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
-        {
-            break Err("cancelled".to_string());
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err("pair: timed out after 5 minutes waiting for browser callback".to_string());
-        }
-        // Cheap polling cadence; the axum task wakes on its own.
-        std::thread::sleep(Duration::from_millis(200));
-        // Drain the server-done channel in case axum exited early.
-        if let Ok(()) = server_done_rx.try_recv() {
-            server_finished = true;
-            // Server stopped without filling the slot — re-check once.
+
+        // Poll the received slot up to 5 minutes. The axum runtime is on a
+        // background thread; we just block here until we see the slot fill, the
+        // caller cancels, or the server-done signal arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        loop {
             if let Some(c) = received.lock().expect("mutex").clone() {
                 break Ok(c);
             }
-            break Err("pair: callback server stopped before capturing token".to_string());
+            if hooks.cancel_requested() {
+                break Err("cancelled".to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(
+                    "pair: timed out after 5 minutes waiting for browser callback".to_string(),
+                );
+            }
+            // Cheap polling cadence; the axum task wakes on its own.
+            std::thread::sleep(Duration::from_millis(200));
+            // Drain the server-done channel in case axum exited early.
+            if let Ok(()) = server_done_rx.try_recv() {
+                server_finished = true;
+                // Server stopped without filling the slot — re-check once.
+                if let Some(c) = received.lock().expect("mutex").clone() {
+                    break Ok(c);
+                }
+                break Err("pair: callback server stopped before capturing token".to_string());
+            }
         }
     };
+    // Decide capture vs cancel NOW — before the shutdown and the bounded join
+    // below — so a cancel arriving during that join cannot claim a flow whose
+    // callback already landed (and vice versa).
+    let outcome = settle_capture(hooks, outcome);
     // Stop the loopback server on EVERY exit (capture, cancel, timeout) and
     // wait — BOUNDED — for it to release the port. A graceful shutdown with no
     // open connection returns at once; a browser holding a keep-alive
@@ -2290,9 +2331,6 @@ fn browser_pair_round_trip(
         drop(server_handle);
     }
     let capture = outcome?;
-    if let Some(on_callback) = hooks.on_callback {
-        on_callback();
-    }
 
     Ok(BrowserRoundTrip {
         device_id,
@@ -7127,6 +7165,34 @@ mod pair_multi_collect_tests {
         let with_home =
             pair_start_multi_request_body(DEVICE, "cb", "h", "w", &[t(T_A)], Some(t(T_A)), "chal");
         assert_eq!(with_home["home_tenant_id"], T_A);
+    }
+
+    /// The capture arbiter: a capture the caller refuses (a cancel won) ends
+    /// the flow cancelled; one it accepts, or no arbiter, proceeds.
+    #[test]
+    fn settle_capture_honours_the_arbiter() {
+        let cap = || Ok(CallbackCapture::Collect { token_id: None });
+        let refuse = || false;
+        let accept = || true;
+        let refused = BrowserPairHooks {
+            claim_capture: Some(&refuse),
+            ..Default::default()
+        };
+        let accepted = BrowserPairHooks {
+            claim_capture: Some(&accept),
+            ..Default::default()
+        };
+        assert_eq!(
+            settle_capture(&refused, cap()),
+            Err("cancelled".to_string())
+        );
+        assert!(settle_capture(&accepted, cap()).is_ok());
+        assert!(settle_capture(&BrowserPairHooks::default(), cap()).is_ok());
+        // A non-capture outcome is never sent to the arbiter.
+        assert_eq!(
+            settle_capture(&refused, Err("timed out".to_string())),
+            Err("timed out".to_string())
+        );
     }
 
     /// The in-app "Connect all my workspaces" never names a home tenant, so the

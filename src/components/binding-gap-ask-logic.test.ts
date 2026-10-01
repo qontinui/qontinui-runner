@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  createProgressSequence,
   isAlreadyInProgress,
   normalizePairAllStatus,
   bannerGapEntries,
@@ -291,5 +292,22 @@ describe("normalizePairAllStatus / isAlreadyInProgress", () => {
 
   it("maps the collecting phase of the progress event", () => {
     expect(normalizePairAllProgress({ phase: "collecting" })).toEqual({ phase: "collecting" });
+  });
+});
+
+describe("createProgressSequence", () => {
+  it("drops a status read overtaken by a progress event", () => {
+    const seq = createProgressSequence();
+    const before = seq.capture();
+    expect(seq.isCurrent(before)).toBe(true);
+    seq.bump(); // e.g. a `done` event lands while the status read is in flight
+    expect(seq.isCurrent(before)).toBe(false);
+    expect(seq.isCurrent(seq.capture())).toBe(true);
+  });
+
+  it("treats cancelling as in flight and not idle", () => {
+    expect(normalizePairAllStatus({ in_flight: true, phase: "cancelling" })?.phase).toBe(
+      "cancelling",
+    );
   });
 });

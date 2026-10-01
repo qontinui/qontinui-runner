@@ -1031,11 +1031,40 @@ static PAIR_ALL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub struct PairAllStatus {
     pub in_flight: bool,
     /// `idle` | `waiting` (before the browser opens) | `browser` (waiting for
-    /// the sign-in) | `collecting` (callback received; collecting + saving —
-    /// no longer cancellable).
+    /// the sign-in) | `cancelling` (a cancel won; the flow is ending) |
+    /// `collecting` (the callback won; collecting + saving — no longer
+    /// cancellable).
     pub phase: &'static str,
     pub connect_url: Option<String>,
     pub launched: bool,
+}
+
+impl PairAllStatus {
+    /// Cancel side of the arbiter: an in-flight flow still waiting on the
+    /// browser moves to `cancelling`. `false` once the capture won
+    /// (`collecting`), or when nothing is in flight.
+    pub(crate) fn try_cancel(&mut self) -> bool {
+        if self.in_flight && matches!(self.phase, "waiting" | "browser") {
+            self.phase = "cancelling";
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Capture side of the arbiter, called by the wait loop the moment the
+    /// browser callback lands: `waiting|browser` → `collecting` and `true`;
+    /// `false` when a cancel already won (`cancelling`), so the flow ends
+    /// cancelled even though the browser called back.
+    pub(crate) fn try_claim_capture(&mut self) -> bool {
+        if self.in_flight && matches!(self.phase, "waiting" | "browser") {
+            self.phase = "collecting";
+            self.connect_url = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 static PAIR_ALL_STATUS: std::sync::Mutex<PairAllStatus> = std::sync::Mutex::new(PairAllStatus {
@@ -1274,7 +1303,10 @@ async fn run_pair_all_tenants<R: Runtime>(
     let mut results = spawn_blocking_tracked(move || {
         let on_connect_url = |url: &str, launched: bool| {
             set_pair_all_status(|st| {
-                st.phase = "browser";
+                // Never overwrite a `cancelling` a cancel already won.
+                if st.phase == "waiting" {
+                    st.phase = "browser";
+                }
                 st.connect_url = Some(url.to_string());
                 st.launched = launched;
             });
@@ -1283,20 +1315,25 @@ async fn run_pair_all_tenants<R: Runtime>(
                 serde_json::json!({"phase": "browser", "connect_url": url, "launched": launched}),
             );
         };
-        let on_callback = || {
-            set_pair_all_status(|st| {
-                st.phase = "collecting";
-                st.connect_url = None;
-            });
-            emit_pair_all_progress(
-                &app_for_blocking,
-                serde_json::json!({"phase": "collecting"}),
-            );
+        // The capture side of the capture-vs-cancel arbiter (see
+        // `PairAllStatus::try_claim_capture`).
+        let claim_capture = || {
+            let won = PAIR_ALL_STATUS
+                .lock()
+                .map(|mut st| st.try_claim_capture())
+                .unwrap_or(false);
+            if won {
+                emit_pair_all_progress(
+                    &app_for_blocking,
+                    serde_json::json!({"phase": "collecting"}),
+                );
+            }
+            won
         };
         let hooks = BrowserPairHooks {
             on_connect_url: Some(&on_connect_url),
             cancel: Some(&PAIR_ALL_CANCEL),
-            on_callback: Some(&on_callback),
+            claim_capture: Some(&claim_capture),
         };
         let (ids, home) = connect_all_start_inputs(&for_blocking);
         let collected = pair_via_browser_multi(&coord_base, &ids, home, &hooks)?;
@@ -1378,14 +1415,16 @@ async fn run_pair_all_tenants<R: Runtime>(
 #[tauri::command]
 pub async fn cancel_pair_all_tenants() -> bool {
     use std::sync::atomic::Ordering;
-    let cancellable = PAIR_ALL_STATUS
+    // Decided under the status mutex, against `try_claim_capture` on the flow's
+    // side: exactly one of cancel and capture wins, and each knows it.
+    let won = PAIR_ALL_STATUS
         .lock()
-        .map(|st| st.in_flight && matches!(st.phase, "waiting" | "browser"))
+        .map(|mut st| st.try_cancel())
         .unwrap_or(false);
-    if cancellable {
+    if won {
         PAIR_ALL_CANCEL.store(true, Ordering::Release);
     }
-    cancellable
+    won
 }
 
 /// PULL half of [`PAIR_ALL_PROGRESS_EVENT`]: where the in-flight flow is, so a
@@ -1677,6 +1716,46 @@ mod ipc_wire_contract_tests {
         }
         assert!(health.ends_with("/api/v1/health/live"));
         assert!(me.ends_with("/api/v1/devices/me"));
+    }
+}
+
+/// The capture-vs-cancel arbiter: exactly one side wins, and the loser
+/// knows it.
+#[cfg(test)]
+mod pair_all_arbiter_tests {
+    use super::PairAllStatus;
+
+    fn browser() -> PairAllStatus {
+        PairAllStatus {
+            in_flight: true,
+            phase: "browser",
+            connect_url: Some("https://x/c".to_string()),
+            launched: true,
+        }
+    }
+
+    #[test]
+    fn a_cancel_after_the_capture_loses_and_the_flow_proceeds() {
+        let mut st = browser();
+        assert!(st.try_claim_capture(), "the capture wins");
+        assert!(!st.try_cancel(), "a cancel after the capture returns false");
+        assert_eq!(st.phase, "collecting", "the flow proceeds to done");
+    }
+
+    #[test]
+    fn a_capture_after_the_cancel_loses_and_the_flow_ends_cancelled() {
+        let mut st = browser();
+        assert!(st.try_cancel(), "the cancel wins");
+        assert!(!st.try_claim_capture(), "a capture after the cancel loses");
+        assert_eq!(st.phase, "cancelling");
+        assert!(!st.try_cancel(), "a second cancel is not a second win");
+    }
+
+    #[test]
+    fn nothing_in_flight_cannot_be_cancelled_or_claimed() {
+        let mut st = PairAllStatus::default();
+        assert!(!st.try_cancel());
+        assert!(!st.try_claim_capture());
     }
 }
 
