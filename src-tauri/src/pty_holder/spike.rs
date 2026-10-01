@@ -82,9 +82,23 @@
 //! No async runtime and no Tauri: `main()` dispatches here before either exists.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+// Phase 2 MOVED these into the holder library's runner-side spawner
+// (`qontinui_pty_holder::spawn`) and start-up module
+// (`qontinui_pty_holder::startup`); the spike calls them from there so the two
+// spawn paths cannot drift while both exist. Re-exported under their old
+// names for the spike's tests.
+#[cfg(unix)]
+use qontinui_pty_holder::startup::{close_inherited_fds, reset_sigchld};
+use qontinui_pty_holder::spawn::{read_all_within, read_line_within};
+pub use qontinui_pty_holder::spawn::{
+    cgroup_is_in_systemd_unit, find_systemd_run, scope_command, user_systemd_reachable,
+    HostFacts,
+};
+use qontinui_pty_holder::startup::{detach_from_spawner, silence_stdio, DetachError};
 
 /// argv[1] that selects the holder.
 pub const SPIKE_FLAG: &str = "--pty-holder-spike";
@@ -126,44 +140,6 @@ pub fn report_timeout() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_REPORT_TIMEOUT)
-}
-
-/// Read one line on a helper thread, giving up after `timeout`. `None` means
-/// the deadline passed (the helper thread stays parked on the pipe until its
-/// writer goes away, which the caller's teardown then causes).
-fn read_line_within<R: Read + Send + 'static>(
-    reader: R,
-    timeout: std::time::Duration,
-) -> Option<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("pty-holder-report".into())
-        .spawn(move || {
-            let mut line = String::new();
-            let _ = BufReader::new(reader).read_line(&mut line);
-            let _ = tx.send(line);
-        })
-        .ok()?;
-    rx.recv_timeout(timeout)
-        .ok()
-        .map(|l| l.trim_end().to_string())
-}
-
-/// Read to EOF on a helper thread, giving up after `timeout`.
-fn read_all_within<R: Read + Send + 'static>(
-    mut reader: R,
-    timeout: std::time::Duration,
-) -> Option<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("pty-holder-stderr".into())
-        .spawn(move || {
-            let mut all = String::new();
-            let _ = reader.read_to_string(&mut all);
-            let _ = tx.send(all);
-        })
-        .ok()?;
-    rx.recv_timeout(timeout).ok()
 }
 
 /// Dispatch from `main()`. `Some(exit_code)` when argv[1] is exactly one of
@@ -310,14 +286,7 @@ pub fn success_pids(line: &str) -> Option<(i32, i32)> {
 #[cfg(target_os = "linux")]
 pub fn verified_pty_child(line: &str) -> Option<i32> {
     let (holder, child) = success_pids(line)?;
-    let raw = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
-    // The comm field is parenthesised and may itself contain ')' or spaces, so
-    // the fields we want start after the LAST ')'.
-    let (_, rest) = raw.rsplit_once(')')?;
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    let ppid: i32 = f.get(1)?.parse().ok()?;
-    let session: i32 = f.get(3)?.parse().ok()?;
-    (ppid == holder && session == child).then_some(child)
+    qontinui_pty_holder::spawn::verify_pty_child(holder, child)
 }
 
 /// Non-Linux: identity cannot be confirmed, so never a pid (see the Linux doc).
@@ -375,71 +344,6 @@ fn emit_line(kind: &str, line: &str, report_file: Option<&Path>) -> Result<(), S
 fn fail(kind: &str, msg: &str, report_file: Option<&Path>, code: i32) -> i32 {
     let _ = emit_line(kind, &format!("{kind}_error={msg}"), report_file);
     code
-}
-
-/// Close every fd >= 3 this process inherited.
-#[cfg(unix)]
-fn close_inherited_fds() {
-    let dir = if Path::new("/proc/self/fd").is_dir() {
-        "/proc/self/fd"
-    } else {
-        "/dev/fd"
-    };
-    // Collect first: the directory handle is itself an fd, and is closed when
-    // `read_dir` is dropped — closing its (now stale) number below is a
-    // harmless EBADF, since nothing is opened in between.
-    let fds: Vec<i32> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .collect(),
-        Err(_) => return,
-    };
-    for fd in fds.into_iter().filter(|&fd| fd > 2) {
-        // SAFETY: closing an fd number this process owns; nothing in this
-        // process holds a Rust handle to any fd >= 3 at this point.
-        unsafe {
-            libc::close(fd);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn reset_sigchld() {
-    // SAFETY: setting a default disposition has no memory-safety preconditions.
-    unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-    }
-}
-
-/// Why the holder could not detach itself.
-#[derive(Debug)]
-#[cfg_attr(not(unix), allow(dead_code))]
-enum DetachError {
-    /// `setsid()` refused because the holder leads its own process group —
-    /// what a job-control shell (`bash` with monitor mode on) or
-    /// `Command::process_group(0)` produces. Recoverable: see
-    /// [`respawn_detached`].
-    GroupLeader,
-    Other(String),
-}
-
-#[cfg(unix)]
-fn detach_from_spawner() -> Result<(), DetachError> {
-    // SAFETY: setsid/getsid/getpid have no memory-safety preconditions.
-    unsafe {
-        if libc::setsid() != -1 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if libc::getsid(0) == libc::getpid() {
-            // Already a session leader (e.g. spawned via setsid(1)): detached.
-            return Ok(());
-        }
-        if err.raw_os_error() == Some(libc::EPERM) {
-            return Err(DetachError::GroupLeader);
-        }
-        Err(DetachError::Other(format!("setsid failed: {err}")))
-    }
 }
 
 /// A process-group leader cannot `setsid()`, and staying in that group would
@@ -506,34 +410,6 @@ fn respawn_detached(args: &[OsString], report_file: Option<&Path>) -> i32 {
         1
     }
 }
-
-#[cfg(not(unix))]
-fn detach_from_spawner() -> Result<(), DetachError> {
-    // Windows: a process cannot leave a job it is already in, so detachment
-    // is the spawner's creation flags (`holder_spawn`), not something the
-    // holder can do for itself.
-    Ok(())
-}
-
-/// Point fds 0/1/2 at `/dev/null` once the report line is out.
-#[cfg(unix)]
-fn silence_stdio() {
-    // SAFETY: open/dup2/close on valid fds; failure leaves the fds as they were.
-    unsafe {
-        let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-        if fd >= 0 {
-            for target in 0..=2 {
-                libc::dup2(fd, target);
-            }
-            if fd > 2 {
-                libc::close(fd);
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn silence_stdio() {}
 
 fn run_holder(args: &[OsString]) -> i32 {
     #[cfg(unix)]
@@ -639,87 +515,6 @@ impl ResolvedRoute {
     }
 }
 
-/// True when a `/proc/<pid>/cgroup` body places the process inside a systemd
-/// unit whose stop the runner itself can trigger — its own service (system or
-/// `app.slice` user service) or a launcher's scope (`tmux-spawn-*.scope`,
-/// `app-*.scope`). Such a unit's stop or crash-restart kills everything in
-/// its cgroup under the default `KillMode=control-group`, `setsid()` or not.
-///
-/// Only the DEEPEST unit component counts — that is the unit the process is
-/// actually in; the ones above it are ancestors. Excluded when deepest:
-/// - `user@<uid>.service` and its `init.scope`: the user manager itself. A
-///   scope route cannot escape it (the scope lives under it too — see the
-///   module docs), so claiming protection there would be false.
-/// - `session-<n>.scope`: a login session. The runner never stops it; what
-///   logout does to it is logind policy (`KillUserProcesses`), which a
-///   transient user scope does not change either.
-pub fn cgroup_is_in_systemd_unit(cgroup_file: &str) -> bool {
-    cgroup_file.lines().any(|line| {
-        let Some(path) = line.splitn(3, ':').nth(2) else {
-            return false;
-        };
-        let Some(unit) = path
-            .split('/')
-            .rfind(|c| c.ends_with(".service") || c.ends_with(".scope"))
-        else {
-            return false;
-        };
-        let user_manager = unit.starts_with("user@") && unit.ends_with(".service");
-        let session = unit.starts_with("session-") && unit.ends_with(".scope");
-        let manager_init = unit == "init.scope";
-        !(user_manager || session || manager_init)
-    })
-}
-
-/// `systemd-run` on `$PATH`, if any.
-pub fn find_systemd_run() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join("systemd-run"))
-        .find(|p| p.is_file())
-}
-
-/// Whether a user systemd instance is reachable: its private socket (or the
-/// user bus) exists under `$XDG_RUNTIME_DIR`.
-pub fn user_systemd_reachable() -> bool {
-    let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") else {
-        return false;
-    };
-    let rt = PathBuf::from(rt);
-    rt.join("systemd/private").exists() || rt.join("bus").exists()
-}
-
-/// The observables a route decision is made from — gathered once by
-/// [`HostFacts::probe`], passed explicitly so [`decide_route`] is testable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostFacts {
-    pub windows: bool,
-    pub linux: bool,
-    /// [`cgroup_is_in_systemd_unit`] on `/proc/self/cgroup`.
-    pub in_unit_cgroup: bool,
-    /// `systemd-run` on `$PATH` AND [`user_systemd_reachable`].
-    pub scope_tooling: bool,
-}
-
-impl HostFacts {
-    pub fn probe() -> Self {
-        let linux = cfg!(target_os = "linux");
-        let forced = std::env::var(FORCE_FACTS_ENV).unwrap_or_default();
-        let force = |name: &str| linux && forced.split(',').any(|f| f.trim() == name);
-        HostFacts {
-            windows: cfg!(windows),
-            linux,
-            in_unit_cgroup: force("in_unit_cgroup")
-                || (linux
-                    && std::fs::read_to_string("/proc/self/cgroup")
-                        .map(|c| cgroup_is_in_systemd_unit(&c))
-                        .unwrap_or(false)),
-            scope_tooling: force("scope_tooling")
-                || (linux && find_systemd_run().is_some() && user_systemd_reachable()),
-        }
-    }
-}
-
 /// A resolved route plus what the spawner must be told about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteDecision {
@@ -762,9 +557,21 @@ pub fn decide_route(route: &str, facts: &HostFacts) -> Result<RouteDecision, Str
     }
 }
 
+/// [`HostFacts::probe`], widened by the spike-only [`FORCE_FACTS_ENV`] test
+/// hook (never carried into the real spawner).
+pub fn probe_facts() -> HostFacts {
+    let mut facts = HostFacts::probe();
+    let forced = std::env::var(FORCE_FACTS_ENV).unwrap_or_default();
+    let force = |name: &str| facts.linux && forced.split(',').any(|f| f.trim() == name);
+    let (in_unit, tooling) = (force("in_unit_cgroup"), force("scope_tooling"));
+    facts.in_unit_cgroup |= in_unit;
+    facts.scope_tooling |= tooling;
+    facts
+}
+
 /// [`decide_route`] against this box, now.
 pub fn resolve_route(route: &str) -> Result<RouteDecision, String> {
-    decide_route(route, &HostFacts::probe())
+    decide_route(route, &probe_facts())
 }
 
 /// Whether `auto` would try the `scope` route on this box, right now.
@@ -780,21 +587,6 @@ fn holder_args(command: &[OsString]) -> Vec<OsString> {
         args.extend(command.iter().cloned());
     }
     args
-}
-
-/// `systemd-run --user --scope --quiet --collect --unit=<unit> -- <exe> <args>`.
-/// In scope mode `systemd-run` registers ITSELF in the new scope and then
-/// execs the command, so the holder (and the PTY child it forks) live in a
-/// cgroup of their own, outside the spawner's unit.
-pub fn scope_command(systemd_run: &Path, unit: &str, exe: &Path, args: &[OsString]) -> Command {
-    // console-ok: systemd-run exists only on Linux; the scope route is refused on Windows.
-    let mut cmd = Command::new(systemd_run);
-    cmd.args(["--user", "--scope", "--quiet", "--collect"])
-        .arg(format!("--unit={unit}"))
-        .arg("--")
-        .arg(exe)
-        .args(args);
-    cmd
 }
 
 /// A spawned holder plus, for the `scope` route, the unit it lives in.
@@ -924,23 +716,7 @@ impl SpawnedHolder {
         #[cfg(not(unix))]
         let _ = line;
         if let Some(unit) = &self.unit {
-            // console-ok: only reached with a scope unit, i.e. on Linux.
-            let spawned = Command::new("systemctl")
-                .args(["--user", "stop", "--no-block", "--quiet", unit])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Ok(mut systemctl) = spawned {
-                let deadline = std::time::Instant::now() + SYSTEMCTL_DEADLINE;
-                while matches!(systemctl.try_wait(), Ok(None))
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                let _ = systemctl.kill();
-                let _ = systemctl.wait();
-            }
+            qontinui_pty_holder::spawn::stop_scope_unit(unit, SYSTEMCTL_DEADLINE);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();

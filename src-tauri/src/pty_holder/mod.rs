@@ -2,16 +2,19 @@
 //! so a terminal-hosted session survives the runner exiting.
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`.
-//! D3: one binary, two modes — the holder is the runner binary re-exec'd with
-//! a pre-GUI argv flag, dispatched from `main()` before any Tauri or
-//! single-instance init. D13: one holder per pane, not one daemon.
+//! D13: one holder per pane, not one daemon. D3 as decided 2026-09-28: the
+//! holder is a DEDICATED binary (`crates/pty-holder`, bin
+//! `qontinui-pty-holder`), not this runner re-exec'd.
 //!
-//! **Phase 0 (this module today) is the go/no-go spike only** — [`spike`]
-//! opens a PTY, spawns a child, reports the pids and serves nothing. It exists
-//! to answer one question with a test: does a held PTY's child outlive the
-//! process that spawned the holder, with the same pid? Phase 1 grows it into
-//! the real `--pty-holder` (lock file, local IPC, answered handshake).
+//! - [`spawn`] (Phase 2) — the runner's door to spawning a pane's holder:
+//!   locating the bundled holder binary and the per-instance pane directory,
+//!   over the holder library's spawner.
+//! - [`spike`] (Phase 0) — the go/no-go survival spike: `--pty-holder-spike`
+//!   opens a PTY in the runner binary itself. Kept only until the second half
+//!   of Phase 2 deletes it; its shared helpers now live in the holder library
+//!   and it calls them from there.
 
+pub mod spawn;
 pub mod spike;
 
 pub use spike::try_run_spike;

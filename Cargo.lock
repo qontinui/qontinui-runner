@@ -6785,6 +6785,7 @@ dependencies = [
  "proc-macro2",
  "qontinui-code-graph",
  "qontinui-db",
+ "qontinui-pty-holder",
  "qontinui-runner-stats",
  "qontinui-runner-win32",
  "qontinui-spec-check",

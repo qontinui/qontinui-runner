@@ -147,6 +147,11 @@ qontinui-spec-check = { path = "../crates/spec-check" }
 # crates/runner-win32/src/lib.rs for why the Win32 pieces went second.
 qontinui-runner-stats = { path = "../crates/runner-stats" }
 qontinui-runner-win32 = { path = "../crates/runner-win32" }
+# The per-pane PTY holder's library half (plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2):
+# the frame protocol, the client, and the spawner the runner starts holders
+# with. The holder BINARY ships beside the runner as a Tauri externalBin.
+qontinui-pty-holder = { path = "../crates/pty-holder" }
 qontinui-types = { path = "../../qontinui-schemas/rust" }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core" }
