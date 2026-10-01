@@ -556,6 +556,46 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/fleet/machine_capability.rs",
+      "symbol": "booted_at",
+      "excerpt": "cfg(windows)-only fn `booted_at` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/machine_capability.rs",
+      "symbol": "config_written_at",
+      "excerpt": "cfg(windows)-only fn `config_written_at` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/machine_capability.rs",
+      "symbol": "live",
+      "excerpt": "cfg(windows)-only fn `live` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/machine_capability.rs",
+      "symbol": "memory_management",
+      "excerpt": "cfg(windows)-only fn `memory_management` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/fleet/machine_capability.rs",
+      "symbol": "reading",
+      "excerpt": "cfg(windows)-only fn `reading` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/fleet/resource_sample.rs",
       "symbol": "attach_wsl_disk",
       "excerpt": "cfg(windows)-only fn `attach_wsl_disk` has no cfg(not(windows)) sibling in this file",
