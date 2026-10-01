@@ -1,0 +1,250 @@
+name: Resolve, verify and install the published runner
+description: >-
+  The PUBLISHED leg's artifact for every published-build parity job: resolve
+  the release to measure, download its Windows installer and checksums, VERIFY
+  the installer against them (an unverified installer is never executed), run
+  the NSIS silent install bounded, and stop any instance the installer
+  auto-launched. Shared by `published-parity` and `clean-room` in
+  .github/workflows/published-parity.yml so both measure the same artifact by
+  the same rules -- one harness, not two.
+
+# Moved here verbatim from published-parity.yml (plan
+# 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# Phase E), with three mechanical changes a composite action forces:
+#   * `secrets.GITHUB_TOKEN` -> `github.token` (composite actions cannot read
+#     the secrets context; `github.token` is the same token).
+#   * the install step's `timeout-minutes: 15` and the stop step's
+#     `continue-on-error: true` are gone: composite steps accept neither. The
+#     CALLER bounds the whole action with a step-level `timeout-minutes`, and
+#     the stop step already ends in `exit 0`. The installer's own inner bound
+#     (WaitForExit 600s + kill) is unchanged.
+#   * the resolved tag is an action OUTPUT, so callers keep reading
+#     `steps.<id>.outputs.tag`.
+# Sets SETUP_EXE in the job env (the verified installer path), as before.
+
+outputs:
+  tag:
+    description: The release tag that was resolved, downloaded, verified and installed.
+    value: ${{ steps.release.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    # -----------------------------------------------------------------------
+    # The PUBLISHED leg's artifact: download, VERIFY, then install.
+    # -----------------------------------------------------------------------
+    - name: Resolve the release to compare against
+      id: release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        # Bound through env rather than spliced in with ${{ }}: a tag name may
+        # contain backticks, $(), ; and | (git check-ref-format permits them),
+        # which inside double quotes would be command substitution. Same
+        # reasoning as release.yml's RELEASE_VERSION binding.
+        INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        EVENT_TAG: ${{ github.event.release.tag_name }}
+      run: |
+        tag="$EVENT_TAG"
+        if [ -z "$tag" ]; then tag="$INPUT_TAG"; fi
+        if [ -z "$tag" ]; then
+          tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName) || tag=""
+        fi
+        if [ -z "$tag" ]; then
+          echo "::error::Could not resolve a release tag to compare against. This is NOT a parity result — the comparison did not run."
+          exit 1
+        fi
+        echo "Comparing against release: $tag"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Download the published installer and its checksums
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ steps.release.outputs.tag }}
+      run: |
+        mkdir -p published-artifact
+        gh release download "$TAG" --repo "${{ github.repository }}" \
+          --dir published-artifact \
+          --pattern 'Qontinui.Runner_*_x64-setup.exe' \
+          --pattern 'checksums-windows-x64.txt'
+        ls -l published-artifact
+      shell: bash
+
+    # An unverified installer is never executed. This step is the one place in
+    # this workflow that is allowed to fail the job outright: refusing to run
+    # an unverified binary is not a parity verdict, it is a refusal to measure.
+    #
+    # FORMAT NOTE — the checksums file is NOT `sha256sum` output. release.yml
+    # generates the Windows one with `certutil -hashfile nsis/*.exe SHA256`,
+    # which writes three lines:
+    #
+    #     SHA256 hash of nsis\Qontinui.Runner_1.0.10_x64-setup.exe:
+    #     <64 hex chars>            (older Windows builds space-separate them)
+    #     CertUtil: -hashfile command completed successfully.
+    #
+    # so `sha256sum -c` cannot read it. We strip CR and spaces and take the
+    # first line that is exactly 64 hex characters. If no such line exists the
+    # file is unparseable and we REFUSE — an unverifiable checksum is not a
+    # pass.
+    - name: Verify the installer against the release checksums
+      run: |
+        set -euo pipefail
+        setup=$(ls published-artifact/Qontinui.Runner_*_x64-setup.exe 2>/dev/null | head -1)
+        if [ -z "$setup" ]; then
+          echo "::error::No Qontinui.Runner_*_x64-setup.exe on release ${{ steps.release.outputs.tag }}. Nothing to compare against."
+          exit 1
+        fi
+        sums="published-artifact/checksums-windows-x64.txt"
+        if [ ! -f "$sums" ]; then
+          echo "::error::Release ${{ steps.release.outputs.tag }} carries no checksums-windows-x64.txt. Refusing to run an unverified installer."
+          exit 1
+        fi
+
+        expected=$(tr -d ' \r' < "$sums" | grep -oiE '^[0-9a-f]{64}$' | head -1 || true)
+        if [ -z "$expected" ]; then
+          echo "::error::Could not parse a SHA-256 digest out of checksums-windows-x64.txt. An unverifiable checksum is not a pass; refusing to install."
+          echo "--- file contents ---"; cat "$sums"
+          exit 1
+        fi
+        actual=$(sha256sum "$setup" | cut -d' ' -f1)
+        expected=$(echo "$expected" | tr 'A-F' 'a-f')
+        actual=$(echo "$actual" | tr 'A-F' 'a-f')
+        echo "expected: $expected"
+        echo "actual  : $actual"
+        if [ "$expected" != "$actual" ]; then
+          echo "::error::Checksum MISMATCH for $setup. Refusing to install or run it."
+          exit 1
+        fi
+        echo "Checksum verified."
+        echo "SETUP_EXE=$setup" >> "$GITHUB_ENV"
+      shell: bash
+
+    # NSIS silent install. Tauri declares no bundle.windows section at all
+    # (no nsis block, no installMode pin — verified 2026-09-02), so the
+    # installer runs on Tauri's defaults and the install directory is NOT
+    # decided in this repo. Nothing here hardcodes it: the locator in
+    # scripts/lib/installed-runner.ps1 probes %LOCALAPPDATA%, %ProgramFiles%
+    # and %ProgramFiles(x86)% in order and THROWS naming every path it tried.
+    #
+    # BOUNDED. Run 35318462832 (2026-09-18, the first nightly on the #1564
+    # workflow) got through the build and the checksum in 30 minutes, then
+    # sat on `"./$SETUP_EXE" /S || true` under git bash for TWO HOURS until
+    # the job's 150-minute budget cancelled it — steps 17-21 skipped, the
+    # count UNKNOWN. What the cancel sweep found alive was the INSTALLER
+    # itself (`Qontinui.Runner_1.0.11_x64-setup`, one pid), no launched app,
+    # and "Installed after" never printed: the installer never finished, and
+    # a bash foreground wait has no bound. `Start-Process` + `WaitForExit(ms)`
+    # bounds the wait, the timed-out installer is killed (a hung NSIS holds
+    # its install-dir handles and its single-instance mutex through both
+    # parity legs otherwise, and if it inherited this step's stdout it would
+    # hold the step open past pwsh's own exit), `timeout-minutes` bounds the
+    # step, and the still-alive process listing with its window title is the
+    # diagnostic for WHY it hung. The step itself never fails: a missing exe
+    # is the locator's to refuse, downstream, naming every path it probed.
+    # (`Start-Process` also gives the installer its own handles, so a process
+    # it launches cannot hold this step open either — covered, not the
+    # measured cause.)
+    - name: Install the published build silently
+      run: |
+        $p = $null
+        try {
+          $setup = (Resolve-Path -LiteralPath $env:SETUP_EXE).Path
+          Write-Host "Installing $setup"
+          $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru
+        } catch {
+          Write-Host "::warning::Could not launch installer '$($env:SETUP_EXE)': $($_.Exception.Message) -- continuing to the exe probe; the locator downstream fails typed."
+        }
+        if ($p -and $p.WaitForExit(600000)) {
+          if ($p.ExitCode -ne 0) {
+            Write-Host "::warning::Installer exited with code $($p.ExitCode) (NSIS: 1 = aborted, 2 = script aborted)."
+          } else {
+            Write-Host "Installer exited with code 0."
+          }
+        } elseif ($p) {
+          $p.Refresh()
+          Write-Host "::warning::Installer (pid $($p.Id)) still running after 600s; main window: '$($p.MainWindowTitle)'. Killing it and continuing to the exe probe."
+          Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -match 'Qontinui|setup' } |
+            ForEach-Object { Write-Host ("alive: pid {0} {1} window='{2}'" -f $_.Id, $_.ProcessName, $_.MainWindowTitle) }
+          # The name filter above cannot see what the installer is WAITING ON
+          # when that is a child it spawned under another name — the NSIS
+          # uninstaller of a prior version runs as `Au_.exe`, a prerequisite
+          # bootstrapper under its own. Walk the installer's own descendants by
+          # ParentProcessId (so nothing outside its tree is listed or touched),
+          # print each with its command line, then stop them leaf-first by exact
+          # pid: an orphaned child would otherwise keep holding the install dir
+          # through both parity legs after its parent is gone.
+          $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+          $tree = [System.Collections.Generic.List[object]]::new()
+          $frontier = @($p.Id)
+          while ($frontier.Count -gt 0) {
+            $children = @($all | Where-Object { $frontier -contains $_.ParentProcessId -and $_.ProcessId -ne $p.Id })
+            $children | ForEach-Object { $tree.Add($_) }
+            $frontier = @($children | ForEach-Object { $_.ProcessId })
+          }
+          if ($tree.Count -eq 0) { Write-Host "installer has no live descendants." }
+          foreach ($c in $tree) {
+            $window = (Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue).MainWindowTitle
+            Write-Host ("descendant: pid {0} parent {1} {2} window='{3}' cmd={4}" -f $c.ProcessId, $c.ParentProcessId, $c.Name, $window, $c.CommandLine)
+          }
+          for ($j = $tree.Count - 1; $j -ge 0; $j--) {
+            Stop-Process -Id $tree[$j].ProcessId -Force -ErrorAction SilentlyContinue
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        }
+
+        # NSIS /S can return before the files are fully written, so poll for
+        # the exe rather than sleeping a fixed amount. A base that is unset
+        # (a service-account runner with no profile) contributes no candidate
+        # rather than a Join-Path binding error. The three bases are the
+        # locator's own (scripts/lib/installed-runner.ps1), in its order, so
+        # this poll never gives up on an install the locator would then find.
+        $bases = @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})
+        $candidates = foreach ($base in $bases) {
+          if ($base) { Join-Path $base 'Qontinui Runner\qontinui-runner.exe' }
+        }
+        $installed = $false
+        for ($i = 1; $i -le 60; $i++) {
+          foreach ($c in $candidates) {
+            if (Test-Path -LiteralPath $c) { Write-Host "Installed after ${i}s: $c"; $installed = $true; break }
+          }
+          if ($installed) { break }
+          Start-Sleep -Seconds 1
+        }
+
+        # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
+        # what actually finds the exe, and it throws naming every path probed
+        # rather than falling back to anything.
+        # The install dir's top-level entries, not a name filter: on run
+        # 35429143803 a filter for 'Qontinui Runner*' printed the directory
+        # and nothing else, which is how the exe's real name (the cargo
+        # binary name, qontinui-runner.exe -- Tauri 2 does not rename it to
+        # productName) stayed unmeasured for one more run.
+        foreach ($base in $bases) {
+          $dir = if ($base) { Join-Path $base 'Qontinui Runner' } else { $null }
+          if ($dir -and (Test-Path -LiteralPath $dir)) {
+            Write-Host "Install dir ${dir}:"
+            Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  {0}{1}" -f $_.Name, $(if ($_.PSIsContainer) { '\' } else { '' })) }
+          }
+        }
+      shell: pwsh
+
+    # The Tauri NSIS installer can launch the app when it finishes. A running
+    # instance would take the port and could make the single-instance path
+    # short-circuit the instances the parity harness boots. Stop any leftover.
+    #
+    # SAFE HERE AND NOWHERE ELSE: this is an ephemeral GitHub-hosted image
+    # with no fleet sessions on it, and the filter is the exact product image
+    # name — never `node.exe`, never `powershell.exe`, never a process-tree
+    # flag. Do not copy this step onto a developer or operator machine; the
+    # fleet's runner-lifecycle rule forbids exactly that.
+    # The image name is the cargo binary name on both builds (Tauri 2 does
+    # not rename it to productName), so the installed one is told apart by
+    # its path: never anything under a cargo target/ directory.
+    - name: Stop any auto-launched published runner
+      run: |
+        Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
+          Where-Object { $_.Path -and $_.Path -notlike '*\target\*' } |
+          ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+        exit 0
+      shell: pwsh
