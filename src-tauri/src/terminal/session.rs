@@ -1285,6 +1285,20 @@ struct IdentitySeamOutcome {
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
 }
 
+/// What the waiter thread knows when a pane's process exits, handed to the
+/// on-exit hook ([`TerminalSession::set_on_exit`]).
+///
+/// `code` is the pane seam's exit code — note that `pane_io` collapses it to
+/// `0` (success) or `1` (anything else), so it distinguishes a clean exit from
+/// a failed one and nothing finer. `close_requested` says whether a killing
+/// teardown began before the exit (an operator close, a shutdown), i.e. whether
+/// the end was REQUESTED rather than the process's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneExitFacts {
+    pub code: Option<i32>,
+    pub close_requested: bool,
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1316,6 +1330,21 @@ pub struct TerminalSession {
     is_alive: Arc<AtomicBool>,
     /// Exit code (set when process exits).
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Set the moment a teardown that KILLS the child begins ([`Self::close_inner`]
+    /// with `kill_child`, and [`Self::close_kill_only`]) — BEFORE the kill, so the
+    /// waiter thread that observes the resulting exit reads it as requested.
+    /// Lets a continuation's exit path tell "the session's process ended on its
+    /// own" from "somebody closed it" (plan
+    /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D2): only
+    /// the first can be a crash worth re-delivering.
+    close_requested: Arc<AtomicBool>,
+    /// The exit facts FROZEN by the waiter the instant `wait()` returned, with
+    /// that instant. A later close (an operator closing a dead tab) must not
+    /// rewrite how the process ended, so readers that come after the exit —
+    /// the continuation reaper above all — read this snapshot, not the live
+    /// flag (plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`,
+    /// review round 1 #2).
+    exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>>,
     /// Handle to the reader thread (for join on cleanup).
     reader_join: Mutex<Option<thread::JoinHandle<()>>>,
     /// Handle to the waiter thread (for join on cleanup).
@@ -1404,7 +1433,7 @@ pub struct TerminalSession {
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
     /// `SessionRegistry::close` is itself idempotent.
-    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>>,
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>>,
     /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When the session declared edit intent on a registered repo and
     /// `worktree_mode_enabled()` was true at spawn time, this carries
@@ -1755,6 +1784,9 @@ impl TerminalSession {
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let close_requested: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let exit_snapshot: Arc<Mutex<Option<(PaneExitFacts, std::time::Instant)>>> =
+            Arc::new(Mutex::new(None));
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_acked = Arc::new(AtomicU64::new(0));
         let emission_skipped = Arc::new(AtomicBool::new(false));
@@ -2154,7 +2186,7 @@ impl TerminalSession {
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn. (`coord_session_id` itself is
         // declared above the reader thread, which also needs a clone of it.)
-        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>> =
+        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
         // Spawn waiter thread: detects process exit
@@ -2162,6 +2194,8 @@ impl TerminalSession {
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
+        let waiter_close_requested = close_requested.clone();
+        let waiter_exit_snapshot = exit_snapshot.clone();
         // Retain a clone for the session struct (input-line warn hook)
         // before the original handle is moved into the waiter thread.
         let session_app_handle = app_handle.clone();
@@ -2187,7 +2221,18 @@ impl TerminalSession {
                 if let Ok(mut ec) = waiter_exit.lock() {
                     *ec = code;
                 }
-                waiter_alive.store(false, Ordering::Relaxed);
+                // Freeze how the process ended BEFORE anything else can mark a
+                // close, and before `is_alive` flips (Release, paired with the
+                // Acquire in `is_alive()`): a reader that sees the pane dead
+                // also sees this snapshot.
+                let exit_facts = PaneExitFacts {
+                    code,
+                    close_requested: waiter_close_requested.load(Ordering::SeqCst),
+                };
+                if let Ok(mut snap) = waiter_exit_snapshot.lock() {
+                    *snap = Some((exit_facts, std::time::Instant::now()));
+                }
+                waiter_alive.store(false, Ordering::Release);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2229,7 +2274,7 @@ impl TerminalSession {
                                 coord_session = %coord_id,
                                 "terminal exit — closing coord session mirror"
                             );
-                            cb(coord_id);
+                            cb(coord_id, exit_facts);
                         }
                     }
                 }
@@ -2285,6 +2330,8 @@ impl TerminalSession {
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
+            close_requested,
+            exit_snapshot,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
@@ -4032,7 +4079,7 @@ impl TerminalSession {
     /// The callback receives the coord session id and must be idempotent
     /// (it shares the close path with the frontend `terminal_close`
     /// command — `SessionRegistry::close_by_id` is already idempotent).
-    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid) + Send + Sync>) {
+    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid, PaneExitFacts) + Send + Sync>) {
         if let Ok(mut slot) = self.on_exit.lock() {
             *slot = Some(hook);
         }
@@ -4320,7 +4367,26 @@ impl TerminalSession {
 
     /// Check if the shell process is still alive.
     pub fn is_alive(&self) -> bool {
-        self.is_alive.load(Ordering::Relaxed)
+        self.is_alive.load(Ordering::Acquire)
+    }
+
+    /// Record that a teardown which KILLS the child has begun. Idempotent.
+    /// Called before the kill so the waiter thread observes it.
+    pub fn mark_close_requested(&self) {
+        self.close_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a killing teardown was requested before (or while) the child
+    /// exited. See the `close_requested` field.
+    pub fn close_requested(&self) -> bool {
+        self.close_requested.load(Ordering::SeqCst)
+    }
+
+    /// The exit facts a continuation's exit path classifies, with the instant
+    /// the process ended: the waiter's FROZEN snapshot once the process has
+    /// exited (the same facts it hands the on-exit hook), `None` while it runs.
+    pub fn exit_snapshot(&self) -> Option<(PaneExitFacts, std::time::Instant)> {
+        self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
     /// The shell process's exit code, once the waiter thread has recorded one.
@@ -4362,6 +4428,9 @@ impl TerminalSession {
     /// ([`Self::close_after_graceful_exit`]); every other teardown step runs.
     fn close_inner(&self, deadline: Option<std::time::Instant>, kill_child: bool) {
         info!(terminal_id = %self.id, "Closing terminal session");
+        if kill_child {
+            self.mark_close_requested();
+        }
         self.is_alive.store(false, Ordering::Relaxed);
 
         // Phase 2 — drop the isolated edit context first so the
@@ -4533,6 +4602,10 @@ impl TerminalSession {
             terminal_id = %self.id,
             "Shutdown deadline exhausted — kill-only terminal teardown"
         );
+        // A shutdown kill is a requested end, not a crash: without this the
+        // waiter would see a bare non-zero exit and the continuation would read
+        // `exit=crashed` and be re-delivered beside its durable restore.
+        self.mark_close_requested();
         self.is_alive.store(false, Ordering::Relaxed);
 
         if let Err(e) = self.io.kill(KILL_FLOOR) {
@@ -5017,6 +5090,8 @@ mod tests {
             // join nonexistent reader/waiter threads.
             is_alive: Arc::new(AtomicBool::new(false)),
             exit_code: Arc::new(Mutex::new(None)),
+            close_requested: Arc::new(AtomicBool::new(false)),
+            exit_snapshot: Arc::new(Mutex::new(None)),
             reader_join: Mutex::new(None),
             waiter_join: Mutex::new(None),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -5219,6 +5294,49 @@ mod tests {
                 tracked_alive: alive.to_vec(),
             },
         )
+    }
+
+    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D2 and
+    /// vet #3: every teardown that KILLS the child marks the end as requested —
+    /// including the shutdown kill-only path, which bypasses `close_inner` — so
+    /// a killed continuation never reads as a crash. A graceful close of a pane
+    /// whose process already exited kills nothing and marks nothing.
+    #[test]
+    fn killing_teardowns_mark_the_end_as_requested() {
+        let s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert!(!s.close_requested());
+        assert_eq!(s.exit_snapshot(), None, "no waiter, no exit recorded");
+        s.close_after_graceful_exit(); // is_alive is false → no kill
+        assert!(!s.close_requested(), "a graceful close of an exited pane is not a kill");
+        s.close_kill_only();
+        assert!(s.close_requested(), "the shutdown kill-only path marks it");
+
+        let t = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        t.close();
+        assert!(t.close_requested(), "close() kills, so it marks");
+
+        // A graceful exit that has to KILL a still-live pane is a requested end.
+        let u = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        u.is_alive.store(true, Ordering::SeqCst);
+        u.close_after_graceful_exit();
+        assert!(u.close_requested(), "a graceful close that kills marks it");
+        u.is_alive.store(false, Ordering::SeqCst);
+
+        // The snapshot is frozen: a close AFTER the exit does not rewrite it.
+        let v = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let crashed = PaneExitFacts {
+            code: Some(1),
+            close_requested: false,
+        };
+        *v.exit_snapshot.lock().unwrap() = Some((crashed, std::time::Instant::now()));
+        v.close();
+        assert!(v.close_requested());
+        assert_eq!(
+            v.exit_snapshot().map(|(f, _)| f),
+            Some(crashed),
+            "close() never rewrites the waiter's frozen snapshot, so closing a dead tab \
+             later cannot turn its crash into a close"
+        );
     }
 
     #[tokio::test(start_paused = true)]

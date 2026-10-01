@@ -300,6 +300,86 @@ pub struct GateContinuationPayload {
     /// not a reason to drop the whole continuation.
     #[serde(default, deserialize_with = "deserialize_lenient_brief")]
     pub brief: Option<ContinuationBrief>,
+    /// Coord's RE-DELIVERY annotation (plan
+    /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D4): present
+    /// only when coord re-drove a continuation whose earlier attempt never
+    /// started or crashed without reporting. The human half of the same
+    /// annotation is a `[coord retry]` banner leading `brief.text`, which every
+    /// brief-capable runner already renders; this typed half is what the
+    /// in-process dedupe keys on ([`claim_gate_dispatch_attempt`]), so a
+    /// re-delivered attempt is not dropped as a duplicate of the attempt this
+    /// process already ran.
+    ///
+    /// Lenient like `brief`: an unreadable value is `None` and never fails the
+    /// frame.
+    #[serde(default, deserialize_with = "deserialize_lenient_retry")]
+    pub retry: Option<ContinuationRetry>,
+}
+
+/// The typed half of coord's re-delivery annotation. See
+/// [`GateContinuationPayload::retry`].
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ContinuationRetry {
+    /// 1-based re-delivery number (the first delivery carries no `retry`).
+    /// Read leniently (a number or a numeric string); an unreadable value drops
+    /// the whole annotation with a `warn!`, never silently.
+    #[serde(default, deserialize_with = "deserialize_lenient_u32")]
+    pub attempt: u32,
+    /// Coord's class token (`never_started`, `work_crashed`, …) — logged.
+    #[serde(default)]
+    pub class: String,
+    /// The budget coord bounds this family by.
+    #[serde(default)]
+    pub max_attempts: u32,
+    /// The consume outcome the previous attempt ended with.
+    #[serde(default)]
+    pub prior_outcome: String,
+    /// `spawn` (never ran) or `work` (ran and crashed).
+    #[serde(default)]
+    pub family: String,
+}
+
+fn deserialize_lenient_u32<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(d)?;
+    let n = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(t) => t.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    n.and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| D::Error::custom(format!("unreadable attempt {value}")))
+}
+
+fn deserialize_lenient_retry<'de, D>(d: D) -> Result<Option<ContinuationRetry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationRetry>(value) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) => {
+            tracing::warn!(
+                "gate continuation: `retry` key is unreadable ({e}) — treating the frame as a \
+                 first delivery; on a device that already ran this gate the re-delivery will \
+                 be dropped as a duplicate"
+            );
+            Ok(None)
+        }
+    }
+}
+
+impl GateContinuationPayload {
+    /// The re-delivery attempt this frame is (0 = a first delivery).
+    fn retry_attempt(&self) -> u32 {
+        self.retry.as_ref().map_or(0, |r| r.attempt)
+    }
 }
 
 /// Coord's assembled continuation brief, as published on the spawn frame.
@@ -2102,7 +2182,7 @@ fn continuation_drain_admission_for(
     consume_target: ConsumeTarget,
 ) -> crate::agent_authorization::DrainAdmission {
     match consume_target {
-        ConsumeTarget::Gate(g) => continuation_drain_admission(Some(g), None),
+        ConsumeTarget::Gate(g, _) => continuation_drain_admission(Some(g), None),
         ConsumeTarget::Dispatch(d) => continuation_drain_admission(None, Some(d)),
         ConsumeTarget::None => continuation_drain_admission(None, None),
     }
@@ -2214,11 +2294,33 @@ fn lock_recover<'a, T>(
 /// Continuations WITHOUT a `gate_id` (legacy coord) can't be deduped by id and
 /// always dispatch — accepted, because legacy coord also never re-lists them via
 /// the (new) poll surface, so the only delivery path is the single WS frame.
-fn dispatched_gate_ids() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
+///
+/// **Keyed on the gate id, valued by the highest re-delivery attempt claimed.**
+/// Coord re-drives a continuation whose earlier attempt never started or
+/// crashed (plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`)
+/// by resetting the SAME gate row, and a gate whose session ran stays claimed
+/// here for the life of the process — so a set of bare ids would drop every
+/// re-delivery to this device forever. A strictly LARGER attempt therefore
+/// claims afresh, while a duplicate of the same attempt (WS + poll) or a stale
+/// older one is still dropped. This is the ONLY guard against a same-device
+/// duplicate: coord's consume route answers `consumed` to a re-claim of an
+/// already-consumed row rather than refusing it.
+///
+/// Each entry is `(attempt, state)`, and a release only TOMBSTONES the entry
+/// for the attempt that holds it — it never removes it. An attempt whose claim
+/// coord ACCEPTED is [`GateClaimState::Sealed`]: coord has consumed that row, so
+/// nothing may re-open the attempt locally (a later error release is a no-op),
+/// and the only way back in is a newer re-delivery attempt (review round 2 #1). Removing would let an
+/// older attempt's release wipe a newer attempt's claim (a re-delivery that
+/// arrived while the older task was still posting its outcome), after which
+/// the newer attempt's second copy — or a stale older frame — would claim and
+/// spawn again on the same device (review round 1 #1).
+fn dispatched_gate_ids(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>> {
     static DISPATCHED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>>,
     > = std::sync::OnceLock::new();
-    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
@@ -2226,7 +2328,50 @@ fn dispatched_gate_ids() -> &'static std::sync::Mutex<std::collections::HashSet<
 /// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
 fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").insert(gate_id)
+    claim_gate_dispatch_attempt(gate_id, 0)
+}
+
+/// [`claim_gate_dispatch`] for re-delivery `attempt` (0 = first delivery).
+/// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
+/// held attempt is THIS one and was released (a local skip that left the row
+/// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
+/// older attempt never claims again, released or not.
+fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    let wins = match held.get(&gate_id) {
+        None => true,
+        Some(&(prev, state)) => {
+            attempt > prev || (attempt == prev && state == GateClaimState::Released)
+        }
+    };
+    if wins {
+        held.insert(gate_id, (attempt, GateClaimState::Held));
+    }
+    wins
+}
+
+/// The in-process state of one gate's highest claimed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimState {
+    /// Claimed and in flight.
+    Held,
+    /// Released by a local skip that left coord's row pending: the same
+    /// attempt may claim again when it is re-listed.
+    Released,
+    /// Coord ACCEPTED this attempt's consume claim: the row is consumed there,
+    /// so no copy of this attempt may ever spawn again in this process.
+    Sealed,
+}
+
+/// Seal the claim `attempt` holds once coord accepted it (see
+/// [`GateClaimState::Sealed`]). No-op for any other attempt.
+fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    if let Some(entry) = held.get_mut(&gate_id) {
+        if entry.0 == attempt {
+            entry.1 = GateClaimState::Sealed;
+        }
+    }
 }
 
 /// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
@@ -2241,7 +2386,18 @@ fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
 /// stranded 51 continuations pending-with-null-outcomes over 2 days.
 fn release_gate_dispatch(gate_id: uuid::Uuid) {
-    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").remove(&gate_id);
+    release_gate_dispatch_attempt(gate_id, 0);
+}
+
+/// Release the claim attempt `attempt` holds — a TOMBSTONE, and a no-op when a
+/// different (newer) attempt holds the gate. See [`dispatched_gate_ids`].
+fn release_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    if let Some(entry) = held.get_mut(&gate_id) {
+        if entry.0 == attempt && entry.1 == GateClaimState::Held {
+            entry.1 = GateClaimState::Released;
+        }
+    }
 }
 
 /// Process-wide set of work-unit `dispatch_id`s whose continuation we have
@@ -2284,7 +2440,7 @@ fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
 /// (legacy, no id) never claimed, so there is nothing to release.
 fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
     match consume_target {
-        ConsumeTarget::Gate(gate_id) => release_gate_dispatch(gate_id),
+        ConsumeTarget::Gate(gate_id, attempt) => release_gate_dispatch_attempt(gate_id, attempt),
         ConsumeTarget::Dispatch(dispatch_id) => release_dispatch_dispatch(dispatch_id),
         ConsumeTarget::None => {}
     }
@@ -2405,7 +2561,16 @@ fn settle_claim_decision(
     gate_id: uuid::Uuid,
 ) -> ClaimOutcome {
     match decision {
-        SpawnDecision::Spawn => ClaimOutcome::Spawn,
+        SpawnDecision::Spawn => {
+            // Coord accepted the claim: the row is consumed there. Seal the
+            // attempt so a later error-path release cannot re-open it to a
+            // late duplicate frame (which coord would answer `consumed` and the
+            // runner would spawn a second time).
+            if let ConsumeTarget::Gate(g, attempt) = consume_target {
+                seal_gate_dispatch_attempt(g, attempt);
+            }
+            ClaimOutcome::Spawn
+        }
         SpawnDecision::SpawnDespiteClaimError { cause } => {
             warn!(
                 "agent_runtime: continuation claim error (proceeding, in-process dedupe \
@@ -2584,6 +2749,9 @@ struct ContinuationSession {
     /// a `dispatch_id` and has no gate row) and for a legacy frame carrying no
     /// id at all. See [`reportable_gate_id`].
     gate_id: Option<uuid::Uuid>,
+    /// When this entry was registered — the session's lifetime for the
+    /// `work_unreported` detail's `after=` field is measured from here.
+    registered_at: std::time::Instant,
 }
 
 /// The value behind [`continuation_sessions`]: the LIVE continuation sessions
@@ -2656,6 +2824,7 @@ impl ContinuationRegistry {
                 terminal_id,
                 anchor_key,
                 gate_id,
+                registered_at: std::time::Instant::now(),
             },
         );
     }
@@ -2923,7 +3092,19 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
         return;
     };
     for session in &reaped {
-        spawn_work_unreported_fallback(&handle, session.gate_id, device_id, &session.terminal_id);
+        let snapshot = pane_exit_facts(&session.terminal_id);
+        let detail = work_unreported_detail(
+            snapshot.map(|(f, _)| f),
+            session_lifetime(session.registered_at, snapshot.map(|(_, at)| at)),
+            &session.terminal_id,
+        );
+        spawn_work_unreported_fallback(
+            &handle,
+            session.gate_id,
+            device_id,
+            &session.terminal_id,
+            detail,
+        );
     }
 }
 
@@ -3567,13 +3748,30 @@ impl Drop for AnchorReservation {
 /// so a direct `tokio::spawn` here would panic ("there is no reactor running").
 /// `None` (no runtime was current at install — headless/unit-test) → the poll is
 /// skipped and the periodic backstop / WS-reconnect catch-up covers it.
+///
+/// `exit` is what the PTY waiter saw ([`crate::terminal::session::PaneExitFacts`]);
+/// `None` (a caller without it) falls back to the live `TerminalManager`'s
+/// record of the pane, and to `exit=unknown` when the pane is gone.
 pub(crate) fn notify_continuation_terminal_exit(
     terminal_id: &str,
     rt_handle: Option<&tokio::runtime::Handle>,
+    exit: Option<crate::terminal::session::PaneExitFacts>,
 ) {
     let Some(session) = deregister_exited_continuation(terminal_id) else {
         return;
     };
+    let (exit, exited_at) = match exit {
+        Some(f) => (Some(f), None),
+        None => match pane_exit_facts(terminal_id) {
+            Some((f, at)) => (Some(f), Some(at)),
+            None => (None, None),
+        },
+    };
+    let detail = work_unreported_detail(
+        exit,
+        session_lifetime(session.registered_at, exited_at),
+        terminal_id,
+    );
     let Some(device_id) = load_local_device_id() else {
         return;
     };
@@ -3592,7 +3790,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
-    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id);
+    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id, detail);
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
@@ -3612,14 +3810,116 @@ fn spawn_work_unreported_fallback(
     gate_id: Option<uuid::Uuid>,
     device_id: uuid::Uuid,
     terminal_id: &str,
+    detail: String,
 ) {
     let Some(gate_id) = gate_id else {
         return;
     };
     let terminal_id = terminal_id.to_string();
     handle.spawn(async move {
-        post_work_unreported_fallback(gate_id, device_id, &terminal_id).await;
+        post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail).await;
     });
+}
+
+/// How a continuation session that STARTED ended — the `exit=` class of the
+/// `work_unreported` detail coord classifies (plan
+/// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D2). Coord
+/// re-delivers ONLY [`WorkExit::Crashed`]; the wire tokens are a contract with
+/// `continuation_spawn_retry::classify_work_exit` and must not be renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkExit {
+    /// The process ended on its own with a failing code.
+    Crashed,
+    /// The process ended on its own with code 0 (`/exit`, including the
+    /// drained runner's graceful exit of a `finished` session).
+    Clean,
+    /// A killing teardown was requested first: an operator close, a shutdown.
+    Closed,
+    /// Nothing is known: no exit facts, or no recorded code.
+    Unknown,
+}
+
+impl WorkExit {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Crashed => "crashed",
+            Self::Clean => "clean",
+            Self::Closed => "closed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Classify the waiter's facts. A requested close wins over the code — a
+    /// killed child exits non-zero, and reading that as a crash would re-deliver
+    /// work its operator (or its runner's shutdown and durable restore) ended
+    /// on purpose. `pane_io` collapses codes to 0/1, so no finer split (a
+    /// SIGINT, a signal) is available here.
+    fn classify(exit: Option<crate::terminal::session::PaneExitFacts>) -> Self {
+        match exit {
+            None => Self::Unknown,
+            Some(f) if f.close_requested => Self::Closed,
+            Some(f) => match f.code {
+                Some(0) => Self::Clean,
+                Some(_) => Self::Crashed,
+                None => Self::Unknown,
+            },
+        }
+    }
+}
+
+/// The one-line `work_unreported` detail:
+/// `exit=<class> code=<n|none> after=<secs>s terminal=<id>`. Single-line and
+/// short by construction (coord keeps the first line, cut at 200 chars), with
+/// the class FIRST because coord's classifier reads only the leading token.
+fn work_unreported_detail(
+    exit: Option<crate::terminal::session::PaneExitFacts>,
+    lifetime: std::time::Duration,
+    terminal_id: &str,
+) -> String {
+    let code = exit
+        .and_then(|f| f.code)
+        .map_or_else(|| "none".to_string(), |c| c.to_string());
+    format!(
+        "exit={} code={code} after={}s terminal={terminal_id}",
+        WorkExit::classify(exit).wire(),
+        lifetime.as_secs()
+    )
+}
+
+/// The live `TerminalManager`'s exit facts for `terminal_id`, or `None` when
+/// there is no manager (headless / unit tests) or the pane is gone. The
+/// reaper's evidence: it can deregister a session BEFORE that session's own
+/// exit hook runs (the waiter clears `is_alive` first), and coord admits only
+/// ONE `spawned → work_*` write, so the reaper must classify from the same
+/// facts the hook would have rather than post `unknown` over a crash.
+///
+/// Returns the waiter's FROZEN snapshot (facts + exit instant), so a tab the
+/// operator closed after the crash still reads as the crash it was. A pane the
+/// manager no longer holds reads `None` → `exit=unknown`, which is never
+/// re-delivered: the conservative direction, reachable only when the session
+/// had no exit hook (its coord registration failed) AND its tab was closed
+/// before the reaper ran.
+fn pane_exit_facts(
+    terminal_id: &str,
+) -> Option<(crate::terminal::session::PaneExitFacts, std::time::Instant)> {
+    use std::sync::Arc;
+    let app = crate::tauri_app_handle::current()?;
+    let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?
+        .inner()
+        .clone();
+    manager.get(terminal_id).and_then(|sess| sess.exit_snapshot())
+}
+
+/// The session's lifetime: registration to the recorded exit instant when
+/// there is one (the reaper can run hours after the exit — review round 1 #6),
+/// else registration to now (the hook runs at the exit).
+fn session_lifetime(
+    registered_at: std::time::Instant,
+    exited_at: Option<std::time::Instant>,
+) -> std::time::Duration {
+    exited_at
+        .map(|at| at.saturating_duration_since(registered_at))
+        .unwrap_or_else(|| registered_at.elapsed())
 }
 
 /// The runner-side FALLBACK producer: the continuation's PTY exited and nothing
@@ -3637,15 +3937,16 @@ async fn post_work_unreported_fallback(
     gate_id: uuid::Uuid,
     device_id: uuid::Uuid,
     terminal_id: &str,
+    detail: String,
 ) {
-    // Bare marker, no detail: the persisted value is what the
-    // `consumed_continuation_no_work` smell reads, and "the session said
-    // nothing" has nothing to add.
+    // The detail is [`work_unreported_detail`]'s one line — HOW the session
+    // ended, which is what lets coord re-deliver a crash and leave a deliberate
+    // end alone. Coord persists `work_unreported: <detail>`.
     match post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
-        None,
+        Some(detail),
     )
     .await
     {
@@ -4042,7 +4343,10 @@ fn focus_existing_continuation(terminal_id: &str) {
 /// - [`ConsumeTarget::None`] — legacy coord (neither id): spawn once, no ack.
 #[derive(Debug, Clone, Copy)]
 enum ConsumeTarget {
-    Gate(uuid::Uuid),
+    /// A gate continuation: the gate id and the re-delivery attempt this run
+    /// claimed (0 = first delivery), so its release tombstones only its own
+    /// claim.
+    Gate(uuid::Uuid, u32),
     Dispatch(uuid::Uuid),
     None,
 }
@@ -4166,12 +4470,33 @@ async fn dispatch_gate_continuation(
         // Fast-path dedupe: drop an in-process duplicate before any claim.
         // (The agent-registry check above is the one I/O that precedes it — it
         // must, so a refused dispatch never claims anything.)
-        if !claim_gate_dispatch(gate_id) {
+        let attempt = payload.retry_attempt();
+        if payload.retry.is_some() && attempt == 0 {
+            warn!(
+                "agent_runtime: gate-continuation gate_id={gate_id} carries a coord `retry` \
+                 annotation with no readable attempt — treated as attempt 0; on a device that \
+                 already ran this gate the re-delivery will be dropped as a duplicate"
+            );
+        }
+        if !claim_gate_dispatch_attempt(gate_id, attempt) {
+            if attempt > 0 {
+                info!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
+                     {attempt} already dispatched in this process; skipping duplicate"
+                );
+            }
             debug!(
-                "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
-                 skipping duplicate"
+                "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} already \
+                 dispatched; skipping duplicate"
             );
             return DispatchOutcome::AlreadyDispatched;
+        }
+        if let Some(retry) = payload.retry.as_ref() {
+            info!(
+                "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DELIVERY attempt \
+                 {}/{} ({} family, class {}); prior outcome {:?}",
+                retry.attempt, retry.max_attempts, retry.family, retry.class, retry.prior_outcome
+            );
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
         // local guards run FIRST inside `run_gate_continuation_inner`, then the
@@ -4179,13 +4504,21 @@ async fn dispatch_gate_continuation(
         // cap passes), then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
             if let Err(e) =
-                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Gate(gate_id)).await
+                run_gate_continuation_inner(
+                    payload,
+                    device_id,
+                    ConsumeTarget::Gate(gate_id, attempt),
+                )
+                .await
             {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
-                // An errored run is no longer in-flight and posted no successful
-                // consume outcome path we can rely on — release the in-process
-                // claim so a re-listed row can retry (see release_gate_dispatch).
-                release_gate_dispatch(gate_id);
+                // An errored run is no longer in-flight. Release its in-process
+                // claim: this re-opens the attempt ONLY when coord never
+                // accepted the claim (`SpawnDespiteClaimError` — the row may
+                // still be pending and re-listed). A run whose claim coord
+                // accepted was SEALED in `settle_claim_decision`, so this is a
+                // no-op for it; coord's re-drive arrives as a newer attempt.
+                release_gate_dispatch_attempt(gate_id, attempt);
             }
         });
         DispatchOutcome::Dispatched
@@ -5172,7 +5505,7 @@ async fn defer_continuation_unclaimed(
     device_id: uuid::Uuid,
     reason: String,
 ) {
-    if let ConsumeTarget::Gate(gate_id) = consume_target {
+    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
             post_continuation_deferred(gate_id, device_id, reason).await;
         }
@@ -5465,7 +5798,7 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id) = consume_target {
+    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -5531,7 +5864,7 @@ async fn run_gate_continuation_inner(
             // outcome so coord doesn't show a perpetually-pending continuation.
             // The work-unit path does NOT ack on failure — leaving the dispatch
             // un-consumed re-lists it on the next reconnect (at-least-once).
-            if let ConsumeTarget::Gate(gate_id) = consume_target {
+            if let ConsumeTarget::Gate(gate_id, _) = consume_target {
                 post_spawn_outcome(
                     gate_id,
                     device_id,
@@ -5580,7 +5913,7 @@ async fn run_gate_continuation_inner(
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
-        ConsumeTarget::Gate(gate_id) => match &result {
+        ConsumeTarget::Gate(gate_id, _) => match &result {
             Ok(_) => {
                 post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
             }
@@ -5619,6 +5952,7 @@ async fn run_gate_continuation_inner(
         notify_continuation_terminal_exit(
             exited_terminal_id,
             tokio::runtime::Handle::try_current().ok().as_ref(),
+            None,
         );
     }
     result.map(|_| ())
@@ -7147,10 +7481,19 @@ async fn run_condition_check_terminal(
 /// (a one-shot continuation with no stable anchor) we fall back to a fresh
 /// v4 — distinctness is preserved, only cross-retry renewal is lost, which
 /// is acceptable for an anchor-less one-shot.
+///
+/// A coord RE-DELIVERY (`retry.attempt > 0`) gets its OWN discriminator: the
+/// crashed attempt's tab can stay open still holding its isolated-edit context,
+/// and closing it later would release a claim keyed on a shared token out from
+/// under the re-delivered session (review round 1 #5). The first delivery keeps
+/// the exact name it always had.
 fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uuid> {
     match payload.anchor_key.as_deref() {
         Some(anchor) if !anchor.is_empty() => {
-            let name = format!("{}:{anchor}", payload.target_device_id);
+            let name = match payload.retry_attempt() {
+                0 => format!("{}:{anchor}", payload.target_device_id),
+                n => format!("{}:{anchor}:retry{n}", payload.target_device_id),
+            };
             Some(uuid::Uuid::new_v5(
                 &uuid::Uuid::NAMESPACE_URL,
                 name.as_bytes(),
@@ -12861,6 +13204,7 @@ mod tests {
             dispatch_id: None,
             target_instance_name: None,
             brief: None,
+            retry: None,
         };
 
         let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
@@ -12906,6 +13250,7 @@ mod tests {
             dispatch_id: None,
             target_instance_name: None,
             brief: None,
+            retry: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -13179,6 +13524,187 @@ mod tests {
     /// (`false`). This is what makes a continuation delivered by BOTH the WS
     /// fast-path and the poll backstop spawn exactly once. Distinct ids never
     /// collide.
+    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`: coord
+    /// re-drives a lost continuation by resetting the SAME gate row, so the
+    /// dedupe must let a strictly LATER attempt through while still dropping a
+    /// same-attempt duplicate and a stale older frame.
+    #[test]
+    fn a_later_redelivery_attempt_claims_afresh_and_is_monotone() {
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "first delivery (attempt 0) wins");
+        assert!(!claim_gate_dispatch(gate), "WS+poll duplicate of attempt 0 dropped");
+        assert!(
+            claim_gate_dispatch_attempt(gate, 1),
+            "re-delivery attempt 1 of a gate this process already ran is NOT a duplicate"
+        );
+        assert!(!claim_gate_dispatch_attempt(gate, 1), "duplicate of attempt 1 dropped");
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 0),
+            "a stale attempt-0 frame arriving late can never re-run"
+        );
+        assert!(claim_gate_dispatch_attempt(gate, 2));
+        // An OLDER attempt's release (its task still posting its outcome when
+        // the re-delivery arrived) must not wipe attempt 2's claim.
+        release_gate_dispatch_attempt(gate, 1);
+        release_gate_dispatch(gate);
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 2),
+            "attempt 2 is still held after older attempts released"
+        );
+        assert!(!claim_gate_dispatch_attempt(gate, 0), "and stale frames stay dropped");
+        release_gate_dispatch_attempt(gate, 2);
+        assert!(
+            claim_gate_dispatch_attempt(gate, 2),
+            "a release of the HOLDING attempt (local skip) lets it re-list"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 1),
+            "a release never lets an OLDER attempt back in"
+        );
+        release_gate_dispatch_attempt(gate, 2);
+
+        // An attempt whose claim coord ACCEPTED is sealed: the dispatcher's
+        // error-path release afterwards must not re-open it (review round 2).
+        let sealed = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(sealed));
+        assert_eq!(
+            settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(sealed, 0), sealed),
+            ClaimOutcome::Spawn
+        );
+        release_gate_dispatch_attempt(sealed, 0);
+        assert!(
+            !claim_gate_dispatch(sealed),
+            "a consumed attempt can never spawn again in this process"
+        );
+        assert!(claim_gate_dispatch_attempt(sealed, 1), "only a re-delivery gets back in");
+    }
+
+    /// The `retry` key parses into the typed annotation, is absent on a first
+    /// delivery, and an unreadable value never fails the frame.
+    #[test]
+    fn retry_annotation_parses_leniently() {
+        let base = serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/babysit-prs 1",
+            "source": "gate_continuation",
+            "gate_id": "22222222-2222-2222-2222-222222222222",
+        });
+        let first: GateContinuationPayload =
+            serde_json::from_value(base.clone()).expect("first delivery parses");
+        assert_eq!(first.retry, None);
+        assert_eq!(first.retry_attempt(), 0);
+
+        let mut redelivered = base.clone();
+        redelivered["retry"] = serde_json::json!({
+            "attempt": 2, "max_attempts": 2, "family": "work", "class": "work_crashed",
+            "prior_outcome": "work_unreported: exit=crashed code=1 after=5s terminal=t",
+        });
+        let p: GateContinuationPayload =
+            serde_json::from_value(redelivered).expect("annotated frame parses");
+        assert_eq!(p.retry_attempt(), 2);
+        assert_eq!(p.retry.as_ref().unwrap().family, "work");
+
+        let mut stringly = base.clone();
+        stringly["retry"] = serde_json::json!({"attempt": "1", "family": "spawn"});
+        let st: GateContinuationPayload = serde_json::from_value(stringly).expect("parses");
+        assert_eq!(st.retry_attempt(), 1, "a numeric string attempt is read");
+
+        let mut bad_attempt = base.clone();
+        bad_attempt["retry"] = serde_json::json!({"attempt": -3});
+        let b: GateContinuationPayload = serde_json::from_value(bad_attempt).expect("parses");
+        assert_eq!(b.retry, None, "an unreadable attempt drops the annotation, frame survives");
+
+        let mut garbled = base;
+        garbled["retry"] = serde_json::json!("not an object");
+        let g: GateContinuationPayload =
+            serde_json::from_value(garbled).expect("a garbled retry never fails the frame");
+        assert_eq!(g.retry_attempt(), 0);
+    }
+
+    /// A re-delivery's worktree-claim discriminator differs from the first
+    /// delivery's (so the crashed attempt's still-open tab cannot release the
+    /// retry's claim), and the first delivery's id is unchanged.
+    #[test]
+    fn a_redelivery_gets_its_own_claim_discriminator() {
+        let first: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/x",
+            "anchor_key": "claim:pr:qontinui/qontinui-coord#1",
+        }))
+        .expect("parses");
+        let mut retried = first.clone();
+        retried.retry = Some(ContinuationRetry {
+            attempt: 1,
+            ..ContinuationRetry::default()
+        });
+        let legacy = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            b"11111111-1111-1111-1111-111111111111:claim:pr:qontinui/qontinui-coord#1",
+        );
+        assert_eq!(continuation_session_id(&first), Some(legacy));
+        assert_ne!(continuation_session_id(&retried), Some(legacy));
+        assert_eq!(
+            continuation_session_id(&retried),
+            continuation_session_id(&retried.clone()),
+            "stable across copies of the same attempt"
+        );
+    }
+
+    /// The lifetime runs to the recorded EXIT, not to whenever the reaper got
+    /// round to it.
+    #[test]
+    fn session_lifetime_stops_at_the_recorded_exit() {
+        let registered = std::time::Instant::now();
+        let exited = registered + std::time::Duration::from_secs(90);
+        assert_eq!(
+            session_lifetime(registered, Some(exited)),
+            std::time::Duration::from_secs(90)
+        );
+        assert!(session_lifetime(registered, None) < std::time::Duration::from_secs(5));
+        assert_eq!(
+            session_lifetime(exited, Some(registered)),
+            std::time::Duration::ZERO,
+            "never negative"
+        );
+    }
+
+    /// The D2 exit grammar: a requested close wins over the code, code 0 is
+    /// clean, any other recorded code a crash, and no facts / no code unknown.
+    /// The detail is single-line, class-first and well under coord's 200-char
+    /// cut with a real terminal id.
+    #[test]
+    fn work_unreported_detail_classifies_how_the_session_ended() {
+        use crate::terminal::session::PaneExitFacts;
+        let f = |code: Option<i32>, close_requested: bool| {
+            Some(PaneExitFacts {
+                code,
+                close_requested,
+            })
+        };
+        assert_eq!(WorkExit::classify(f(Some(1), false)), WorkExit::Crashed);
+        assert_eq!(WorkExit::classify(f(Some(0), false)), WorkExit::Clean);
+        assert_eq!(WorkExit::classify(f(Some(1), true)), WorkExit::Closed);
+        assert_eq!(WorkExit::classify(f(Some(0), true)), WorkExit::Closed);
+        assert_eq!(WorkExit::classify(f(None, false)), WorkExit::Unknown);
+        assert_eq!(WorkExit::classify(None), WorkExit::Unknown);
+
+        let tid = "2f0ab50e-b265-44f4-a1b4-b738a79b9c66";
+        let d = work_unreported_detail(
+            f(Some(1), false),
+            std::time::Duration::from_secs(412),
+            tid,
+        );
+        assert_eq!(d, format!("exit=crashed code=1 after=412s terminal={tid}"));
+        assert!(d.starts_with("exit=crashed "), "coord reads the leading token: {d}");
+        assert!(!d.contains('\n') && d.chars().count() < 200, "{d}");
+        assert_eq!(
+            work_unreported_detail(None, std::time::Duration::from_millis(900), tid),
+            format!("exit=unknown code=none after=0s terminal={tid}")
+        );
+        // What coord persists still matches the runner's own marker test.
+        assert!(ContinuationOutcome::WorkUnreported.matches_recorded(&format!("work_unreported: {d}")));
+    }
+
     #[test]
     fn claim_gate_dispatch_is_once_per_gate_id() {
         let gate = uuid::Uuid::now_v7();
@@ -13284,7 +13810,7 @@ mod tests {
         let d = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(g));
         assert!(claim_dispatch_dispatch(d));
-        release_local_dispatch_claim(ConsumeTarget::Gate(g));
+        release_local_dispatch_claim(ConsumeTarget::Gate(g, 0));
         release_local_dispatch_claim(ConsumeTarget::Dispatch(d));
         release_local_dispatch_claim(ConsumeTarget::None); // no-op, must not panic
         assert!(claim_gate_dispatch(g), "gate id was released");
@@ -13340,7 +13866,7 @@ mod tests {
         // …and the production settle, which is the only release on this path.
         let kept = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(kept), "delivery 1 claims the id");
-        settle_skipped_claim(&cancelled, ConsumeTarget::Gate(kept));
+        settle_skipped_claim(&cancelled, ConsumeTarget::Gate(kept, 0));
         assert!(
             !claim_gate_dispatch(kept),
             "a cancelled skip must KEEP the claim so a duplicate delivery is absorbed"
@@ -13349,7 +13875,7 @@ mod tests {
 
         let relisted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(relisted), "delivery 1 claims the id");
-        settle_skipped_claim(&superseded, ConsumeTarget::Gate(relisted));
+        settle_skipped_claim(&superseded, ConsumeTarget::Gate(relisted, 0));
         assert!(
             claim_gate_dispatch(relisted),
             "after a superseded skip, the re-listed gate id claims again"
@@ -13366,7 +13892,7 @@ mod tests {
         let funnel_relisted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_relisted));
         assert_eq!(
-            settle_claim_decision(&superseded, ConsumeTarget::Gate(funnel_relisted), gate),
+            settle_claim_decision(&superseded, ConsumeTarget::Gate(funnel_relisted, 0), gate),
             ClaimOutcome::Skip,
             "a superseded claim refusal must not spawn"
         );
@@ -13380,7 +13906,7 @@ mod tests {
         let funnel_kept = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_kept));
         assert_eq!(
-            settle_claim_decision(&cancelled, ConsumeTarget::Gate(funnel_kept), gate),
+            settle_claim_decision(&cancelled, ConsumeTarget::Gate(funnel_kept, 0), gate),
             ClaimOutcome::Skip,
             "a cancelled claim refusal must not spawn"
         );
@@ -13417,7 +13943,7 @@ mod tests {
         let funnel_rerouted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_rerouted));
         assert_eq!(
-            settle_claim_decision(&rerouted, ConsumeTarget::Gate(funnel_rerouted), gate),
+            settle_claim_decision(&rerouted, ConsumeTarget::Gate(funnel_rerouted, 0), gate),
             ClaimOutcome::Skip,
             "a rerouted claim refusal must not spawn and must not defer"
         );
@@ -13439,7 +13965,7 @@ mod tests {
             let claimed = uuid::Uuid::now_v7();
             assert!(claim_gate_dispatch(claimed));
             assert_eq!(
-                settle_claim_decision(&proceeding, ConsumeTarget::Gate(claimed), gate),
+                settle_claim_decision(&proceeding, ConsumeTarget::Gate(claimed, 0), gate),
                 ClaimOutcome::Spawn,
                 "{proceeding:?} must reach the spawn"
             );
@@ -13463,7 +13989,7 @@ mod tests {
         let funnel_deferred = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_deferred));
         assert_eq!(
-            settle_claim_decision(&deferred, ConsumeTarget::Gate(funnel_deferred), gate),
+            settle_claim_decision(&deferred, ConsumeTarget::Gate(funnel_deferred, 0), gate),
             ClaimOutcome::DeferUnclaimed(crate::coord_drain_state::DeferClass::Drained),
             "a claim error under the drain must defer, not spawn and not skip, and must \
              carry the drain's own class into the stamp"
@@ -15612,6 +16138,7 @@ mod tests {
                 // Upstream's dispatch-time continuation brief: irrelevant to
                 // the gate-id discrimination this test pins.
                 brief: None,
+                retry: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -15926,7 +16453,7 @@ mod tests {
 
         register_continuation_session("term-cont-2".to_string(), None, None);
         // No runtime handle (None) — must not panic on the missing reactor.
-        notify_continuation_terminal_exit("term-cont-2", None);
+        notify_continuation_terminal_exit("term-cont-2", None, None);
         assert!(
             !continuation_sessions()
                 .lock()
@@ -16254,7 +16781,7 @@ mod drain_claim_tests {
             DrainAdmission::work(SpawnOrigin::UnitContinuation, format!("dispatch:{d}"))
         );
         assert_eq!(
-            continuation_drain_admission_for(ConsumeTarget::Gate(g)),
+            continuation_drain_admission_for(ConsumeTarget::Gate(g, 0)),
             DrainAdmission::work(SpawnOrigin::GateContinuation, format!("gate:{g}"))
         );
         assert_eq!(

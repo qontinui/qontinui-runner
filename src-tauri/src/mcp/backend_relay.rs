@@ -4549,7 +4549,7 @@ async fn register_remote_created_session(
             // leaving a ghost for coord's stale watcher to reap. Same
             // idempotent door the explicit close uses.
             let close_registry = registry.clone();
-            session.set_on_exit(Box::new(move |id| {
+            session.set_on_exit(Box::new(move |id, _exit| {
                 if let Err(e) = close_registry.close_by_id(id) {
                     warn!(
                         coord_session = %id,

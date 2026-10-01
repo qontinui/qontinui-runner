@@ -379,7 +379,7 @@ pub async fn terminal_create(
                 // `terminal_close` command, so a double-close (exit +
                 // explicit close) is a no-op.
                 let close_registry = registry.clone();
-                session.set_on_exit(Box::new(move |coord_id| {
+                session.set_on_exit(Box::new(move |coord_id, _exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2295,7 +2295,7 @@ pub(crate) fn create_terminal_session_backend(
                 // spawn on.
                 let exited_terminal_id = info.id.clone();
                 let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-                session.set_on_exit(Box::new(move |coord_id| {
+                session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2306,6 +2306,7 @@ pub(crate) fn create_terminal_session_backend(
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
+                        Some(exit),
                     );
                 }));
                 let rx = session.subscribe_output();
