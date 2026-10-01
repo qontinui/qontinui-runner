@@ -793,9 +793,7 @@ pub async fn redeem_pair_code(
     code: String,
     backend_url: Option<String>,
 ) -> Result<RedeemPairCodeResponse, String> {
-    use qontinui_runner_lib::pair::{
-        pair_with_pair_code, persist_pairing, read_device_id_from_disk,
-    };
+    use qontinui_runner_lib::pair::{pair_with_pair_code, read_device_id_from_disk};
 
     let code_trimmed = code.trim().to_string();
     if code_trimmed.is_empty() {
@@ -858,22 +856,10 @@ pub async fn redeem_pair_code(
     let tenant_id = uuid::Uuid::parse_str(tenant_id_str.trim())
         .map_err(|e| format!("server returned malformed tenant_id: {e}"))?;
 
-    // Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
-    let resp_for_persist = resp.clone();
-    spawn_blocking_tracked(move || persist_pairing(&resp_for_persist, tenant_id))
-        .await
-        .map_err(|e| format!("persist pairing task panicked: {e}"))?
-        .map_err(|e| format!("persist pairing: {}", e))?;
-
-    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
-    // tenant is the default), so every rejection coord recorded against the OLD
-    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
-    // stores a working credential and the next refresher pass re-reads the stale
-    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
-    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
-        tenant_id,
-        crate::auth::default_binding_tenant(),
-    );
+    // The post-pairing steps both redeem doors share; see
+    // [`complete_pairing_after_redeem`]. This interactive door adds only the
+    // sign-out-marker clear below.
+    complete_pairing_after_redeem(&resp, tenant_id, "redeem_pair_code", || Ok(())).await?;
 
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
@@ -888,14 +874,68 @@ pub async fn redeem_pair_code(
     // (This command is allowlisted over the UI-Bridge HTTP surface for
     // agent-driven pairing, so it is a live path, not a theoretical one.)
     //
-    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
-    // must not un-logout the operator. Placed HERE rather than inside
-    // `persist_pairing` also on purpose: the background device-JWT refresher
-    // writes the same credential slots, and clearing on that path would silently
-    // un-logout the operator on the next refresh cycle.
+    // Placed AFTER the shared core (which persists) on purpose: a redeem that
+    // failed to persist must not un-logout the operator. Kept OUT of the core
+    // and of `persist_pairing` also on purpose: the background device-JWT
+    // refresher and its operator-authorized redeem write the same credential
+    // slots, and clearing on those paths would silently un-logout the operator.
     if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
         warn!("redeem_pair_code: could not clear the interactive sign-out marker: {e}");
     }
+
+    let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
+
+    info!(
+        "redeem_pair_code: device paired (user_id={}, tenant_id={}, device_id={})",
+        resp.user_id, tenant_id_str, response_device_id
+    );
+
+    Ok(RedeemPairCodeResponse {
+        user_id: resp.user_id,
+        tenant_id: tenant_id_str.to_string(),
+        device_id: response_device_id,
+    })
+}
+
+/// The post-pairing core BOTH redeem doors run once a pair code has been
+/// redeemed with web: the interactive [`redeem_pair_code`] command and the
+/// refresher's operator-authorized redeem (`mcp::pending_redeem`). One body so
+/// a step added here reaches both doors — a step added to one door only is
+/// exactly the drift this exists to prevent.
+///
+/// `before_persist` is the calling door's last say before anything is written
+/// (the background door re-checks that the local user has not signed out in
+/// the meantime); an `Err` from it aborts with nothing persisted. Door-specific
+/// effects AFTER the core (the interactive door's sign-out-marker clear) stay
+/// with the door.
+pub(crate) async fn complete_pairing_after_redeem(
+    resp: &qontinui_runner_lib::pair::PairCompleteResponse,
+    tenant_id: uuid::Uuid,
+    caller: &str,
+    before_persist: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    before_persist()?;
+    // Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
+    let resp_for_persist = resp.clone();
+    spawn_blocking_tracked(move || {
+        qontinui_runner_lib::pair::persist_pairing(&resp_for_persist, tenant_id)
+    })
+    .await
+    .map_err(|e| format!("persist pairing task panicked: {e}"))?
+    .map_err(|e| format!("persist pairing: {e}"))?;
+
+    // Post-persist credential steps (e.g. device-machine-key enrolment) belong
+    // HERE, so both doors run them.
+
+    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
+    // tenant is the default), so every rejection coord recorded against the OLD
+    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
+    // stores a working credential and the next refresher pass re-reads the stale
+    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
+    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+        tenant_id,
+        crate::auth::default_binding_tenant(),
+    );
 
     // Promote to Tier 2 (qontinui_account) now that a device JWT is in
     // hand. Redeeming a pair code IS a cloud-account bind, so the runner
@@ -915,7 +955,7 @@ pub async fn redeem_pair_code(
     // owns all three conditions of `settings::should_persist_migration` —
     // nothing-to-persist, `!is_secondary`, and (structurally, via its
     // `serde_json::Value` edit) an authoritative source.
-    promote_tier_after_pairing("redeem_pair_code");
+    promote_tier_after_pairing(caller);
 
     // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
     // only when the tier changed. `persist_pairing` above just wrote a fresh
@@ -929,20 +969,8 @@ pub async fn redeem_pair_code(
     // to a connected relay just re-evaluates its idle gate.
     crate::mcp::backend_relay::commands::kick_cloud_relay().await;
     crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-    info!("redeem_pair_code: kicked relay + device-JWT refresher to pick up the fresh pairing");
-
-    let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
-
-    info!(
-        "redeem_pair_code: device paired (user_id={}, tenant_id={}, device_id={})",
-        resp.user_id, tenant_id_str, response_device_id
-    );
-
-    Ok(RedeemPairCodeResponse {
-        user_id: resp.user_id,
-        tenant_id: tenant_id_str.to_string(),
-        device_id: response_device_id,
-    })
+    info!("{caller}: kicked relay + device-JWT refresher to pick up the fresh pairing");
+    Ok(())
 }
 
 /// Promote this runner to Tier `qontinui_account` after a pairing credential

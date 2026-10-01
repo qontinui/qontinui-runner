@@ -373,7 +373,8 @@ where
         if state.last_warned.as_deref() != Some("signed_out") {
             state.last_warned = Some("signed_out".to_string());
             info!(
-                "pending_redeem: credential is dark but the local user logged out — not                  asking web for an operator-authorized redeem until they sign in again"
+                "pending_redeem: credential is dark but the local user logged out — not \
+                 asking web for an operator-authorized redeem until they sign in again"
             );
         }
         return PassResult::LocallySignedOut;
@@ -383,7 +384,8 @@ where
         if state.last_warned.as_deref() != Some("no_web_base") {
             state.last_warned = Some("no_web_base".to_string());
             warn!(
-                "pending_redeem: credential is dark but no qontinui-web base URL resolves —                  cannot ask web for an operator-authorized redeem"
+                "pending_redeem: credential is dark but no qontinui-web base URL resolves — \
+                 cannot ask web for an operator-authorized redeem"
             );
         }
         return PassResult::NoWebBase;
@@ -489,21 +491,24 @@ fn describe_failure(outcome: &PollOutcome) -> String {
 struct LiveEffects;
 
 impl RedeemEffects for LiveEffects {
-    /// The redeem steps of `commands::web_integration::redeem_pair_code`
-    /// MINUS its interactive-sign-out clear. That command is an EXPLICIT local
-    /// acquisition, so it ends a local logout; this is a background path a
-    /// remote operator triggers, and the command's own comment says the clear
-    /// must never run from one (it would silently un-logout the local user).
-    /// [`run_pass`] does not poll while signed out at all; this keeps the
-    /// marker untouched even if that gate is ever bypassed. The device id is
-    /// the one the poll named, never re-resolved.
+    /// The `pair.rs` redeem, then the SAME post-pairing core the interactive
+    /// `redeem_pair_code` command runs
+    /// ([`crate::commands::web_integration::complete_pairing_after_redeem`]),
+    /// so a step added there reaches this door too. What this door does NOT
+    /// do is the command's interactive-sign-out clear: that command is an
+    /// EXPLICIT local acquisition, while this is a background path a remote
+    /// operator triggers, and clearing from here would silently un-logout the
+    /// local user. [`run_pass`] does not poll while signed out at all; the
+    /// core's `before_persist` re-checks just before writing, so a sign-out
+    /// during the redeem round-trip is not undone either. The device id is the
+    /// one the poll named, never re-resolved.
     async fn redeem(
         &self,
         web_base: &str,
         code: &RedeemCode,
         device_id: &str,
     ) -> Result<(), String> {
-        use qontinui_runner_lib::pair::{pair_with_pair_code, persist_pairing};
+        use qontinui_runner_lib::pair::pair_with_pair_code;
         let (base, code, did) = (web_base.to_string(), code.clone(), device_id.to_string());
         let resp = spawn_blocking_tracked(move || pair_with_pair_code(&base, code.expose(), &did))
             .await
@@ -513,14 +518,23 @@ impl RedeemEffects for LiveEffects {
             .as_deref()
             .and_then(|t| uuid::Uuid::parse_str(t.trim()).ok())
             .ok_or_else(|| "redeem response carried no usable tenant_id".to_string())?;
-        persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {e}"))?;
-        crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+        crate::commands::web_integration::complete_pairing_after_redeem(
+            &resp,
             tenant_id,
-            crate::auth::default_binding_tenant(),
-        );
-        crate::commands::web_integration::promote_tier_after_pairing("pending_redeem");
-        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-        Ok(())
+            "pending_redeem",
+            || {
+                if crate::auth::AuthManager::new().is_interactive_signed_out() {
+                    warn!(
+                        "pending_redeem: the local user signed out while the authorized \
+                         code was being redeemed — nothing persisted; the spent code is \
+                         discarded"
+                    );
+                    return Err("the local user signed out during the redeem".to_string());
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn clear_anchor(&self) {
@@ -1180,36 +1194,78 @@ mod tests {
         assert!(fx.calls().is_empty());
     }
 
-    /// The live redeem must never clear the interactive-sign-out marker —
-    /// `redeem_pair_code`'s own comment forbids that from a background path. A
-    /// behavioural test cannot drive a network redeem into a real store, so
-    /// this pins it at the source (the technique the refresher's
-    /// `every_in_process_re_pair_path_retires_the_stale_rejection_streak`
-    /// uses), comments stripped so prose cannot satisfy or trip it.
+    /// Strip `//` comments line by line so prose can neither satisfy nor trip
+    /// a source scan.
+    fn code_only(text: &str) -> String {
+        text.lines()
+            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of the top-level item starting with `item`, up to the first
+    /// unindented closing brace.
+    fn item_body<'a>(text: &'a str, item: &str) -> &'a str {
+        let (_, rest) = text
+            .split_once(item)
+            .unwrap_or_else(|| panic!("{item} exists"));
+        rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+    }
+
+    fn source(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    }
+
+    /// Both redeem doors go through ONE post-pairing core, so a step added
+    /// there (e.g. #1770's machine-key enrolment) reaches the background door
+    /// too; and only the interactive door clears the sign-out marker. A network
+    /// redeem cannot be driven from a unit test, so this pins it at the source
+    /// (the technique the refresher's
+    /// `every_in_process_re_pair_path_retires_the_stale_rejection_streak` uses).
     #[test]
-    fn the_live_redeem_never_clears_the_sign_out_marker() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/pending_redeem.rs");
-        let text = std::fs::read_to_string(&path).expect("read pending_redeem.rs");
+    fn both_redeem_doors_share_one_core_and_only_the_interactive_one_ends_a_logout() {
+        let text = source("src/mcp/pending_redeem.rs");
         let (live, _tests) = text
             .split_once("#[cfg(test)]\nmod tests")
             .expect("test module marker");
-        let code: String = live
-            .lines()
-            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let live = code_only(live);
         assert!(
-            code.contains("persist_pairing("),
-            "the live redeem persists"
+            live.contains("complete_pairing_after_redeem("),
+            "the background redeem runs the shared post-pairing core"
         );
         assert!(
-            !code.contains("clear_interactive_signed_out"),
+            !live.contains("persist_pairing("),
+            "the background redeem must not persist around the shared core"
+        );
+        assert!(
+            !live.contains("clear_interactive_signed_out"),
             "the refresher's redeem must not end a local logout"
         );
         assert!(
-            !code.contains("redeem_pair_code("),
+            !live.contains("redeem_pair_code("),
             "the interactive command clears the marker; this path must not call it"
+        );
+
+        let web = code_only(&source("src/commands/web_integration.rs"));
+        let core = item_body(&web, "pub(crate) async fn complete_pairing_after_redeem(");
+        assert!(core.contains("persist_pairing("), "the core persists");
+        assert!(
+            !core.contains("clear_interactive_signed_out"),
+            "the shared core must not end a local logout — that is the interactive door's"
+        );
+        let interactive = item_body(&web, "pub async fn redeem_pair_code(");
+        assert!(
+            interactive.contains("complete_pairing_after_redeem("),
+            "the interactive door runs the shared core"
+        );
+        assert!(
+            !interactive.contains("persist_pairing("),
+            "the interactive door must not persist around the shared core"
+        );
+        assert!(
+            interactive.contains("clear_interactive_signed_out"),
+            "the interactive door still ends a local logout"
         );
     }
 
