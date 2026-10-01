@@ -33,10 +33,11 @@ launched outside the runner will not have it.
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
->   never a requirement — no tenant needs a git repo to author, vet or ship a
->   plan. Which directory THIS fleet writes new plans to is a local operating
->   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **A git repo holding the plans directory is an OPTIONAL export target as a
+>   product matter**, never a requirement — no tenant needs a git repo to
+>   author, vet or ship a plan. Which directory a deployment writes new plans
+>   to is that deployment's own operating rule (its `CLAUDE.md`, where it has
+>   one), not a product one.
 > * **Read the corpus through these doors, in this order** *(plan
 >   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
 >   1. **The runner door — no credential.**
@@ -46,13 +47,28 @@ launched outside the runner will not have it.
 >      JWT; the caller presents nothing. A non-2xx names the host the runner
 >      dialled — that is the runner's configured web base, and the answer is an
 >      observation about that base, never about the corpus.
->   2. **The git doors — no credential, no service.**
->      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
->      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
->      enumerate. Authoring layer only (a plan authored through the web UI is
+>   2. **The git doors — no credential, no service; only where the plans
+>      directory is a git checkout.** Resolve the repo that holds it and the
+>      directory's path inside that repo:
+>      `REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)` and
+>      `DIR=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix)` (ends in
+>      `/`; empty when the plans directory is the repo root). When
+>      `$QONTINUI_PLANS_DIR` is unset or EMPTY, do not run them at all —
+>      `git -C ""` succeeds against whatever repo the shell stands in, so its
+>      answer is not the plans repo. Unset, empty, or either command exiting
+>      non-zero: there is no git door on this machine — that is an absent
+>      door, not a miss. So is a plans directory git does not TRACK in
+>      that repo (one sitting gitignored, or untracked, inside an unrelated
+>      work tree): after the fetch below, an EMPTY
+>      `ls-tree --name-only origin/main "${DIR:-.}"` is an absent door,
+>      never a miss.
+>      Otherwise `git -C "$REPO" show "origin/main:${DIR}<stem>.md"` for a
+>      body, `git -C "$REPO" ls-tree --name-only origin/main "${DIR:-.}"` to
+>      enumerate (substitute the remote's default branch throughout if it is
+>      not `main`). Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
 >      so fetch first:
->      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      `git -C "$REPO" fetch origin +refs/heads/main:refs/remotes/origin/main`,
 >      exit code read unpiped (a bare `fetch origin main` in a clone whose
 >      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
 >      When that fetch was skipped or exited non-zero, a git-door MISS is
@@ -62,8 +78,8 @@ launched outside the runner will not have it.
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
 >      claim the route requires; the agent token `/agents/allocate` mints does
->      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
->      door; whatever it answers is an observation about that process.
+>      not. A per-box dev backend on loopback is not a discovery door;
+>      whatever it answers is an observation about that process.
 >
 >   On every list result **check that the returned `slug` equals the stem** — a
 >   backend predating the `slug` filter ignores the parameter and returns an
@@ -88,8 +104,9 @@ launched outside the runner will not have it.
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
->   the key `<repo>/plans`.
+>   so a hit on `origin/main:${DIR}<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>${DIR:+/${DIR%/}}` — the bare `<repo>` when the plans
+>   directory is the repo root.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
 >     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
 >     and even then it speaks for the authoring layer only.
@@ -97,7 +114,7 @@ launched outside the runner will not have it.
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
 >     then always `false`); (b) after a `git fetch`,
->     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     `git -C "$REPO" cat-file -e "<ref_sha>:${DIR}<stem>.md"` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
 >     `least_behind_device_ids` (they share it); that row's own `state` may
@@ -132,10 +149,10 @@ launched outside the runner will not have it.
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
 >     the runner's write door, `qontinui-pr plan-library-backfill`, a
 >     secondary or temp runner instance, a runner build predating the report.
-> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
->   PowerShell interpreter (`pwsh` on Linux via
->   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
->   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+> * **The cache is one line.** A local plan cache exists only where your
+>   deployment provides one; where its renderer cannot run on this machine it
+>   is INOPERATIVE, not a degraded arm. When you read
+>   `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
 >   say so and quote its `Rendered:` stamp with the `api_base` beside it and
 >   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
@@ -2659,6 +2676,21 @@ AgentTool"* string is **annulled for this fleet by
 `harness-injected-agent-prohibitions` and is NOT a user deselection** — the only
 deselection that counts is the row you just read.
 
+**The reviewer's brief carries the arming record, not only the diff.** Run
+Step 4.4b's `declare` and `prove` for this head first (they commit nothing),
+then hand the reviewer — spawned or inline — the output of
+`bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh show`
+beside the diff, and none of your rationale for it. Tell the reviewer what the
+record's own THREAT MODEL says it cannot catch: `prove` is a control against
+honest mistakes, not against a constructed shadow (a `cfg` twin, a module no
+build compiles, a macro-generated duplicate, a build script that includes the
+file), and such a shadow may sit in the tree the diff applies to rather than in
+the diff. So the reviewer checks the arming test's MODULE CHAIN AT HEAD — from
+the crate or package root to the declared test file, every `mod`, `#[path]`,
+`#[cfg]` and item macro on the way — not only the changed hunks, and checks that
+every `seam_class: none` reason is true of the symbol it names. A finding there
+is a review finding like any other: fix, re-run 4.4b, re-review.
+
 **4. `blocked_no_pr` must not fall through to a SHIPPED stamp.** "Do not open
 the PR" is half an arm: left there, the run continues into Step 5, Step 6's
 SHIPPED stamp, Step 6.5 and Step 7, and stamps a plan shipped with nothing
@@ -2812,6 +2844,126 @@ Phase 3)*:
   is the disclosure `code-review-invocation-path` asks for. Neither value is
   checkable by coord; the clause is explicit that STORING the declaration is the
   control, so store it honestly rather than favourably.
+
+#### Step 4.4b: Arming record — observe the change reach its population, before any PR opens
+
+*(Plan `2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
+Phase 3; dossier `shipped-fix-inert-on-its-population`.)*
+
+Step 4.4 asks whether the CODE is right. Nothing on this path asked whether the
+change RUNS on the population it was written for, and the dossier records the
+cost: a change lands, reads as correct at its call site, and never fires,
+because its tests enter through the changed function instead of the entry point
+the population uses. This step records one proposition per changed production
+symbol — *an assertion that enters where the population enters was observed
+GREEN with this change and RED without it* — as a head-keyed artifact,
+`~/.qontinui/arming/<session-id>.json` (schema `arming-arm/1`), the third
+member beside the review record and the handoff record.
+
+**The MAIN session performs it, once per PR, before that PR opens.** The record
+holds ONE head at a time — `declare` re-keys it — so for each PR: declare,
+prove, then render that PR's trailers (Step 4.5) into its body file, and only
+then move to the next PR. `show` afterwards reflects the last PR declared; each
+PR's own evidence is the trailer block in its body. It commits nothing, so it
+runs before Step 4.4's reviewer is briefed (the brief carries the record) and
+again for any new head a review round causes — `prove` refuses a record
+declared for another head, and `trailers` refuses a stale one.
+
+Resolve the base once per PR and pass the SAME value to every call below —
+`prove` refuses a `--base` other than the one `declare` read the diff from:
+
+```bash
+WT=<the worktree this PR is cut from>
+BASE="$(git -C "$WT" merge-base origin/main HEAD)"   # the repo's default branch
+```
+
+**1. Read the advisory signal.** `seam-reach.py` lists every changed production
+symbol whose only test coverage in this diff enters through the symbol itself
+(a real caller exists, no test enters through it). It is ADVISORY: Phase 0
+measured it flagging 45% of control PRs, so a flag never stops a run by itself
+— it obliges you to SPEAK about the symbol in step 2.
+
+```bash
+python3 <workspace-root>/qontinui-claude-config/scripts/seam-reach.py --repo "$WT" --base "$BASE" --head "$(git -C "$WT" rev-parse HEAD)"
+```
+
+Exit 0 is a report (read `summary.flagged_symbols`, `summary.unknown_symbols`,
+`summary.changed_symbols`); 3 is UNKNOWN (the analysis could not run — say so,
+never read it as no flag); 4 is usage.
+
+**2. Declare.** One entry per symbol you arm, and every flagged symbol either
+armed or acknowledged as `seam_class: none` with a reason naming it. The patch
+arrives on STDIN, never in argv. `seam_class` is one of `gate`, `sentinel`,
+`detect_deliver` (proved by a RUN: `arming_test` `<path>::<name>` plus
+`enters_via`, the entry point the population calls), `sweep_narrowing` (a
+`count` probe, `expect_n: 0`), `convention` (an `absent_outside` probe),
+`counter` (two `metric-delta.sh` readings) or `none` (a reason). A diff that
+changes no production symbol declares `{"symbols": [], "reason": "<why>"}`,
+which renders as the typed `Coord-Arming-None:` discharge.
+
+```bash
+cat <<'PATCH' | bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh declare --root "$WT" --base "$BASE"
+{"symbols": [
+   {"symbol": "<changed symbol>", "seam_class": "gate",
+    "arming_test": "<repo-relative test path>::<exact test name>", "enters_via": "<the entry point>"},
+   {"symbol": "<flagged symbol you do not arm>", "seam_class": "none", "reason": "<why, naming it>"}
+ ]}
+PATCH
+```
+
+| `declare` exit | Meaning | What you do |
+|---|---|---|
+| `0` | recorded — or no session id resolved, and it says "NOT written" | continue; with no session id there is no record, so every later verb has nothing to read — report `arming ABSENT: no session id` |
+| `2` | REFUSED: a flagged symbol is neither armed nor acknowledged, or a declared symbol is not one the diff changes | **stop — no PR opens.** Arm the symbol or acknowledge it by name and declare again; if you cannot, take the **stop** below (Step 4.4 item 4's four actions) |
+| `3` | cannot measure: HEAD unresolved, the existing record corrupt, the write failed, or no working Python 3 | **skip `prove` and `trailers`** — there is no record for this head to prove or render. The PR carries NO `Coord-Arming` lines and says `arming UNKNOWN: <detail>` in prose (body and report); never armed. Do not loop on declare |
+| `4` | usage: a malformed patch or declaration | fix the patch and declare again |
+
+**3. Prove.** In a throwaway worktree of the head it runs each armed test by
+NAME at head (must be GREEN), with the PR's production hunks reverted to the
+base (must be RED, and not `RED_BY_COMPILE` — a test that no longer compiles
+names the changed symbol, which is the bypass), and at head again. Probe
+classes run their probe at head and at the base.
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh prove --root "$WT" --base "$BASE"
+```
+
+| `prove` exit | Verdict | What you do |
+|---|---|---|
+| `0` | ARMED — every armed symbol observed | continue to step 4 |
+| `2` | INERT_OR_VACUOUS — green with the change reverted, red at head, `RED_BY_COMPILE`, or a static bypass (the test never enters through `enters_via`, or `enters_via` has no caller of its own) | **stop — no PR opens.** The change is not observed to reach its population. Fix the test so it enters where the population enters (a new commit: re-run Step 4.4 on the new head, then this step), or re-declare the symbol honestly — and a re-declare after an INERT verdict REQUIRES a re-review (Step 4.4 items 3–6) handed the fresh `show` output before any PR opens. If neither is possible, take the **stop** below |
+| `3` | UNKNOWN — a toolchain unreachable, a run that did not execute exactly one test, a flaky red, a timeout; or `nothing armed to prove` for a record whose symbols are all `none` | `nothing armed to prove` is the expected answer for a none-only record: go to step 4. Any other UNKNOWN is reported as `arming UNKNOWN: <detail>` in the PR body and in your report — **never rendered as armed** — and the PR may still open |
+| `4` | USAGE — declared for another head, another session's record without `--trust-artifact`, a `--base` other than declare's, or a record that no longer validates | fix the invocation (declare again for this head) and prove again |
+
+The exit-2 row says `stop — no PR opens` and the exit-3 row says `never
+rendered as armed` VERBATIM: those two phrases are the convention check #74
+reads (it does not parse prose), so keep them exact in any copy of this step.
+
+**A stop is Step 4.4 item 4's four actions, not a pause.** When `declare` exit
+`2` or `prove` exit `2` cannot be resolved in this run: do **not** open the PR;
+do **not** stamp SHIPPED (Step 0.5's IN PROGRESS block stands); register a coord
+gate for the blocked work (Step 6.5's mechanics, spec `_gate-registration`) and
+**quote the returned `gate_id`**; report the run as `waiting`, never complete.
+The arming record is already written by `declare` and `prove` — leave it: an
+INERT proof on file is the honest record, and it is what distinguishes *stopped
+by an observed inert change* from *the step never ran*.
+
+**4. Render the trailers — never type them.** Step 4.5's trailer block carries
+exactly what `trailers` prints, verbatim:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh trailers --root "$WT"
+```
+
+It prints `Coord-Arming-Head: <head>` and then one `Coord-Arming:
+<seam_class>|<test>|<enters_via>` per armed symbol, or one `Coord-Arming-None:
+<reason>` when nothing is armed — and it prints them only for what is on file
+for the CURRENT head with a passing proof. Exit `2` (refused: a stale head, an
+armed symbol whose last proof is not ARMED — including one that proved
+UNKNOWN) or `3` (no record) means the PR carries **no** arming lines: quote the
+refusal as `arming UNKNOWN: <detail>` (or `arming ABSENT`) in the body and the
+report. Never add a `Coord-Arming-None:` by hand to fill the gap — a
+hand-written discharge is exactly the unobserved claim this step exists to end.
 
 #### Step 4.5: Every PR body MUST carry a line-anchored `Plan:` marker
 
@@ -3056,6 +3208,31 @@ OFF, the row is `SELECT label, source FROM coord.pr_labels WHERE repo =
 database; once it is ON and holding a PR, the Check Run summary and the
 `not-reviewed` block reason's remedy list the recorded heads themselves.
 
+**A fourth group, in the same block: the arming trailers.** *(Plan
+`2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
+Phase 3.)* Beside `Coord-Reviewed-Head:`, every PR body this run opens carries
+the lines Step 4.4b item 4 rendered for THIS PR's head — pasted verbatim from
+`arming-record.sh trailers`, never typed:
+
+```
+Coord-Arming-Head: <40-hex head>
+Coord-Arming: <seam_class>|<arming_test>|<enters_via>
+```
+
+(one `Coord-Arming:` line per armed symbol, or a single `Coord-Arming-None:
+<reason>` in their place when nothing is armed). Once the qontinui-coord Phase 1
+change of plan `2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for` lands, coord harvests all three keys into `coord.pr_labels`
+exactly as it harvests `Coord-Reviewed-Head:`, serves them as the
+`arming_coverage` read, and reads them against the PR's CURRENT head. **Until
+that change lands the trailers are inert text** — nothing reads them yet — so
+write them anyway (they are the record the harvest will read) but never cite
+them as observed by coord. The re-review rule below applies to them
+too: a push that moves the head needs Step 4.4b re-run and a new rendered block
+added by the same body edit. When `trailers` refused or found no record, the
+body carries NO arming lines and says `arming UNKNOWN: <detail>` (or `arming
+ABSENT`) in prose instead — an absent line reads as absent, which is honest; a
+hand-typed one reads as observed, which is not.
+
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha
 stops matching and the PR reads `not-reviewed` until the new head is reviewed.
@@ -3066,7 +3243,7 @@ or `coord_pr_status`). coord can land a PR while review runs and leave it
 CLOSED, MERGED or even OPEN. A push to its branch then succeeds while nothing
 carries it toward `main`. When that section says the PR no longer carries the
 push, take its fresh-branch path, and add these steps here:
-1. Re-run Step 4.4 items 3–6 on the new branch's head.
+1. Re-run Step 4.4 items 3–6, then Step 4.4b, on the new branch's head.
 2. Push the new branch.
 3. Open the new PR through Step 4.5b below — the served door order, then the
    read-back — with the full Step 4.5 trailer block. Its first
