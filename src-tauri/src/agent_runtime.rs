@@ -3907,7 +3907,9 @@ fn pane_exit_facts(
     let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?
         .inner()
         .clone();
-    manager.get(terminal_id).and_then(|sess| sess.exit_snapshot())
+    manager
+        .get(terminal_id)
+        .and_then(|sess| sess.exit_snapshot())
 }
 
 /// The session's lifetime: registration to the recorded exit instant when
@@ -4503,13 +4505,12 @@ async fn dispatch_gate_continuation(
         // consume-CLAIM is awaited (contract item 4: claim only after the local
         // cap passes), then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
-            if let Err(e) =
-                run_gate_continuation_inner(
-                    payload,
-                    device_id,
-                    ConsumeTarget::Gate(gate_id, attempt),
-                )
-                .await
+            if let Err(e) = run_gate_continuation_inner(
+                payload,
+                device_id,
+                ConsumeTarget::Gate(gate_id, attempt),
+            )
+            .await
             {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
                 // An errored run is no longer in-flight. Release its in-process
@@ -13532,12 +13533,18 @@ mod tests {
     fn a_later_redelivery_attempt_claims_afresh_and_is_monotone() {
         let gate = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(gate), "first delivery (attempt 0) wins");
-        assert!(!claim_gate_dispatch(gate), "WS+poll duplicate of attempt 0 dropped");
+        assert!(
+            !claim_gate_dispatch(gate),
+            "WS+poll duplicate of attempt 0 dropped"
+        );
         assert!(
             claim_gate_dispatch_attempt(gate, 1),
             "re-delivery attempt 1 of a gate this process already ran is NOT a duplicate"
         );
-        assert!(!claim_gate_dispatch_attempt(gate, 1), "duplicate of attempt 1 dropped");
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 1),
+            "duplicate of attempt 1 dropped"
+        );
         assert!(
             !claim_gate_dispatch_attempt(gate, 0),
             "a stale attempt-0 frame arriving late can never re-run"
@@ -13551,7 +13558,10 @@ mod tests {
             !claim_gate_dispatch_attempt(gate, 2),
             "attempt 2 is still held after older attempts released"
         );
-        assert!(!claim_gate_dispatch_attempt(gate, 0), "and stale frames stay dropped");
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 0),
+            "and stale frames stay dropped"
+        );
         release_gate_dispatch_attempt(gate, 2);
         assert!(
             claim_gate_dispatch_attempt(gate, 2),
@@ -13568,7 +13578,11 @@ mod tests {
         let sealed = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(sealed));
         assert_eq!(
-            settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(sealed, 0), sealed),
+            settle_claim_decision(
+                &SpawnDecision::Spawn,
+                ConsumeTarget::Gate(sealed, 0),
+                sealed
+            ),
             ClaimOutcome::Spawn
         );
         release_gate_dispatch_attempt(sealed, 0);
@@ -13576,7 +13590,10 @@ mod tests {
             !claim_gate_dispatch(sealed),
             "a consumed attempt can never spawn again in this process"
         );
-        assert!(claim_gate_dispatch_attempt(sealed, 1), "only a re-delivery gets back in");
+        assert!(
+            claim_gate_dispatch_attempt(sealed, 1),
+            "only a re-delivery gets back in"
+        );
     }
 
     /// The `retry` key parses into the typed annotation, is absent on a first
@@ -13612,7 +13629,10 @@ mod tests {
         let mut bad_attempt = base.clone();
         bad_attempt["retry"] = serde_json::json!({"attempt": -3});
         let b: GateContinuationPayload = serde_json::from_value(bad_attempt).expect("parses");
-        assert_eq!(b.retry, None, "an unreadable attempt drops the annotation, frame survives");
+        assert_eq!(
+            b.retry, None,
+            "an unreadable attempt drops the annotation, frame survives"
+        );
 
         let mut garbled = base;
         garbled["retry"] = serde_json::json!("not an object");
@@ -13689,20 +13709,21 @@ mod tests {
         assert_eq!(WorkExit::classify(None), WorkExit::Unknown);
 
         let tid = "2f0ab50e-b265-44f4-a1b4-b738a79b9c66";
-        let d = work_unreported_detail(
-            f(Some(1), false),
-            std::time::Duration::from_secs(412),
-            tid,
-        );
+        let d = work_unreported_detail(f(Some(1), false), std::time::Duration::from_secs(412), tid);
         assert_eq!(d, format!("exit=crashed code=1 after=412s terminal={tid}"));
-        assert!(d.starts_with("exit=crashed "), "coord reads the leading token: {d}");
+        assert!(
+            d.starts_with("exit=crashed "),
+            "coord reads the leading token: {d}"
+        );
         assert!(!d.contains('\n') && d.chars().count() < 200, "{d}");
         assert_eq!(
             work_unreported_detail(None, std::time::Duration::from_millis(900), tid),
             format!("exit=unknown code=none after=0s terminal={tid}")
         );
         // What coord persists still matches the runner's own marker test.
-        assert!(ContinuationOutcome::WorkUnreported.matches_recorded(&format!("work_unreported: {d}")));
+        assert!(
+            ContinuationOutcome::WorkUnreported.matches_recorded(&format!("work_unreported: {d}"))
+        );
     }
 
     #[test]

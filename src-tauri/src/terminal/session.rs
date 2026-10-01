@@ -5307,7 +5307,10 @@ mod tests {
         assert!(!s.close_requested());
         assert_eq!(s.exit_snapshot(), None, "no waiter, no exit recorded");
         s.close_after_graceful_exit(); // is_alive is false → no kill
-        assert!(!s.close_requested(), "a graceful close of an exited pane is not a kill");
+        assert!(
+            !s.close_requested(),
+            "a graceful close of an exited pane is not a kill"
+        );
         s.close_kill_only();
         assert!(s.close_requested(), "the shutdown kill-only path marks it");
 
