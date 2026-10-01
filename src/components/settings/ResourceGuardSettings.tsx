@@ -14,8 +14,11 @@
  *     **This panel edits BOTH halves of that group.** Since
  *     `2026-08-30-load-aware-spawn-admission-control` the same struct also
  *     carries two OS-thread CEILINGS (`warn_thread_count` /
- *     `critical_thread_count`, defaults 256 / 400 against tokio's 512-slot
- *     blocking pool), enforced by the same gate and by the same master switch.
+ *     `critical_thread_count`), enforced by the same gate and by the same
+ *     master switch. Each is OPTIONAL: `null` means "this machine's default",
+ *     which the runner sizes from the box (cores, memory, the measured at-rest
+ *     thread floor) and floors at the calibration box's 256 / 400; a number
+ *     replaces that default, looser or tighter.
  *     They are edited here because every CRITICAL refusal the gate issues —
  *     either lane — ends with "The limits live in Settings > Resource Guard",
  *     and the thread-lane toast even carries an "Open Resource Guard settings"
@@ -26,9 +29,13 @@
  *     below rejects, reintroduced by the lane that shipped later.
  *
  *     A ceiling is not a floor and nothing about it may be copied from the
- *     memory pair: the ordering rule inverts (`critical >= warn`), the
- *     three-term fold is a `min`, and the clamp pushes UP. The panel spells that
- *     out beside the inputs, and `resourceGuardHelpers` does it in code.
+ *     memory pair: the ordering rule inverts (`critical >= warn`) and the clamp
+ *     pushes UP. What the runner ENFORCES, and which term decided it, is
+ *     served by the runner (`thread_ceilings` on `get_session_guard_settings`)
+ *     and rendered as-is — this panel no longer re-derives the fold, because
+ *     the default is a function of the machine and a TypeScript copy of it had
+ *     already drifted (plan `2026-10-01-runner-thread-ceilings-ignore-the-
+ *     machine-and-the-guard-dialog-says-low-memory`, Phase 2).
  *   - `ci_node` (`settings::CiNodeSettings`) — the floors that decide whether
  *     coord may send this box CI work. It had NO settings UI before this panel
  *     and `settings.rs` documented it as hand-edited JSON; shipping the first
@@ -47,7 +54,7 @@
  * the ordering predicate) live in `resourceGuardHelpers.ts`.
  */
 
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, X, ShieldAlert, Info, TriangleAlert } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
@@ -62,22 +69,21 @@ import {
   SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
-  THREAD_CEILING_DEFAULT_CRITICAL,
-  THREAD_CEILING_DEFAULT_WARN,
-  THREAD_CEILING_FLOOR,
-  THREAD_CEILING_INPUT_MAX,
+  THREAD_CEILING_ABS_MAX,
   THREAD_CEILING_INPUT_MIN,
   bytesToGib,
   clampGib,
   clampInt,
   concurrencyAboveSuggestionWarning,
   effectiveSessionFloorsGib,
-  effectiveThreadCeilings,
   gibToBytes,
   parseConcurrencyInput,
+  parseThreadCeilingInput,
   type CiNodeHostSuggestion,
+  type ThreadCeilingsReport,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
+  threadCeilingSourceText,
   threadCeilingsAreInverted,
 } from "./resourceGuardHelpers";
 import type { LogFunction } from "./types";
@@ -91,14 +97,23 @@ interface TauriResult<T> {
 /**
  * Wire shape of `settings::SessionGuardSettings` — two lanes, snake_case. The
  * memory pair is in BYTES (the 1.5 GiB critical default has no integer-GiB
- * spelling); the thread pair is a plain count of OS threads.
+ * spelling); the thread pair is a plain count of OS threads, `null` when the
+ * operator left it on this machine's default.
  */
 export interface SessionGuardSettingsValue {
   warn_free_commit_bytes: number;
   critical_free_commit_bytes: number;
-  warn_thread_count: number;
-  critical_thread_count: number;
+  warn_thread_count: number | null;
+  critical_thread_count: number | null;
   enabled: boolean;
+}
+
+/**
+ * `get_session_guard_settings`' response: the persisted settings plus the
+ * runner's read-only report of the thread ceilings it enforces.
+ */
+interface SessionGuardResponse extends SessionGuardSettingsValue {
+  thread_ceilings?: ThreadCeilingsReport | null;
 }
 
 /** Wire shape of `settings::CiNodeSettings`. */
@@ -122,8 +137,8 @@ interface ResourceGuardSettingsProps {
 const DEFAULT_SESSION_GUARD: SessionGuardSettingsValue = {
   warn_free_commit_bytes: 3 * 1024 * 1024 * 1024,
   critical_free_commit_bytes: (3 * 1024 * 1024 * 1024) / 2,
-  warn_thread_count: THREAD_CEILING_DEFAULT_WARN,
-  critical_thread_count: THREAD_CEILING_DEFAULT_CRITICAL,
+  warn_thread_count: null,
+  critical_thread_count: null,
   enabled: true,
 };
 
@@ -146,10 +161,23 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const [criticalGib, setCriticalGib] = useState(
     bytesToGib(DEFAULT_SESSION_GUARD.critical_free_commit_bytes),
   );
-  const [warnThreads, setWarnThreads] = useState(DEFAULT_SESSION_GUARD.warn_thread_count);
-  const [criticalThreads, setCriticalThreads] = useState(
+  // The operator's thread overrides (`null` = machine default), their text
+  // drafts while being edited (committed on blur and on save, like the
+  // concurrency input), and the runner's report of what it ENFORCES for the
+  // last SAVED pair — re-fetched after every save, never recomputed here.
+  const [warnThreads, setWarnThreads] = useState<number | null>(
+    DEFAULT_SESSION_GUARD.warn_thread_count,
+  );
+  const [criticalThreads, setCriticalThreads] = useState<number | null>(
     DEFAULT_SESSION_GUARD.critical_thread_count,
   );
+  const [warnThreadsDraft, setWarnThreadsDraft] = useState<string | null>(null);
+  const [criticalThreadsDraft, setCriticalThreadsDraft] = useState<string | null>(null);
+  const [threadReport, setThreadReport] = useState<ThreadCeilingsReport | null>(null);
+  const [savedThreads, setSavedThreads] = useState<{
+    warn: number | null;
+    critical: number | null;
+  }>({ warn: null, critical: null });
   const [guardEnabled, setGuardEnabled] = useState(DEFAULT_SESSION_GUARD.enabled);
 
   const [ciNode, setCiNode] = useState<CiNodeSettingsValue>(DEFAULT_CI_NODE);
@@ -172,7 +200,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         // Both groups in one pass: the panel is only coherent when it shows the
         // whole ladder, so a partial load would render a half-truth.
         const [guardResult, ciResult] = await Promise.all([
-          invoke<TauriResult<SessionGuardSettingsValue>>("get_session_guard_settings"),
+          invoke<TauriResult<SessionGuardResponse>>("get_session_guard_settings"),
           invoke<
             TauriResult<CiNodeSettingsValue & { host_suggestion?: CiNodeHostSuggestion | null }>
           >("get_ci_node_settings"),
@@ -180,11 +208,16 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         if (cancelled) return;
 
         if (guardResult?.success && guardResult.data) {
-          const g = { ...DEFAULT_SESSION_GUARD, ...guardResult.data };
+          // `thread_ceilings` is the runner's read-only report, not a setting:
+          // split it off so it never rides into saved state.
+          const { thread_ceilings, ...persisted } = guardResult.data;
+          const g = { ...DEFAULT_SESSION_GUARD, ...persisted };
           setWarnGib(bytesToGib(g.warn_free_commit_bytes));
           setCriticalGib(bytesToGib(g.critical_free_commit_bytes));
           setWarnThreads(g.warn_thread_count);
           setCriticalThreads(g.critical_thread_count);
+          setSavedThreads({ warn: g.warn_thread_count, critical: g.critical_thread_count });
+          setThreadReport(thread_ceilings ?? null);
           setGuardEnabled(g.enabled);
           onLog("debug", "Session-guard settings loaded");
         } else {
@@ -228,7 +261,22 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   // The SAME rule on the other lane, with the comparison inverted — a ceiling's
   // lighter verdict is the lower number. Both are refused by the Rust writer;
   // either one disables Save.
-  const invertedCeilings = threadCeilingsAreInverted(warnThreads, criticalThreads);
+  // Pending drafts count: the Save button commits them, so the check must see
+  // what will actually be sent.
+  const pendingWarnThreads =
+    warnThreadsDraft !== null
+      ? parseThreadCeilingInput(warnThreadsDraft, warnThreads)
+      : warnThreads;
+  const pendingCriticalThreads =
+    criticalThreadsDraft !== null
+      ? parseThreadCeilingInput(criticalThreadsDraft, criticalThreads)
+      : criticalThreads;
+  const invertedCeilings = threadCeilingsAreInverted(pendingWarnThreads, pendingCriticalThreads);
+  // The runner's report describes the SAVED pair. While the form differs from
+  // it, the "Enforced" lines say so rather than presenting a stale number as
+  // the consequence of what is typed.
+  const threadsUnsaved =
+    pendingWarnThreads !== savedThreads.warn || pendingCriticalThreads !== savedThreads.critical;
   const warnAboveCiNodeReject = warnGib > CI_NODE_REJECT_FLOOR_GIB;
 
   // What the runner will actually enforce, beside what is configured. The
@@ -240,9 +288,32 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const warnIsClamped = effective.warnGib !== warnGib;
   const criticalIsClamped = effective.criticalGib !== criticalGib;
 
-  const effectiveThreads = effectiveThreadCeilings(warnThreads, criticalThreads);
-  const warnThreadsClamped = effectiveThreads.warnThreads !== warnThreads;
-  const criticalThreadsClamped = effectiveThreads.criticalThreads !== criticalThreads;
+  /**
+   * Re-read the session-guard group after a save, for the two things only the
+   * runner knows: the thread overrides as STORED (the load migration turns an
+   * explicit 256 / 400 back into "machine default") and the ceilings it now
+   * enforces. A failed read leaves the previous report in place and says so in
+   * the log — it never fabricates one.
+   */
+  const refreshThreadCeilings = async () => {
+    try {
+      const result = await invoke<TauriResult<SessionGuardResponse>>("get_session_guard_settings");
+      if (!result?.success || !result.data) {
+        onLog("warning", "Could not re-read the enforced thread ceilings after saving");
+        return;
+      }
+      const { thread_ceilings, ...persisted } = result.data;
+      setWarnThreads(persisted.warn_thread_count);
+      setCriticalThreads(persisted.critical_thread_count);
+      setSavedThreads({
+        warn: persisted.warn_thread_count,
+        critical: persisted.critical_thread_count,
+      });
+      setThreadReport(thread_ceilings ?? null);
+    } catch (err) {
+      onLog("warning", `Could not re-read the enforced thread ceilings: ${String(err)}`);
+    }
+  };
 
   /**
    * Save both groups INDEPENDENTLY and report per group.
@@ -274,13 +345,20 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         enabled: guardEnabled,
         warnFreeCommitBytes: gibToBytes(warnGib),
         criticalFreeCommitBytes: gibToBytes(criticalGib),
-        warnThreadCount: warnThreads,
-        criticalThreadCount: criticalThreads,
+        warnThreadCount: pendingWarnThreads,
+        criticalThreadCount: pendingCriticalThreads,
       });
       if (!guardResult?.success) {
         throw new Error(guardResult?.message || "Unknown error saving session-guard settings");
       }
+      setWarnThreadsDraft(null);
+      setCriticalThreadsDraft(null);
+      setWarnThreads(pendingWarnThreads);
+      setCriticalThreads(pendingCriticalThreads);
       saved.push("session limits");
+      // Re-read what the runner now ENFORCES — and what it stored: a value
+      // equal to the old 256 / 400 default reads back as the machine default.
+      await refreshThreadCeilings();
     } catch (err) {
       console.error("Failed to save session-guard settings:", err);
       failures.push(`session limits — ${String(err)}`);
@@ -494,93 +572,49 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           </p>
         </div>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium" htmlFor="resource-guard-warn-threads">
-            Warn above (OS threads)
-          </label>
-          <input
-            id="resource-guard-warn-threads"
-            data-ui-bridge-id="settings.resource-guard-warn-threads"
-            type="number"
-            min={THREAD_CEILING_INPUT_MIN}
-            max={THREAD_CEILING_INPUT_MAX}
-            step={1}
-            value={warnThreads}
-            onChange={(e) =>
-              setWarnThreads(
-                clampInt(
-                  parseInt(e.target.value, 10),
-                  THREAD_CEILING_INPUT_MIN,
-                  THREAD_CEILING_INPUT_MAX,
-                  DEFAULT_SESSION_GUARD.warn_thread_count,
-                ),
-              )
-            }
-            disabled={!guardEnabled}
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-          />
-          <p className="text-[10px] text-muted-foreground">
-            Your own spawn still proceeds with a notification. A queued gate continuation defers
-            here and is re-delivered when threads free up — back-pressure that arrives early is the
-            point of a queue. Range {THREAD_CEILING_INPUT_MIN}-{THREAD_CEILING_INPUT_MAX}.
-          </p>
-          <EffectiveLimit
-            uiBridgeId="settings.resource-guard-warn-threads-effective"
-            configured={`${warnThreads} threads`}
-            effective={`${effectiveThreads.warnThreads} threads`}
-            clamped={warnThreadsClamped}
-            reason={
-              warnThreads > THREAD_CEILING_DEFAULT_WARN
-                ? `above the runner's built-in ${THREAD_CEILING_DEFAULT_WARN}-thread warn ceiling, which nothing can raise`
-                : `below the ${THREAD_CEILING_FLOOR}-thread clamp, under which a machine measured at 150-151 threads at rest could never start a session again`
-            }
-          />
-        </div>
+        <ThreadCeilingInput
+          which="warn"
+          label="Warn above (OS threads)"
+          value={warnThreads}
+          draft={warnThreadsDraft}
+          onDraft={setWarnThreadsDraft}
+          onCommit={(v) => {
+            setWarnThreadsDraft(null);
+            setWarnThreads(v);
+          }}
+          report={threadReport}
+          unsaved={threadsUnsaved}
+          disabled={!guardEnabled}
+          help={
+            <>
+              Your own spawn still proceeds with a notification. A queued gate continuation defers
+              here and is re-delivered when threads free up — back-pressure that arrives early is
+              the point of a queue.
+            </>
+          }
+        />
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium" htmlFor="resource-guard-critical-threads">
-            Block above (OS threads)
-          </label>
-          <input
-            id="resource-guard-critical-threads"
-            data-ui-bridge-id="settings.resource-guard-critical-threads"
-            type="number"
-            min={THREAD_CEILING_INPUT_MIN}
-            max={THREAD_CEILING_INPUT_MAX}
-            step={1}
-            value={criticalThreads}
-            onChange={(e) =>
-              setCriticalThreads(
-                clampInt(
-                  parseInt(e.target.value, 10),
-                  THREAD_CEILING_INPUT_MIN,
-                  THREAD_CEILING_INPUT_MAX,
-                  DEFAULT_SESSION_GUARD.critical_thread_count,
-                ),
-              )
-            }
-            disabled={!guardEnabled}
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-          />
-          <p className="text-[10px] text-muted-foreground">
-            A spawn is refused by default, always with an explicit override. Keep it{" "}
-            <strong>above</strong> the warn ceiling — the inverse of the memory pair, because on a
-            ceiling the lighter verdict is the lower number.
-          </p>
-          <EffectiveLimit
-            uiBridgeId="settings.resource-guard-critical-threads-effective"
-            configured={`${criticalThreads} threads`}
-            effective={`${effectiveThreads.criticalThreads} threads`}
-            clamped={criticalThreadsClamped}
-            reason={
-              criticalThreads > THREAD_CEILING_DEFAULT_CRITICAL
-                ? `above the runner's built-in ${THREAD_CEILING_DEFAULT_CRITICAL}-thread block ceiling, which nothing can raise`
-                : criticalThreads < THREAD_CEILING_FLOOR
-                  ? `below the ${THREAD_CEILING_FLOOR}-thread clamp, under which a machine measured at 150-151 threads at rest could never start a session again`
-                  : "below the effective warn ceiling, and the lighter verdict has to fire first — so it is raised up to it rather than blocking spawns that were never warned about"
-            }
-          />
-        </div>
+        <ThreadCeilingInput
+          which="critical"
+          label="Block above (OS threads)"
+          value={criticalThreads}
+          draft={criticalThreadsDraft}
+          onDraft={setCriticalThreadsDraft}
+          onCommit={(v) => {
+            setCriticalThreadsDraft(null);
+            setCriticalThreads(v);
+          }}
+          report={threadReport}
+          unsaved={threadsUnsaved}
+          disabled={!guardEnabled}
+          help={
+            <>
+              A spawn is refused by default, always with an explicit override. Keep it{" "}
+              <strong>above</strong> the warn ceiling — the inverse of the memory pair, because on a
+              ceiling the lighter verdict is the lower number.
+            </>
+          }
+        />
 
         {invertedCeilings && (
           <div
@@ -589,11 +623,11 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           >
             <TriangleAlert className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`} />
             <p className={`text-xs ${getAccentColors("red").text}`}>
-              The block ceiling ({criticalThreads} threads) is below the warn ceiling ({warnThreads}{" "}
-              threads), so spawns would be blocked before they were ever warned about. The runner
-              refuses this combination — raise the block ceiling or lower the warn ceiling. (Note
-              the direction: on a ceiling the block limit is the HIGHER number, the opposite of the
-              GiB floors above.)
+              The block ceiling ({pendingCriticalThreads} threads) is below the warn ceiling (
+              {pendingWarnThreads} threads), so spawns would be blocked before they were ever warned
+              about. The runner refuses this combination — raise the block ceiling or lower the warn
+              ceiling. (Note the direction: on a ceiling the block limit is the HIGHER number, the
+              opposite of the GiB floors above.)
             </p>
           </div>
         )}
@@ -648,18 +682,16 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             an unknown as a zero is the one thing this guard must never do.
             <br />
             <br />
-            The thread ceilings compose the same way with every step mirrored, because higher is
-            worse there:{" "}
-            <code>
-              min(this machine, your tenant&apos;s fleet ceiling, the built-in{" "}
-              {THREAD_CEILING_DEFAULT_WARN}/{THREAD_CEILING_DEFAULT_CRITICAL} defaults)
-            </code>
-            , clamped <strong>up</strong> at {THREAD_CEILING_FLOOR} threads and with the block
-            ceiling never below the warn ceiling. Coord publishes no thread column yet, so that
-            fleet term is dormant on every machine today and the fold is{" "}
-            <code>min(this machine, the built-in defaults)</code>. The heavier of the two lanes
-            decides; on a tie the memory lane is the one quoted in the message, and the other is
-            still written to the log.
+            The thread ceilings compose differently, because the safe number depends on the box.
+            This machine&apos;s default is sized from its cores and memory (sessions it can carry)
+            but never given more blocking-pool headroom than the calibration box had, and never set
+            below the built-in 256 / 400. <strong>Your value replaces that default</strong> — looser
+            or tighter — within a lower clamp this machine can still spawn under and an upper bound
+            of {THREAD_CEILING_ABS_MAX}. Your tenant&apos;s fleet ceiling can only tighten (coord
+            publishes no thread column yet, so it is dormant today). The &quot;Enforced&quot; lines
+            are the runner&apos;s own numbers, with the term that decided each. The heavier of the
+            two lanes decides; on a tie the memory lane is the one quoted in the message, and the
+            other is still written to the log.
           </p>
         </div>
       </div>
@@ -844,6 +876,117 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   );
 }
 
+// ── One thread-ceiling input ────────────────────────────────────────────────
+interface ThreadCeilingInputProps {
+  which: "warn" | "critical";
+  label: string;
+  /** The stored override, `null` = machine default. */
+  value: number | null;
+  /** The text being typed, `null` when not editing. */
+  draft: string | null;
+  onDraft: (draft: string | null) => void;
+  /** Commit a parsed value (`null` only from the "machine default" button). */
+  onCommit: (value: number | null) => void;
+  /** The runner's report for the last saved pair, `null` if unavailable. */
+  report: ThreadCeilingsReport | null;
+  /** `true` when the form differs from the pair the report describes. */
+  unsaved: boolean;
+  disabled: boolean;
+  help: ReactNode;
+}
+
+/**
+ * A thread-ceiling override: empty means "this machine's default" (shown as a
+ * placeholder with the runner's number), a typed value is committed on blur,
+ * and "Use machine default" is the only way back to `null` — a transiently
+ * empty box never flips the setting, the same contract as the concurrency
+ * input. Beneath it, the ceiling the runner ENFORCES and the term that decided
+ * it, straight from the runner's report.
+ */
+function ThreadCeilingInput({
+  which,
+  label,
+  value,
+  draft,
+  onDraft,
+  onCommit,
+  report,
+  unsaved,
+  disabled,
+  help,
+}: ThreadCeilingInputProps) {
+  const id = `resource-guard-${which}-threads`;
+  const enforced = report ? report[which] : null;
+  return (
+    <div className="space-y-1.5">
+      <label className="text-xs font-medium" htmlFor={id}>
+        {label}
+      </label>
+      <input
+        id={id}
+        data-ui-bridge-id={`settings.${id}`}
+        type="number"
+        min={THREAD_CEILING_INPUT_MIN}
+        max={THREAD_CEILING_ABS_MAX}
+        step={1}
+        value={draft ?? value ?? ""}
+        placeholder={
+          // Only when the report IS the machine default may its number be
+          // quoted as one; anything else would be re-deriving the fold here.
+          enforced !== null && report?.provenance[which] !== "local"
+            ? `machine default (${enforced})`
+            : "machine default"
+        }
+        onChange={(e) => onDraft(e.target.value)}
+        onBlur={() => {
+          if (draft === null) return;
+          onCommit(parseThreadCeilingInput(draft, value));
+        }}
+        disabled={disabled}
+        className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+      />
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] text-muted-foreground">
+          {help} Range {THREAD_CEILING_INPUT_MIN}-{THREAD_CEILING_ABS_MAX}; empty uses this
+          machine&apos;s default (256 / 400 typed explicitly also reads back as the default).
+        </p>
+        <button
+          type="button"
+          data-ui-bridge-id={`settings.${id}-use-default`}
+          onClick={() => {
+            onDraft(null);
+            onCommit(null);
+          }}
+          disabled={disabled || (value === null && draft === null)}
+          className="text-[10px] px-2 py-0.5 rounded-md bg-muted/50 hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+        >
+          Use machine default
+        </button>
+      </div>
+      <p
+        data-ui-bridge-id={`settings.${id}-effective`}
+        className={`text-[10px] ${
+          // Amber when the runner enforces something other than the stored
+          // override (a fleet term, a clamp, the ladder).
+          report && !unsaved && value !== null && report.provenance[which] !== "local"
+            ? getAccentColors("amber").text
+            : "text-muted-foreground"
+        }`}
+      >
+        {report ? (
+          <>
+            Enforced: <strong>{report[which]} threads</strong> —{" "}
+            {threadCeilingSourceText(which, report)}.
+            {unsaved ? " Save to see what your change enforces." : ""}
+          </>
+        ) : (
+          "Enforced ceiling unavailable — the runner did not report it."
+        )}
+      </p>
+    </div>
+  );
+}
+
 // ── Configured vs. enforced ─────────────────────────────────────────────────
 interface EffectiveLimitProps {
   uiBridgeId: string;
@@ -864,8 +1007,9 @@ interface EffectiveLimitProps {
  * `max(configured, hardcoded default)` — so the entire bottom of the input's
  * range was inert and nothing on the page said so. Showing the enforced number
  * always (not only when it differs) also makes the clamps visible: the
- * `SESSION_FLOOR_CAP_GIB` ceiling, the `THREAD_CEILING_FLOOR` clamp, and both
- * ladder coercions.
+ * `SESSION_FLOOR_CAP_GIB` ceiling and the memory ladder coercion. (The thread
+ * pair has its own line in `ThreadCeilingInput`, rendered from the runner's
+ * report.)
  *
  * Takes pre-formatted STRINGS rather than numbers and a unit flag, because the
  * two lanes disagree about direction as well as unit and a component that

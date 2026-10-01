@@ -2507,10 +2507,22 @@ fn settle_claim_decision(
 /// The wedge's own arithmetic gives the conversion: 540 threads at ~130 sessions
 /// against a 150-151-thread idle baseline is roughly **3 OS threads per
 /// continuation session**. So the shipped thread ceilings
-/// ([`crate::settings::SessionGuardSettings::warn_thread_count`] 256 /
-/// `critical_thread_count` 400) correspond to about **35** and **83** concurrent
-/// sessions. 64 sits between them — which means that in ordinary conditions the
-/// thread lane trips FIRST and this count never binds.
+/// ([`crate::settings::SHIPPED_WARN_THREAD_CEILING`] 256 /
+/// [`crate::settings::SHIPPED_CRITICAL_THREAD_CEILING`] 400) correspond to about
+/// **35** and **83** concurrent sessions **on the calibration box** (a runner
+/// idling at 151). 64 sits between them — which means that on such a box, in
+/// ordinary conditions, the thread lane trips FIRST and this count never binds.
+///
+/// **This count is NOT scaled with the machine, and on a big box it may now bind
+/// first.** Since plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-
+/// the-guard-dialog-says-low-memory` the thread ceilings are a machine default
+/// (`resource_guard::merge_thread_ceilings`: session capacity from cores and
+/// `MemTotal`, min'd with constant blocking-pool headroom, floored at 256 / 400).
+/// On a 48-core / 368 GB box carrying ~164 sessions the warn ceiling reads ≈ 555
+/// — past ~64 continuation sessions' worth of threads — so there this cap, not
+/// the thread lane, is what defers continuations. That is deliberate: it is a
+/// separate bound on a different axis (below), and scaling it was explicitly out
+/// of that plan's scope.
 ///
 /// That is intended, not an oversight. The two limits are measuring different
 /// things and the honest one is the thread count: it is a live reading of the
@@ -2524,8 +2536,8 @@ fn settle_claim_decision(
 ///
 /// It is therefore sized as a *ceiling on absurdity*, not as a tuned capacity
 /// number: at ~3 threads apiece, 64 sessions is ~192 threads of continuation
-/// load on top of the idle 150 — over the 256 warn ceiling, under the 400
-/// critical one. Nothing on this fleet has ever legitimately wanted more than 64
+/// load on top of the idle 150 — over the calibration box's 256 warn ceiling,
+/// under its 400 critical one. Nothing on this fleet has ever legitimately wanted more than 64
 /// concurrent continuations; the observed peak that broke the box was twice it.
 ///
 /// ## It is a steady-state bound, NOT a semaphore
@@ -2540,7 +2552,7 @@ fn settle_claim_decision(
 /// dispatches have registered; it cannot hold it *within* one.
 ///
 /// That is the same check-to-register window
-/// [`crate::settings::SessionGuardSettings::critical_thread_count`]'s doc
+/// [`crate::settings::SHIPPED_CRITICAL_THREAD_CEILING`]'s doc
 /// already sizes 400 around ("a burst of concurrent admissions can each pass the
 /// ceiling and only then create their threads"), stated here too because a
 /// number documented as a concurrency limit and enforced as a steady-state one
@@ -3012,9 +3024,12 @@ enum ContinuationGuard {
 ///    nothing.
 /// 2. **Thread pressure next.** It goes AHEAD of the count cap because it is the
 ///    real signal — a live reading of the resource that actually ran out on
-///    2026-08-29 — and because it is the earlier, cheaper catch: on this fleet
-///    it binds at roughly 35 concurrent sessions (warn) where the count cap
-///    binds at 64, so on the path to a wedge it is what fires. Reporting a
+///    2026-08-29 — and because it is the earlier, cheaper catch: on the
+///    calibration box it binds at roughly 35 concurrent sessions (warn) where
+///    the count cap binds at 64, so on the path to a wedge it is what fires.
+///    (On a box whose machine-scaled warn ceiling clears ~64 sessions' worth of
+///    threads the order flips and the count cap below binds first — see
+///    [`DEFAULT_CONTINUATION_SESSION_CAP`].) Reporting a
 ///    thread-starved machine as "capped" would send the next investigation to
 ///    the wrong constant, which is precisely what happened last time.
 /// 3. **The count cap last**, as the backstop for load the thread count cannot
@@ -14104,13 +14119,17 @@ mod tests {
     /// means these tests also fail if the ceilings are moved out from under
     /// them, which is the coupling worth having.
     ///
+    /// Judged against the shipped 256 / 400 pair — the calibration box's
+    /// ceilings, which is what a machine with no measured inputs enforces.
+    ///
     /// `None` is the UNKNOWN reading — what
     /// [`crate::health_monitor::thread_count_reading`] returns when the OS
     /// thread table cannot be read.
     fn thread_verdict(reading: Option<usize>) -> crate::resource_guard::SpawnGate {
         crate::resource_guard::evaluate_threads(
             reading,
-            &crate::settings::SessionGuardSettings::default(),
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
         )
     }
 
@@ -16027,7 +16046,8 @@ mod tests {
         //    412 is over the critical ceiling. Corrected there too.)
         let verdict = crate::resource_guard::evaluate_threads(
             Some(300),
-            &crate::settings::SessionGuardSettings::default(),
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
         );
         let (severity, observation) = verdict
             .tripped()
@@ -16041,7 +16061,8 @@ mod tests {
         // word and the limit can never come from different verdicts.
         let wedge = crate::resource_guard::evaluate_threads(
             Some(540),
-            &crate::settings::SessionGuardSettings::default(),
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
         );
         let (wedge_severity, wedge_observation) = wedge
             .tripped()

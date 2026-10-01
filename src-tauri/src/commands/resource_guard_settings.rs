@@ -69,8 +69,38 @@ fn session_floors_are_inverted(warn_bytes: u64, critical_bytes: u64) -> bool {
 ///
 /// Equal ceilings are legal, exactly as equal floors are: "warn and block at the
 /// same point" is a blunt but coherent operator choice.
-fn thread_ceilings_are_inverted(warn_threads: usize, critical_threads: usize) -> bool {
-    critical_threads < warn_threads
+///
+/// Takes the operator's OPTIONAL overrides: a pair is only transposed when the
+/// operator stated both halves. With one half unset its effective partner is
+/// the machine default, which moves with the box — a pair that is fine today
+/// can invert on a busier day — so that case is the fold's to coerce
+/// (`resource_guard::coerce_ceiling_ladder`, logged on the transition) rather
+/// than the writer's to refuse.
+fn thread_ceilings_are_inverted(
+    warn_threads: Option<usize>,
+    critical_threads: Option<usize>,
+) -> bool {
+    matches!((warn_threads, critical_threads), (Some(w), Some(c)) if c < w)
+}
+
+/// The first stated thread ceiling above
+/// [`crate::resource_guard::THREAD_CEILING_ABS_MAX`], if any.
+///
+/// Refused rather than stored: the fold would cut it to the bound anyway, and a
+/// saved number the guard silently does not enforce is exactly the D3 defect
+/// of plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+/// dialog-says-low-memory` — a value above the old 400 was saved and then
+/// discarded by the `min`, with nothing said. Until that plan this check did
+/// not exist because nothing above 400 could take effect; now an operator
+/// value can loosen, so the bound has to be stated where it is written.
+fn thread_ceiling_above_bound(
+    warn_threads: Option<usize>,
+    critical_threads: Option<usize>,
+) -> Option<usize> {
+    [warn_threads, critical_threads]
+        .into_iter()
+        .flatten()
+        .find(|&n| n > crate::resource_guard::THREAD_CEILING_ABS_MAX)
 }
 
 /// `true` when an allowlist entry is a wildcard.
@@ -88,11 +118,28 @@ fn allowlist_has_wildcard(repo_allowlist: &[String]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Internal implementation of [`get_session_guard_settings`].
+///
+/// The response is the persisted [`SessionGuardSettings`] — the two thread
+/// fields `null` when the operator left them on the machine default — plus one
+/// read-only key, `thread_ceilings`: the ceilings the guard ENFORCES right now
+/// and the term that decided each
+/// (`resource_guard::EffectiveThreadCeilings::to_json`, the same projection
+/// `/health` serves as `threadCeilings`). The panel renders that instead of
+/// re-deriving the fold in TypeScript: the TS mirror it replaces had already
+/// drifted from the Rust fold (it never knew the machine shift), and a second
+/// copy of a fold is how the panel and the guard end up disagreeing. It is never
+/// written back — the save command takes the settings fields by name.
 fn get_session_guard_settings_impl() -> Result<CommandResponse, AppError> {
     info!("Getting session-guard settings");
 
     let guard = settings::get_session_guard_settings();
-    let data = serde_json::to_value(&guard)?;
+    let mut data = serde_json::to_value(&guard)?;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "thread_ceilings".to_string(),
+            crate::resource_guard::effective_thread_ceilings(&guard).to_json(guard.enabled),
+        );
+    }
 
     Ok(CommandResponse {
         success: true,
@@ -112,12 +159,13 @@ fn save_session_guard_settings_impl(
     enabled: bool,
     warn_free_commit_bytes: u64,
     critical_free_commit_bytes: u64,
-    warn_thread_count: usize,
-    critical_thread_count: usize,
+    warn_thread_count: Option<usize>,
+    critical_thread_count: Option<usize>,
 ) -> Result<CommandResponse, AppError> {
     info!(
         "Saving session-guard settings: enabled={}, warn_free_commit_bytes={}, \
-         critical_free_commit_bytes={}, warn_thread_count={}, critical_thread_count={}",
+         critical_free_commit_bytes={}, warn_thread_count={:?}, critical_thread_count={:?} \
+         (None = machine default)",
         enabled,
         warn_free_commit_bytes,
         critical_free_commit_bytes,
@@ -141,11 +189,23 @@ fn save_session_guard_settings_impl(
     // `evaluate_threads` (which tests critical first) turns every reading above
     // the critical ceiling into a refusal and the warn band between the two
     // ceases to exist, on eight unattended seams at once.
-    if thread_ceilings_are_inverted(warn_thread_count, critical_thread_count) {
+    if let (true, Some(warn), Some(critical)) = (
+        thread_ceilings_are_inverted(warn_thread_count, critical_thread_count),
+        warn_thread_count,
+        critical_thread_count,
+    ) {
         return Err(AppError::ConfigError(format!(
-            "critical thread ceiling ({critical_thread_count}) must not sit below the warn \
-             ceiling ({warn_thread_count}) — a warn is the lighter verdict and must fire first, \
-             and on a CEILING that means the lower number"
+            "critical thread ceiling ({critical}) must not sit below the warn ceiling ({warn}) \
+             — a warn is the lighter verdict and must fire first, and on a CEILING that means \
+             the lower number"
+        )));
+    }
+    if let Some(n) = thread_ceiling_above_bound(warn_thread_count, critical_thread_count) {
+        return Err(AppError::ConfigError(format!(
+            "thread ceiling {n} is above the {} bound — four times tokio's 512-slot blocking \
+             pool, past which a ceiling could not fire before the pool it protects was \
+             exhausted. Leave the field on the machine default to let the runner size it.",
+            crate::resource_guard::THREAD_CEILING_ABS_MAX
         )));
     }
 
@@ -189,13 +249,21 @@ fn save_session_guard_settings_impl(
 /// and either inversion refuses the whole save. One master `enabled` switch
 /// covers both lanes, exactly as
 /// [`settings::SessionGuardSettings::enabled`] documents.
+///
+/// The two thread ceilings are OPTIONAL: `null` hands the choice to the
+/// machine default (`resource_guard::merge_thread_ceilings`), a number
+/// replaces it in either direction, bounded at
+/// `resource_guard::THREAD_CEILING_ABS_MAX`. A number EQUAL to the old shipped
+/// default (256 warn / 400 critical) is stored but reads back as the machine
+/// default — the load migration `SessionGuardSettings::warn_thread_count`
+/// documents.
 #[tauri::command]
 pub fn save_session_guard_settings(
     enabled: bool,
     warn_free_commit_bytes: u64,
     critical_free_commit_bytes: u64,
-    warn_thread_count: usize,
-    critical_thread_count: usize,
+    warn_thread_count: Option<usize>,
+    critical_thread_count: Option<usize>,
 ) -> Result<CommandResponse, String> {
     save_session_guard_settings_impl(
         enabled,
@@ -392,15 +460,8 @@ mod tests {
     /// which of the two fields they transposed.
     #[test]
     fn inverted_floors_are_refused_before_any_write() {
-        let d = SessionGuardSettings::default();
-        let err = save_session_guard_settings_impl(
-            true,
-            GIB,
-            3 * GIB,
-            d.warn_thread_count,
-            d.critical_thread_count,
-        )
-        .expect_err("critical above warn must not persist");
+        let err = save_session_guard_settings_impl(true, GIB, 3 * GIB, None, None)
+            .expect_err("critical above warn must not persist");
         let msg = String::from(err);
         assert!(msg.contains(&GIB.to_string()), "{msg}");
         assert!(msg.contains(&(3 * GIB).to_string()), "{msg}");
@@ -417,21 +478,45 @@ mod tests {
     /// fails here instead of shipping a lane whose validation is upside down.
     #[test]
     fn only_a_strictly_lower_critical_ceiling_is_inverted() {
-        assert!(thread_ceilings_are_inverted(256, 200));
-        assert!(!thread_ceilings_are_inverted(256, 256));
-        assert!(!thread_ceilings_are_inverted(256, 400));
+        assert!(thread_ceilings_are_inverted(Some(256), Some(200)));
+        assert!(!thread_ceilings_are_inverted(Some(256), Some(256)));
+        assert!(!thread_ceilings_are_inverted(Some(256), Some(400)));
         let d = SessionGuardSettings::default();
         assert!(!thread_ceilings_are_inverted(
             d.warn_thread_count,
             d.critical_thread_count
         ));
+        // Half a pair is never a transposition: the unset half is the machine
+        // default, which the fold coerces against on its own.
+        assert!(!thread_ceilings_are_inverted(Some(1000), None));
+        assert!(!thread_ceilings_are_inverted(None, Some(210)));
 
         // The two lanes disagree by construction on every non-equal pair.
         assert_ne!(
-            thread_ceilings_are_inverted(256, 400),
+            thread_ceilings_are_inverted(Some(256), Some(400)),
             session_floors_are_inverted(256, 400),
             "a floor and a ceiling cannot share an ordering predicate"
         );
+    }
+
+    /// A stated ceiling above `THREAD_CEILING_ABS_MAX` is refused before any
+    /// write — the fold would cut it, and a saved number the guard does not
+    /// enforce is the defect this bound closes. Exactly AT the bound is legal,
+    /// and an unset field is never checked.
+    #[test]
+    fn a_thread_ceiling_above_the_absolute_bound_is_refused() {
+        let max = crate::resource_guard::THREAD_CEILING_ABS_MAX;
+        assert_eq!(thread_ceiling_above_bound(Some(max), Some(max)), None);
+        assert_eq!(thread_ceiling_above_bound(None, None), None);
+        assert_eq!(
+            thread_ceiling_above_bound(Some(256), Some(max + 1)),
+            Some(max + 1)
+        );
+        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(300), Some(max + 1))
+            .expect_err("a ceiling past the bound must not persist");
+        let msg = String::from(err);
+        assert!(msg.contains(&(max + 1).to_string()), "{msg}");
+        assert!(msg.contains(&max.to_string()), "{msg}");
     }
 
     /// An inverted CEILING ladder is refused rather than persisted, for the
@@ -441,7 +526,7 @@ mod tests {
     /// names both numbers so the operator can see which field they transposed.
     #[test]
     fn inverted_thread_ceilings_are_refused_before_any_write() {
-        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, 256, 200)
+        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(256), Some(200))
             .expect_err("a critical ceiling below the warn ceiling must not persist");
         let msg = String::from(err);
         assert!(msg.contains("256"), "{msg}");

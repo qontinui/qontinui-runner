@@ -267,11 +267,18 @@ pub(crate) struct ResourceSample {
     /// see it yet — so a consumer's grade of this number may disagree with
     /// the guard's
     ///
-    /// `resource_guard` re-bases each machine's thread ladder onto its own
-    /// measured at-rest floor, so on a high-core box the runner may enforce
-    /// e.g. 507 / 651 while coord's `DEFAULT_THREAD_WARN_COUNT` /
-    /// `DEFAULT_THREAD_CRITICAL_COUNT` still grade at 256 / 400. **That
-    /// divergence is real, known, and not closed by this field.**
+    /// `resource_guard` derives each machine's thread ceilings from the box —
+    /// session capacity from cores and `MemTotal`, min'd with constant
+    /// blocking-pool headroom above the measured at-rest floor, floored at the
+    /// shipped 256 / 400 plus that floor's shift, and replaceable by the
+    /// operator in either direction (plan `2026-10-01-runner-thread-ceilings-
+    /// ignore-the-machine-and-the-guard-dialog-says-low-memory`) — so on a
+    /// 48-core box under load the runner may enforce e.g. 555 / 747 while
+    /// coord's `DEFAULT_THREAD_WARN_COUNT` / `DEFAULT_THREAD_CRITICAL_COUNT`
+    /// still grade at 256 / 400. **That divergence is real, known, WIDENED by
+    /// that plan, and not closed by this field.** A red coord tile on a scaled
+    /// box is this gap, not a regression; `/health` `threadCeilings` names the
+    /// enforced pair and where each number came from.
     ///
     /// Publishing the effective ceilings beside the reading is the fix, and it
     /// is deliberately NOT done here yet, because it would be inert and noisy:
@@ -290,9 +297,8 @@ pub(crate) struct ResourceSample {
     /// [`crate::settings::SessionGuardSettings`] … so the dashboard's verdict
     /// and the local spawn gate's cannot drift into two opinions." That was
     /// true only while the ceilings were absolute constants. They are now
-    /// re-based onto each machine's measured at-rest thread floor
-    /// ([`crate::resource_guard::machine_thread_shift`]), so a
-    /// 48-core box enforces a different pair from a 4-core one and a hardcoded
+    /// derived per machine ([`crate::resource_guard::merge_thread_ceilings`]),
+    /// so a 48-core box enforces a different pair from a 4-core one and a hardcoded
     /// 256/400 on the reader's side IS the drift that sentence promised could
     /// not happen. Publishing the pair beside the reading is what keeps the
     /// promise; hardcoding it is what breaks it.
