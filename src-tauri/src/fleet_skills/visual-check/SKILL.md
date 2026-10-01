@@ -96,7 +96,9 @@ curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
 url), a registered app (its base url), then an adb serial / `emulator-NNNN`.
 An unknown id is a **malformed request**, exactly like an unknown `element`:
 HTTP **404** with `unknown vision target '<id>'` in `error` — the same on every
-vision route. If the target resolves but its capture fails (no
+vision route. A target that WAS valid but has gone away (adb device unplugged, an app whose
+registration heartbeat expired) answers the same 404 "unknown vision target" —
+re-list the targets before assuming a typo. If the target resolves but its capture fails (no
 `screenshotProvider` wired, the device is unreachable), the capture was
 attempted and failed: `status: "unknown"`, `unknown.code: "producer_failed"`,
 with `unknown.detail` naming the capture — never a silent fallback to the
