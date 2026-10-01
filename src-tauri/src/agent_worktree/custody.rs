@@ -1747,7 +1747,11 @@ pub mod coord {
             assert_eq!(merged.sessions.len(), 2, "s1 is ONE session, not two");
             let s1 = &merged.sessions[0];
             assert_eq!(s1.session_id, "s1");
-            let paths: Vec<&str> = s1.worktrees.iter().map(|w| w.worktree_path.as_str()).collect();
+            let paths: Vec<&str> = s1
+                .worktrees
+                .iter()
+                .map(|w| w.worktree_path.as_str())
+                .collect();
             assert_eq!(paths, vec!["wt/a", "wt/c"]);
 
             let idx = CoordOwnership::from_response(merged);
@@ -1808,7 +1812,9 @@ pub mod coord {
             )
             .await;
             assert_eq!(seen.len(), 2);
-            assert!(partial.expect("must be partial").contains("repeated a cursor"));
+            assert!(partial
+                .expect("must be partial")
+                .contains("repeated a cursor"));
         }
 
         /// A->B->A: the cycle is caught at the first REPEAT, not only when the
@@ -1829,7 +1835,9 @@ pub mod coord {
             .await;
             assert_eq!(seen.len(), 3);
             assert_eq!(merged.sessions.len(), 3, "no page is merged twice");
-            assert!(partial.expect("a cycle is partial").contains("repeated a cursor"));
+            assert!(partial
+                .expect("a cycle is partial")
+                .contains("repeated a cursor"));
         }
 
         /// A pre-cursor coord honours `?limit=` but cannot be asked for more.
@@ -1846,12 +1854,17 @@ pub mod coord {
             let (merged, partial, seen) = walk_fake(vec![full.as_str()], MAX_PAGES).await;
             assert_eq!(seen, vec![None]);
             assert_eq!(merged.sessions[0].worktrees.len(), PAGE_LIMIT as usize);
-            assert!(partial.expect("a full legacy page may be capped").contains("predates"));
+            assert!(partial
+                .expect("a full legacy page may be capped")
+                .contains("predates"));
 
             // The SAME full page from a cursor-aware coord saying `null` is whole.
             let whole = full.replace(r#""count":1"#, r#""count":1,"nextCursor":null"#);
             let (_, partial, _) = walk_fake(vec![whole.as_str()], MAX_PAGES).await;
-            assert!(partial.is_none(), "an explicit null ends the walk completely");
+            assert!(
+                partial.is_none(),
+                "an explicit null ends the walk completely"
+            );
         }
 
         #[tokio::test]

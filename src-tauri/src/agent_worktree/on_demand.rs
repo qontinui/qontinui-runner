@@ -3393,7 +3393,10 @@ mod tests {
             report.orphans[0].session_label, "unattributed-partial-coord-index",
             "the row itself must not claim a confident 'unattributed'"
         );
-        assert_eq!(report.orphans[0].attribution_source, "none_partial_coord_index");
+        assert_eq!(
+            report.orphans[0].attribution_source,
+            "none_partial_coord_index"
+        );
         assert_eq!(
             report.coord_ownership_partial.as_deref(),
             Some("stopped at the 100-page bound")
