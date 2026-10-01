@@ -667,6 +667,16 @@ fn door_health() -> &'static Mutex<DoorHealth> {
 /// 404s is exactly the case that must not run free.
 static ROUTE_ANSWERED: AtomicBool = AtomicBool::new(false);
 
+/// PURE: does this acquire answer prove coord serves the admission route? Only
+/// a parsed 2xx grant does. Every non-2xx — a 403 `device_principal_required`
+/// (a token that is not a paired device token: headless and temp runners), a
+/// 400 for a malformed body, a 401, a 5xx — is an UNKNOWN answer that must not
+/// flip [`ROUTE_ANSWERED`]: a 403 from a coord that predates admission's
+/// router would otherwise turn every later 404 into a regression.
+fn proves_route_served(admission: &Admission) -> bool {
+    matches!(admission, Admission::Granted { .. })
+}
+
 fn note_route_answered() {
     ROUTE_ANSWERED.store(true, Ordering::Relaxed);
 }
@@ -749,7 +759,7 @@ async fn acquire_at(
     if let Some(budget) = budget {
         note_budget(budget);
     }
-    if matches!(admission, Admission::Granted { .. }) {
+    if proves_route_served(&admission) {
         note_route_answered();
     }
     admission
@@ -1265,7 +1275,10 @@ pub async fn admit_continuation(origin: SpawnOrigin, work_key: &str) -> Continua
                     )
                 })
                 .unwrap_or_default();
-            info!("admission: {work_key} deferred — {detail}{budget}");
+            // Debug, not info: the dispatcher logs the one operator-facing
+            // line per poll (it stops asking after the first deferral), and a
+            // second line here would double it.
+            debug!("admission: {work_key} deferred — {detail}{budget}");
         }
         ContinuationAdmission::Admitted(_) => {}
     }
@@ -1445,6 +1458,46 @@ mod tests {
                 reason: UnknownReason::Transport(_)
             }
         ));
+    }
+
+    /// Coord answers 403 `device_principal_required` to a token that is not a
+    /// paired device token, and 400 to a malformed body. Both are UNKNOWN —
+    /// never a grant, never a hard refusal — take the local bucket even before
+    /// any 2xx (they are not the route-absent 404), and never prove the route.
+    #[test]
+    fn a_403_or_400_is_unknown_takes_the_bucket_and_does_not_prove_the_route() {
+        for status in [403u16, 400] {
+            let (a, budget) =
+                read_acquire(ok(status, r#"{"error":"device_principal_required"}"#), 1);
+            assert_eq!(
+                a,
+                Admission::Unknown {
+                    reason: UnknownReason::UnexpectedStatus(status)
+                }
+            );
+            assert_eq!(budget, None);
+            assert!(
+                !proves_route_served(&a),
+                "{status} must not flip the route bit"
+            );
+            let t0 = Instant::now();
+            let mut bucket = TokenBucket::new(1, 0, t0);
+            let fresh = DecideContext {
+                route_answered_before: false,
+                coord_refill_per_min: None,
+            };
+            match decide(a, fresh, &mut bucket, t0) {
+                ContinuationAdmission::Admitted(p) => {
+                    assert!(
+                        !p.passed_through_absent_route(),
+                        "{status} is not a pass-through"
+                    )
+                }
+                other => panic!("{status} with a full bucket admits on it, got {other:?}"),
+            }
+            assert_eq!(bucket.available(t0), 0, "{status} spent the local token");
+        }
+        assert!(proves_route_served(&grant()));
     }
 
     #[test]
