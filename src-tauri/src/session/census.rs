@@ -34,7 +34,7 @@
 //! | `account` | config-dir basename minus `.claude-`; `default` for `.claude` |
 //! | `last_acted_at` | `timestamp` of the last `user`/`assistant` line in the tail of `<config_dir>/projects/*/<session_id>.jsonl`, else registry `statusUpdatedAt`, else null — NEVER the file mtime (it moves with no new turn: coord finding `124c0ce9`) |
 //! | `tmux_pane` | Linux `/proc/<pid>/environ` `TMUX_PANE`, else the registry `tmux` locator's `%N` suffix |
-//! | `runner_hosted` | THIS runner hosts it (the session-message poller's own predicate, [`crate::mcp::session_message_poller::runner_hosts`]) OR its process ancestry includes ANY `qontinui-runner` process on the device ([`runner_ancestor`]) |
+//! | `runner_hosted` | THIS runner hosts it (the session-message poller's own predicate, [`crate::mcp::session_message_poller::runner_hosts`]) OR its NEAREST supervising process — the first `qontinui-runner` or `claude` ancestor — is a runner ([`runner_ancestor`]); a `claude` nested inside another session's tool call is not runner-hosted |
 //!
 //! `pid_alive` is always `true` here: [`read_live_sessions`] drops a registry
 //! row whose pid is not in the live process table (a crashed process cannot
@@ -47,7 +47,9 @@
 //! stores know nothing about. Judged by this runner's predicate alone they
 //! would read as "live but unhosted" and the poller would claim `no_pusher`
 //! for a session another runner can push to. The ppid walk closes that blind
-//! spot on Linux. On other OSes ancestry is not read ([`ANCESTRY_SUPPORTED`]):
+//! spot on Linux. The walk stops at the first `claude` ancestor too: a session
+//! started from a tool call inside a runner-hosted session has a runner above
+//! it but no pusher of its own. On other OSes ancestry is not read ([`ANCESTRY_SUPPORTED`]):
 //! `runner_hosted` is this runner's predicate alone and a live, unhosted
 //! session still reports `no_pusher` — the pre-ancestry behaviour.
 //!
@@ -222,9 +224,17 @@ fn retry_cache() -> &'static Mutex<RetryCache> {
     CELL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The tail reader [`last_turn_in_file_with`] is given — `read_tail` in
+/// production, injectable so a transient failure can be simulated.
+type TailReader<'a> = &'a dyn Fn(&Path, u64) -> Option<(Vec<u8>, bool)>;
+
 /// The last turn timestamp in ONE transcript file.
 fn last_turn_in_file(path: &Path) -> Option<DateTime<Utc>> {
-    let (bytes, truncated) = read_tail(path, TAIL_FIRST)?;
+    last_turn_in_file_with(path, &read_tail)
+}
+
+fn last_turn_in_file_with(path: &Path, read: TailReader<'_>) -> Option<DateTime<Utc>> {
+    let (bytes, truncated) = read(path, TAIL_FIRST)?;
     if let Some(t) = last_turn_in(&bytes, truncated) {
         return Some(t);
     }
@@ -239,7 +249,11 @@ fn last_turn_in_file(path: &Path) -> Option<DateTime<Utc>> {
             }
         }
     }
-    let found = read_tail(path, TAIL_RETRY).and_then(|(b, t)| last_turn_in(&b, t));
+    // Only a SUCCESSFUL read is cached: a transient failure (the file rotated,
+    // a permission blip) must be retried next tick, not remembered as "no
+    // turn line" for as long as the size holds.
+    let (bytes, truncated) = read(path, TAIL_RETRY)?;
+    let found = last_turn_in(&bytes, truncated);
     if let Ok(mut cache) = retry_cache().lock() {
         if cache.len() >= RETRY_CACHE_CAP {
             cache.clear();
@@ -332,6 +346,9 @@ const ANCESTRY_MAX_DEPTH: usize = 64;
 /// truncates `comm` to 15 bytes, which is exactly this string).
 const RUNNER_COMM: &str = "qontinui-runner";
 
+/// The Claude Code CLI's process name in `/proc/<pid>/comm`.
+const CLAUDE_COMM: &str = "claude";
+
 /// `(comm, ppid)` out of one `/proc/<pid>/stat` line. `comm` may itself
 /// contain spaces and parentheses, so it is the text between the FIRST `(`
 /// and the LAST `)`; `ppid` is the second field after that.
@@ -356,14 +373,23 @@ pub fn read_proc_stat(_pid: u32) -> Option<(String, u32)> {
     None
 }
 
-/// Does `pid`'s process ancestry include a `qontinui-runner` process — this
-/// runner or any other on the device? Walks ppids up to
-/// [`ANCESTRY_MAX_DEPTH`] through the injected reader.
+/// Is `pid`'s NEAREST supervising process a `qontinui-runner` — this runner
+/// or any other on the device? Walks ppids up to [`ANCESTRY_MAX_DEPTH`]
+/// through the injected reader and stops at the FIRST ancestor that is either
+/// a runner or another `claude` process.
 ///
-/// `Some(true)` a runner ancestor was found; `Some(false)` the walk reached
-/// init (pid ≤ 1) without one; `None` UNKNOWN — a link was unreadable (the
-/// process exited mid-walk, or the OS has no `/proc`), the tree cycled, or the
-/// depth bound was hit.
+/// The `claude` stop is what keeps a nested session honest: a `claude`
+/// started from a tool call inside a runner-hosted session has a runner far up
+/// its tree, but nothing pushes to IT — the runner's PTY belongs to the outer
+/// session. So `runner_hosted` means "its nearest supervisor is a runner", not
+/// "a runner is somewhere above it".
+///
+/// `Some(true)` the nearest supervisor is a runner; `Some(false)` it is
+/// another `claude`, or the walk reached init (pid ≤ 1) with neither; `None`
+/// UNKNOWN — a link was unreadable (the process exited mid-walk, or the OS has
+/// no `/proc`), the tree cycled, or the depth bound was hit. A CLI that runs
+/// under a different process name (e.g. `node`) is not recognised as a
+/// `claude` stop, so such a nested session still reads as hosted.
 pub fn runner_ancestor(pid: u32, read_stat: &dyn Fn(u32) -> Option<(String, u32)>) -> Option<bool> {
     let (_, mut cur) = read_stat(pid)?;
     for _ in 0..ANCESTRY_MAX_DEPTH {
@@ -373,6 +399,9 @@ pub fn runner_ancestor(pid: u32, read_stat: &dyn Fn(u32) -> Option<(String, u32)
         let (comm, ppid) = read_stat(cur)?;
         if comm.starts_with(RUNNER_COMM) {
             return Some(true);
+        }
+        if comm == CLAUDE_COMM {
+            return Some(false);
         }
         if ppid == cur {
             return None;
@@ -1098,6 +1127,65 @@ mod tests {
             _ => None,
         };
         assert_eq!(runner_ancestor(10, &me_runner), Some(false));
+    }
+
+    #[test]
+    fn a_claude_nested_in_a_runner_hosted_session_is_not_runner_hosted() {
+        // 900 (inner claude, started by a tool call) → 850 (bash) →
+        // 800 (outer claude, runner-hosted) → 700 (qontinui-runner) → 1
+        let tree = |pid: u32| match pid {
+            900 => Some(("claude".to_string(), 850)),
+            850 => Some(("bash".to_string(), 800)),
+            800 => Some(("claude".to_string(), 700)),
+            700 => Some(("qontinui-runner".to_string(), 1)),
+            _ => None,
+        };
+        assert_eq!(
+            runner_ancestor(800, &tree),
+            Some(true),
+            "outer: nearest is the runner"
+        );
+        assert_eq!(
+            runner_ancestor(900, &tree),
+            Some(false),
+            "inner: nearest supervisor is another claude, not a runner"
+        );
+    }
+
+    #[test]
+    fn a_transient_retry_failure_is_never_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-x");
+        let p = a.join("projects/p");
+        fs::create_dir_all(&p).unwrap();
+        let path = p.join(format!("{SID_A}.jsonl"));
+        let filler = format!(
+            "{{\"type\":\"progress\",\"pad\":\"{}\"}}\n",
+            "x".repeat(1000)
+        );
+        let mut body = String::from("{\"type\":\"user\",\"timestamp\":\"2026-10-01T03:00:00Z\"}\n");
+        for _ in 0..100 {
+            body.push_str(&filler);
+        }
+        fs::write(&path, body).unwrap();
+        // The first window reads; the wide retry fails transiently.
+        let flaky = |p: &Path, max: u64| {
+            if max == TAIL_FIRST {
+                read_tail(p, max)
+            } else {
+                None
+            }
+        };
+        assert_eq!(last_turn_in_file_with(&path, &flaky), None);
+        assert!(
+            !retry_cache().lock().unwrap().contains_key(&path),
+            "a failed read must not be cached"
+        );
+        // Next tick the read succeeds and finds the turn.
+        assert_eq!(
+            last_turn_in_file(&path).map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-10-01T03:00:00+00:00")
+        );
     }
 
     #[test]
