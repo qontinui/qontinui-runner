@@ -29,7 +29,7 @@ Ordered from *carried by the build* down to *found on the operator's disk*, then
 Where the Qontinui repo checkouts live on this box. This is the root every checkout-bound capability below is resolved relative to, so it is the row that explains most of the others: when it is `unresolved`, every `dev_checkout` and `operator_checkout` row downstream of it is unresolved too, and the manifest should be read from this row outward. A published install on an operator's machine is EXPECTED to have no workspace root at all — that is the normal case for the audience, not a fault.
 
 - Class: `path_resolution`
-- Resolved by: `workspace_paths::runner_workspace_root → qontinui_types::paths::qontinui_workspace_root`
+- Resolved by: `workspace_paths::runner_workspace_root_for_session → qontinui_types::paths::qontinui_workspace_root`
 - Expected rungs: operator_checkout, exe_relative_checkout, unresolved
 
 ### 2. `bundled_resources`
@@ -77,7 +77,7 @@ The named-subagent definitions written into a spawned session's `<cwd>/.claude/a
 The CHECKOUT copy of the same subagent definitions, read from `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off the operator's disk. It outranks the embedded floor, so on a box that has that sibling repo this row — not `fleet_agents` — decides what a session actually gets. Two sources for one asset, with nothing asserting they agree; when no root resolves, or the root holds no such sibling checkout, the copy is a no-op reported as `sibling_checkout_absent` with the embedded copy serving, and the spawn continues.
 
 - Class: `session_provisioning`
-- Resolved by: `agent_runtime::provision_agent_definitions_from_root`
+- Resolved by: `agent_runtime::provision_agent_definitions_from_root (AGENT_DEFS_SIBLING_REPO)`
 - Expected rungs: operator_checkout, unresolved
 
 ### 8. `agent_commands_registry`

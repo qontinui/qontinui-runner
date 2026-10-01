@@ -644,7 +644,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
             Rung::ExeRelativeCheckout,
             Rung::Unresolved,
         ],
-        anchor: "workspace_paths::runner_workspace_root → qontinui_types::paths::qontinui_workspace_root",
+        anchor: "workspace_paths::runner_workspace_root_for_session → qontinui_types::paths::qontinui_workspace_root",
     },
     CapabilitySpec {
         id: "bundled_resources",
@@ -743,7 +743,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       `sibling_checkout_absent` with the embedded copy serving, and the \
                       spawn continues.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
-        anchor: "agent_runtime::provision_agent_definitions_from_root",
+        anchor: "agent_runtime::provision_agent_definitions_from_root (AGENT_DEFS_SIBLING_REPO)",
     },
     CapabilitySpec {
         id: "agent_commands_registry",
