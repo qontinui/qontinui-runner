@@ -4177,6 +4177,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_gate_status",
     "coord_get_answer",
     "coord_get_prompt_document",
+    // The product glossary (plan
+    // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+    // Phase C2): a read of the table compiled into coord from qontinui-schemas,
+    // added by that phase's coord half on every curated floor
+    // (`agent_tool_access::TWIN_READ_TOOLS`) with an anonymous HTTP twin
+    // `GET /coord/glossary`. Withholding it here would protect nothing and only
+    // answer `-32601` for a definition. Until a coord build serving it is
+    // deployed, coord itself answers the call as an unknown tool.
+    "coord_glossary",
     "coord_inbox",
     "coord_is_commit_live",
     "coord_is_merge_safe",
@@ -11837,6 +11846,10 @@ pub fn create_router(
         // three layers (plan 2026-09-03-plan-library-write-door-nonce-authorized-…).
         .merge(crate::mcp::plan_library::routes())
         .merge(crate::mcp::session_briefing::routes())
+        // The compiled-in product glossary (plan
+        // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+        // C2). Stateless and credential-free; on origin_guard::FOREIGN_ROUTES.
+        .merge(crate::mcp::glossary::routes())
         // Claude Code session repository read door (plan
         // 2026-08-26-claude-code-session-repository-in-qontinui-web). READ ONLY:
         // the two list reads (`GET /session-repository`, `/unfinished`) plus the
@@ -15091,6 +15104,25 @@ mod coord_mcp_body_gate_tests {
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
         coord_mcp_body_gate(v.to_string().as_bytes()).map_err(|r| (r.id, r.message))
+    }
+
+    /// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`
+    /// Phase C2: the glossary read forwards, with and without its one argument,
+    /// and is not also recorded as a deliberate exclusion.
+    #[test]
+    fn glossary_read_is_forwarded() {
+        assert!(coord_mcp_tool_is_allowed("coord_glossary"));
+        assert!(!coord_mcp_withholding_is_deliberate("coord_glossary"));
+        for arguments in [serde_json::json!({}), serde_json::json!({"term": "gate"})] {
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"coord_glossary","arguments":arguments}
+                }))
+                .is_ok(),
+                "coord_glossary must be callable through the proxy"
+            );
+        }
     }
 
     /// Both membership tables are sorted — `binary_search` correctness.
