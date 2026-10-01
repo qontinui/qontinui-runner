@@ -196,6 +196,43 @@ describe("describeRemoteCreateFailure", () => {
     expect(unknownCode.explanation).toBe("who knows");
   });
 
+  /**
+   * The target's coord device drain refuses before either create dial is
+   * consulted, so the panel must not send the operator to a dial — and must
+   * keep "drained" apart from "could not tell".
+   */
+  it("names a drained target without blaming the create dial", () => {
+    const r = describeRemoteCreateFailure({
+      stage: "create",
+      code: "device_drained",
+      message:
+        "coord has drained this device (rebuild) — this remote terminal create was refused, not queued; nothing was spawned",
+    });
+    expect(r.headline).toMatch(/drained/);
+    expect(r.explanation).toMatch(/^coord has drained this device \(rebuild\)/);
+    const remedy = r.remedy.join("\n");
+    expect(remedy).toMatch(/Nothing was spawned/);
+    expect(remedy).toMatch(/not the create dial/);
+    expect(remedy).not.toContain("settings.json");
+    expect(r.strandedTerminalId).toBeNull();
+  });
+
+  it("keeps an unreadable drain state apart from a drained one", () => {
+    const r = describeRemoteCreateFailure({
+      stage: "create",
+      code: "drain_unreadable",
+      message:
+        "coord drain state unknown (coord drain state not read yet) — this remote terminal create was refused, not queued; nothing was spawned",
+    });
+    expect(r.headline).toMatch(/cannot read its own drain state/);
+    expect(r.headline).not.toMatch(/drained/);
+    const remedy = r.remedy.join("\n");
+    expect(remedy).toMatch(/fails closed/);
+    expect(remedy).toMatch(/Nothing was spawned/);
+    expect(remedy).not.toContain("settings.json");
+    expect(r.strandedTerminalId).toBeNull();
+  });
+
   /** A relay-side failure says the grant is spent and a terminal may exist. */
   it("says a timed-out create may still have spawned something", () => {
     const r = describeRemoteCreateFailure({

@@ -4771,6 +4771,24 @@ where
     }
 }
 
+/// The refusal message a drain-deferred relay create carries back to its source.
+///
+/// The drain gate's `reason` is written for work that IS re-run once the drain
+/// lifts ("… is deferred and runs once the drain lifts"). A relay create is
+/// one-shot: nothing re-presents it, so that tail would tell the remote
+/// operator to wait for something that never happens. Keep the state half —
+/// coord's drain window and the operator's reason, or the unknown cause — and
+/// say what actually happened to this request.
+fn relay_create_drain_message(reason: &str) -> String {
+    // The gate's own tail is the LAST " — " clause; the operator's drain reason
+    // or the unknown cause before it may contain one of their own.
+    let state = reason
+        .rsplit_once(" — ")
+        .map_or(reason, |(head, _)| head)
+        .trim();
+    format!("{state} — this remote terminal create was refused, not queued; nothing was spawned")
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): a relay create — web, mobile or a remote runner — is a remote
@@ -4794,7 +4812,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // `drain_unreadable` while the state is unknown, `device_drained`
             // only when coord said drained.
             "code": class.code(),
-            "message": reason,
+            "message": relay_create_drain_message(&reason),
             "request_id": data.get("request_id"),
         }));
     }
@@ -8758,5 +8776,50 @@ mod remote_create_registration_tests {
             .as_str()
             .unwrap()
             .contains("no HTTP answer"));
+    }
+}
+
+#[cfg(test)]
+mod relay_create_drain_message_tests {
+    use super::relay_create_drain_message;
+    use crate::coord_drain_state::{gate_for_at, CoordDrainState, DrainGate, SpawnOrigin};
+
+    fn reason_for(state: &CoordDrainState) -> String {
+        match gate_for_at(state, SpawnOrigin::Unknown, chrono::Utc::now()) {
+            DrainGate::Defer { reason, .. } => reason,
+            DrainGate::Allow => panic!("{state:?} should defer a relay create"),
+        }
+    }
+
+    /// Built from the gate's REAL reasons, so a reworded gate cannot leave the
+    /// relay saying the create "runs once the drain lifts".
+    #[test]
+    fn keeps_the_drain_state_and_drops_the_will_run_later_promise() {
+        let drained = relay_create_drain_message(&reason_for(&CoordDrainState::Drained {
+            until: None,
+            reason: Some("rebuild".to_string()),
+        }));
+        assert!(
+            drained.starts_with("coord has drained this device (rebuild) — "),
+            "{drained}"
+        );
+        let unknown = relay_create_drain_message(&reason_for(&CoordDrainState::Unknown {
+            since: chrono::Utc::now(),
+            cause: "coord drain state not read yet".to_string(),
+        }));
+        assert!(
+            unknown.starts_with("coord drain state unknown (coord drain state not read yet) — "),
+            "{unknown}"
+        );
+        for message in [&drained, &unknown] {
+            assert!(message.contains("refused, not queued"), "{message}");
+            assert!(message.contains("nothing was spawned"), "{message}");
+            assert!(!message.contains("runs once"), "{message}");
+            assert!(
+                !message.contains("until the state is read again"),
+                "{message}"
+            );
+            assert_eq!(message.matches(" — ").count(), 1, "{message}");
+        }
     }
 }
