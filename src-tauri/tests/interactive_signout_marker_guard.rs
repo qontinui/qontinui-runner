@@ -47,6 +47,12 @@
 
 use std::path::{Path, PathBuf};
 
+// The shared `is_test_only_file` predicate (plan
+// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b): one
+// definition, compiled into this gate by path rather than copied into it.
+#[path = "../src/source_lex.rs"]
+mod source_lex;
+
 /// Defines `persist_pairing` itself; must stay marker-agnostic so the
 /// background refresher can never clear the marker through it.
 const PERSIST_PAIRING_DEFINITION: &str = "pair.rs";
@@ -202,6 +208,11 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// block-comment continuations) are dropped entirely; inline `/* … */` and
 /// trailing `//` comments are stripped from otherwise-code lines.
 fn production_lines(text: &str) -> Vec<String> {
+    // A file opening `#![cfg(test)]` (an extracted test module) is test code
+    // end to end: it carries no in-file `#[cfg(test)]` region to track.
+    if source_lex::is_test_only_file(text) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut depth: i32 = 0;
     let mut pending_cfg_test = false;
@@ -231,6 +242,19 @@ fn production_lines(text: &str) -> Vec<String> {
             cfg_test_active = true;
             cfg_test_depth = depth;
             pending_cfg_test = false;
+        } else if pending_cfg_test
+            && raw
+                .split("//")
+                .next()
+                .unwrap_or("")
+                .trim_end()
+                .ends_with(';')
+        {
+            // A braceless `#[cfg(test)]` item — `mod x;` (what the test-module
+            // extraction leaves in the parent), a `use`, a `const` — ends here.
+            // Left pending, it would latch onto the NEXT braced item, which is
+            // production code.
+            pending_cfg_test = false;
         }
         depth += opens - closes;
         if cfg_test_active && depth <= cfg_test_depth {
@@ -238,6 +262,39 @@ fn production_lines(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// An extracted test module's clear is test code, not a production clearer;
+/// the same line in a production file is still seen (the control).
+#[test]
+fn an_extracted_test_only_file_has_no_production_lines() {
+    let body = "fn t(s: &S) {\n    s.clear_interactive_signed_out();\n}\n";
+    let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+    assert!(
+        !production_lines(&extracted)
+            .iter()
+            .any(|l| l.contains(CLEAR_CALL)),
+        "a `#![cfg(test)]` file's clear was read as production"
+    );
+    assert!(
+        production_lines(body)
+            .iter()
+            .any(|l| l.contains(CLEAR_CALL)),
+        "control: the scan sees the same clear in a production file"
+    );
+}
+
+/// The parent the extraction leaves behind: `#[cfg(test)]` on a braceless
+/// `mod tests;`. The production item AFTER it is still production.
+#[test]
+fn production_after_an_out_of_line_test_mod_is_still_scanned() {
+    let parent = "#[cfg(test)]\nmod tests;\n\npub fn prod(s: &S) {\n    s.clear_interactive_signed_out();\n}\n";
+    assert!(
+        production_lines(parent)
+            .iter()
+            .any(|l| l.contains(CLEAR_CALL)),
+        "the `#[cfg(test)] mod tests;` line hid the production fn after it"
+    );
 }
 
 /// Remove single-line `/* … */` block comments and a trailing `// …` line
