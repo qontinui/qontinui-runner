@@ -233,17 +233,23 @@ pub(crate) enum PinTiming {
 pub(crate) struct PinSurface {
     pub surface: &'static str,
     pub timing: PinTiming,
-    /// Where the read is: `file::fn`. Named by function rather than line so it
-    /// does not go stale on the next unrelated edit.
-    pub evidence: &'static str,
+    /// Every function that reads the pin for this surface, as
+    /// `<path under src-tauri/src>::<fn>`. Structured (one reader per entry)
+    /// so the source-scan guard can check it: a pin read in a function named
+    /// neither here nor in [`PIN_READER_EXCLUSIONS`] fails the build's tests.
+    #[serde(rename = "evidence")]
+    pub readers: &'static [&'static str],
     pub detail: &'static str,
 }
 
-/// Every consumer of the machine pin, classified per-use vs startup. Built
-/// from a grep of every `resolve_tenant_pin` / `resolve_active_tenant_id` /
-/// `active_tenant_uuid` / `active_tenant_id_str` reader, excluding tests, this
-/// module's own readout, and one-shot diagnostics (`coord_doctor`), which read
-/// per invocation.
+/// Every consumer of the machine pin, classified per-use vs startup.
+///
+/// Kept honest by `commands::tenant::tests::every_pin_reader_is_classified`,
+/// which scans `src-tauri/src` (test modules excluded) for each call or path
+/// reference to `resolve_tenant_pin`, `resolve_active_tenant_id`,
+/// `active_tenant_uuid`, `active_tenant_id_str` and `machine_pin_tenant`, and
+/// requires the enclosing function to be named here or in
+/// [`PIN_READER_EXCLUSIONS`].
 ///
 /// Sessions that ALREADY exist are not a surface here. Whether one moves
 /// depends on how its tenant was held at creation, which is what the
@@ -253,72 +259,141 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "new_session_tenant",
         timing: PinTiming::Live,
-        evidence: "session/mod.rs::resolve_new_session_tenant \
-                   (also claude_session/coord_register.rs::AiCoordRegistrar::new, \
-                   ::federation_session_tenant)",
-        detail: "the tenant a NEW session is recorded under, read at its creation",
+        readers: &["session/mod.rs::resolve_new_session_tenant"],
+        detail: "the tenant a NEW session is recorded under, read at its creation \
+                 (also reached through claude_session/coord_register.rs, which calls this \
+                 resolver per registration)",
     },
     PinSurface {
-        surface: "coord_mcp_new_nonce_mint",
+        surface: "coord_mcp_mint_and_provisioning",
         timing: PinTiming::Live,
-        evidence: "coord_mcp.rs::mint_and_register_nonce_with (MintPin::MachineNow)",
-        detail: "a new coord-mcp binding with no spawn-chosen tenant samples the pin at mint \
-                 and, if pinned, freezes it for the binding's life",
+        readers: &[
+            "coord_mcp.rs::mint_and_register_nonce_with",
+            "coord_mcp.rs::reusable_in_cwd_device_nonce",
+            "coord_mcp.rs::cwd_key_pinned_away_from_machine",
+            "coord_mcp.rs::record_terminal_coord_mcp_delivery",
+            "coord_mcp.rs::deliver_terminal_coord_mcp_unrecorded",
+        ],
+        detail: "a new coord-mcp key with no spawn-chosen tenant samples the pin at mint and, \
+                 if pinned, freezes it for the key's life; provisioning decides key reuse and \
+                 records the spawn-default pin per terminal",
     },
     PinSurface {
         surface: "coord_mcp_unpinned_session_requests",
         timing: PinTiming::Live,
-        evidence: "coord_mcp.rs::decide_session_tenant rows 2-4 \
-                   (via session_tenant_or_refuse / session_tenant_decision)",
-        detail: "a binding frozen unpinned re-reads the pin on every proxied request; one \
-                 frozen pinned (row 1) does not",
+        readers: &[
+            "coord_mcp.rs::session_tenant_or_refuse",
+            "coord_mcp.rs::session_tenant_decision",
+        ],
+        detail: "a key frozen unpinned (live or graced) re-reads the pin on every proxied \
+                 request (decide_session_tenant rows 2-4); one frozen pinned (row 1) does not",
     },
     PinSurface {
         surface: "device_jwt_refresher",
         timing: PinTiming::Live,
-        evidence: "mcp/device_jwt_refresher.rs::refresher_loop, \
-                   ::publish_coord_credential_status, ::read_sweep_inputs",
+        readers: &[
+            "mcp/device_jwt_refresher.rs::refresher_loop",
+            "mcp/device_jwt_refresher.rs::publish_coord_credential_status",
+            "mcp/device_jwt_refresher.rs::read_sweep_inputs",
+        ],
         detail: "re-read on each refresher tick (5 min) and each slot sweep",
     },
     PinSurface {
         surface: "device_level_publishers",
         timing: PinTiming::Live,
-        evidence: "agent_worktree/census.rs::build_and_publish, ::resolve_volume_poster; \
-                   agent_worktree/fs_backstop.rs::tick_once; \
-                   agent_worktree/maintenance_executor.rs::report_reset_git_op; \
-                   fleet/resource_sample.rs::publish_once",
-        detail: "re-read on each publish/tick; the volume poster is rebuilt when the tenant \
-                 in its key changes",
+        readers: &[
+            "agent_worktree/census.rs::resolve_tenant_id",
+            "agent_worktree/fs_backstop.rs::resolve_tenant_id",
+            "agent_worktree/maintenance_executor.rs::resolve_tenant_id",
+            "fleet/resource_sample.rs::resolve_tenant_id",
+        ],
+        detail: "each module's resolver is called per publish/tick (census build_and_publish \
+                 and resolve_volume_poster, which rebuilds the poster when the tenant in its \
+                 key changes; fs_backstop tick_once; maintenance report_reset_git_op; \
+                 resource_sample publish_once)",
     },
     PinSurface {
         surface: "session_outbox_tenant_backfill",
         timing: PinTiming::Live,
-        evidence: "session/coord_sync.rs::push_record, ::rebuild_create_body",
+        readers: &[
+            "session/coord_sync.rs::push_record",
+            "session/coord_sync.rs::rebuild_create_body",
+        ],
         detail: "fills the tenant only for records that carry none, read per record",
     },
     PinSurface {
         surface: "per_request_readouts",
         timing: PinTiming::Live,
-        evidence: "mcp_api.rs::health; commands/session_info.rs::read_session_tenancy; \
-                   mcp/ui_bridge/gated_flow.rs::ui_bridge_session_handler; \
-                   repo_detection.rs::register_repo_with_coord",
-        detail: "read per request",
+        readers: &[
+            "mcp_api.rs::health",
+            "commands/session_info.rs::read_session_tenancy",
+            "mcp/ui_bridge/gated_flow.rs::ui_bridge_session_handler",
+            "repo_detection.rs::register_repo_with_coord",
+            "coord_mcp.rs::report_for",
+            "commands/tenant.rs::active_tenant_view",
+            "commands/tenant.rs::read_active_tenant_id",
+        ],
+        detail: "read per request (/health, session info, the ui-bridge session route, repo \
+                 registration, the coord-mcp doctor, GET /tenant/active)",
     },
     PinSurface {
         surface: "session_coordination_dual_write_gate",
         timing: PinTiming::NextStart,
-        evidence: "session/dual_write.rs::DualWriteGate::new; \
-                   session/coord_sync.rs::CoordSync::start_flag_poll_task",
-        detail: "the gate resolves its tenant once at construction and the flag poll is \
-                 started only for that tenant; this process keeps both",
+        readers: &[
+            "session/dual_write.rs::new",
+            "session/coord_sync.rs::start_flag_poll_task",
+        ],
+        detail: "DualWriteGate::new resolves its tenant once at construction and the flag poll \
+                 is started only for that tenant; this process keeps both",
     },
     PinSurface {
         surface: "coord_mcp_nonce_restore",
         timing: PinTiming::NextStart,
-        evidence: "coord_mcp.rs::restore_proxy_nonces_from (restore_time_pin)",
-        detail: "persisted bindings with no recorded tenant take the pin as sampled once at \
-                 boot; bindings already restored count under existing_sessions",
+        readers: &["coord_mcp.rs::restore_proxy_nonces_from"],
+        detail: "persisted keys with no recorded tenant take the pin as sampled once at boot; \
+                 keys already restored count under existing_sessions",
     },
+    PinSurface {
+        surface: "coord_mcp_on_disk_nonce_adoption",
+        timing: PinTiming::NextStart,
+        readers: &["coord_mcp.rs::adopt_on_disk_nonce"],
+        detail: "the boot reconcile (reconcile_root_config_at, reconcile_session_configs, run \
+                 from the mcp_api startup block) adopts on-disk .mcp.json keys with the pin as \
+                 read then; adopted keys count under existing_sessions",
+    },
+];
+
+/// Pin readers that are deliberately NOT a [`PinSurface`], with the reason.
+/// Same `<path>::<fn>` form; the guard test accepts a function named here.
+pub(crate) const PIN_READER_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "ambient.rs::active_tenant_uuid",
+        "the accessor itself; classified at its callers",
+    ),
+    (
+        "session/dual_write.rs::resolve_active_tenant_id",
+        "a delegate to resolve_tenant_pin; every caller is scanned and classified",
+    ),
+    (
+        "coord_doctor.rs::read_active_tenant_id_from_machine_json",
+        "diagnostic; reads per invocation and changes nothing",
+    ),
+    (
+        "coord_doctor.rs::read_coord_tenant_bindings",
+        "diagnostic; reads per invocation and changes nothing",
+    ),
+    (
+        "coord_doctor.rs::resolve_coord_mcp_door",
+        "diagnostic; reads per invocation and changes nothing",
+    ),
+    (
+        "session_archive/mod.rs::machine_pin_tenant",
+        "CLI only (qontinui-pr session-archive backfill), not the runner process",
+    ),
+    (
+        "bin/qontinui_cli.rs::session_archive_backfill",
+        "CLI only, not the runner process",
+    ),
 ];
 
 /// The pin as it stands, plus the bound tenants a switch may choose from.
@@ -480,11 +555,12 @@ pub(crate) fn apply_active_tenant(tenant_id: &str) -> Result<String, SetActiveTe
 
 /// The success payload both doors return after [`apply_active_tenant`].
 ///
-/// `existing_sessions` is measured, not asserted: a coord-mcp binding frozen
-/// `Pinned` at creation keeps its tenant, while one frozen unpinned — the
-/// normal single-tenant shape, and a restored or adopted nonce with no recorded
-/// tenant — follows the new pin on its next request. So an unpinned → pinned
-/// switch, the likely first headless use, DOES move running sessions.
+/// `existing_sessions` is measured, not asserted: a coord-mcp key (live or
+/// graced) frozen `Pinned` at creation keeps its tenant, while one frozen
+/// unpinned — the normal single-tenant shape, and a restored or adopted key
+/// with no recorded tenant — follows the new pin on its next request. So an
+/// unpinned → pinned switch, the likely first headless use, DOES move running
+/// sessions. Reads both proxy registries, so call it off the async executor.
 pub(crate) fn applied_payload(
     active_tenant_id: &str,
     previous: Option<String>,
@@ -506,7 +582,8 @@ pub(crate) fn applied_payload(
                 "effect": "use the new pin on their next coord-mcp request, unless their \
                            workspace declares a tenant (so the count is an upper bound)",
             },
-            "scope": "live device coord-mcp bindings in this runner process",
+            "scope": "device coord-mcp keys in this runner process, live and graced \
+                      (evicted keys keep serving for the grace TTL)",
         },
     })
 }
@@ -866,5 +943,247 @@ mod tests {
             Err(SetActiveTenantError::Malformed("nope".into()))
         );
         assert_eq!(apply_active_tenant("  "), Err(SetActiveTenantError::Empty));
+    }
+
+    // ------------------------------------------------------------------
+    // PIN_SURFACES is checked against the SOURCE, not against itself.
+    // ------------------------------------------------------------------
+
+    /// The pin-reading spellings the guard looks for.
+    const PIN_READER_TOKENS: &[&str] = &[
+        "resolve_tenant_pin",
+        "resolve_active_tenant_id",
+        "active_tenant_uuid",
+        "active_tenant_id_str",
+        "machine_pin_tenant",
+    ];
+
+    fn src_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// The name after the first `fn ` on `line`, if any.
+    fn fn_name_on(line: &str) -> Option<String> {
+        let mut rest = line;
+        while let Some(i) = rest.find("fn ") {
+            let before_ok = rest
+                .get(..i)
+                .and_then(|b| b.chars().last())
+                .is_none_or(|c| !is_ident(c));
+            let after = rest.get(i + 3..).unwrap_or("");
+            if before_ok {
+                let name: String = after
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| is_ident(*c))
+                    .collect();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+            rest = after;
+        }
+        None
+    }
+
+    /// Does `line` CALL or PATH-REFERENCE `tok` (not merely name a field or
+    /// define the fn)? A use is `tok(` or `::tok` / `.tok(`.
+    fn uses_token(line: &str, tok: &str) -> bool {
+        let mut from = 0;
+        while let Some(off) = line.get(from..).and_then(|rest| rest.find(tok)) {
+            let i = from + off;
+            let end = i + tok.len();
+            let before = line.get(..i).unwrap_or("");
+            let after = line.get(end..).unwrap_or("");
+            let bounded = before.chars().last().is_none_or(|c| !is_ident(c))
+                && after.chars().next().is_none_or(|c| !is_ident(c));
+            let is_def = before.trim_end().ends_with("fn");
+            // Inside a string literal (an odd number of quotes before it) is a
+            // mention, not a read — `PIN_READER_EXCLUSIONS` itself is one.
+            let in_string = before.matches('"').count() % 2 == 1;
+            let is_use = after.starts_with('(') || before.ends_with("::");
+            if bounded && !is_def && is_use && !in_string {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// Every `(path::fn)` whose body reads the pin, outside test modules.
+    ///
+    /// Heuristics, stated so a failure is readable: a column-0
+    /// `#[cfg(test)]` followed by a column-0 `mod` skips to the next
+    /// column-0 `}`; files named `tests.rs` or under a `tests/` dir are
+    /// skipped; `//` lines are skipped; the enclosing function is the last
+    /// `fn <name>` seen above the use.
+    fn scan_pin_readers() -> std::collections::BTreeSet<String> {
+        let root = src_root();
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "tests") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs")
+                    || path.file_name().is_some_and(|n| n == "tests.rs")
+                {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let src = std::fs::read_to_string(&path).unwrap();
+                let lines: Vec<&str> = src.lines().collect();
+                let mut current_fn = String::from("<none>");
+                let mut i = 0;
+                while i < lines.len() {
+                    let line = lines[i];
+                    if line == "#[cfg(test)]" {
+                        let mut j = i + 1;
+                        while j < lines.len() && lines[j].starts_with("#[") {
+                            j += 1;
+                        }
+                        let next = lines.get(j).copied().unwrap_or("");
+                        if next.starts_with("mod ")
+                            || next.starts_with("pub mod ")
+                            || next.starts_with("pub(crate) mod ")
+                        {
+                            i = j + 1;
+                            while i < lines.len() && lines[i] != "}" {
+                                i += 1;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if line.trim_start().starts_with("//") {
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(name) = fn_name_on(line) {
+                        current_fn = name;
+                    }
+                    if PIN_READER_TOKENS.iter().any(|t| uses_token(line, t)) {
+                        out.insert(format!("{rel}::{current_fn}"));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_pin_reader_is_classified() {
+        let named: std::collections::BTreeSet<&str> = PIN_SURFACES
+            .iter()
+            .flat_map(|s| s.readers.iter().copied())
+            .chain(PIN_READER_EXCLUSIONS.iter().map(|(r, _)| *r))
+            .collect();
+        let found = scan_pin_readers();
+        assert!(
+            found.len() >= 20,
+            "the scan found only {} readers — it has stopped seeing the tree: {found:?}",
+            found.len()
+        );
+        let unclassified: Vec<&String> = found
+            .iter()
+            .filter(|r| !named.contains(r.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "pin readers named in neither PIN_SURFACES nor PIN_READER_EXCLUSIONS — classify \
+             each as live or next_start (read the code), or exclude it with a reason: \
+             {unclassified:?}"
+        );
+    }
+
+    /// Every named reader names a function that EXISTS in that file, so an
+    /// entry cannot rot into a pointer at nothing.
+    #[test]
+    fn every_named_reader_exists() {
+        let root = src_root();
+        for reader in PIN_SURFACES
+            .iter()
+            .flat_map(|s| s.readers.iter().copied())
+            .chain(PIN_READER_EXCLUSIONS.iter().map(|(r, _)| *r))
+        {
+            let (file, func) = reader.rsplit_once("::").expect("<path>::<fn>");
+            let src = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("{reader}: {file} unreadable: {e}"));
+            assert!(
+                src.lines().any(|l| fn_name_on(l).as_deref() == Some(func)),
+                "{reader}: no `fn {func}` in {file}"
+            );
+        }
+    }
+
+    /// The startup readers, exactly — by function, not by surface label.
+    #[test]
+    fn next_start_readers_are_exactly_the_startup_reads() {
+        let next_start: std::collections::BTreeSet<&str> = PIN_SURFACES
+            .iter()
+            .filter(|s| s.timing == PinTiming::NextStart)
+            .flat_map(|s| s.readers.iter().copied())
+            .collect();
+        assert_eq!(
+            next_start,
+            [
+                "coord_mcp.rs::adopt_on_disk_nonce",
+                "coord_mcp.rs::restore_proxy_nonces_from",
+                "session/coord_sync.rs::start_flag_poll_task",
+                "session/dual_write.rs::new",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    /// The scanner's own heuristics, on synthetic source.
+    #[test]
+    fn token_use_detection_ignores_fields_and_definitions() {
+        assert!(uses_token(
+            "let p = resolve_tenant_pin();",
+            "resolve_tenant_pin"
+        ));
+        assert!(uses_token(
+            ".or_else(crate::x::resolve_active_tenant_id)",
+            "resolve_active_tenant_id"
+        ));
+        assert!(uses_token("doc.active_tenant_uuid()", "active_tenant_uuid"));
+        assert!(!uses_token(
+            "pub fn resolve_tenant_pin() -> T {",
+            "resolve_tenant_pin"
+        ));
+        assert!(!uses_token(
+            "    pub machine_pin_tenant: Option<Uuid>,",
+            "machine_pin_tenant"
+        ));
+        assert!(!uses_token(
+            "opts.machine_pin_tenant,",
+            "machine_pin_tenant"
+        ));
+        assert!(!uses_token("resolve_tenant_pins()", "resolve_tenant_pin"));
+        assert!(!uses_token(
+            r#"        "session/dual_write.rs::resolve_active_tenant_id","#,
+            "resolve_active_tenant_id"
+        ));
+        assert_eq!(
+            fn_name_on("    pub(crate) async fn foo_bar(x: u8) {").as_deref(),
+            Some("foo_bar")
+        );
+        assert_eq!(fn_name_on("let f = |x| x;"), None);
     }
 }
