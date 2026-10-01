@@ -1136,6 +1136,11 @@ fn unhosted_reason(
             "live on this device (session census) and hosted by no runner — no push primitive \
              reaches it; delivered only by the recipient's coord_inbox pull",
         )
+    } else if verdict == LocalVerdict::LiveUnderARunner {
+        (
+            BlockReason::TargetNotLive,
+            "live under another runner on this device (session census); not hosted by this runner",
+        )
     } else {
         (BlockReason::TargetNotLive, "no live session on this device")
     }
