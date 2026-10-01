@@ -520,6 +520,12 @@ mod tests {
 
     #[test]
     fn test_retry_succeeds_on_second_attempt() {
+        // The 429 below reaches `rotate_account_on_rate_limit`, which WRITES
+        // `RESOLVED_CONFIG_DIR` when the roster holds two or more accounts.
+        // An isolated ambient makes the roster empty (rotation returns false
+        // before writing), and the fleet pin serializes this test against the
+        // one that publishes a temp dir there.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         use std::sync::atomic::{AtomicU32, Ordering};
         let call_count = AtomicU32::new(0);
 

@@ -839,12 +839,15 @@ mod tests {
     ///
     /// Deliberately `Manual`-only: the `LeastUsage` arms read the process-global
     /// `RESOLVED_CONFIG_DIR`. What IS serialized: every test holding
-    /// `pin_account_selection_for_test` — this one,
-    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` (the only
-    /// test that writes `RESOLVED_CONFIG_DIR`), and the `config_report_cmd`
-    /// tests that reach `get_effective_config_dir` through the report. A test
-    /// reading `RESOLVED_CONFIG_DIR` WITHOUT that pin is not serialized
-    /// against the writer.
+    /// `pin_account_selection_for_test` (directly or through
+    /// `isolated_ambient_with_fleet_pin`) — this one,
+    /// `effective_config_dir_follows_the_fleet_mode_unless_pinned` (the one test
+    /// that publishes a dir there), the `config_report_cmd` tests that reach
+    /// `get_effective_config_dir` through the report, and
+    /// `retry::tests::test_retry_succeeds_on_second_attempt` (whose 429 reaches
+    /// `rotate_account_on_rate_limit`, a writer it keeps inert with an empty
+    /// roster). A test touching `RESOLVED_CONFIG_DIR` WITHOUT that pin is not
+    /// serialized against them.
     #[test]
     fn effective_config_dir_distinguishes_unconfigured_from_dead_credentials() {
         // The mode is resolved against the process-global fleet cache; pin it
@@ -915,11 +918,14 @@ mod tests {
     ///
     /// Held under the fleet pin for the whole test. That serializes it against
     /// every test that also takes `pin_account_selection_for_test` — and ONLY
-    /// those: the other tests in this module and the `config_report_cmd` tests
-    /// that reach `get_effective_config_dir`. `RESOLVED_CONFIG_DIR` is set
+    /// those: the other tests in this module, the `config_report_cmd` tests
+    /// that reach `get_effective_config_dir`, and the retry test whose 429
+    /// reaches `rotate_account_on_rate_limit`. `RESOLVED_CONFIG_DIR` is set
     /// explicitly per arm and restored on drop, and the restore guard is
     /// declared AFTER the temp dirs so it drops FIRST: a deleted path is never
-    /// left published. No other test in this crate writes it.
+    /// left published. This is the only test that publishes a dir there; the
+    /// retry test reaches the rotation writer, but with an empty roster it
+    /// returns before writing.
     #[test]
     fn effective_config_dir_follows_the_fleet_mode_unless_pinned() {
         let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
