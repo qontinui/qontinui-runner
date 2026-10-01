@@ -11,7 +11,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
 | `supervisor_dependency` | 50 | 50 | 0 | 40 | 4 | 6 |
-| `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
+| `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
@@ -163,7 +163,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/orchestration_loop/remote_client.rs` | `SupervisorClient::<impl>` | `impl SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on. |
 | `src/orchestration_loop/remote_client.rs` | `struct SupervisorClient` | `pub struct SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — The supervisor HTTP client used by the user-facing orchestration loop. |
 
-## `plans_dir` (32 rows)
+## `plans_dir` (34 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -196,7 +196,9 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/plan_workunit_adapter/trigger.rs` | `LoopState::apply_resolution` | `setting = "paths.plans_dir",` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `ResolvedDirs::resolve` | `plans: resolve_plans_dir(inputs.plans_dir, &no_tenant_overrides, None),` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `record_scan_divergence` | `plans_dir = ?divergence.plans_dir,` | 2 | unreviewed |
-| `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `"plans_dir_migration: recorded paths.plans_dir = {value:?} from the retired env \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `"plans_dir_migration: kept existing setting: paths.plans_dir is already set, \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `"plans_dir_migration: seeded from {var}: recorded paths.plans_dir = {value:?}. \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `{PLANS_DIR_ENV}{ignored}). paths.plans_dir stays unset, so the \` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
