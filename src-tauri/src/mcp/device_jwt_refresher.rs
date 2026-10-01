@@ -8980,9 +8980,11 @@ mod tenant_slot_refresh_tests {
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
         for (file, item) in [
             ("src/commands/auth.rs", "async fn finalize_signed_in("),
+            // Both pair-code redeem doors (the interactive command and the
+            // refresher's operator-authorized redeem) run this shared core.
             (
                 "src/commands/web_integration.rs",
-                "pub async fn redeem_pair_code(",
+                "pub(crate) async fn complete_pairing_after_redeem(",
             ),
         ] {
             // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
