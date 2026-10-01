@@ -23,8 +23,9 @@
 //!
 //! No transcript content (only the `timestamp` of its last turn line — `type`
 //! and `timestamp` are the only keys ever deserialized), no environment values
-//! (the one `TMUX_PANE` variable is extracted from `/proc/<pid>/environ` and
-//! everything else in that buffer is dropped unread), no credentials.
+//! (`/proc/<pid>/environ` is read whole into memory, scanned for the one
+//! `TMUX_PANE` entry, and the buffer is dropped when the function returns —
+//! nothing else in it is copied, stored or logged), no credentials.
 //!
 //! ## Field sources (contract §2)
 //!
@@ -33,23 +34,34 @@
 //! | `account` | config-dir basename minus `.claude-`; `default` for `.claude` |
 //! | `last_acted_at` | `timestamp` of the last `user`/`assistant` line in the tail of `<config_dir>/projects/*/<session_id>.jsonl`, else registry `statusUpdatedAt`, else null — NEVER the file mtime (it moves with no new turn: coord finding `124c0ce9`) |
 //! | `tmux_pane` | Linux `/proc/<pid>/environ` `TMUX_PANE`, else the registry `tmux` locator's `%N` suffix |
-//! | `runner_hosted` | the session-message poller's own "live local session the runner hosts" predicate ([`crate::mcp::session_message_poller::runner_hosts`]) |
+//! | `runner_hosted` | THIS runner hosts it (the session-message poller's own predicate, [`crate::mcp::session_message_poller::runner_hosts`]) OR its process ancestry includes ANY `qontinui-runner` process on the device ([`runner_ancestor`]) |
 //!
 //! `pid_alive` is always `true` here: [`read_live_sessions`] drops a registry
 //! row whose pid is not in the live process table (a crashed process cannot
 //! delete its own file), so a row in the snapshot is a live process. A dead
 //! session is reported by its ABSENCE from a fresh snapshot.
 //!
+//! ## Why ancestry, not only this runner's predicate
+//!
+//! A secondary/temp runner on the same device hosts sessions THIS runner's
+//! stores know nothing about. Judged by this runner's predicate alone they
+//! would read as "live but unhosted" and the poller would claim `no_pusher`
+//! for a session another runner can push to. The ppid walk closes that blind
+//! spot on Linux. On other OSes ancestry is not read ([`ANCESTRY_SUPPORTED`]):
+//! `runner_hosted` is this runner's predicate alone and a live, unhosted
+//! session still reports `no_pusher` — the pre-ancestry behaviour.
+//!
 //! ## Failure posture
 //!
 //! Best-effort throughout. An indeterminate process snapshot skips the tick
 //! (posting an empty set would read as "every session on this device died");
-//! a failed POST is logged once per state change, never per tick; nothing
-//! here can panic the loop or block the lifecycle poll.
+//! a failed POST is logged once per state change, never per tick; the
+//! filesystem walk runs on the blocking pool, so nothing here can panic the
+//! loop or stall an async worker.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -88,6 +100,10 @@ pub struct CensusRow {
     pub registry_status_updated_at: Option<String>,
     pub last_acted_at: Option<String>,
     pub runner_hosted: bool,
+    /// Local only, never posted: did the ppid walk find a `qontinui-runner`
+    /// ancestor? `None` = not read (non-Linux) or unreadable mid-walk.
+    #[serde(skip)]
+    pub runner_ancestor: Option<bool>,
 }
 
 /// The whole-device snapshot body.
@@ -131,6 +147,17 @@ fn ms_to_rfc3339(ms: i64) -> Option<String> {
         .map(|t| t.to_rfc3339())
 }
 
+/// A hyphenated, 36-character UUID — the only shape of session id this module
+/// will splice into a file name. A registry row is written by another program,
+/// so an id like `../x` must never reach a path join.
+pub fn is_uuid_shaped(s: &str) -> bool {
+    s.len() == 36 && uuid::Uuid::try_parse(s).is_ok()
+}
+
+// ===========================================================================
+// last_acted_at — the last turn line's own timestamp
+// ===========================================================================
+
 /// The tail window [`last_acted_at`] reads first, and the wider one it
 /// retries with when the first held no complete turn line (one tool result can
 /// exceed 64 KB on its own).
@@ -147,12 +174,32 @@ struct TurnStamp {
     timestamp: Option<String>,
 }
 
-/// The `timestamp` of the LAST `user`/`assistant` line in `tail`, or `None`.
-/// The first line of a tail window may be cut mid-record; it simply fails to
-/// parse and is skipped.
-fn last_turn_in(tail: &str) -> Option<DateTime<Utc>> {
-    tail.lines().rev().find_map(|line| {
-        let stamp: TurnStamp = serde_json::from_str(line).ok()?;
+/// The last `max` bytes of `path`, and whether the window starts mid-file
+/// (so its first line is probably a fragment).
+fn read_tail(path: &Path, max: u64) -> Option<(Vec<u8>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let truncated = len > max;
+    if truncated {
+        file.seek(SeekFrom::Start(len - max)).ok()?;
+    }
+    let mut bytes = Vec::with_capacity(len.min(max) as usize);
+    file.take(max).read_to_end(&mut bytes).ok()?;
+    Some((bytes, truncated))
+}
+
+/// The `timestamp` of the LAST `user`/`assistant` line in a tail window, or
+/// `None`. Lines are decoded one at a time and LOSSILY, so a multibyte
+/// character a writer has only half-flushed spoils one line, never the window;
+/// a fragment that fails to parse is simply skipped. When the window starts
+/// mid-file its first line is dropped as a fragment.
+fn last_turn_in(bytes: &[u8], truncated: bool) -> Option<DateTime<Utc>> {
+    let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    let skip = usize::from(truncated);
+    lines.iter().skip(skip).rev().find_map(|raw| {
+        let line = String::from_utf8_lossy(raw);
+        let stamp: TurnStamp = serde_json::from_str(line.trim()).ok()?;
         if !matches!(stamp.kind.as_deref(), Some("user" | "assistant")) {
             return None;
         }
@@ -160,6 +207,46 @@ fn last_turn_in(tail: &str) -> Option<DateTime<Utc>> {
             .ok()
             .map(|t| t.with_timezone(&Utc))
     })
+}
+
+/// Results of the 1 MB retry, keyed by `(path, size)`. A transcript whose final
+/// line alone exceeds the first window would otherwise be re-read at 1 MB on
+/// every tick while it sits idle; an unchanged size means an unchanged tail
+/// for an append-only file. Cleared wholesale when it grows past
+/// [`RETRY_CACHE_CAP`] so it stays bounded.
+type RetryCache = HashMap<PathBuf, (u64, Option<DateTime<Utc>>)>;
+const RETRY_CACHE_CAP: usize = 1024;
+
+fn retry_cache() -> &'static Mutex<RetryCache> {
+    static CELL: std::sync::OnceLock<Mutex<RetryCache>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The last turn timestamp in ONE transcript file.
+fn last_turn_in_file(path: &Path) -> Option<DateTime<Utc>> {
+    let (bytes, truncated) = read_tail(path, TAIL_FIRST)?;
+    if let Some(t) = last_turn_in(&bytes, truncated) {
+        return Some(t);
+    }
+    if !truncated {
+        return None; // the whole file was read
+    }
+    let len = std::fs::metadata(path).ok()?.len();
+    if let Ok(cache) = retry_cache().lock() {
+        if let Some((size, hit)) = cache.get(path) {
+            if *size == len {
+                return *hit;
+            }
+        }
+    }
+    let found = read_tail(path, TAIL_RETRY).and_then(|(b, t)| last_turn_in(&b, t));
+    if let Ok(mut cache) = retry_cache().lock() {
+        if cache.len() >= RETRY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (len, found));
+    }
+    found
 }
 
 /// When the session last ACTED: the `timestamp` of the last `user` or
@@ -172,31 +259,31 @@ fn last_turn_in(tail: &str) -> Option<DateTime<Utc>> {
 /// A session id names one transcript, but the project directory it lives in
 /// is the encoded cwd at launch, which a later `cd` does not move — so every
 /// project dir is probed rather than guessing one from the registry `cwd`.
-/// `None` when no transcript carries a turn line (yet).
+/// `None` when no transcript carries a turn line (yet), or when the id is not
+/// UUID-shaped ([`is_uuid_shaped`]).
 pub fn last_acted_at(config_dir: &Path, session_id: &str) -> Option<DateTime<Utc>> {
+    if !is_uuid_shaped(session_id) {
+        return None;
+    }
     let file = format!("{session_id}.jsonl");
     let entries = std::fs::read_dir(config_dir.join("projects")).ok()?;
     entries
         .flatten()
         .map(|e| e.path().join(&file))
         .filter(|p| p.is_file())
-        .filter_map(|p| {
-            let tail = crate::terminal::transcript::read_tail_bytes(&p, TAIL_FIRST)?;
-            last_turn_in(&tail).or_else(|| {
-                let len = std::fs::metadata(&p).ok()?.len();
-                (len > TAIL_FIRST)
-                    .then(|| crate::terminal::transcript::read_tail_bytes(&p, TAIL_RETRY))
-                    .flatten()
-                    .and_then(|t| last_turn_in(&t))
-            })
-        })
+        .filter_map(|p| last_turn_in_file(&p))
         .max()
 }
 
+// ===========================================================================
+// tmux pane
+// ===========================================================================
+
 /// Extract `TMUX_PANE` from a raw `/proc/<pid>/environ` buffer (NUL-separated
-/// `KEY=value` entries). Every other entry is skipped without being decoded or
-/// retained. A pane id that is not `%<digits>` is rejected rather than passed
-/// on, so nothing but a pane id can ever leave this function.
+/// `KEY=value` entries). Only the `TMUX_PANE=` entry is decoded; nothing else
+/// is copied out of the buffer. A pane id that is not `%<digits>` is rejected
+/// rather than passed on, so nothing but a pane id can ever leave this
+/// function.
 pub fn tmux_pane_from_environ(environ: &[u8]) -> Option<String> {
     const KEY: &[u8] = b"TMUX_PANE=";
     let value = environ
@@ -218,6 +305,7 @@ fn valid_pane(s: &str) -> Option<String> {
 
 /// This process's tmux pane, read from the live process environment.
 /// Linux only — no other OS exposes another process's environment cheaply.
+/// The environ buffer is read whole and dropped when this returns.
 #[cfg(target_os = "linux")]
 pub fn tmux_pane_of_pid(pid: u32) -> Option<String> {
     let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
@@ -229,18 +317,91 @@ pub fn tmux_pane_of_pid(_pid: u32) -> Option<String> {
     None
 }
 
+// ===========================================================================
+// Process ancestry — is ANY runner on this device an ancestor?
+// ===========================================================================
+
+/// Whether [`read_proc_stat`] can read ancestry on this OS. Off Linux the
+/// census and the poller keep the pre-ancestry behaviour (module doc).
+pub const ANCESTRY_SUPPORTED: bool = cfg!(target_os = "linux");
+
+/// Bound on the ppid walk, so a cycle or a pathological tree cannot spin.
+const ANCESTRY_MAX_DEPTH: usize = 64;
+
+/// The runner's process name as `/proc/<pid>/comm` reports it (the kernel
+/// truncates `comm` to 15 bytes, which is exactly this string).
+const RUNNER_COMM: &str = "qontinui-runner";
+
+/// `(comm, ppid)` out of one `/proc/<pid>/stat` line. `comm` may itself
+/// contain spaces and parentheses, so it is the text between the FIRST `(`
+/// and the LAST `)`; `ppid` is the second field after that.
+pub fn parse_proc_stat(stat: &str) -> Option<(String, u32)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?.to_string();
+    let mut fields = stat.get(close + 1..)?.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse().ok()?;
+    Some((comm, ppid))
+}
+
+/// `/proc/<pid>/stat` → `(comm, ppid)`. Linux only.
+#[cfg(target_os = "linux")]
+pub fn read_proc_stat(pid: u32) -> Option<(String, u32)> {
+    parse_proc_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_proc_stat(_pid: u32) -> Option<(String, u32)> {
+    None
+}
+
+/// Does `pid`'s process ancestry include a `qontinui-runner` process — this
+/// runner or any other on the device? Walks ppids up to
+/// [`ANCESTRY_MAX_DEPTH`] through the injected reader.
+///
+/// `Some(true)` a runner ancestor was found; `Some(false)` the walk reached
+/// init (pid ≤ 1) without one; `None` UNKNOWN — a link was unreadable (the
+/// process exited mid-walk, or the OS has no `/proc`), the tree cycled, or the
+/// depth bound was hit.
+pub fn runner_ancestor(pid: u32, read_stat: &dyn Fn(u32) -> Option<(String, u32)>) -> Option<bool> {
+    let (_, mut cur) = read_stat(pid)?;
+    for _ in 0..ANCESTRY_MAX_DEPTH {
+        if cur <= 1 {
+            return Some(false);
+        }
+        let (comm, ppid) = read_stat(cur)?;
+        if comm.starts_with(RUNNER_COMM) {
+            return Some(true);
+        }
+        if ppid == cur {
+            return None;
+        }
+        cur = ppid;
+    }
+    None
+}
+
+// ===========================================================================
+// Snapshot
+// ===========================================================================
+
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
 
+/// The per-row probes [`build_snapshot`] takes, injected so it is a pure
+/// function of paths in tests.
+pub struct Probes<'a> {
+    pub tmux_pane_of: &'a dyn Fn(u32) -> Option<String>,
+    pub read_stat: &'a dyn Fn(u32) -> Option<(String, u32)>,
+    pub is_runner_hosted: &'a dyn Fn(&str) -> bool,
+}
+
 /// Project one registry row into a census row.
-fn row_from(
-    config_dir: &Path,
-    s: &LiveClaudeSession,
-    tmux_pane_of: &dyn Fn(u32) -> Option<String>,
-    is_runner_hosted: &dyn Fn(&str) -> bool,
-) -> CensusRow {
+fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> CensusRow {
+    let runner_ancestor = runner_ancestor(s.pid, probes.read_stat);
     CensusRow {
         session_id: s.session_id.clone(),
         pid: s.pid,
@@ -252,25 +413,26 @@ fn row_from(
         cwd: non_empty(&s.working_dir),
         entrypoint: s.entrypoint.clone(),
         kind: non_empty(&s.kind),
-        tmux_pane: tmux_pane_of(s.pid)
+        tmux_pane: (probes.tmux_pane_of)(s.pid)
             .or_else(|| s.tmux.as_deref().and_then(tmux_pane_from_locator)),
         window_name: non_empty(&s.name),
         window_name_source: s.name_source.clone(),
         registry_status: non_empty(&s.status),
         registry_status_updated_at: s.status_updated_at.and_then(ms_to_rfc3339),
         // The last turn line's own timestamp; else the registry's
-        // `statusUpdatedAt` (weaker — it moves on status changes, and lags
-        // real activity by days on idle-status rows); else null.
+        // `statusUpdatedAt` (weaker — it moves on status changes only); else
+        // null.
         last_acted_at: last_acted_at(config_dir, &s.session_id)
             .map(|t| t.to_rfc3339())
             .or_else(|| s.status_updated_at.and_then(ms_to_rfc3339)),
-        runner_hosted: is_runner_hosted(&s.session_id),
+        runner_hosted: (probes.is_runner_hosted)(&s.session_id) || runner_ancestor == Some(true),
+        runner_ancestor,
     }
 }
 
 /// Build the census snapshot — a pure function of the account homes, the live
-/// pid set and the two injected per-row probes, so it is unit-tested against a
-/// temp dir of fake registry rows and transcripts.
+/// pid set and the injected [`Probes`], so it is unit-tested against a temp dir
+/// of fake registry rows and transcripts.
 ///
 /// Rows are ordered by `(session_id, pid)` so two snapshots of an unchanged
 /// machine serialize identically.
@@ -279,15 +441,14 @@ pub fn build_snapshot(
     live_pids: &HashSet<u32>,
     observed_at: DateTime<Utc>,
     runner_build: Option<String>,
-    tmux_pane_of: &dyn Fn(u32) -> Option<String>,
-    is_runner_hosted: &dyn Fn(&str) -> bool,
+    probes: &Probes<'_>,
 ) -> CensusSnapshot {
     let mut sessions: Vec<CensusRow> = Vec::new();
     for dir in config_dirs {
         // One home at a time so each row keeps the config dir it came from —
         // `read_live_sessions` reports the account label but not the path.
         for s in read_live_sessions(std::slice::from_ref(dir), live_pids) {
-            sessions.push(row_from(dir, &s, tmux_pane_of, is_runner_hosted));
+            sessions.push(row_from(dir, &s, probes));
         }
     }
     sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id).then(a.pid.cmp(&b.pid)));
@@ -306,10 +467,44 @@ pub fn build_snapshot(
 // The device-local read (Phase 4 `no_pusher`)
 // ===========================================================================
 
-/// The last snapshot's live session ids, and when it was taken.
+/// What the local census says about one session id, for the poller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalVerdict {
+    /// No census yet, or the last one is stale — or a live row's ancestry
+    /// could not be read on an OS that supports reading it.
+    Unknown,
+    /// No live Claude process on this device carries the id.
+    NotLive,
+    /// Live, and hosted by a runner — this one, or another on the device.
+    LiveUnderARunner,
+    /// Live, and no runner on the device hosts it: nothing can push to it.
+    LiveUnhosted,
+}
+
+/// Per session id, folded over every live row (a session may have several
+/// processes): did ANY row have a runner as host/ancestor, and was ANY row's
+/// ancestry unreadable?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Presence {
+    any_runner: bool,
+    any_unknown: bool,
+}
+
+/// The verdict for a live session. Pure, so both OS arms are tested anywhere.
+fn presence_verdict(p: Presence, ancestry_supported: bool) -> LocalVerdict {
+    if p.any_runner {
+        LocalVerdict::LiveUnderARunner
+    } else if ancestry_supported && p.any_unknown {
+        LocalVerdict::Unknown
+    } else {
+        LocalVerdict::LiveUnhosted
+    }
+}
+
+/// The last snapshot's live sessions, and when it was taken.
 struct LocalCensus {
     taken: Instant,
-    live_session_ids: HashSet<String>,
+    live: HashMap<String, Presence>,
 }
 
 fn local_census() -> &'static Mutex<Option<LocalCensus>> {
@@ -319,30 +514,34 @@ fn local_census() -> &'static Mutex<Option<LocalCensus>> {
 
 /// Record a freshly built snapshot as this device's local census.
 pub fn remember(snapshot: &CensusSnapshot, taken: Instant) {
-    let live_session_ids = snapshot
-        .sessions
-        .iter()
-        .filter(|r| r.pid_alive)
-        .map(|r| r.session_id.clone())
-        .collect();
+    let mut live: HashMap<String, Presence> = HashMap::new();
+    for r in snapshot.sessions.iter().filter(|r| r.pid_alive) {
+        let p = live.entry(r.session_id.clone()).or_default();
+        p.any_runner |= r.runner_hosted;
+        p.any_unknown |= r.runner_ancestor.is_none();
+    }
     if let Ok(mut g) = local_census().lock() {
-        *g = Some(LocalCensus {
-            taken,
-            live_session_ids,
-        });
+        *g = Some(LocalCensus { taken, live });
     }
 }
 
-/// Is `session_id` a LIVE Claude process on this device, per the runner's own
-/// census? Three-valued: `None` when no census was taken yet or the last one
-/// is older than [`CENSUS_STALE_AFTER`] — UNKNOWN, never "not live".
-pub fn live_on_this_device(session_id: &str, now: Instant) -> Option<bool> {
-    let g = local_census().lock().ok()?;
-    let c = g.as_ref()?;
+/// What the runner's own census says about `session_id`. A missing or stale
+/// census (older than [`CENSUS_STALE_AFTER`]) is [`LocalVerdict::Unknown`],
+/// never "not live".
+pub fn local_verdict(session_id: &str, now: Instant) -> LocalVerdict {
+    let Ok(g) = local_census().lock() else {
+        return LocalVerdict::Unknown;
+    };
+    let Some(c) = g.as_ref() else {
+        return LocalVerdict::Unknown;
+    };
     if now.saturating_duration_since(c.taken) > CENSUS_STALE_AFTER {
-        return None;
+        return LocalVerdict::Unknown;
     }
-    Some(c.live_session_ids.contains(session_id))
+    match c.live.get(session_id) {
+        None => LocalVerdict::NotLive,
+        Some(p) => presence_verdict(*p, ANCESTRY_SUPPORTED),
+    }
 }
 
 #[cfg(test)]
@@ -372,8 +571,9 @@ enum PostState {
 }
 
 /// Spawn the census publisher. PRIMARY runner only: a secondary/temp runner on
-/// the same device would post the same device id with a different
-/// `runner_hosted` view and the two whole-snapshot replaces would flap.
+/// the same device would post the same device id and the two whole-snapshot
+/// replaces would flap. (The primary still sees a secondary's sessions as
+/// runner-hosted, through [`runner_ancestor`].)
 pub fn spawn_publisher(app: tauri::AppHandle) {
     if !crate::instance::owns_shared_root_state() {
         info!("session census: not the primary runner — publisher not started");
@@ -413,8 +613,8 @@ fn log_transition(state: &PostState) {
             info!("session census: no device credential (unpaired) — not posting (state change)")
         }
         PostState::Snapshot => warn!(
-            "session census: process snapshot indeterminate — skipped (an empty census would \
-             read as every session dead)"
+            "session census: process snapshot or census build indeterminate — skipped (an \
+             empty census would read as every session dead)"
         ),
         PostState::Unavailable => info!(
             "session census: coord answered 503 (census store not deployed yet) — retrying each \
@@ -429,55 +629,55 @@ fn log_transition(state: &PostState) {
     }
 }
 
-/// The runner-hosted predicate, bound to this tick's substrate.
-fn hosted_probe(app: &tauri::AppHandle) -> Box<dyn Fn(&str) -> bool + '_> {
-    use tauri::Manager;
-    let sm = app.try_state::<std::sync::Arc<crate::claude_session::SessionManager>>();
-    let reg =
-        app.try_state::<std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
-    let store = app
-        .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
-    match (sm, store) {
-        (Some(sm), Some(store)) => Box::new(move |id: &str| {
-            crate::mcp::session_message_poller::runner_hosts(
-                sm.inner(),
-                reg.as_ref().map(|r| r.inner().as_ref()),
-                store.inner(),
-                id,
-            )
-        }),
-        // Substrate not up yet: nothing can be pushed to, so nothing is
-        // runner-hosted in the sense the poller means.
-        _ => Box::new(|_: &str| false),
-    }
+/// The managed state THIS runner's hosted predicate reads, copied out of
+/// Tauri's state as owned `Arc`s so the census build can move to the blocking
+/// pool.
+struct HostedSubstrate {
+    sessions: Option<Arc<crate::claude_session::SessionManager>>,
+    registrar: Option<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
+    lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
 }
 
-/// Build this tick's snapshot. Synchronous on purpose: the runner-hosted probe
-/// borrows managed state (not `Send`), so it must not live across an `.await`.
-fn snapshot_now(app: &tauri::AppHandle, live_pids: &HashSet<u32>) -> CensusSnapshot {
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let hosted = hosted_probe(app);
-    build_snapshot(
-        &config_dirs,
-        live_pids,
-        Utc::now(),
-        Some(env!("RUNNER_BUILD_ID").to_string()),
-        &tmux_pane_of_pid,
-        hosted.as_ref(),
-    )
+impl HostedSubstrate {
+    fn from_app(app: &tauri::AppHandle) -> Self {
+        use tauri::Manager;
+        Self {
+            sessions: app
+                .try_state::<Arc<crate::claude_session::SessionManager>>()
+                .map(|s| s.inner().clone()),
+            registrar: app
+                .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+                .map(|s| s.inner().clone()),
+            lifecycle: app
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+                .map(|s| s.inner().clone()),
+        }
+    }
+
+    fn hosts(&self, id: &str) -> bool {
+        match (&self.sessions, &self.lifecycle) {
+            (Some(sm), Some(store)) => crate::mcp::session_message_poller::runner_hosts(
+                sm,
+                self.registrar.as_deref(),
+                store,
+                id,
+            ),
+            // Substrate not up yet: nothing can be pushed to by THIS runner.
+            _ => false,
+        }
+    }
 }
 
 async fn tick(app: &tauri::AppHandle) -> PostState {
     let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
         return PostState::NoDeviceId;
     };
-    let paired = matches!(
-        crate::auth::AuthManager::new().get_access_token(),
-        Ok(t) if !t.trim().is_empty()
-    );
-    if !paired {
+    // The PAIRED-DEVICE JWT, resolved ONCE and presented verbatim below.
+    // coord's ingest 403s an agent or bootstrap token, and a path device that
+    // differs from the token's. No credential ⇒ no post: never anonymous.
+    let Some(token) = crate::auth::device_bearer_scoped(crate::auth::TenantScope::Device) else {
         return PostState::Unpaired;
-    }
+    };
 
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = match super::claude_session_registry::live_pids_from_snapshot(&snap) {
@@ -488,7 +688,31 @@ async fn tick(app: &tauri::AppHandle) -> PostState {
         }
     };
     let taken = Instant::now();
-    let snapshot = snapshot_now(app, &live_pids);
+    let substrate = HostedSubstrate::from_app(app);
+    // Every account home's registry, every transcript tail, every /proc read:
+    // filesystem work, so it runs on the blocking pool, never on an async worker.
+    let built = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let hosted = |id: &str| substrate.hosts(id);
+        build_snapshot(
+            &crate::terminal::transcript::find_claude_config_dirs(),
+            &live_pids,
+            Utc::now(),
+            Some(env!("RUNNER_BUILD_ID").to_string()),
+            &Probes {
+                tmux_pane_of: &tmux_pane_of_pid,
+                read_stat: &read_proc_stat,
+                is_runner_hosted: &hosted,
+            },
+        )
+    })
+    .await;
+    let snapshot = match built {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(error = %e, "session census: build task failed");
+            return PostState::Snapshot;
+        }
+    };
     remember(&snapshot, taken);
     debug!(
         rows = snapshot.sessions.len(),
@@ -508,11 +732,15 @@ async fn tick(app: &tauri::AppHandle) -> PostState {
         Ok(c) => c,
         Err(_) => return PostState::Transport,
     };
-    // The PAIRED-DEVICE JWT (`TenantScope::Device` → the device's own slot):
-    // coord's ingest 403s an agent or bootstrap token, and a path device that
-    // differs from the token's. Unpaired was already turned away above, so
-    // this never posts anonymously.
-    match crate::auth::attach_device_auth(client.post(&url).json(&snapshot))
+    // coord-auth-exempt(device-jwt-required): `token` is the paired-device JWT
+    // resolved once above via `device_bearer_scoped(TenantScope::Device)`; the
+    // tick returns `Unpaired` before reaching here when there is none, so this
+    // never posts anonymously. coord's census ingest accepts only that
+    // credential, for the path device id.
+    match client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&snapshot)
         .send()
         .await
     {
@@ -533,6 +761,23 @@ mod tests {
     const SID_A: &str = "11111111-1111-4111-8111-111111111111";
     const SID_B: &str = "22222222-2222-4222-8222-222222222222";
     const SID_DEAD: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn no_pane(_: u32) -> Option<String> {
+        None
+    }
+    fn no_stat(_: u32) -> Option<(String, u32)> {
+        None
+    }
+    fn not_hosted(_: &str) -> bool {
+        false
+    }
+    fn no_probes() -> Probes<'static> {
+        Probes {
+            tmux_pane_of: &no_pane,
+            read_stat: &no_stat,
+            is_runner_hosted: &not_hosted,
+        }
+    }
 
     fn home(root: &Path, name: &str) -> PathBuf {
         let d = root.join(name);
@@ -622,8 +867,17 @@ mod tests {
             &live,
             observed,
             Some("build-1".into()),
-            &|pid| (pid == 200).then(|| "%414".to_string()),
-            &|sid| sid == SID_B,
+            &Probes {
+                tmux_pane_of: &|pid| (pid == 200).then(|| "%414".to_string()),
+                // pid 100 → 50 → 1: no runner ancestor; pid 200 is not walked
+                // past its own unreadable parent.
+                read_stat: &|pid| match pid {
+                    100 => Some(("claude".into(), 50)),
+                    50 => Some(("tmux: server".into(), 1)),
+                    _ => None,
+                },
+                is_runner_hosted: &|sid| sid == SID_B,
+            },
         );
 
         assert_eq!(snap.account_homes, 2);
@@ -658,6 +912,7 @@ mod tests {
             "last turn line's timestamp, never the later summary line"
         );
         assert!(!ra.runner_hosted);
+        assert_eq!(ra.runner_ancestor, Some(false));
 
         let rb = &snap.sessions[1];
         assert_eq!(rb.account.as_deref(), Some("default"));
@@ -717,29 +972,207 @@ mod tests {
         let a = home(tmp.path(), ".claude-x");
         registry_row(&a, 100, SID_A, r#","statusUpdatedAt":1790832214000"#);
         let live: HashSet<u32> = [100].into_iter().collect();
-        let snap = build_snapshot(&[a], &live, Utc::now(), None, &|_| None, &|_| false);
+        let snap = build_snapshot(&[a], &live, Utc::now(), None, &no_probes());
         assert_eq!(snap.sessions[0].last_acted_at, ms_to_rfc3339(1790832214000));
     }
 
     #[test]
-    fn the_local_census_is_three_valued_and_goes_unknown_when_stale() {
+    fn the_local_census_is_tri_state_and_goes_unknown_when_stale() {
         // The ONLY test touching the process-global cell, so no ordering race.
         clear_local_census_for_test();
         let t0 = Instant::now();
-        assert_eq!(live_on_this_device(SID_A, t0), None, "no census yet");
+        assert_eq!(
+            local_verdict(SID_A, t0),
+            LocalVerdict::Unknown,
+            "no census yet"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let a = home(tmp.path(), ".claude-x");
         registry_row(&a, 100, SID_A, "");
-        let live: HashSet<u32> = [100].into_iter().collect();
-        let snap = build_snapshot(&[a], &live, Utc::now(), None, &|_| None, &|_| false);
+        registry_row(&a, 200, SID_B, "");
+        let live: HashSet<u32> = [100, 200].into_iter().collect();
+        // pid 100 sits under ANOTHER runner (pid 7, a secondary); pid 200 has
+        // no runner anywhere above it.
+        let snap = build_snapshot(
+            &[a],
+            &live,
+            Utc::now(),
+            None,
+            &Probes {
+                tmux_pane_of: &|_| None,
+                read_stat: &|pid| match pid {
+                    100 => Some(("claude".into(), 7)),
+                    7 => Some(("qontinui-runner".into(), 1)),
+                    200 => Some(("claude".into(), 1)),
+                    _ => None,
+                },
+                is_runner_hosted: &|_| false,
+            },
+        );
+        assert!(
+            snap.sessions[0].runner_hosted,
+            "a secondary runner's session is hosted"
+        );
+        assert!(!snap.sessions[1].runner_hosted);
         remember(&snap, t0);
 
-        assert_eq!(live_on_this_device(SID_A, t0), Some(true));
-        assert_eq!(live_on_this_device(SID_B, t0), Some(false));
+        assert_eq!(local_verdict(SID_A, t0), LocalVerdict::LiveUnderARunner);
+        assert_eq!(local_verdict(SID_B, t0), LocalVerdict::LiveUnhosted);
+        assert_eq!(local_verdict(SID_DEAD, t0), LocalVerdict::NotLive);
         let stale = t0 + CENSUS_STALE_AFTER + Duration::from_secs(1);
-        assert_eq!(live_on_this_device(SID_A, stale), None, "stale is UNKNOWN");
+        assert_eq!(
+            local_verdict(SID_A, stale),
+            LocalVerdict::Unknown,
+            "stale is UNKNOWN"
+        );
         clear_local_census_for_test();
+    }
+
+    #[test]
+    fn presence_verdict_claims_unhosted_only_without_any_runner() {
+        let runner = Presence {
+            any_runner: true,
+            any_unknown: true,
+        };
+        let unknown = Presence {
+            any_runner: false,
+            any_unknown: true,
+        };
+        let clear = Presence {
+            any_runner: false,
+            any_unknown: false,
+        };
+        for supported in [true, false] {
+            assert_eq!(
+                presence_verdict(runner, supported),
+                LocalVerdict::LiveUnderARunner
+            );
+            assert_eq!(
+                presence_verdict(clear, supported),
+                LocalVerdict::LiveUnhosted
+            );
+        }
+        // Linux: an unreadable walk is UNKNOWN, never "no runner".
+        assert_eq!(presence_verdict(unknown, true), LocalVerdict::Unknown);
+        // Off Linux ancestry is never read: the pre-ancestry behaviour.
+        assert_eq!(presence_verdict(unknown, false), LocalVerdict::LiveUnhosted);
+    }
+
+    #[test]
+    fn runner_ancestry_walks_a_fake_proc_tree() {
+        // 900 (claude) → 800 (bash) → 700 (qontinui-runner) → 1
+        let tree = |pid: u32| match pid {
+            900 => Some(("claude".to_string(), 800)),
+            800 => Some(("bash".to_string(), 700)),
+            700 => Some(("qontinui-runner".to_string(), 1)),
+            // 600 (claude) → 500 (tmux) → 1, no runner
+            600 => Some(("claude".to_string(), 500)),
+            500 => Some(("tmux: server".to_string(), 1)),
+            // 400 → 300 whose stat is unreadable (exited mid-walk)
+            400 => Some(("claude".to_string(), 300)),
+            // 200 → 100 → 200: a cycle
+            200 => Some(("a".to_string(), 100)),
+            100 => Some(("b".to_string(), 200)),
+            // 50 → 50: self-parented
+            50 => Some(("c".to_string(), 50)),
+            _ => None,
+        };
+        assert_eq!(runner_ancestor(900, &tree), Some(true));
+        assert_eq!(runner_ancestor(600, &tree), Some(false));
+        assert_eq!(
+            runner_ancestor(400, &tree),
+            None,
+            "unreadable link is UNKNOWN"
+        );
+        assert_eq!(
+            runner_ancestor(200, &tree),
+            None,
+            "a cycle hits the depth bound"
+        );
+        assert_eq!(runner_ancestor(50, &tree), None);
+        assert_eq!(runner_ancestor(12345, &tree), None, "unreadable self");
+        // The process itself is never its own ancestor.
+        let me_runner = |pid: u32| match pid {
+            10 => Some(("qontinui-runner".to_string(), 1)),
+            _ => None,
+        };
+        assert_eq!(runner_ancestor(10, &me_runner), Some(false));
+    }
+
+    #[test]
+    fn proc_stat_parsing_survives_spaces_and_parens_in_comm() {
+        assert_eq!(
+            parse_proc_stat("1234 (qontinui-runner) S 1 1234 1234 0 -1"),
+            Some(("qontinui-runner".to_string(), 1))
+        );
+        assert_eq!(
+            parse_proc_stat("77 (tmux: server (x)) S 5 77 77"),
+            Some(("tmux: server (x)".to_string(), 5))
+        );
+        assert_eq!(parse_proc_stat("garbage"), None);
+    }
+
+    #[test]
+    fn a_non_uuid_session_id_never_reaches_a_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-x");
+        transcript(&a, "p", SID_A, "2026-10-01T01:00:00Z");
+        assert!(is_uuid_shaped(SID_A));
+        for bad in ["../x", "", "not-a-uuid", "11111111111141118111111111111111"] {
+            assert!(!is_uuid_shaped(bad), "{bad}");
+            assert_eq!(last_acted_at(&a, bad), None);
+        }
+    }
+
+    #[test]
+    fn a_half_written_multibyte_character_does_not_null_last_acted_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-x");
+        let p = a.join("projects/p");
+        fs::create_dir_all(&p).unwrap();
+        let mut body =
+            b"{\"type\":\"assistant\",\"timestamp\":\"2026-10-01T02:00:00Z\"}\n".to_vec();
+        // A trailing record cut inside a 3-byte UTF-8 character.
+        body.extend_from_slice(b"{\"type\":\"user\",\"x\":\"\xE2\x82");
+        fs::write(p.join(format!("{SID_A}.jsonl")), body).unwrap();
+        assert_eq!(
+            last_acted_at(&a, SID_A).map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-10-01T02:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn the_wide_retry_is_cached_per_path_and_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = home(tmp.path(), ".claude-x");
+        let p = a.join("projects/p");
+        fs::create_dir_all(&p).unwrap();
+        let path = p.join(format!("{SID_A}.jsonl"));
+        let filler = format!(
+            "{{\"type\":\"progress\",\"pad\":\"{}\"}}\n",
+            "x".repeat(1000)
+        );
+        let write = |ts: &str| {
+            let mut body = format!("{{\"type\":\"user\",\"timestamp\":\"{ts}\"}}\n");
+            for _ in 0..100 {
+                body.push_str(&filler);
+            }
+            fs::write(&path, body).unwrap();
+        };
+        write("2026-10-01T01:00:00Z");
+        let first = last_acted_at(&a, SID_A).unwrap();
+        // Same SIZE, different content: the cached answer is served, proving
+        // the 1 MB window was not re-read.
+        write("2026-10-01T09:00:00Z");
+        assert_eq!(last_acted_at(&a, SID_A).unwrap(), first);
+        // A size change invalidates it.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, filler.as_bytes()).unwrap();
+        assert_eq!(
+            last_acted_at(&a, SID_A).map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-10-01T09:00:00+00:00")
+        );
     }
 
     #[test]
@@ -766,6 +1199,7 @@ mod tests {
                 registry_status_updated_at: None,
                 last_acted_at: None,
                 runner_hosted: false,
+                runner_ancestor: Some(true),
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();

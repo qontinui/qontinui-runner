@@ -4389,13 +4389,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `terminal::usage_limit::spawn_grid_scan_loop` and
                 // `terminal::auto_response::spawn_grid_scan_loop`.)
 
-                // Infrequent liveness poll for lazy close-detection. Every
-                // 45s it snapshots open lifecycle records against the live
-                // terminal manager + a single system process snapshot, runs
-                // the pure `classify` decision core (asymmetric — NEVER closes
-                // on uncertainty), and flips confidently-dead sessions to
-                // `closed`. Detached for the process lifetime; wrapped so a
-                // fallible tick never panics the loop.
                 // Machine-wide live Claude session census (plan
                 // 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account,
                 // Phase 2). A SIBLING of the lifecycle poll below rather than
@@ -4406,6 +4399,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // best-effort; see `session::census`.
                 session::census::spawn_publisher(app.handle().clone());
 
+                // Infrequent liveness poll for lazy close-detection. Every
+                // 45s it snapshots open lifecycle records against the live
+                // terminal manager + a single system process snapshot, runs
+                // the pure `classify` decision core (asymmetric — NEVER closes
+                // on uncertainty), and flips confidently-dead sessions to
+                // `closed`. Detached for the process lifetime; wrapped so a
+                // fallible tick never panics the loop.
                 let poll_tm = term_for_session.clone();
                 let poll_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {

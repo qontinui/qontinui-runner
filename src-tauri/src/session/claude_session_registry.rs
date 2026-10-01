@@ -90,21 +90,54 @@ struct RegistryFile {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: Option<i64>,
-    /// When `status` last changed (epoch ms). NOT a liveness clock — on
-    /// 2026-10-01 four live rows carried values 1-6 days older than their
-    /// transcripts' last write. Carried for the session census only.
-    #[serde(default)]
+    /// When `status` last changed (epoch ms). NOT a liveness clock: it moves
+    /// on status changes only. The session census takes liveness from the last
+    /// turn line's own timestamp instead — not even from transcript mtime,
+    /// which coord finding `124c0ce9` measured moving without turns. Carried
+    /// for the session census only.
+    ///
+    /// The four census-only fields below are LENIENT ([`lenient_ms`],
+    /// [`lenient_string`]): a type the CLI changes in a future release reads
+    /// as `None` for that field, never as a parse failure — which would drop
+    /// the WHOLE row from every registry reader, the restore path's liveness
+    /// oracle included.
+    #[serde(default, deserialize_with = "lenient_ms")]
     status_updated_at: Option<i64>,
     /// Process start token (a string: `/proc/<pid>/stat` field 22 on Linux),
     /// the pid-reuse discriminator beside `pid`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     proc_start: Option<String>,
     /// `cli`, `sdk-ts`, … — how the process was launched.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     entrypoint: Option<String>,
     /// `<tmux session>:@<window>.%<pane>` when the CLI runs inside tmux.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     tmux: Option<String>,
+}
+
+/// String, or a number rendered as one; any other JSON type is `None`.
+fn lenient_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+/// Epoch ms as an integer, a float (truncated) or a numeric string; any other
+/// value is `None`.
+fn lenient_ms<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
 }
 
 /// One live Claude Code process, as the operator sees it.
@@ -400,6 +433,26 @@ mod tests {
         assert_eq!(
             s.resume_command,
             "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+        );
+    }
+
+    #[test]
+    fn a_retyped_census_field_never_drops_the_row() {
+        // procStart as a NUMBER and statusUpdatedAt as a non-numeric STRING:
+        // the row must still parse, with the odd values degraded per field.
+        let row = r#"{"pid":7,"sessionId":"7f7e6038-d85c-426f-b930-bc429fe62c58","procStart":123,"statusUpdatedAt":"x","entrypoint":["cli"],"tmux":null,"name":"n"}"#;
+        let s = parse_registry_file(row, Path::new("/home/x/.claude-a")).unwrap();
+        assert_eq!(s.pid, 7);
+        assert_eq!(s.proc_start.as_deref(), Some("123"));
+        assert_eq!(s.status_updated_at, None);
+        assert_eq!(s.entrypoint, None);
+        assert_eq!(s.tmux, None);
+        let numeric = r#"{"pid":8,"sessionId":"s","statusUpdatedAt":"1790832214000"}"#;
+        assert_eq!(
+            parse_registry_file(numeric, Path::new("/x/.claude-a"))
+                .unwrap()
+                .status_updated_at,
+            Some(1790832214000)
         );
     }
 

@@ -77,7 +77,8 @@
 //!   not spam. A `blocking` message ([`posts_to_coord`]) is also reported to
 //!   coord via a fail-open `delivery-blocked` POST: past the 60 s threshold
 //!   for `target_not_live` and `no_pusher` (a recipient the runner's own
-//!   session census sees live on this device but does not host — plan
+//!   session census sees live on this device with no runner — this one or any
+//!   other — as its host or process ancestor — plan
 //!   `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
 //!   Phase 4), past the repeat window for `pty_never_idle` (a busy
 //!   live recipient) — evidence for the
@@ -624,6 +625,11 @@ impl SurfacingTracker {
         }
     }
 
+    /// Has `message_id` been noted blocked for `reason`?
+    fn has(&self, message_id: &str, reason: BlockReason) -> bool {
+        self.entries.contains_key(&(message_id.to_string(), reason))
+    }
+
     /// A successful delivery clears every tracking entry for the message.
     fn clear_message(&mut self, message_id: &str) {
         self.entries.retain(|(mid, _), _| mid != message_id);
@@ -1103,19 +1109,33 @@ pub(crate) fn runner_hosts(
 }
 
 /// The reason to report for a target [`resolve_target`] could not route,
-/// given the census verdict for it (`Some(true)` = a live Claude process on
-/// this device, `Some(false)` = none, `None` = no fresh census → UNKNOWN).
+/// given what the runner's own session census says about it.
 ///
-/// Only a POSITIVE census sighting yields `no_pusher`; an absent or stale
-/// census keeps the pre-census `target_not_live`, never a guess.
-fn unhosted_reason(census_live: Option<bool>) -> (BlockReason, &'static str) {
-    match census_live {
-        Some(true) => (
+/// Only [`LocalVerdict::LiveUnhosted`] — a live Claude process on this device
+/// with NO runner (this one or any other) as host or ancestor — yields
+/// `no_pusher`. A session under another runner is that runner's to push; an
+/// absent, stale or unreadable census is UNKNOWN; neither is upgraded to
+/// `no_pusher`, both keep the pre-census `target_not_live`.
+///
+/// Sticky per message: once `no_pusher` has been reported for a message
+/// (`already_no_pusher`), it is never followed by `target_not_live` for the
+/// same message — a census that later goes stale must not make one message
+/// carry both reasons.
+///
+/// [`LocalVerdict::LiveUnhosted`]: crate::session::census::LocalVerdict::LiveUnhosted
+fn unhosted_reason(
+    verdict: crate::session::census::LocalVerdict,
+    already_no_pusher: bool,
+) -> (BlockReason, &'static str) {
+    use crate::session::census::LocalVerdict;
+    if already_no_pusher || verdict == LocalVerdict::LiveUnhosted {
+        (
             BlockReason::NoPusher,
-            "live on this device (session census) but not runner-hosted — no push primitive \
+            "live on this device (session census) and hosted by no runner — no push primitive \
              reaches it; delivered only by the recipient's coord_inbox pull",
-        ),
-        _ => (BlockReason::TargetNotLive, "no live session on this device"),
+        )
+    } else {
+        (BlockReason::TargetNotLive, "no live session on this device")
     }
 }
 
@@ -1540,8 +1560,10 @@ async fn deliver_once(
             // counter, one info line per window, and past the threshold the
             // surfacing POST (fix 2; once per repeat window, fail-open). Which
             // reason is the census's call: see `unhosted_reason`.
-            let (reason, detail) =
-                unhosted_reason(crate::session::census::live_on_this_device(to_session, now));
+            let (reason, detail) = unhosted_reason(
+                crate::session::census::local_verdict(to_session, now),
+                tracker.has(&msg.message_id, BlockReason::NoPusher),
+            );
             surface_blocked_delivery(&ctx, tracker, msg, to_session, reason, detail, now).await;
             continue;
         };
@@ -2258,13 +2280,46 @@ mod tests {
     }
 
     #[test]
-    fn only_a_positive_census_sighting_reports_no_pusher() {
-        // Live on this device per the census, but resolve_target missed it.
-        assert_eq!(unhosted_reason(Some(true)).0, BlockReason::NoPusher);
-        // Census says no live process: the pre-census reason.
-        assert_eq!(unhosted_reason(Some(false)).0, BlockReason::TargetNotLive);
+    fn only_a_live_session_with_no_runner_reports_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnhosted, false).0,
+            BlockReason::NoPusher
+        );
+        // Live under ANOTHER runner on the device: that runner pushes it.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnderARunner, false).0,
+            BlockReason::TargetNotLive
+        );
+        assert_eq!(
+            unhosted_reason(LocalVerdict::NotLive, false).0,
+            BlockReason::TargetNotLive
+        );
         // No fresh census is UNKNOWN — never upgraded to no_pusher.
-        assert_eq!(unhosted_reason(None).0, BlockReason::TargetNotLive);
+        assert_eq!(
+            unhosted_reason(LocalVerdict::Unknown, false).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_message_once_no_pusher_never_also_reports_target_not_live() {
+        use crate::session::census::LocalVerdict;
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
+        let (r1, _) = unhosted_reason(
+            LocalVerdict::LiveUnhosted,
+            t.has("m", BlockReason::NoPusher),
+        );
+        assert_eq!(r1, BlockReason::NoPusher);
+        t.note_blocked("m", r1, t0, thresh, repeat, true);
+        // The census later goes stale (Unknown): still no_pusher for "m".
+        let (r2, _) = unhosted_reason(LocalVerdict::Unknown, t.has("m", BlockReason::NoPusher));
+        assert_eq!(r2, BlockReason::NoPusher);
+        // A different message is unaffected.
+        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, t.has("n", BlockReason::NoPusher));
+        assert_eq!(r3, BlockReason::TargetNotLive);
     }
 
     #[test]
