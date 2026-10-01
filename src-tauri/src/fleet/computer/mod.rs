@@ -229,7 +229,7 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
         scan: if g.systemd {
             ServiceScan {
                 units: Some(units),
-                complete_kinds: if g.list_rc == Some(0) && g.runner_active != Some(true) {
+                complete_kinds: if g.inventory_complete() && g.runner_active != Some(true) {
                     vec![services::KIND_GH_ACTIONS_RUNNER]
                 } else {
                     Vec::new()
@@ -572,10 +572,6 @@ pub(crate) fn problem_paths(problems: &[String]) -> Vec<String> {
     v
 }
 
-/// coord's event retention (contract §1: 30 days). An event older than this
-/// is dropped by coord on ingest and counted in `events_expired`.
-pub(crate) const EVENT_RETENTION_SECS: i64 = 30 * 24 * 3600;
-
 /// `telemetry_gap` reasons whose `dropped_events` is a running total.
 const MARKER_REASONS: &[&str] = &[
     "pending_event_buffer_full",
@@ -597,9 +593,12 @@ fn marker_total(e: &ComputerEvent) -> Option<u64> {
 /// `sent` events as older than its retention — or `None` when every expired
 /// event was itself a marker (re-reporting a lost marker as a new loss would
 /// be noise). Earlier markers among the expired are FOLDED: their totals are
-/// carried into the new marker, as `quarantine` does. coord reports only a
-/// count, so the expired set is taken to be the sent events older than
-/// [`EVENT_RETENTION_SECS`]. PURE.
+/// carried into the new marker, as `quarantine` does.
+///
+/// coord reports only a count, and it expires strictly by AGE against its
+/// own (configurable) retention and its own clock — so the expired set is
+/// the `events_expired` OLDEST of `sent` by `observed_at`, never a local
+/// retention constant compared against this machine's clock. PURE.
 pub(crate) fn expired_marker_for(
     identity: &str,
     sent: &[ComputerEvent],
@@ -609,14 +608,14 @@ pub(crate) fn expired_marker_for(
     if events_expired == 0 {
         return None;
     }
-    let cutoff = now - chrono::Duration::seconds(EVENT_RETENTION_SECS);
-    let expired: Vec<&ComputerEvent> = sent
-        .iter()
-        .filter(|e| {
-            chrono::DateTime::parse_from_rfc3339(&e.observed_at)
-                .is_ok_and(|t| t.with_timezone(&chrono::Utc) < cutoff)
-        })
-        .collect();
+    let mut by_age: Vec<&ComputerEvent> = sent.iter().collect();
+    by_age.sort_by_key(|e| {
+        chrono::DateTime::parse_from_rfc3339(&e.observed_at)
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(i64::MIN)
+    });
+    let n = usize::try_from(events_expired).unwrap_or(usize::MAX);
+    let expired: Vec<&ComputerEvent> = by_age.into_iter().take(n).collect();
     let markers: Vec<u64> = expired.iter().filter_map(|e| marker_total(e)).collect();
     let real = events_expired.saturating_sub(markers.len() as u64);
     if real == 0 {
@@ -1383,7 +1382,7 @@ mod tests {
     #[test]
     fn a_guest_reports_as_a_child_of_its_host_and_never_attaches_the_device() {
         let g = wsl_guest::parse_guest_probe(
-            "MACHINE_ID\tfedcba9876543210fedcba9876543210\nHOSTNAME\tbad host;id\nPID1\tsystemd\nLIST_RC\t0\nSHOW_BEGIN\nSHOW_END\nPROBE_END\n",
+            "MACHINE_ID\tfedcba9876543210fedcba9876543210\nHOSTNAME\tbad host;id\nPID1\tsystemd\nLIST_RC\t0\nUNIT_COUNT\t0\nSHOW_BEGIN\nSHOW_END\nSHOW_RC\t0\nPROBE_END\n",
         )
         .unwrap();
         let o = guest_observed(&g, HOST_ID);
@@ -1434,7 +1433,7 @@ mod tests {
     fn the_host_claims_no_guest_completeness_while_a_guest_runner_reports() {
         let probe = |active: &str| {
             wsl_guest::parse_guest_probe(&format!(
-                "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t0\nRUNNER_ACTIVE\t{active}\nSHOW_BEGIN\nId=actions.runner.example-org-example-repo.wslbox.service\nActiveState=inactive\n\nSHOW_END\nPROBE_END\n"
+                "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t0\nRUNNER_ACTIVE\t{active}\nUNIT_COUNT\t1\nSHOW_BEGIN\nId=actions.runner.example-org-example-repo.wslbox.service\nActiveState=inactive\n\nSHOW_END\nSHOW_RC\t0\nPROBE_END\n"
             ))
             .unwrap()
         };
@@ -1557,10 +1556,26 @@ mod tests {
             None
         );
         assert_eq!(expired_marker_for(HOST_ID, &sent, 0, now), None);
-        // coord's count with no event old enough locally (clock disagreement):
-        // reported as real loss.
+        // coord's count exceeds what was sent: coord's count is the loss.
         let m = expired_marker_for(HOST_ID, &[ev("x")], 2, now).unwrap();
         assert_eq!(m.detail["dropped_events"], 2);
+
+        // The expired set is the OLDEST n by observed_at — whatever this
+        // machine's clock or any local retention would say: here the only
+        // expired event is the oldest, a marker, so no new marker.
+        let mut future = ev("far-future");
+        future.observed_at = "2030-01-01T00:00:00Z".into();
+        let mut oldest_marker = old("gap-0");
+        oldest_marker.observed_at = "2026-08-01T00:00:00Z".into();
+        oldest_marker.kind = "telemetry_gap".into();
+        oldest_marker.detail = serde_json::json!({"reason": "events_expired", "dropped_events": 3});
+        assert_eq!(
+            expired_marker_for(HOST_ID, &[future.clone(), oldest_marker.clone()], 1, now),
+            None
+        );
+        // Two expired: the marker (3, folded) and the next-oldest real one.
+        let m = expired_marker_for(HOST_ID, &[future, oldest_marker], 2, now).unwrap();
+        assert_eq!(m.detail["dropped_events"], 4);
     }
 
     #[test]

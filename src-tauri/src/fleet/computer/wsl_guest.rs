@@ -104,8 +104,11 @@ pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
 /// `ListUnitsByPatterns` ∪ `ListUnitFilesByPatterns` the runner's D-Bus scan
 /// uses, and `systemctl show` on an unloaded name loads it on demand just as
 /// that scan's `LoadUnit` does — so both reporters produce the same rows.
-/// `LIST_RC` is 0 only when BOTH listings exited 0.
-pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 'actions.runner.*' 2>/dev/null); frc=$?; if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'SHOW_BEGIN\n'; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; fi; printf '\nSHOW_END\n'; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
+/// `LIST_RC` is 0 only when BOTH listings exited 0; `UNIT_COUNT` is the size
+/// of the union and `SHOW_RC` the exit of `systemctl show` — a listing is only
+/// a COMPLETE inventory when show also exited 0 and returned one `Id=` record
+/// per listed unit (see [`GuestProbe::inventory_complete`]).
+pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 'actions.runner.*' 2>/dev/null); frc=$?; if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'UNIT_COUNT\t%s\n' "$(printf '%s\n' "$units" | awk 'NF' | wc -l)"; printf 'SHOW_BEGIN\n'; shrc=0; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; shrc=$?; fi; printf '\nSHOW_END\n'; printf 'SHOW_RC\t%s\n' "$shrc"; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
 
 /// Everything one guest probe produced. Holds the identity HASH, never the
 /// raw machine id — [`parse_guest_probe`] hashes it and drops it.
@@ -145,6 +148,13 @@ pub(crate) struct GuestProbe {
     /// A runner whose state dir is moved by `QONTINUI_HOME` is visible only
     /// through its unit.
     pub(crate) runner_active: Option<bool>,
+    /// Units the union listing named (`UNIT_COUNT`).
+    pub(crate) unit_count: Option<usize>,
+    /// Exit status of `systemctl show` (`SHOW_RC`).
+    pub(crate) show_rc: Option<i32>,
+    /// `Id=` records in the show block, counted raw (before any filtering),
+    /// so it is comparable with [`Self::unit_count`].
+    pub(crate) show_ids: usize,
     pub(crate) units: Vec<UnitProps>,
     pub(crate) runner_files: BTreeMap<String, String>,
 }
@@ -170,6 +180,9 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
             if line.trim() == "SHOW_END" {
                 in_show = false;
             } else {
+                if line.starts_with("Id=") {
+                    g.show_ids += 1;
+                }
                 show.push_str(line);
                 show.push('\n');
             }
@@ -208,6 +221,8 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
             "OOM_KILL" => g.oom_kill_total = v.trim().parse().ok(),
             "PID1" => g.systemd = v.trim() == "systemd",
             "LIST_RC" => g.list_rc = v.trim().parse().ok(),
+            "UNIT_COUNT" => g.unit_count = v.trim().parse().ok(),
+            "SHOW_RC" => g.show_rc = v.trim().parse().ok(),
             "RUNNER_ACTIVE" => g.runner_active = v.trim().parse::<u32>().ok().map(|n| n > 0),
             "RUNNERFILE" => {
                 if let Some(json) = parts.next() {
@@ -222,6 +237,17 @@ pub(crate) fn parse_guest_probe(text: &str) -> Option<GuestProbe> {
     g.identity_hash = identity_hash_of(&machine_id)?;
     g.units = parse_systemctl_show(&show);
     Some(g)
+}
+
+impl GuestProbe {
+    /// Whether this probe is a COMPLETE inventory of the guest's
+    /// `actions.runner.*` units: both listings exited 0, `systemctl show`
+    /// exited 0, and it returned exactly one `Id=` record per listed unit. A
+    /// failed or timed-out show yields zero rows — claimed complete, that
+    /// would delete every stored runner row and resolve their alerts.
+    pub(crate) fn inventory_complete(&self) -> bool {
+        self.list_rc == Some(0) && self.show_rc == Some(0) && self.unit_count == Some(self.show_ids)
+    }
 }
 
 #[cfg(windows)]
@@ -327,6 +353,7 @@ OOM_KILL\t3\n\
 PID1\tsystemd\n\
 LIST_RC\t0\n\
 RUNNER_ACTIVE\t0\n\
+UNIT_COUNT\t1\n\
 SHOW_BEGIN\n\
 Id=actions.runner.example-org-example-repo.wslbox.service\n\
 ActiveState=failed\n\
@@ -340,6 +367,7 @@ StateChangeTimestamp=Wed 2026-09-30 01:48:16 UTC\n\
 ExecMainStatus=0\n\
 \n\
 SHOW_END\n\
+SHOW_RC\t0\n\
 RUNNERFILE\tactions.runner.example-org-example-repo.wslbox.service\t{  \"agentName\": \"wslbox\",  \"gitHubUrl\": \"https://github.com/example-org/example-repo\"}\n\
 PROBE_END\n";
 
@@ -468,8 +496,35 @@ exit 0
             ]
         );
         assert_eq!(g.list_rc, Some(0));
+        assert_eq!((g.unit_count, g.show_rc, g.show_ids), (Some(2), Some(0), 2));
+        assert!(g.inventory_complete(), "the counts cover the union");
         // A failed list-unit-files makes the listing incomplete.
         assert_eq!(run_guest_script(true).list_rc, Some(1));
+    }
+
+    #[test]
+    fn a_guest_inventory_is_complete_only_when_show_answered_for_every_unit() {
+        let g = parse_guest_probe(GUEST_OUTPUT).unwrap();
+        assert_eq!((g.unit_count, g.show_rc, g.show_ids), (Some(1), Some(0), 1));
+        assert!(g.inventory_complete());
+        // `systemctl show` failed: zero or partial rows, never complete.
+        let failed = parse_guest_probe(&GUEST_OUTPUT.replace("SHOW_RC\t0", "SHOW_RC\t1")).unwrap();
+        assert!(!failed.inventory_complete());
+        // Show answered for fewer units than were listed.
+        let short =
+            parse_guest_probe(&GUEST_OUTPUT.replace("UNIT_COUNT\t1", "UNIT_COUNT\t2")).unwrap();
+        assert!(!short.inventory_complete());
+        // A probe from an older script (no counts): not complete.
+        let old = parse_guest_probe(
+            &GUEST_OUTPUT
+                .replace("UNIT_COUNT\t1\n", "")
+                .replace("SHOW_RC\t0\n", ""),
+        )
+        .unwrap();
+        assert!(!old.inventory_complete());
+        // The listing failed: not complete.
+        let listing = parse_guest_probe(&GUEST_OUTPUT.replace("LIST_RC\t0", "LIST_RC\t1")).unwrap();
+        assert!(!listing.inventory_complete());
     }
 
     #[test]
