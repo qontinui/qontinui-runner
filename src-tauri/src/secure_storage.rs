@@ -83,7 +83,7 @@ const STORAGE_FILE: &str = "auth_tokens.enc";
 /// A healthy read-modify-write holds it for milliseconds; ten seconds of
 /// contention means a peer is wedged, and the write fails loudly rather than
 /// blocking a heartbeat or a refresher tick forever.
-const STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Poll interval while waiting for the store lock.
 const STORE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(15);

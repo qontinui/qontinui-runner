@@ -300,7 +300,7 @@ fn keychain_enabled_env() -> bool {
 /// (plan `2026-08-29-qontinui-profile-device-pair-never-exits`, Phase 1). A
 /// few seconds is generous for what is otherwise a local D-Bus round-trip,
 /// not a network call.
-const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Tripped once any [`keyring_call_bounded`] call times out. `AuthManager` is
 /// shared with the runner's background device-JWT refresher
