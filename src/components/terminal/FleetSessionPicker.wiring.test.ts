@@ -319,7 +319,9 @@ describe("the retired `truncated` contract is gone from every layer", () => {
 describe("the walk sends the cursor, and only within its own scope", () => {
   it("puts the cursor on the wire beside the three scope parameters", () => {
     expect(HOOK).toContain('invoke<FleetSessionsResponse>("fleet_sessions_list"');
-    expect(HOOK).toContain("args: { deviceId, state, includeClosed, limit, cursor }");
+    expect(HOOK).toContain(
+      "args: { deviceId, state, sessionStatus, includeClosed, limit, cursor }",
+    );
   });
 
   it("sends a cursor ONLY when advancing, never on a restart", () => {
@@ -497,7 +499,9 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
     // so the trigger SAYS what it is. Keying only on a callback's identity makes
     // the trigger an implicit consequence of that callback's dependency list,
     // which is exactly how `limit` got in.
-    expect(HOOK).toContain("const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });");
+    expect(HOOK).toContain(
+      "const scopeKey = fleetScopeKey({ deviceId, state, includeClosed, sessionStatus });",
+    );
     expect(HOOK).toContain("}, [fetchPage, scopeKey, restartToken]);");
     // And it needs no suppression: both are real dependencies of the effect.
     expect(HOOK).not.toContain("eslint-disable-next-line react-hooks/exhaustive-deps");
@@ -513,8 +517,8 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
   });
 
   it("keeps `limit` out of the dependency list that restarts the walk", () => {
-    expect(HOOK).toContain("[deviceId, state, includeClosed],");
-    expect(HOOK).not.toContain("[deviceId, state, includeClosed, limit],");
+    expect(HOOK).toContain("[deviceId, state, includeClosed, sessionStatus],");
+    expect(HOOK).not.toMatch(/\[deviceId, state, includeClosed[^\]]*\blimit\b[^\]]*\],/);
   });
 
   it("reads the page size through a ref so the next page uses the new one", () => {
@@ -525,8 +529,12 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
   });
 
   it("leaves `limit` out of the scope fingerprint itself", () => {
-    expect(DISCOVERY).toContain(
-      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+    // `sessionStatus` joined the fingerprint with coord's Phase 4 filter (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`); `limit` still
+    // stays out.
+    const fingerprint = /return JSON\.stringify\(\[([^\]]*)\]\);/.exec(codeOf(DISCOVERY))?.[1];
+    expect(fingerprint?.replace(/\s+/g, " ").trim()).toBe(
+      "scope.deviceId, scope.state, scope.includeClosed, scope.sessionStatus ?? null,",
     );
   });
 });
