@@ -4,9 +4,9 @@
 //!
 //! Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
 //! Phase 2. Every requirement here was found by the Phase 0 spike's six review
-//! rounds and recorded in the plan's "what it hands Phase 2" blockquote; the
-//! spike (`src-tauri/src/pty_holder/spike.rs`) now calls these helpers rather
-//! than carrying its own copies. It lives in this LIBRARY (not in src-tauri)
+//! rounds and recorded in the plan's "what it hands Phase 2" blockquote (the
+//! spike itself was deleted in Phase 2 once these helpers replaced its
+//! copies). It lives in this LIBRARY (not in src-tauri)
 //! so the holder crate's own integration tests can drive it against the real
 //! holder binary on every CI leg, Windows included — the only place its
 //! `cfg(windows)` arm executes at all.
