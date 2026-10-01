@@ -216,7 +216,9 @@ pub(crate) fn parse_systemctl_show(text: &str) -> Vec<UnitProps> {
                 _ => {}
             }
         }
-        if !p.unit.is_empty() && !not_found {
+        // Unique by `Id`: `systemctl show` given an alias and its target
+        // prints the canonical unit twice — one unit, one row.
+        if !p.unit.is_empty() && !not_found && !out.iter().any(|q: &UnitProps| q.unit == p.unit) {
             out.push(p);
         }
     }
@@ -352,18 +354,39 @@ pub(crate) enum SessionBus {
     Failed,
 }
 
+/// The session-bus socket zbus would connect to when no
+/// `DBUS_SESSION_BUS_ADDRESS` is set: `$XDG_RUNTIME_DIR/bus`, or — when
+/// `XDG_RUNTIME_DIR` is unset/blank, as zbus's `Address::session()` falls back
+/// — `/run/user/<euid>/bus`. PURE.
+pub(crate) fn session_bus_socket(xdg_runtime_dir: Option<&Path>, euid: u32) -> PathBuf {
+    match xdg_runtime_dir.filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => d.join("bus"),
+        None => PathBuf::from(format!("/run/user/{euid}/bus")),
+    }
+}
+
 /// Whether a missing session-bus connection is "absent by design" rather than
-/// a failure: `DBUS_SESSION_BUS_ADDRESS` unset/blank AND no socket at
-/// `$XDG_RUNTIME_DIR/bus`. Anything else is a bus that SHOULD have answered —
-/// a user-unit runner restarted while its bus was unreachable must not claim
-/// its own kind complete and delete its own rows. PURE over its inputs.
+/// a failure: `DBUS_SESSION_BUS_ADDRESS` unset/blank AND nothing at the socket
+/// path zbus would try ([`session_bus_socket`]). Anything else is a bus that
+/// SHOULD have answered — a user-unit runner restarted while its bus was
+/// unreachable must not claim its own kind complete and delete its own rows.
 pub(crate) fn session_bus_absent_by_design(
     dbus_session_bus_address: Option<&str>,
-    xdg_runtime_dir: Option<&Path>,
+    socket: &Path,
 ) -> bool {
-    let no_address = dbus_session_bus_address.is_none_or(|a| a.trim().is_empty());
-    let no_socket = xdg_runtime_dir.is_none_or(|d| !d.join("bus").exists());
-    no_address && no_socket
+    dbus_session_bus_address.is_none_or(|a| a.trim().is_empty()) && !socket.exists()
+}
+
+/// The unit name a `ListUnitFilesByPatterns` / `list-unit-files` row
+/// contributes: the file name, except for a template (`foo@.service`, not an
+/// instance) and an `alias` row (a symlink whose unit is listed under its
+/// canonical name — keeping it would report one unit twice). PURE.
+pub(crate) fn unit_file_name(path: &str, state: &str) -> Option<String> {
+    if state == "alias" {
+        return None;
+    }
+    let name = Path::new(path).file_name()?.to_str()?;
+    (!name.contains("@.")).then(|| name.to_string())
 }
 
 /// Which kinds a Linux host scan saw completely (amendment A2). Both watched
@@ -487,7 +510,10 @@ pub(crate) mod linux {
                 None => {
                     let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
                     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-                    if super::session_bus_absent_by_design(addr.as_deref(), xdg.as_deref()) {
+                    // SAFETY: geteuid has no preconditions and cannot fail.
+                    let euid = unsafe { libc::geteuid() };
+                    let socket = super::session_bus_socket(xdg.as_deref(), euid);
+                    if super::session_bus_absent_by_design(addr.as_deref(), &socket) {
                         session = SessionBus::AbsentByDesign;
                     }
                 }
@@ -582,20 +608,15 @@ pub(crate) mod linux {
             }
         };
         {
-            for (path, _state) in files {
-                if let Some(name) = std::path::Path::new(&path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                {
-                    // `foo@.service` is a template, not an instance.
-                    if !name.contains("@.") {
-                        names.insert(name.to_string());
-                    }
+            for (path, state) in files {
+                if let Some(name) = super::unit_file_name(&path, &state) {
+                    names.insert(name);
                 }
             }
         }
 
         let mut out = Vec::with_capacity(names.len());
+        let mut seen_ids = BTreeSet::new();
         for name in names {
             let path: OwnedObjectPath =
                 match call(conn, MGR_PATH, MGR_IFACE, "LoadUnit", &(name.as_str(),)).await {
@@ -641,7 +662,13 @@ pub(crate) mod linux {
                     continue;
                 }
             };
-            out.push(props_from_maps(name, &unit, &svc));
+            // Key on the unit's own `Id` (its canonical name), as
+            // `systemctl show` does: a name that resolves to an already-seen
+            // unit is the same unit, not a second row.
+            let id = str_prop(&unit, "Id").unwrap_or(name);
+            if seen_ids.insert(id.clone()) {
+                out.push(props_from_maps(id, &unit, &svc));
+            }
         }
         Ok((out, whole))
     }
@@ -1070,6 +1097,20 @@ ActiveState=inactive
         assert_eq!(classify_unit(&units[1].unit), "qontinui_runner");
     }
 
+    /// `systemctl show` handed an alias and its target prints the canonical
+    /// `Id` twice; the parser keeps one row, keyed on that `Id` — the key the
+    /// D-Bus scan uses too.
+    #[test]
+    fn show_output_is_unique_by_id() {
+        let text = "Id=actions.runner.example-org-example-repo.box.service\nActiveState=active\n\nId=actions.runner.example-org-example-repo.box.service\nActiveState=active\n";
+        let units = parse_systemctl_show(text);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            "actions.runner.example-org-example-repo.box.service"
+        );
+    }
+
     #[test]
     fn only_utc_timestamps_are_trusted() {
         assert!(parse_show_timestamp("Wed 2026-09-30 01:48:16 UTC").is_some());
@@ -1217,18 +1258,64 @@ DISPLAY_NAME: Print Spooler\r
     fn a_session_bus_is_absent_by_design_only_when_nothing_advertises_one() {
         let dir = std::env::temp_dir().join(format!("qontinui-session-bus-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Nothing advertised: absent by design.
-        assert!(session_bus_absent_by_design(None, None));
-        assert!(session_bus_absent_by_design(Some(" "), Some(&dir)));
+        let socket = session_bus_socket(Some(&dir), 4242);
+        assert_eq!(socket, dir.join("bus"));
+        // Nothing advertised and no socket: absent by design.
+        assert!(session_bus_absent_by_design(None, &socket));
+        assert!(session_bus_absent_by_design(Some(" "), &socket));
         // An address is set: a bus that should have answered.
         assert!(!session_bus_absent_by_design(
-            Some("unix:path=/run/user/1000/bus"),
-            None
+            Some("unix:path=/run/user/4242/bus"),
+            &socket
         ));
-        // A socket exists in XDG_RUNTIME_DIR: likewise.
-        std::fs::write(dir.join("bus"), b"").unwrap();
-        assert!(!session_bus_absent_by_design(None, Some(&dir)));
+        // A socket exists where zbus would look: likewise.
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!session_bus_absent_by_design(None, &socket));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// zbus falls back to `/run/user/<euid>/bus` when `XDG_RUNTIME_DIR` is
+    /// unset — so must the absent-by-design check.
+    #[test]
+    fn the_session_socket_falls_back_to_run_user_euid() {
+        assert_eq!(
+            session_bus_socket(None, 4242),
+            PathBuf::from("/run/user/4242/bus")
+        );
+        assert_eq!(
+            session_bus_socket(Some(Path::new("")), 4242),
+            PathBuf::from("/run/user/4242/bus")
+        );
+        assert_eq!(
+            session_bus_socket(Some(Path::new("/tmp/xdg-example")), 4242),
+            PathBuf::from("/tmp/xdg-example/bus")
+        );
+    }
+
+    #[test]
+    fn unit_file_rows_drop_templates_and_aliases() {
+        assert_eq!(
+            unit_file_name(
+                "/etc/systemd/system/actions.runner.example-org-example-repo.box.service",
+                "enabled"
+            )
+            .as_deref(),
+            Some("actions.runner.example-org-example-repo.box.service")
+        );
+        assert_eq!(
+            unit_file_name(
+                "/etc/systemd/system/actions.runner.example-alias.service",
+                "alias"
+            ),
+            None
+        );
+        assert_eq!(
+            unit_file_name(
+                "/usr/lib/systemd/system/actions.runner.t@.service",
+                "static"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -217,10 +217,12 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
         // not "no units".
         //
         // Per-kind completeness (amendment A2): the host lists the guest's
-        // `actions.runner.*` SYSTEM units (`--all`, so a stopped runner is
-        // listed), so that kind is complete when `list-units` exited 0. It is
-        // NEVER complete for `qontinui_runner`: the host cannot see the
-        // guest's user bus, and the guest's own runner reports those rows.
+        // `actions.runner.*` SYSTEM units (loaded units ∪ unit files), and that
+        // kind is complete only when `GuestProbe::inventory_complete()` holds —
+        // both listings and `systemctl show` exited 0 and `show` returned one
+        // `Id=` record per listed unit. It is NEVER complete for
+        // `qontinui_runner`: the host cannot see the guest's user bus, and the
+        // guest's own runner reports those rows.
         //
         // And when a runner is ACTIVE inside the guest, the host claims no
         // completeness at all: that runner is the authority for the guest's
@@ -598,7 +600,10 @@ fn marker_total(e: &ComputerEvent) -> Option<u64> {
 /// coord reports only a count, and it expires strictly by AGE against its
 /// own (configurable) retention and its own clock — so the expired set is
 /// the `events_expired` OLDEST of `sent` by `observed_at`, never a local
-/// retention constant compared against this machine's clock. PURE.
+/// retention constant compared against this machine's clock. An
+/// `observed_at` that does not parse ranks as the OLDEST (it is the likeliest
+/// to have been refused or dropped), and ties keep their order in `sent` (the
+/// sort is stable). PURE.
 pub(crate) fn expired_marker_for(
     identity: &str,
     sent: &[ComputerEvent],

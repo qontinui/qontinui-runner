@@ -96,19 +96,25 @@ pub(crate) fn attribute_vm_oom_once(guests: &mut [GuestProbe]) {
 /// trusts; `.runner` is read without `sudo` (a `0700` home simply yields no
 /// line and the unit-name fallback applies).
 ///
-/// **The unit set matches the in-guest scan's.** `list-units --all` lists only
-/// LOADED units, so an installed runner that is disabled, stopped and
-/// unloaded would be missing — and a "complete" inventory without it would
-/// delete its row. The script therefore unions `list-units --all` with
-/// `list-unit-files` (templates `foo@.service` excluded), exactly the
-/// `ListUnitsByPatterns` ∪ `ListUnitFilesByPatterns` the runner's D-Bus scan
-/// uses, and `systemctl show` on an unloaded name loads it on demand just as
-/// that scan's `LoadUnit` does — so both reporters produce the same rows.
+/// **The unit set follows the in-guest scan's rules.** `list-units --all`
+/// lists only LOADED units, so an installed runner that is disabled, stopped
+/// and unloaded would be missing — and a "complete" inventory without it
+/// would delete its row. The script therefore unions `list-units --all` with
+/// `list-unit-files`, the same two sources as the runner's D-Bus scan
+/// (`ListUnitsByPatterns` ∪ `ListUnitFilesByPatterns`), drops the same rows it
+/// drops (templates `foo@.service` and `alias` symlinks — [`super::services::unit_file_name`]),
+/// and `systemctl show` on an unloaded name loads it on demand as that scan's
+/// `LoadUnit` does. Both key a row on the unit's own `Id`.
+///
+/// `list-unit-files` is called WITHOUT a pattern and filtered in `awk`:
+/// with a pattern that matches nothing it exits 1 (systemd 257), which would
+/// make a guest with no runner units never complete. Its exit status is
+/// captured from `systemctl` itself, before the filter.
 /// `LIST_RC` is 0 only when BOTH listings exited 0; `UNIT_COUNT` is the size
 /// of the union and `SHOW_RC` the exit of `systemctl show` — a listing is only
 /// a COMPLETE inventory when show also exited 0 and returned one `Id=` record
 /// per listed unit (see [`GuestProbe::inventory_complete`]).
-pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 'actions.runner.*' 2>/dev/null); frc=$?; if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'UNIT_COUNT\t%s\n' "$(printf '%s\n' "$units" | awk 'NF' | wc -l)"; printf 'SHOW_BEGIN\n'; shrc=0; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; shrc=$?; fi; printf '\nSHOW_END\n'; printf 'SHOW_RC\t%s\n' "$shrc"; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
+pub(crate) const GUEST_SCRIPT: &str = r#"printf 'MACHINE_ID\t%s\n' "$(cat /etc/machine-id 2>/dev/null)"; printf 'BOOT_ID\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'HOSTNAME\t%s\n' "$(cat /proc/sys/kernel/hostname 2>/dev/null)"; printf 'KERNEL\t%s\n' "$(uname -r 2>/dev/null)"; printf 'ARCH\t%s\n' "$(uname -m 2>/dev/null)"; printf 'OS\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")"; printf 'OS_VERSION\t%s\n' "$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")"; printf 'NPROC\t%s\n' "$(nproc 2>/dev/null)"; awk '/^MemTotal:/{printf "MEM_TOTAL_KB\t%s\n",$2} /^SwapTotal:/{printf "SWAP_TOTAL_KB\t%s\n",$2}' /proc/meminfo 2>/dev/null; printf 'DISK_TOTAL\t%s\n' "$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}')"; awk '/^btime /{printf "BTIME\t%s\n",$2}' /proc/stat 2>/dev/null; awk '/^oom_kill /{printf "OOM_KILL\t%s\n",$2}' /proc/vmstat 2>/dev/null; printf 'PID1\t%s\n' "$(cat /proc/1/comm 2>/dev/null)"; sf="$HOME/.qontinui/runner/computer-observer.json"; fresh=0; if [ -n "$HOME" ] && [ -f "$sf" ]; then m=$(stat -c %Y "$sf" 2>/dev/null); n=$(date +%s); if [ -n "$m" ] && [ $((n - m)) -lt 600 ]; then fresh=1; fi; fi; sysl=$(systemctl list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); src=$?; usrl=$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user list-units --type=service --state=active --plain --no-legend 'qontinui-runner*' 2>/dev/null); urc=$?; act=$(printf '%s\n%s\n' "$sysl" "$usrl" | awk 'NF' | wc -l); if [ "$fresh" = 1 ] || [ "$act" -gt 0 ]; then printf 'RUNNER_ACTIVE\t1\n'; elif [ "$src" = 0 ] && [ "$urc" = 0 ] && [ -n "$HOME" ]; then printf 'RUNNER_ACTIVE\t0\n'; fi; listing=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null); lrc=$?; files=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null); frc=$?; files=$(printf '%s\n' "$files" | awk '$1 ~ /^actions\.runner\./ && $2 != "alias"'); if [ "$lrc" = 0 ] && [ "$frc" = 0 ]; then printf 'LIST_RC\t0\n'; elif [ "$lrc" != 0 ]; then printf 'LIST_RC\t%s\n' "$lrc"; else printf 'LIST_RC\t%s\n' "$frc"; fi; units=$(printf '%s\n%s\n' "$listing" "$files" | awk 'NF && $1 !~ /@\./ {print $1}' | sort -u); printf 'UNIT_COUNT\t%s\n' "$(printf '%s\n' "$units" | awk 'NF' | wc -l)"; printf 'SHOW_BEGIN\n'; shrc=0; if [ -n "$units" ]; then TZ=UTC systemctl show $units -p Id,ActiveState,SubState,Result,Restart,OOMPolicy,MemoryMax,MemoryPeak,NRestarts,StateChangeTimestamp,ExecMainStatus,WorkingDirectory,ExecStart,ControlGroup,LoadState 2>/dev/null; shrc=$?; fi; printf '\nSHOW_END\n'; printf 'SHOW_RC\t%s\n' "$shrc"; for u in $units; do wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null); if [ -n "$wd" ] && [ -r "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; printf 'PROBE_END\n'"#;
 
 /// Everything one guest probe produced. Holds the identity HASH, never the
 /// raw machine id — [`parse_guest_probe`] hashes it and drops it.
@@ -397,12 +403,13 @@ PROBE_END\n";
     /// the shell half (the list-units ∪ list-unit-files union, the template
     /// exclusion, `LIST_RC`) is exercised, not just the parser.
     #[cfg(unix)]
-    fn run_guest_script(fail_unit_files: bool) -> GuestProbe {
+    fn run_guest_script(fail_unit_files: bool, no_runner_files: bool) -> GuestProbe {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
-            "qontinui-guest-script-{}-{}",
+            "qontinui-guest-script-{}-{}-{}",
             std::process::id(),
-            fail_unit_files
+            fail_unit_files,
+            no_runner_files
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -413,11 +420,18 @@ PROBE_END\n";
 case "$*" in
   *list-unit-files*)
     [ -n "$FAIL_UNIT_FILES" ] && exit 1
-    printf 'actions.runner.example-org-example-repo.wslbox.service enabled enabled\n'
-    printf 'actions.runner.example-org-other-repo.wslbox.service disabled enabled\n'
-    printf 'actions.runner.example-template@.service static -\n' ;;
+    # Real systemd (257): a PATTERN that matches nothing exits 1, silently.
+    case "$*" in *actions.runner*) [ -n "$NO_RUNNER_FILES" ] && exit 1 ;; esac
+    printf 'example-daemon.service enabled enabled\n'
+    printf 'dbus-org.example.service alias -\n'
+    if [ -z "$NO_RUNNER_FILES" ]; then
+      printf 'actions.runner.example-org-example-repo.wslbox.service enabled enabled\n'
+      printf 'actions.runner.example-org-other-repo.wslbox.service disabled enabled\n'
+      printf 'actions.runner.example-alias.wslbox.service alias -\n'
+      printf 'actions.runner.example-template@.service static -\n'
+    fi ;;
   *list-units*actions.runner*)
-    printf 'actions.runner.example-org-example-repo.wslbox.service loaded active running GitHub Actions Runner\n' ;;
+    [ -z "$NO_RUNNER_FILES" ] && printf 'actions.runner.example-org-example-repo.wslbox.service loaded active running GitHub Actions Runner\n' ;;
   *list-units*) : ;;
   *show*)
     for u in "$@"; do
@@ -448,6 +462,11 @@ exit 0
         } else {
             cmd.env_remove("FAIL_UNIT_FILES");
         }
+        if no_runner_files {
+            cmd.env("NO_RUNNER_FILES", "1");
+        } else {
+            cmd.env_remove("NO_RUNNER_FILES");
+        }
         let out =
             crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(20))
                 .unwrap();
@@ -476,7 +495,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn a_unit_known_only_to_list_unit_files_is_reported() {
-        let g = run_guest_script(false);
+        let g = run_guest_script(false, false);
         let units: Vec<(&str, Option<&str>)> = g
             .units
             .iter()
@@ -498,8 +517,23 @@ exit 0
         assert_eq!(g.list_rc, Some(0));
         assert_eq!((g.unit_count, g.show_rc, g.show_ids), (Some(2), Some(0), 2));
         assert!(g.inventory_complete(), "the counts cover the union");
+        // The alias row and the template were dropped; unrelated units too.
+        assert!(g.units.iter().all(|u| !u.unit.contains("example-alias")));
         // A failed list-unit-files makes the listing incomplete.
-        assert_eq!(run_guest_script(true).list_rc, Some(1));
+        assert_eq!(run_guest_script(true, false).list_rc, Some(1));
+    }
+
+    /// A guest with NO runner unit files: `list-unit-files` with a pattern
+    /// exits 1 on no match, which would leave such a guest incomplete forever.
+    /// Listed without a pattern and filtered, it is a complete, empty inventory.
+    #[cfg(unix)]
+    #[test]
+    fn a_guest_with_no_runner_units_is_a_complete_empty_inventory() {
+        let g = run_guest_script(false, true);
+        assert_eq!(g.list_rc, Some(0));
+        assert_eq!((g.unit_count, g.show_rc, g.show_ids), (Some(0), Some(0), 0));
+        assert!(g.units.is_empty());
+        assert!(g.inventory_complete());
     }
 
     #[test]
