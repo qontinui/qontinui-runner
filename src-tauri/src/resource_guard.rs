@@ -2155,8 +2155,9 @@ impl ShedLog {
             ),
             ShedState::HoldingOff => tracing::info!(
                 spender,
-                "resource_guard: memory pressure eased, but {spender} is holding off a few more \
-                 cycles before resuming (exponential backoff after a critical episode) — {why}"
+                "resource_guard: free commit is no longer below the critical floor, but \
+                 {spender} is holding off a few more cycles before resuming (exponential backoff \
+                 after a critical episode) — {why}"
             ),
         }
         true
@@ -4113,6 +4114,23 @@ mod tests {
             .count();
         // 4 ticks of hold-off, then 36 throttled ticks of which 9 run.
         assert_eq!(ran, 9);
+    }
+
+    /// N-1: the hold-off line never claims pressure eased while the verdict is
+    /// still WARN — it quotes the warn clause instead.
+    #[test]
+    fn holding_off_line_is_honest_under_warn() {
+        let ((), logs) = capture_logs(|| {
+            let mut shed = BackgroundShed::new("dip_spender", ShedPolicy::ThrottleAndBackoff);
+            shed.admit(&test_skip_verdict());
+            shed.admit(&test_throttle_verdict());
+        });
+        let line = logs
+            .lines()
+            .find(|l| l.contains("holding off"))
+            .expect("a hold-off line");
+        assert!(!line.contains("eased"), "{line}");
+        assert!(line.contains("below the 3.00 GiB warn floor"), "{line}");
     }
 
     /// The edge trigger: a spender that stays shed logs ONE line on entry and

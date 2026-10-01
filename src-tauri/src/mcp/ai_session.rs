@@ -1109,8 +1109,10 @@ pub(crate) async fn session_commit_state_inner(
     // those `git` calls is bounded: `git_status_subset` runs them through
     // `process_helpers::run_probe` under its `GIT_TIMEOUT` (20 s PER CALL), so
     // an actually-hung git (index.lock, a stalled mount) holds this thread for
-    // at most 20 s per call — up to 3–7 calls, i.e. a couple of minutes for a
-    // pathological probe — and then gives it back.
+    // at most 20 s per call and then gives it back. A probe is one
+    // `rev-parse --show-toplevel` per distinct parent directory of the touched
+    // files, plus two calls per repo (the mid-merge `rev-parse --git-dir` and
+    // the `status --porcelain`), each bounded by `GIT_TIMEOUT` on its own.
     tokio::task::spawn_blocking(move || commit_state_from_touched_files(files))
         .await
         .map_err(|e| {
@@ -1219,12 +1221,13 @@ const COMMIT_STATE_THROTTLE_FACTOR: u32 = 10;
 /// Global cap on commit-state probes in flight at once, across every session.
 ///
 /// Phase 3 of the same plan: this spender had NO global bound — one
-/// independent `spawn_blocking` per session per emit. A probe is 3–7
-/// sequential `git` calls (each one `CreateProcess` plus two `pipe-drain`
-/// threads), and each call may hold its blocking-pool thread for up to
-/// `GIT_TIMEOUT = 20 s` — so a pathological probe holds its thread for up to
-/// 3–7 × 20 s. It is the only spender whose burst scales with session count,
-/// and the measured shape preceding the commit-exhaustion aborts.
+/// independent `spawn_blocking` per session per emit. A probe is a run of
+/// sequential `git` calls — one `rev-parse --show-toplevel` per distinct parent
+/// directory of the touched files, plus two per repo (`rev-parse --git-dir` for
+/// the mid-merge check, and `status --porcelain`) — each one `CreateProcess`
+/// plus two `pipe-drain` threads, and each bounded by `GIT_TIMEOUT = 20 s` on
+/// its own. It is the only spender whose burst scales with session count, and
+/// the measured shape preceding the commit-exhaustion aborts.
 ///
 /// **Four**, because that is what the work needs and no more: a probe is
 /// sequential `git` calls on one blocking thread, so four in flight is at most
@@ -1261,15 +1264,25 @@ fn commit_state_window(
     }
 }
 
+/// The largest per-session window any verdict imposes (THROTTLE's). A
+/// `last_start` entry older than this can no longer delay anything, so it is
+/// pruned — see [`CommitStateLimiter::release`].
+const COMMIT_STATE_MAX_WINDOW: std::time::Duration =
+    COMMIT_STATE_WINDOW.saturating_mul(COMMIT_STATE_THROTTLE_FACTOR);
+
 /// A session's outstanding-driver slot.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct CommitStateSlot {
     /// Another request arrived after the current probe STARTED, so the driver
     /// owes one more probe.
     rerun: bool,
-    /// At least one of those requests must not be shed (the post-commit
-    /// emit). Sticky until the rerun it caused actually starts.
+    /// At least one of those requests must not be shed OR paced (the
+    /// post-commit emit). Sticky until the probe it caused actually starts.
     forced: bool,
+    /// Woken by a forced claim, so a driver sleeping out its initial delay or
+    /// its rerun pacing starts at once. Replaced at every probe start, so a
+    /// wake-up already answered by a probe cannot cut a LATER sleep short.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -1277,8 +1290,10 @@ struct CommitStateBook {
     /// session id → its driver's slot; present iff a driver is outstanding.
     slots: std::collections::HashMap<String, CommitStateSlot>,
     /// session id → when its most recent probe STARTED. The per-session pacing
-    /// clock, shared by a driver's reruns and by the next driver.
-    last_start: std::collections::HashMap<String, std::time::Instant>,
+    /// clock, shared by a driver's reruns and by the next driver. Kept on the
+    /// tokio clock so the pacing is testable on a paused one; in production
+    /// it is the monotonic clock.
+    last_start: std::collections::HashMap<String, tokio::time::Instant>,
 }
 
 /// The global in-flight cap, per-session coalescing and per-session pacing for
@@ -1294,8 +1309,8 @@ struct CommitStateBook {
 ///   tracker as it is then, so the last edit of a burst is never the one lost.
 ///   Without this, a cap would turn a burst into a queue that grows with
 ///   session count × wait time and replays stale requests one by one.
-/// - `last_start` paces each session: no two probes of one session start
-///   closer than the verdict's window, reruns included.
+/// - `last_start` paces each session: no two unforced probes of one session
+///   start closer than the verdict's window, reruns included.
 pub(crate) struct CommitStateLimiter {
     permits: tokio::sync::Semaphore,
     book: std::sync::Mutex<CommitStateBook>,
@@ -1315,7 +1330,7 @@ struct SlotRelease<'a> {
 impl Drop for SlotRelease<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.limiter.book().slots.remove(self.session_id);
+            CommitStateLimiter::release(&mut self.limiter.book(), self.session_id);
         }
     }
 }
@@ -1332,15 +1347,33 @@ impl CommitStateLimiter {
         self.book.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Drop the session's slot, and prune every `last_start` entry old enough
+    /// that it can no longer delay a probe. Without the prune the map grows by
+    /// one entry per session the runner has ever seen; with it, it holds only
+    /// sessions probed within the last [`COMMIT_STATE_MAX_WINDOW`]. A release
+    /// is the natural moment: it is when a session stops needing its entry.
+    fn release(book: &mut CommitStateBook, session_id: &str) {
+        book.slots.remove(session_id);
+        let now = tokio::time::Instant::now();
+        book.last_start
+            .retain(|_, started| now.saturating_duration_since(*started) < COMMIT_STATE_MAX_WINDOW);
+    }
+
     /// Claim this session's driver slot. `true` ⇒ the caller must start a
     /// driver ([`Self::drive`]); `false` ⇒ one is already outstanding and now
-    /// owes one more probe. `force` makes that owed probe unsheddable.
+    /// owes one more probe. `force` makes that owed probe unsheddable and
+    /// unpaced, and wakes the driver if it is sleeping.
     pub(crate) fn claim(&self, session_id: &str, force: bool) -> bool {
         let mut book = self.book();
         match book.slots.get_mut(session_id) {
             Some(slot) => {
                 slot.rerun = true;
-                slot.forced |= force;
+                if force {
+                    slot.forced = true;
+                    // `notify_one` stores a permit when nobody is waiting yet,
+                    // so a driver that has not reached its sleep still wakes.
+                    slot.wake.notify_one();
+                }
                 false
             }
             None => {
@@ -1357,15 +1390,34 @@ impl CommitStateLimiter {
         &self,
         session_id: &str,
         window: std::time::Duration,
-        now: std::time::Instant,
+        now: tokio::time::Instant,
     ) -> Option<std::time::Duration> {
         let due = *self.book().last_start.get(session_id)? + window;
         (due > now).then(|| due - now)
     }
 
     #[cfg(test)]
-    fn record_start(&self, session_id: &str, at: std::time::Instant) {
+    fn record_start(&self, session_id: &str, at: tokio::time::Instant) {
         self.book().last_start.insert(session_id.to_string(), at);
+    }
+
+    /// Sleep `delay`, cut short by a forced claim. Returns whether the slot is
+    /// forced when the sleep ends.
+    async fn wakeable_sleep(&self, session_id: &str, delay: std::time::Duration) -> bool {
+        let wake = self.book().slots.get(session_id).map(|s| s.wake.clone());
+        match wake {
+            Some(wake) => {
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = wake.notified() => {}
+                }
+            }
+            None => tokio::time::sleep(delay).await,
+        }
+        self.book()
+            .slots
+            .get(session_id)
+            .is_some_and(|slot| slot.forced)
     }
 
     /// Wait `initial_delay`, run `probe` under a global permit, then once more
@@ -1373,10 +1425,14 @@ impl CommitStateLimiter {
     /// out — including on unwind or cancellation ([`SlotRelease`]) — so the next
     /// [`Self::claim`] starts a fresh driver.
     ///
-    /// `pace` is consulted before an unforced RERUN: `None` (SKIP) drops it —
-    /// the badge is then refreshed by the next hook, or by the frontend's 30 s
-    /// poll — and `Some(window)` delays it until `window` after the previous
-    /// probe started. A FORCED rerun is neither shed nor paced.
+    /// Before every UNFORCED probe that had to wait — the deferred first probe
+    /// and every rerun — `pace` is consulted AFTER the wait: `None` (SKIP) sheds
+    /// it, because a box that went critical while the probe was deferred must
+    /// not then spawn `git` on the strength of a verdict read before it did. A
+    /// rerun is also consulted BEFORE its wait, and `Some(window)` delays it
+    /// until `window` after the previous probe started. A FORCED probe is
+    /// neither shed nor paced: a forced claim wakes whichever sleep the driver
+    /// is in.
     pub(crate) async fn drive<P, Fut>(
         &self,
         session_id: &str,
@@ -1392,10 +1448,17 @@ impl CommitStateLimiter {
             session_id,
             armed: true,
         };
-        if let Some(delay) = initial_delay {
-            tokio::time::sleep(delay).await;
-        }
+        let mut delay = initial_delay;
         loop {
+            if let Some(wait) = delay.take() {
+                let forced = self.wakeable_sleep(session_id, wait).await;
+                // The verdict may have changed while this probe was deferred.
+                if !forced && pace().is_none() && self.shed(session_id) {
+                    release.armed = false;
+                    return;
+                }
+            }
+
             let permit = self.permits.acquire().await;
             {
                 // Every request that landed before this instant is answered by
@@ -1405,7 +1468,7 @@ impl CommitStateLimiter {
                     *slot = CommitStateSlot::default();
                 }
                 book.last_start
-                    .insert(session_id.to_string(), std::time::Instant::now());
+                    .insert(session_id.to_string(), tokio::time::Instant::now());
             }
             // The semaphore is never closed, so `permit` is always `Ok`; if it
             // ever were not, skipping the probe and releasing is still correct.
@@ -1414,45 +1477,55 @@ impl CommitStateLimiter {
             }
             drop(permit);
 
-            let (slot, last_start) = {
+            let (rerun, forced, last_start) = {
                 let mut book = self.book();
-                let slot = book.slots.get(session_id).copied().unwrap_or_default();
-                if !slot.rerun {
-                    // Removed under the same lock that read "no rerun", so a
+                let (rerun, forced) = book
+                    .slots
+                    .get(session_id)
+                    .map(|slot| (slot.rerun, slot.forced))
+                    .unwrap_or_default();
+                let last_start = book.last_start.get(session_id).copied();
+                if !rerun {
+                    // Released under the same lock that read "no rerun", so a
                     // `claim` either lands before (and is seen as a rerun) or
                     // after (and starts a fresh driver) — never in between.
-                    book.slots.remove(session_id);
+                    Self::release(&mut book, session_id);
                 }
-                (slot, book.last_start.get(session_id).copied())
+                (rerun, forced, last_start)
             };
-            if !slot.rerun {
+            if !rerun {
                 release.armed = false;
                 return;
             }
-            if slot.forced {
+            if forced {
                 continue;
             }
             // Consulted OUTSIDE the lock: the live verdict can read settings,
-            // and `claim` runs on the hook path. A `claim` landing in this gap
-            // only re-sets flags on a slot that is still present.
+            // and `claim` runs on the hook path.
             let Some(window) = pace() else {
-                // Shed — unless a forced claim landed while we asked.
-                let mut book = self.book();
-                if book.slots.get(session_id).is_some_and(|s| s.forced) {
-                    continue;
+                if self.shed(session_id) {
+                    release.armed = false;
+                    return;
                 }
-                book.slots.remove(session_id);
-                release.armed = false;
-                return;
+                continue;
             };
-            if let Some(started) = last_start {
-                let due = started + window;
-                let now = std::time::Instant::now();
-                if due > now {
-                    tokio::time::sleep(due - now).await;
-                }
-            }
+            delay = last_start
+                .map(|started| started + window)
+                .and_then(|due| due.checked_duration_since(tokio::time::Instant::now()))
+                .filter(|wait| !wait.is_zero());
         }
+    }
+
+    /// Shed the owed probe: release the slot and return `true` — unless a
+    /// forced claim has landed, in which case the probe is owed regardless and
+    /// this returns `false`.
+    fn shed(&self, session_id: &str) -> bool {
+        let mut book = self.book();
+        if book.slots.get(session_id).is_some_and(|slot| slot.forced) {
+            return false;
+        }
+        Self::release(&mut book, session_id);
+        true
     }
 }
 
@@ -1485,7 +1558,7 @@ fn decide_commit_state_emit(
     verdict: &crate::resource_guard::BackgroundWork,
     limiter: &CommitStateLimiter,
     session_id: &str,
-    now: std::time::Instant,
+    now: tokio::time::Instant,
 ) -> EmitDecision {
     let Some(window) = commit_state_window(verdict) else {
         return EmitDecision::Shed;
@@ -1561,7 +1634,7 @@ pub fn emit_commit_state_for_session(app_handle: tauri::AppHandle, session_id: S
         .note(state, &verdict);
 
     let limiter = commit_state_limiter();
-    match decide_commit_state_emit(&verdict, limiter, &session_id, std::time::Instant::now()) {
+    match decide_commit_state_emit(&verdict, limiter, &session_id, tokio::time::Instant::now()) {
         EmitDecision::Shed | EmitDecision::Coalesced => {}
         EmitDecision::Start(delay) => spawn_commit_state_driver(app_handle, session_id, delay),
     }
@@ -3981,7 +4054,8 @@ mod commit_state_limiter_tests {
     use super::*;
     use crate::resource_guard::{test_skip_verdict, test_throttle_verdict, BackgroundWork};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -4267,37 +4341,37 @@ mod commit_state_limiter_tests {
         }
     }
 
-    /// W2 end to end: a burst inside the window yields exactly one immediate
-    /// probe and exactly one trailing probe.
+    fn paused_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    /// W2 end to end, on a paused clock so the timing is exact: a burst inside
+    /// the window yields exactly one immediate probe and exactly one trailing
+    /// probe, and the trailing one starts exactly one window after the first.
     #[test]
     fn a_burst_gets_exactly_one_trailing_probe() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
-        let probes = Arc::new(AtomicUsize::new(0));
-        let window = Duration::from_millis(40);
-        rt().block_on(async {
+        let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+        paused_rt().block_on(async {
+            let t0 = Instant::now();
             let mut drivers = Vec::new();
             for _ in 0..6 {
-                let verdict_window = Some(window);
-                let now = Instant::now();
-                let decision = {
-                    if !limiter.claim("s", false) {
-                        EmitDecision::Coalesced
-                    } else {
-                        EmitDecision::Start(limiter.delay_until_due("s", window, now))
-                    }
-                };
+                let decision =
+                    decide_commit_state_emit(&BackgroundWork::Run, &limiter, "s", Instant::now());
                 if let EmitDecision::Start(delay) = decision {
-                    let (l, p) = (limiter.clone(), probes.clone());
+                    let (l, st) = (limiter.clone(), starts.clone());
                     drivers.push(tokio::spawn(async move {
                         l.drive(
                             "s",
                             delay,
-                            move || verdict_window,
+                            || Some(COMMIT_STATE_WINDOW),
                             move || {
-                                let p = p.clone();
-                                async move {
-                                    p.fetch_add(1, Ordering::SeqCst);
-                                }
+                                st.lock().unwrap().push(Instant::now());
+                                async {}
                             },
                         )
                         .await
@@ -4308,7 +4382,150 @@ mod commit_state_limiter_tests {
             for d in drivers {
                 d.await.unwrap();
             }
+            let starts = starts.lock().unwrap();
+            assert_eq!(starts.len(), 2, "leading + one trailing");
+            assert_eq!(starts[0] - t0, Duration::ZERO);
+            // The trailing probe starts exactly one Run window after the first.
+            assert_eq!(starts[1] - starts[0], COMMIT_STATE_WINDOW);
         });
-        assert_eq!(probes.load(Ordering::SeqCst), 2, "leading + one trailing");
+    }
+
+    /// W-1: a forced claim landing while the driver sleeps out its deferral is
+    /// neither shed nor paced — it wakes the sleep, and the probe runs at once
+    /// even though `pace` says SKIP.
+    #[test]
+    fn a_forced_claim_wakes_a_sleeping_driver() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+        paused_rt().block_on(async {
+            let t0 = Instant::now();
+            assert!(limiter.claim("s", false));
+            let (l, st) = (limiter.clone(), starts.clone());
+            let driver = tokio::spawn(async move {
+                l.drive(
+                    "s",
+                    Some(Duration::from_secs(3600)),
+                    || None,
+                    move || {
+                        st.lock().unwrap().push(Instant::now());
+                        async {}
+                    },
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            assert!(!limiter.claim("s", true));
+            driver.await.unwrap();
+            let starts = starts.lock().unwrap();
+            assert_eq!(starts.len(), 1, "the forced probe ran despite SKIP");
+            assert!(starts[0] - t0 < Duration::from_secs(1), "and was not paced");
+        });
+        assert!(limiter.claim("s", false), "slot released");
+    }
+
+    /// W-1, rerun arm: a forced claim during a rerun's pacing sleep wakes it.
+    #[test]
+    fn a_forced_claim_wakes_a_pacing_rerun() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        paused_rt().block_on(async {
+            let t0 = Instant::now();
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let probe = gated_probe(probes.clone(), started.clone(), release.clone());
+            let driver = tokio::spawn(async move {
+                l.drive("s", None, || Some(Duration::from_secs(3600)), probe)
+                    .await
+            });
+            started.notified().await;
+            assert!(!limiter.claim("s", false), "an unforced rerun, paced 1 h");
+            release.notify_one();
+            // Let the driver finish the probe and enter the pacing sleep.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!limiter.claim("s", true));
+            driver.await.unwrap();
+            assert!(Instant::now() - t0 < Duration::from_secs(1), "not paced");
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// W-2: a deferred first probe re-checks the verdict after its wait, and
+    /// sheds if the box went critical meanwhile — no probe, slot released.
+    #[test]
+    fn a_deferred_probe_is_shed_if_the_verdict_went_skip_while_waiting() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let probes = Arc::new(AtomicUsize::new(0));
+        paused_rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let (l, p) = (limiter.clone(), probes.clone());
+            l.drive(
+                "s",
+                Some(Duration::from_secs(5)),
+                || None,
+                move || {
+                    p.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                },
+            )
+            .await;
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert!(limiter.claim("s", false), "slot released");
+    }
+
+    /// W-2, rerun arm: a rerun admitted before its pacing sleep is still shed
+    /// if the verdict is SKIP once the sleep ends.
+    #[test]
+    fn a_paced_rerun_is_shed_if_the_verdict_went_skip_while_waiting() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        paused_rt().block_on(async {
+            assert!(limiter.claim("s", false));
+            let l = limiter.clone();
+            let probe = gated_probe(probes.clone(), started.clone(), release.clone());
+            let mut verdicts = vec![None, Some(Duration::from_secs(5))];
+            let driver = tokio::spawn(async move {
+                l.drive("s", None, move || verdicts.pop().flatten(), probe)
+                    .await
+            });
+            started.notified().await;
+            assert!(!limiter.claim("s", false));
+            release.notify_one();
+            driver.await.unwrap();
+        });
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "the rerun was shed after its wait"
+        );
+        assert!(limiter.claim("s", false));
+    }
+
+    /// L-1: releasing a slot prunes `last_start` entries too old to delay
+    /// anything, so the map does not grow with every session ever seen.
+    #[test]
+    fn release_prunes_stale_pacing_entries() {
+        let limiter = Arc::new(CommitStateLimiter::new(4));
+        paused_rt().block_on(async {
+            limiter.record_start("gone", Instant::now());
+            tokio::time::advance(COMMIT_STATE_MAX_WINDOW + Duration::from_millis(1)).await;
+            assert!(limiter.claim("live", false));
+            limiter
+                .drive("live", None, || Some(Duration::ZERO), || async {})
+                .await;
+        });
+        let book = limiter.book();
+        assert!(!book.last_start.contains_key("gone"), "stale entry pruned");
+        assert!(book.last_start.contains_key("live"), "fresh entry kept");
     }
 }
