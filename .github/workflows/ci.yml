@@ -859,6 +859,16 @@ jobs:
           # nothing. Keeping the two logs distinct is what makes the split
           # transparent to the ingest; the expiry summariser below reads both.
           set -o pipefail
+          # The runner's `terminal::daemon_pane_io` end-to-end tests (plan
+          # 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions,
+          # Phase 2; `cfg(target_os = "linux")`) drive the REAL holder binary,
+          # which is a bin of ANOTHER workspace package — `cargo test` from
+          # src-tauri never builds it, and those tests fail (never skip) when
+          # it is missing. Built here, in the compile half, so the run half
+          # still invokes no cargo. Linux only: the tests are Linux only.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo build -p qontinui-pty-holder
+          fi
           cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
         shell: bash
 
