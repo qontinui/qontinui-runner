@@ -5655,7 +5655,7 @@ async fn run_gate_continuation_inner(
     // above was already bound at allocate time.
     if result.is_ok() {
         if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
-            report_session_launched(dispatch_agent, pinned_session_id).await;
+            tokio::spawn(report_session_launched(dispatch_agent, pinned_session_id));
         }
     }
 
@@ -8039,6 +8039,11 @@ async fn run_agent_subprocess(
 
     // Step 3: subprocess + restart loop.
     let mut restarts = 0u32;
+    // Which Claude session each attempt runs under, and whether the dispatch's
+    // session has been reported yet (plan
+    // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    // Phase 4).
+    let mut session_pins = SpawnSessionPins::default();
     let mut final_exit_code: Option<i64> = None;
     let mut final_reason: Option<String> = None;
     // The lifecycle phase the terminal `spawn-failed` post reports. `Exited` for
@@ -8067,12 +8072,9 @@ async fn run_agent_subprocess(
             break;
         }
         // Pin this attempt's Claude session id so coord can be told which
-        // session the dispatch launched (plan
-        // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
-        // Phase 4). Fresh per attempt: a restart is a new session, and the CLI
-        // refuses a reused id.
-        let attempt_session_id = uuid::Uuid::new_v4();
-        let session_args = pinned_session_args(attempt_session_id);
+        // session the dispatch launched. Minted INSIDE the loop, fresh per
+        // attempt: a restart is a new session, and the CLI refuses a reused id.
+        let session_args = session_pins.next_attempt();
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
@@ -8093,13 +8095,17 @@ async fn run_agent_subprocess(
                     crate::session::tracking_health::register_headless_claude_pid(p);
                 }
                 // First successful spawn = post spawn-complete with pid.
+                // The FIRST SUCCESSFUL spawn's session is the dispatch's session,
+                // even when earlier attempts failed to start. coord binds the
+                // earliest report and never rebinds, so later restarts are not
+                // reported. Sent off the spawn path, so the child's stdout pump
+                // is never held behind a coord round trip.
+                if let Some(session) = session_pins.take_first_success() {
+                    tokio::spawn(report_session_launched(payload.agent_id, session));
+                }
                 if restarts == 0 {
                     report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
                         .await;
-                    // The FIRST session is the one the dispatch launched; coord
-                    // binds the earliest report and never rebinds, so a
-                    // restart's session is not reported.
-                    report_session_launched(payload.agent_id, attempt_session_id).await;
                 } else {
                     info!(
                         "agent_runtime: restart {restarts} succeeded agent_id={}",
@@ -9140,6 +9146,38 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// must be fresh for each spawn attempt, because the CLI refuses to reuse one.
 fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
     vec!["--session-id".to_string(), session_id.to_string()]
+}
+
+/// The Claude session ids of one launch's spawn attempts.
+///
+/// [`Self::next_attempt`] mints a FRESH id for every attempt, because a restart
+/// is a new session and the CLI refuses to reuse an id.
+/// [`Self::take_first_success`] hands back the id of the first attempt that
+/// actually spawned, exactly once. That is the session coord binds the
+/// dispatch to, whether or not earlier attempts failed to start.
+#[derive(Debug, Default)]
+struct SpawnSessionPins {
+    current: Option<uuid::Uuid>,
+    reported: bool,
+}
+
+impl SpawnSessionPins {
+    /// Mint the next attempt's session id and return its `claude` flags.
+    fn next_attempt(&mut self) -> Vec<String> {
+        let id = uuid::Uuid::new_v4();
+        self.current = Some(id);
+        pinned_session_args(id)
+    }
+
+    /// The current attempt's id, the first time a spawn succeeds; `None` after.
+    fn take_first_success(&mut self) -> Option<uuid::Uuid> {
+        if self.reported {
+            return None;
+        }
+        let id = self.current?;
+        self.reported = true;
+        Some(id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -12727,6 +12765,35 @@ mod tests {
                 "--session-id".to_string(),
                 "99999999-9999-4999-8999-999999999999".to_string()
             ]
+        );
+    }
+
+    /// Every spawn attempt runs under a FRESH session id, and the session
+    /// reported is the first one that actually spawned: here attempt 1 fails to
+    /// start, attempt 2 spawns (reported), and attempt 3's restart is not.
+    #[test]
+    fn each_spawn_attempt_pins_a_fresh_session_and_the_first_success_is_reported() {
+        let id_of = |args: &[String]| {
+            assert_eq!(args[0], "--session-id");
+            uuid::Uuid::parse_str(&args[1]).expect("a uuid")
+        };
+        let mut pins = SpawnSessionPins::default();
+        assert_eq!(pins.take_first_success(), None, "nothing spawned yet");
+        let first = id_of(&pins.next_attempt());
+        // attempt 1 failed to spawn: nothing taken
+        let second = id_of(&pins.next_attempt());
+        assert_ne!(first, second, "a retry never reuses an id");
+        assert_eq!(
+            pins.take_first_success(),
+            Some(second),
+            "first SUCCESS, not attempt 1"
+        );
+        let third = id_of(&pins.next_attempt());
+        assert_ne!(second, third);
+        assert_eq!(
+            pins.take_first_success(),
+            None,
+            "a restart is never reported"
         );
     }
 
