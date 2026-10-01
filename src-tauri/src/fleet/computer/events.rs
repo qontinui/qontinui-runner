@@ -133,12 +133,6 @@ pub(crate) struct ObsInput<'a> {
     /// a guest that loses ownership must CLEAR its baseline — carrying it would
     /// produce a bogus delta if it regains ownership later.
     pub(crate) carry_oom_baseline: bool,
-    /// Emit the UNATTRIBUTED remainder of an `oom_kill` delta. `false` for a
-    /// runner whose own computer is a WSL guest: its `/proc/vmstat` counter
-    /// is VM-wide, and the VM-wide remainder belongs to the Windows host's
-    /// guest probe — reporting it from inside too would count each kill once
-    /// per in-guest runner. Unit-attributed kills are still reported.
-    pub(crate) report_unattributed_oom: bool,
 }
 
 pub(crate) fn rfc3339(t: DateTime<Utc>) -> String {
@@ -401,7 +395,7 @@ pub(crate) fn derive(
         if let (Some(a), Some(b)) = (baseline, input.oom_kill_total) {
             if b > a {
                 let unattributed = (b - a).saturating_sub(attributed);
-                if unattributed > 0 && input.report_unattributed_oom {
+                if unattributed > 0 {
                     let how = if rebooted {
                         "vmstat_since_boot"
                     } else {
@@ -649,7 +643,6 @@ mod tests {
             services: Some(units),
             services_complete: true,
             carry_oom_baseline: true,
-            report_unattributed_oom: true,
         }
     }
 
@@ -796,7 +789,6 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             services_complete: true,
             carry_oom_baseline: true,
-            report_unattributed_oom: true,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         // The reboot, plus the one kill counted since that boot (baseline 0).
@@ -824,7 +816,6 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: Some(&units),
             services_complete: true,
             carry_oom_baseline: true,
-            report_unattributed_oom: true,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
         let kinds: Vec<&str> = ev.iter().map(|e| e.kind.as_str()).collect();
@@ -845,7 +836,6 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             services: None,
             services_complete: false,
             carry_oom_baseline: true,
-            report_unattributed_oom: true,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
         let (jitter, o1) = derive(
@@ -885,7 +875,6 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         let lost = ObsInput {
             oom_kill_total: None,
             carry_oom_baseline: false,
-            report_unattributed_oom: true,
             ..input(&units, None)
         };
         let (_, o1) = derive(Some(&o0), &lost, t("2026-09-30T01:00:30Z"));
@@ -1012,47 +1001,48 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         assert!(telemetry_gap(None, None, t("2026-09-30T01:16:23Z"), 30, None, None).is_none());
     }
 
-    /// A runner inside a WSL guest reports the unit-attributed kill but not
-    /// the VM-wide remainder (the Windows host's guest probe owns that).
+    /// The in-guest runner owns the VM-wide counter, with full cgroup
+    /// attribution: a kill inside `qontinui-runner.service`'s cgroup is ONE
+    /// attributed event, with no unattributed remainder beside it; a kill
+    /// elsewhere in the VM is the remainder, under the shared VM-wide id
+    /// `oom_kill:[boot, "", total]` that the Windows host's probe would also
+    /// use (so a race between the two dedupes in coord).
     #[test]
-    fn a_runner_inside_a_guest_reports_only_attributed_kills() {
-        let before = watched(ACTIVE_BEFORE, Some(0));
-        let after = watched(svc::INCIDENT_SHOW, None);
-        let (_, o0) = derive(
-            None,
-            &ObsInput {
-                report_unattributed_oom: false,
-                ..input(&before, Some(5))
-            },
-            t("2026-09-30T01:40:00Z"),
+    fn a_kill_in_the_runners_own_cgroup_is_counted_once() {
+        const RUNNER: &str = "\
+Id=qontinui-runner.service
+ActiveState=active
+SubState=running
+Result=success
+OOMPolicy=continue
+NRestarts=0
+StateChangeTimestamp=Wed 2026-09-30 01:00:00 UTC
+ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service
+";
+        let before = watched(RUNNER, Some(0));
+        let (_, o0) = derive(None, &input(&before, Some(5)), t("2026-09-30T01:40:00Z"));
+        let after = watched(RUNNER, Some(1));
+        let (ev, o1) = derive(
+            Some(&o0),
+            &input(&after, Some(6)),
+            t("2026-09-30T01:40:30Z"),
         );
-        // vmstat 5 → 8: one kill is the unit's, two are elsewhere in the VM.
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].detail["attribution"], "cgroup_memory_events");
+        assert_eq!(ev[0].detail["victim_unit"], "qontinui-runner.service");
+
+        // A kill elsewhere in the VM: the remainder, under the shared id.
         let (ev, _) = derive(
-            Some(&o0),
-            &ObsInput {
-                report_unattributed_oom: false,
-                ..input(&after, Some(8))
-            },
-            t("2026-09-30T01:48:40Z"),
+            Some(&o1),
+            &input(&after, Some(7)),
+            t("2026-09-30T01:41:00Z"),
         );
-        let attributions: Vec<&str> = ev
-            .iter()
-            .filter(|e| e.kind == "oom_kill")
-            .filter_map(|e| e.detail["attribution"].as_str())
-            .collect();
-        assert_eq!(attributions, vec!["unit_result"]);
-        // The same observation from the host's probe reports the remainder.
-        let (ev_host, _) = derive(
-            Some(&o0),
-            &input(&after, Some(8)),
-            t("2026-09-30T01:48:40Z"),
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].detail["attribution"], "vmstat_delta");
+        assert_eq!(
+            ev[0].client_event_id,
+            event_id("oom_kill", &[BOOT, "", "7"])
         );
-        let remainder: Vec<u64> = ev_host
-            .iter()
-            .filter(|e| e.detail["attribution"] == "vmstat_delta")
-            .filter_map(|e| e.detail["count"].as_u64())
-            .collect();
-        assert_eq!(remainder, vec![2]);
     }
 
     #[test]

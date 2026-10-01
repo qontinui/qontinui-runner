@@ -296,21 +296,36 @@ pub(crate) fn cap_report(mut computers: Vec<ComputerReport>) -> Vec<ComputerRepo
     computers
 }
 
-/// The per-computer `identity_conflict` flags from a 200 response, or `None`
-/// when the body is not the documented shape (then every computer counts as
-/// delivered, the pre-outcome behaviour). PURE.
-pub(crate) fn parse_outcomes(body: &str) -> Option<BTreeMap<String, bool>> {
+/// One computer's result in a 200 response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Outcome {
+    /// coord did NOT store this computer's services or events.
+    pub(crate) identity_conflict: bool,
+    /// Events coord dropped as older than its retention window.
+    pub(crate) events_expired: u64,
+}
+
+/// The per-computer outcomes of a 200 response, or `None` when the body is
+/// not the documented shape (then every computer counts as delivered, the
+/// pre-outcome behaviour). PURE.
+pub(crate) fn parse_outcomes(body: &str) -> Option<BTreeMap<String, Outcome>> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let arr = v.get("computers")?.as_array()?;
     Some(
         arr.iter()
             .filter_map(|c| {
                 let id = c.get("identity_hash")?.as_str()?.to_string();
-                let conflict = c
-                    .get("identity_conflict")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                Some((id, conflict))
+                let o = Outcome {
+                    identity_conflict: c
+                        .get("identity_conflict")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    events_expired: c
+                        .get("events_expired")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                };
+                Some((id, o))
             })
             .collect(),
     )
@@ -515,7 +530,9 @@ pub(crate) fn presanitize(c: &mut ComputerReport, now: chrono::DateTime<chrono::
     for e in &mut c.events {
         if in_future(&e.observed_at, limit) {
             if let Some(d) = e.detail.as_object_mut() {
-                d.insert("reported_observed_at".into(), e.observed_at.clone().into());
+                // Set once: a second re-stamp keeps the FIRST original.
+                d.entry("reported_observed_at")
+                    .or_insert_with(|| e.observed_at.clone().into());
             }
             e.observed_at = events::rfc3339(now);
             skew = true;
@@ -571,17 +588,72 @@ pub(crate) fn smooth_offset(prev: Option<f64>, sample: f64) -> f64 {
     }
 }
 
+/// A sample further than this from local time is DISCARDED: an hour is far
+/// beyond any honest clock drift, and a `Date` header that wrong (a proxy, a
+/// broken coord clock, a test double) must not move every timestamp this
+/// machine sends.
+pub(crate) const MAX_OFFSET_SECS: f64 = 3600.0;
+/// Two consecutive samples must agree this closely before an estimate is
+/// first adopted — one stray `Date` header cannot set it.
+pub(crate) const OFFSET_AGREEMENT_SECS: f64 = 30.0;
+/// The offset is applied only when coord is behind by MORE than this: inside
+/// the band, the difference is `Date`'s 1 s resolution and network latency,
+/// not a clock disagreement.
+pub(crate) const OFFSET_DEAD_BAND_SECS: f64 = 5.0;
+
+/// One `coord − local` sample from a `Date` header, or `None` when it is out
+/// of bounds. `Date` truncates to the whole second, so the true coord time is
+/// on average half a second later: +0.5 s. PURE.
+pub(crate) fn offset_sample(
+    coord_date: chrono::DateTime<chrono::Utc>,
+    local: chrono::DateTime<chrono::Utc>,
+) -> Option<f64> {
+    let s = (coord_date - local).num_milliseconds() as f64 / 1000.0 + 0.5;
+    (s.abs() <= MAX_OFFSET_SECS).then_some(s)
+}
+
+/// The smoothed `coord − local` clock offset, adopted only after two
+/// consecutive in-bounds samples agree within [`OFFSET_AGREEMENT_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct ClockOffset {
+    pub(crate) estimate: Option<f64>,
+    last_sample: Option<f64>,
+}
+
+impl ClockOffset {
+    pub(crate) fn observe(&mut self, sample: Option<f64>) {
+        let Some(s) = sample else {
+            return;
+        };
+        match self.estimate {
+            Some(_) => self.estimate = Some(smooth_offset(self.estimate, s)),
+            None => {
+                if self
+                    .last_sample
+                    .is_some_and(|p| (s - p).abs() <= OFFSET_AGREEMENT_SECS)
+                {
+                    self.estimate = Some(s);
+                }
+            }
+        }
+        self.last_sample = Some(s);
+    }
+}
+
 /// The clock timestamps are checked and stamped against: the EARLIER of this
-/// machine's clock and coord's (estimated from its `Date` headers). coord
-/// refuses a timestamp more than 300 s ahead of ITS clock, so when coord is
-/// behind, coord's clock is the bound; when coord is ahead, ours already is.
-/// PURE.
+/// machine's clock and coord's. coord refuses a timestamp more than 300 s
+/// ahead of ITS clock, so when coord is behind (beyond the dead band) coord's
+/// clock is the bound; otherwise ours is. Never more than [`MAX_OFFSET_SECS`]
+/// before local time, whatever the input. PURE.
 pub(crate) fn effective_now(
     local: chrono::DateTime<chrono::Utc>,
     coord_offset_secs: Option<f64>,
 ) -> chrono::DateTime<chrono::Utc> {
     match coord_offset_secs {
-        Some(o) if o < 0.0 => local + chrono::Duration::milliseconds((o * 1000.0) as i64),
+        Some(o) if o < -OFFSET_DEAD_BAND_SECS => {
+            let o = o.max(-MAX_OFFSET_SECS);
+            local + chrono::Duration::milliseconds((o * 1000.0) as i64)
+        }
         _ => local,
     }
 }
@@ -598,6 +670,49 @@ pub(crate) fn problem_paths(problems: &[String]) -> Vec<String> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Split refused-as-future ids into those ALREADY re-stamped once (carrying
+/// `detail.reported_observed_at` — they go to quarantine) and the rest. PURE.
+pub(crate) fn split_restamped(
+    state: &ObserverState,
+    identity: &str,
+    ids: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let q = state.pending.get(identity);
+    ids.iter().cloned().partition(|id| {
+        q.and_then(|q| q.iter().find(|e| &e.client_event_id == id))
+            .is_some_and(|e| e.detail.get("reported_observed_at").is_some())
+    })
+}
+
+/// Null `booted_at` and every `state_changed_at` — after coord refused them
+/// as in the future. PURE.
+pub(crate) fn null_boot_and_change_times(c: &mut ComputerReport) {
+    c.booted_at = None;
+    if let Some(rows) = c.services.as_mut() {
+        for r in rows {
+            r.state_changed_at = None;
+        }
+    }
+}
+
+/// The `telemetry_gap` that records events coord dropped as expired.
+pub(crate) fn expired_marker(
+    identity: &str,
+    count: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ComputerEvent {
+    let at = events::rfc3339(now);
+    ComputerEvent {
+        client_event_id: events::event_id("telemetry_gap", &["expired", identity, &at]),
+        kind: "telemetry_gap".into(),
+        observed_at: at,
+        detail: serde_json::json!({
+            "reason": "events_expired",
+            "dropped_events": count,
+        }),
+    }
 }
 
 /// Re-stamp the named events at `now` (the reference clock), keeping their
@@ -644,9 +759,13 @@ pub(crate) struct Reporter {
     route_absent_logged: bool,
     /// The last 422 problem list logged — a CHANGED list is logged again.
     last_problems: Vec<String>,
-    /// Smoothed `coord − local` clock offset in seconds, from the `Date`
-    /// header of every coord response. `None` until coord has answered.
-    coord_offset_secs: Option<f64>,
+    /// Smoothed `coord − local` clock offset, from the `Date` header of
+    /// every coord response (bounded; adopted only once two samples agree).
+    clock: ClockOffset,
+    /// After coord refused `booted_at`/`state_changed_at` as in the future:
+    /// send those fields null until this instant.
+    null_times_until: Option<tokio::time::Instant>,
+    expired_logged: bool,
     skew_logged: bool,
     /// After a 422 naming no event: send stripped reports until this instant.
     strip_until: Option<tokio::time::Instant>,
@@ -680,7 +799,9 @@ impl Reporter {
             route_absent_until: None,
             route_absent_logged: false,
             last_problems: Vec::new(),
-            coord_offset_secs: None,
+            clock: ClockOffset::default(),
+            null_times_until: None,
+            expired_logged: false,
             skew_logged: false,
             strip_until: None,
             server_errors: 0,
@@ -719,8 +840,10 @@ impl Reporter {
     }
 
     fn back_off(&mut self) {
-        self.route_absent_until =
-            Some(tokio::time::Instant::now() + Duration::from_secs(REPORT_FULL_SECS));
+        self.route_absent_until = Some(
+            tokio::time::Instant::now()
+                + crate::fleet::resource_sample::jittered_sleep(REPORT_FULL_SECS),
+        );
     }
 
     /// One tick. Best-effort end to end: every failure returns quietly.
@@ -841,10 +964,6 @@ impl Reporter {
                 // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
                 // owner this tick must not keep a baseline it no longer tracks.
                 carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
-                // A runner INSIDE a WSL guest (its own computer is the guest)
-                // reports only unit-attributed kills; the VM-wide remainder is
-                // the Windows host's to report.
-                report_unattributed_oom: o.base.kind != "wsl_guest" || !o.base.attach_device,
             };
             let (evs, mut next) = events::derive(state.computers.get(id), &input, now);
             next.kind = Some(o.base.kind.clone());
@@ -877,20 +996,25 @@ impl Reporter {
             })
             .collect();
         let mut computers = cap_report(computers);
-        let ref_now = effective_now(now, self.coord_offset_secs);
+        let ref_now = effective_now(now, self.clock.estimate);
         if computers.is_empty() {
             return;
         }
         let mut skewed = false;
+        let null_times = self
+            .null_times_until
+            .is_some_and(|t| tokio::time::Instant::now() < t);
         for c in &mut computers {
             skewed |= presanitize(c, ref_now);
+            if null_times {
+                null_boot_and_change_times(c);
+            }
         }
         if skewed && !self.skew_logged {
             self.skew_logged = true;
             warn!(
                 "fleet::computer: timestamps more than {MAX_FUTURE_SKEW_SECS}s ahead of the reference \
-                 clock ({}) were nulled or re-stamped — this machine's clock and the reference \
-                 disagree",
+                 clock were nulled or re-stamped{}",
                 self.clock_description()
             );
         }
@@ -930,15 +1054,15 @@ impl Reporter {
             }
         };
         let status = resp.status();
-        if let Some(coord_now) = resp
+        // THIS response's raw, bounded sample — the re-stamp of a refused
+        // event uses it directly (the smoothed estimate may lag a clock step).
+        let raw_sample = resp
             .headers()
             .get(reqwest::header::DATE)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_http_date)
-        {
-            let sample = (coord_now - chrono::Utc::now()).num_milliseconds() as f64 / 1000.0;
-            self.coord_offset_secs = Some(smooth_offset(self.coord_offset_secs, sample));
-        }
+            .and_then(|coord_now| offset_sample(coord_now, chrono::Utc::now()));
+        self.clock.observe(raw_sample);
         let text = resp.text().await.unwrap_or_default();
         match status.as_u16() {
             200..=299 => {
@@ -964,8 +1088,8 @@ impl Reporter {
                 self.back_off();
             }
             422 => {
-                let ref_now = effective_now(now, self.coord_offset_secs);
-                self.on_rejected(&body, &text, ref_now, strip)
+                let restamp_now = effective_now(now, raw_sample.or(self.clock.estimate));
+                self.on_rejected(&body, &text, restamp_now, strip)
             }
             401 | 403 => {
                 self.log_failure(format!("POST {url} -> HTTP {status} (credential refused)"));
@@ -1019,8 +1143,8 @@ impl Reporter {
         if !self.skew_logged && problems.iter().any(|p| p.contains("in the future")) {
             self.skew_logged = true;
             warn!(
-                "fleet::computer: coord refused a timestamp as in the future — this machine's \
-                 clock and coord's disagree ({}); the events are re-stamped, not dropped",
+                "fleet::computer: coord refused a timestamp as in the future{}; such events are \
+                 re-stamped once, not dropped",
                 self.clock_description()
             );
         }
@@ -1032,11 +1156,16 @@ impl Reporter {
             .cloned()
             .partition(|p| p.contains("in the future"));
         let mut restamped = 0;
-        let named = rejected_events(&other, body);
+        let mut named = rejected_events(&other, body);
         let mut q = Quarantined::default();
         if let Some(state) = self.state.as_mut() {
             for (id, ids) in &rejected_events(&future, body) {
-                restamped += restamp(state, id, ids, now);
+                // An event refused as future AGAIN after one re-stamp is not
+                // a clock artefact this reporter can fix: quarantine it, so a
+                // refusal can never loop.
+                let (again, first) = split_restamped(state, id, ids);
+                restamped += restamp(state, id, &first, now);
+                named.entry(id.clone()).or_default().extend(again);
             }
             for (id, ids) in &named {
                 let r = quarantine(state, id, Some(ids), &problems, now);
@@ -1044,7 +1173,18 @@ impl Reporter {
                 q.markers += r.markers;
             }
         }
-        if restamped > 0 || q.events > 0 {
+        // A future `booted_at` / `state_changed_at` is a computer- or
+        // service-level clock refusal: null those fields for one cadence
+        // rather than stripping the report or quarantining events.
+        let time_fields = future.iter().any(|p| {
+            let path = p.split(':').next().unwrap_or("");
+            path.ends_with(".booted_at") || path.ends_with(".state_changed_at")
+        });
+        if time_fields {
+            self.null_times_until =
+                Some(tokio::time::Instant::now() + Duration::from_secs(REPORT_FULL_SECS));
+        }
+        if restamped > 0 || q.events > 0 || time_fields {
             self.persist();
             return;
         }
@@ -1076,21 +1216,35 @@ impl Reporter {
         &mut self,
         body: &ComputerReportReq,
         full: bool,
-        outcomes: Option<&BTreeMap<String, bool>>,
+        outcomes: Option<&BTreeMap<String, Outcome>>,
     ) {
         if full {
             self.last_full = Some(tokio::time::Instant::now());
         }
         let mut conflicted = 0;
+        let mut expired_total = 0;
+        let now = chrono::Utc::now();
         if let Some(state) = self.state.as_mut() {
             for c in &body.computers {
-                if outcomes
+                let outcome = outcomes
                     .and_then(|o| o.get(&c.identity_hash))
                     .copied()
-                    .unwrap_or(false)
-                {
+                    .unwrap_or_default();
+                if outcome.identity_conflict {
                     conflicted += 1;
                     continue;
+                }
+                if outcome.events_expired > 0 {
+                    expired_total += outcome.events_expired;
+                    events::push_pending(
+                        state,
+                        &c.identity_hash,
+                        vec![expired_marker(
+                            &c.identity_hash,
+                            outcome.events_expired,
+                            now,
+                        )],
+                    );
                 }
                 if let Some(q) = state.pending.get_mut(&c.identity_hash) {
                     q.retain(|e| {
@@ -1111,6 +1265,13 @@ impl Reporter {
             }
             state.pending.retain(|_, q| !q.is_empty());
         }
+        if expired_total > 0 && !self.expired_logged {
+            self.expired_logged = true;
+            warn!(
+                "fleet::computer: coord dropped {expired_total} queued event(s) as older than its \
+                 retention window — this machine held them too long; a telemetry_gap records it"
+            );
+        }
         if conflicted > 0 && !self.conflict_logged {
             self.conflict_logged = true;
             warn!(
@@ -1121,15 +1282,17 @@ impl Reporter {
         self.persist();
     }
 
-    /// Which clock disagrees, for the skew warnings.
+    /// Which clock disagrees, for the skew warnings — empty inside the dead
+    /// band, where there is no disagreement worth naming.
     fn clock_description(&self) -> String {
-        match self.coord_offset_secs {
-            Some(o) if o < -1.0 => {
-                format!("coord's clock is about {:.0}s BEHIND this machine's", -o)
+        match self.clock.estimate {
+            Some(o) if o < -OFFSET_DEAD_BAND_SECS => {
+                format!(" — coord's clock is about {:.0}s BEHIND this machine's", -o)
             }
-            Some(o) if o > 1.0 => format!("coord's clock is about {o:.0}s AHEAD of this machine's"),
-            Some(_) => "the two clocks agree to within a second".to_string(),
-            None => "coord's clock is not known yet".to_string(),
+            Some(o) if o > OFFSET_DEAD_BAND_SECS => {
+                format!(" — coord's clock is about {o:.0}s AHEAD of this machine's")
+            }
+            _ => String::new(),
         }
     }
 
@@ -1222,7 +1385,6 @@ mod tests {
                 services: o.scan.units.as_deref(),
                 services_complete: true,
                 carry_oom_baseline: true,
-                report_unattributed_oom: true,
             }
         }
         let (_, obs0) = events::derive(None, &inp(&before, 5), t("2026-09-30T01:40:00Z"));
@@ -1484,8 +1646,95 @@ mod tests {
             r#"{{"computers":[{{"identity_hash":"{HOST_ID}","computer_id":"00000000-0000-4000-8000-000000000001","services_upserted":1,"services_deleted":0,"events_inserted":0,"events_duplicate":0,"identity_conflict":true}}]}}"#
         );
         let o = parse_outcomes(&body).unwrap();
-        assert_eq!(o.get(HOST_ID), Some(&true));
+        assert_eq!(
+            o.get(HOST_ID),
+            Some(&Outcome {
+                identity_conflict: true,
+                events_expired: 0
+            })
+        );
         assert_eq!(parse_outcomes("not json"), None);
+
+        let expired = format!(
+            r#"{{"computers":[{{"identity_hash":"{HOST_ID}","identity_conflict":false,"events_expired":4}}]}}"#
+        );
+        assert_eq!(parse_outcomes(&expired).unwrap()[HOST_ID].events_expired, 4);
+        let m = expired_marker(HOST_ID, 4, at("2026-09-30T02:00:00Z"));
+        assert_eq!(m.kind, "telemetry_gap");
+        assert_eq!(m.observed_at, "2026-09-30T02:00:00Z");
+        assert_eq!(
+            m.detail,
+            serde_json::json!({"reason": "events_expired", "dropped_events": 4})
+        );
+    }
+
+    #[test]
+    fn the_clock_offset_is_bounded_and_needs_agreement() {
+        let local = at("2026-09-30T02:00:00Z");
+        // A Date header ten years behind is discarded outright.
+        assert_eq!(offset_sample(at("2016-09-30T02:00:00Z"), local), None);
+        let mut c = ClockOffset::default();
+        c.observe(offset_sample(at("2016-09-30T02:00:00Z"), local));
+        assert_eq!(c.estimate, None);
+        // +0.5 s for Date's truncation to the second.
+        assert_eq!(
+            offset_sample(at("2026-09-30T01:50:00Z"), local),
+            Some(-599.5)
+        );
+        // One sample is not adopted; a second that agrees within 30 s is.
+        c.observe(Some(-599.5));
+        assert_eq!(c.estimate, None);
+        c.observe(Some(-200.0));
+        assert_eq!(c.estimate, None, "disagreeing by 399.5 s: not adopted");
+        c.observe(Some(-210.0));
+        assert_eq!(c.estimate, Some(-210.0));
+        // Then it smooths.
+        c.observe(Some(-200.0));
+        assert_eq!(c.estimate, Some(-207.0));
+
+        // Dead band: within 5 s, nothing is applied.
+        assert_eq!(effective_now(local, Some(-4.9)), local);
+        assert_eq!(
+            effective_now(local, Some(-5.5)),
+            local - chrono::Duration::milliseconds(5500)
+        );
+        // Clamped: never more than an hour before local, whatever comes in.
+        assert_eq!(
+            effective_now(local, Some(-315_360_000.0)),
+            local - chrono::Duration::seconds(3600)
+        );
+    }
+
+    #[test]
+    fn an_event_refused_as_future_twice_is_quarantined_not_restamped_again() {
+        let mut st = ObserverState::default();
+        let mut once = ev("restamped-once");
+        once.detail = serde_json::json!({"reported_observed_at": "2026-09-30T03:00:00Z"});
+        let mut fresh = ev("fresh");
+        fresh.observed_at = "2026-09-30T03:00:00Z".into();
+        st.pending.insert(HOST_ID.into(), vec![once, fresh]);
+        let ids = vec!["restamped-once".to_string(), "fresh".to_string()];
+        let (again, first) = split_restamped(&st, HOST_ID, &ids);
+        assert_eq!(again, vec!["restamped-once".to_string()]);
+        assert_eq!(first, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn refused_boot_and_change_times_are_nulled() {
+        let mut c = plan_computer(&observed(svc::INCIDENT_SHOW), true, None, &[]).unwrap();
+        assert!(c.booted_at.is_some());
+        null_boot_and_change_times(&mut c);
+        assert_eq!(c.booted_at, None);
+        assert!(c
+            .services
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|r| r.state_changed_at.is_none()));
+        assert_eq!(
+            c.services.as_ref().unwrap()[0].result.as_deref(),
+            Some("oom-kill")
+        );
     }
 
     #[test]
