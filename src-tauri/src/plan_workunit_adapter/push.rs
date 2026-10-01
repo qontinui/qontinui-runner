@@ -350,13 +350,15 @@ pub struct TransitionBody {
 
 /// Build the `metadata` JSON pushed alongside the work-unit: the enrichment
 /// coord's old slug+status projection discarded — phase sub-units, dependency
-/// edges, the source-file back-link, and the plan's `area`.
+/// edges, the source-file back-link, the plan's `area` and its
+/// `initiative_item`.
 ///
 /// `area` is emitted only when the status block declares a kebab-case one
 /// ([`super::parser::extract_area`]); otherwise the KEY IS OMITTED, never sent
 /// as `null` or `""`. coord's upsert replaces `metadata` wholesale, so for a
 /// plan-backed unit the plan file is the single author of its area: a plan
-/// that declares none sends none.
+/// that declares none sends none. `initiative_item`
+/// ([`super::parser::extract_initiative_item`]) follows the identical rule.
 pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     let mut m = serde_json::json!({
         "depends_on": u.depends_on,
@@ -369,6 +371,9 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     });
     if let Some(area) = &u.area {
         m["area"] = serde_json::Value::String(area.clone());
+    }
+    if let Some(item) = &u.initiative_item {
+        m["initiative_item"] = serde_json::Value::String(item.clone());
     }
     m
 }
@@ -1060,14 +1065,17 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
-/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
-/// its status block declares one. coord replaces `metadata` wholesale, so an
-/// archive stamp without the area would erase it from the unit — the same
-/// omit-when-`None` rule as [`build_metadata`].
+/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` and
+/// `initiative_item` when its status block declares them. coord replaces
+/// `metadata` wholesale, so an archive stamp without them would erase them from
+/// the unit — the same omit-when-`None` rule as [`build_metadata`].
 fn archive_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     let mut m = serde_json::json!({ "archive_path": u.source_path });
     if let Some(area) = &u.area {
         m["area"] = serde_json::Value::String(area.clone());
+    }
+    if let Some(item) = &u.initiative_item {
+        m["initiative_item"] = serde_json::Value::String(item.clone());
     }
     m
 }
@@ -1485,6 +1493,8 @@ mod tests {
             depends_on: vec!["2026-01-01-dep".to_string()],
             area: None,
             area_rejected: None,
+            initiative_item: None,
+            initiative_item_rejected: None,
             phases: vec![ParsedPhase {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
@@ -1693,6 +1703,27 @@ mod tests {
         assert_eq!(m["source_path"], "plans/s.md");
     }
 
+    /// `initiative_item` follows `area`'s rule exactly: present when the plan
+    /// declares one, the KEY absent — not `null`, not `""` — when it does not.
+    #[test]
+    fn build_metadata_initiative_item_present_when_some_absent_when_none() {
+        let with = ParsedWorkUnit {
+            initiative_item: Some("one-screen-project-state".to_string()),
+            ..unit("s", "vetted")
+        };
+        let m = build_metadata(&with);
+        assert_eq!(
+            m["initiative_item"],
+            serde_json::json!("one-screen-project-state")
+        );
+
+        let m = build_metadata(&unit("s", "vetted"));
+        assert!(
+            !m.as_object().unwrap().contains_key("initiative_item"),
+            "a None initiative_item must omit the key entirely: {m}"
+        );
+    }
+
     /// The archive stamp is a wholesale `metadata` replacement too, so it must
     /// carry a declared area rather than erase it — and omit it when `None`.
     #[tokio::test]
@@ -1716,6 +1747,35 @@ mod tests {
         assert_eq!(first["archive_path"], serde_json::json!(u.source_path));
         let second = ups[1].metadata.as_ref().unwrap();
         assert!(!second.as_object().unwrap().contains_key("area"));
+    }
+
+    /// The archive stamp must not erase a declared initiative item either.
+    #[tokio::test]
+    async fn archive_stamp_keeps_a_declared_initiative_item() {
+        let sink = FakeSink::default();
+        let u = ParsedWorkUnit {
+            initiative_item: Some("one-screen-project-state".to_string()),
+            ..unit("2026-01-01-archived", "shipped")
+        };
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
+        push_archive_metadata(
+            &sink,
+            &unit("2026-01-01-archived-2", "shipped"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+
+        let ups = sink.upserts.lock().unwrap();
+        let first = ups[0].metadata.as_ref().unwrap();
+        assert_eq!(
+            first["initiative_item"],
+            serde_json::json!("one-screen-project-state")
+        );
+        let second = ups[1].metadata.as_ref().unwrap();
+        assert!(!second.as_object().unwrap().contains_key("initiative_item"));
     }
 
     #[tokio::test]
