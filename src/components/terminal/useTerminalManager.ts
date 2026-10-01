@@ -9,7 +9,7 @@ import {
   type SessionCloseArgs,
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
-import { spawnWithResourceGuard } from "@/lib/resourceGuard";
+import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
 import {
   EMPTY_HIDDEN_WORKER_STATE,
@@ -1307,38 +1307,49 @@ export function useTerminalManager(
   }, [resyncTabs]);
 
   const createTerminal = useCallback(
-    async (title?: string, workingDir?: string, tenantId?: string): Promise<string | null> => {
+    async (
+      title?: string,
+      workingDir?: string,
+      tenantId?: string,
+      spawnSource?: ResourceGuardSource,
+    ): Promise<string | null> => {
       try {
         const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
         // Attended spawn: the first invoke goes without an override. If the
-        // spawn-time resource gate refuses (below the CRITICAL free-commit
-        // floor), `spawnWithResourceGuard` shows the blocking dialog and
-        // re-invokes with `resourceOverride: true` only if the operator picks
-        // "Start anyway". Declining re-throws the refusal, so the existing
-        // catch below still runs and the tab is not created.
-        const result = await spawnWithResourceGuard((resourceOverride) =>
-          invoke<CommandResponse>("terminal_create", {
-            title: displayTitle,
-            // Page-default fallback applied HERE, before the Rust command sees
-            // it — `terminal_create` derives `intent_repo` from this value and
-            // may reassign it to an isolated worktree, so `null` is not
-            // equivalent to the page default. See `resolveSpawnWorkingDir`.
-            workingDir: resolveSpawnWorkingDir(workingDir, defaultWorkingDir),
-            pageId: pageId !== "default" ? pageId : null,
-            // F2/F3 — the tenant the operator picked for THIS spawn. Sent
-            // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
-            // the stamped tenant is exactly what the picker showed, with no
-            // read-then-stamp race against a concurrent tenant switch. `null`
-            // means the caller's `resolveTenantForSpawn` found no pin to send
-            // (single-tenant OR unpaired device) — Rust then applies its own
-            // device-default stamping, exactly as before F2.
-            tenantId: tenantId ?? null,
-            // Phase 2 (pop-out windows): tag the pane with its owning window so
-            // its coord-session identity doesn't collide with a same-(title,cwd)
-            // pane in another window. "main" → omitted (legacy/back-compat key).
-            windowLabel: windowLabel !== "main" ? windowLabel : null,
-            resourceOverride,
-          }),
+        // spawn-time resource gate refuses (past a CRITICAL limit on either
+        // lane), `spawnWithResourceGuard` shows the blocking dialog — or spends
+        // a live "Start anyway" grant for that lane — and re-invokes with
+        // `resourceOverride: true`. Declining re-throws the refusal, so the
+        // existing catch below still runs and the tab is not created.
+        // `spawnSource` names the caller in that dialog: a bulk caller (session
+        // restore, workspace load) passes its own label and queue depth so the
+        // operator can see a burst AS a burst; every other caller is a single
+        // new terminal.
+        const result = await spawnWithResourceGuard(
+          (resourceOverride) =>
+            invoke<CommandResponse>("terminal_create", {
+              title: displayTitle,
+              // Page-default fallback applied HERE, before the Rust command sees
+              // it — `terminal_create` derives `intent_repo` from this value and
+              // may reassign it to an isolated worktree, so `null` is not
+              // equivalent to the page default. See `resolveSpawnWorkingDir`.
+              workingDir: resolveSpawnWorkingDir(workingDir, defaultWorkingDir),
+              pageId: pageId !== "default" ? pageId : null,
+              // F2/F3 — the tenant the operator picked for THIS spawn. Sent
+              // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
+              // the stamped tenant is exactly what the picker showed, with no
+              // read-then-stamp race against a concurrent tenant switch. `null`
+              // means the caller's `resolveTenantForSpawn` found no pin to send
+              // (single-tenant OR unpaired device) — Rust then applies its own
+              // device-default stamping, exactly as before F2.
+              tenantId: tenantId ?? null,
+              // Phase 2 (pop-out windows): tag the pane with its owning window so
+              // its coord-session identity doesn't collide with a same-(title,cwd)
+              // pane in another window. "main" → omitted (legacy/back-compat key).
+              windowLabel: windowLabel !== "main" ? windowLabel : null,
+              resourceOverride,
+            }),
+          spawnSource ?? { label: "new terminal" },
         );
 
         if (!result.success || !result.data) return null;

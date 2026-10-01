@@ -58,6 +58,7 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 
 import { ToastContainer } from "./components/ToastContainer";
 import { ResourceGuardDialog } from "./components/ResourceGuardDialog";
+import { ResourceGuardGrantBanner } from "./components/ResourceGuardGrantBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -993,6 +994,9 @@ function AppContent() {
               refusal. Prop-less and rendered once — it subscribes to
               `lib/resourceGuard`'s queue, which any spawn surface can fill. */}
             <ResourceGuardDialog />
+            {/* The live "Start anyway" grant, if any — its countdown and Revoke.
+              An override the operator cannot see is a surprise. */}
+            <ResourceGuardGrantBanner />
             {/* Surfaces incoming cross-machine session handoffs as toasts.
               Listens for `session-event` with kind=handoff_request — PR #258. */}
             <IncomingHandoffToastBridge />

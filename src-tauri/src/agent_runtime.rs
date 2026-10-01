@@ -12835,12 +12835,12 @@ mod tests {
         assert_eq!(reason, refusal, "the gate's reason travels unwrapped");
 
         let (reason, phase) =
-            classify_pty_spawn_error("resource_guard:critical: commit headroom below the floor");
+            classify_pty_spawn_error("resource_guard:critical:free_commit_bytes: commit headroom");
         assert_eq!(phase, SpawnPhase::Exited);
         assert_eq!(
             reason,
-            "terminal session create failed: resource_guard:critical: commit headroom below the \
-             floor"
+            "terminal session create failed: resource_guard:critical:free_commit_bytes: commit \
+             headroom"
         );
     }
 
