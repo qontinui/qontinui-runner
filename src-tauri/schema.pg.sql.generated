@@ -5566,6 +5566,45 @@ CREATE TABLE coord.overlap_detections (
 
 
 --
+-- Name: overlord_interventions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.overlord_interventions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    intervention_id uuid NOT NULL,
+    supersedes uuid,
+    tenant_id uuid NOT NULL,
+    session_id uuid,
+    claude_code_session_id uuid,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    stop_class text NOT NULL,
+    strike smallint,
+    catalog_hits jsonb DEFAULT '[]'::jsonb NOT NULL,
+    evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    inputs_unreadable text[] DEFAULT '{}'::text[] NOT NULL,
+    verb text NOT NULL,
+    mode text NOT NULL,
+    message_id uuid,
+    question_id uuid,
+    touch_key text,
+    outcome text,
+    outcome_observed_at timestamp with time zone,
+    operator_label text,
+    brief_version text,
+    judge_model text,
+    recorded_by_device_id uuid,
+    CONSTRAINT ck_overlord_interventions_chain_root CHECK (((supersedes IS NULL) = (intervention_id = id))),
+    CONSTRAINT ck_overlord_interventions_mode CHECK ((mode = ANY (ARRAY['shadow'::text, 'live'::text]))),
+    CONSTRAINT ck_overlord_interventions_operator_label CHECK (((operator_label IS NULL) OR (operator_label = ANY (ARRAY['A'::text, 'B'::text, 'C'::text, 'D'::text, 'E'::text, 'F'::text])))),
+    CONSTRAINT ck_overlord_interventions_outcome CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['resumed'::text, 'did_work'::text, 'escalated'::text, 'closed'::text, 'no_change'::text, 'unknown'::text])))),
+    CONSTRAINT ck_overlord_interventions_stop_class CHECK ((stop_class = ANY (ARRAY['A'::text, 'B'::text, 'C'::text, 'D'::text, 'E'::text, 'F'::text, 'U'::text]))),
+    CONSTRAINT ck_overlord_interventions_strike CHECK (((strike IS NULL) OR ((strike >= 0) AND (strike <= 2)))),
+    CONSTRAINT ck_overlord_interventions_verb CHECK ((verb = ANY (ARRAY['leave'::text, 'nudge'::text, 'handoff-prompt'::text, 'gate-register-nudge'::text, 'escalate'::text, 'finish+close'::text, 'spawn'::text, 'redirect'::text])))
+);
+
+
+--
 -- Name: page_spec_paths; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -18988,6 +19027,14 @@ ALTER TABLE ONLY coord.overlap_detections
 
 
 --
+-- Name: overlord_interventions overlord_interventions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.overlord_interventions
+    ADD CONSTRAINT overlord_interventions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: page_spec_paths page_spec_paths_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -26391,6 +26438,27 @@ CREATE INDEX ix_operator_touches_tenant_reason_emitted_at ON coord.operator_touc
 --
 
 CREATE INDEX ix_operator_touches_tenant_session ON coord.operator_touches USING btree (tenant_id, session_id);
+
+
+--
+-- Name: ix_overlord_interventions_tenant_chain; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_overlord_interventions_tenant_chain ON coord.overlord_interventions USING btree (tenant_id, intervention_id, recorded_at DESC);
+
+
+--
+-- Name: ix_overlord_interventions_tenant_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_overlord_interventions_tenant_observed_at ON coord.overlord_interventions USING btree (tenant_id, observed_at DESC);
+
+
+--
+-- Name: ix_overlord_interventions_tenant_session; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_overlord_interventions_tenant_session ON coord.overlord_interventions USING btree (tenant_id, session_id);
 
 
 --
