@@ -365,6 +365,11 @@ pub(crate) fn derive(
             if b > a {
                 let unattributed = (b - a).saturating_sub(attributed);
                 if unattributed > 0 {
+                    let how = if rebooted {
+                        "vmstat_since_boot"
+                    } else {
+                        "vmstat_delta"
+                    };
                     events.push(ComputerEvent {
                         client_event_id: event_id("oom_kill", &[boot, "", &b.to_string()]),
                         kind: "oom_kill".into(),
@@ -372,7 +377,7 @@ pub(crate) fn derive(
                         detail: json!({
                             "victim_unit": null,
                             "count": unattributed,
-                            "attribution": if rebooted { "vmstat_since_boot" } else { "vmstat_delta" },
+                            "attribution": how,
                             "oom_kill_total": b,
                             "previous_oom_kill_total": a,
                         }),
