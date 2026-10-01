@@ -221,10 +221,15 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
         // listed), so that kind is complete when `list-units` exited 0. It is
         // NEVER complete for `qontinui_runner`: the host cannot see the
         // guest's user bus, and the guest's own runner reports those rows.
+        //
+        // And when a runner is ACTIVE inside the guest, the host claims no
+        // completeness at all: that runner is the authority for the guest's
+        // inventory, and two complete-inventory reporters for one computer
+        // would flap on any residual difference between their views.
         scan: if g.systemd {
             ServiceScan {
                 units: Some(units),
-                complete_kinds: if g.list_rc == Some(0) {
+                complete_kinds: if g.list_rc == Some(0) && g.runner_active != Some(true) {
                     vec![services::KIND_GH_ACTIONS_RUNNER]
                 } else {
                     Vec::new()
@@ -1421,6 +1426,33 @@ mod tests {
         assert!(o.scan.complete_kinds.is_empty());
         let c = plan_computer(&o, true, None, &[]).unwrap();
         assert!(c.services_complete_kinds.is_empty());
+    }
+
+    /// With a runner reporting from inside the guest, the host's probe
+    /// claims no completeness: the in-guest runner owns the inventory.
+    #[test]
+    fn the_host_claims_no_guest_completeness_while_a_guest_runner_reports() {
+        let probe = |active: &str| {
+            wsl_guest::parse_guest_probe(&format!(
+                "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t0\nRUNNER_ACTIVE\t{active}\nSHOW_BEGIN\nId=actions.runner.example-org-example-repo.wslbox.service\nActiveState=inactive\n\nSHOW_END\nPROBE_END\n"
+            ))
+            .unwrap()
+        };
+        let busy = guest_observed(&probe("1"), HOST_ID);
+        assert!(busy.scan.complete_kinds.is_empty());
+        let c = plan_computer(&busy, true, None, &[]).unwrap();
+        assert!(c.services_complete_kinds.is_empty());
+        assert_eq!(
+            c.services.as_ref().map(Vec::len),
+            Some(1),
+            "rows still sent as a delta"
+        );
+
+        let idle = guest_observed(&probe("0"), HOST_ID);
+        assert_eq!(idle.scan.complete_kinds, vec!["gh_actions_runner"]);
+        // Undeterminable liveness: the host keeps its (loud) claim.
+        let unknown = guest_observed(&probe(""), HOST_ID);
+        assert_eq!(unknown.scan.complete_kinds, vec!["gh_actions_runner"]);
     }
 
     fn ev(id: &str) -> ComputerEvent {
