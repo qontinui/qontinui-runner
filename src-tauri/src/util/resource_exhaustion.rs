@@ -310,6 +310,13 @@ struct StderrNeedle {
 /// default language — the same call Git for Windows' launcher makes to print
 /// `error launching git: …` — so the German box gets German needles and the
 /// English box English ones, with no language table to keep current.
+/// Build the stderr needles now. Called at startup so the first classification
+/// — which happens under memory pressure by definition — does not also pay for
+/// rendering and allocating them.
+pub fn prewarm_stderr_needles() {
+    let _ = stderr_needles();
+}
+
 fn stderr_needles() -> &'static [StderrNeedle] {
     static NEEDLES: OnceLock<Vec<StderrNeedle>> = OnceLock::new();
     NEEDLES.get_or_init(|| {
@@ -674,9 +681,11 @@ static ANY_OPEN: AtomicBool = AtomicBool::new(false);
 ///
 /// On an opening edge this emits ONE `resource_exhaustion` WARN carrying the
 /// kind, the OS code, the caller, and a memory reading taken now; and, for
-/// every kind except `fd`, appends a line to `wedge-incidents.log` (token
-/// `commit_exhaustion` for the commit kind, `resource_exhaustion` otherwise)
-/// so the next boot's crash harvest can name the episode the process died in.
+/// every kind except `fd`, appends a line to `wedge-incidents.log` (token from
+/// [`incident_token`]) so the next boot's crash harvest can name the episode
+/// the process died in. The episode's close appends the matching
+/// `<token>_closed` line, so the harvest can tell an episode the process died
+/// INSIDE from one that had already ended.
 /// `fd` stays out of that file: it has its own stamp and its own consumer
 /// (`ui_error::classify_fd_pressure`), and its floods (5,841 in one day) would
 /// bury the incidents the file exists for.
@@ -759,13 +768,8 @@ fn emit_opened(kind: ExhaustionKind, evidence: Evidence, os_code: Option<i32>, c
          further failures of this kind are counted, not logged, until the episode closes",
         code = os_code.map_or_else(|| "none".to_string(), |c| c.to_string()),
     );
-    if kind == ExhaustionKind::Fd {
+    let Some(incident_token) = incident_token(kind, evidence) else {
         return;
-    }
-    let incident_token = if kind == ExhaustionKind::Commit {
-        "commit_exhaustion"
-    } else {
-        "resource_exhaustion"
     };
     let reading_text = match reading {
         Some((r, age)) => format!(
@@ -781,6 +785,25 @@ fn emit_opened(kind: ExhaustionKind, evidence: Evidence, os_code: Option<i32>, c
     crate::alloc_breadcrumb::append_incident(incident_token, &detail);
 }
 
+/// The `wedge-incidents.log` token an episode of this (kind, evidence) opens
+/// with, or `None` for `fd` (kept out of the file — see [`report_exhaustion`]).
+/// Its close is the same token with [`CLOSED_SUFFIX`]. The text-evidenced
+/// commit case keeps "suspected" in the token, so the next-boot harvest can
+/// never render a suspicion as an OS-reported fact.
+pub fn incident_token(kind: ExhaustionKind, evidence: Evidence) -> Option<&'static str> {
+    match (kind, evidence) {
+        (ExhaustionKind::Fd, _) => None,
+        (ExhaustionKind::Commit, Evidence::OsCode) => Some("commit_exhaustion"),
+        (ExhaustionKind::Commit, Evidence::ChildStderr) => Some("commit_exhaustion_suspected"),
+        (ExhaustionKind::NoSystemResources | ExhaustionKind::TaskLimit, _) => {
+            Some("resource_exhaustion")
+        }
+    }
+}
+
+/// Appended to an [`incident_token`] on the line that closes its episode.
+pub const CLOSED_SUFFIX: &str = "_closed";
+
 fn emit_closed(kind: ExhaustionKind, evidence: Evidence, c: ClosedEpisode, ended_by: &str) {
     tracing::info!(
         event = "resource_exhaustion_closed",
@@ -793,6 +816,20 @@ fn emit_closed(kind: ExhaustionKind, evidence: Evidence, c: ClosedEpisode, ended
         c.suppressed_repeats,
         c.duration_ms,
     );
+    // The close path is ordinary code (never the allocator), so allocating
+    // here is fine. `kind=` matches the opening line's field, which is what
+    // the harvest pairs on.
+    if let Some(token) = incident_token(kind, evidence) {
+        crate::alloc_breadcrumb::append_incident(
+            &format!("{token}{CLOSED_SUFFIX}"),
+            &format!(
+                "kind={} suppressed_repeats={} duration_ms={} ended_by={ended_by}",
+                event_kind_token(kind, evidence),
+                c.suppressed_repeats,
+                c.duration_ms
+            ),
+        );
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1097,6 +1134,25 @@ mod tests {
             "The paging file is too small for this operation to complete"
         );
         assert_eq!(message_needle("Unknown error 1455 (os error 1455)"), None);
+    }
+
+    /// The incident tokens: fd stays out of the file, and a text-evidenced
+    /// commit episode keeps "suspected" in its token.
+    #[test]
+    fn incident_tokens_keep_suspicion_and_exclude_fd() {
+        assert_eq!(incident_token(ExhaustionKind::Fd, Evidence::OsCode), None);
+        assert_eq!(
+            incident_token(ExhaustionKind::Commit, Evidence::OsCode),
+            Some("commit_exhaustion")
+        );
+        assert_eq!(
+            incident_token(ExhaustionKind::Commit, Evidence::ChildStderr),
+            Some("commit_exhaustion_suspected")
+        );
+        assert_eq!(
+            incident_token(ExhaustionKind::TaskLimit, Evidence::OsCode),
+            Some("resource_exhaustion")
+        );
     }
 
     /// The cached reading is UNKNOWN until something records one.

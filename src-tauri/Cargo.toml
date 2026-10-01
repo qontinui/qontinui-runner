@@ -223,6 +223,11 @@ windows-sys = { version = "0.59", features = [
     # dashboard's path joins treat `D:\x` and its physical target as one
     # directory (`commands::saved_projects::build_subst_aliases`).
     "Win32_Storage_FileSystem",
+    # WriteFile's OVERLAPPED parameter type — the allocation-failure
+    # breadcrumb's raw write (`alloc_breadcrumb::raw_write`). Named explicitly:
+    # without it `WriteFile` resolved only through another crate's feature
+    # unification, which a dependency bump could silently take away.
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
