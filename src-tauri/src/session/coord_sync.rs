@@ -9060,6 +9060,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             crate::session::coord_transport_rung::OUTCOME_OK,
             "https://coord.qontinui.io/mcp",
             crate::session::coord_transport_rung::OPERATION_READ,
@@ -9442,6 +9443,7 @@ mod tests {
         let rung = crate::session::coord_transport_rung::RungEmitter::new(outbox.clone(), machine)
             .with_tenant_lookup(Box::new(lookup));
         let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            None,
             None,
             None,
             None,
