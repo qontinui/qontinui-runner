@@ -1009,10 +1009,23 @@ fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
 /// never read-modify-written by two writers at once.
 fn lock_binding_reconcile(
     paired_user: &std::path::Path,
+    timeout: std::time::Duration,
 ) -> Result<crate::secure_storage::FileLockGuard, String> {
     let lock = crate::secure_storage::lock_path_for(&omission_streaks_path(paired_user));
-    crate::secure_storage::lock_file_exclusive(&lock).map_err(|e| format!("{e:#}"))
+    crate::secure_storage::lock_file_exclusive_within(&lock, timeout).map_err(|e| format!("{e:#}"))
 }
+
+/// How long a reconcile waits for the reconcile lock. A reconcile that cannot
+/// get it just tries again next heartbeat.
+const RECONCILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `persist_pairing_with` waits for the reconcile lock. It runs AFTER
+/// coord already minted the credential, so failing here discards a good token:
+/// the budget must sit clearly above a reconcile's worst-case hold, which is
+/// two store-lock waits (the one batched conditional clear, plus the default
+/// re-point's legacy write, 10 s each) plus file I/O.
+pub(crate) const PAIRING_RECONCILE_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(90);
 
 // Test hook run after a reconcile has decided what to drop and read the slots
 // it will clear, and before it clears them.
@@ -1133,7 +1146,7 @@ pub(crate) fn reconcile_paired_bindings_at(
 ) -> Result<BindingReconcileReport, String> {
     // One pass is one critical section: decide, then clear, with no pairing
     // able to interleave (persist_pairing_with takes the same lock).
-    let _reconcile_lock = lock_binding_reconcile(path)?;
+    let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
     let mut report = BindingReconcileReport::default();
 
     let bytes = match std::fs::read(path) {
@@ -1187,26 +1200,55 @@ pub(crate) fn reconcile_paired_bindings_at(
     }
     // The exact token each due tenant's slot held when the drop was decided.
     // Clears are conditional on it, so a slot rewritten since (a refresher
-    // re-mint) is spared rather than deleted.
-    let observed: std::collections::HashMap<uuid::Uuid, String> = due
-        .iter()
-        .filter_map(|t| match mgr.get_tenant_device_jwt(t) {
-            Ok(Some(tok)) => Some((*t, tok)),
-            _ => None,
-        })
-        .collect();
+    // re-mint) is spared rather than deleted. A slot whose read FAILED is
+    // UNKNOWN: its tenant is held, never dropped on an unread slot.
+    let mut observed: Vec<(uuid::Uuid, String)> = Vec::new();
+    let mut unreadable: Vec<uuid::Uuid> = Vec::new();
+    for t in &due {
+        match mgr.get_tenant_device_jwt(t) {
+            Ok(Some(tok)) => observed.push((*t, tok)),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "reconcile: tenant {t} was due to drop but its slot could not be read \
+                     ({e:#}) — HOLDING it (unknown); this echo was {coord_set:?}"
+                );
+                unreadable.push(*t);
+            }
+        }
+    }
     #[cfg(test)]
     if let Some(hook) = AFTER_RECONCILE_DECISION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    // `Ok(true)` = the slot was cleared or there was none to clear; `Ok(false)`
-    // = it changed since the decision and was spared.
-    let clear_as_observed = |t: &uuid::Uuid| -> Result<bool, String> {
-        match observed.get(t) {
-            Some(tok) => mgr
-                .clear_tenant_device_jwt_if_unchanged(t, tok)
-                .map_err(|e| format!("{e:#}")),
-            None => Ok(true),
+    // ALL conditional clears under ONE store-lock acquisition, so this pass
+    // holds the reconcile lock for at most one store wait here.
+    let cleared: Result<std::collections::HashMap<uuid::Uuid, bool>, String> = mgr
+        .clear_tenant_device_jwts_if_unchanged(&observed)
+        .map(|v| v.into_iter().collect())
+        .map_err(|e| format!("{e:#}"));
+    if let Err(e) = &cleared {
+        tracing::warn!(
+            "reconcile: conditional slot clear failed ({e}) — HOLDING every due tenant this pass"
+        );
+    }
+    /// What became of one due tenant's slot.
+    enum SlotFate {
+        /// Cleared, or there was no slot to clear: the drop may proceed.
+        Gone,
+        /// Changed since the decision, unreadable, or the clear failed: hold.
+        Held,
+    }
+    let fate = |t: &uuid::Uuid| -> SlotFate {
+        if unreadable.contains(t) {
+            return SlotFate::Held;
+        }
+        match &cleared {
+            Err(_) => SlotFate::Held,
+            Ok(map) => match map.get(t) {
+                Some(true) | None => SlotFate::Gone,
+                Some(false) => SlotFate::Held,
+            },
         }
     };
     let keeps = |t: &uuid::Uuid| coord_set.contains(t) || !due.contains(t);
@@ -1219,28 +1261,26 @@ pub(crate) fn reconcile_paired_bindings_at(
     for b in bindings {
         match uuid::Uuid::parse_str(b.tenant_id.trim()) {
             Ok(t) if keeps(&t) => kept.push(b),
-            Ok(t) => match clear_as_observed(&t) {
-                Ok(false) => {
+            Ok(t) => match fate(&t) {
+                SlotFate::Held => {
                     tracing::warn!(
                         "reconcile: tenant {t} was due to drop but its slot changed since the \
-                         decision — KEEPING binding and slot; this echo was {coord_set:?}"
+                         decision or could not be read/cleared — KEEPING binding and slot; \
+                         this echo was {coord_set:?}"
                     );
                     report.held.push((t, 0));
                     kept.push(b);
                 }
-                cleared => {
+                SlotFate::Gone => {
+                    // Designed home of slot deletion: coord no longer has the
+                    // binding, so its credential is dead weight.
                     tracing::warn!(
-                        "reconcile: DROPPING binding and clearing slot for tenant {t} — omitted \
+                        "reconcile: DROPPED binding and cleared slot for tenant {t} — omitted \
                          from {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since \
                          unix {}; this echo was {coord_set:?}",
                         run_began(&t)
                     );
                     report.dropped.push(t);
-                    // Designed home of slot deletion: coord no longer has the
-                    // binding, so its credential is dead weight. Best-effort.
-                    if let Err(e) = cleared {
-                        tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
-                    }
                 }
             },
             Err(_) => {
@@ -1254,19 +1294,24 @@ pub(crate) fn reconcile_paired_bindings_at(
     }
 
     // Orphan slots (credential without a binding entry) that coord's set
-    // doesn't contain either — same authority statement, same fate.
+    // doesn't contain either — same authority statement, same fate. Only
+    // slots OBSERVED (or unreadable) at decision time: a slot that appeared
+    // since is not one this pass decided about.
     let kept_tenants: Vec<uuid::Uuid> = kept
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .collect();
-    // Only slots OBSERVED at decision time: a slot that appeared since is not
-    // one this pass decided about.
-    let mut orphans: Vec<uuid::Uuid> = observed.keys().copied().collect();
+    let mut orphans: Vec<uuid::Uuid> = observed
+        .iter()
+        .map(|(t, _)| *t)
+        .chain(unreadable.iter().copied())
+        .collect();
     orphans.sort();
+    orphans.dedup();
     for t in orphans {
         if !keeps(&t) && !report.dropped.contains(&t) && !kept_tenants.contains(&t) {
-            match clear_as_observed(&t) {
-                Ok(true) => {
+            match fate(&t) {
+                SlotFate::Gone => {
                     tracing::warn!(
                         "reconcile: cleared ORPHAN slot for tenant {t} — omitted from \
                          {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix \
@@ -1275,8 +1320,7 @@ pub(crate) fn reconcile_paired_bindings_at(
                     );
                     report.dropped_slots.push(t);
                 }
-                Ok(false) => report.held.push((t, 0)),
-                Err(e) => tracing::debug!("reconcile: clear orphan slot {t} failed: {e}"),
+                SlotFate::Held => report.held.push((t, 0)),
             }
         }
     }
@@ -2137,7 +2181,7 @@ pub(crate) fn persist_pairing_with(
     // Serialize with the heartbeat reconcile for the whole pairing, so a
     // reconcile can neither decide against a half-written pairing nor clear the
     // slot this pairing is about to write.
-    let _reconcile_lock = lock_binding_reconcile(path)?;
+    let _reconcile_lock = lock_binding_reconcile(path, PAIRING_RECONCILE_LOCK_WAIT)?;
     mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
     reset_omission_streak(path, &tenant_id);
@@ -3455,6 +3499,48 @@ mod tests {
         assert_eq!(r2.held, vec![(tb(), 0)]);
         assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), Some(fresh));
         assert_eq!(read_file(&path).bindings.len(), 2);
+    }
+
+    /// A pairing that lands WHILE a reconcile holds the reconcile lock waits for
+    /// it and succeeds (it runs after coord already minted, so failing would
+    /// discard a good credential), and both effects survive.
+    #[test]
+    fn a_pairing_concurrent_with_a_reconcile_succeeds() {
+        assert!(
+            PAIRING_RECONCILE_LOCK_WAIT > 2 * RECONCILE_LOCK_WAIT,
+            "the pairing budget must exceed a reconcile's worst-case hold"
+        );
+        let dir = temp_dir_for("reconcile_concurrent_pair");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+
+        let (in_hook_tx, in_hook_rx) = std::sync::mpsc::channel::<()>();
+        let (m, p) = (mgr.clone(), path.clone());
+        let reconciler = std::thread::spawn(move || {
+            AFTER_RECONCILE_DECISION.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    in_hook_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }))
+            });
+            reconcile_paired_bindings_at(&m, &p, &[ta()], T0 + 30).expect("r2")
+        });
+        // The reconcile is mid-pass and holds the lock; pair tenant C now.
+        in_hook_rx.recv().unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("c")), tc())
+            .expect("a pairing must wait out a reconcile, not fail");
+        let r2 = reconciler.join().unwrap();
+        assert_eq!(r2.dropped, vec![tb()]);
+        let tenants: Vec<String> = read_file(&path)
+            .bindings
+            .into_iter()
+            .map(|b| b.tenant_id)
+            .collect();
+        assert!(tenants.contains(&T_C.to_string()), "{tenants:?}");
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
     }
 
     /// S8: a negative gap (the clock moved back) counts as an omission and

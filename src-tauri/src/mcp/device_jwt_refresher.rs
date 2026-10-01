@@ -1018,7 +1018,12 @@ pub(crate) async fn try_refresh_once(
     // slot. The refresh-token slot stays empty (device-JWT lifecycle is
     // owned by coord, not by an OAuth refresh chain). Guarded by the
     // tenant we just asked pair-cli to mint for — see `RefreshOutcome::TenantMismatch`.
-    match auth_manager.store_tokens_expecting(&resp.token, "", Some(tenant_id)) {
+    let token_for_store = resp.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", Some(tenant_id))
+    })
+    .await
+    {
         Ok(()) => {
             // M1: a NEW credential is in the slot — and, via the mirror, in
             // its tenant's slot — so every rejection coord recorded against
@@ -1176,7 +1181,12 @@ pub(crate) async fn try_device_self_refresh(
     // request against `current`, so a re-mint for any other tenant is a coord
     // bug or a stale slot, never a legitimate answer to THIS request.
     let expected_tenant = crate::auth::jwt_tenant_claim(&current);
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -3808,6 +3818,19 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
     .to_string()
 }
 
+/// Run one blocking credential-store write OFF the async worker: every store
+/// mutation takes the cross-process store lock, which may wait up to 10 s under
+/// contention (plan `2026-09-30-runner-says-connected-…` D4).
+async fn store_write_off_runtime<R: Send + 'static>(
+    auth_manager: &crate::auth::AuthManager,
+    write: impl FnOnce(&crate::auth::AuthManager) -> anyhow::Result<R> + Send + 'static,
+) -> anyhow::Result<R> {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || write(&mgr))
+        .await
+        .map_err(|e| anyhow::anyhow!("credential-store write task failed: {e}"))?
+}
+
 /// Clear one dead per-tenant slot and try to re-derive a working credential
 /// for it — the EXIT from Phase 2's two absorbing states.
 ///
@@ -3840,19 +3863,6 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
 /// `tenant`, and seeding either slot with that credential would be the exact
 /// cross-tenant substitution `select_device_bearer` refuses by design. A
 /// `None` return (mismatch, or any other failure) leaves this slot cleared.
-/// Run one blocking credential-store write OFF the async worker: every store
-/// mutation takes the cross-process store lock, which may wait up to 10 s under
-/// contention (plan `2026-09-30-runner-says-connected-…` D4).
-async fn store_write_off_runtime<R: Send + 'static>(
-    auth_manager: &crate::auth::AuthManager,
-    write: impl FnOnce(&crate::auth::AuthManager) -> anyhow::Result<R> + Send + 'static,
-) -> anyhow::Result<R> {
-    let mgr = auth_manager.clone();
-    spawn_blocking_tracked(move || write(&mgr))
-        .await
-        .map_err(|e| anyhow::anyhow!("credential-store write task failed: {e}"))?
-}
-
 async fn clear_and_rederive_tenant_slot(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
@@ -4390,7 +4400,12 @@ pub(crate) async fn try_device_machine_key_exchange(
     // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
     // the doc comment above for why a mismatch here is exactly the incident
     // this exchange path was found to bypass.
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.

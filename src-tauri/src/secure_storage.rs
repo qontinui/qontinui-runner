@@ -117,6 +117,9 @@ pub(crate) fn process_attribution() -> String {
 pub(crate) struct FileLockGuard {
     file: fs::File,
     path: PathBuf,
+    /// `!Send`: the guard's bookkeeping lives in a THREAD-local set, so it must
+    /// be dropped on the thread that took it.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for FileLockGuard {
@@ -164,6 +167,15 @@ fn locking_disabled_for_mutation_check() -> bool {
 /// BLOCKING: under contention it sleeps on the calling thread, so async
 /// callers run the locked work through `spawn_blocking`.
 pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLockGuard> {
+    lock_file_exclusive_within(lock_path, STORE_LOCK_TIMEOUT)
+}
+
+/// [`lock_file_exclusive`] with an explicit wait budget, for a caller whose
+/// lock may legitimately be held longer than one store write.
+pub(crate) fn lock_file_exclusive_within(
+    lock_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<FileLockGuard> {
     let path = lock_path.to_path_buf();
     if HELD_FILE_LOCKS.with(|h| h.borrow().contains(&path)) {
         let msg = format!(
@@ -190,7 +202,7 @@ pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLoc
     let mut holder_path = path.clone().into_os_string();
     holder_path.push(".holder");
     let holder_path = PathBuf::from(holder_path);
-    let deadline = std::time::Instant::now() + STORE_LOCK_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => break,
@@ -205,7 +217,7 @@ pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLoc
                          write without it (a lock-free read-modify-write can silently drop \
                          another tenant's credential slot) [waiter {}]",
                         path.display(),
-                        STORE_LOCK_TIMEOUT,
+                        timeout,
                         process_attribution()
                     );
                 }
@@ -233,7 +245,11 @@ pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLoc
         }
     }
     HELD_FILE_LOCKS.with(|h| h.borrow_mut().insert(path.clone()));
-    Ok(FileLockGuard { file, path })
+    Ok(FileLockGuard {
+        file,
+        path,
+        _not_send: std::marker::PhantomData,
+    })
 }
 
 /// Stored token data structure
@@ -1620,37 +1636,53 @@ impl SecureStorage {
         Ok(())
     }
 
-    /// Remove one tenant's slot ONLY if it still holds `observed` — the token
-    /// the caller saw when it DECIDED to clear. Compare and remove happen under
-    /// one store lock, so a slot rewritten in between (a re-pair, a refresher
-    /// re-mint) survives. Returns whether the slot was removed.
+    /// Remove each tenant's slot ONLY if it still holds `observed` — the token
+    /// the caller saw when it DECIDED to clear — so a slot rewritten in between
+    /// (a re-pair, a refresher re-mint) survives. Every `(tenant, observed)`
+    /// pair is compared and (if unchanged) removed under
+    /// ONE store-lock acquisition and at most one save. Returns, per tenant,
+    /// whether its slot was removed.
     #[track_caller]
-    pub fn clear_tenant_device_jwt_if_unchanged(
+    pub fn clear_tenant_device_jwts_if_unchanged(
         &self,
-        tenant_id: &uuid::Uuid,
-        observed: &str,
-    ) -> Result<bool> {
+        expected: &[(uuid::Uuid, String)],
+    ) -> Result<Vec<(uuid::Uuid, bool)>> {
         let caller = std::panic::Location::caller();
-        let key = Self::tenant_device_jwt_key(tenant_id);
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
         let _guard = self.lock_store()?;
         let mut tokens = self.load_tokens_for_write()?;
-        if tokens.tenant_device_jwts.get(&key).map(String::as_str) != Some(observed) {
-            warn!(
-                "Per-tenant device JWT for tenant {tenant_id} NOT cleared: the slot changed \
-                 since the clear was decided (caller={caller} {})",
-                process_attribution()
-            );
-            return Ok(false);
+        let mut out = Vec::with_capacity(expected.len());
+        for (tenant_id, observed) in expected {
+            let key = Self::tenant_device_jwt_key(tenant_id);
+            let unchanged =
+                tokens.tenant_device_jwts.get(&key).map(String::as_str) == Some(observed.as_str());
+            if unchanged {
+                tokens.tenant_device_jwts.remove(&key);
+            }
+            out.push((*tenant_id, unchanged));
         }
-        tokens.tenant_device_jwts.remove(&key);
         let slots_after = tokens.tenant_device_jwts.len();
-        self.save_tokens(&tokens)?;
-        warn!(
-            "Per-tenant device JWT cleared for tenant {tenant_id} (conditional; \
-             slots_after={slots_after} caller={caller} {})",
-            process_attribution()
-        );
-        Ok(true)
+        if out.iter().any(|(_, removed)| *removed) {
+            self.save_tokens(&tokens)?;
+        }
+        for (tenant_id, removed) in &out {
+            if *removed {
+                warn!(
+                    "Per-tenant device JWT cleared for tenant {tenant_id} (conditional batch; \
+                     slots_after={slots_after} caller={caller} {})",
+                    process_attribution()
+                );
+            } else {
+                warn!(
+                    "Per-tenant device JWT for tenant {tenant_id} NOT cleared: the slot changed \
+                     since the clear was decided (caller={caller} {})",
+                    process_attribution()
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
@@ -2418,18 +2450,65 @@ mod tests {
             2 * LOCK_CHILD_WRITES,
             "one process's slots were lost to the other"
         );
+        let _ = fs::remove_file(&go);
+        for base in [0xA000u128, 0xB000] {
+            let _ = fs::remove_file(lock_child_marker(
+                &storage.storage_path,
+                &format!("ready.{base}"),
+            ));
+        }
         let _ = fs::remove_file(&storage.storage_path);
     }
 
     /// A nested acquisition of the store lock on one thread is refused at
-    /// once (it would otherwise wait out the timeout against itself); in a
-    /// debug build it trips the debug_assert.
+    /// once (it would otherwise wait out the timeout against itself). A debug
+    /// build trips the debug_assert; a release build returns the error.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "nested acquisition")]
     fn test_nested_store_lock_on_one_thread_is_refused() {
         let storage = create_test_storage("store_lock_nested");
         let _outer = storage.lock_store().unwrap();
         let _ = storage.lock_store();
+    }
+
+    /// Release twin of the test above: the nested call returns the error.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_nested_store_lock_on_one_thread_is_refused() {
+        let storage = create_test_storage("store_lock_nested");
+        let _outer = storage.lock_store().unwrap();
+        let started = std::time::Instant::now();
+        let err = storage
+            .lock_store()
+            .err()
+            .expect("nested lock must be refused");
+        assert!(format!("{err:#}").contains("nested acquisition"), "{err:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "refused, not waited"
+        );
+    }
+
+    /// The batch conditional clear removes only the slots that still hold
+    /// their observed token, in one pass.
+    #[test]
+    fn test_batch_conditional_clear_spares_rewritten_slots() {
+        let storage = create_test_storage("batch_conditional_clear");
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        storage.store_tenant_device_jwt(&a, "a1").unwrap();
+        storage.store_tenant_device_jwt(&b, "b1").unwrap();
+        storage.store_tenant_device_jwt(&b, "b2").unwrap();
+        let out = storage
+            .clear_tenant_device_jwts_if_unchanged(&[(a, "a1".into()), (b, "b1".into())])
+            .unwrap();
+        assert_eq!(out, vec![(a, true), (b, false)]);
+        assert!(storage.get_tenant_device_jwt(&a).unwrap().is_none());
+        assert_eq!(
+            storage.get_tenant_device_jwt(&b).unwrap().as_deref(),
+            Some("b2")
+        );
+        let _ = fs::remove_file(&storage.storage_path);
     }
 
     /// The conditional clear removes the slot only while it still holds the
@@ -2440,16 +2519,18 @@ mod tests {
         let t = uuid::Uuid::from_u128(7);
         storage.store_tenant_device_jwt(&t, "old").unwrap();
         storage.store_tenant_device_jwt(&t, "new").unwrap();
-        assert!(!storage
-            .clear_tenant_device_jwt_if_unchanged(&t, "old")
-            .unwrap());
+        let once = |tok: &str| {
+            storage
+                .clear_tenant_device_jwts_if_unchanged(&[(t, tok.to_string())])
+                .unwrap()[0]
+                .1
+        };
+        assert!(!once("old"));
         assert_eq!(
             storage.get_tenant_device_jwt(&t).unwrap().as_deref(),
             Some("new")
         );
-        assert!(storage
-            .clear_tenant_device_jwt_if_unchanged(&t, "new")
-            .unwrap());
+        assert!(once("new"));
         assert!(storage.get_tenant_device_jwt(&t).unwrap().is_none());
         let _ = fs::remove_file(&storage.storage_path);
     }
