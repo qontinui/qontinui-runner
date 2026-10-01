@@ -7957,9 +7957,9 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
+    // Same for the fleet SKILLS. (provision_agent_definitions above writes the
+    // embedded agent defs on every device and overlays a claude-config
+    // checkout's copies where one exists.)
     crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
@@ -8255,12 +8255,10 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
 /// mcp that could alter spawn behavior).
 ///
-/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
-/// then simply lacks subagents (same as before this fix; no regression). The
-/// fleet-portability follow-up is to BUNDLE these defs into the runner binary
-/// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
-/// checkout still get them; this copy-from-checkout path unblocks the current
-/// operator fleet.
+/// Fail-soft: if the source dir is missing we `warn` and return Ok. The defs
+/// bundled into the runner binary (`crate::fleet_agents`) are written first in
+/// every case, so a device without a `qontinui-claude-config` checkout still
+/// gets them; the checkout copy is an overlay on top.
 ///
 /// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
 /// An absent sibling checkout — including the case where no workspace root
@@ -8347,10 +8345,22 @@ fn provision_agent_definitions_from_root(
             "agent_runtime: {absent} ({embedded} embedded subagent def(s) provisioned into {})",
             dst_dir.display()
         );
+        // Name the exact path that was checked when a root resolved; the
+        // template only when there was no root to look under.
+        let looked_at = root.map_or_else(
+            || format!("<workspace-root>/{AGENT_DEFS_SIBLING_REPO}/.claude/agents"),
+            |root| {
+                root.join(AGENT_DEFS_SIBLING_REPO)
+                    .join(".claude")
+                    .join("agents")
+                    .display()
+                    .to_string()
+            },
+        );
         return Ok(ProvisionReport::unresolved(
             "agent_definitions",
             0,
-            format!("<workspace-root>/{AGENT_DEFS_SIBLING_REPO}/.claude/agents"),
+            looked_at,
             format!("{absent} {embedded} embedded default(s) stand in."),
         )
         .with_destination(dst_dir.display().to_string()));

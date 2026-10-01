@@ -161,22 +161,13 @@ async fn handle_scan(
     // machine that is not the author's, that scanned a directory which does not
     // exist and answered 200 with an empty surface — a wrong answer wearing a
     // success code. An unresolvable root is UNKNOWN, so say so.
-    let project_root = find_project_root().ok_or_else(|| {
+    let project_root = find_project_root().map_err(|why| {
         (
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             Json(ApiResponse {
                 success: false,
                 data: None,
-                // The scan reads the runner's own SOURCE checkout, which an
-                // installed product does not carry and has no copy of: the
-                // typed `sibling_checkout_absent` with no fallback.
-                error: Some(
-                    qontinui_types::paths::SiblingCheckoutAbsent::new(
-                        "qontinui-runner",
-                        qontinui_types::paths::SiblingFallback::Unsupported,
-                    )
-                    .to_string(),
-                ),
+                error: Some(why),
                 error_detail: None,
                 hint: None,
                 code: None,
@@ -233,7 +224,11 @@ async fn handle_scan(
 
 // ─── Project root discovery ──────────────────────────────────────────────────
 
-fn find_project_root() -> Option<PathBuf> {
+/// The runner's own source checkout, or the rendered reason there is none: the
+/// typed `workspace_root_unresolved` refusal when no root resolves (an operator
+/// can fix that), else `sibling_checkout_absent` with no fallback — the scan
+/// reads SOURCE, which an installed product does not carry and has no copy of.
+fn find_project_root() -> Result<PathBuf, String> {
     // Try walking up from the current exe location
     if let Ok(exe) = std::env::current_exe() {
         let mut cur = exe.clone();
@@ -242,7 +237,7 @@ fn find_project_root() -> Option<PathBuf> {
                 break;
             }
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
-                return Some(cur);
+                return Ok(cur);
             }
         }
     }
@@ -251,7 +246,7 @@ fn find_project_root() -> Option<PathBuf> {
         let mut cur = cwd;
         for _ in 0..6 {
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
-                return Some(cur);
+                return Ok(cur);
             }
             if !cur.pop() {
                 break;
@@ -265,14 +260,18 @@ fn find_project_root() -> Option<PathBuf> {
     // machine layout, baked into a shipped route. `runner_workspace_root` answers
     // the same question portably: `$QONTINUI_ROOT`, then `$QONTINUI_WORKSPACE_ROOT`,
     // then the `paths.workspace_root` setting, then this executable's ancestry.
-    // Discovery surface, so it degrades to `None` and the caller reports an
-    // actionable failure rather than scanning a fabricated directory.
-    let root = crate::workspace_paths::runner_workspace_root().into_root()?;
+    // The caller reports the rendered reason rather than scanning a fabricated
+    // directory.
+    let root = crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string())?;
     let candidate = root.join("qontinui-runner");
     if candidate.join("src-tauri").join("Cargo.toml").exists() {
-        return Some(candidate);
+        return Ok(candidate);
     }
-    None
+    Err(qontinui_types::paths::SiblingCheckoutAbsent::new(
+        "qontinui-runner",
+        qontinui_types::paths::SiblingFallback::Unsupported,
+    )
+    .to_string())
 }
 
 // ─── Core scanner ────────────────────────────────────────────────────────────

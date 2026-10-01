@@ -8061,7 +8061,7 @@ pub(crate) fn stdio_shim_gate() -> StdioShimGate {
                 shim,
                 interpreters,
                 budget,
-            } => probe_stdio_shim(Some(shim), &interpreters, budget),
+            } => probe_stdio_shim(Ok(shim), &interpreters, budget),
         };
     }
     if switch.is_none() && cfg!(test) {
@@ -8164,14 +8164,16 @@ fn probe_stdio_shim_and_store() -> StdioShimGate {
 
 /// `<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`, resolved
 /// the way the runner resolves that repo everywhere else (the workspace root),
-/// or `None` when no root resolves. Existence is the probe's business.
-fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
-    Some(
-        qontinui_root_dir()?
-            .join("qontinui-claude-config")
-            .join("scripts")
-            .join(COORD_MCP_STDIO_SHIM_FILE),
-    )
+/// or the rendered `workspace_root_unresolved` refusal when no root resolves.
+/// Existence is the probe's business.
+fn resolve_stdio_shim_path() -> Result<std::path::PathBuf, String> {
+    crate::workspace_paths::require_workspace_root()
+        .map(|root| {
+            root.join("qontinui-claude-config")
+                .join("scripts")
+                .join(COORD_MCP_STDIO_SHIM_FILE)
+        })
+        .map_err(|unresolved| unresolved.to_string())
 }
 
 /// The uncached probe: the shim must exist, and `<interpreter> <shim>
@@ -8179,15 +8181,17 @@ fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
 /// manages it. Every failure is a [`StdioShimGate::Refused`] naming what was
 /// tried, never an error — the builder's fail-open contract.
 fn probe_stdio_shim(
-    shim: Option<std::path::PathBuf>,
+    shim: Result<std::path::PathBuf, String>,
     interpreters: &[std::path::PathBuf],
     budget: std::time::Duration,
 ) -> StdioShimGate {
-    let Some(shim) = shim else {
-        return StdioShimGate::Refused(format!(
-            "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\
-             {COORD_MCP_STDIO_SHIM_FILE} cannot be located"
-        ));
+    let shim = match shim {
+        Ok(shim) => shim,
+        Err(unresolved) => {
+            return StdioShimGate::Refused(format!(
+                "{COORD_MCP_STDIO_SHIM_FILE} cannot be located: {unresolved}"
+            ))
+        }
     };
     if !shim.is_file() {
         return StdioShimGate::Refused(format!("shim absent at {}", shim.display()));

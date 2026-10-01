@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
+| `repo_layout` | 39 | 51 | 39 | 0 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
 | `supervisor_dependency` | 50 | 50 | 0 | 40 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
@@ -16,15 +16,11 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
 
-## `repo_layout` (55 rows)
+## `repo_layout` (39 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
-| `src/agent_runtime.rs` | `continuation_fallback_workdir` | `.ok_or_else(\|\| "no QONTINUI_ROOT or canonical checkout resolved".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
-| `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_worktree/disk_survey.rs` | `survey` | `"the workspace root could not be resolved (set QONTINUI_ROOT, or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `const AGENT_DEFS_SIBLING_REPO` | `const AGENT_DEFS_SIBLING_REPO: &str = "qontinui-claude-config";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ai_router.rs` | `route_with_learning` | `has_ui_component: context.prompt.to_lowercase().contains("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `IsolatedAmbient::new` | `std::env::set_var("QONTINUI_ROOT", &root);` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ambient.rs` | `const AMBIENT_ENV_KEYS` | `"QONTINUI_ROOT",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -33,7 +29,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/config.rs` | `get_workspace_paths_impl` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/commands/terminal_analysis.rs` | `get_latest_plan_content` | `let dev_notes = parent.join("qontinui-dev-notes");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `"qontinui-mobile".to_string(),` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -42,39 +37,28 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/context/builtins.rs` | `get_builtin_contexts` | `category: Some("ui-bridge".to_string()),` | 4 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-mobile/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/context/builtins.rs` | `get_builtin_contexts` | `file_patterns: Some(vec!["**/qontinui-web/**".to_string()]),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/coord_mcp.rs` | `probe_stdio_shim` | `no workspace root resolved, so <root>/qontinui-claude-config/scripts/\` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/coord_mcp.rs` | `resolve_stdio_shim_path` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/database/pg/apps.rs` | `bootstrap_dev_apps` | `resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/coord_mcp.rs` | `resolve_stdio_shim_path` | `root.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-supervisor",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/database/pg/apps.rs` | `const DEV_SIBLING_APPS` | `"qontinui-web",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/dev_services.rs` | `get_default_dev_services` | `let web_dir = workspace.join("qontinui-web");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/env_agent/apply_repos.rs` | `apply_section_with` | `"Set $QONTINUI_ROOT, or the runner's 'paths.workspace_root' setting, to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/env_agent/apply_repos.rs` | `incomparable_scope` | `'qontinui-runner env scope-root' / $QONTINUI_ROOT on one of the two \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const HARNESS_CONFIG_REPO_DIR` | `const HARNESS_CONFIG_REPO_DIR: &str = "qontinui-claude-config";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const HARNESS_PLANS_REPO_DIR` | `const HARNESS_PLANS_REPO_DIR: &str = "qontinui-dev-notes";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `const WEB_REPO_DIR` | `const WEB_REPO_DIR: &str = "qontinui-web";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `rest.contains("qontinui-claude-config\\scripts\\dev-start.ps1")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/env_agent/collectors.rs` | `dev_start_plain_ok` | `\|\| rest.contains("qontinui-claude-config/scripts/dev-start.ps1")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet.rs` | `const SKILL_SOURCE_REL` | `const SKILL_SOURCE_REL: &[&str] = &["qontinui-claude-config", ".claude", "skills"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/fleet.rs` | `publish_tree_state` | `QONTINUI_ROOT to override). Skipping."` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/fleet.rs` | `spawn_skill_parity_pass_if_due` | `located — set QONTINUI_ROOT or the runner's paths.workspace_root"` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/fleet_commands.rs` | `const FLEET_COMMANDS` | `("ui-bridge", UI_BRIDGE),` | 1 | unreviewed | `fleet_commands` |
-| `src/main.rs` | `run_app` | `injected. Set $QONTINUI_ROOT (or 'paths.workspace_root') to \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/api_surface.rs` | `handle_scan` | `"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/mcp/shared.rs` | `get_workspace_paths_internal` | `.join("qontinui-claude-config")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/mcp/task_runs.rs` | `migrate_task_run_logs` | `Set $QONTINUI_ROOT (or the 'paths.workspace_root' setting) to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/online_learning/context.rs` | `normalize_domain` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/orchestrator/learning_recorder.rs` | `infer_domain_tags` | `tags.insert("ui-bridge".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `const HTN_SRC_REPOS` | `const HTN_SRC_REPOS: [&str; 2] = ["qontinui", "multistate"];` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/planning_bridge.rs` | `execute_htn_attempt` | `$QONTINUI_ROOT to the directory holding the repo checkouts if the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/planning_bridge.rs` | `execute_htn_attempt` | `is already installed for this interpreter. Set $QONTINUI_ROOT to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |
+| `src/slash_commands.rs` | `find_commands_directory_reported` | `"qontinui-claude-config",` | 1 | unreviewed | `slash_commands` |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `.join("qontinui-claude-config")` | 1 | unreviewed | `slash_commands` |
 | `src/ui_bridge_plugin.rs` | `init` | `Builder::new("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workflow_generation/generator.rs` | `generate_workflow` | `\|\| stage_json.contains("ui-bridge");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
+| `src/workspace_paths.rs` | `runner_workspace_root_for_session` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 
 ## `dev_ports` (27 rows)
 

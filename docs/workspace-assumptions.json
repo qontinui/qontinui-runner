@@ -1516,41 +1516,8 @@
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
-      "symbol": "continuation_fallback_workdir",
-      "excerpt": ".ok_or_else(|| \"no QONTINUI_ROOT or canonical checkout resolved\".to_string());",
-      "count": 2,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
-      "excerpt": "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions_from_root",
-      "excerpt": ".join(\"qontinui-claude-config\")",
-      "count": 1,
-      "disposition": "unreviewed",
-      "capability": "agent_definitions"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_runtime.rs",
-      "symbol": "run_condition_check_terminal",
-      "excerpt": "let reason = \"no QONTINUI_ROOT resolved — nowhere to run the check from\";",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/agent_worktree/disk_survey.rs",
-      "symbol": "survey",
-      "excerpt": "\"the workspace root could not be resolved (set QONTINUI_ROOT, or the \\",
+      "symbol": "const AGENT_DEFS_SIBLING_REPO",
+      "excerpt": "const AGENT_DEFS_SIBLING_REPO: &str = \"qontinui-claude-config\";",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1615,14 +1582,6 @@
       "file": "src/check_executor/command_builder.rs",
       "symbol": "build_devtools_command",
       "excerpt": "Ok((\"qontinui-devtools\".to_string(), args))",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/ci_node/admission.rs",
-      "symbol": "start_build",
-      "excerpt": "\"QONTINUI_ROOT not resolvable on this device\".to_string(),",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1693,24 +1652,8 @@
     {
       "class": "repo_layout",
       "file": "src/coord_mcp.rs",
-      "symbol": "probe_stdio_shim",
-      "excerpt": "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/coord_mcp.rs",
       "symbol": "resolve_stdio_shim_path",
-      "excerpt": ".join(\"qontinui-claude-config\")",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/database/pg/apps.rs",
-      "symbol": "bootstrap_dev_apps",
-      "excerpt": "resolved, so no dev apps were registered. Set $QONTINUI_ROOT (or the \\",
+      "excerpt": "root.join(\"qontinui-claude-config\")",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1735,22 +1678,6 @@
       "file": "src/dev_services.rs",
       "symbol": "get_default_dev_services",
       "excerpt": "let web_dir = workspace.join(\"qontinui-web\");",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/env_agent/apply_repos.rs",
-      "symbol": "apply_section_with",
-      "excerpt": "\"Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/env_agent/apply_repos.rs",
-      "symbol": "incomparable_scope",
-      "excerpt": "`qontinui-runner env scope-root` / $QONTINUI_ROOT on one of the two \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1804,22 +1731,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/fleet.rs",
-      "symbol": "publish_tree_state",
-      "excerpt": "QONTINUI_ROOT to override). Skipping.\"",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/fleet.rs",
-      "symbol": "spawn_skill_parity_pass_if_due",
-      "excerpt": "located — set QONTINUI_ROOT or the runner's paths.workspace_root\"",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/fleet_commands.rs",
       "symbol": "const FLEET_COMMANDS",
       "excerpt": "(\"ui-bridge\", UI_BRIDGE),",
@@ -1829,33 +1740,9 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/main.rs",
-      "symbol": "run_app",
-      "excerpt": "injected. Set $QONTINUI_ROOT (or `paths.workspace_root`) to \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/mcp/api_surface.rs",
-      "symbol": "handle_scan",
-      "excerpt": "\"Cannot locate the qontinui-runner checkout to scan. Set $QONTINUI_ROOT \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/mcp/shared.rs",
       "symbol": "get_workspace_paths_internal",
       "excerpt": ".join(\"qontinui-claude-config\")",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/mcp/task_runs.rs",
-      "symbol": "migrate_task_run_logs",
-      "excerpt": "Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \\",
       "count": 1,
       "disposition": "unreviewed"
     },
@@ -1885,22 +1772,6 @@
     },
     {
       "class": "repo_layout",
-      "file": "src/planning_bridge.rs",
-      "symbol": "execute_htn_attempt",
-      "excerpt": "$QONTINUI_ROOT to the directory holding the repo checkouts if the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/planning_bridge.rs",
-      "symbol": "execute_htn_attempt",
-      "excerpt": "is already installed for this interpreter. Set $QONTINUI_ROOT to the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
       "file": "src/routing/q_router.rs",
       "symbol": "Domain::from_domain_tags",
       "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
@@ -1912,6 +1783,15 @@
       "file": "src/slash_commands.rs",
       "symbol": "find_commands_directory_reported",
       "excerpt": "\"<workspace-root>/qontinui-claude-config/.claude/commands\",",
+      "count": 1,
+      "disposition": "unreviewed",
+      "capability": "slash_commands"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/slash_commands.rs",
+      "symbol": "find_commands_directory_reported",
+      "excerpt": "\"qontinui-claude-config\",",
       "count": 1,
       "disposition": "unreviewed",
       "capability": "slash_commands"
@@ -1944,19 +1824,10 @@
     {
       "class": "repo_layout",
       "file": "src/workspace_paths.rs",
-      "symbol": "persist_resolved_workspace_root",
-      "excerpt": "`paths.workspace_root` was left unset. Set $QONTINUI_ROOT (or the \\",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "repo_layout",
-      "file": "src/workspace_paths.rs",
-      "symbol": "runner_workspace_root",
+      "symbol": "runner_workspace_root_for_session",
       "excerpt": "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "workspace_root"
+      "disposition": "unreviewed"
     },
     {
       "class": "supervisor_dependency",

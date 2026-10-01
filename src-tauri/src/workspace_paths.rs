@@ -205,7 +205,7 @@ pub fn runner_workspace_root_from(
 /// [`require_workspace_root`] instead: materialising a git worktree at a
 /// fabricated location is strictly worse than a loud error.
 pub fn workspace_root() -> Option<PathBuf> {
-    degrade(runner_workspace_root())
+    workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
 }
 
 /// [`workspace_root`] for a surface acting for a session opened on
@@ -353,15 +353,11 @@ pub fn workspace_root_observation() -> CapabilityObservation {
 /// A surface that degrades rather than fails can still use this door to
 /// RENDER why it skipped: `match require_workspace_root() { Err(e) => …{e}… }`.
 pub fn require_workspace_root() -> Result<PathBuf, WorkspaceRootUnresolved> {
-    runner_workspace_root().require()
-}
-
-/// [`require_workspace_root`] for a surface acting for a session opened on
-/// `session_repo` — see [`runner_workspace_root_for_session`].
-pub fn require_workspace_root_for_session(
-    session_repo: Option<&Path>,
-) -> Result<PathBuf, WorkspaceRootUnresolved> {
-    runner_workspace_root_for_session(session_repo).require()
+    let resolved = runner_workspace_root();
+    // A rejected higher-priority input is logged even when a lower rung then
+    // answers — the same never-silent fall-through `workspace_root` keeps.
+    log_rejection(&resolved);
+    resolved.require()
 }
 
 /// The runner's contribution to the resolution: this executable's path, tagged
@@ -427,9 +423,7 @@ pub fn persist_resolved_workspace_root() -> Result<(), String> {
 
     // Resolved ONCE: the value written and the refusal rendered when nothing
     // resolves must describe the same resolution.
-    let resolved = runner_workspace_root();
-    log_rejection(&resolved);
-    let resolved = resolved.require();
+    let resolved = require_workspace_root();
     let Some(value) = migration_write(existing.as_deref(), resolved.as_deref().ok()) else {
         // Render the one typed refusal rather than composing a sentence about
         // variables this operator may never have heard of.
