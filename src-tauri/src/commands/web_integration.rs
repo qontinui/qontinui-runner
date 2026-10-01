@@ -915,35 +915,7 @@ pub async fn redeem_pair_code(
     // owns all three conditions of `settings::should_persist_migration` —
     // nothing-to-persist, `!is_secondary`, and (structurally, via its
     // `serde_json::Value` edit) an authoritative source.
-    match settings::promote_tier_to_account() {
-        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
-            info!(
-                "redeem_pair_code: promoted runner to Tier QontinuiAccount in {}",
-                path.display()
-            );
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
-            debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
-            // A secondary must never write the shared settings.json (it would
-            // demote the primary), but THIS process still holds a device JWT
-            // and needs Tier 2 to bring its relay online — so apply the tier
-            // as the in-memory-only overlay, which is never persisted.
-            // Guarded on there being no runtime override already: an explicit
-            // operator choice (`set_runner_tier`) is authoritative over an
-            // inferred promotion, and that precedence must not be inverted.
-            if settings::in_memory_tier().is_none() {
-                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
-                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping the settings.json write");
-            } else {
-                warn!("redeem_pair_code: secondary runner with an explicit runtime tier override — leaving it alone");
-            }
-        }
-        Err(e) => {
-            warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
-        }
-    }
+    promote_tier_after_pairing("redeem_pair_code");
 
     // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
     // only when the tier changed. `persist_pairing` above just wrote a fresh
@@ -971,6 +943,44 @@ pub async fn redeem_pair_code(
         tenant_id: tenant_id_str.to_string(),
         device_id: response_device_id,
     })
+}
+
+/// Promote this runner to Tier `qontinui_account` after a pairing credential
+/// was persisted — the tier step of [`redeem_pair_code`], shared with the
+/// refresher's operator-authorized redeem (`mcp::pending_redeem`) so the two
+/// cannot drift. `caller` prefixes the log lines. See the comment at the call
+/// in [`redeem_pair_code`] for why the write goes through
+/// `settings::promote_tier_to_account` and how a secondary is handled.
+pub(crate) fn promote_tier_after_pairing(caller: &str) {
+    match settings::promote_tier_to_account() {
+        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
+            info!(
+                "{caller}: promoted runner to Tier QontinuiAccount in {}",
+                path.display()
+            );
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
+            debug!("{caller}: runner already at Tier QontinuiAccount — no settings write");
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
+            // A secondary must never write the shared settings.json (it would
+            // demote the primary), but THIS process still holds a device JWT
+            // and needs Tier 2 to bring its relay online — so apply the tier
+            // as the in-memory-only overlay, which is never persisted.
+            // Guarded on there being no runtime override already: an explicit
+            // operator choice (`set_runner_tier`) is authoritative over an
+            // inferred promotion, and that precedence must not be inverted.
+            if settings::in_memory_tier().is_none() {
+                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
+                warn!("{caller}: secondary runner — applying tier in-memory only, skipping the settings.json write");
+            } else {
+                warn!("{caller}: secondary runner with an explicit runtime tier override — leaving it alone");
+            }
+        }
+        Err(e) => {
+            warn!("{caller}: tier promotion persist failed (continuing): {e}");
+        }
+    }
 }
 
 /// Tauri plugin exposing all web-integration commands.
