@@ -4103,6 +4103,21 @@ impl TerminalSession {
         }
     }
 
+    /// Take the parked `IsolatedEditContext` back OFF this session, leaving
+    /// the slot empty so a later `close()` releases nothing.
+    ///
+    /// For a gate continuation whose `claude` never started: the runner retries
+    /// the launch in a fresh pane and the retry inherits this context (its
+    /// worktree claim + heartbeat) instead of the dead pane releasing it.
+    pub fn take_isolated_edit_ctx(
+        &self,
+    ) -> Option<crate::agent_worktree::isolated_edit::IsolatedEditContext> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     /// Every owner-token session id a worktree claim held BY this terminal can
     /// carry: its coord session id, and the discriminator its parked
     /// `IsolatedEditContext` acquired its claims under (a gate continuation's is

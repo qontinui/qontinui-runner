@@ -3133,8 +3133,11 @@ fn evaluate_continuation_guard(
     //
     // Admitted coord LAUNCHES count toward the same cap: both populations are
     // unattended coord-dispatched sessions spending the same machine, and a cap
-    // that one of them can walk past is not a bound on the box.
-    let live_count = live_count + admitted_launch_count();
+    // that one of them can walk past is not a bound on the box. So do terminal
+    // continuations still inside their start window: they register only once
+    // their session has started (`run_continuation_terminal`), up to
+    // CONTINUATION_START_WINDOW per attempt after this guard said Proceed.
+    let live_count = live_count + admitted_launch_count() + starting_continuation_count();
 
     // Thread pressure next, then the count cap — shared with the launch path
     // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
@@ -5571,14 +5574,14 @@ async fn run_gate_continuation_inner(
             let res =
                 run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
             drop(ctx);
-            res
+            res.map(|()| None)
         }
     };
 
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
         ConsumeTarget::Gate(gate_id) => match &result {
-            Ok(()) => {
+            Ok(_) => {
                 post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
             }
             Err(e) => {
@@ -5606,7 +5609,19 @@ async fn run_gate_continuation_inner(
         }
         ConsumeTarget::None => {}
     }
-    result
+    // A terminal session that STARTED and had already exited by its start
+    // verdict ended before it was registered, so its PTY exit hook posted
+    // nothing. Fire the exit path only NOW, after `spawned` was posted above:
+    // coord takes `spawned → work_unreported` but refuses `spawned` over a
+    // `work_unreported` that raced ahead of it. The exit path deregisters the
+    // entry and posts the fallback, which a session's own report outranks.
+    if let Ok(Some(exited_terminal_id)) = &result {
+        notify_continuation_terminal_exit(
+            exited_terminal_id,
+            tokio::runtime::Handle::try_current().ok().as_ref(),
+        );
+    }
+    result.map(|_| ())
 }
 
 /// Zone ceiling for a continuation page before it is considered "full".
@@ -5765,9 +5780,17 @@ pub(crate) fn build_continuation_claude_command(
 /// so the heartbeat lives for the visible session's lifetime and releases on
 /// close — the same claim bookkeeping the headless path holds.
 ///
-/// Lifecycle posts: `spawn-complete` once the terminal session is created and
-/// running; `spawn-failed` on ANY failure along the way (no Tauri app handle,
-/// missing managed state, window/session creation error).
+/// Lifecycle posts: `spawn-complete` once the session has STARTED (see
+/// [`await_continuation_start`] — a created PTY is not a started session);
+/// `spawn-failed` on ANY failure along the way (no Tauri app handle, missing
+/// managed state, window/session creation error, or a session that never
+/// started in [`CONTINUATION_START_MAX_ATTEMPTS`] attempts). `Ok(())` therefore
+/// means "started", which is what the caller's `spawned` outcome claims.
+///
+/// `Ok(Some(terminal_id))` is a session that started and had ALREADY exited by
+/// its verdict: the caller fires the exit path for it once `spawned` is posted
+/// (see the tail of [`run_gate_continuation_inner`]). `Ok(None)` is a session
+/// still running and registered.
 async fn run_continuation_terminal(
     agent_id: uuid::Uuid,
     workdir: &str,
@@ -5783,7 +5806,7 @@ async fn run_continuation_terminal(
     // drops it, which releases the anchor; the `Ok` arm hands it to the
     // registry once the live entry exists.
     reservation: AnchorReservation,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     use std::sync::Arc;
 
     // The one place the overloaded `gate_id` slot is disambiguated for this
@@ -5855,7 +5878,7 @@ async fn run_continuation_terminal(
     // (same as the worker-tab spawn path) so the continuation /implement-plan
     // session does not stall on interactive Bash permission prompts — an
     // unattended gate continuation has no operator to answer them.
-    let claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+    let mut claude_bin = spawn_blocking_tracked(resolve_claude_bin)
         .await
         .unwrap_or_else(|_| claude_bin_path());
     // Phase 2c — `--add-dir=<sibling>` (attached form — see the
@@ -5867,11 +5890,6 @@ async fn run_continuation_terminal(
         .as_ref()
         .map(|c| c.claude_add_dir_args())
         .unwrap_or_default();
-    // Pre-pin the Claude session id (#548 Phase 1): the registry records
-    // synchronously at spawn instead of mtime-guessing from transcripts.
-    // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
-    let pinned_session_id = uuid::Uuid::new_v4().to_string();
-
     // Account selection: pin the most-available (token-bearing) account so the
     // continuation does not spawn under a quota-exhausted default and die
     // instantly (the bug: continuations spawned under the runner's boot account
@@ -5922,204 +5940,542 @@ async fn run_continuation_terminal(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // Durable lifecycle capture: this backend path never fires the frontend
-    // `terminal_session_record_open`, so without a hint a restart loses the
-    // continuation. `config_dir` is now the SELECTED account dir (above): it
-    // both sets `CLAUDE_CONFIG_DIR` for the spawn AND keeps restore consistent
-    // (`buildResumeCmd` resumes under the same dir). `None` (single-account /
-    // Manual default) keeps the prior behavior. RISK note: the id resolver
-    // scans config dirs first-hit-wins, but worktree paths are
-    // per-continuation-unique, so cross-account binding stays low-probability.
-    // Page distribution: backend continuations historically all landed on the
-    // "default" page, overflowing its 9-zone grid into the Unassigned list. Pick
-    // a non-full page at create-time so continuations spread across pages, and
-    // persist it in the durable record so a restart re-lands on the same page.
-    // Count live terminals per page from the manager's current session list.
-    let counts: Vec<(String, usize)> = {
-        let mut per_page: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for info in terminal_manager.list() {
-            *per_page.entry(info.page_id).or_insert(0) += 1;
-        }
-        per_page.into_iter().collect()
-    };
-    let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
-        uuid::Uuid::new_v4().to_string()
-    });
+    // The start-verdict loop (2026-10-01, merytshost: three continuations whose
+    // PTY printed `exec: claude: not found` and exited in under 100 ms, each
+    // then reported as `work_unreported` — "ran and said nothing" — when the
+    // runner's own lifecycle store recorded them `never-started`). A PTY that
+    // was CREATED is not a session that STARTED, and coord's outcome contract
+    // makes the difference irreversible: once `spawned` is posted the only
+    // legal next write is a `work_*` token (`spawned → spawn_failed` is
+    // refused), and nothing re-delivers a claimed continuation. So the
+    // `spawned` verdict is withheld until [`await_continuation_start`] has
+    // seen the session start, a never-started attempt is retried locally
+    // (bounded by [`CONTINUATION_START_MAX_ATTEMPTS`]), and only an
+    // exhausted retry surfaces as an `Err` — which the caller posts as the
+    // FIRST outcome, `spawn_failed: <detail>`, the token gate_doctor flags at
+    // once.
+    let mut ctx = ctx;
+    let mut attempt: u32 = 1;
+    // Count this continuation toward the P4 cap for the whole start window:
+    // it is not in the live registry until its verdict, and a burst of
+    // dispatches must not all read the same low live count while theirs are
+    // still starting. Released when this fn returns (a started session is by
+    // then registered, so the overlap only ever over-counts).
+    let _starting = StartingContinuationSlot::acquire();
+    loop {
+        // Pre-pin the Claude session id (#548 Phase 1): the registry records
+        // synchronously at spawn instead of mtime-guessing from transcripts.
+        // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
+        let pinned_session_id = uuid::Uuid::new_v4().to_string();
 
-    let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
-        config_dir: selected_config_dir,
-        working_dir: workdir.to_string(),
-        title: title.clone(),
-        page_id: Some(target_page.clone()),
-        // Matches the `--session-id` in the spawn argv → synchronous record.
-        claude_session_id: Some(pinned_session_id.clone()),
-        zone_index: None,
-        // Autonomous gate continuation → pin the agent git identity on the PTY.
-        inject_agent_git_identity: true,
-        // The AUTHORITATIVE producer's wiring: tell the session which gate it is
-        // (`QONTINUI_GATE_ID`) and which device claimed the continuation
-        // (`QONTINUI_GATE_DEVICE_ID`), so a session-close skill can POST
-        // `work_completed` / `work_abandoned` — the only honest answer to "did
-        // the work happen?", which the runner itself cannot observe. `None` for
-        // a work-unit dispatch: nothing injected, and the session correctly
-        // reads the absent variables as "no gate to report to".
-        gate_identity: reportable_gate.map(|gate_id| crate::commands::terminal::GateIdentity {
-            gate_id,
-            consuming_device_id: device_id,
-        }),
-        // A gate continuation is NEW work, not the continuation of a coord
-        // session row — no parent. The row is still keyed by the id this
-        // session runs under, so its own `coord_report_status` resolves it.
-        coord_lineage: Some(
-            crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
-        ),
-        // Settled below, from the SAME carrier the argv is built from.
-        policy_delivery: None,
-    };
+        // Durable lifecycle capture: this backend path never fires the frontend
+        // `terminal_session_record_open`, so without a hint a restart loses the
+        // continuation. `config_dir` is now the SELECTED account dir (above): it
+        // both sets `CLAUDE_CONFIG_DIR` for the spawn AND keeps restore consistent
+        // (`buildResumeCmd` resumes under the same dir). `None` (single-account /
+        // Manual default) keeps the prior behavior. RISK note: the id resolver
+        // scans config dirs first-hit-wins, but worktree paths are
+        // per-continuation-unique, so cross-account binding stays low-probability.
+        // Page distribution: backend continuations historically all landed on the
+        // "default" page, overflowing its 9-zone grid into the Unassigned list. Pick
+        // a non-full page at create-time so continuations spread across pages, and
+        // persist it in the durable record so a restart re-lands on the same page.
+        // Count live terminals per page from the manager's current session list.
+        let counts: Vec<(String, usize)> = {
+            let mut per_page: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for info in terminal_manager.list() {
+                *per_page.entry(info.page_id).or_insert(0) += 1;
+            }
+            per_page.into_iter().collect()
+        };
+        let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
+            uuid::Uuid::new_v4().to_string()
+        });
 
-    // Provision `.mcp.json` so this continuation can reach coord coordination
-    // tools (`coord_register_gate` over /mcp) and `coord-acting-bearer.sh` for
-    // the operator-scoped write surface — closing the reach gap where gate
-    // continuations (a primary place follow-up gates get registered) had no
-    // coord identity and fell back to the operator-bearer stopgap. Uses the
-    // runner's own device JWT; guarded against non-verifying bearers + clobber.
-    // Device-JWT sessions get the loopback live-token PROXY shape, so the
-    // ACTUALLY-BOUND API port must come from the managed AppState. Phase 3a:
-    // when AppState isn't reachable we pass `None` (fail-closed) rather than the
-    // env-default 9876 — that default is wrong on secondary/temp runners and
-    // writes a dead-but-valid-looking proxy config (the F1 root cause).
-    // Provisioning then refuses the device-path write + drops a degraded
-    // breadcrumb instead of pointing the session at a port nothing serves.
-    let bound_port = app
-        .try_state::<Arc<crate::commands::AppState>>()
-        .map(|s| crate::mcp::types::runner_api_port(s.inner()));
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+        let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
+            config_dir: selected_config_dir.clone(),
+            working_dir: workdir.to_string(),
+            title: title.clone(),
+            page_id: Some(target_page.clone()),
+            // Matches the `--session-id` in the spawn argv → synchronous record.
+            claude_session_id: Some(pinned_session_id.clone()),
+            zone_index: None,
+            // Autonomous gate continuation → pin the agent git identity on the PTY.
+            inject_agent_git_identity: true,
+            // The AUTHORITATIVE producer's wiring: tell the session which gate it is
+            // (`QONTINUI_GATE_ID`) and which device claimed the continuation
+            // (`QONTINUI_GATE_DEVICE_ID`), so a session-close skill can POST
+            // `work_completed` / `work_abandoned` — the only honest answer to "did
+            // the work happen?", which the runner itself cannot observe. `None` for
+            // a work-unit dispatch: nothing injected, and the session correctly
+            // reads the absent variables as "no gate to report to".
+            gate_identity: reportable_gate.map(|gate_id| crate::commands::terminal::GateIdentity {
+                gate_id,
+                consuming_device_id: device_id,
+            }),
+            // A gate continuation is NEW work, not the continuation of a coord
+            // session row — no parent. The row is still keyed by the id this
+            // session runs under, so its own `coord_report_status` resolves it.
+            coord_lineage: Some(
+                crate::commands::terminal::CoordSessionLineage::for_pinned_session(
+                    &pinned_session_id,
+                ),
+            ),
+            // Settled below, from the SAME carrier the argv is built from.
+            policy_delivery: None,
+        };
 
-    // The argv, built HERE rather than beside `launch_cfg` above: the briefing
-    // it carries gates its memory clause on `coord_mcp`, which the call
-    // immediately above is what decides. Only the RENDER moved — provisioning
-    // still runs exactly where it did, after the account-credential abort, so no
-    // aborted continuation gains a `.mcp.json` it never had before.
-    //
-    // Phase 1b: the generic runner context PLUS coord's dispatch-time brief.
-    // This is the TERMINAL presentation arm; the HEADLESS arm is the other half
-    // of the same seam and composes the brief into its prompt in
-    // `run_gate_continuation_inner` (it has no `--append-system-prompt` seam of
-    // its own). A brief appended at only one of them reaches only one spawn
-    // path. The briefing is then composed with the tenant's cached policy body
-    // into one `--append-system-prompt-file` when that cache exists (plan
-    // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
-    // stays inline otherwise.
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        compose_continuation_system_prompt(
-            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
-            payload.brief.as_ref(),
-        ),
-    ));
-    // The marker the policy hook's route trusts as proof of delivery — taken
-    // from the very carrier the argv uses, never recomputed.
-    let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
-    let argv = build_continuation_claude_command(
-        claude_bin,
-        &pinned_session_id,
-        add_dir_args,
-        payload.initial_prompt.clone(),
-        prompt_carrier,
-        // Direct exec — no identity shim in the chain to append `--settings`,
-        // so the hook carrier has to be spelled out here or this session runs
-        // with no SessionStart/PreCompact/Stop hook at all.
-        crate::session::claude_hook::direct_spawn_settings_args(),
-        &launch_cfg,
-    );
-    // ...unless an operator template put a replacement prompt in the final
-    // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
-    capture_hint.policy_delivery =
-        crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
-    let command = Some(argv);
+        // Provision `.mcp.json` so this continuation can reach coord coordination
+        // tools (`coord_register_gate` over /mcp) and `coord-acting-bearer.sh` for
+        // the operator-scoped write surface — closing the reach gap where gate
+        // continuations (a primary place follow-up gates get registered) had no
+        // coord identity and fell back to the operator-bearer stopgap. Uses the
+        // runner's own device JWT; guarded against non-verifying bearers + clobber.
+        // Device-JWT sessions get the loopback live-token PROXY shape, so the
+        // ACTUALLY-BOUND API port must come from the managed AppState. Phase 3a:
+        // when AppState isn't reachable we pass `None` (fail-closed) rather than the
+        // env-default 9876 — that default is wrong on secondary/temp runners and
+        // writes a dead-but-valid-looking proxy config (the F1 root cause).
+        // Provisioning then refuses the device-path write + drops a degraded
+        // breadcrumb instead of pointing the session at a port nothing serves.
+        let bound_port = app
+            .try_state::<Arc<crate::commands::AppState>>()
+            .map(|s| crate::mcp::types::runner_api_port(s.inner()));
+        let coord_mcp =
+            crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
 
-    // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
-    // as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
-    // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
-    // no qontinui-claude-config checkout has no skills dir at all.
-    crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // The argv, built HERE rather than beside `launch_cfg` above: the briefing
+        // it carries gates its memory clause on `coord_mcp`, which the call
+        // immediately above is what decides. Only the RENDER moved — provisioning
+        // still runs exactly where it did, after the account-credential abort, so no
+        // aborted continuation gains a `.mcp.json` it never had before.
+        //
+        // Phase 1b: the generic runner context PLUS coord's dispatch-time brief.
+        // This is the TERMINAL presentation arm; the HEADLESS arm is the other half
+        // of the same seam and composes the brief into its prompt in
+        // `run_gate_continuation_inner` (it has no `--append-system-prompt` seam of
+        // its own). A brief appended at only one of them reaches only one spawn
+        // path. The briefing is then composed with the tenant's cached policy body
+        // into one `--append-system-prompt-file` when that cache exists (plan
+        // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
+        // stays inline otherwise.
+        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
+            compose_continuation_system_prompt(
+                crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+                payload.brief.as_ref(),
+            ),
+        ));
+        // The marker the policy hook's route trusts as proof of delivery — taken
+        // from the very carrier the argv uses, never recomputed.
+        let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
+        let argv = build_continuation_claude_command(
+            claude_bin.clone(),
+            &pinned_session_id,
+            add_dir_args.clone(),
+            payload.initial_prompt.clone(),
+            prompt_carrier,
+            // Direct exec — no identity shim in the chain to append `--settings`,
+            // so the hook carrier has to be spelled out here or this session runs
+            // with no SessionStart/PreCompact/Stop hook at all.
+            crate::session::claude_hook::direct_spawn_settings_args(),
+            &launch_cfg,
+        );
+        // ...unless an operator template put a replacement prompt in the final
+        // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
+        capture_hint.policy_delivery =
+            crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
+        let command = Some(argv);
 
-    // The PTY seam derives workspace trust for the pinned account through the
-    // trust gate's SYNC door, which can only read the dial cache. Warm it here,
-    // from the one async context on this path, so that decision is made on the
-    // tenant's dial rather than on a cold cache (which would withhold the mint
-    // and leave an unattended, interactive `claude` facing the trust dialog).
-    crate::claude_session::trust_gate::warm_dial().await;
+        // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
+        // as project slash commands regardless of the device's ~/.claude.
+        crate::fleet_commands::provision_fleet_commands_for_session(workdir);
+        // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
+        // no qontinui-claude-config checkout has no skills dir at all.
+        crate::fleet_skills::provision_fleet_skills_for_session(workdir);
 
-    let result = crate::commands::terminal::create_tracked_terminal_session_backend(
-        &terminal_manager,
-        &session_registry,
-        app.clone(),
-        title,
-        workdir.to_string(),
-        payload.anchor_key.clone(),
-        payload.anchor_key.clone(),
-        intent_repo,
-        command,
-        ctx,
-        capture_hint,
-        Some(target_page),
-        // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
-        // the critical floor. A gate continuation is brand-new autonomous work
-        // with nobody at the keyboard to answer a dialog, and it is exactly the
-        // class of spawn that piled `claude` + `rustc` onto an already-starved
-        // box on the night of the incident. Refusing here is NOT a silent
-        // forever-refusal: the `Err` arm below calls `report_spawn_failed`, so
-        // coord learns the continuation did not start and can re-dispatch it
-        // once the box breathes — the same defer-don't-reject posture
-        // `ci_node::admission` takes for CI work.
-        false,
-    );
+        // The PTY seam derives workspace trust for the pinned account through the
+        // trust gate's SYNC door, which can only read the dial cache. Warm it here,
+        // from the one async context on this path, so that decision is made on the
+        // tenant's dial rather than on a cold cache (which would withhold the mint
+        // and leave an unattended, interactive `claude` facing the trust dialog).
+        crate::claude_session::trust_gate::warm_dial().await;
 
-    match result {
-        Ok((terminal_id, coord_session_id)) => {
-            // Register in the live continuation-session registry so P3 (dedup by
-            // anchor_key) and P4 (concurrency cap) see this session as live until
-            // its PTY exits (reaped lazily by the guard's liveness prune).
-            // `reportable_gate` (not `payload.gate_id`) so the PTY-exit fallback
-            // never posts an outcome against a work-unit `dispatch_id`.
-            // The hand-over inserts the live entry and gives the permit
-            // back under ONE lock acquisition, so no same-anchor dispatch can
-            // observe the anchor held by neither — and the permit is consumed,
-            // so nothing of this dispatch's can touch the anchor again.
-            reservation.handed_to_registry(terminal_id.clone(), reportable_gate);
-            // The session is intentionally left on `main` (docked, visible) — no
-            // pop-out window was opened, so there is nothing to reassign it to.
-            info!(
-                "agent_runtime: gate-continuation terminal session created \
+        let result = crate::commands::terminal::create_tracked_terminal_session_backend(
+            &terminal_manager,
+            &session_registry,
+            app.clone(),
+            title.clone(),
+            workdir.to_string(),
+            payload.anchor_key.clone(),
+            payload.anchor_key.clone(),
+            intent_repo.clone(),
+            command,
+            ctx.take(),
+            capture_hint,
+            Some(target_page),
+            // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
+            // the critical floor. A gate continuation is brand-new autonomous work
+            // with nobody at the keyboard to answer a dialog, and it is exactly the
+            // class of spawn that piled `claude` + `rustc` onto an already-starved
+            // box on the night of the incident. Refusing here is NOT a silent
+            // forever-refusal: the `Err` arm below calls `report_spawn_failed`, so
+            // coord learns the continuation did not start and can re-dispatch it
+            // once the box breathes — the same defer-don't-reject posture
+            // `ci_node::admission` takes for CI work.
+            false,
+        );
+
+        let (terminal_id, coord_session_id) = match result {
+            Ok(created) => created,
+            Err(e) => {
+                // The PTY seam returns text, so a trust-gate refusal arrives as the
+                // gate's own `spawn_blocked …` string rather than as the typed
+                // `SpawnBlocked` the headless funnel downcasts. Classify it by its
+                // prefix — the same device the resource guard uses — so the
+                // lifecycle post says `blocked` for a spawn that never started a
+                // child, instead of `exited`, and carries the refusal verbatim
+                // (it names the failing conjuncts) rather than wrapped as a create
+                // failure.
+                let (reason, phase) = classify_pty_spawn_error(&e);
+                report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
+                return Err(anyhow::anyhow!(e));
+            }
+        };
+
+        // Withhold the verdict until the session has demonstrably started (its
+        // pinned transcript exists), has outlived the start window, or has died
+        // without starting. See [`await_continuation_start`].
+        let transcript_paths = continuation_transcript_paths(
+            selected_config_dir.as_deref(),
+            workdir,
+            &pinned_session_id,
+        );
+        let started =
+            await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
+        match started {
+            ContinuationStart::Closed => {
+                // The operator closed the pane inside the window. Not a launch
+                // failure to retry: the close already released the worktree
+                // claim, and reopening what the operator closed would be wrong.
+                let reason = "continuation pane was closed before the session started".to_string();
+                warn!("agent_runtime: gate-continuation terminal_id={terminal_id}: {reason}");
+                report_spawn_failed(agent_id, &reason, None, attempt.saturating_sub(1), None).await;
+                return Err(anyhow::anyhow!(reason));
+            }
+            ContinuationStart::NeverStarted(evidence) => {
+                let detail = never_started_detail(&evidence);
+                // A pane that died within ~100 ms can exit before its coord
+                // session id was set, so its exit hook never closed the coord
+                // row. Close it here (idempotent if the hook did).
+                if let Some(coord_id) = coord_session_id {
+                    if let Err(e) = session_registry.close_by_id(coord_id) {
+                        debug!(
+                            "agent_runtime: never-started continuation coord session \
+                             {coord_id} close: {e}"
+                        );
+                    }
+                }
+                if attempt < CONTINUATION_START_MAX_ATTEMPTS {
+                    warn!(
+                        "agent_runtime: gate-continuation terminal_id={terminal_id} never started \
+                     (attempt {attempt}/{CONTINUATION_START_MAX_ATTEMPTS}): {detail} — \
+                     retrying in {}s",
+                        CONTINUATION_START_RETRY_DELAY.as_secs()
+                    );
+                    // Take the worktree claim back off the dead pane so the retry
+                    // inherits it rather than the pane releasing it. The dead pane
+                    // itself is left visible (and is not killed: its pid is gone,
+                    // and a kill aimed at a dead pid can land on a reused one) — it
+                    // is the operator's evidence of what failed.
+                    ctx = terminal_manager
+                        .get(&terminal_id)
+                        .and_then(|s| s.take_isolated_edit_ctx());
+                    attempt += 1;
+                    tokio::time::sleep(CONTINUATION_START_RETRY_DELAY).await;
+                    // Re-resolve: the first resolution may itself have run
+                    // inside the reinstall window and fallen back to the bare
+                    // name.
+                    claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+                        .await
+                        .unwrap_or_else(|_| claude_bin_path());
+                    continue;
+                }
+                let reason = format!("never started ({attempt} attempts): {detail}");
+                warn!("agent_runtime: gate-continuation terminal_id={terminal_id} {reason}");
+                report_spawn_failed(
+                    agent_id,
+                    &reason,
+                    evidence.exit_code.map(i64::from),
+                    attempt.saturating_sub(1),
+                    None,
+                )
+                .await;
+                // `reservation` drops on this return and releases the anchor.
+                return Err(anyhow::anyhow!(reason));
+            }
+            ContinuationStart::Started { pty_alive } => {
+                // Register in the live continuation-session registry so P3 (dedup by
+                // anchor_key) and P4 (concurrency cap) see this session as live until
+                // its PTY exits (reaped lazily by the guard's liveness prune).
+                // `reportable_gate` (not `payload.gate_id`) so the PTY-exit fallback
+                // never posts an outcome against a work-unit `dispatch_id`.
+                // The hand-over inserts the live entry and gives the permit
+                // back under ONE lock acquisition, so no same-anchor dispatch can
+                // observe the anchor held by neither — and the permit is consumed,
+                // so nothing of this dispatch's can touch the anchor again.
+                reservation.handed_to_registry(terminal_id.clone(), reportable_gate);
+                // A session that STARTED and has already exited (at the verdict,
+                // or in the instant between the verdict and the hand-over above)
+                // ended before it was registered, so its PTY exit hook found
+                // nothing and posted nothing. The CALLER fires the exit path for
+                // it after posting `spawned` — see this fn's doc. If the hook is
+                // merely running late, whichever deregisters first reports and
+                // the other is a no-op.
+                let exited = !pty_alive
+                    || !terminal_manager
+                        .get(&terminal_id)
+                        .is_some_and(|s| s.is_alive());
+                // The session is intentionally left on `main` (docked, visible) — no
+                // pop-out window was opened, so there is nothing to reassign it to.
+                info!(
+                    "agent_runtime: gate-continuation terminal session started \
                  terminal_id={terminal_id} coord_session={coord_session_id:?} \
-                 agent_id={agent_id}"
-            );
-            // Surface the freshly-created continuation to the operator: emit a
-            // `terminal-focus-request` so the frontend (a) switches the main view
-            // to the Terminal panel and (b) selects this tab. Without this the tab
-            // is appended off-screen / un-selected and the operator sees nothing.
-            // SCOPED to the MAIN window (`emit_to`, NOT bare `emit`) so a pop-out
-            // window is not yanked to this tab — `terminal-created` is a global
-            // broadcast, but a focus action must target only `main`.
-            emit_terminal_focus_request(&app, &terminal_id);
-            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None).await;
-            Ok(())
+                 agent_id={agent_id} attempt={attempt}"
+                );
+                // Surface the freshly-created continuation to the operator: emit a
+                // `terminal-focus-request` so the frontend (a) switches the main view
+                // to the Terminal panel and (b) selects this tab. Without this the tab
+                // is appended off-screen / un-selected and the operator sees nothing.
+                // SCOPED to the MAIN window (`emit_to`, NOT bare `emit`) so a pop-out
+                // window is not yanked to this tab — `terminal-created` is a global
+                // broadcast, but a focus action must target only `main`.
+                emit_terminal_focus_request(&app, &terminal_id);
+                report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
+                    .await;
+                return Ok(exited.then_some(terminal_id));
+            }
         }
-        Err(e) => {
-            // The PTY seam returns text, so a trust-gate refusal arrives as the
-            // gate's own `spawn_blocked …` string rather than as the typed
-            // `SpawnBlocked` the headless funnel downcasts. Classify it by its
-            // prefix — the same device the resource guard uses — so the
-            // lifecycle post says `blocked` for a spawn that never started a
-            // child, instead of `exited`, and carries the refusal verbatim
-            // (it names the failing conjuncts) rather than wrapped as a create
-            // failure.
-            let (reason, phase) = classify_pty_spawn_error(&e);
-            report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-            Err(anyhow::anyhow!(e))
+    }
+}
+
+/// Process-wide count of terminal continuations inside their start window —
+/// counted toward the P4 cap beside the live registry (see
+/// [`StartingContinuationSlot`]).
+static STARTING_CONTINUATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of terminal continuations currently inside their start window.
+fn starting_continuation_count() -> usize {
+    STARTING_CONTINUATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// RAII hold on one [`STARTING_CONTINUATIONS`] slot: taken before the first
+/// PTY of a continuation is created, released on every return of
+/// [`run_continuation_terminal`] (and on panic, by drop).
+struct StartingContinuationSlot;
+
+impl StartingContinuationSlot {
+    fn acquire() -> Self {
+        STARTING_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for StartingContinuationSlot {
+    fn drop(&mut self) {
+        STARTING_CONTINUATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How many times a gate-continuation terminal is created before a session that
+/// never STARTS is given up on and reported `spawn_failed` (1 initial + 2
+/// retries).
+///
+/// Bounded small on purpose: the transient this exists for (a package manager
+/// briefly unlinking `claude` mid-reinstall, ~2 s) clears in one retry, and a
+/// cause that survives three attempts is not transient and belongs in front of
+/// gate_doctor as `spawn_failed`, not in a retry loop.
+const CONTINUATION_START_MAX_ATTEMPTS: u32 = 3;
+
+/// Pause between never-started attempts — longer than npm's reify window so a
+/// retry does not land inside the same one.
+const CONTINUATION_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long [`await_continuation_start`] waits for a start signal before
+/// presuming a still-running PTY started. Must exceed the identity shim's own
+/// bounded resolve wait (`QONTINUI_SHIM_RESOLVE_WAIT_SECS`, default 10 s) plus
+/// `claude`'s own startup, or a shim still waiting out a reinstall would be
+/// ruled "started" with nothing yet running.
+const CONTINUATION_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll cadence inside the start window.
+const CONTINUATION_START_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What one tick of the start window observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartObservation {
+    /// The pinned session's transcript exists in some account's config dir —
+    /// `claude` started and recorded the prompt. The only positive proof.
+    transcript_present: bool,
+    /// The PTY child is still running.
+    pty_alive: bool,
+}
+
+/// [`classify_continuation_start`]'s verdict for one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTick {
+    /// Started. `pty_alive` is false when it started and has ALREADY exited.
+    Started { pty_alive: bool },
+    /// The PTY is gone and no transcript was ever written: nothing ran.
+    NeverStarted,
+    /// Neither yet — keep watching.
+    Pending,
+}
+
+/// The pure start-verdict core, unit-tested in isolation.
+///
+/// - A transcript is proof of a start whatever the PTY is doing.
+/// - A dead PTY with no transcript is a session that never started. The
+///   continuation is an INTERACTIVE `claude` (never `--print`), which does not
+///   exit on its own after its prompt, so a PTY gone inside the window with no
+///   transcript is a launch that failed (`not found`, a crash, an auth death)
+///   — and with no transcript there is no recorded turn, so a retry cannot
+///   duplicate work.
+/// - A PTY still alive at the end of the window is PRESUMED started: something
+///   is running (a trust dialog, a slow first turn, a transcript written to a
+///   config dir the probe does not know), and a false "never started" there
+///   would double-spawn live work. Erring toward `Started` keeps today's
+///   behaviour as the floor.
+fn classify_continuation_start(
+    obs: StartObservation,
+    elapsed: std::time::Duration,
+    window: std::time::Duration,
+) -> StartTick {
+    if obs.transcript_present {
+        return StartTick::Started {
+            pty_alive: obs.pty_alive,
+        };
+    }
+    if !obs.pty_alive {
+        return StartTick::NeverStarted;
+    }
+    if elapsed >= window {
+        return StartTick::Started { pty_alive: true };
+    }
+    StartTick::Pending
+}
+
+/// What a never-started PTY left behind, for the `spawn_failed` detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeverStartedEvidence {
+    exit_code: Option<i32>,
+    /// Milliseconds from creation to the tick that saw the PTY gone.
+    lifetime_ms: u128,
+    /// The pane's last non-empty output line, ANSI-stripped.
+    last_output: Option<String>,
+}
+
+/// The settled start verdict for one attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContinuationStart {
+    Started {
+        pty_alive: bool,
+    },
+    NeverStarted(NeverStartedEvidence),
+    /// The manager no longer holds the pane: the operator closed it inside the
+    /// window. Not retried (the close released the worktree claim).
+    Closed,
+}
+
+/// Candidate transcript paths for the pinned session: the selected account's
+/// config dir first, then every account home on the machine (the same set
+/// `create_terminal_session_backend`'s pinned-session verifier probes).
+fn continuation_transcript_paths(
+    selected_config_dir: Option<&str>,
+    workdir: &str,
+    pinned_session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    selected_config_dir
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .chain(crate::terminal::transcript::find_claude_config_dirs())
+        .map(|dir| {
+            crate::terminal::transcript::session_transcript_path(&dir, workdir, pinned_session_id)
+        })
+        .collect()
+}
+
+/// Watch a freshly created continuation PTY until [`classify_continuation_start`]
+/// settles, at most [`CONTINUATION_START_WINDOW`].
+///
+/// A terminal the manager no longer holds (closed by the operator inside the
+/// window) is [`ContinuationStart::Closed`] unless its transcript proves it
+/// started — never a never-started launch to retry.
+async fn await_continuation_start(
+    terminal_manager: &crate::terminal::TerminalManager,
+    terminal_id: &str,
+    transcript_paths: &[std::path::PathBuf],
+) -> ContinuationStart {
+    let begun = std::time::Instant::now();
+    loop {
+        let session = terminal_manager.get(terminal_id);
+        let obs = StartObservation {
+            transcript_present: transcript_paths.iter().any(|p| p.exists()),
+            pty_alive: session.as_ref().is_some_and(|s| s.is_alive()),
+        };
+        match classify_continuation_start(obs, begun.elapsed(), CONTINUATION_START_WINDOW) {
+            StartTick::Started { pty_alive } => return ContinuationStart::Started { pty_alive },
+            StartTick::NeverStarted if session.is_none() => return ContinuationStart::Closed,
+            StartTick::NeverStarted => {
+                let last_output = session.as_ref().and_then(|s| {
+                    last_output_line(&String::from_utf8_lossy(&s.get_scrollback_buffer().0))
+                });
+                return ContinuationStart::NeverStarted(NeverStartedEvidence {
+                    exit_code: session.as_ref().and_then(|s| s.exit_code()),
+                    lifetime_ms: begun.elapsed().as_millis(),
+                    last_output,
+                });
+            }
+            StartTick::Pending => tokio::time::sleep(CONTINUATION_START_POLL).await,
         }
+    }
+}
+
+/// Characters of the pane's last output line kept in a `spawn_failed` detail.
+const LAST_OUTPUT_KEEP_CHARS: usize = 100;
+
+/// The last non-empty line of raw pane output, ANSI-stripped, keeping its LAST
+/// [`LAST_OUTPUT_KEEP_CHARS`] characters — the cause sits at the END
+/// (`…/claude: line 74: exec: claude: not found`), after a long shim path.
+fn last_output_line(raw: &str) -> Option<String> {
+    let text = crate::terminal::strip_ansi(raw);
+    let line = text
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .rev()
+        .find(|l| !l.is_empty())?;
+    let chars: Vec<char> = line.chars().collect();
+    let skip = chars.len().saturating_sub(LAST_OUTPUT_KEEP_CHARS);
+    let tail: String = chars.into_iter().skip(skip).collect();
+    Some(if skip > 0 { format!("…{tail}") } else { tail })
+}
+
+/// One-line `spawn_failed` detail for a never-started attempt. Single-line by
+/// construction, and CAUSE FIRST: coord keeps only the first line of a detail
+/// and cuts it at 200 chars, so the pane's last line leads and the exit
+/// summary, which is the expendable part, trails.
+fn never_started_detail(evidence: &NeverStartedEvidence) -> String {
+    let code = evidence
+        .exit_code
+        .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+    let summary = format!(
+        "pty exited (code {code}) {}ms after spawn, no session transcript",
+        evidence.lifetime_ms
+    );
+    match &evidence.last_output {
+        Some(line) => format!("{line} [{summary}]"),
+        None => summary,
     }
 }
 
@@ -15094,6 +15450,143 @@ mod tests {
         // coord persists `work_completed` BARE and never with a detail suffix,
         // so the suffixed form is not a shape this predicate should invent.
         assert!(!is_session_work_outcome("work_completed: anything"));
+    }
+
+    /// The start verdict that decides between `spawned` and a never-started
+    /// retry / `spawn_failed` (2026-10-01: three continuations whose PTY died
+    /// in under 100 ms with `exec: claude: not found` were reported
+    /// `work_unreported`, "ran and said nothing", because a CREATED pty was
+    /// taken for a STARTED session).
+    #[test]
+    fn continuation_start_verdict_separates_never_started_from_started() {
+        use std::time::Duration;
+        let window = Duration::from_secs(30);
+        let early = Duration::from_millis(73);
+        let obs = |transcript_present, pty_alive| StartObservation {
+            transcript_present,
+            pty_alive,
+        };
+        // The incident: pty gone at 73 ms, no transcript — NEVER started.
+        assert_eq!(
+            classify_continuation_start(obs(false, false), early, window),
+            StartTick::NeverStarted
+        );
+        // Dead and transcript-less is never-started at ANY point in the window:
+        // the shim's own bounded wait can stretch a failed launch to ~10 s.
+        assert_eq!(
+            classify_continuation_start(obs(false, false), Duration::from_secs(11), window),
+            StartTick::NeverStarted
+        );
+        // A transcript is proof of a start whatever the pty is doing — and a
+        // started session that already exited must say so, so its exit can
+        // still be reported.
+        assert_eq!(
+            classify_continuation_start(obs(true, true), early, window),
+            StartTick::Started { pty_alive: true }
+        );
+        assert_eq!(
+            classify_continuation_start(obs(true, false), early, window),
+            StartTick::Started { pty_alive: false }
+        );
+        // Alive, no transcript yet: keep watching inside the window...
+        assert_eq!(
+            classify_continuation_start(obs(false, true), early, window),
+            StartTick::Pending
+        );
+        // ...and PRESUME started at its end: a false never-started on a live
+        // pane would double-spawn work, so today's behaviour is the floor.
+        assert_eq!(
+            classify_continuation_start(obs(false, true), window, window),
+            StartTick::Started { pty_alive: true }
+        );
+    }
+
+    /// The window must outlast the identity shim's own default resolve wait,
+    /// or a shim still waiting out a reinstall would be ruled started with
+    /// nothing running; and the retry budget stays small and non-zero.
+    #[test]
+    fn continuation_start_bounds_are_coherent_with_the_shim_wait() {
+        assert!(CONTINUATION_START_WINDOW > std::time::Duration::from_secs(10));
+        assert!(CONTINUATION_START_POLL < CONTINUATION_START_WINDOW);
+        assert!((2..=5).contains(&CONTINUATION_START_MAX_ATTEMPTS));
+        assert!(CONTINUATION_START_RETRY_DELAY >= std::time::Duration::from_secs(2));
+    }
+
+    /// The `spawn_failed` detail: one line (coord keeps only the first and cuts
+    /// it at 200 chars), CAUSE FIRST so the cut never loses it.
+    #[test]
+    fn never_started_detail_is_one_line_and_keeps_the_cause_under_coords_cut() {
+        let raw = "\x1b[0m/tmp/qontinui-identity-2b19d73c13053e92/claude: line 74: exec: claude: \
+                   not found\r\n\r\n";
+        let last = last_output_line(raw);
+        assert_eq!(
+            last.as_deref(),
+            Some(
+                "/tmp/qontinui-identity-2b19d73c13053e92/claude: line 74: exec: claude: not found"
+            )
+        );
+        let detail = never_started_detail(&NeverStartedEvidence {
+            exit_code: Some(1),
+            lifetime_ms: 73,
+            last_output: last,
+        });
+        assert!(!detail.contains('\n') && !detail.contains('\r'), "{detail}");
+        assert!(
+            detail.starts_with("/tmp/qontinui-identity-"),
+            "cause first: {detail}"
+        );
+        assert!(
+            detail.contains("code 1") && detail.contains("73ms"),
+            "{detail}"
+        );
+        // What coord persists: `spawn_failed: ` + the first line cut at 200.
+        let reason = format!("never started (3 attempts): {detail}");
+        assert_eq!(first_line(&reason), reason);
+        let persisted: String = first_line(&reason).chars().take(200).collect();
+        assert!(persisted.contains("exec: claude: not found"), "{persisted}");
+        assert!(ContinuationOutcome::SpawnFailed
+            .matches_recorded(&format!("spawn_failed: {persisted}")));
+
+        // A very long line keeps its TAIL, where the cause is.
+        let long = format!(
+            "{}exec: claude: not found",
+            "/very/long/shim/path".repeat(20)
+        );
+        let kept = last_output_line(&long).unwrap();
+        assert!(
+            kept.starts_with('…') && kept.ends_with("exec: claude: not found"),
+            "{kept}"
+        );
+        assert_eq!(kept.chars().count(), LAST_OUTPUT_KEEP_CHARS + 1);
+
+        // No exit code and no output: still a well-formed sentence.
+        let bare = never_started_detail(&NeverStartedEvidence {
+            exit_code: None,
+            lifetime_ms: 0,
+            last_output: None,
+        });
+        assert_eq!(
+            bare,
+            "pty exited (code unknown) 0ms after spawn, no session transcript"
+        );
+        assert_eq!(last_output_line("\r\n  \n"), None);
+    }
+
+    /// A continuation inside its start window counts toward the P4 cap until
+    /// its run returns, however it returns.
+    #[test]
+    fn starting_continuation_slot_counts_while_held() {
+        // The slots feed the P4 cap count every guard test reads, so hold the
+        // same lock they do or a parallel cap test sees +2.
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = starting_continuation_count();
+        let a = StartingContinuationSlot::acquire();
+        let b = StartingContinuationSlot::acquire();
+        assert!(starting_continuation_count() >= before + 2);
+        drop(a);
+        drop(b);
+        // Other tests never take a slot, so the count is back where it was.
+        assert_eq!(starting_continuation_count(), before);
     }
 
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a

@@ -28,6 +28,12 @@
 //!   (heavy/async, wrong for a tiny synchronous stub) and no extra crates.
 //! - **Real-tool resolution** scans `PATH` EXCLUDING the shim's own dir (so it
 //!   never recurses), preferring `<name>.exe` then `<name>.cmd` then bare.
+//! - **Bounded resolve wait.** A real tool momentarily ABSENT from `PATH` (a
+//!   package manager mid-reinstall — npm's reify renames `bin/<tool>` aside for
+//!   ~2 s) is re-scanned for at most `QONTINUI_SHIM_RESOLVE_WAIT_SECS` (default
+//!   10 s for claude/gemini, 3 s for install tools) before the fail-open
+//!   fall-through, which then names the tool and the `PATH` searched on stderr.
+//!   A resolved tool never waits; see [`resolve_real_waiting`].
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
@@ -70,6 +76,19 @@ const OVERRIDE_ENV: &str = "QONTINUI_INSTALL_OVERRIDE";
 /// identity dir, and failing to exclude it would let the stub resolve ITSELF as
 /// the "real" tool (self-spawn loop).
 const SHIM_DIR_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR";
+
+/// Override, in whole seconds, for how long a real-tool MISS is re-scanned
+/// before falling through (`0` disables the wait). Shared with the bash and
+/// `.cmd` shim templates. See [`resolve_real_waiting`].
+const RESOLVE_WAIT_ENV: &str = "QONTINUI_SHIM_RESOLVE_WAIT_SECS";
+/// Default resolve wait for the identity family (claude/gemini) — the 2026-10-01
+/// loss was a `claude` that vanished for one npm reify.
+const IDENTITY_RESOLVE_WAIT: Duration = Duration::from_secs(10);
+/// Default resolve wait for the install family: shorter, because probing an
+/// install tool that is simply not installed is common and pays the full wait.
+const INSTALL_RESOLVE_WAIT: Duration = Duration::from_secs(3);
+/// Re-scan cadence inside the resolve wait.
+const RESOLVE_POLL: Duration = Duration::from_millis(250);
 
 /// Env var carrying the runner-pre-generated session UUID the identity shim
 /// pins via `--session-id` (identity mode only).
@@ -540,7 +559,7 @@ pub fn identity_argv(
 /// confirmation POST → exec real with the composed argv.
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
-    let real = resolve_real(tool.program(), &own_dirs);
+    let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
@@ -716,7 +735,7 @@ fn session_open_body_fields(
 /// should propagate (the real tool's, or the spawn-failure surrogate).
 fn run(tool: ShimTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
-    let real = resolve_real(tool.program(), &own_dirs);
+    let real = resolve_real_waiting(tool.program(), &own_dirs, INSTALL_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation is a pure passthrough — no runner
     // contact, just run the real tool with the guard still set.
@@ -1019,6 +1038,95 @@ fn resolve_real(name: &str, own_dirs: &[PathBuf]) -> Option<PathBuf> {
     resolve_real_in(name, own_dirs, &path_var)
 }
 
+/// [`resolve_real`] with a bounded wait on a MISS.
+///
+/// One PATH scan used to decide: a miss fell straight through to dispatching
+/// the bare name, which fails when the tool is momentarily on NO `PATH` entry —
+/// Claude Code's auto-updater re-running `npm install --global` of the same
+/// version, whose reify renames `bin/claude` aside for ~2 s. On 2026-10-01 that
+/// window cost a runner-spawned gate continuation (`exec: claude: not found`,
+/// 73 ms after spawn). A miss now re-scans every [`RESOLVE_POLL`] for up to
+/// `default_wait` (or [`RESOLVE_WAIT_ENV`]), announcing the wait on stderr;
+/// a final miss names the tool and the `PATH` searched before the caller's
+/// fail-open fall-through runs. A hit on the first scan costs nothing extra.
+fn resolve_real_waiting(
+    name: &str,
+    own_dirs: &[PathBuf],
+    default_wait: Duration,
+) -> Option<PathBuf> {
+    let wait = resolve_wait_from(env::var(RESOLVE_WAIT_ENV).ok().as_deref(), default_wait);
+    let mut announced = false;
+    let found = resolve_with_wait(
+        || resolve_real(name, own_dirs),
+        wait,
+        RESOLVE_POLL,
+        |d| {
+            if !announced {
+                announced = true;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up \
+                     to {}s for it to reappear (a package-manager reinstall briefly removes it)",
+                    wait.as_secs()
+                );
+            }
+            std::thread::sleep(d);
+        },
+    );
+    if found.is_none() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "qontinui-shim: the real {name} was not found on PATH after waiting {}s; falling back \
+             to PATH dispatch. PATH searched (excluding {}): {}",
+            wait.as_secs(),
+            own_dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            env::var("PATH").unwrap_or_default()
+        );
+    }
+    found
+}
+
+/// Parse [`RESOLVE_WAIT_ENV`]: whole seconds, `0` disables; absent or garbled
+/// falls back to `default_wait` (fail-open to the designed default, never to
+/// "no wait" or to an unbounded one).
+fn resolve_wait_from(raw: Option<&str>, default_wait: Duration) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default_wait)
+}
+
+/// The pure retry core of [`resolve_real_waiting`]: probe once; on a miss,
+/// `sleep(poll)` and re-probe until a hit or until `wait` worth of polls are
+/// spent. Bounded by attempt COUNT (not a wall clock), so tests drive it with a
+/// recording `sleep` and no real time passes.
+fn resolve_with_wait<P, S>(
+    mut probe: P,
+    wait: Duration,
+    poll: Duration,
+    mut sleep: S,
+) -> Option<PathBuf>
+where
+    P: FnMut() -> Option<PathBuf>,
+    S: FnMut(Duration),
+{
+    if let Some(found) = probe() {
+        return Some(found);
+    }
+    let poll_ms = poll.as_millis().max(1);
+    let retries = wait.as_millis().div_ceil(poll_ms);
+    for _ in 0..retries {
+        sleep(poll);
+        if let Some(found) = probe() {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Core of [`resolve_real`], parameterized on the `PATH` value. Split out so
 /// tests can drive resolution with an explicit PATH instead of mutating the
 /// process-global `PATH` env var: that mutation raced other tests under the
@@ -1097,9 +1205,18 @@ fn exec_real_child_env(
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
-        // (Our own dir is still ahead on PATH, but the guard short-circuits a
-        // re-entry to a pure passthrough — no infinite loop.)
-        None => Command::new(name),
+        // Our own dir is still ahead on PATH, so this can re-enter THIS stub;
+        // the guard makes that a passthrough, and the zero resolve wait set
+        // below keeps the re-entry from paying the wait again at every level.
+        // Already a nested invocation (the guard is set) and still nothing
+        // outside our dirs: dispatching by name could only find a shim of ours
+        // again — a chain of re-entries. Command-not-found, loudly, instead.
+        None if env::var(GUARD_ENV).ok().as_deref() == Some("1") => return Some(127),
+        None => {
+            let mut c = Command::new(name);
+            c.env(RESOLVE_WAIT_ENV, "0");
+            c
+        }
     };
     for var in env_remove {
         cmd.env_remove(var);
@@ -1351,6 +1468,78 @@ mod tests {
         let body2 = pre_call_body("pip", &[], false, true);
         assert!(body2.contains("\"override_escalation\":true"));
         assert!(body2.contains("\"packages\":[]"));
+    }
+
+    #[test]
+    fn resolve_with_wait_hits_first_scan_without_sleeping() {
+        let mut sleeps = Vec::new();
+        let got = resolve_with_wait(
+            || Some(PathBuf::from("/real/claude")),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |d| sleeps.push(d),
+        );
+        assert_eq!(got, Some(PathBuf::from("/real/claude")));
+        assert!(sleeps.is_empty(), "a hit must never pay the wait");
+    }
+
+    /// The 2026-10-01 shape: the tool is absent for the first scans (npm reify
+    /// renamed `bin/claude` aside) and reappears — the shim must find it.
+    #[test]
+    fn resolve_with_wait_finds_a_tool_that_reappears_mid_wait() {
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let got = resolve_with_wait(
+            || {
+                calls += 1;
+                (calls >= 5).then(|| PathBuf::from("/real/claude"))
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+        );
+        assert_eq!(got, Some(PathBuf::from("/real/claude")));
+        assert_eq!(calls, 5);
+        assert_eq!(sleeps, 4);
+    }
+
+    #[test]
+    fn resolve_with_wait_is_bounded_and_zero_disables_it() {
+        let mut calls = 0;
+        let got = resolve_with_wait(
+            || {
+                calls += 1;
+                None
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            |_| {},
+        );
+        assert_eq!(got, None);
+        assert_eq!(calls, 5, "1 initial scan + 1s / 250ms re-scans");
+
+        let mut calls = 0;
+        let got = resolve_with_wait(
+            || {
+                calls += 1;
+                None
+            },
+            Duration::ZERO,
+            Duration::from_millis(250),
+            |_| panic!("a zero wait must never sleep"),
+        );
+        assert_eq!(got, None);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn resolve_wait_env_parses_seconds_and_fails_open_to_the_default() {
+        let d = Duration::from_secs(10);
+        assert_eq!(resolve_wait_from(None, d), d);
+        assert_eq!(resolve_wait_from(Some("0"), d), Duration::ZERO);
+        assert_eq!(resolve_wait_from(Some(" 4 "), d), Duration::from_secs(4));
+        assert_eq!(resolve_wait_from(Some("soon"), d), d);
+        assert_eq!(resolve_wait_from(Some("-1"), d), d);
     }
 
     #[test]
