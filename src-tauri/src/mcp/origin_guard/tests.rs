@@ -1411,10 +1411,7 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
         "/api/v1/devices/{device_id}/machine-credential/exchange",
     ),
     // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock); GET is a header `.get(`.
-    (
-        "GET",
-        "/api/v1/devices/{device_id}/machine-credential/mint",
-    ),
+    ("GET", "/api/v1/devices/{device_id}/machine-credential/mint"),
     // Outbound qontinui-web URL, not a runner route (device_jwt_refresher test mock).
     (
         "POST",
