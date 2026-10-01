@@ -1133,32 +1133,72 @@ const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// the tree alone. `Status` and `SpawnError` keep FALSE, so the behaviour of
 /// every case reachable before this change is unchanged.
 ///
-/// [`DegradeReason::CommitExhaustionSuspected`] joins the TRUE side: it used
-/// to arrive here as `Status`, but it is not git's answer — git never listed
-/// anything, its own child launch failed for want of commit (plan
+/// Resource exhaustion joins the TRUE side too (plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
-/// Phase 0). It is evidence of nothing, so it withholds the clearance.
+/// Phase 0): [`DegradeReason::CommitExhaustionSuspected`] used to arrive here as
+/// `Status`, but it is not git's answer — git never listed anything, its own
+/// child launch failed for want of commit — and a `SpawnError` whose
+/// classification names an exhaustion (`ERROR_COMMITMENT_LIMIT`, `ENOMEM`,
+/// `EAGAIN`, …) says the MACHINE could not start git, not that git is absent.
+/// Both are evidence of nothing, so both withhold the clearance. A `SpawnError`
+/// with no exhaustion classification (git not installed) keeps FALSE.
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
-    use crate::process_helpers::{run_probe_quiet, DegradeReason, ProbeOutcome};
+    use crate::process_helpers::run_probe_quiet;
 
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
-    match run_probe_quiet(
-        cmd,
-        CLAUDE_TREE_PROBE_TIMEOUT,
-        "agent_worktree: git ls-files -- .claude",
-    ) {
+    repo_authored_from_outcome(
+        workdir,
+        run_probe_quiet(
+            cmd,
+            CLAUDE_TREE_PROBE_TIMEOUT,
+            "agent_worktree: git ls-files -- .claude",
+        ),
+    )
+}
+
+/// The verdict half of [`claude_tree_is_repo_authored`], split out so every
+/// degrade arm is settleable in a test without a git that fails on demand.
+fn repo_authored_from_outcome(
+    workdir: &str,
+    outcome: crate::process_helpers::ProbeOutcome,
+) -> bool {
+    use crate::process_helpers::{DegradeReason, ProbeOutcome};
+
+    match outcome {
         ProbeOutcome::Captured(stdout) => !stdout.is_empty(),
+        // The machine could not start git (or git could not start its own
+        // child) for want of a resource — evidence of nothing. Withhold.
+        ProbeOutcome::Degraded(DegradeReason::SpawnError(f)) if f.exhaustion.is_some() => {
+            warn!(
+                workdir = %workdir,
+                exhaustion = ?f.exhaustion,
+                os_code = ?f.os_code,
+                "fleet provisioning: git could not be started for the .claude tracked-file \
+                 probe because this machine is out of a resource; cannot prove .claude is \
+                 untracked, so treating the tree as repo-authored and skipping provisioning"
+            );
+            true
+        }
+        ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code }) => {
+            warn!(
+                workdir = %workdir,
+                os_code,
+                "fleet provisioning: the .claude tracked-file probe failed because git's own \
+                 child launch hit commit exhaustion (suspected); cannot prove .claude is \
+                 untracked, so treating the tree as repo-authored and skipping provisioning"
+            );
+            true
+        }
         // Evidence of absence — keep the provisioning arm.
         ProbeOutcome::Degraded(DegradeReason::Status)
         | ProbeOutcome::Degraded(DegradeReason::SpawnError(_)) => false,
         // Evidence of nothing — withhold the clearance.
         ProbeOutcome::Degraded(DegradeReason::TimedOut { .. })
-        | ProbeOutcome::Degraded(DegradeReason::Truncated(_))
-        | ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { .. }) => {
+        | ProbeOutcome::Degraded(DegradeReason::Truncated(_)) => {
             warn!(
                 workdir = %workdir,
                 "fleet provisioning: the .claude tracked-file probe did not answer inside \
@@ -1330,6 +1370,43 @@ mod tests {
             claude_tree_is_repo_authored(root.to_str().unwrap()),
             "a repo that tracks .claude/ must be left alone"
         );
+    }
+
+    /// A git the MACHINE could not start (a classified exhaustion) proves
+    /// nothing about `.claude`, so it withholds the clearance; a git that is
+    /// simply not installed (unclassified spawn error) and git's own non-zero
+    /// answer keep the provisioning arm. Plan
+    /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
+    /// Phase 0.
+    #[test]
+    fn resource_exhaustion_withholds_the_provisioning_clearance() {
+        use crate::process_helpers::{DegradeReason, ProbeOutcome};
+        use qontinui_runner_lib::util::resource_exhaustion::{ExhaustionKind, SpawnFailure};
+
+        let exhausted = SpawnFailure {
+            os_code: Some(1455),
+            exhaustion: Some(ExhaustionKind::Commit),
+        };
+        assert!(repo_authored_from_outcome(
+            "wd",
+            ProbeOutcome::Degraded(DegradeReason::SpawnError(exhausted))
+        ));
+        assert!(repo_authored_from_outcome(
+            "wd",
+            ProbeOutcome::Degraded(DegradeReason::CommitExhaustionSuspected { os_code: 1455 })
+        ));
+        let not_installed = SpawnFailure {
+            os_code: Some(2),
+            exhaustion: None,
+        };
+        assert!(!repo_authored_from_outcome(
+            "wd",
+            ProbeOutcome::Degraded(DegradeReason::SpawnError(not_installed))
+        ));
+        assert!(!repo_authored_from_outcome(
+            "wd",
+            ProbeOutcome::Degraded(DegradeReason::Status)
+        ));
     }
 
     /// The provisioning arm must still fire on the case the feature exists for:

@@ -35,8 +35,14 @@
 //!   ([`install`]) and kept as a raw descriptor in an atomic; the write is one
 //!   raw OS call (`write(2)` / `WriteFile`) — no `std::fs::File` buffering, no
 //!   tracing, no stderr lock the dying handler is about to take.
-//! - **It writes once.** An atomic flag per wrapper: a failure storm (every
-//!   thread failing at once) writes one line, not a thousand.
+//! - **It writes a bounded number of lines.** An atomic counter per wrapper
+//!   caps the arm at [`MAX_BREADCRUMB_LINES`]: a failure storm (every thread
+//!   failing at once) writes eight lines, not a thousand — and not ONE,
+//!   because a graceful failure (a `try_reserve`, or std's `read_to_end`
+//!   surfacing `ErrorKind::OutOfMemory`) returns null here too and survives,
+//!   and must not use up the only line the later fatal failure needed. A slot
+//!   is taken only once the handle is open, so a failure before [`install`]
+//!   costs nothing.
 //! - **It changes nothing.** The null is returned unchanged, so the default
 //!   handler prints its line and aborts exactly as before. The wrapper
 //!   observes; it never alters the outcome.
@@ -61,12 +67,14 @@
 //! The wrapper type and the handle live here so both the allocator (registered
 //! in the runner bin's `main.rs`) and `util::resource_exhaustion` (lib) reach
 //! ONE handle. Only the runner binary registers it; the lib's other binaries
-//! and every test binary keep the plain system allocator, and the wrapper is
-//! tested by instantiating it over a stub inner allocator.
+//! and every test binary keep the plain system allocator. So the wrapper's
+//! SUCCESS path runs only in the runner binary itself — no test exercises it
+//! as the process allocator. What the tests cover is the wrapper instantiated
+//! over a stub inner allocator (success and failure arms, called directly).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::util::resource_exhaustion::{last_memory_reading, MemoryReading};
 
@@ -144,15 +152,24 @@ fn raw_write(bytes: &[u8]) {
         }
         let mut rest = bytes;
         // Bounded: a regular-file O_APPEND write of a few hundred bytes is
-        // whole in practice; the loop only covers a signal-interrupted write.
-        for _ in 0..4 {
+        // whole in practice. The loop covers a short write and a write
+        // interrupted by a signal (EINTR) before any byte landed; any other
+        // error gives up. `last_os_error` reads errno into an `io::Error`'s
+        // inline OS-code variant — no allocation.
+        for _ in 0..8 {
             if rest.is_empty() {
                 return;
             }
             // SAFETY: `fd` is the descriptor `install` leaked for the life of
             // the process; `rest` is a valid readable slice.
             let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
-            if n <= 0 {
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            if n == 0 {
                 return;
             }
             rest = &rest[n as usize..];
@@ -205,9 +222,12 @@ pub fn append_incident(token: &str, detail: &str) {
 /// Where the failure arm's one line goes. Abstracted so the wrapper can be
 /// tested over a capturing sink; production is [`IncidentFileSink`].
 pub trait BreadcrumbSink: Sync {
-    /// Write one pre-formatted line. Called at most once per wrapper, from
-    /// inside a failing allocator: implementations must not allocate or lock
-    /// in production.
+    /// Whether a line written now would land anywhere. Checked BEFORE a slot
+    /// is taken, so a failure before the sink is ready costs no slot.
+    fn is_ready(&self) -> bool;
+    /// Write one pre-formatted line. Called at most
+    /// [`MAX_BREADCRUMB_LINES`] times per wrapper, from inside a failing
+    /// allocator: implementations must not allocate or lock in production.
     fn write_line(&self, line: &[u8]);
 }
 
@@ -215,20 +235,41 @@ pub trait BreadcrumbSink: Sync {
 pub struct IncidentFileSink;
 
 impl BreadcrumbSink for IncidentFileSink {
+    fn is_ready(&self) -> bool {
+        #[cfg(unix)]
+        {
+            INCIDENT_FD.load(Ordering::Acquire) >= 0
+        }
+        #[cfg(windows)]
+        {
+            INCIDENT_HANDLE.load(Ordering::Acquire) != 0
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
     fn write_line(&self, line: &[u8]) {
         raw_write(line);
     }
 }
 
-/// A [`GlobalAlloc`] that forwards every call to `inner` and, the first time
-/// an allocation returns null, writes one breadcrumb line to `sink`.
+/// How many `alloc_failure` lines one wrapper may write. More than one because
+/// a graceful allocation failure also comes through here and survives; small
+/// because a storm must not flood the incident file.
+pub const MAX_BREADCRUMB_LINES: usize = 8;
+
+/// A [`GlobalAlloc`] that forwards every call to `inner` and, for each of the
+/// first [`MAX_BREADCRUMB_LINES`] allocations that return null while `sink` is
+/// ready, writes one breadcrumb line to `sink`.
 ///
 /// Generic over the inner allocator and the sink so the failure arm is
 /// testable without exhausting a real machine.
 pub struct BreadcrumbAlloc<A, S> {
     inner: A,
     sink: S,
-    fired: AtomicBool,
+    written: AtomicUsize,
 }
 
 /// The runner binary's global allocator type.
@@ -246,7 +287,7 @@ impl<A, S> BreadcrumbAlloc<A, S> {
         BreadcrumbAlloc {
             inner,
             sink,
-            fired: AtomicBool::new(false),
+            written: AtomicUsize::new(0),
         }
     }
 }
@@ -275,7 +316,13 @@ impl<A, S: BreadcrumbSink> BreadcrumbAlloc<A, S> {
     #[cold]
     #[inline(never)]
     fn on_null(&self, op: AllocOp, size: usize, align: usize) {
-        if self.fired.swap(true, Ordering::AcqRel) {
+        // Readiness first, so a failure before `install` takes no slot; then
+        // a load-then-add, so the counter never climbs (or wraps) past the cap
+        // under a storm.
+        if !self.sink.is_ready() || self.written.load(Ordering::Acquire) >= MAX_BREADCRUMB_LINES {
+            return;
+        }
+        if self.written.fetch_add(1, Ordering::AcqRel) >= MAX_BREADCRUMB_LINES {
             return;
         }
         let mut line = LineBuf::new();
@@ -524,7 +571,7 @@ fn format_alloc_failure_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
     /// An inner allocator that returns null while `failing` is set, and
@@ -563,11 +610,16 @@ mod tests {
     /// A capturing sink. It allocates, which is fine: under test the wrapper
     /// is called directly, not registered as the process allocator.
     struct TestSink {
+        ready: AtomicBool,
         lines: Mutex<Vec<Vec<u8>>>,
         calls: AtomicUsize,
     }
 
     impl BreadcrumbSink for TestSink {
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+
         fn write_line(&self, line: &[u8]) {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.lines.lock().unwrap().push(line.to_vec());
@@ -580,17 +632,20 @@ mod tests {
                 failing: AtomicBool::new(false),
             },
             TestSink {
+                ready: AtomicBool::new(true),
                 lines: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
             },
         )
     }
 
-    /// Plan Phase 0 verification (b2): N consecutive failures write exactly
-    /// ONE breadcrumb and return null every time — the wrapper observes, it
-    /// never converts a failure into anything else.
+    /// Plan Phase 0 verification (b2), as amended by review: N consecutive
+    /// failures write a BOUNDED number of breadcrumbs (at most
+    /// [`MAX_BREADCRUMB_LINES`], so a surviving `try_reserve` failure cannot
+    /// use up the only line) and return null every time — the wrapper
+    /// observes, it never converts a failure into anything else.
     #[test]
-    fn n_consecutive_failures_write_one_breadcrumb_and_return_null_each_time() {
+    fn n_consecutive_failures_write_a_bounded_number_of_breadcrumbs_and_return_null() {
         let a = harness();
         let layout = Layout::from_size_align(2_097_152, 8).unwrap();
 
@@ -609,8 +664,8 @@ mod tests {
         assert!(unsafe { a.realloc(&mut dummy, Layout::new::<u8>(), 4096) }.is_null());
         assert_eq!(
             a.sink.calls.load(Ordering::SeqCst),
-            1,
-            "a failure storm writes one line"
+            MAX_BREADCRUMB_LINES,
+            "a failure storm writes a bounded number of lines"
         );
 
         let lines = a.sink.lines.lock().unwrap();
@@ -618,6 +673,26 @@ mod tests {
         assert!(line
             .contains(" alloc_failure memory allocation of 2097152 bytes failed (alloc, align 8"));
         assert!(line.ends_with(&format!("(pid {})\n", std::process::id())));
+    }
+
+    /// A failure while the sink is not ready (before `install`) takes no
+    /// slot: once it becomes ready the full budget is still there.
+    #[test]
+    fn failures_before_the_sink_is_ready_consume_no_slot() {
+        let a = harness();
+        a.sink.ready.store(false, Ordering::SeqCst);
+        a.inner.failing.store(true, Ordering::SeqCst);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        for _ in 0..20 {
+            assert!(unsafe { a.alloc(layout) }.is_null());
+        }
+        assert_eq!(a.sink.calls.load(Ordering::SeqCst), 0);
+
+        a.sink.ready.store(true, Ordering::SeqCst);
+        for _ in 0..20 {
+            assert!(unsafe { a.alloc(layout) }.is_null());
+        }
+        assert_eq!(a.sink.calls.load(Ordering::SeqCst), MAX_BREADCRUMB_LINES);
     }
 
     /// The line is the `wedge-incidents.log` shape — an RFC 3339 timestamp
@@ -671,10 +746,12 @@ mod tests {
         }
     }
 
-    /// Before `install` the production sink is a silent no-op — which is what
-    /// every test binary and every non-runner binary sees.
+    /// Before `install` the production sink reports not-ready and is a silent
+    /// no-op — which is what every test binary and every non-runner binary
+    /// sees.
     #[test]
     fn the_production_sink_is_inert_until_installed() {
+        assert!(!IncidentFileSink.is_ready());
         IncidentFileSink.write_line(b"never written\n");
     }
 }
