@@ -232,7 +232,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/config_report.rs` | `render_layer_doc` | `docs/runner-config-layers.md'. NOT from PowerShell, whose '>' writes UTF-16 \` | 1 | unreviewed |
 | `src/config_report_cmd.rs` | `seam_reports` | `&crate::claude_session::runner::build_inline_child_command("cmd.exe", &[], "."),` | 1 | unreviewed |
 | `src/coord_doctor.rs` | `const CHECK_SPECS` | `dev-start.ps1 / the supervisor); spawns are stripped either way` | 1 | unreviewed |
-| `src/crash_observability.rs` | `format_harvest_breadcrumb` | `flipping its shutdown marker to clean:true (crash, OOM kill, taskkill /F,\n\` | 1 | unreviewed |
+| `src/crash_observability.rs` | `format_harvest_breadcrumb` | `abort, OOM kill, taskkill /F, or power loss). This artifact was\n\` | 1 | unreviewed |
 | `src/crash_observability.rs` | `install` | `cfg(windows)-only fn 'install' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `read_exception` | `cfg(windows)-only fn 'read_exception' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/crash_observability.rs` | `run_bounded` | `cfg(windows)-only fn 'run_bounded' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
