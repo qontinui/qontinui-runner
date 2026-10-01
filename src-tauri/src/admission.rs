@@ -27,13 +27,23 @@
 //!   [`Admission::Unknown`]. [`release`] returns a lease with the number of
 //!   permits actually used. Every admission-route response carries coord's
 //!   standing `budget`, cached in [`cached_budget`].
-//! * **Local bucket.** Admission UNKNOWN — no coord device, no device JWT, a 404
-//!   from a coord that predates the route, a 5xx, a timeout over 3 s —
-//!   THROTTLES rather than stops: unattended spawns draw from a conservative
-//!   [`TokenBucket`] (burst 4, refill 4/min, env-tunable). This deliberately
-//!   differs from the drain, where UNKNOWN defers everything: a drain is an
-//!   explicit stop order, admission is a RATE, and an offline runner must still
-//!   be able to do its work — just not 180 spawns of it at once.
+//! * **Local bucket.** Admission UNKNOWN — no coord device, no device JWT, a 5xx,
+//!   a transport failure, a timeout over 3 s — THROTTLES rather than stops:
+//!   unattended spawns draw from a conservative [`TokenBucket`] (burst 4, refill
+//!   4/min, env-tunable). This deliberately differs from the drain, where
+//!   UNKNOWN defers everything: a drain is an explicit stop order, admission is
+//!   a RATE, and an offline runner must still be able to do its work — just not
+//!   180 spawns of it at once. The bucket is for a coord that HAS admission but
+//!   cannot answer right now.
+//! * **A 404 is not UNKNOWN — it is a definite answer that admission does not
+//!   exist on this coord yet.** A 404 from the acquire route BEFORE this process
+//!   has ever seen an admission route answer 2xx passes the spawn through: that
+//!   is the pre-plan state, where the 64-session cap and the thread-pressure
+//!   defer are the backstops, and throttling it to 4 + 4/min would punish a
+//!   runner for meeting an older coord. Logged at info once per cooldown and
+//!   counted (`spawn_admission_route_absent` in the continuation poll report).
+//!   A 404 AFTER a 2xx is a regression or a misroute, not an older coord, and
+//!   takes the local bucket like any other UNKNOWN.
 //!
 //! ## Who enforces what (Phase 2)
 //!
@@ -56,7 +66,7 @@
 //! `Unknown`, which the caller turns into a local-bucket decision.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -338,8 +348,20 @@ async fn report_once() {
         "{}/coord/devices/me/spawn-admission/report",
         target.base.trim_end_matches('/')
     );
-    match post_json(&url, &target.bearer, &body, REPORT_TIMEOUT).await {
+    // A per-report client, like `coord_drain_state::read_me_drain`'s: the
+    // reporter runs on the fleet-heartbeat thread's dedicated current-thread
+    // runtime, and a connection pooled by the shared client must not be opened
+    // on one runtime and reused from another. One connection per 30 s is cheap.
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("admission: spawn report not sent — reqwest builder: {e}");
+            return;
+        }
+    };
+    match post_json(&client, &url, &target.bearer, &body, REPORT_TIMEOUT).await {
         Ok((status, text)) if (200..300).contains(&status) => {
+            note_route_answered();
             if let Ok(resp) = serde_json::from_str::<ReportResponse>(&text) {
                 if let Some(budget) = resp.budget {
                     note_budget(budget);
@@ -431,6 +453,16 @@ pub enum UnknownReason {
 }
 
 impl UnknownReason {
+    /// Is this a 404 — coord does not serve the route — directly or as the
+    /// cause of a running cooldown?
+    pub fn is_route_absent(&self) -> bool {
+        match self {
+            UnknownReason::RouteAbsent => true,
+            UnknownReason::CoolingDown(inner) => inner.is_route_absent(),
+            _ => false,
+        }
+    }
+
     /// Operator-readable sentence.
     pub fn describe(&self) -> String {
         match self {
@@ -628,13 +660,33 @@ fn door_health() -> &'static Mutex<DoorHealth> {
     HEALTH.get_or_init(|| Mutex::new(DoorHealth::default()))
 }
 
+/// Whether any admission route has answered 2xx in this process. Separates the
+/// two meanings of a 404: before any 2xx it is a coord that predates admission
+/// (pass through); after one it is a regression or a misroute (local bucket).
+/// Per-process and never reset: a coord that once served the route and now
+/// 404s is exactly the case that must not run free.
+static ROUTE_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+fn note_route_answered() {
+    ROUTE_ANSWERED.store(true, Ordering::Relaxed);
+}
+
+/// See [`ROUTE_ANSWERED`].
+pub fn route_has_answered() -> bool {
+    ROUTE_ANSWERED.load(Ordering::Relaxed)
+}
+
 /// Ask coord for `count` permits of `class` for a spawn of `origin`.
 ///
 /// Never errors and never blocks past [`ACQUIRE_TIMEOUT`]: every failure is an
-/// [`Admission::Unknown`] naming its cause, which the caller turns into a
-/// local-bucket decision. A 404 is UNKNOWN, never a grant — the deploy order
-/// puts coord's route first, but a runner build that meets an older coord must
-/// throttle, not run free.
+/// [`Admission::Unknown`] naming its cause. A 404 is reported as
+/// [`UnknownReason::RouteAbsent`], never as a grant; whether it passes the spawn
+/// through or draws on the local bucket is [`decide`]'s call, made against
+/// [`route_has_answered`].
+///
+/// Uses the process-wide [`crate::coord_http::coord_client`]: every acquire and
+/// release runs on the main runtime (the continuation dispatcher and the
+/// permits it hands out), so one pooled client is correct there.
 pub async fn acquire(
     origin: SpawnOrigin,
     class: SpawnClass,
@@ -650,7 +702,13 @@ pub async fn acquire(
             reason: UnknownReason::CoolingDown(Box::new(why)),
         };
     }
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Admission::Unknown {
+            reason: UnknownReason::Transport("no shared coord HTTP client".to_string()),
+        };
+    };
     let admission = acquire_at(
+        client,
         &target.base,
         &target.bearer,
         origin,
@@ -667,6 +725,7 @@ pub async fn acquire(
 /// [`acquire`] against an explicit base and bearer, with no cooldown — the
 /// network half, separated so a test can drive it against a local server.
 async fn acquire_at(
+    client: &reqwest::Client,
     base: &str,
     bearer: &str,
     origin: SpawnOrigin,
@@ -685,9 +744,13 @@ async fn acquire_at(
         count,
         work_keys,
     };
-    let (admission, budget) = read_acquire(post_json(&url, bearer, &body, timeout).await, count);
+    let (admission, budget) =
+        read_acquire(post_json(client, &url, bearer, &body, timeout).await, count);
     if let Some(budget) = budget {
         note_budget(budget);
+    }
+    if matches!(admission, Admission::Granted { .. }) {
+        note_route_answered();
     }
     admission
 }
@@ -714,7 +777,12 @@ pub async fn release(lease_id: uuid::Uuid, used: u32) {
             return;
         }
     };
+    let Some(client) = crate::coord_http::coord_client() else {
+        debug!("admission: lease {lease_id} not released (no shared coord HTTP client) — it lapses at coord's TTL");
+        return;
+    };
     release_at(
+        client,
         &target.base,
         &target.bearer,
         lease_id,
@@ -724,14 +792,22 @@ pub async fn release(lease_id: uuid::Uuid, used: u32) {
     .await;
 }
 
-/// [`release`] against an explicit base and bearer.
-async fn release_at(base: &str, bearer: &str, lease_id: uuid::Uuid, used: u32, timeout: Duration) {
+/// [`release`] against an explicit client, base and bearer.
+async fn release_at(
+    client: &reqwest::Client,
+    base: &str,
+    bearer: &str,
+    lease_id: uuid::Uuid,
+    used: u32,
+    timeout: Duration,
+) {
     let url = format!(
         "{}/coord/devices/me/spawn-admission/{lease_id}/release",
         base.trim_end_matches('/')
     );
-    match post_json(&url, bearer, &ReleaseBody { used }, timeout).await {
+    match post_json(client, &url, bearer, &ReleaseBody { used }, timeout).await {
         Ok((status, text)) if (200..300).contains(&status) => {
+            note_route_answered();
             if let Ok(resp) = serde_json::from_str::<ReportResponse>(&text) {
                 if let Some(budget) = resp.budget {
                     note_budget(budget);
@@ -767,23 +843,17 @@ impl PostError {
     }
 }
 
-/// The ONE coord write this module makes: POST `body` to `url` with the device
-/// JWT `bearer`, and return the status and body text.
-///
-/// A per-call client, like `coord_drain_state::read_me_drain`'s: the reporter
-/// runs on the fleet-heartbeat thread's dedicated current-thread runtime and a
-/// pooled connection must not outlive the runtime that opened it. The cost is a
-/// connection per request, at a cadence of seconds, not milliseconds.
+/// The ONE coord write this module makes: POST `body` to `url` on `client`
+/// with the device JWT `bearer` and a per-request `timeout`, and return the
+/// status and body text. The client is the caller's choice — the shared pooled
+/// one on the main runtime, a per-report one on the heartbeat runtime.
 async fn post_json<B: Serialize + ?Sized>(
+    client: &reqwest::Client,
     url: &str,
     bearer: &str,
     body: &B,
     timeout: Duration,
 ) -> Result<(u16, String), PostError> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| PostError::Transport(format!("reqwest builder: {e}")))?;
     // coord-auth-exempt(device-jwt-required): fails CLOSED — `resolve_target`
     // returns `UnknownReason::NoDeviceJwt` before any request when no device JWT
     // is held, and `bearer` is that JWT. The fail-soft helper would send the
@@ -792,6 +862,7 @@ async fn post_json<B: Serialize + ?Sized>(
     // the local cause the UNKNOWN arm exists to name.
     let resp = client
         .post(url)
+        .timeout(timeout)
         .bearer_auth(bearer)
         .json(body)
         .send()
@@ -851,6 +922,12 @@ impl TokenBucket {
             tokens: f64::from(burst),
             last: now,
         }
+    }
+
+    /// How long one token takes to refill — the earliest a deferred spawn could
+    /// be admitted again — or `None` for a bucket that never refills.
+    pub fn refill_period(&self) -> Option<Duration> {
+        (self.refill_per_sec > 0.0).then(|| Duration::from_secs_f64(1.0 / self.refill_per_sec))
     }
 
     fn refill(&mut self, now: Instant) {
@@ -924,6 +1001,10 @@ enum PermitSource {
     /// spent at take and never returned — the bucket meters a RATE, and a
     /// spawn that then failed still happened as far as the rate is concerned.
     LocalBucket,
+    /// Coord answered 404 and no admission route has ever answered 2xx in this
+    /// process: coord predates admission, so the spawn passes through on the
+    /// pre-plan backstops (the 64 cap and the thread-pressure defer).
+    RouteAbsent,
     /// No admission applies to this spawn (see [`AdmissionPermit::not_required`]).
     NotRequired,
 }
@@ -952,6 +1033,14 @@ impl AdmissionPermit {
         Self {
             source: PermitSource::NotRequired,
         }
+    }
+
+    /// `true` when this spawn passed through because coord does not serve the
+    /// admission route at all (see [`PermitSource::RouteAbsent`]) — counted
+    /// separately by the dispatcher so a fleet still on a pre-admission coord
+    /// is visible in the poll report.
+    pub fn passed_through_absent_route(&self) -> bool {
+        self.source == PermitSource::RouteAbsent
     }
 
     /// The session now exists and counts for itself: convert the permit.
@@ -1000,27 +1089,63 @@ impl Drop for AdmissionPermit {
 pub enum ContinuationAdmission {
     /// Spawn, holding this permit until the session exists.
     Admitted(AdmissionPermit),
-    /// Do not spawn now; leave the row pending. `stamp` is the
-    /// `continuation-deferred` reason (`spawn_admission:<detail>`, the
-    /// `<class>:<detail>` shape coord groups pending rows by), `detail` the
-    /// operator-readable sentence for the log.
-    Deferred { stamp: String, detail: String },
+    /// Do not spawn now; leave the row pending.
+    ///
+    /// * `key` — `refused:<coord's reason>` or `local_bucket_empty`, for logs.
+    /// * `detail` — the operator-readable sentence.
+    /// * `retry_after` — the earliest a re-poll could be admitted: the larger of
+    ///   coord's `retry_after_secs` and one refill period (coord's refill when
+    ///   coord refused, the local bucket's when it paid). `None` when nothing
+    ///   will refill — the periodic backstop poll is the only retry then.
+    ///
+    /// There is deliberately NO coord `continuation-deferred` stamp for this
+    /// verdict: that stamp is rate-limited to one per gate per hour, and an
+    /// admission deferral clears within seconds to a minute, so stamping it
+    /// would mask the next real reason (`thread_pressure:`, `at_cap:`) for an
+    /// hour — the same reason the boot-time presentation deferral posts none.
+    /// Coord sees admission deferrals through its own ledger and the poll
+    /// report's `spawn_admission_deferred` count instead.
+    Deferred {
+        key: String,
+        detail: String,
+        retry_after: Option<Duration>,
+    },
 }
 
-/// The stamp class every admission deferral carries.
-pub const DEFERRAL_STAMP_CLASS: &str = "spawn_admission";
+/// What [`decide`] needs besides coord's answer and the bucket.
+#[derive(Debug, Clone, Copy)]
+pub struct DecideContext {
+    /// [`route_has_answered`] at decision time.
+    pub route_answered_before: bool,
+    /// Coord's last-known refill rate (from the cached budget), used to time
+    /// the re-poll after a coord refusal.
+    pub coord_refill_per_min: Option<u32>,
+}
+
+/// The later of coord's hint and one refill period.
+fn retry_after_of(hint_secs: Option<u64>, refill_period: Option<Duration>) -> Option<Duration> {
+    match (hint_secs.map(Duration::from_secs), refill_period) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
 
 /// PURE over its inputs: turn coord's answer into a verdict, drawing on the
-/// local `bucket` only when coord could not answer.
+/// local `bucket` only when coord has admission but could not answer.
 ///
 /// * `Granted { n ≥ 1 }` → admitted on the coord lease.
-/// * `Granted { n = 0 }` → coord is reachable and refused: deferred, stamped
-///   `spawn_admission:refused:<coord's reason>`. The local bucket is NOT
-///   consulted — coord's "no" is an answer, and only its silence falls back.
-/// * `Unknown` → one local token: admitted, or deferred
-///   `spawn_admission:local_bucket_empty` when the bucket is dry.
+/// * `Granted { n = 0 }` → coord is reachable and refused: deferred
+///   `refused:<coord's reason>`. A lease coord attached to the refusal anyway is
+///   released at once with `used = 0`. The local bucket is NOT consulted —
+///   coord's "no" is an answer, and only its silence falls back.
+/// * `Unknown` from a 404 while no admission route has ever answered 2xx →
+///   admitted without admission ([`PermitSource::RouteAbsent`]): coord predates
+///   the routes.
+/// * any other `Unknown` (a 404 after a 2xx included) → one local token:
+///   admitted, or deferred `local_bucket_empty` when the bucket is dry.
 pub fn decide(
     admission: Admission,
+    ctx: DecideContext,
     bucket: &mut TokenBucket,
     now: Instant,
 ) -> ContinuationAdmission {
@@ -1031,18 +1156,35 @@ pub fn decide(
             })
         }
         Admission::Granted {
+            lease_id,
             reason,
             retry_after_secs,
             ..
         } => {
+            // A zero grant should carry no lease; if one does, hand it straight
+            // back rather than let it sit out the TTL. Dropping the permit is
+            // the release (used = 0).
+            drop(AdmissionPermit {
+                source: PermitSource::Coord { lease: lease_id },
+            });
             let key = reason.unwrap_or_else(|| "no_reason".to_string());
             let retry = retry_after_secs
                 .map(|s| format!("; coord suggests retrying in {s}s"))
                 .unwrap_or_default();
+            let coord_period = ctx
+                .coord_refill_per_min
+                .filter(|r| *r > 0)
+                .map(|r| Duration::from_secs_f64(60.0 / f64::from(r)));
             ContinuationAdmission::Deferred {
-                stamp: format!("{DEFERRAL_STAMP_CLASS}:refused:{key}"),
+                key: format!("refused:{key}"),
                 detail: format!("coord refused the spawn permit ({key}){retry}"),
+                retry_after: retry_after_of(retry_after_secs, coord_period),
             }
+        }
+        Admission::Unknown { reason } if reason.is_route_absent() && !ctx.route_answered_before => {
+            ContinuationAdmission::Admitted(AdmissionPermit {
+                source: PermitSource::RouteAbsent,
+            })
         }
         Admission::Unknown { reason } => {
             if bucket.try_take(1, now) {
@@ -1051,27 +1193,37 @@ pub fn decide(
                 })
             } else {
                 ContinuationAdmission::Deferred {
-                    stamp: format!("{DEFERRAL_STAMP_CLASS}:local_bucket_empty"),
+                    key: "local_bucket_empty".to_string(),
                     detail: format!(
                         "coord admission unknown ({}) and the local spawn bucket is empty",
                         reason.describe()
                     ),
+                    retry_after: bucket.refill_period(),
                 }
             }
         }
     }
 }
 
+/// When the route-absent pass-through was last logged at info. One line per
+/// [`ROUTE_ABSENT_COOLDOWN`] — every continuation passes through while coord
+/// predates admission, and a line per row would bury the log.
+fn route_absent_logged() -> &'static Mutex<Option<Instant>> {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
 /// Admit one continuation spawn of `origin` for `work_key` (a `gate:<id>` /
-/// `dispatch:<id>` key). Called by the continuation dispatcher BEFORE it spawns
-/// the run task, so a backlog drains at the admitted rate instead of all at
-/// once — the in-flight race the 64-session cap's doc says that cap cannot
-/// close (every row reads the pre-burst registry).
+/// `dispatch:<id>` key). Called by the continuation dispatcher AFTER the cheap
+/// local guards and BEFORE it spawns the run task, so a backlog drains at the
+/// admitted rate instead of all at once — the in-flight race the 64-session
+/// cap's doc says that cap cannot close (every row reads the pre-burst
+/// registry).
 pub async fn admit_continuation(origin: SpawnOrigin, work_key: &str) -> ContinuationAdmission {
     let admission = acquire(origin, SpawnClass::Continuation, 1, &[work_key.to_string()]).await;
     match &admission {
         Admission::Unknown { reason } => debug!(
-            "admission: {work_key}: coord admission unknown ({}) — using the local bucket",
+            "admission: {work_key}: coord admission unknown ({})",
             reason.describe()
         ),
         // Shadow mode: coord granted regardless and recorded the verdict it
@@ -1082,20 +1234,40 @@ pub async fn admit_continuation(origin: SpawnOrigin, work_key: &str) -> Continua
         }
         Admission::Granted { .. } => {}
     }
-    let verdict = decide(admission, &mut lock(local_bucket()), Instant::now());
-    if let ContinuationAdmission::Deferred { detail, .. } = &verdict {
-        let budget = cached_budget()
-            .map(|(b, age)| {
-                format!(
-                    " (coord's last budget, {}s old: {} available, burst {}, refill {}/min)",
-                    age.as_secs(),
-                    b.permits_available,
-                    b.burst,
-                    b.refill_per_min
-                )
-            })
-            .unwrap_or_default();
-        info!("admission: {work_key} deferred — {detail}{budget}");
+    let ctx = DecideContext {
+        route_answered_before: route_has_answered(),
+        coord_refill_per_min: cached_budget().map(|(b, _)| b.refill_per_min),
+    };
+    let verdict = decide(admission, ctx, &mut lock(local_bucket()), Instant::now());
+    match &verdict {
+        ContinuationAdmission::Admitted(p) if p.passed_through_absent_route() => {
+            let mut last = lock(route_absent_logged());
+            if last.is_none_or(|t| t.elapsed() >= ROUTE_ABSENT_COOLDOWN) {
+                *last = Some(Instant::now());
+                info!(
+                    "admission: coord does not serve the spawn-admission route (404) and never \
+                     has in this process — it predates admission, so continuations pass through \
+                     on the local backstops (64-session cap, thread-pressure defer); logged once \
+                     per {}s",
+                    ROUTE_ABSENT_COOLDOWN.as_secs()
+                );
+            }
+        }
+        ContinuationAdmission::Deferred { detail, .. } => {
+            let budget = cached_budget()
+                .map(|(b, age)| {
+                    format!(
+                        " (coord's last budget, {}s old: {} available, burst {}, refill {}/min)",
+                        age.as_secs(),
+                        b.permits_available,
+                        b.burst,
+                        b.refill_per_min
+                    )
+                })
+                .unwrap_or_default();
+            info!("admission: {work_key} deferred — {detail}{budget}");
+        }
+        ContinuationAdmission::Admitted(_) => {}
     }
     verdict
 }
@@ -1112,6 +1284,13 @@ mod tests {
     /// The coord door [`resolve_target`] answers under `cfg(test)`: `None`
     /// (the not-enrolled arm) unless a test points it at a local fake coord.
     pub(super) static TEST_TARGET: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+    /// A context where coord has served the admission routes before (so a 404
+    /// would take the bucket) and no budget is cached.
+    const SEEN: DecideContext = DecideContext {
+        route_answered_before: true,
+        coord_refill_per_min: None,
+    };
 
     // --- class mapping -----------------------------------------------------
 
@@ -1336,6 +1515,7 @@ mod tests {
                     Admission::Unknown {
                         reason: reason.clone()
                     },
+                    SEEN,
                     &mut bucket,
                     Instant::now()
                 ),
@@ -1398,6 +1578,8 @@ mod tests {
     enum Script {
         Grant,
         Refuse,
+        /// A zero grant that (wrongly) carries a lease anyway.
+        RefuseWithLease(uuid::Uuid),
         Status(u16),
         Hang,
     }
@@ -1457,6 +1639,12 @@ mod tests {
                     "budget": budget, "shadow": false
                 }))
                 .into_response(),
+                Script::RefuseWithLease(lease) => Json(serde_json::json!({
+                    "granted": 0, "lease_id": lease, "lease_expires_at": null,
+                    "retry_after_secs": null, "reason": "bucket_empty",
+                    "budget": budget, "shadow": false
+                }))
+                .into_response(),
                 Script::Status(s) => StatusCode::from_u16(s)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
                     .into_response(),
@@ -1506,8 +1694,10 @@ mod tests {
         ])
         .await;
         let keys = vec!["gate:abc".to_string()];
+        let client = reqwest::Client::new();
         let go = || {
             acquire_at(
+                &client,
                 &coord.base,
                 "tok",
                 SpawnOrigin::GateContinuation,
@@ -1559,6 +1749,7 @@ mod tests {
         let coord = fake_coord(vec![Script::Hang]).await;
         let started = Instant::now();
         let a = acquire_at(
+            &reqwest::Client::new(),
             &coord.base,
             "tok",
             SpawnOrigin::UnitContinuation,
@@ -1584,7 +1775,15 @@ mod tests {
     async fn release_posts_used_to_the_lease_route() {
         let coord = fake_coord(vec![]).await;
         let lease = uuid::Uuid::now_v7();
-        release_at(&coord.base, "tok", lease, 1, RELEASE_TIMEOUT).await;
+        release_at(
+            &reqwest::Client::new(),
+            &coord.base,
+            "tok",
+            lease,
+            1,
+            RELEASE_TIMEOUT,
+        )
+        .await;
         let got = lock(&coord.releases).clone();
         assert_eq!(
             got,
@@ -1668,7 +1867,7 @@ mod tests {
     }
 
     /// A 10-row backlog against a coord that grants 3 then refuses: exactly 3
-    /// rows take a permit, 7 defer with a `spawn_admission:refused:` stamp, and
+    /// rows take a permit, 7 defer keyed `refused:bucket_empty`, and
     /// the local bucket is never touched — coord's "no" is an answer.
     #[test]
     fn a_backlog_takes_coord_permits_and_defers_when_coord_refuses() {
@@ -1677,9 +1876,9 @@ mod tests {
         let answers = (0..10).map(|i| if i < 3 { grant() } else { refusal() });
         let (mut admitted, mut stamps) = (Vec::new(), Vec::new());
         for a in answers {
-            match decide(a, &mut bucket, t0) {
+            match decide(a, SEEN, &mut bucket, t0) {
                 ContinuationAdmission::Admitted(p) => admitted.push(p),
-                ContinuationAdmission::Deferred { stamp, .. } => stamps.push(stamp),
+                ContinuationAdmission::Deferred { key, .. } => stamps.push(key),
             }
         }
         assert_eq!(admitted.len(), 3);
@@ -1688,9 +1887,7 @@ mod tests {
             "each holds its coord lease"
         );
         assert_eq!(stamps.len(), 7);
-        assert!(stamps
-            .iter()
-            .all(|s| s == "spawn_admission:refused:bucket_empty"));
+        assert!(stamps.iter().all(|s| s == "refused:bucket_empty"));
         assert_eq!(
             bucket.available(t0),
             4,
@@ -1710,7 +1907,7 @@ mod tests {
             reason: UnknownReason::Timeout,
         };
         let verdicts: Vec<_> = (0..10)
-            .map(|_| decide(unknown(), &mut bucket, t0))
+            .map(|_| decide(unknown(), SEEN, &mut bucket, t0))
             .collect();
         let admitted = verdicts
             .iter()
@@ -1719,16 +1916,17 @@ mod tests {
         assert_eq!(admitted, 4, "the burst, and no more, in one poll");
         assert!(verdicts.iter().skip(4).all(|v| matches!(
             v,
-            ContinuationAdmission::Deferred { stamp, .. } if stamp == "spawn_admission:local_bucket_empty"
+            ContinuationAdmission::Deferred { key, retry_after, .. }
+                if key == "local_bucket_empty" && *retry_after == Some(Duration::from_secs(15))
         )));
         // The next poll 15 s later re-lists the deferred rows: one more runs.
         let later = t0 + Duration::from_secs(15);
         assert!(matches!(
-            decide(unknown(), &mut bucket, later),
+            decide(unknown(), SEEN, &mut bucket, later),
             ContinuationAdmission::Admitted(_)
         ));
         assert!(matches!(
-            decide(unknown(), &mut bucket, later),
+            decide(unknown(), SEEN, &mut bucket, later),
             ContinuationAdmission::Deferred { .. }
         ));
     }
@@ -1743,12 +1941,19 @@ mod tests {
     /// cannot race another test over them.
     #[tokio::test]
     async fn the_dispatch_seam_takes_permits_defers_on_refusal_and_settles_leases() {
-        let coord = fake_coord(vec![Script::Grant, Script::Grant, Script::Refuse]).await;
+        let stray = uuid::Uuid::now_v7();
+        let coord = fake_coord(vec![
+            Script::Grant,
+            Script::Grant,
+            Script::Refuse,
+            Script::RefuseWithLease(stray),
+        ])
+        .await;
         *lock(&TEST_TARGET) = Some((coord.base.clone(), "tok".to_string()));
         *lock(door_health()) = DoorHealth::default();
 
         let mut verdicts = Vec::new();
-        for i in 0..3 {
+        for i in 0..4 {
             verdicts.push(
                 admit_continuation(SpawnOrigin::GateContinuation, &format!("gate:{i}")).await,
             );
@@ -1763,8 +1968,12 @@ mod tests {
         };
         assert!(matches!(
             it.next(),
-            Some(ContinuationAdmission::Deferred { ref stamp, .. })
-                if stamp == "spawn_admission:refused:bucket_empty"
+            Some(ContinuationAdmission::Deferred { ref key, retry_after, .. })
+                if key == "refused:bucket_empty" && retry_after == Some(Duration::from_secs(10))
+        ));
+        assert!(matches!(
+            it.next(),
+            Some(ContinuationAdmission::Deferred { .. })
         ));
         let (l1, l2) = (
             first.lease().expect("lease"),
@@ -1775,22 +1984,120 @@ mod tests {
 
         // The releases are spawned onto this runtime; give them a bounded wait.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while lock(&coord.releases).len() < 2 && Instant::now() < deadline {
+        while lock(&coord.releases).len() < 3 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         *lock(&TEST_TARGET) = None;
         let mut got = lock(&coord.releases).clone();
-        got.sort_by_key(|(l, _)| if *l == l1.to_string() { 0 } else { 1 });
+        let rank = |l: &str| {
+            if l == l1.to_string() {
+                0
+            } else if l == l2.to_string() {
+                1
+            } else {
+                2
+            }
+        };
+        got.sort_by_key(|(l, _)| rank(l));
         assert_eq!(
             got,
             vec![
                 (l1.to_string(), serde_json::json!({"used": 1})),
                 (l2.to_string(), serde_json::json!({"used": 0})),
-            ]
+                (stray.to_string(), serde_json::json!({"used": 0})),
+            ],
+            "converted -> used 1, dropped -> used 0, a lease on a zero grant -> used 0"
         );
         let sent = lock(&coord.acquires).clone();
-        assert_eq!(sent.len(), 3, "one acquire per row, BEFORE any spawn");
+        assert_eq!(sent.len(), 4, "one acquire per row, BEFORE any spawn");
         assert_eq!(sent[2]["work_keys"], serde_json::json!(["gate:2"]));
+    }
+
+    /// A 404 before any admission route has answered 2xx: coord predates
+    /// admission, so the spawn passes through and the local bucket is untouched.
+    /// The same 404 after a 2xx is a regression and takes the bucket.
+    #[test]
+    fn a_404_passes_through_only_until_the_route_has_answered() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::new(1, 0, t0);
+        let fresh = DecideContext {
+            route_answered_before: false,
+            coord_refill_per_min: None,
+        };
+        for reason in [
+            UnknownReason::RouteAbsent,
+            UnknownReason::CoolingDown(Box::new(UnknownReason::RouteAbsent)),
+        ] {
+            match decide(Admission::Unknown { reason }, fresh, &mut bucket, t0) {
+                ContinuationAdmission::Admitted(p) => assert!(p.passed_through_absent_route()),
+                other => panic!("a pre-admission coord passes through, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            bucket.available(t0),
+            1,
+            "pass-through spends no local token"
+        );
+
+        // Other UNKNOWN causes never pass through, even before any 2xx.
+        let five_hundred = decide(
+            Admission::Unknown {
+                reason: UnknownReason::ServerError(503),
+            },
+            fresh,
+            &mut bucket,
+            t0,
+        );
+        assert!(matches!(
+            five_hundred,
+            ContinuationAdmission::Admitted(ref p) if !p.passed_through_absent_route()
+        ));
+        assert_eq!(bucket.available(t0), 0, "a 5xx drew on the bucket");
+
+        // After a 2xx, a 404 is a regression: bucket (now empty) -> deferred.
+        assert!(matches!(
+            decide(
+                Admission::Unknown {
+                    reason: UnknownReason::RouteAbsent
+                },
+                SEEN,
+                &mut bucket,
+                t0
+            ),
+            ContinuationAdmission::Deferred { ref key, .. } if key == "local_bucket_empty"
+        ));
+    }
+
+    #[test]
+    fn the_retry_after_is_the_later_of_coords_hint_and_one_refill_period() {
+        let s = Duration::from_secs;
+        assert_eq!(retry_after_of(Some(30), Some(s(10))), Some(s(30)));
+        assert_eq!(retry_after_of(Some(2), Some(s(10))), Some(s(10)));
+        assert_eq!(retry_after_of(None, Some(s(15))), Some(s(15)));
+        assert_eq!(retry_after_of(Some(7), None), Some(s(7)));
+        assert_eq!(retry_after_of(None, None), None);
+        assert_eq!(
+            TokenBucket::new(4, 4, Instant::now()).refill_period(),
+            Some(s(15))
+        );
+        assert_eq!(TokenBucket::new(4, 0, Instant::now()).refill_period(), None);
+        // A coord refusal is timed off coord's refill when no hint is given.
+        let mut bucket = TokenBucket::new(4, 4, Instant::now());
+        let ctx = DecideContext {
+            route_answered_before: true,
+            coord_refill_per_min: Some(6),
+        };
+        let refusal = Admission::Granted {
+            n: 0,
+            lease_id: None,
+            reason: None,
+            retry_after_secs: None,
+            shadow: false,
+        };
+        assert!(matches!(
+            decide(refusal, ctx, &mut bucket, Instant::now()),
+            ContinuationAdmission::Deferred { retry_after: Some(d), .. } if d == s(10)
+        ));
     }
 
     #[test]
