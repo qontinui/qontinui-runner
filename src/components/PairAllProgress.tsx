@@ -10,6 +10,8 @@
  * After: one result row per workspace, named from the view.
  */
 
+import { useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useUIElement } from "@qontinui/ui-bridge";
 
 import {
@@ -30,10 +32,63 @@ const linkStyle = {
   cursor: "pointer",
 } as const;
 
+function ConnectLink({
+  idPrefix,
+  url,
+  launched,
+}: {
+  idPrefix: string;
+  url: string;
+  launched: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const { ref: openRef } = useUIElement({
+    id: `${idPrefix}-connect-link`,
+    label: "Open the workspace sign-in link",
+    type: "button",
+  });
+  const { ref: copyRef } = useUIElement({
+    id: `${idPrefix}-copy-link`,
+    label: "Copy the workspace sign-in link",
+    type: "button",
+  });
+  return (
+    <div style={{ opacity: launched ? 0.7 : 1 }}>
+      {launched ? "Browser didn\u2019t open? " : "The browser could not be opened. "}
+      <button
+        ref={openRef}
+        type="button"
+        onClick={() => void openUrl(url).catch(() => undefined)}
+        style={linkStyle}
+      >
+        Open the sign-in link
+      </button>{" "}
+      ·{" "}
+      <button
+        ref={copyRef}
+        type="button"
+        onClick={() =>
+          navigator.clipboard
+            .writeText(url)
+            .then(() => setCopied(true))
+            .catch(() => setCopied(false))
+        }
+        style={linkStyle}
+      >
+        {copied ? "Copied" : "Copy link"}
+      </button>
+      {!launched ? (
+        <div style={{ wordBreak: "break-all", userSelect: "all", opacity: 0.8 }}>{url}</div>
+      ) : null}
+    </div>
+  );
+}
+
 export function PairAllProgress({
   idPrefix,
   phase,
   connectLink,
+  cancellable,
   results,
   view,
   onCancel,
@@ -42,6 +97,8 @@ export function PairAllProgress({
   idPrefix: string;
   phase: PairAllPhase;
   connectLink: { url: string; launched: boolean } | null;
+  /** False once the browser has called back: the flow can no longer be cancelled. */
+  cancellable: boolean;
   results: TenantPairResult[] | null;
   view: BindingGapView | null;
   onCancel: () => void;
@@ -51,36 +108,28 @@ export function PairAllProgress({
     label: "Cancel workspace sign-in",
     type: "button",
   });
-  const { ref: linkRef } = useUIElement({
-    id: `${idPrefix}-connect-link`,
-    label: "Open the workspace sign-in link",
-    type: "generic",
-  });
 
   return (
     <>
       {phase === "waiting" ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.75rem" }}>
-          {connectLink && !connectLink.launched ? (
+          {connectLink ? (
+            <ConnectLink
+              idPrefix={idPrefix}
+              url={connectLink.url}
+              launched={connectLink.launched}
+            />
+          ) : null}
+          {!cancellable ? (
+            <div style={{ opacity: 0.7 }}>Saving your workspace credentials…</div>
+          ) : null}
+          {cancellable ? (
             <div>
-              The browser could not be opened. Open this link to sign in:{" "}
-              <a ref={linkRef} href={connectLink.url} target="_blank" rel="noreferrer">
-                {connectLink.url}
-              </a>
-            </div>
-          ) : connectLink ? (
-            <div style={{ opacity: 0.7 }}>
-              Browser didn&rsquo;t open?{" "}
-              <a ref={linkRef} href={connectLink.url} target="_blank" rel="noreferrer">
-                Open the sign-in link
-              </a>
+              <button ref={cancelRef} type="button" onClick={onCancel} style={linkStyle}>
+                Cancel
+              </button>
             </div>
           ) : null}
-          <div>
-            <button ref={cancelRef} type="button" onClick={onCancel} style={linkStyle}>
-              Cancel
-            </button>
-          </div>
         </div>
       ) : null}
       {results && results.length > 0 ? (

@@ -55,7 +55,8 @@ function WorkspaceRow({ row }: { row: BindingGapRow }) {
 
 export function WorkspacesCredentialSection() {
   const { view, refresh } = useBindingGapView();
-  const { phase, results, error, connectLink, connect, cancel } = usePairAllTenants(refresh);
+  const { phase, results, error, connectLink, cancellable, connect, cancel } =
+    usePairAllTenants(refresh);
   const { ref: sectionRef } = useUIElement({
     id: "settings-workspaces",
     label: "Workspaces credential state",
@@ -122,6 +123,7 @@ export function WorkspacesCredentialSection() {
         idPrefix="settings-workspaces"
         phase={phase}
         connectLink={connectLink}
+        cancellable={cancellable}
         results={results}
         view={view}
         onCancel={() => void cancel()}

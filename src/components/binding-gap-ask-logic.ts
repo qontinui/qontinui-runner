@@ -255,6 +255,7 @@ export const CANCEL_PAIR_ALL_TENANTS_CMD = "cancel_pair_all_tenants";
 export type PairAllProgress =
   | { phase: "waiting" }
   | { phase: "browser"; connectUrl: string; launched: boolean }
+  | { phase: "collecting" }
   | { phase: "done"; results: TenantPairResult[] }
   | { phase: "error"; error: string }
   | { phase: "cancelled" };
@@ -272,6 +273,8 @@ export function normalizePairAllProgress(raw: unknown): PairAllProgress | null {
         ? null
         : { phase: "browser", connectUrl, launched: o.launched === true };
     }
+    case "collecting":
+      return { phase: "collecting" };
     case "done":
       return { phase: "done", results: normalizePairAllResults(o) ?? [] };
     case "error":
@@ -281,4 +284,35 @@ export function normalizePairAllProgress(raw: unknown): PairAllProgress | null {
     default:
       return null;
   }
+}
+
+/** Tauri command: where the in-flight flow is (pull half of the event). */
+export const GET_PAIR_ALL_STATUS_CMD = "get_pair_all_status";
+
+export interface PairAllStatus {
+  inFlight: boolean;
+  /** `waiting` and `browser` are cancellable; `collecting` is not. */
+  phase: "idle" | "waiting" | "browser" | "collecting";
+  connectUrl: string | null;
+  launched: boolean;
+}
+
+/** Coerce `get_pair_all_status`; `null` when it is not that shape. */
+export function normalizePairAllStatus(raw: unknown): PairAllStatus | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.in_flight !== "boolean") return null;
+  const phase =
+    o.phase === "waiting" || o.phase === "browser" || o.phase === "collecting" ? o.phase : "idle";
+  return {
+    inFlight: o.in_flight,
+    phase: o.in_flight ? phase : "idle",
+    connectUrl: str(o.connect_url),
+    launched: o.launched === true,
+  };
+}
+
+/** True when the runner refused a second flow because one is already running. */
+export function isAlreadyInProgress(error: string): boolean {
+  return error.includes("already in progress");
 }

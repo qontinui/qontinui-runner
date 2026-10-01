@@ -105,7 +105,8 @@ function GapRow({
 export function BindingGapAskBanner() {
   const { tier } = useRunnerTier();
   const { view, refresh } = useBindingGapView();
-  const { phase, results, error, connectLink, connect, cancel, reset } = usePairAllTenants(refresh);
+  const { phase, results, error, connectLink, cancellable, connect, cancel, reset } =
+    usePairAllTenants(refresh);
   const [asks, setAsks] = useState<BindingGapAsk[] | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
   const [showTerminal, setShowTerminal] = useState(false);
@@ -283,6 +284,7 @@ export function BindingGapAskBanner() {
           idPrefix="binding-gap"
           phase={phase}
           connectLink={connectLink}
+          cancellable={cancellable}
           results={results}
           view={view}
           onCancel={() => void cancel()}

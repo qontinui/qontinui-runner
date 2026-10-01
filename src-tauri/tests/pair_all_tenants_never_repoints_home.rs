@@ -49,6 +49,7 @@ const FLOW: &[(&str, &str)] = &[
     ("commands/web_integration.rs", "run_pair_all_tenants"),
     ("commands/web_integration.rs", "select_pair_tenants"),
     ("commands/web_integration.rs", "cancel_pair_all_tenants"),
+    ("commands/web_integration.rs", "get_pair_all_status"),
     ("commands/web_integration.rs", "finish_explicit_pairing"),
     ("pair.rs", "pair_via_browser_multi"),
     ("pair.rs", "connect_all_start_inputs"),

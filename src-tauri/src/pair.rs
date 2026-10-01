@@ -2046,6 +2046,9 @@ pub struct BrowserPairHooks<'a> {
     /// Checked by the wait loop every 200 ms; once set the flow ends with
     /// `Err("cancelled")` and the loopback server shuts down.
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Called once when the browser callback was captured — the point after
+    /// which `cancel` is no longer consulted.
+    pub on_callback: Option<&'a (dyn Fn() + Sync)>,
 }
 
 /// What one completed browser round-trip produced.
@@ -2246,6 +2249,7 @@ fn browser_pair_round_trip(
     // background thread; we just block here until we see the slot fill, the
     // caller cancels, or the server-done signal arrives.
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let mut server_finished = false;
     let outcome = loop {
         if let Some(c) = received.lock().expect("mutex").clone() {
             break Ok(c);
@@ -2263,6 +2267,7 @@ fn browser_pair_round_trip(
         std::thread::sleep(Duration::from_millis(200));
         // Drain the server-done channel in case axum exited early.
         if let Ok(()) = server_done_rx.try_recv() {
+            server_finished = true;
             // Server stopped without filling the slot — re-check once.
             if let Some(c) = received.lock().expect("mutex").clone() {
                 break Ok(c);
@@ -2271,13 +2276,23 @@ fn browser_pair_round_trip(
         }
     };
     // Stop the loopback server on EVERY exit (capture, cancel, timeout) and
-    // wait for it to release the port; a graceful shutdown with no open
-    // connection returns at once.
+    // wait — BOUNDED — for it to release the port. A graceful shutdown with no
+    // open connection returns at once; a browser holding a keep-alive
+    // connection open must not hold the flow, so after 5 s the thread is
+    // detached (it ends on its own 5-minute backstop).
     signal_shutdown(&shutdown);
-    if let Ok(Err(e)) = server_handle.join() {
-        tracing::debug!("pair: loopback callback server ended with: {e}");
+    if server_finished || server_done_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+        if let Ok(Err(e)) = server_handle.join() {
+            tracing::debug!("pair: loopback callback server ended with: {e}");
+        }
+    } else {
+        tracing::debug!("pair: loopback callback server still draining after 5 s — detached");
+        drop(server_handle);
     }
     let capture = outcome?;
+    if let Some(on_callback) = hooks.on_callback {
+        on_callback();
+    }
 
     Ok(BrowserRoundTrip {
         device_id,
@@ -7351,78 +7366,115 @@ mod pair_multi_collect_tests {
     }
 
     /// Phase 3 gate (D4): every slot write of a pair-all runs under the
-    /// cross-process store lock, so a refresher-style write for ANOTHER tenant,
-    /// racing it from another thread through its OWN `SecureStorage` handle on
-    /// the same `.enc`, survives a pair-all persistence of N tenants — and all N
-    /// survive it. Repeated to give the race many chances.
+    /// cross-process store lock, so a refresher-style write for ANOTHER tenant
+    /// survives a pair-all persistence of N tenants, and all N survive it.
+    ///
+    /// Deterministic, not a timing race: the "refresher" (its own thread and
+    /// its own `SecureStorage` handle on the same `.enc`) is PARKED inside its
+    /// read-modify-write right after its load
+    /// ([`crate::secure_storage::park_next_rmw_after_load`]). The pair-all then
+    /// runs. With the store lock it blocks behind the parked writer, which is
+    /// released after a bounded 3 s wait (inside the store lock's 10 s
+    /// budget), and every slot survives. With
+    /// `QONTINUI_TEST_DISABLE_STORE_LOCK=1` the pair-all completes while the
+    /// refresher still holds its stale load, the refresher's save then drops
+    /// the pair-all's slots, and this test FAILS — the mutation check that it
+    /// tests the lock.
     #[test]
     fn a_concurrent_refresher_write_for_another_tenant_survives_a_pair_all() {
+        use std::sync::mpsc;
+        use std::time::Duration;
         const T_D: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-        for round in 0..20 {
-            let dir = tempfile::tempdir().unwrap();
-            let enc = dir.path().join("tokens.enc");
-            let mgr = test_mgr(dir.path());
-            let path = dir.path().join("paired_user.json");
-            // Seed the store so both writers merge into a readable one.
-            mgr.store_tenant_device_jwt(&t(T_D), "jwt.d.0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let enc = dir.path().join("tokens.enc");
+        let mgr = test_mgr(dir.path());
+        // Seed tenant D as the established DEFAULT, so the pair-all below
+        // writes only per-tenant slots (a default write would also try the OS
+        // keychain, whose bounded ~3 s call on a headless box would make the
+        // interleaving depend on that timeout).
+        let seed = PairCompleteResponse {
+            token: "jwt.d.0".to_string(),
+            user_id: USER.to_string(),
+            device_id: None,
+            jti: None,
+            exp: None,
+            tenant_id: None,
+            device_machine_key: None,
+        };
+        persist_pairing_with(&mgr, &dir.path().join("paired_user.json"), &seed, t(T_D)).unwrap();
 
-            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let refresher = {
-                let enc = enc.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let other = crate::auth::AuthManager::with_storage(
-                        crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
-                    );
-                    barrier.wait();
-                    for i in 1..=5 {
-                        other
-                            .store_tenant_device_jwt(&t(T_D), &format!("jwt.d.{i}"))
-                            .unwrap();
-                    }
-                })
-            };
-            let resp = PairCollectResponse {
-                device_id: None,
-                results: vec![
-                    minted(T_A, "jwt.a"),
-                    minted(T_B, "jwt.b"),
-                    minted(T_C, "jwt.c"),
-                ],
-            };
-            barrier.wait();
-            let outcomes = persist_collected_pairings_with(
-                &mgr,
-                &path,
-                &resp,
-                &[t(T_A), t(T_B), t(T_C)],
-                DEVICE,
-                None,
-            );
-            refresher.join().unwrap();
-
-            assert!(
-                outcomes
-                    .iter()
-                    .all(|o| o.status == TenantPairStatus::Connected),
-                "round {round}: {outcomes:?}"
-            );
-            let reader = crate::auth::AuthManager::with_storage(
-                crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
-            );
-            for (tenant, tag) in [(T_A, "jwt.a"), (T_B, "jwt.b"), (T_C, "jwt.c")] {
-                assert_eq!(
-                    reader.get_tenant_device_jwt(&t(tenant)).unwrap(),
-                    Some(tok(tenant, tag)),
-                    "round {round}: pair-all slot {tenant} lost"
+        let (loaded_tx, loaded_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let refresher = {
+            let enc = enc.clone();
+            std::thread::spawn(move || {
+                let other = crate::auth::AuthManager::with_storage(
+                    crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
                 );
-            }
+                crate::secure_storage::park_next_rmw_after_load(move || {
+                    loaded_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                other.store_tenant_device_jwt(&t(T_D), "jwt.d.1").unwrap();
+            })
+        };
+        // The refresher has loaded (and, with locking on, holds the lock).
+        loaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let pair_all = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mgr = test_mgr(&dir);
+                let resp = PairCollectResponse {
+                    device_id: None,
+                    results: vec![
+                        minted(T_A, "jwt.a"),
+                        minted(T_B, "jwt.b"),
+                        minted(T_C, "jwt.c"),
+                    ],
+                };
+                let outcomes = persist_collected_pairings_with(
+                    &mgr,
+                    &dir.join("paired_user.json"),
+                    &resp,
+                    &[t(T_A), t(T_B), t(T_C)],
+                    DEVICE,
+                    None,
+                );
+                let _ = done_tx.send(());
+                outcomes
+            })
+        };
+        // Without the lock the pair-all finishes (in milliseconds) while the
+        // refresher is parked; with it, it is blocked behind the refresher, so
+        // this wait runs out and the refresher is released.
+        let _ = done_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        refresher.join().unwrap();
+        let outcomes = pair_all.join().unwrap();
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == TenantPairStatus::Connected),
+            "{outcomes:?}"
+        );
+        let reader = crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
+        );
+        for (tenant, tag) in [(T_A, "jwt.a"), (T_B, "jwt.b"), (T_C, "jwt.c")] {
             assert_eq!(
-                reader.get_tenant_device_jwt(&t(T_D)).unwrap().as_deref(),
-                Some("jwt.d.5"),
-                "round {round}: the concurrent refresher write was lost"
+                reader.get_tenant_device_jwt(&t(tenant)).unwrap(),
+                Some(tok(tenant, tag)),
+                "pair-all slot {tenant} lost to the concurrent refresher write"
             );
         }
+        assert_eq!(
+            reader.get_tenant_device_jwt(&t(T_D)).unwrap().as_deref(),
+            Some("jwt.d.1"),
+            "the concurrent refresher write was lost"
+        );
     }
 
     /// A token minted for another tenant is never written into this row's slot.

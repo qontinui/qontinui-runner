@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  isAlreadyInProgress,
+  normalizePairAllStatus,
   bannerGapEntries,
   displayNameFor,
   normalizePairAllProgress,
@@ -257,5 +259,37 @@ describe("normalizePairAllProgress", () => {
     expect(normalizePairAllProgress(null)).toBeNull();
     expect(normalizePairAllProgress({ phase: "browser" })).toBeNull();
     expect(normalizePairAllProgress({ phase: "nope" })).toBeNull();
+  });
+});
+
+describe("normalizePairAllStatus / isAlreadyInProgress", () => {
+  it("maps an in-flight status and idles a finished one", () => {
+    expect(
+      normalizePairAllStatus({
+        in_flight: true,
+        phase: "browser",
+        connect_url: "https://x/c",
+        launched: false,
+      }),
+    ).toEqual({ inFlight: true, phase: "browser", connectUrl: "https://x/c", launched: false });
+    expect(normalizePairAllStatus({ in_flight: false, phase: "browser" })?.phase).toBe("idle");
+    expect(normalizePairAllStatus({ in_flight: true, phase: "collecting" })?.phase).toBe(
+      "collecting",
+    );
+    expect(normalizePairAllStatus({})).toBeNull();
+    expect(normalizePairAllStatus(null)).toBeNull();
+  });
+
+  it("recognises the runner's one-flow-at-a-time refusal", () => {
+    expect(
+      isAlreadyInProgress(
+        "a workspace sign-in is already in progress — finish it in your browser first",
+      ),
+    ).toBe(true);
+    expect(isAlreadyInProgress("cancelled")).toBe(false);
+  });
+
+  it("maps the collecting phase of the progress event", () => {
+    expect(normalizePairAllProgress({ phase: "collecting" })).toEqual({ phase: "collecting" });
   });
 });

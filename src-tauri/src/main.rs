@@ -3634,6 +3634,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::web_integration::get_web_integration_status,
             commands::web_integration::pair_all_tenants,
             commands::web_integration::cancel_pair_all_tenants,
+            commands::web_integration::get_pair_all_status,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
             commands::web_integration::test_web_integration_connection,

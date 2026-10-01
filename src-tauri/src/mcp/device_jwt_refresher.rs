@@ -2309,7 +2309,9 @@ pub struct BindingGapView {
 /// * a tenant the report does not name as a gap but which this box holds no
 ///   credential for (coord bound it after the report was published) → unknown;
 /// * a tenant the report names as a gap that the current bound set no longer
-///   contains (coord unbound it since) → unknown.
+///   contains (coord unbound it since) → unknown;
+/// * a tenant this box holds a credential for that coord does not bind →
+///   unknown, never connected.
 pub(crate) fn binding_gap_view(
     report: &BindingGapReport,
     bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
@@ -2389,7 +2391,11 @@ pub(crate) fn binding_gap_view(
                     TenantCredentialState::NoCredential
                 } else if gaps.contains(t) {
                     TenantCredentialState::Unknown
-                } else if covered.contains(t) {
+                } else if covered.contains(t) && bound_now.contains(t) {
+                    // Connected = a credential here AND coord still binds it.
+                    // A slot for a tenant coord no longer binds is not a
+                    // working workspace; it renders unknown, and so is never
+                    // re-paired (that would re-create the binding).
                     TenantCredentialState::Connected
                 } else {
                     TenantCredentialState::Unknown
@@ -11367,6 +11373,26 @@ mod binding_gap_view_tests {
                 "{view:?}"
             );
         }
+    }
+
+    /// A slot (or default) for a tenant coord does not bind is not connected.
+    #[test]
+    fn a_covered_but_unbound_tenant_is_unknown_not_connected() {
+        let (bound, unbound_slot, unbound_default) = (tenant(1), tenant(6), tenant(7));
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![]),
+            &CoordBoundTenantsRead::Known(vec![bound]),
+            Some(&[bound, unbound_slot]),
+            crate::auth::BindingTenantRead::Bound(unbound_default),
+        );
+        assert_eq!(
+            states(&view),
+            vec![
+                (bound.to_string(), TenantCredentialState::Connected),
+                (unbound_slot.to_string(), TenantCredentialState::Unknown),
+                (unbound_default.to_string(), TenantCredentialState::Unknown),
+            ]
+        );
     }
 
     /// The wire shape the frontend parses.

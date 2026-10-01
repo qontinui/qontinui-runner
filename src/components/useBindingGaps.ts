@@ -12,6 +12,9 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   BINDING_GAP_NUDGE_EVENT,
+  GET_PAIR_ALL_STATUS_CMD,
+  isAlreadyInProgress,
+  normalizePairAllStatus,
   CANCEL_PAIR_ALL_TENANTS_CMD,
   normalizePairAllProgress,
   PAIR_ALL_PROGRESS_EVENT,
@@ -89,6 +92,8 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
   error: string | null;
   /** Set when the runner reported the URL to open; `launched` false → show it. */
   connectLink: { url: string; launched: boolean } | null;
+  /** False once the browser has called back (collecting) — Cancel is hidden. */
+  cancellable: boolean;
   connect: (tenantIds: string[]) => Promise<void>;
   cancel: () => Promise<void>;
   reset: () => void;
@@ -97,6 +102,26 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
   const [results, setResults] = useState<TenantPairResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connectLink, setConnectLink] = useState<{ url: string; launched: boolean } | null>(null);
+  const [cancellable, setCancellable] = useState(true);
+
+  /** Adopt the runner's view of the ONE flow (mount, or a refused 2nd start). */
+  const adoptStatus = useCallback(async () => {
+    try {
+      const st = normalizePairAllStatus(await invoke<unknown>(GET_PAIR_ALL_STATUS_CMD));
+      if (st === null || !st.inFlight) return;
+      setPhase("waiting");
+      setCancellable(st.phase !== "collecting");
+      setConnectLink(st.connectUrl ? { url: st.connectUrl, launched: st.launched } : null);
+    } catch {
+      /* an older runner without the command: nothing to adopt */
+    }
+  }, []);
+
+  // A surface mounted mid-flow shows the flow, not an idle button.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one pull on mount; state is set only after the awaited read, the same sync point TenantContext uses
+    void adoptStatus();
+  }, [adoptStatus]);
 
   useEffect(() => {
     const unlisten = listen<unknown>(PAIR_ALL_PROGRESS_EVENT, (ev) => {
@@ -108,9 +133,16 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
           setResults(null);
           setError(null);
           setConnectLink(null);
+          setCancellable(true);
           break;
         case "browser":
+          setPhase("waiting");
           setConnectLink({ url: p.connectUrl, launched: p.launched });
+          break;
+        case "collecting":
+          setPhase("waiting");
+          setConnectLink(null);
+          setCancellable(false);
           break;
         case "done":
           setResults(p.results);
@@ -143,6 +175,8 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
       setPhase("waiting");
       setResults(null);
       setError(null);
+      setCancellable(true);
+      let alreadyRunning = false;
       try {
         const raw = await invoke<unknown>(PAIR_ALL_TENANTS_CMD, {
           tenantIds: tenantIds.length > 0 ? tenantIds : null,
@@ -153,6 +187,9 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
         const msg = String(e);
         if (msg === "cancelled") {
           setPhase("idle");
+        } else if (isAlreadyInProgress(msg)) {
+          // Another surface started the flow: show it, not an error.
+          alreadyRunning = true;
         } else {
           setError(msg);
           setPhase("error");
@@ -161,8 +198,9 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
         setConnectLink(null);
         await refresh();
       }
+      if (alreadyRunning) await adoptStatus();
     },
-    [refresh],
+    [refresh, adoptStatus],
   );
 
   const cancel = useCallback(async () => {
@@ -180,5 +218,5 @@ export function usePairAllTenants(refresh: () => Promise<unknown>): {
     setConnectLink(null);
   }, []);
 
-  return { phase, results, error, connectLink, connect, cancel, reset };
+  return { phase, results, error, connectLink, cancellable, connect, cancel, reset };
 }

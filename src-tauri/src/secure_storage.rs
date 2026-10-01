@@ -142,6 +142,29 @@ pub(crate) fn lock_path_for(path: &std::path::Path) -> PathBuf {
     parent.join(name)
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARK_AFTER_LOAD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TEST-ONLY: run `f` once, on THE CALLING THREAD, inside its next
+/// [`SecureStorage::locked_rmw`] — after the load, before the save. Lets a
+/// concurrency test park one writer mid-RMW deterministically. Thread-local,
+/// so it never touches another test's writes. Compiled out of every non-test
+/// build.
+#[cfg(test)]
+pub(crate) fn park_next_rmw_after_load(f: impl FnOnce() + 'static) {
+    PARK_AFTER_LOAD.with(|p| *p.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+fn run_parked_after_load() {
+    if let Some(f) = PARK_AFTER_LOAD.with(|p| p.borrow_mut().take()) {
+        f();
+    }
+}
+
 /// `true` under `cfg(test)` when `QONTINUI_TEST_DISABLE_STORE_LOCK=1`: the
 /// mutation switch the concurrency tests are checked against (they must FAIL
 /// with locking disabled). Compiled out of every non-test build.
@@ -910,6 +933,8 @@ impl SecureStorage {
     ) -> Result<R> {
         let _guard = self.lock_store()?;
         let mut tokens = load(self)?;
+        #[cfg(test)]
+        run_parked_after_load();
         let out = modify(&mut tokens);
         self.save_tokens(&tokens)?;
         Ok(out)

@@ -1013,7 +1013,8 @@ pub struct PairAllTenantsResponse {
 /// surface (the banner and the Settings card) shows the same state, and so a
 /// failed browser launch can be answered with an "Open this link" fallback.
 /// Payload `{phase, …}`: `waiting {tenant_ids}`, `browser {connect_url,
-/// launched}`, `done {results}`, `error {error}`, `cancelled`.
+/// launched}`, `collecting` (callback received — no longer cancellable),
+/// `done {results}`, `error {error}`, `cancelled`.
 pub const PAIR_ALL_PROGRESS_EVENT: &str = "pair-all-tenants-progress";
 
 static PAIR_ALL_IN_FLIGHT: std::sync::atomic::AtomicBool =
@@ -1022,6 +1023,33 @@ static PAIR_ALL_IN_FLIGHT: std::sync::atomic::AtomicBool =
 /// Set by [`cancel_pair_all_tenants`]; read by the browser round-trip's wait
 /// loop. Cleared whenever a new flow starts.
 static PAIR_ALL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where the in-flight flow is, for [`get_pair_all_status`] (a surface
+/// mounted mid-flow) and [`cancel_pair_all_tenants`] (cancel only while the
+/// browser has not called back yet).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PairAllStatus {
+    pub in_flight: bool,
+    /// `idle` | `waiting` (before the browser opens) | `browser` (waiting for
+    /// the sign-in) | `collecting` (callback received; collecting + saving —
+    /// no longer cancellable).
+    pub phase: &'static str,
+    pub connect_url: Option<String>,
+    pub launched: bool,
+}
+
+static PAIR_ALL_STATUS: std::sync::Mutex<PairAllStatus> = std::sync::Mutex::new(PairAllStatus {
+    in_flight: false,
+    phase: "idle",
+    connect_url: None,
+    launched: false,
+});
+
+fn set_pair_all_status(update: impl FnOnce(&mut PairAllStatus)) {
+    if let Ok(mut st) = PAIR_ALL_STATUS.lock() {
+        update(&mut st);
+    }
+}
 
 /// RAII claim on the single in-flight [`pair_all_tenants`] flow.
 struct PairAllInFlight;
@@ -1033,6 +1061,14 @@ impl PairAllInFlight {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| {
                 PAIR_ALL_CANCEL.store(false, Ordering::Release);
+                set_pair_all_status(|st| {
+                    *st = PairAllStatus {
+                        in_flight: true,
+                        phase: "waiting",
+                        connect_url: None,
+                        launched: false,
+                    }
+                });
                 PairAllInFlight
             })
             .map_err(|_| {
@@ -1044,6 +1080,14 @@ impl PairAllInFlight {
 
 impl Drop for PairAllInFlight {
     fn drop(&mut self) {
+        set_pair_all_status(|st| {
+            *st = PairAllStatus {
+                in_flight: false,
+                phase: "idle",
+                connect_url: None,
+                launched: false,
+            }
+        });
         PAIR_ALL_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1229,14 +1273,30 @@ async fn run_pair_all_tenants<R: Runtime>(
     let app_for_blocking = app.clone();
     let mut results = spawn_blocking_tracked(move || {
         let on_connect_url = |url: &str, launched: bool| {
+            set_pair_all_status(|st| {
+                st.phase = "browser";
+                st.connect_url = Some(url.to_string());
+                st.launched = launched;
+            });
             emit_pair_all_progress(
                 &app_for_blocking,
                 serde_json::json!({"phase": "browser", "connect_url": url, "launched": launched}),
             );
         };
+        let on_callback = || {
+            set_pair_all_status(|st| {
+                st.phase = "collecting";
+                st.connect_url = None;
+            });
+            emit_pair_all_progress(
+                &app_for_blocking,
+                serde_json::json!({"phase": "collecting"}),
+            );
+        };
         let hooks = BrowserPairHooks {
             on_connect_url: Some(&on_connect_url),
             cancel: Some(&PAIR_ALL_CANCEL),
+            on_callback: Some(&on_callback),
         };
         let (ids, home) = connect_all_start_inputs(&for_blocking);
         let collected = pair_via_browser_multi(&coord_base, &ids, home, &hooks)?;
@@ -1308,18 +1368,35 @@ async fn run_pair_all_tenants<R: Runtime>(
     Ok(PairAllTenantsResponse { results })
 }
 
-/// End the in-flight [`pair_all_tenants`] flow (an abandoned browser tab
-/// otherwise holds it for up to 5 minutes). Returns whether a flow was
-/// running. The flow ends with `Err("cancelled")` within ~200 ms and its
-/// loopback server shuts down.
+/// End the in-flight [`pair_all_tenants`] flow while it is still waiting on
+/// the browser (an abandoned tab otherwise holds it for up to 5 minutes).
+/// Returns `true` only when that cancel will take effect: a flow is running
+/// AND the browser has not called back yet. Once the callback has landed the
+/// flow is collecting and saving credentials, cannot be cancelled, and this
+/// returns `false`. A cancelled flow ends with `Err("cancelled")` within
+/// ~200 ms and its loopback server shuts down.
 #[tauri::command]
 pub async fn cancel_pair_all_tenants() -> bool {
     use std::sync::atomic::Ordering;
-    let running = PAIR_ALL_IN_FLIGHT.load(Ordering::Acquire);
-    if running {
+    let cancellable = PAIR_ALL_STATUS
+        .lock()
+        .map(|st| st.in_flight && matches!(st.phase, "waiting" | "browser"))
+        .unwrap_or(false);
+    if cancellable {
         PAIR_ALL_CANCEL.store(true, Ordering::Release);
     }
-    running
+    cancellable
+}
+
+/// PULL half of [`PAIR_ALL_PROGRESS_EVENT`]: where the in-flight flow is, so a
+/// surface mounted mid-flow shows "Waiting for browser…", the connect link and
+/// Cancel instead of an idle button.
+#[tauri::command]
+pub async fn get_pair_all_status() -> PairAllStatus {
+    PAIR_ALL_STATUS
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default()
 }
 
 /// Tauri plugin exposing all web-integration commands.
@@ -1333,6 +1410,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             redeem_pair_code,
             pair_all_tenants,
             cancel_pair_all_tenants,
+            get_pair_all_status,
         ])
         .build()
 }
