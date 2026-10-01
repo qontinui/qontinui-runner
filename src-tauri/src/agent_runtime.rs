@@ -1062,32 +1062,59 @@ pub(crate) fn resolve_claude_bin() -> String {
     bare
 }
 
+/// Which binary a never-started retry execs after re-resolving. PURE.
+///
+/// Unix: adopt the re-resolution only if it is ABSOLUTE. A bare-name fallback
+/// means nothing launchable resolved on PATH this time; keeping the previous
+/// absolute path instead makes the seam refuse THAT file with the typed
+/// [`SpawnRefusal::ClaudeCliUnlaunchable`] (which D5 can defer unclaimed),
+/// where a bare name would be a PATH search whose failure carries no cause.
+/// Windows: the re-resolution always wins (a bare name there is the npm-only
+/// install shape, unchanged).
+fn adopt_reresolved_claude_bin(previous: String, reresolved: String) -> String {
+    #[cfg(unix)]
+    {
+        if !std::path::Path::new(&reresolved).is_absolute()
+            && std::path::Path::new(&previous).is_absolute()
+        {
+            return previous;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = previous;
+    reresolved
+}
+
 /// PURE over the injected exec predicate: the unix PATH pick for `bare`.
 ///
 /// The FIRST candidate that passes the exec seam's own predicate
 /// ([`crate::terminal::pane_io::probe_launchable`]) wins, so a stale,
 /// non-executable earlier match (a half-reinstalled npm bin dir) cannot mask a
 /// working later one. When no candidate is launchable, the first one that at
-/// least EXISTS as a file is returned anyway — so the pre-claim probe still
-/// names that file and reports its real fault (`eacces`) rather than
-/// `not_on_path`. `None` when nothing on PATH is even a file.
+/// least EXISTS as a directory entry (a non-executable file, or a dangling
+/// symlink) is returned anyway — so the pre-claim probe still names that entry
+/// and reports its real fault (`eacces` / `enoent`) rather than `not_on_path`.
+/// `None` when no PATH directory has an entry by that name.
 #[cfg(not(windows))]
 fn pick_claude_candidate_unix(
     bare: &str,
     dirs: &[std::path::PathBuf],
     probe: &dyn Fn(&std::path::Path) -> Result<(), crate::terminal::pane_io::ExecFault>,
 ) -> Option<String> {
-    let mut first_file: Option<std::path::PathBuf> = None;
+    // The first directory ENTRY named `bare` — `symlink_metadata` does not
+    // follow links, so a dangling nvm link (its target removed mid-reinstall)
+    // counts and then probes as `enoent` rather than reading as `not_on_path`.
+    let mut first_entry: Option<std::path::PathBuf> = None;
     for dir in dirs {
         let cand = dir.join(bare);
         if probe(&cand).is_ok() {
             return Some(cand.to_string_lossy().into_owned());
         }
-        if first_file.is_none() && cand.is_file() {
-            first_file = Some(cand);
+        if first_entry.is_none() && std::fs::symlink_metadata(&cand).is_ok() {
+            first_entry = Some(cand);
         }
     }
-    first_file.map(|p| p.to_string_lossy().into_owned())
+    first_entry.map(|p| p.to_string_lossy().into_owned())
 }
 
 // =============================================================================
@@ -2841,10 +2868,23 @@ fn settle_claim_decision(
 /// [`InFlightContinuationSlot`] from the guard's critical section until its live
 /// row exists (or it gives up), and the count this cap is compared against is
 /// `live + in-flight + admitted launches`. The slot is counted under the SAME
-/// lock that reads `live`, so two evaluations racing for the last slot cannot
-/// both pass the count. Plan
+/// lock that reads `live`, so two CONTINUATION evaluations racing for the last
+/// slot cannot both pass the count. Plan
 /// `2026-09-30-a-gate-continuation-is-claimed-before-the-resource-guard-and-the-claude-cli-check`,
 /// Phase 3.
+///
+/// That serialization is between continuation evaluations only. A coord launch
+/// ([`admit_launch`]) counts under the `admitted_launches` lock and the
+/// continuation guard reads the launch count after releasing the registry lock,
+/// so a launch and a continuation evaluated together at `cap - 1` can both
+/// pass — pre-existing, and not changed here.
+///
+/// **A freed in-flight slot does not trigger the capacity-freed re-poll.** Only
+/// a continuation PTY's exit ([`notify_continuation_terminal_exit`]) kicks an
+/// immediate poll. When an admitted continuation gives up instead (a deferral,
+/// a spawn failure, a headless child that exits), its slot is released silently,
+/// and an `AtCap` row it was holding out waits for the next backstop poll
+/// (default 300 s, [`spawn_continuation_backstop_poll`]).
 ///
 /// **What that does NOT close, stated rather than overstated: the THREAD lane
 /// is still a snapshot.** A burst admitted under the thread ceilings creates its
@@ -4701,14 +4741,12 @@ async fn dispatch_gate_continuation(
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
         if let Some(gate_id) = payload.gate_id {
-            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-                post_continuation_deferred(
-                    gate_id,
-                    device_id,
-                    authorization_deferral_stamp_reason(&authz),
-                )
-                .await;
-            }
+            post_deferred_stamp_rate_limited(
+                gate_id,
+                device_id,
+                authorization_deferral_stamp_reason(&authz),
+            )
+            .await;
         }
         return DispatchOutcome::Denied;
     }
@@ -5373,6 +5411,12 @@ fn deferred_stamp_last_post(
 /// `now`? `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per
 /// gate (and records `now` as the last post when it says `true`). Takes `now`
 /// as a parameter so the rate-limit window is unit-testable.
+///
+/// The record is PROVISIONAL: a caller whose POST then fails hands it back with
+/// [`rollback_deferred_stamp`], so a stamp lost to a coord outage does not
+/// suppress the next attempt for an hour. Recording here (rather than after the
+/// POST) keeps concurrent deferrals for one gate from all posting at once.
+/// [`post_deferred_stamp_rate_limited`] is the one caller that does both.
 fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
     let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
     if let Some(last) = map.get(&gate_id) {
@@ -5387,6 +5431,33 @@ fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> b
     }
     map.insert(gate_id, now);
     true
+}
+
+/// Hand back the provisional record [`should_post_deferred_stamp`] took at
+/// `claimed_at` — only if it is still that record (a later successful post owns
+/// the entry otherwise). Removing rather than restoring the previous instant is
+/// exact: an earlier entry could only have been replaced if it was already
+/// outside the window, where it suppresses nothing.
+fn rollback_deferred_stamp(gate_id: uuid::Uuid, claimed_at: std::time::Instant) {
+    let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
+    if map.get(&gate_id) == Some(&claimed_at) {
+        map.remove(&gate_id);
+    }
+}
+
+/// The rate-limited deferred stamp: post at most hourly per gate, and count
+/// only a stamp coord acknowledged (2xx) against the hour.
+async fn post_deferred_stamp_rate_limited(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    reason: String,
+) {
+    let now = std::time::Instant::now();
+    if should_post_deferred_stamp(gate_id, now)
+        && !post_continuation_deferred(gate_id, device_id, reason).await
+    {
+        rollback_deferred_stamp(gate_id, now);
+    }
 }
 
 /// Wire body for `POST /coord/gates/{gate_id}/continuation-deferred`.
@@ -5689,9 +5760,16 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
 /// **Best-effort**: the route may 404 until coord's parallel phase deploys —
 /// ANY non-2xx or transport error is `debug!` and we move on.
-async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
+///
+/// Returns whether coord acknowledged the stamp (2xx) — what the hourly rate
+/// limit counts ([`post_deferred_stamp_rate_limited`]).
+async fn post_continuation_deferred(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    reason: String,
+) -> bool {
     let Some(base) = connected_coord_base() else {
-        return;
+        return false;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -5699,7 +5777,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
             "agent_runtime: continuation-deferred: no shared coord client \
              gate_id={gate_id} (continuing)"
         );
-        return;
+        return false;
     };
     let body = ContinuationDeferredBody { device_id, reason };
     // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
@@ -5714,6 +5792,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
                 body.reason
             );
+            true
         }
         Ok(resp) => {
             debug!(
@@ -5721,11 +5800,15 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
                  (route may not be deployed yet; continuing)",
                 resp.status()
             );
+            false
         }
-        Err(e) => debug!(
-            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
-             (continuing): {e:#}"
-        ),
+        Err(e) => {
+            debug!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
+                 (continuing): {e:#}"
+            );
+            false
+        }
     }
 }
 
@@ -5847,9 +5930,7 @@ async fn defer_continuation_unclaimed(
     reason: String,
 ) {
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
-        if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-            post_continuation_deferred(gate_id, device_id, reason).await;
-        }
+        post_deferred_stamp_rate_limited(gate_id, device_id, reason).await;
     }
     release_local_dispatch_claim(consume_target);
 }
@@ -7318,10 +7399,13 @@ async fn run_continuation_terminal(
                     tokio::time::sleep(CONTINUATION_START_RETRY_DELAY).await;
                     // Re-resolve: the first resolution may itself have run
                     // inside the reinstall window and fallen back to the bare
-                    // name.
-                    claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+                    // name. On unix a re-resolution that falls back to the bare
+                    // name does NOT replace an absolute binary (see
+                    // `adopt_reresolved_claude_bin`).
+                    let reresolved = spawn_blocking_tracked(resolve_claude_bin)
                         .await
                         .unwrap_or_else(|_| claude_bin_path());
+                    claude_bin = adopt_reresolved_claude_bin(claude_bin, reresolved);
                     continue;
                 }
                 let reason = format!("never started ({attempt} attempts): {detail}");
@@ -16798,6 +16882,123 @@ mod tests {
         }
         // The PTY detail #2674 classifies is the seam's own text, unrenamed.
         assert_eq!(pty().to_string(), pty_text);
+    }
+
+    /// Review round 2 #6: a D5 deferral through the REAL
+    /// `defer_continuation_unclaimed` releases the re-delivery attempt it ran
+    /// under, so that same attempt re-claims when coord re-lists the row —
+    /// and an older attempt still cannot.
+    #[tokio::test]
+    async fn d5_deferral_releases_the_redelivery_attempt_it_ran_under() {
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch_attempt(gate, 2), "the dispatcher's claim");
+        let error = seam_error(
+            "Failed to spawn shell: Unable to spawn /x/claude because it doesn't exist on the \
+             filesystem or is not executable (ENOENT: No such file or directory)"
+                .to_string(),
+            Some(SpawnRefusal::ClaudeCliUnlaunchable {
+                path: "/x/claude".to_string(),
+                fault: crate::terminal::pane_io::ExecFault::NotFound,
+            }),
+        );
+        let outcomes = std::cell::Cell::new(0usize);
+        let disposition = settle_failed_gate_spawn(
+            gate,
+            Some(ClaimSent::NotSent),
+            &error,
+            |_detail| {
+                outcomes.set(outcomes.get() + 1);
+                async {}
+            },
+            // No coord base under test, so the stamp POST is a no-op.
+            |stamp| defer_continuation_unclaimed(ConsumeTarget::Gate(gate, 2), device, stamp),
+        )
+        .await;
+        assert_eq!(
+            disposition,
+            FailedSpawnDisposition::DeferUnclaimed("claude_cli_unavailable:enoent".into())
+        );
+        assert_eq!(outcomes.get(), 0);
+        assert!(
+            claim_gate_dispatch_attempt(gate, 2),
+            "the re-listed row's same attempt must be claimable again"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 1),
+            "an older attempt never claims again"
+        );
+        release_gate_dispatch_attempt(gate, 2);
+    }
+
+    /// Review round 2 #3: a stamp whose POST failed is rolled back, so the next
+    /// deferral can stamp at once; a rollback never removes a newer record.
+    #[test]
+    fn a_failed_deferred_stamp_does_not_hold_the_hourly_window() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        assert!(should_post_deferred_stamp(gate, t0));
+        assert!(!should_post_deferred_stamp(gate, t0), "held while provisional");
+        rollback_deferred_stamp(gate, t0);
+        assert!(
+            should_post_deferred_stamp(gate, t0 + Duration::from_secs(1)),
+            "a failed stamp leaves the window open"
+        );
+        // A stale rollback (of `t0`) must not remove the newer record.
+        rollback_deferred_stamp(gate, t0);
+        assert!(
+            !should_post_deferred_stamp(gate, t0 + Duration::from_secs(2)),
+            "the newer (successful) record still suppresses"
+        );
+    }
+
+    /// Review round 2 #1: on unix a never-started retry keeps the absolute
+    /// binary when re-resolution falls back to a bare name.
+    #[test]
+    fn a_bare_reresolution_does_not_replace_an_absolute_binary() {
+        let abs = if cfg!(windows) { "C:\\x\\claude.exe" } else { "/x/claude" };
+        let other = if cfg!(windows) { "C:\\y\\claude.exe" } else { "/y/claude" };
+        assert_eq!(
+            adopt_reresolved_claude_bin(abs.into(), other.into()),
+            other,
+            "an absolute re-resolution is adopted"
+        );
+        assert_eq!(
+            adopt_reresolved_claude_bin("claude".into(), "claude".into()),
+            "claude"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            adopt_reresolved_claude_bin(abs.into(), "claude".into()),
+            abs,
+            "a bare fallback keeps the previous absolute path"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            adopt_reresolved_claude_bin(abs.into(), "claude".into()),
+            "claude",
+            "Windows is unchanged"
+        );
+    }
+
+    /// Review round 2 #2: a PATH dir holding only a dangling `claude` symlink
+    /// resolves to that link, which probes as `enoent` — not `not_on_path`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_resolves_and_probes_as_enoent() {
+        let probe = &crate::terminal::pane_io::probe_launchable;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("claude");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).expect("symlink");
+        let link = link.to_string_lossy().into_owned();
+        assert_eq!(
+            pick_claude_candidate_unix("claude", &[dir.path().to_path_buf()], probe),
+            Some(link.clone())
+        );
+        assert_eq!(
+            claude_cli_readiness(&link, probe),
+            CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::NotFound)
+        );
     }
 
     /// Finding 7: a claim's connect failure is `NotSent` only when it failed
