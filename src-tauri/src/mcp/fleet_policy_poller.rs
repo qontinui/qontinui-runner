@@ -911,6 +911,33 @@ pub(crate) fn pin_account_selection_for_test(
     pin
 }
 
+/// The guards a test holds when it reaches account selection through a
+/// production path that reads the machine roster (the config report, the
+/// retry loop's rate-limit rotation): an isolated ambient, THEN the fleet pin
+/// at "no fleet opinion".
+///
+/// The ORDER is the point of the helper. Every test that takes both locks
+/// takes them in this order, and no test takes the fleet pin before the
+/// ambient, so the pair cannot deadlock. The ambient points
+/// `QONTINUI_CONFIG_DIR` / `HOME` at an empty temp dir, so the per-instance
+/// roster is empty. The machine-global roster resolves through
+/// `dirs::config_dir()`, which on Linux follows `XDG_CONFIG_HOME` when it is
+/// set — `cargo-guard.sh` points that at a fresh per-run sandbox. The pin
+/// serializes the test against the one test that publishes a temp dir into
+/// `RESOLVED_CONFIG_DIR`.
+///
+/// Returned as a tuple: fields drop in declaration order, so the ambient is
+/// restored first and the fleet pin is released last.
+#[cfg(test)]
+pub(crate) fn isolated_ambient_with_fleet_pin() -> (
+    qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+    AccountSelectionPin,
+) {
+    let ambient = crate::test_env::isolated_ambient();
+    let pin = pin_account_selection_for_test(None);
+    (ambient, pin)
+}
+
 /// Normalize coord's `effective_level` onto an account-selection mode. PURE.
 ///
 /// Trimmed, ASCII-case-insensitive match against the three
