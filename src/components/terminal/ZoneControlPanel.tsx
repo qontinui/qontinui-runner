@@ -744,12 +744,23 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
       if (workspace.layoutId !== zoneLayout.layoutId) {
         zoneLayout.setLayoutId(workspace.layoutId);
       }
-      for (const session of workspace.sessions) {
+      for (const [index, session] of workspace.sessions.entries()) {
+        // Serial, like the cold restore: name the burst in the resource-guard
+        // dialog, with the sessions still ahead (this one included).
+        const spawnSource = {
+          label: "workspace load",
+          queued: workspace.sessions.length - index,
+        };
         if (session.zoneIndex < 0) {
-          await createTerminal(session.title, session.workingDir);
+          await createTerminal(session.title, session.workingDir, undefined, spawnSource);
           continue;
         }
-        const tabId = await createTerminal(session.title, session.workingDir);
+        const tabId = await createTerminal(
+          session.title,
+          session.workingDir,
+          undefined,
+          spawnSource,
+        );
         if (tabId) {
           zoneLayout.assignTabToZone(session.zoneIndex, tabId);
         }

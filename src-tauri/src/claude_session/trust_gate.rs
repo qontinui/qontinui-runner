@@ -2234,7 +2234,7 @@ THE AUTONOMY DIAL. One of:
         assert!(r.starts_with(SPAWN_BLOCKED_REFUSAL_PREFIX));
         for other in [
             "terminal session create failed: spawn_blocked (…)",
-            "resource_guard:critical: commit headroom below the floor",
+            "resource_guard:critical:free_commit_bytes: commit headroom below the floor",
             "",
             "SPAWN_BLOCKED",
         ] {

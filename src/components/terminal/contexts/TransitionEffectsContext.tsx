@@ -104,6 +104,8 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       const tabId = await createTerminal(
         oldTab?.title ? `${oldTab.title} (2)` : undefined,
         oldTab?.workingDir ?? undefined,
+        undefined,
+        { label: "restart in zone" },
       );
       if (tabId) {
         zoneLayout.assignTabToZone(zoneIdx, tabId);

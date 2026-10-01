@@ -182,8 +182,28 @@ pub(crate) const RESOURCE_GUARD_EVENT: &str = "resource-guard-notice";
 /// through a dozen unrelated call sites for no gain. A stable prefix keeps the
 /// refusal machine-recognisable end to end: `src/lib/resourceGuard.ts` matches
 /// on it to decide "this is an overridable refusal, show the dialog" versus
-/// "this is a real spawn failure, report it". Everything after the prefix is
-/// human text and may be reworded freely; the prefix may not.
+/// "this is a real spawn failure, report it". The prefix may not change.
+///
+/// ## The wire after the prefix: one lane token, then human text
+///
+/// A refusal reads `resource_guard:critical:<metric>: <message>`, where
+/// `<metric>` is [`LaneMetric::wire_name`] (`free_commit_bytes` |
+/// `thread_count`) — see [`critical_refusal`]. The token is there because the
+/// dialog has to know WHICH lane refused, and nothing else can tell it: a
+/// refusal deliberately emits no [`RESOURCE_GUARD_EVENT`] (see that constant),
+/// so the event payload's `metric` never reaches the webview for this verdict.
+/// Before the token the dialog titled every refusal "Low memory", including
+/// thread-lane refusals on a box with hundreds of GB free.
+///
+/// It goes AFTER this unchanged prefix so every consumer that matches with
+/// `starts_with` keeps working byte for byte: `looping_agent_supervisor`'s
+/// no-backoff arm, the external HTTP callers `mcp::tauri_proxy` tells to
+/// match on the prefix, and `src/lib/resourceGuard.ts`. Everything after
+/// `<metric>: ` is human text and may be reworded freely. The token is one
+/// short word rather than a JSON tail because every log line and every
+/// `report_spawn_failed` reason carries this string as operator-facing text.
+/// The token itself is shared vocabulary with the notice payload and with
+/// `src/lib/resourceGuardWire.fixture.json`, which both sides' tests read.
 pub(crate) const CRITICAL_REFUSAL_PREFIX: &str = "resource_guard:critical:";
 
 /// One gibibyte, the unit the floors are quoted in.
@@ -670,9 +690,10 @@ pub(crate) enum LaneMetric {
 
 impl LaneMetric {
     /// Stable machine name for the event payload
-    /// (`src/hooks/useResourceGuardNotifications.ts`). Snake case to match the
-    /// Rust field names it stands in for; the webview only ever compares it,
-    /// never renders it.
+    /// (`src/hooks/useResourceGuardNotifications.ts`) and the lane token on the
+    /// CRITICAL refusal wire ([`CRITICAL_REFUSAL_PREFIX`], parsed by
+    /// `src/lib/resourceGuard.ts`). Snake case to match the Rust field names it
+    /// stands in for; the webview only ever compares it, never renders it.
     fn wire_name(self) -> &'static str {
         match self {
             LaneMetric::FreeCommitBytes => "free_commit_bytes",
@@ -1724,10 +1745,15 @@ fn format_gib(bytes: u64) -> String {
 /// act on — they cannot tell whether to close a build, close a session, or raise
 /// a limit that was set too low. All three parts come from the
 /// [`GateObservation`], so the same sentence serves either lane.
+///
+/// The lane token ([`LaneMetric::wire_name`]) sits between the prefix and the
+/// text, so the dialog can title the refusal by the lane that actually spoke —
+/// see [`CRITICAL_REFUSAL_PREFIX`] for why it cannot come from anywhere else.
 fn critical_refusal(what: &str, observation: &GateObservation) -> String {
     format!(
-        "{CRITICAL_REFUSAL_PREFIX} Not starting a new {what}: {}. {} The limits live in \
+        "{CRITICAL_REFUSAL_PREFIX}{}: Not starting a new {what}: {}. {} The limits live in \
          Settings > Resource Guard.",
+        observation.metric.wire_name(),
         observation.clause("critical"),
         observation.metric.remedy(),
     )
@@ -2069,8 +2095,8 @@ mod tests {
     }
 
     /// The refusal string is what the operator reads and what
-    /// `src/lib/resourceGuard.ts` matches on: prefix first, then the lane, the
-    /// live headroom and the configured floor.
+    /// `src/lib/resourceGuard.ts` matches on: prefix first, then the lane
+    /// token, then the lane, the live headroom and the configured floor.
     #[test]
     fn refusal_names_the_prefix_the_lane_the_headroom_and_the_floor() {
         let msg = critical_refusal(
@@ -2078,10 +2104,70 @@ mod tests {
             &memory_observation("host", 1_073_741_824, 1_610_612_736),
         );
         assert!(msg.starts_with(CRITICAL_REFUSAL_PREFIX));
+        assert!(
+            msg.starts_with("resource_guard:critical:free_commit_bytes: "),
+            "missing lane token: {msg}"
+        );
         assert!(msg.contains("terminal session"));
         assert!(msg.contains("host lane"));
         assert!(msg.contains("1.00 GiB"), "missing headroom: {msg}");
         assert!(msg.contains("1.50 GiB"), "missing floor: {msg}");
+    }
+
+    /// The wire fixture both sides read, byte for byte. `src/lib/resourceGuard.test.ts`
+    /// parses these exact strings; this test proves Rust still produces them.
+    /// Read from the manifest dir, never the CWD, so the test binary finds it
+    /// wherever it runs from.
+    fn wire_fixture() -> serde_json::Value {
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/lib/resourceGuardWire.fixture.json"
+        ));
+        serde_json::from_str(raw).expect("resourceGuardWire.fixture.json is valid JSON")
+    }
+
+    /// Every lane's refusal carries its [`LaneMetric::wire_name`] token
+    /// straight after the unchanged prefix, and the full string is exactly
+    /// what the webview's parser is tested against. A rewording here without
+    /// the matching fixture edit fails this test, which is the point: the
+    /// dialog's title depends on the token surviving every rewording.
+    #[test]
+    fn the_refusal_wire_matches_the_shared_fixture() {
+        let fixture = wire_fixture();
+        assert_eq!(fixture["prefix"], CRITICAL_REFUSAL_PREFIX);
+
+        let cases = [
+            (
+                LaneMetric::FreeCommitBytes,
+                memory_observation("host", GIB_U64, 3 * GIB_U64 / 2),
+            ),
+            (LaneMetric::ThreadCount, thread_observation(540, 400)),
+        ];
+        for (metric, observation) in cases {
+            let wire = critical_refusal("terminal session", &observation);
+            let token = format!("{CRITICAL_REFUSAL_PREFIX}{}: ", metric.wire_name());
+            assert!(wire.starts_with(&token), "{metric:?} lost its token: {wire}");
+            assert_eq!(
+                fixture["refusals"][metric.wire_name()],
+                wire.as_str(),
+                "{metric:?}: the Rust refusal and src/lib/resourceGuardWire.fixture.json \
+                 disagree — update both sides together"
+            );
+        }
+    }
+
+    /// The dialog's titles are the Rust headlines, held in the shared fixture
+    /// so the webview cannot drift from the toast and log vocabulary.
+    #[test]
+    fn the_lane_headlines_match_the_shared_fixture() {
+        let fixture = wire_fixture();
+        for metric in [LaneMetric::FreeCommitBytes, LaneMetric::ThreadCount] {
+            assert_eq!(
+                fixture["headlines"][metric.wire_name()],
+                metric.headline(),
+                "{metric:?}"
+            );
+        }
     }
 
     /// 1.5 GiB must render as `1.50 GiB`, not `2 GiB` — the default critical
@@ -2424,6 +2510,10 @@ mod tests {
     fn a_thread_refusal_keeps_the_prefix_and_names_the_right_remedy() {
         let msg = critical_refusal("terminal session", &thread_observation(540, 400));
         assert!(msg.starts_with(CRITICAL_REFUSAL_PREFIX));
+        assert!(
+            msg.starts_with("resource_guard:critical:thread_count: "),
+            "a thread refusal must name its lane, or the dialog says \"Low memory\": {msg}"
+        );
         assert!(msg.contains("540 threads"), "missing reading: {msg}");
         assert!(
             msg.contains("400-thread critical ceiling"),
