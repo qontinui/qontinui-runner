@@ -297,6 +297,24 @@ describe("one decision per burst", () => {
     expect(getGrantsSnapshot()[0].remaining).toBe(GRANT_SPAWN_LIMIT);
   });
 
+  it("a refusal that named no lane never spends a live named grant", async () => {
+    const p = spawnWithResourceGuard(
+      vi.fn().mockRejectedValueOnce(THREAD_REFUSAL).mockResolvedValueOnce("x"),
+    );
+    await vi.waitFor(() => expect(getSnapshot()).not.toBeNull());
+    resolvePendingResourceBlock(true);
+    await p;
+    expect(getGrantsSnapshot()[0].remaining).toBe(GRANT_SPAWN_LIMIT);
+
+    // An unknown-lane refusal must ask, not ride the thread grant.
+    const legacy = spawnWithResourceGuard(vi.fn().mockRejectedValue(LEGACY_REFUSAL));
+    await vi.waitFor(() => expect(getSnapshot()).toMatchObject({ metric: "unknown" }));
+    expect(getGrantsSnapshot()[0].remaining).toBe(GRANT_SPAWN_LIMIT);
+    resolvePendingResourceBlock(false);
+    await expect(legacy).rejects.toBe(LEGACY_REFUSAL);
+    expect(getGrantsSnapshot()[0].remaining).toBe(GRANT_SPAWN_LIMIT);
+  });
+
   it("a grant is lane-scoped: it never answers another lane's refusal", async () => {
     const p = spawnWithResourceGuard(
       vi.fn().mockRejectedValueOnce(THREAD_REFUSAL).mockResolvedValueOnce("x"),

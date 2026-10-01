@@ -2580,7 +2580,10 @@ mod tests {
         for (metric, observation) in cases {
             let wire = critical_refusal("terminal session", &observation);
             let token = format!("{CRITICAL_REFUSAL_PREFIX}{}: ", metric.wire_name());
-            assert!(wire.starts_with(&token), "{metric:?} lost its token: {wire}");
+            assert!(
+                wire.starts_with(&token),
+                "{metric:?} lost its token: {wire}"
+            );
             assert_eq!(
                 fixture["refusals"][metric.wire_name()],
                 wire.as_str(),
