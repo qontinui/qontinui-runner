@@ -945,10 +945,12 @@ mod tests {
         // + the 6 glossary/refusal types (GlossaryTerm, Refusal, RefusalCode,
         // RefusalSource, NextAction, NextActionKind — plan
         // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
-        // C1/D1) = 560.
-        // The codegen's "Processing N top-level types" line (last measured at
-        // 554, before the glossary/refusal six) should read 560 here.
-        assert_eq!(obj.len(), 560, "Expected 560 schema entries");
+        // C1/D1) = 560
+        // + the 1 scheduler probe condition (ProbeCondition — plan
+        // 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one
+        // Phase 4) = 561.
+        // The codegen's "Processing N top-level types" line should read 561 here.
+        assert_eq!(obj.len(), 561, "Expected 561 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
