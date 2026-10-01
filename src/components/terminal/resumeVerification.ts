@@ -20,6 +20,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
 import {
   CLAUDE_HANDSHAKE_REGEXES,
+  CLAUDE_TITLE_REGEXES,
   CLAUDE_RESUME_FAILURE_REGEXES,
   type HandshakePatterns,
 } from "./providerAdapter";
@@ -79,10 +80,68 @@ export function buildPickerAnswer(policy: ResumeSummaryPolicy): string {
   return policy === "summary" ? "1\r" : "2\r";
 }
 
-/** Strip ANSI escape sequences so patterns match rendered text. */
+/**
+ * Strip ANSI escape sequences so patterns match rendered text.
+ *
+ * Used for the FAILURE and PICKER phrases. Cursor motion is deleted, so text
+ * that Claude Code v2 draws with cursor moves collapses (`No\x1b[1Cconversation`
+ * becomes `Noconversation`). That is deliberate: those checks run over the
+ * whole tail, and a resumed conversation that merely MENTIONS "No conversation
+ * found" or "Resume full session as-is" must not fail the resume or trigger
+ * the picker answer. The success markers use {@link renderAnsi} instead.
+ */
 export function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
   return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "");
+}
+
+/**
+ * Render ANSI output to approximate screen text, for the SUCCESS markers only.
+ *
+ * Claude Code v2 paints its TUI with cursor addressing. The gaps between words
+ * are often cursor moves rather than spaces (`Claude\x1b[1CCode`), and the `❯`
+ * prompt sits one cursor-down below its `────` rule. Deleting those moves (as
+ * {@link stripAnsi} does) glues the words together, so a marker cannot match a
+ * pane that plainly shows it. Here, horizontal moves become spaces and
+ * vertical moves become newlines. Column positions are approximate, which is
+ * enough for a marker match.
+ */
+export function renderAnsi(text: string): string {
+  /* eslint-disable no-control-regex */
+  return (
+    text
+      // OSC and DCS strings: window titles, shell-integration marks, device
+      // control. Titles are read separately by `lastOscTitle`.
+      .replace(/\x1b\][^\x07]*?(?:\x07|\x1b\\)/g, "")
+      .replace(/\x1bP[^\x1b]*\x1b\\/g, "")
+      // Cursor forward (CUF) → that many spaces; column absolute (CHA) → one.
+      .replace(/\x1b\[(\d*)C/g, (_m, n: string) => " ".repeat(Math.min(Number(n || "1"), 256)))
+      .replace(/\x1b\[\d*G/g, " ")
+      // Vertical moves and absolute positioning (CUU, CUD, CNL, CPL, CUP, HVP,
+      // VPA) → a new line.
+      .replace(/\x1b\[[\d;]*[ABEFHfd]/g, "\n")
+      // Every other CSI, including private-parameter forms such as `ESC[>0q`.
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+      // Charset designation (`ESC(B`), two-byte escapes (`ESC7`, `ESC M`, …)
+      // and the shift-in/shift-out controls.
+      .replace(/\x1b[()][0-9A-Za-z]/g, "")
+      .replace(/\x1b[0-9=>MDEc]/g, "")
+      .replace(/[\x0e\x0f]/g, "")
+  );
+  /* eslint-enable no-control-regex */
+}
+
+/**
+ * The CURRENT window title: the last OSC 0 / OSC 2 title in `text`, or
+ * `undefined` when there is none. Claude Code titles its window
+ * `✳ Claude Code` at launch, before it paints anything else, and resets the
+ * title to empty on exit. Only the last title counts, so a pane that has fallen
+ * back to a shell is not verified by a title an earlier Claude set.
+ */
+export function lastOscTitle(text: string): string | undefined {
+  // eslint-disable-next-line no-control-regex
+  const titleOsc = /\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  return Array.from(text.matchAll(titleOsc), (m) => m[1]).at(-1);
 }
 
 /**
@@ -112,19 +171,27 @@ export function detectResumeFailure(text: string, patterns?: HandshakePatterns):
  * True when the pane's recent output shows the provider's resume handshake.
  * Same union rule as {@link detectResumeFailure}: descriptor substrings ∪
  * descriptor regexes, falling back to Claude's regex set when no descriptor is
- * supplied. The Claude descriptor's regexes carry the rounded input-box frame
- * marker, which no substring can express — a restored pane that has painted
- * only the frame verifies here.
+ * supplied. The Claude descriptor's regexes carry the input-box frame
+ * markers, which no substring can express — a restored pane that has painted
+ * only the frame verifies here. Body markers run over {@link renderAnsi}
+ * output; title markers run over the pane's current window title
+ * ({@link lastOscTitle}) alone.
  */
 export function detectClaudeHandshake(text: string, patterns?: HandshakePatterns): boolean {
-  const stripped = stripAnsi(text);
+  const rendered = renderAnsi(text);
+  // The current window title is matched only against title patterns: the shell
+  // titles the window too, so body markers must never see it.
+  const title = lastOscTitle(text);
+  const titleMatch = (titlePatterns?: RegExp[]) =>
+    title !== undefined && matchRegexes(title, titlePatterns);
   if (patterns) {
     return (
-      matchSubstrings(stripped, patterns.success) ||
-      matchRegexes(stripped, patterns.successPatterns)
+      matchSubstrings(rendered, patterns.success) ||
+      matchRegexes(rendered, patterns.successPatterns) ||
+      titleMatch(patterns.titlePatterns)
     );
   }
-  return matchRegexes(stripped, CLAUDE_HANDSHAKE_REGEXES);
+  return matchRegexes(rendered, CLAUDE_HANDSHAKE_REGEXES) || titleMatch(CLAUDE_TITLE_REGEXES);
 }
 
 /** Case-insensitive substring match of any pattern in `text`. */

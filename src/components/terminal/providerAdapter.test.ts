@@ -48,6 +48,12 @@ describe("claudeDescriptor", () => {
     expect(CLAUDE_RESUME_FAILURE_REGEXES.length).toBeGreaterThan(0);
   });
 
+  it("carries the v2 markers: the versioned logo line and the rule-prompt-rule frame", () => {
+    const sources = CLAUDE_HANDSHAKE_REGEXES.map((re) => re.source);
+    expect(sources).toContain("Claude Code v\\d");
+    expect(sources.some((src) => src.includes("─{3,}") && src.includes("❯"))).toBe(true);
+  });
+
   it("keeps the box-frame regex — the one marker no substring can express", () => {
     const frame = "╭────────────────────────────╮\n│ >  │\n╰────────────────────────────╯";
     expect(CLAUDE_HANDSHAKE_REGEXES.some((re) => re.source === "[╭╰]─{3,}")).toBe(true);
