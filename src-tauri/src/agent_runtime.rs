@@ -1066,10 +1066,10 @@ fn adopt_reresolved_claude_bin(previous: String, reresolved: String) -> String {
 /// ([`crate::terminal::pane_io::probe_launchable`]) wins, so a stale,
 /// non-executable earlier match (a half-reinstalled npm bin dir) cannot mask a
 /// working later one. When no candidate is launchable, the first one that at
-/// least EXISTS as a directory entry (a non-executable file, or a dangling
-/// symlink) is returned anyway — so the pre-claim probe still names that entry
-/// and reports its real fault (`eacces` / `enoent`) rather than `not_on_path`.
-/// `None` when no PATH directory has an entry by that name.
+/// least EXISTS as a non-directory entry (a non-executable file, or a symlink,
+/// dangling included) is returned anyway — so the pre-claim probe still names
+/// that entry and reports its real fault (`eacces` / `enoent`) rather than
+/// `not_on_path`. `None` when no PATH directory has such an entry.
 #[cfg(not(windows))]
 fn pick_claude_candidate_unix(
     bare: &str,
@@ -1085,7 +1085,12 @@ fn pick_claude_candidate_unix(
         if probe(&cand).is_ok() {
             return Some(cand.to_string_lossy().into_owned());
         }
-        if first_entry.is_none() && std::fs::symlink_metadata(&cand).is_ok() {
+        // Not a directory: a `claude/` dir on PATH is no CLI at all. A
+        // symlink (dangling or not) is judged by its own metadata, so it
+        // still counts.
+        if first_entry.is_none()
+            && std::fs::symlink_metadata(&cand).is_ok_and(|meta| !meta.is_dir())
+        {
             first_entry = Some(cand);
         }
     }
@@ -5352,6 +5357,12 @@ async fn post_spawn_outcome(
 /// Minimum interval between deferred-stamp posts for the SAME gate id. The
 /// backstop re-lists a deferred row every ~300s; without this limit a 2-day
 /// AtCap stall would post ~576 stamps per gate.
+///
+/// An attempt counts against the interval when coord ANSWERED it — accepted
+/// (2xx) or definitively rejected (4xx, including the 404 of a coord that has
+/// not deployed the route). Only an attempt that never got an answer
+/// ([`DeferredStampPost::Unreached`]: a transport error, a 5xx, or no coord to
+/// send to) is handed back, so the next deferral may try again at once.
 const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Per-gate last-posted times for the deferred stamp (in-process rate limit).
@@ -5401,8 +5412,9 @@ fn rollback_deferred_stamp(gate_id: uuid::Uuid, claimed_at: std::time::Instant) 
     }
 }
 
-/// The rate-limited deferred stamp: post at most hourly per gate, and count
-/// only a stamp coord acknowledged (2xx) against the hour.
+/// The rate-limited deferred stamp: post at most hourly per gate. An attempt
+/// coord answered (accepted or rejected) holds the hour; an unreached one is
+/// rolled back (see [`CONTINUATION_DEFERRED_STAMP_INTERVAL`]).
 async fn post_deferred_stamp_rate_limited(
     gate_id: uuid::Uuid,
     device_id: uuid::Uuid,
@@ -5410,9 +5422,36 @@ async fn post_deferred_stamp_rate_limited(
 ) {
     let now = std::time::Instant::now();
     if should_post_deferred_stamp(gate_id, now)
-        && !post_continuation_deferred(gate_id, device_id, reason).await
+        && post_continuation_deferred(gate_id, device_id, reason).await
+            == DeferredStampPost::Unreached
     {
         rollback_deferred_stamp(gate_id, now);
+    }
+}
+
+/// What a deferred-stamp POST achieved — the three answers the rate limit
+/// treats differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredStampPost {
+    /// coord recorded the stamp (2xx).
+    Posted,
+    /// coord answered and refused (4xx — e.g. 404 from a coord without the
+    /// route, 409/422). Re-posting within the hour would get the same answer,
+    /// so it holds the hour like a success.
+    Rejected,
+    /// No answer worth counting: a transport error, a 5xx, any other status,
+    /// or no coord base / client to send with. Rolled back, so the next
+    /// deferral tries again.
+    Unreached,
+}
+
+/// PURE: classify a deferred-stamp POST's HTTP status (`None` = the request
+/// never got a response).
+fn classify_deferred_stamp_status(status: Option<u16>) -> DeferredStampPost {
+    match status {
+        Some(s) if (200..300).contains(&s) => DeferredStampPost::Posted,
+        Some(s) if (400..500).contains(&s) => DeferredStampPost::Rejected,
+        _ => DeferredStampPost::Unreached,
     }
 }
 
@@ -5717,15 +5756,18 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// **Best-effort**: the route may 404 until coord's parallel phase deploys —
 /// ANY non-2xx or transport error is `debug!` and we move on.
 ///
-/// Returns whether coord acknowledged the stamp (2xx) — what the hourly rate
-/// limit counts ([`post_deferred_stamp_rate_limited`]).
+/// Returns what the attempt achieved ([`DeferredStampPost`], classified by
+/// [`classify_deferred_stamp_status`]) — the hourly rate limit holds the hour
+/// for `Posted` and `Rejected` and hands it back for `Unreached`
+/// ([`post_deferred_stamp_rate_limited`]). No coord base or no shared client is
+/// `Unreached`: nothing was sent, and retrying costs nothing until one exists.
 async fn post_continuation_deferred(
     gate_id: uuid::Uuid,
     device_id: uuid::Uuid,
     reason: String,
-) -> bool {
+) -> DeferredStampPost {
     let Some(base) = connected_coord_base() else {
-        return false;
+        return DeferredStampPost::Unreached;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -5733,7 +5775,7 @@ async fn post_continuation_deferred(
             "agent_runtime: continuation-deferred: no shared coord client \
              gate_id={gate_id} (continuing)"
         );
-        return false;
+        return DeferredStampPost::Unreached;
     };
     let body = ContinuationDeferredBody { device_id, reason };
     // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
@@ -5748,7 +5790,7 @@ async fn post_continuation_deferred(
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
                 body.reason
             );
-            true
+            DeferredStampPost::Posted
         }
         Ok(resp) => {
             debug!(
@@ -5756,14 +5798,14 @@ async fn post_continuation_deferred(
                  (route may not be deployed yet; continuing)",
                 resp.status()
             );
-            false
+            classify_deferred_stamp_status(Some(resp.status().as_u16()))
         }
         Err(e) => {
             debug!(
                 "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
                  (continuing): {e:#}"
             );
-            false
+            classify_deferred_stamp_status(None)
         }
     }
 }
@@ -16844,6 +16886,68 @@ mod tests {
         assert_eq!(
             claude_cli_readiness(&link, probe),
             CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::NotFound)
+        );
+
+        // Review round 3 #3: a DIRECTORY named `claude` is no fallback — the
+        // dangling link in a later dir is.
+        let with_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(with_dir.path().join("claude")).expect("mkdir");
+        // `access(X_OK)` passes a directory; the probe must not (execve
+        // refuses it with EACCES).
+        assert_eq!(
+            claude_cli_readiness(&with_dir.path().join("claude").to_string_lossy(), probe),
+            CliReadiness::Unlaunchable(crate::terminal::pane_io::ExecFault::PermissionDenied),
+            "a directory is not launchable"
+        );
+        assert_eq!(
+            pick_claude_candidate_unix("claude", &[with_dir.path().to_path_buf()], probe),
+            None,
+            "a directory entry is not a CLI candidate"
+        );
+        assert_eq!(
+            pick_claude_candidate_unix(
+                "claude",
+                &[with_dir.path().to_path_buf(), dir.path().to_path_buf()],
+                probe
+            ),
+            Some(link)
+        );
+    }
+
+    /// Review round 3 #1: the deferred-stamp POST classification — only an
+    /// unanswered attempt is `Unreached` (and rolled back).
+    #[test]
+    fn deferred_stamp_post_classification() {
+        assert_eq!(classify_deferred_stamp_status(Some(200)), DeferredStampPost::Posted);
+        assert_eq!(classify_deferred_stamp_status(Some(204)), DeferredStampPost::Posted);
+        for rejected in [400, 404, 409, 422, 499] {
+            assert_eq!(
+                classify_deferred_stamp_status(Some(rejected)),
+                DeferredStampPost::Rejected,
+                "{rejected}"
+            );
+        }
+        for unreached in [None, Some(500), Some(503), Some(302)] {
+            assert_eq!(
+                classify_deferred_stamp_status(unreached),
+                DeferredStampPost::Unreached,
+                "{unreached:?}"
+            );
+        }
+    }
+
+    /// Review round 3 #2: with no coord configured (tests deflect
+    /// `connected_coord_base` to `None`) nothing is sent, which is
+    /// `Unreached` — so the provisional record is rolled back and the gate's
+    /// window stays OPEN for the next deferral. Inverting the rollback
+    /// condition (or treating no-coord as answered) fails this.
+    #[tokio::test]
+    async fn a_stamp_with_no_coord_configured_leaves_the_window_open() {
+        let gate = uuid::Uuid::now_v7();
+        post_deferred_stamp_rate_limited(gate, uuid::Uuid::now_v7(), "at_cap:64".into()).await;
+        assert!(
+            should_post_deferred_stamp(gate, std::time::Instant::now()),
+            "an unsent stamp must not hold the hourly window"
         );
     }
 
