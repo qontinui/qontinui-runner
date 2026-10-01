@@ -4114,6 +4114,20 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
 ///   default, precedence-aware re-derive, reversible by re-running).
 ///
+/// The phase-attestation pair is the same drift found one round later (coord
+/// `6e410068c`, plan `2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr`
+/// Phase 4, granted on coord's device floor after the 2026-09-29 diff above):
+/// `coord_work_unit_attest_phase` records evidence for a declared phase whose
+/// correct output is not a PR, and `coord_work_unit_retract_phase_attestation`
+/// is its correction verb. They are the PR-less siblings of
+/// `coord_work_unit_add_citation` / `coord_work_unit_remove_citation`, and
+/// coord holds the same kind of bound on them: both reach only
+/// `coord.work_unit_phase_attestations`, which can never move a unit to
+/// `shipped` on its own. The attest verb's `evidence_ref` must resolve to a
+/// live coord artifact at write time, and its attester is the caller's verified
+/// identity, never an argument. The retract verb never deletes the row and
+/// cannot reach a citation table.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4239,11 +4253,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
     "coord_work_unit_add_citation",
+    "coord_work_unit_attest_phase",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
     "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
+    "coord_work_unit_retract_phase_attestation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
     "coord_write_prompt_document",
@@ -15681,8 +15697,9 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
-    /// The agent escalate-evidence door and the ten device-floor names found
-    /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
+    /// The agent escalate-evidence door and the device-floor names found
+    /// beside it, plus the later phase-attestation pair (see
+    /// [`COORD_MCP_ALLOWED_TOOLS`]'s note), must be forwarded,
     /// while the operator escape hatch for the same block stays withheld. A
     /// literal enumeration, so dropping any one name — or moving the operator
     /// attest onto the allowlist — reds this test by name.
@@ -15700,6 +15717,8 @@ mod coord_mcp_body_gate_tests {
             "coord_primary_tree_branch_status",
             "coord_withdraw_agent_question",
             "coord_work_unit_overview",
+            "coord_work_unit_attest_phase",
+            "coord_work_unit_retract_phase_attestation",
         ] {
             assert!(
                 coord_mcp_tool_is_allowed(tool),
