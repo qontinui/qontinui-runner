@@ -1051,13 +1051,19 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
 /// Phase 3b).
 ///
-/// The exception is `qontinui_runner_lib::alloc_breadcrumb`, which writes the
-/// SAME line format through a handle it opened at startup — tokens
+/// Two writers bypass this function. `append_watchdog_incident` (the
+/// runtime-independent watchdog) writes its own `WATCHDOG` lines; and
+/// `qontinui_runner_lib::alloc_breadcrumb` writes through a handle it opened at
+/// startup — tokens
 /// `alloc_failure`, `commit_exhaustion`, `commit_exhaustion_suspected`,
 /// `resource_exhaustion`, `resource_exhaustion_suspected`, and each episode
 /// token's `_closed` twin (`commit_exhaustion_closed`, …). It cannot come
 /// through here: its `alloc_failure` line is written from inside a failing
-/// allocator, and this function allocates (`format!`, `chrono`). Plan
+/// allocator, and this function allocates (`format!`, `chrono`). EVERY writer
+/// keeps the `<RFC 3339> <TOKEN> … (pid N)` shape — the timestamp first and
+/// the pid LAST — because the next boot's crash harvest
+/// (`crash_observability::find_prior_exhaustion`) attributes lines to a run by
+/// that trailing pid; a line without it cannot be attributed to any run. Plan
 /// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`
 /// Phase 0. A second incident file would be one more observability
 /// channel nobody greps — and this one is already the first thing to read after
@@ -1287,13 +1293,14 @@ fn append_watchdog_incident(dir: &Path, reason: WatchdogReason, s: WatchdogSampl
     let line = format!(
         "{} WATCHDOG {} — pid {}, probe heartbeat {}s old, metrics heartbeat {}s old, \
          consecutive /livez failures {}. Written by the runtime-independent watchdog \
-         thread, so this line survives a fully parked runtime.\n",
+         thread, so this line survives a fully parked runtime. (pid {})\n",
         chrono::Utc::now().to_rfc3339(),
         reason.as_str(),
         std::process::id(),
         monitor_age,
         metrics_age,
-        s.consecutive_failures
+        s.consecutive_failures,
+        std::process::id()
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
