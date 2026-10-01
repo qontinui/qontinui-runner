@@ -127,7 +127,9 @@ pub(crate) struct ObsInput<'a> {
     pub(crate) oom_kill_total: Option<u64>,
     /// `None` = no service information this tick (keep the previous units).
     pub(crate) services: Option<&'a [WatchedUnit]>,
-    pub(crate) services_complete: bool,
+    /// The kinds this scan saw COMPLETELY (amendment A2): a remembered unit
+    /// of such a kind that is absent now is gone; other kinds keep theirs.
+    pub(crate) complete_kinds: &'a [&'static str],
     /// Keep the previous `oom_kill_total` when this tick has none. `false`
     /// for a WSL guest: the VM-wide counter is owned by one guest per VM, and
     /// a guest that loses ownership must CLEAR its baseline — carrying it would
@@ -224,9 +226,12 @@ pub(crate) fn derive(
     let mut units = prev.units.clone();
     let mut attributed: u64 = 0;
     if let Some(current) = input.services {
-        if input.services_complete {
-            units.retain(|name, _| current.iter().any(|w| &w.row.unit == name));
-        }
+        units.retain(|name, _| {
+            current.iter().any(|w| &w.row.unit == name)
+                || !input
+                    .complete_kinds
+                    .contains(&super::services::classify_unit(name))
+        });
         for w in current {
             let r = &w.row;
             let cur_state = r.active_state.as_deref();
@@ -641,7 +646,7 @@ mod tests {
             booted_at: Some("2026-09-21T14:13:20Z"),
             oom_kill_total: oom,
             services: Some(units),
-            services_complete: true,
+            complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
         }
     }
@@ -787,7 +792,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             booted_at: Some("2026-09-30T03:00:00Z"),
             oom_kill_total: Some(1),
             services: Some(&units),
-            services_complete: true,
+            complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
@@ -814,7 +819,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             booted_at: Some("2026-09-30T03:00:00Z"),
             oom_kill_total: Some(2),
             services: Some(&units),
-            services_complete: true,
+            complete_kinds: &["gh_actions_runner", "qontinui_runner"],
             carry_oom_baseline: true,
         };
         let (ev, _) = derive(Some(&obs0), &inp, t("2026-09-30T03:01:00Z"));
@@ -834,7 +839,7 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
             booted_at: Some(booted),
             oom_kill_total: None,
             services: None,
-            services_complete: false,
+            complete_kinds: &[],
             carry_oom_baseline: true,
         };
         let (_, o0) = derive(None, &mk("2026-09-29T08:00:00Z"), t("2026-09-30T01:00:00Z"));
@@ -934,13 +939,45 @@ ControlGroup=/system.slice/actions.runner.example-org-example-repo.fleetbox.serv
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Amendment A2: a remembered unit absent from this scan is forgotten
+    /// only when ITS kind was scanned completely.
+    #[test]
+    fn units_are_forgotten_only_for_completely_scanned_kinds() {
+        const BOTH: &str = "\
+Id=actions.runner.example-org-example-repo.fleetbox.service
+ActiveState=active
+
+Id=qontinui-runner.service
+ActiveState=active
+";
+        const GH_ONLY: &str = "\
+Id=actions.runner.example-org-example-repo.fleetbox.service
+ActiveState=active
+";
+        let both = watched(BOTH, None);
+        let (_, o0) = derive(None, &input(&both, None), t("2026-09-30T01:00:00Z"));
+        assert_eq!(o0.units.len(), 2);
+        let gh = watched(GH_ONLY, None);
+        // Session bus failed: only gh complete → the user unit is kept.
+        let partial = ObsInput {
+            complete_kinds: &["gh_actions_runner"],
+            ..input(&gh, None)
+        };
+        let (_, o1) = derive(Some(&o0), &partial, t("2026-09-30T01:00:30Z"));
+        assert!(o1.units.contains_key("qontinui-runner.service"));
+        // Both kinds complete → it is really gone.
+        let (_, o2) = derive(Some(&o0), &input(&gh, None), t("2026-09-30T01:01:00Z"));
+        assert!(!o2.units.contains_key("qontinui-runner.service"));
+        assert_eq!(o2.units.len(), 1);
+    }
+
     #[test]
     fn no_service_information_keeps_the_previous_units() {
         let units = watched(ACTIVE_BEFORE, None);
         let (_, obs0) = derive(None, &input(&units, Some(1)), t("2026-09-30T01:00:00Z"));
         let inp = ObsInput {
             services: None,
-            services_complete: false,
+            complete_kinds: &[],
             ..input(&units, Some(1))
         };
         let (ev, obs1) = derive(Some(&obs0), &inp, t("2026-09-30T01:00:30Z"));
