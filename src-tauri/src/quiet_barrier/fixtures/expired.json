@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "repo-20260929T095000Z-d4e5f6",
+  "scope": "repo:qontinui-web",
+  "purpose": "node_modules reinstall",
+  "requester": {"session_id": "aaaaaaaa-0000-4000-8000-000000000004", "device": "11111111-2222-3333-4444-555555555555"},
+  "opened_at": "2026-09-29T09:50:00Z",
+  "until": "2026-09-29T10:10:00Z",
+  "max_until": "2026-09-29T11:50:00Z",
+  "straggler_policy": "wait",
+  "state": "open"
+}

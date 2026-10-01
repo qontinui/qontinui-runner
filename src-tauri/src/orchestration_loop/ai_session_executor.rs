@@ -689,7 +689,12 @@ pub async fn dispatch_subtask(
         }
 
         // 5. Submit the brief + report contract as the worker's first message.
-        if let Err(e) = session.send_user_message(&first_message) {
+        // Spawn plumbing (the brief of a session spawned a line above), not a
+        // wake: governed at spawn by the drain, so the quiet barrier passes it.
+        if let Err(e) = session.send_user_message(
+            &first_message,
+            crate::quiet_barrier::SdkMessageCaller::ExecutorFirstMessage,
+        ) {
             session_mgr.remove(&trid);
             let _ = session.close();
             return Err(format!(

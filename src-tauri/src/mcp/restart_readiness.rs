@@ -156,7 +156,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — the `safe_to_restart` verdict never reads it (only the quiet-barrier `resume` classification does, per process, and only while a runner-restart barrier is open), an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -301,8 +301,11 @@ pub struct LiveClaudeTotals {
     /// min), or `unknown`. `working + idle + stale + unknown == total` always:
     /// a process that cannot be classified is `unknown`, never `idle`.
     ///
-    /// ⚠ **REPORT-ONLY — the verdict never reads it.** An idle session still
-    /// dies on a restart. This exists so an operator can see how many of the
+    /// ⚠ **`safe_to_restart` never reads it.** An idle session still dies on a
+    /// restart. The one consumer is the quiet-barrier `resume` classification,
+    /// which reads the same per-process class ([`process_activity`]) for its
+    /// "idle at a turn boundary" condition, and only under an open
+    /// `runner-restart` barrier. This exists so an operator can see how many of the
     /// open sessions are actually working and decide what to finish first; see
     /// [`crate::session::claude_activity`] for the evidence and its precedence.
     pub by_activity: ActivityCounts,
@@ -427,6 +430,23 @@ pub struct RestartReadiness {
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
     pub boundary: &'static str,
+    /// Plan `2026-09-29-quiet-on-demand-…` (D5): would a restart RIGHT NOW
+    /// lose nothing that the boot restore does not bring back? `true` only
+    /// while a `runner-restart` quiet barrier is open (so the autonomous wake
+    /// doors defer — D4; `resume.wake_paths_gated` is the gate's own answer),
+    /// every plane resolved, the AI plane is empty, and every live agent
+    /// session is either `resumable` or `finished` (see `resume`).
+    ///
+    /// Additive: `safe_to_restart` above is unchanged and still means "no work
+    /// in flight at all". The two are never merged.
+    pub safe_with_resume: bool,
+    /// Why `safe_with_resume` is what it is — including, when no barrier is
+    /// open, that it was not computed at all.
+    pub safe_with_resume_reason: String,
+    /// The resumable classification. `null` unless a `runner-restart` barrier
+    /// is open: without one, an idle session can be woken, so nothing is
+    /// resumable by construction.
+    pub resume: Option<crate::quiet_barrier::resume::ResumeBlock>,
 }
 
 // ---------------------------------------------------------------------------
@@ -580,18 +600,69 @@ pub fn activity_counts(
         &report.live_untracked,
     ] {
         for process in list {
-            counts.add(claude_activity::classify(
-                evidence.pane_by_pid.get(&process.pid),
-                process.has_live_children,
-                evidence
-                    .records
-                    .get(&process.pid)
-                    .unwrap_or(&RecordReading::Missing),
-                evidence.now_ms,
-            ));
+            counts.add(process_activity(process, evidence));
         }
     }
     counts
+}
+
+/// What Claude Code's own record for this process says on the `waiting`
+/// question — a permission prompt or a question. The activity axis counts a
+/// `waiting` record as `idle` (correctly: no turn is running), but a pending
+/// prompt is LOST on resume, so the quiet-barrier `resume` classification
+/// treats it as `waiting_human` exactly as it does the sideband (plan D2).
+///
+/// Tri-state: a record that could not be read — missing, unparseable,
+/// ambiguous, a reused pid, or no entry at all because the read timed out, was
+/// skipped while an earlier one was in flight, or was never requested — is
+/// `Unreadable`, which resume reports as `unknown` and never resumable.
+/// Resume-only: `by_activity` never reads this.
+pub fn record_waiting_read(
+    process: &LiveClaudeProcess,
+    evidence: &ActivityEvidence,
+) -> crate::quiet_barrier::resume::RecordWaitingRead {
+    use crate::quiet_barrier::resume::RecordWaitingRead;
+    match evidence.records.get(&process.pid) {
+        Some(RecordReading::Parsed(ev)) if ev.status == "waiting" => RecordWaitingRead::Waiting,
+        Some(RecordReading::Parsed(_)) => RecordWaitingRead::NotWaiting,
+        Some(RecordReading::Missing) => {
+            RecordWaitingRead::Unreadable("no `sessions/<pid>.json` record exists".to_string())
+        }
+        Some(RecordReading::Unparseable) => {
+            RecordWaitingRead::Unreadable("the session record did not parse".to_string())
+        }
+        Some(RecordReading::Ambiguous) => RecordWaitingRead::Unreadable(
+            "two config dirs hold conflicting records for this pid".to_string(),
+        ),
+        Some(RecordReading::PidReused) => RecordWaitingRead::Unreadable(
+            "the record belongs to an earlier process that held this pid".to_string(),
+        ),
+        None => RecordWaitingRead::Unreadable(
+            "the record was not read — the read timed out, was skipped while an earlier read \
+             was in flight, or was not requested"
+                .to_string(),
+        ),
+    }
+}
+
+/// One live process's class on the activity axis — exactly the value
+/// [`activity_counts`] adds for it. The quiet-barrier resume classification
+/// (`quiet_barrier::resume`) reads its "idle at a turn boundary" condition
+/// from here, so `by_activity` and `resume` share one census and one set of
+/// blind spots rather than two idle heuristics that can disagree.
+pub fn process_activity(
+    process: &LiveClaudeProcess,
+    evidence: &ActivityEvidence,
+) -> claude_activity::Activity {
+    claude_activity::classify(
+        evidence.pane_by_pid.get(&process.pid),
+        process.has_live_children,
+        evidence
+            .records
+            .get(&process.pid)
+            .unwrap_or(&RecordReading::Missing),
+        evidence.now_ms,
+    )
 }
 
 /// pid → pane observation, for the top-level terminal-hosted processes whose
@@ -636,12 +707,18 @@ impl Drop for InFlightRead {
 }
 
 /// The live processes whose activity the pane did NOT decide — the only ones
-/// whose Claude Code record is worth reading — with the census's process age
-/// for the record's identity check.
+/// whose Claude Code record `by_activity` needs — with the census's process age
+/// for the record's identity check. `include_pane_decided` reads EVERY live
+/// process's record instead: the quiet-barrier `resume` classification needs
+/// the record's own `waiting` status even where the pane decided the activity
+/// (see [`record_says_waiting`]). It never changes `by_activity`, because
+/// [`claude_activity::classify`] consults the record only when the pane is not
+/// decisive.
 fn pids_needing_a_record(
     report: &TrackingHealthReport,
     pane_by_pid: &HashMap<u32, TerminalObservation>,
     now_ms: i64,
+    include_pane_decided: bool,
 ) -> Vec<LivePid> {
     [
         &report.terminal_hosted,
@@ -652,7 +729,8 @@ fn pids_needing_a_record(
     .iter()
     .flat_map(|l| l.iter())
     .filter(|p| {
-        pane_by_pid
+        include_pane_decided
+            || pane_by_pid
             .get(&p.pid)
             .and_then(|obs| claude_activity::classify_from_pane(obs, p.has_live_children, now_ms))
             .is_none()
@@ -677,6 +755,10 @@ fn pids_needing_a_record(
 /// timed-out one) is still running, a new call skips the read and reports its
 /// undecided processes `unknown`. Production passes
 /// [`RECORD_READ_IN_FLIGHT`].
+///
+/// `read_pane_decided` (true only while a `runner-restart` quiet barrier is
+/// open) also reads the records of pane-decided processes, for the resume
+/// rule in [`record_says_waiting`]; `by_activity` is identical either way.
 pub async fn gather_activity_evidence(
     report: &TrackingHealthReport,
     observed: &ObservedInputs,
@@ -684,10 +766,11 @@ pub async fn gather_activity_evidence(
     proc_start: fn(u32) -> Option<String>,
     read_timeout: std::time::Duration,
     in_flight: &'static AtomicBool,
+    read_pane_decided: bool,
 ) -> ActivityEvidence {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let pane_by_pid = pane_observations_by_pid(report, observed);
-    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms);
+    let pids = pids_needing_a_record(report, &pane_by_pid, now_ms, read_pane_decided);
     let records = if pids.is_empty() {
         HashMap::new()
     } else if in_flight
@@ -869,6 +952,9 @@ pub fn build_verdict(
             session_status_source: status_source,
             wind_down_candidates,
             boundary: BOUNDARY,
+            safe_with_resume: false,
+            safe_with_resume_reason: RESUME_NOT_COMPUTED.to_string(),
+            resume: None,
         };
     }
 
@@ -1021,6 +1107,74 @@ pub fn build_verdict(
         session_status_source: status_source,
         wind_down_candidates,
         boundary: BOUNDARY,
+        safe_with_resume: false,
+        safe_with_resume_reason: RESUME_NOT_COMPUTED.to_string(),
+        resume: None,
+    }
+}
+
+/// `safe_with_resume_reason` before [`attach_resume`] runs.
+pub const RESUME_NOT_COMPUTED: &str = "not computed";
+
+/// PURE: attach the quiet-barrier resume verdict to a built readiness body.
+///
+/// `barrier` is the live runner-restart barrier state; `block` the resume
+/// block the handler gathered under it (`None` when the barrier is not open —
+/// nothing is gathered then). The existing `safe_to_restart` verdict is never
+/// touched.
+pub fn attach_resume(
+    verdict: &mut RestartReadiness,
+    barrier: &crate::quiet_barrier::BarrierState,
+    block: Option<crate::quiet_barrier::resume::ResumeBlock>,
+) {
+    use crate::quiet_barrier::BarrierState;
+    match (barrier, block) {
+        (BarrierState::Absent, _) => {
+            verdict.safe_with_resume = false;
+            verdict.safe_with_resume_reason = "no runner-restart quiet barrier is open, so idle \
+                sessions can still be woken and none is counted as resumable (open one with \
+                `quiet-barrier.sh open runner-restart`)"
+                .to_string();
+            verdict.resume = None;
+        }
+        (BarrierState::Unknown(why), _) => {
+            verdict.safe_with_resume = false;
+            verdict.safe_with_resume_reason = format!(
+                "UNKNOWN: the quiet-barrier store could not be read ({why}); autonomous wakes \
+                 are held fail-closed, but no resume verdict is computed on an unknown barrier"
+            );
+            verdict.resume = None;
+        }
+        (BarrierState::Open(b), None) => {
+            verdict.safe_with_resume = false;
+            verdict.safe_with_resume_reason = format!(
+                "UNKNOWN: runner-restart barrier {} is open but the resume classification could \
+                 not be gathered",
+                b.id
+            );
+            verdict.resume = None;
+        }
+        (BarrierState::Open(_), Some(block)) => {
+            verdict.safe_with_resume = block.blocking_count == 0;
+            verdict.safe_with_resume_reason = if block.blocking_count == 0 {
+                format!(
+                    "every live agent session is at a resumable safe point under barrier {} \
+                     ({} resumable, {} finished); the boot restore is expected to bring back {} \
+                     session(s)",
+                    block.barrier_id,
+                    block.resumable_count,
+                    block.finished_count,
+                    block.expected_restore_set.len()
+                )
+            } else {
+                format!(
+                    "{} straggler(s) not at a resumable safe point under barrier {} ({} \
+                     resumable) — see `resume.stragglers`",
+                    block.blocking_count, block.barrier_id, block.resumable_count
+                )
+            };
+            verdict.resume = Some(block);
+        }
     }
 }
 
@@ -1157,12 +1311,19 @@ pub async fn restart_readiness_handler(
     unknowns.extend(pass_unknowns);
     let status_source = SessionStatusSource::from(&status_fetch);
 
-    // ── The ACTIVITY axis (report-only; the verdict never reads it) ───────
+    // ── The ACTIVITY axis (`safe_to_restart` never reads it; the quiet-barrier
+    //    `resume` block below reads it per process) ──────────────────────────
     //
     // The pane half is the observation `fresh_pass` already took for the
     // wind-down verdicts — no second look at any pane. The record half reads
     // Claude Code's `sessions/<pid>.json` only for processes the pane did not
     // decide, off the executor and under `RECORD_READ_TIMEOUT`.
+    //
+    // Under an open runner-restart barrier the record is read for EVERY
+    // process, pane-decided or not: the `resume` block needs its `waiting`
+    // status (a permission prompt or question, lost on resume — plan D2).
+    let barrier = crate::quiet_barrier::runner_restart_barrier_open();
+    let barrier_open = matches!(barrier, crate::quiet_barrier::BarrierState::Open(_));
     let activity_evidence = match pass.as_ref() {
         Some(p) => {
             gather_activity_evidence(
@@ -1172,6 +1333,7 @@ pub async fn restart_readiness_handler(
                 claude_activity::proc_start_ticks,
                 RECORD_READ_TIMEOUT,
                 &RECORD_READ_IN_FLIGHT,
+                barrier_open,
             )
             .await
         }
@@ -1206,7 +1368,30 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
+    // ── Quiet-barrier resume classification (plan quiet-on-demand, D5) ────
+    // Gathered ONLY while a runner-restart barrier is open: without one, an
+    // idle session can be woken, so nothing is resumable by construction and
+    // none of this is paid for. `barrier` was read once, above, before the
+    // activity evidence, so both see the same barrier state.
+    let resume_block = match &barrier {
+        crate::quiet_barrier::BarrierState::Open(b) => Some(
+            gather_resume(
+                app,
+                b,
+                crate::quiet_barrier::autonomous_wakes_deferred_under(&barrier),
+                pass.as_ref(),
+                &observed,
+                &activity_evidence,
+                ai.as_ref(),
+                &unknowns,
+                now_ms,
+            )
+            .await,
+        ),
+        _ => None,
+    };
+
+    let mut verdict = build_verdict(
         terminal,
         headless,
         ai,
@@ -1215,7 +1400,322 @@ pub async fn restart_readiness_handler(
         drain,
         census,
         status_source,
-    ))
+    );
+    attach_resume(&mut verdict, &barrier, resume_block);
+    Json(verdict)
+}
+
+/// What [`resume_block_from`] reads about one top-level terminal-hosted
+/// process from the live box — the parts that need the process table, the
+/// terminal manager or the pending-prompt registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeProbe {
+    pub terminal_id: Option<String>,
+    pub sideband: crate::quiet_barrier::resume::SidebandRead,
+    pub descendants: crate::quiet_barrier::resume::Descendants,
+    pub pending_autonomous: Vec<String>,
+}
+
+/// Gather the D2 inputs for every live agent session from the live box, and
+/// fold them into the `resume` block through [`resume_block_from`]. Every read
+/// that fails becomes an `unknown` straggler, never a resumable session.
+#[allow(clippy::too_many_arguments)]
+async fn gather_resume(
+    app: &tauri::AppHandle,
+    barrier: &crate::quiet_barrier::Barrier,
+    wake_paths_gated: bool,
+    pass: Option<&tracking_health::TrackingHealthPass>,
+    observed: &wind_down_observer::ObservedInputs,
+    activity: &ActivityEvidence,
+    ai: Option<&AiPlane>,
+    unknowns: &[String],
+    now_ms: i64,
+) -> crate::quiet_barrier::resume::ResumeBlock {
+    use crate::quiet_barrier::resume::{
+        classify_descendants, resolve_mcp_servers, Descendants, SidebandRead,
+    };
+    use tauri::Manager;
+
+    // The restore side: what the NEXT boot would select.
+    //
+    // ASSUMPTION — the restart happens NOW. `restorable_records(now, Some(now),
+    // …)` anchors the selection at this instant, as if the shutdown marker
+    // were written now. If the actual shutdown comes minutes later and a
+    // session's `last_seen_at` is not heartbeated meanwhile, it can age out of
+    // the 600 s anchor grace and the real expected set is SMALLER than this
+    // one. Phase 5's post-restart `restore-census` is what catches that: it
+    // compares the restored set against the snapshot taken from this field and
+    // reports `partial`/`mismatch`, never a silent pass.
+    let restorable: Result<HashMap<String, bool>, String> = match app
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => {
+            let records = store.restorable_records(now_ms, Some(now_ms), true);
+            let probe = crate::session::reconcile::DiskTranscriptIndex::discover();
+            Ok(
+                crate::session::restore_census::expected_rows(records, &probe)
+                    .into_iter()
+                    .map(|row| (row.claude_session_id, row.restorable))
+                    .collect(),
+            )
+        }
+        None => Err("the lifecycle store did not resolve".to_string()),
+    };
+
+    let top: Vec<&LiveClaudeProcess> = pass
+        .map(|p| {
+            p.report
+                .terminal_hosted
+                .iter()
+                .filter(|p| !p.nested_under_claude)
+                .collect()
+        })
+        .unwrap_or_default();
+    let snapshot = if top.is_empty() {
+        crate::process_capture::process_tree::ProcessSnapshot::default()
+    } else {
+        crate::process_capture::process_tree::snapshot_process_table_public().await
+    };
+    let mut pids: Vec<u32> = top.iter().map(|p| p.pid).collect();
+    for p in &top {
+        if let Some(children) = snapshot.parent_map.get(&p.pid) {
+            pids.extend(children.iter().copied());
+        }
+    }
+    let cmdlines = if pids.is_empty() {
+        HashMap::new()
+    } else {
+        crate::process_capture::process_tree::command_lines_for_pids(&pids).await
+    };
+    let manager = app
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|m| m.inner().clone());
+
+    let probe = |p: &LiveClaudeProcess| -> ResumeProbe {
+        let terminal_id = p
+            .session_id
+            .as_deref()
+            .and_then(|sid| observed.terminal_for(sid))
+            .map(str::to_string);
+        let sideband = match (manager.as_ref(), terminal_id.as_deref()) {
+            (Some(m), Some(t)) => match m.get(t).map(|s| s.last_agent_status()) {
+                Some(Ok(Some(state))) => SidebandRead::Reported(state.state),
+                Some(Ok(None)) => SidebandRead::NeverReported,
+                Some(Err(_)) | None => SidebandRead::Unreadable,
+            },
+            _ => SidebandRead::Unreadable,
+        };
+        let descendants = if snapshot.parent_map.is_empty() {
+            Descendants::Unknown("the process table is unreadable".to_string())
+        } else {
+            let sigs = resolve_mcp_servers(cmdlines.get(&p.pid).map(String::as_str), p.cwd.as_deref());
+            classify_descendants(p.pid, &snapshot.parent_map, &cmdlines, sigs.as_deref())
+        };
+        let pending_autonomous = terminal_id
+            .as_deref()
+            .map(crate::quiet_barrier::pending::for_session)
+            .unwrap_or_default();
+        ResumeProbe {
+            terminal_id,
+            sideband,
+            descendants,
+            pending_autonomous,
+        }
+    };
+
+    // An AI session's queued autonomous SDK messages are registered under its
+    // INSTANCE key (session id + instance number), not the manager key the AI
+    // plane reports — resolve it through the manager.
+    let sessions = app
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .map(|m| m.inner().clone());
+    // A lookup miss is UNKNOWN (an `unknown` straggler), never a silent "no
+    // pending": entries are keyed by instance, so no bare-key fallback could
+    // ever match.
+    let ai_pending = |key: &str| -> Option<Vec<String>> {
+        let session = sessions.as_ref()?.get(key)?;
+        Some(crate::quiet_barrier::pending::for_session(
+            session.pending_registry_key(),
+        ))
+    };
+
+    resume_block_from(
+        barrier,
+        wake_paths_gated,
+        pass,
+        activity,
+        ai,
+        unknowns,
+        &restorable,
+        &probe,
+        &ai_pending,
+    )
+}
+
+/// PURE: the `resume` block from everything [`gather_resume`] read. Every
+/// D2 condition is decided here, so it is unit-testable without a box:
+///
+/// - a census pass that did not resolve is an `unknown` straggler — never an
+///   empty, vacuously "all resumable" plane;
+/// - a session whose coord work axis reads `finished` (`!blocks_restart`) is
+///   counted `finished`, not resumable and not a straggler;
+/// - the barrier's own requester is a `requester` straggler;
+/// - the rest are classified by [`crate::quiet_barrier::resume::classify`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_block_from(
+    barrier: &crate::quiet_barrier::Barrier,
+    wake_paths_gated: bool,
+    pass: Option<&tracking_health::TrackingHealthPass>,
+    activity: &ActivityEvidence,
+    ai: Option<&AiPlane>,
+    unknowns: &[String],
+    restorable: &Result<HashMap<String, bool>, String>,
+    probe: &dyn Fn(&LiveClaudeProcess) -> ResumeProbe,
+    ai_pending: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> crate::quiet_barrier::resume::ResumeBlock {
+    use crate::quiet_barrier::resume::{build_block, RestoreSelection, SessionInput, Straggler};
+
+    let mut others: Vec<Straggler> = Vec::new();
+    if !unknowns.is_empty() {
+        others.push(Straggler::other(
+            None,
+            "unknown",
+            format!("unknown: {}", unknowns.join("; ")),
+        ));
+    }
+    match ai {
+        None => others.push(Straggler::other(
+            None,
+            "unknown",
+            "unknown: the AI/task-run plane could not be determined",
+        )),
+        Some(a) => {
+            for s in &a.sessions {
+                // A queued autonomous SDK message lives only in memory and
+                // dies with the restart: name it, so the operator sees WHAT
+                // would be lost, not just that the session is live.
+                let Some(pending) = ai_pending(&s.id) else {
+                    others.push(Straggler::other(
+                        None,
+                        "unknown",
+                        format!(
+                            "unknown: AI/task-run session {} did not resolve through the session \
+                             manager, so whether it holds a queued autonomous prompt is unknown",
+                            s.id
+                        ),
+                    ));
+                    continue;
+                };
+                others.push(if pending.is_empty() {
+                    Straggler::other(
+                        None,
+                        "ai_session",
+                        format!(
+                            "AI/task-run session {} is live; the terminal restore path does not \
+                             resume it",
+                            s.id
+                        ),
+                    )
+                } else {
+                    Straggler::other(
+                        None,
+                        "pending_autonomous_prompt",
+                        format!(
+                            "AI/task-run session {} holds a deferred autonomous prompt in memory, \
+                             which the restart would drop: {}",
+                            s.id,
+                            pending.join(", ")
+                        ),
+                    )
+                });
+            }
+        }
+    }
+
+    let mut expected_restore_set: Vec<String> = restorable
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, ok)| **ok)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    expected_restore_set.sort();
+
+    let Some(pass) = pass else {
+        others.push(Straggler::other(
+            None,
+            "unknown",
+            "unknown: the process census did not resolve, so no live session could be \
+             classified",
+        ));
+        return build_block(&barrier.id, &[], others, expected_restore_set, wake_paths_gated);
+    };
+    for p in &pass.report.headless_exempt {
+        others.push(Straggler::other(
+            Some(p.pid),
+            "headless",
+            "headless agent-runtime `claude` — not restored by the terminal restore path",
+        ));
+    }
+    for p in &pass.report.live_untracked {
+        others.push(Straggler::other(
+            Some(p.pid),
+            "unknown",
+            "unknown: a live `claude` no terminal, AI session or headless registration accounts for",
+        ));
+    }
+    if ai.is_some_and(|a| a.count == 0) {
+        for p in &pass.report.ai_plane {
+            others.push(Straggler::other(
+                Some(p.pid),
+                "ai_session",
+                "a live `claude` under the AI plane's roots while no AI session is open",
+            ));
+        }
+    }
+
+    let sessions: Vec<SessionInput> = pass
+        .report
+        .terminal_hosted
+        .iter()
+        .filter(|p| !p.nested_under_claude)
+        .map(|p| {
+            let ResumeProbe {
+                terminal_id,
+                sideband,
+                descendants,
+                pending_autonomous,
+            } = probe(p);
+            let restore = match (restorable, p.session_id.as_deref()) {
+                (Err(why), _) => RestoreSelection::Unknown(why.clone()),
+                (Ok(_), None) => RestoreSelection::Unknown("no session id".to_string()),
+                (Ok(m), Some(sid)) => match m.get(sid) {
+                    Some(true) => RestoreSelection::Restorable,
+                    Some(false) => RestoreSelection::NotRestorable,
+                    None => RestoreSelection::NotSelected,
+                },
+            };
+            SessionInput {
+                session_id: p.session_id.clone(),
+                terminal_id,
+                pid: p.pid,
+                finished: !p.blocks_restart,
+                // The same per-process class `live_claude.by_activity` counts:
+                // one census, never a parallel idle heuristic.
+                activity: process_activity(p, activity),
+                record: record_waiting_read(p, activity),
+                is_requester: p.session_id.as_deref().is_some_and(|sid| barrier.exempts(sid)),
+                pending_autonomous,
+                sideband,
+                descendants,
+                restore,
+            }
+        })
+        .collect();
+
+    build_block(&barrier.id, &sessions, others, expected_restore_set, wake_paths_gated)
 }
 
 // ---------------------------------------------------------------------------
@@ -3142,6 +3642,84 @@ mod tests {
         }
     }
 
+    /// `process_activity` is the per-process twin of `by_activity`: the
+    /// quiet-barrier `resume` block reads it, so the two can never disagree
+    /// about which process is idle. Pid 4 is the case that matters to resume —
+    /// an idle pane whose MCP-shim child vetoes pane-idle, decided `idle` by
+    /// Claude Code's record.
+    #[test]
+    fn process_activity_is_the_per_process_twin_of_by_activity() {
+        use claude_activity::Activity;
+        let report = activity_report();
+        let evidence = activity_evidence();
+        let mut summed = ActivityCounts::default();
+        for list in [
+            &report.terminal_hosted,
+            &report.ai_plane,
+            &report.headless_exempt,
+            &report.live_untracked,
+        ] {
+            for p in list {
+                summed.add(process_activity(p, &evidence));
+            }
+        }
+        assert_eq!(summed, activity_counts(&report, &evidence));
+        let by_pid = |pid: u32| {
+            report
+                .terminal_hosted
+                .iter()
+                .find(|p| p.pid == pid)
+                .map(|p| process_activity(p, &evidence))
+        };
+        assert_eq!(by_pid(1), Some(Activity::Working));
+        assert_eq!(by_pid(2), Some(Activity::Idle));
+        assert_eq!(by_pid(4), Some(Activity::Idle));
+        // No evidence at all is `unknown`, never `idle` — resume blocks on it.
+        assert_eq!(
+            process_activity(&report.terminal_hosted[1], &ActivityEvidence::default()),
+            Activity::Unknown
+        );
+
+        // Pid 4's record reads `waiting`: the activity axis says `idle`, the
+        // resume-only rule says a prompt is pending (plan D2).
+        let p4 = &report.terminal_hosted[3];
+        assert_eq!(p4.pid, 4);
+        assert_eq!(process_activity(p4, &evidence), Activity::Idle);
+        use crate::quiet_barrier::resume::RecordWaitingRead;
+        assert_eq!(record_waiting_read(p4, &evidence), RecordWaitingRead::Waiting);
+        assert_eq!(
+            record_waiting_read(&report.terminal_hosted[1], &evidence),
+            RecordWaitingRead::NotWaiting
+        );
+    }
+
+    /// Under a barrier every live process's record is read, pane-decided or
+    /// not — and `by_activity` does not move, because the pane still decides
+    /// first.
+    #[test]
+    fn reading_pane_decided_records_never_moves_by_activity() {
+        let report = activity_report();
+        let evidence = activity_evidence();
+        let undecided = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW, false);
+        let all = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW, true);
+        assert_eq!(all.len(), report.live_claude_total);
+        assert!(undecided.len() < all.len());
+        // Pid 2's pane decides `idle`; a `waiting` record for it changes
+        // nothing on the activity axis.
+        let mut with_pane_decided = evidence.clone();
+        with_pane_decided
+            .records
+            .insert(2, act_record("waiting", None));
+        assert_eq!(
+            activity_counts(&report, &with_pane_decided),
+            activity_counts(&report, &evidence)
+        );
+        assert_eq!(
+            record_waiting_read(&report.terminal_hosted[1], &with_pane_decided),
+            crate::quiet_barrier::resume::RecordWaitingRead::Waiting
+        );
+    }
+
     #[test]
     fn by_activity_classifies_every_census_class_and_sums_to_total() {
         let report = activity_report();
@@ -3273,7 +3851,7 @@ mod tests {
     fn records_are_read_only_for_processes_the_pane_did_not_decide() {
         let report = activity_report();
         let evidence = activity_evidence();
-        let pids: Vec<u32> = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW)
+        let pids: Vec<u32> = pids_needing_a_record(&report, &evidence.pane_by_pid, ACT_NOW, false)
             .into_iter()
             .map(|p| p.pid)
             .collect();
@@ -3333,6 +3911,7 @@ mod tests {
             kernel_agrees,
             RECORD_READ_TIMEOUT,
             &IN_FLIGHT,
+            false,
         )
         .await;
         assert!(
@@ -3381,6 +3960,7 @@ mod tests {
             slow_once,
             std::time::Duration::from_millis(20),
             &IN_FLIGHT,
+            false,
         )
         .await;
         assert!(evidence.records.is_empty());
@@ -3429,6 +4009,7 @@ mod tests {
                 kernel,
                 std::time::Duration::from_millis(timeout_ms),
                 &IN_FLIGHT,
+                false,
             )
             .await
         }
@@ -3467,5 +4048,296 @@ mod tests {
                 .idle,
             9
         );
+    }
+
+    // ── Quiet-barrier resume fields (plan 2026-09-29-quiet-on-demand, D5) ──
+
+    fn idle_verdict() -> RestartReadiness {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        verdict_from(
+            &empty_report(now_ms),
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        )
+    }
+
+    fn open_barrier() -> crate::quiet_barrier::BarrierState {
+        let crate::quiet_barrier::FileRecord::Recorded(b) = crate::quiet_barrier::parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        crate::quiet_barrier::BarrierState::Open(b)
+    }
+
+    /// Without a barrier the new fields are present, `false` / `null`, with a
+    /// reason — and the existing verdict is untouched.
+    #[test]
+    fn resume_fields_serialize_false_and_null_without_a_barrier() {
+        let mut v = idle_verdict();
+        assert!(v.safe_to_restart);
+        attach_resume(&mut v, &crate::quiet_barrier::BarrierState::Absent, None);
+        assert!(v.safe_to_restart, "safe_to_restart must not move");
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["safe_with_resume"], false);
+        assert!(json["resume"].is_null());
+        assert!(json["safe_with_resume_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no runner-restart quiet barrier is open"));
+
+        let mut v = idle_verdict();
+        attach_resume(
+            &mut v,
+            &crate::quiet_barrier::BarrierState::Unknown("corrupt".into()),
+            None,
+        );
+        assert!(!v.safe_with_resume);
+        assert!(v.safe_with_resume_reason.starts_with("UNKNOWN"));
+        assert!(v.resume.is_none());
+    }
+
+    /// Note 13: `resume_block_from` — the pure half of `gather_resume` — maps
+    /// a `finished` session to `finished_count`, the barrier's requester to a
+    /// `requester` straggler, an in-memory pending prompt to a
+    /// `pending_autonomous_prompt` straggler, a session with no record read to
+    /// `unknown`, and resumes the rest; a census pass that did not resolve is
+    /// an `unknown` straggler, never a vacuous "all resumable".
+    #[test]
+    fn resume_block_from_maps_finished_requester_pending_and_a_missing_pass() {
+        use crate::quiet_barrier::resume::{Descendants, SidebandRead};
+        let now_ms = ACT_NOW;
+        let crate::quiet_barrier::BarrierState::Open(mut barrier) = open_barrier() else {
+            unreachable!()
+        };
+        barrier.requester_session_id = Some("s-req".to_string());
+
+        let mut report = empty_report(now_ms);
+        report.terminal_hosted = vec![
+            wind_down_proc(1, Some("s-ok"), Some("working"), false, true),
+            wind_down_proc(2, Some("s-fin"), Some("finished"), false, true),
+            wind_down_proc(3, Some("s-req"), Some("working"), false, true),
+            wind_down_proc(4, Some("s-pend"), Some("working"), false, true),
+            wind_down_proc(5, Some("s-norec"), Some("working"), false, true),
+        ];
+        report.live_claude_total = 5;
+        let pass = tracking_health::TrackingHealthPass {
+            report,
+            open_records: vec![],
+        };
+        let evidence = ActivityEvidence {
+            pane_by_pid: HashMap::new(),
+            records: [1u32, 2, 3, 4]
+                .into_iter()
+                .map(|pid| (pid, act_record("idle", None)))
+                .collect(),
+            now_ms,
+        };
+        let restorable: Result<HashMap<String, bool>, String> = Ok([
+            "s-ok", "s-fin", "s-req", "s-pend", "s-norec",
+        ]
+        .into_iter()
+        .map(|s| (s.to_string(), true))
+        .collect());
+        let probe = |p: &LiveClaudeProcess| ResumeProbe {
+            terminal_id: Some(format!("term-{}", p.pid)),
+            sideband: SidebandRead::Reported("finished".to_string()),
+            descendants: Descendants::McpOnly,
+            pending_autonomous: if p.pid == 4 {
+                vec!["auto_response:r (scheduled)".to_string()]
+            } else {
+                vec![]
+            },
+        };
+        let ai = ai_plane_from(&[], &[], now_ms);
+        let block = resume_block_from(
+            &barrier,
+            true,
+            Some(&pass),
+            &evidence,
+            Some(&ai),
+            &[],
+            &restorable,
+            &probe,
+            &|_| Some(vec![]),
+        );
+        assert_eq!(block.resumable_count, 1, "{block:?}");
+        assert_eq!(block.finished_count, 1);
+        let class_of = |sid: &str| {
+            block
+                .stragglers
+                .iter()
+                .find(|s| s.session_id.as_deref() == Some(sid))
+                .map(|s| s.class)
+        };
+        assert_eq!(class_of("s-req"), Some("requester"));
+        assert_eq!(class_of("s-pend"), Some("pending_autonomous_prompt"));
+        assert_eq!(class_of("s-norec"), Some("unknown"));
+        assert_eq!(class_of("s-ok"), None);
+        assert_eq!(class_of("s-fin"), None);
+        assert_eq!(block.blocking_count, 3);
+        assert_eq!(block.expected_restore_set.len(), 5);
+
+        // An AI session holding a queued autonomous message is a
+        // `pending_autonomous_prompt` straggler; one without is `ai_session`.
+        let ai_two = ai_plane_from(
+            &[
+                AiSessionInput {
+                    id: "tr-queued".to_string(),
+                    state: "processing".to_string(),
+                    has_worktree: false,
+                    created_at_ms: None,
+                },
+                AiSessionInput {
+                    id: "tr-plain".to_string(),
+                    state: "ready".to_string(),
+                    has_worktree: false,
+                    created_at_ms: None,
+                },
+            ],
+            &[],
+            now_ms,
+        );
+        let with_ai = resume_block_from(
+            &barrier,
+            true,
+            Some(&pass),
+            &evidence,
+            Some(&ai_two),
+            &[],
+            &restorable,
+            &probe,
+            &|id| match id {
+                "tr-queued" => Some(vec![
+                    "sdk_queue (1 autonomous SDK message(s) queued in memory)".to_string(),
+                ]),
+                "tr-plain" => Some(vec![]),
+                _ => None,
+            },
+        );
+        let classes: Vec<&str> = with_ai
+            .stragglers
+            .iter()
+            .filter(|s| s.session_id.is_none() && s.pid.is_none())
+            .map(|s| s.class)
+            .collect();
+        assert!(classes.contains(&"pending_autonomous_prompt"), "{classes:?}");
+        assert!(classes.contains(&"ai_session"), "{classes:?}");
+
+        // A session the manager cannot resolve is `unknown`, never "no pending".
+        let ai_lost = ai_plane_from(
+            &[AiSessionInput {
+                id: "tr-lost".to_string(),
+                state: "ready".to_string(),
+                has_worktree: false,
+                created_at_ms: None,
+            }],
+            &[],
+            now_ms,
+        );
+        let lost = resume_block_from(
+            &barrier,
+            true,
+            Some(&pass),
+            &evidence,
+            Some(&ai_lost),
+            &[],
+            &restorable,
+            &probe,
+            &|_| None,
+        );
+        let unknown_ai = lost
+            .stragglers
+            .iter()
+            .find(|s| s.reason.contains("tr-lost"))
+            .expect("the unresolved AI session is reported");
+        assert_eq!(unknown_ai.class, "unknown");
+
+        // The census pass did not resolve: an explicit unknown straggler.
+        let missing = resume_block_from(
+            &barrier,
+            true,
+            None,
+            &evidence,
+            Some(&ai),
+            &[],
+            &restorable,
+            &probe,
+            &|_| Some(vec![]),
+        );
+        assert_eq!(missing.resumable_count, 0);
+        assert_eq!(missing.blocking_count, 1);
+        assert_eq!(missing.stragglers[0].class, "unknown");
+        assert!(missing.stragglers[0].reason.contains("census"), "{missing:?}");
+    }
+
+    /// Under an open barrier the `resume` block serializes with its exact wire
+    /// keys (Phase 5's script reads them), and `safe_with_resume` follows
+    /// `blocking_count == 0`.
+    #[test]
+    fn resume_block_serializes_its_wire_keys_under_an_open_barrier() {
+        use crate::quiet_barrier::resume::{build_block, Straggler};
+        let mut v = idle_verdict();
+        let block = build_block(
+            "rr-20260929T101500Z-a1b2c3",
+            &[],
+            vec![],
+            vec!["sess-a".to_string()],
+            true,
+        );
+        attach_resume(&mut v, &open_barrier(), Some(block));
+        assert!(v.safe_with_resume);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["safe_with_resume"], true);
+        let resume = &json["resume"];
+        let mut keys: Vec<&str> = resume
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "barrier_id",
+                "blocking_count",
+                "expected_restore_set",
+                "finished_count",
+                "resumable_count",
+                "stragglers",
+                "wake_paths_gated",
+            ]
+        );
+        assert_eq!(resume["barrier_id"], "rr-20260929T101500Z-a1b2c3");
+        assert_eq!(resume["expected_restore_set"], serde_json::json!(["sess-a"]));
+
+        let mut v = idle_verdict();
+        let block = build_block(
+            "rr-20260929T101500Z-a1b2c3",
+            &[],
+            vec![Straggler::other(Some(42), "headless", "headless")],
+            vec![],
+            true,
+        );
+        attach_resume(&mut v, &open_barrier(), Some(block));
+        assert!(!v.safe_with_resume);
+        let json = serde_json::to_value(&v).unwrap();
+        let straggler = &json["resume"]["stragglers"][0];
+        let mut keys: Vec<&str> = straggler
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["class", "pid", "reason", "session_id", "terminal_id"]);
+        assert_eq!(straggler["pid"], 42);
+        assert_eq!(json["resume"]["blocking_count"], 1);
     }
 }

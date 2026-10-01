@@ -123,10 +123,37 @@ pub fn reload_rules(rules: Vec<FleetRule>) {
         }
     }
     let count = compiled.len();
+    let live: std::collections::HashSet<String> = compiled.iter().map(|r| r.id.clone()).collect();
     if let Ok(mut guard) = COMPILED_RULES.write() {
         *guard = compiled;
     }
+    // A rule that was removed — or every rule, when the set is now empty (the
+    // feature deactivated) — will never fire again, so a barrier-deferred
+    // response for it is no longer pending work.
+    prune_pending_for_rules(&live);
     info!(count, "auto_response: rules reloaded");
+}
+
+/// Drop the pending-prompt entries of rules not in `live` (all of them when
+/// `live` is empty). A fire still scheduled for such a rule keeps its entry
+/// until it settles (its task still submits).
+fn prune_pending_for_rules(live: &std::collections::HashSet<String>) {
+    for (tid, key) in crate::quiet_barrier::pending::keys_with_prefix(PENDING_PREFIX) {
+        let Some(rid) = key.strip_prefix(PENDING_PREFIX) else {
+            continue;
+        };
+        if !live.contains(rid) {
+            clear_unwanted_pending(&tid, rid);
+        }
+    }
+}
+
+/// Is a rule with id `rid` currently loaded?
+fn rule_is_loaded(rid: &str) -> bool {
+    COMPILED_RULES
+        .read()
+        .map(|g| g.iter().any(|r| r.id == rid))
+        .unwrap_or(false)
 }
 
 /// True iff at least one rule is loaded — the PTY hot-path early-out.
@@ -178,6 +205,58 @@ fn collect_rising_edges(
     fired
 }
 
+/// Re-arm `(tid, rid)`'s edge so the rule fires again on the next pass that
+/// sees its text. Used when a scheduled response was DEFERRED by a quiet
+/// barrier: the edge that scheduled it was consumed, and without re-arming, a
+/// screen that keeps the text painted through the window would never fire
+/// again — the response would be lost rather than deferred.
+fn rearm_edge(tid: &str, rid: &str) {
+    let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(flags) = edge.get_or_insert_with(HashMap::new).get_mut(tid) {
+        flags.insert(rid.to_string(), false);
+    }
+}
+
+/// The prefix of every [`crate::quiet_barrier::pending`] key this module owns.
+const PENDING_PREFIX: &str = "auto_response:";
+
+/// The [`crate::quiet_barrier::pending`] key an auto-response for rule `rid`
+/// registers under.
+fn pending_key(rid: &str) -> String {
+    format!("{PENDING_PREFIX}{rid}")
+}
+
+/// Forget `tid`'s scan watermark, so the next scan re-reads its screen even if
+/// nothing repainted.
+fn forget_scan_watermark(tid: &str) {
+    let mut gate = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(g) = gate.as_mut() {
+        g.forget(tid);
+    }
+}
+
+/// How a scheduled submission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitOutcome {
+    /// The prompt is on the wire.
+    Submitted,
+    /// A quiet barrier deferred it: nothing was written, and the rule must be
+    /// re-evaluated after release (see [`rearm_edge`]).
+    Deferred,
+    /// Anything else (session gone, PTY exited, …).
+    Failed,
+}
+
+impl SubmitOutcome {
+    fn from_submit_error(err: &str) -> Self {
+        if crate::quiet_barrier::deferred_barrier_id(err).is_some() {
+            Self::Deferred
+        } else {
+            Self::Failed
+        }
+    }
+}
+
 /// One grid-scan pass over every live terminal: for each rule whose pattern is
 /// *freshly* visible on a terminal's rendered screen, schedule a backed-off
 /// response via the shared [`scheduler`]. Cheap no-op when no rules are loaded.
@@ -185,6 +264,15 @@ pub fn scan_grids_once() {
     use tauri::Manager;
 
     if !rules_active() {
+        return;
+    }
+    // A runner-restart quiet barrier holds every autonomous wake (plan
+    // `2026-09-29-quiet-on-demand-…`, D4). Skip the whole pass — WITHOUT
+    // touching the edge or scan-gate state — so the first pass after release
+    // judges every screen afresh: a rule whose text is still painted then
+    // fires on that pass instead of being lost to an edge consumed mid-window.
+    if let Some(barrier_id) = crate::quiet_barrier::autonomous_wakes_held() {
+        debug!(%barrier_id, "auto_response: grid scan held by quiet barrier");
         return;
     }
     let Some(app) = crate::tauri_app_handle::current() else {
@@ -199,6 +287,10 @@ pub fn scan_grids_once() {
     // the scheduler with NO locks held (the scheduler spawns + locks its own
     // state).
     let mut to_fire: Vec<(String, String, CompiledAction, BackoffConfig, String)> = Vec::new();
+    // `(tid, rid)` whose rule is no longer on screen: a barrier-deferred
+    // response for it is no longer wanted, so its pending-prompt entry goes
+    // (applied after the locks below are released).
+    let mut no_longer_matching: Vec<(String, String)> = Vec::new();
     {
         let Ok(rules) = COMPILED_RULES.read() else {
             return;
@@ -226,7 +318,16 @@ pub fn scan_grids_once() {
             };
             let normalized = normalize(&text);
             let prev = map.entry(tid.clone()).or_default();
-            for idx in collect_rising_edges(&normalized, &rules, prev) {
+            let fired = collect_rising_edges(&normalized, &rules, prev);
+            for rule in rules.iter() {
+                // The registry is a leaf lock, safe to probe under these.
+                if !prev.get(&rule.id).copied().unwrap_or(false)
+                    && crate::quiet_barrier::pending::contains(tid, &pending_key(&rule.id))
+                {
+                    no_longer_matching.push((tid.clone(), rule.id.clone()));
+                }
+            }
+            for idx in fired {
                 let rule = &rules[idx];
                 to_fire.push((
                     tid.clone(),
@@ -243,8 +344,20 @@ pub fn scan_grids_once() {
         gate.retain_live(&live);
     } // rules + edge + scan-gate locks released
 
+    for (tid, rid) in no_longer_matching {
+        clear_unwanted_pending(&tid, &rid);
+    }
     for (tid, rid, action, backoff, context) in to_fire {
         scheduler::on_match(&tid, &rid, &action, &backoff, &context);
+    }
+}
+
+/// Drop the pending-prompt entry for `(tid, rid)` when no fire is scheduled
+/// for it — i.e. it is a barrier-deferred response whose text has since left
+/// the screen. A fire still sleeping keeps its entry (it will submit).
+fn clear_unwanted_pending(tid: &str, rid: &str) {
+    if !scheduler::is_pending(tid, rid) {
+        crate::quiet_barrier::pending::clear(tid, &pending_key(rid));
     }
 }
 
@@ -432,6 +545,21 @@ mod scheduler {
         entry.pending = false;
     }
 
+    /// A scheduled fire that a quiet barrier DEFERRED: clear `pending` so the
+    /// next match can schedule again, WITHOUT bumping `attempts` — nothing
+    /// reached the session, so the backoff must not grow for it.
+    pub(super) fn release_deferred(tid: &str, rid: &str) {
+        let Ok(mut guard) = STATE.lock() else {
+            return;
+        };
+        if let Some(entry) = guard
+            .get_or_insert_with(HashMap::new)
+            .get_mut(&(tid.to_string(), rid.to_string()))
+        {
+            entry.pending = false;
+        }
+    }
+
     /// Entry point from the hook: schedule a backed-off response for a matched
     /// rule. No-op when a response is already pending for this pair.
     ///
@@ -452,6 +580,14 @@ mod scheduler {
         let Some(delay) = register_match(tid, rid, cfg, Instant::now()) else {
             return;
         };
+        // From here until `settle` the response exists only in this process's
+        // memory (a sleeping task), so a restart would drop it: register it
+        // as a pending autonomous prompt for the quiet-barrier resume check.
+        crate::quiet_barrier::pending::mark(
+            tid,
+            &super::pending_key(rid),
+            "auto-response scheduled or barrier-deferred",
+        );
         let tid = tid.to_string();
         let rid = rid.to_string();
         let action = action.clone();
@@ -463,14 +599,19 @@ mod scheduler {
             "auto_response: scheduling response"
         );
         tauri::async_runtime::spawn(async move {
+            // Clears the pending entry and frees the pair if this task ends
+            // WITHOUT settling (a panic in the scorer or the submit path).
+            let fire = FireGuard::new(&tid, &rid);
             tokio::time::sleep(delay).await;
+            let mut outcome = SubmitOutcome::Failed;
             match action {
                 CompiledAction::Fixed(text) => {
                     // Report the regex `submit_prompt` injection to coord's
                     // unified audit log ONLY when the submission actually
                     // landed. Best-effort + fire-and-forget (never blocks/fails
                     // the scheduler).
-                    if submit_to_session(&tid, &rid, &text).await {
+                    outcome = submit_to_session(&tid, &rid, &text).await;
+                    if outcome == SubmitOutcome::Submitted {
                         super::report::report_submit_prompt_injection(
                             &tid, &rid, &context, &context, &text,
                         )
@@ -495,7 +636,7 @@ mod scheduler {
                     .await
                     {
                         Some(text) => {
-                            submit_to_session(&tid, &rid, &text).await;
+                            outcome = submit_to_session(&tid, &rid, &text).await;
                         }
                         None => info!(
                             terminal_id = %tid,
@@ -505,34 +646,126 @@ mod scheduler {
                     }
                 }
             }
-            // Always bump backoff: a `resolved:false` / error still consumed an
-            // attempt, so the next match waits longer (and the reset-window
-            // restarts attempts once the burst is over).
-            record_fired(&tid, &rid, Instant::now());
+            fire.disarm();
+            settle(&tid, &rid, outcome, Instant::now());
         });
+    }
+
+    /// Armed for the life of one scheduled fire; on drop while still armed
+    /// (the task unwound before reaching `settle`) it clears the pair's
+    /// pending-prompt entry and frees the pair, so a panic can neither leave a
+    /// permanent `pending_autonomous_prompt` straggler nor wedge the rule.
+    pub(super) struct FireGuard {
+        tid: String,
+        rid: String,
+        armed: bool,
+    }
+
+    impl FireGuard {
+        pub(super) fn new(tid: &str, rid: &str) -> Self {
+            Self {
+                tid: tid.to_string(),
+                rid: rid.to_string(),
+                armed: true,
+            }
+        }
+
+        pub(super) fn disarm(mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for FireGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                crate::quiet_barrier::pending::clear(&self.tid, &super::pending_key(&self.rid));
+                release_deferred(&self.tid, &self.rid);
+            }
+        }
+    }
+
+    /// Settle one scheduled fire.
+    ///
+    /// - **Deferred** by a quiet barrier: nothing was sent, so no attempt was
+    ///   consumed. Free the pair ([`release_deferred`]), re-arm its edge
+    ///   ([`super::rearm_edge`]) and forget the terminal's scan watermark, so
+    ///   the first scan after release re-evaluates the screen — even an
+    ///   unchanged one — and fires again. The pending-prompt registry entry is
+    ///   KEPT: the response now exists only as in-memory re-arm state, which a
+    ///   restart drops, so the session stays a `pending_autonomous_prompt`
+    ///   straggler until it fires or its text leaves the screen.
+    /// - **Submitted / Failed:** always bump backoff — a `resolved:false` /
+    ///   error still consumed an attempt, so the next match waits longer (and
+    ///   the reset-window restarts attempts once the burst is over) — and
+    ///   clear the registry entry.
+    pub(super) fn settle(tid: &str, rid: &str, outcome: SubmitOutcome, now: Instant) {
+        settle_with(tid, rid, outcome, now, super::rule_is_loaded(rid));
+    }
+
+    /// [`settle`] with whether `rid` is still a loaded rule passed in. A
+    /// DEFERRED fire for a rule that is no longer loaded (removed while the
+    /// fire slept) will never fire again — no scan checks a rule that is not
+    /// loaded — so its pending entry is cleared instead of kept.
+    pub(super) fn settle_with(
+        tid: &str,
+        rid: &str,
+        outcome: SubmitOutcome,
+        now: Instant,
+        rule_loaded: bool,
+    ) {
+        if outcome == SubmitOutcome::Deferred && !rule_loaded {
+            release_deferred(tid, rid);
+            crate::quiet_barrier::pending::clear(tid, &super::pending_key(rid));
+            return;
+        }
+        if outcome == SubmitOutcome::Deferred {
+            release_deferred(tid, rid);
+            super::rearm_edge(tid, rid);
+            // An unchanged screen would never be re-scanned (the scan gate
+            // skips a terminal whose grid has not moved), so the re-armed edge
+            // would never fire and the entry would never clear: forget the
+            // watermark so the first scan AFTER RELEASE re-evaluates it.
+            super::forget_scan_watermark(tid);
+            return;
+        }
+        crate::quiet_barrier::pending::clear(tid, &super::pending_key(rid));
+        record_fired(tid, rid, now);
+    }
+
+    /// Whether a fire is scheduled and not yet settled for `(tid, rid)`.
+    pub(super) fn is_pending(tid: &str, rid: &str) -> bool {
+        let Ok(guard) = STATE.lock() else {
+            return false;
+        };
+        guard
+            .as_ref()
+            .and_then(|m| m.get(&(tid.to_string(), rid.to_string())))
+            .is_some_and(|e| e.pending)
     }
 
     /// Resolve the live session for `tid` and submit `prompt` into it. If the
     /// session is gone (closed during the backoff), log and return — the
     /// scheduler state is reaped lazily by the next reload / process anyway.
     ///
-    /// Returns `true` only when the prompt was actually submitted into a live
-    /// session (so the caller can gate audit reporting on a real injection).
-    async fn submit_to_session(tid: &str, rid: &str, prompt: &str) -> bool {
+    /// Returns [`SubmitOutcome::Submitted`] only when the prompt was actually
+    /// submitted into a live session (so the caller can gate audit reporting on
+    /// a real injection), and [`SubmitOutcome::Deferred`] when a quiet barrier
+    /// held it (so the caller re-arms rather than burning an attempt).
+    async fn submit_to_session(tid: &str, rid: &str, prompt: &str) -> SubmitOutcome {
         use tauri::Manager;
 
         let Some(app) = crate::tauri_app_handle::current() else {
-            return false;
+            return SubmitOutcome::Failed;
         };
         let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
-            return false;
+            return SubmitOutcome::Failed;
         };
         let Some(session) = tm.get(tid) else {
             info!(
                 terminal_id = %tid,
                 "auto_response: session gone before scheduled submission — skipping"
             );
-            return false;
+            return SubmitOutcome::Failed;
         };
         if let Err(e) = session.submit_prompt(
             prompt,
@@ -540,14 +773,24 @@ mod scheduler {
                 rule_id: rid.to_string(),
             },
         ) {
-            warn!(
-                terminal_id = %tid,
-                error = %e,
-                "auto_response: failed to submit scheduled prompt"
-            );
-            return false;
+            let outcome = SubmitOutcome::from_submit_error(&e);
+            if outcome == SubmitOutcome::Deferred {
+                info!(
+                    terminal_id = %tid,
+                    rule_id = %rid,
+                    "auto_response: scheduled prompt deferred by a quiet barrier — \
+                     re-evaluated after release"
+                );
+            } else {
+                warn!(
+                    terminal_id = %tid,
+                    error = %e,
+                    "auto_response: failed to submit scheduled prompt"
+                );
+            }
+            return outcome;
         }
-        true
+        SubmitOutcome::Submitted
     }
 
     /// Score the policy's options via the local Claude CLI, then resolve the
@@ -1459,5 +1702,227 @@ mod tests {
                 .as_secs(),
             60
         );
+    }
+
+    // ── Quiet-barrier deferral (plan 2026-09-29-quiet-on-demand, D4) ──────
+
+    #[test]
+    fn a_barrier_refusal_is_a_deferral_and_anything_else_a_failure() {
+        let deferred = crate::quiet_barrier::deferred_error("rr-1", "auto_response:r", "t", "x");
+        assert_eq!(
+            SubmitOutcome::from_submit_error(&deferred),
+            SubmitOutcome::Deferred
+        );
+        assert_eq!(
+            SubmitOutcome::from_submit_error("TERMINAL_EXITED: gone"),
+            SubmitOutcome::Failed
+        );
+    }
+
+    /// A deferred fire frees the pair WITHOUT consuming an attempt: the next
+    /// match (after release) schedules at attempt 0's delay again.
+    #[test]
+    fn a_deferred_fire_frees_the_pair_without_growing_the_backoff() {
+        let cfg = BackoffConfig {
+            initial_delay_secs: 60,
+            multiplier: 2.0,
+            max_delay_secs: None,
+        };
+        let t0 = Instant::now();
+        assert_eq!(
+            scheduler::register_match("term-Q", "r1", &cfg, t0)
+                .unwrap()
+                .as_secs(),
+            60
+        );
+        // Pending: a second match does not stack.
+        assert!(scheduler::register_match("term-Q", "r1", &cfg, t0).is_none());
+        scheduler::release_deferred("term-Q", "r1");
+        assert_eq!(
+            scheduler::register_match("term-Q", "r1", &cfg, t0)
+                .unwrap()
+                .as_secs(),
+            60,
+            "a deferral must not bump attempts"
+        );
+    }
+
+    /// Item 5 / note 13: the spawned task's settle path. A `Deferred` fire
+    /// frees the pair WITHOUT an attempt (`release_deferred`), re-arms the
+    /// consumed edge (`rearm_edge`) and KEEPS the pending-prompt entry; a later
+    /// `Submitted` settle bumps the backoff and clears the entry; a deferred
+    /// entry whose text left the screen is cleared by the scan's cleanup.
+    #[test]
+    fn settle_deferred_releases_rearms_and_keeps_the_pending_entry() {
+        let tid = "term-settle-deferred";
+        let rid = "rule-settle";
+        let cfg = BackoffConfig {
+            initial_delay_secs: 60,
+            multiplier: 2.0,
+            max_delay_secs: None,
+        };
+        let t0 = Instant::now();
+        // Schedule: the pair is pending and the entry is registered (what
+        // `on_match` does before spawning).
+        assert!(scheduler::register_match(tid, rid, &cfg, t0).is_some());
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
+        // The edge was consumed by the scan that scheduled it.
+        {
+            let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+            edge.get_or_insert_with(HashMap::new)
+                .entry(tid.to_string())
+                .or_default()
+                .insert(rid.to_string(), true);
+        }
+
+        scheduler::settle_with(tid, rid, SubmitOutcome::Deferred, t0, true);
+        assert!(!scheduler::is_pending(tid, rid), "release_deferred freed the pair");
+        {
+            let edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                edge.as_ref().unwrap()[tid].get(rid),
+                Some(&false),
+                "rearm_edge reset the consumed edge"
+            );
+        }
+        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        // No attempt consumed: the next schedule is at attempt 0's delay.
+        assert_eq!(
+            scheduler::register_match(tid, rid, &cfg, t0).unwrap().as_secs(),
+            60
+        );
+
+        // Delivered after release: backoff grows, entry cleared.
+        scheduler::settle_with(tid, rid, SubmitOutcome::Submitted, t0, true);
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert_eq!(
+            scheduler::register_match(tid, rid, &cfg, t0).unwrap().as_secs(),
+            120
+        );
+
+        // A deferred entry whose text has left the screen: the cleanup drops it
+        // only when no fire is still scheduled.
+        scheduler::settle_with(tid, rid, SubmitOutcome::Deferred, t0, true);
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "deferred");
+        assert!(scheduler::register_match(tid, rid, &cfg, t0).is_some());
+        clear_unwanted_pending(tid, rid);
+        assert!(
+            crate::quiet_barrier::pending::contains(tid, &pending_key(rid)),
+            "a fire still sleeping keeps its entry"
+        );
+        scheduler::release_deferred(tid, rid);
+        clear_unwanted_pending(tid, rid);
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+    }
+
+    /// W3: a deferred fire on an UNCHANGED screen is re-evaluated by the first
+    /// scan after release — `settle` forgets the scan watermark, which the
+    /// scan gate would otherwise use to skip the terminal forever.
+    #[test]
+    fn a_deferred_fire_on_an_unchanged_screen_is_rescanned_after_release() {
+        let tid = "term-unchanged-screen";
+        {
+            let mut gate = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            let g = gate.get_or_insert_with(super::super::scan_gate::ScanGate::new);
+            assert!(g.should_scan(tid, 7));
+            assert!(!g.should_scan(tid, 7), "unchanged: skipped");
+        }
+        scheduler::settle_with(tid, "rule-unchanged", SubmitOutcome::Deferred, Instant::now(), true);
+        let mut gate = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            gate.as_mut().unwrap().should_scan(tid, 7),
+            "the next scan re-reads the unchanged screen"
+        );
+    }
+
+    /// Round-3 note 4: a fire for a rule that was removed while it slept, and
+    /// that then settles `Deferred`, clears its entry (it can never fire again)
+    /// and frees the pair — instead of keeping a permanent straggler.
+    #[test]
+    fn a_deferred_fire_for_a_removed_rule_clears_its_entry() {
+        let tid = "term-removed-rule-deferred";
+        let rid = "rule-removed-while-sleeping";
+        let cfg = BackoffConfig::default();
+        assert!(scheduler::register_match(tid, rid, &cfg, Instant::now()).is_some());
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
+        scheduler::settle_with(tid, rid, SubmitOutcome::Deferred, Instant::now(), false);
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!scheduler::is_pending(tid, rid));
+        // `settle` itself reads the live rule set: this id is not loaded.
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
+        scheduler::settle(tid, rid, SubmitOutcome::Deferred, Instant::now());
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+    }
+
+    /// W3: removing a rule, or deactivating every rule, drops its deferred
+    /// entries; a rule still loaded keeps its entry.
+    #[test]
+    fn removed_and_deactivated_rules_drop_their_pending_entries() {
+        let tid = "term-prune-rules";
+        crate::quiet_barrier::pending::mark(tid, &pending_key("kept"), "deferred");
+        crate::quiet_barrier::pending::mark(tid, &pending_key("gone"), "deferred");
+        let live: std::collections::HashSet<String> = ["kept".to_string()].into();
+        prune_pending_for_rules(&live);
+        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key("kept")));
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key("gone")));
+        // Deactivated: no rules at all.
+        prune_pending_for_rules(&std::collections::HashSet::new());
+        assert!(crate::quiet_barrier::pending::for_session(tid).is_empty());
+    }
+
+    /// W3: a fire task that unwinds before settling clears its entry and frees
+    /// the pair.
+    #[test]
+    fn a_panicking_fire_clears_its_entry_and_frees_the_pair() {
+        let tid = "term-fire-panics";
+        let rid = "rule-panics";
+        let cfg = BackoffConfig::default();
+        assert!(scheduler::register_match(tid, rid, &cfg, Instant::now()).is_some());
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
+        let joined = std::thread::spawn(move || {
+            let _fire = scheduler::FireGuard::new(tid, rid);
+            panic!("scorer blew up");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(!crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        assert!(!scheduler::is_pending(tid, rid), "the pair can schedule again");
+
+        // A disarmed guard (the task reached `settle`) leaves the entry alone.
+        crate::quiet_barrier::pending::mark(tid, &pending_key(rid), "scheduled");
+        scheduler::FireGuard::new(tid, rid).disarm();
+        assert!(crate::quiet_barrier::pending::contains(tid, &pending_key(rid)));
+        crate::quiet_barrier::pending::clear(tid, &pending_key(rid));
+    }
+
+    /// Re-arming a consumed edge makes a still-painted match fire again on the
+    /// next pass — the "re-evaluated after release" half of the deferral.
+    #[test]
+    fn rearm_edge_lets_a_still_painted_match_fire_again() {
+        let rule = CompiledRule {
+            id: "rule-rearm".to_string(),
+            regex: regex::Regex::new("rate limited").unwrap(),
+            action: CompiledAction::Fixed("continue".to_string()),
+            backoff: BackoffConfig::default(),
+        };
+        let rules = vec![rule];
+        let screen = "api error: rate limited";
+        {
+            let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = edge
+                .get_or_insert_with(HashMap::new)
+                .entry("term-rearm".to_string())
+                .or_default();
+            assert_eq!(collect_rising_edges(screen, &rules, prev), vec![0]);
+            // Still painted: no second edge.
+            assert!(collect_rising_edges(screen, &rules, prev).is_empty());
+        }
+        rearm_edge("term-rearm", "rule-rearm");
+        let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = edge
+            .get_or_insert_with(HashMap::new)
+            .get_mut("term-rearm")
+            .unwrap();
+        assert_eq!(collect_rising_edges(screen, &rules, prev), vec![0]);
     }
 }

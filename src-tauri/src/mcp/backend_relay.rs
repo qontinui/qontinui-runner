@@ -3783,7 +3783,13 @@ async fn handle_chat_message(api_state: &Arc<ApiState>, data: &Value) -> Option<
                 .append_task_output_ex(task_run_id, &msg, false, false)
                 .await;
 
-            match session.send_user_message(content) {
+            // The operator typing into the web chat, relayed verbatim — a
+            // human's keystrokes, so `Operator`: a quiet barrier never holds
+            // it, exactly like `RemoteTerminalInput` on the PTY side (D4).
+            match session.send_user_message(
+                content,
+                crate::quiet_barrier::SdkMessageCaller::BackendChatRelay,
+            ) {
                 Ok(sent_immediately) => Some(serde_json::json!({
                     "type": "chat_message_ack",
                     "success": true,
@@ -4044,11 +4050,6 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             Ok(session) => {
                 let session = Arc::new(session);
 
-                if let Err(e) = session_manager.register(&bg_task_run_id, session.clone()) {
-                    warn!("Failed to register relay AI session: {}", e);
-                    return;
-                }
-
                 crate::commands::ai_session::emit_session_state(
                     &bg_state.app_handle,
                     &bg_task_run_id,
@@ -4056,9 +4057,21 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
                     session.state(),
                 );
 
+                // Initial prompt, THEN register (plan `2026-09-29-quiet-on-demand-…`, D4): an
+                // unregistered session is reachable by nothing — not the poller, the
+                // conductor nor HTTP — so `send_initial_prompt` cannot lose a race to
+                // another turn and be refused, leaving a registered session that never
+                // gets its brief. Same order as promotion and the rate-limit restart.
                 let prompt_to_send = initial_prompt.as_deref().unwrap_or(&system_prompt);
                 if let Err(e) = session.send_initial_prompt(prompt_to_send) {
                     warn!("Failed to send initial prompt for relay chat: {}", e);
+                    let _ = session.close();
+                    return;
+                }
+
+                if let Err(e) = session_manager.register(&bg_task_run_id, session.clone()) {
+                    warn!("Failed to register relay AI session: {}", e);
+                    let _ = session.close();
                     return;
                 }
 

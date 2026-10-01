@@ -97,6 +97,14 @@ impl ScanGate {
         }
     }
 
+    /// Forget `terminal_id`'s watermark, so the next tick scans it even if its
+    /// grid has not changed. Used when a decision made on the last scan was
+    /// undone (a quiet-barrier-deferred auto-response): an unchanged screen
+    /// must still be judged again.
+    pub(super) fn forget(&mut self, terminal_id: &str) {
+        self.seen.remove(terminal_id);
+    }
+
     /// Drop watermarks for terminals that have gone away.
     pub(super) fn retain_live(&mut self, live: &HashSet<&String>) {
         self.seen.retain(|tid, _| live.contains(tid));

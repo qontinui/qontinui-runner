@@ -431,6 +431,63 @@ fn terminal_exited_response(id: &str, message: &str, bytes_dropped: usize) -> Ap
     body
 }
 
+/// Build the `409 QUIET_BARRIER_DEFERRED` body for an autonomous write the
+/// quiet-barrier gate deferred (plan `2026-09-29-quiet-on-demand-…`, D4).
+///
+/// 409, not 5xx: the runner is healthy and the request is well-formed — it
+/// conflicts with an open `runner-restart` barrier, and the same request
+/// succeeds once that barrier is released or expires. `barrier_id` is in the
+/// context so the caller can wait on exactly that barrier.
+fn quiet_barrier_deferred_response(
+    id: &str,
+    message: &str,
+    barrier_id: &str,
+    bytes_dropped: usize,
+) -> ApiResponse<()> {
+    let mut body = api_error_detailed(
+        message.to_string(),
+        crate::mcp::ui_bridge::UiBridgeError {
+            code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionFailed,
+            message: message.to_string(),
+            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::RetryAfterMs(30_000)),
+            context: Some(serde_json::json!({
+                "terminal_id": id,
+                "reason": crate::quiet_barrier::QUIET_BARRIER_DEFERRED,
+                "barrier_id": barrier_id,
+                "bytes_dropped": bytes_dropped,
+                "hint": "A runner-restart quiet barrier is holding autonomous writes so idle \
+                         sessions stay idle for a resumable restart. Nothing was written; \
+                         retry after the barrier is released or expires.",
+            })),
+        },
+    );
+    body.code = Some(crate::quiet_barrier::QUIET_BARRIER_DEFERRED.to_string());
+    body
+}
+
+/// Map a `write` / `submit_prompt` refusal that the quiet-barrier gate
+/// produced to its 409; `None` for every other error.
+fn quiet_barrier_conflict(
+    id: &str,
+    err: &str,
+    bytes_dropped: usize,
+) -> Option<(StatusCode, Json<ApiResponse<()>>)> {
+    let barrier_id = crate::quiet_barrier::deferred_barrier_id(err)?;
+    info!(
+        "HTTP: write to terminal {} deferred by quiet barrier {}",
+        id, barrier_id
+    );
+    Some((
+        StatusCode::CONFLICT,
+        Json(quiet_barrier_deferred_response(
+            id,
+            err,
+            barrier_id,
+            bytes_dropped,
+        )),
+    ))
+}
+
 /// Write data to a terminal's PTY stdin.
 pub async fn write_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -462,6 +519,9 @@ pub async fn write_terminal_handler(
             // healthy; 400 + `ACTION_FAILED` tells it the request is unsatisfiable
             // until the session is restarted, which is what the frontend's
             // `buildWriteFailure` already reports for the same condition.
+            if let Some(conflict) = quiet_barrier_conflict(&id, &e, bytes.len()) {
+                return conflict;
+            }
             if e.starts_with(crate::terminal::session::TERMINAL_EXITED) {
                 warn!("HTTP: refused write to exited terminal {}: {}", id, e);
                 return (
@@ -589,6 +649,9 @@ pub async fn submit_prompt_handler(
             crate::terminal::session::PtyWriteCaller::HttpSubmitPrompt,
         )
         .map_err(|e| {
+            if let Some(conflict) = quiet_barrier_conflict(&id, &e, request.message.len()) {
+                return conflict;
+            }
             error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1368,5 +1431,27 @@ mod tests {
             paths.len(),
             registered
         );
+    }
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: a write/submit the quiet
+    /// barrier deferred maps to `409 QUIET_BARRIER_DEFERRED` naming the
+    /// barrier id; every other refusal is left to the existing mapping.
+    #[test]
+    fn a_quiet_barrier_deferral_maps_to_a_409_naming_the_barrier() {
+        let err = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "http_submit_prompt",
+            "term-9",
+            "held",
+        );
+        let (status, Json(body)) =
+            quiet_barrier_conflict("term-9", &err, 5).expect("a deferral is a conflict");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("QUIET_BARRIER_DEFERRED"));
+        let json = serde_json::to_value(&body).unwrap();
+        let text = json.to_string();
+        assert!(text.contains("rr-20260929T101500Z-a1b2c3"), "{text}");
+        assert!(text.contains("\"barrier_id\""), "{text}");
+        assert!(quiet_barrier_conflict("term-9", "TERMINAL_EXITED: x", 1).is_none());
     }
 }

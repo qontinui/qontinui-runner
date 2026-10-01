@@ -37,6 +37,10 @@ use std::os::windows::io::AsRawHandle;
 /// Maximum number of pending user messages in the queue.
 const MAX_PENDING_MESSAGES: usize = 10;
 
+/// How often the heartbeat thread retries draining a queue whose head the
+/// quiet barrier held at turn end (see [`super::queued`]).
+const QUEUED_DRAIN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Metadata about a git worktree this session has been promoted into.
 ///
 /// When `Some`, the underlying Claude CLI process has its `cwd` set to
@@ -125,8 +129,10 @@ pub struct ClaudeSession {
     state_tracker: SessionStateTracker,
     /// Thread-safe stdin writer.
     stdin_writer: Arc<StdinWriter>,
-    /// Queue of user messages waiting to be sent (when session is Processing).
-    pending_messages: Arc<Mutex<VecDeque<String>>>,
+    /// Queue of user messages waiting to be sent (when session is Processing),
+    /// each with the door it came from so the turn-end drain re-checks the
+    /// quiet barrier (see [`super::queued`]).
+    pending_messages: Arc<Mutex<VecDeque<super::queued::QueuedMessage>>>,
     /// Accumulated text output from the session.
     accumulated_output: Arc<Mutex<String>>,
     /// Whether a user has sent at least one message (for autonomous/interactive switching).
@@ -193,6 +199,17 @@ pub struct ClaudeSession {
     /// default is ON) or the coord session id / device id couldn't be
     /// resolved — a strict no-op.
     agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+    /// The Claude CLI session id this session was pinned (`--session-id`) or
+    /// resumed (`--resume`) with, when the spawn pinned one. Passed to the
+    /// quiet-barrier wake gate beside `session_id`, so a barrier whose
+    /// requester names the Claude session id exempts this session exactly as
+    /// the PTY gate does with a terminal's pinned id.
+    pinned_cli_session_id: Option<String>,
+    /// This session INSTANCE's key in the quiet-barrier pending registry
+    /// ([`super::queued::new_instance_key`]): the session id plus a
+    /// per-process instance number, so a promoted / restarted session that
+    /// reuses the id never shares — or clears — this instance's entry.
+    instance_key: String,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -289,6 +306,8 @@ impl ClaudeSession {
             }
             None => (None, None),
         };
+        let pinned_cli_session_id = session_id_pin.clone().or_else(|| resume_id_pin.clone());
+        let instance_key = super::queued::new_instance_key(session_id);
 
         // Model override (e.g., from per-stage config) is fed to the seam below
         // as `spec.model` so it wins over any template `--model`.
@@ -553,7 +572,8 @@ impl ClaudeSession {
         // Create shared state
         let state_tracker = SessionStateTracker::new();
         let stdin_writer = Arc::new(StdinWriter::new(stdin));
-        let pending_messages: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages: Arc<Mutex<VecDeque<super::queued::QueuedMessage>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         let accumulated_output = Arc::new(Mutex::new(String::new()));
         let user_has_interacted = Arc::new(AtomicBool::new(false));
         let shared_output_buf = Arc::new(Mutex::new(String::new()));
@@ -658,15 +678,46 @@ impl ClaudeSession {
         let app_handle_heartbeat = app_handle.clone();
         let session_ctx_heartbeat = session_ctx.clone();
         let has_output_heartbeat = has_output.clone();
+        let state_for_drain = state_tracker.clone();
+        let writer_for_drain = stdin_writer.clone();
+        let pending_for_drain = pending_messages.clone();
+        let interacted_for_drain = user_has_interacted.clone();
         let start_time = Instant::now();
 
         let heartbeat_handle = thread::spawn(move || {
             let mut last_update = 0u64;
+            let mut last_drain_retry = Instant::now();
             loop {
-                if stop_rx.try_recv().is_ok() {
-                    break;
+                match stop_rx.try_recv() {
+                    // Stopped, or the session was dropped without sending
+                    // (its sender is gone): either way, end the thread —
+                    // it holds the queue, the stdin writer and the app handle.
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
                 thread::sleep(Duration::from_millis(100));
+
+                // A queued message the quiet barrier held at turn end has no
+                // later turn end to drain it, so retry the drain every few
+                // seconds while the session sits Ready with a non-empty queue:
+                // the held entry goes out once the barrier is released.
+                if last_drain_retry.elapsed() >= QUEUED_DRAIN_RETRY_INTERVAL {
+                    last_drain_retry = Instant::now();
+                    let queued = pending_for_drain
+                        .lock()
+                        .map(|q| !q.is_empty())
+                        .unwrap_or(false);
+                    if queued {
+                        dispatcher::send_next_pending_message(
+                            &state_for_drain,
+                            &writer_for_drain,
+                            &pending_for_drain,
+                            &interacted_for_drain,
+                            &app_handle_heartbeat,
+                            session_ctx_heartbeat.as_ref(),
+                        );
+                    }
+                }
 
                 if has_output_heartbeat.load(Ordering::Relaxed) {
                     continue;
@@ -1171,6 +1222,8 @@ impl ClaudeSession {
         // Spawn a background thread to wait for child process exit
         // and manage final cleanup / state transitions.
         let state_for_waiter = state_tracker.clone();
+        let pending_for_waiter = pending_messages.clone();
+        let instance_key_for_waiter = instance_key.clone();
         let writer_for_waiter = stdin_writer.clone();
         let session_id_for_waiter = session_id.to_string();
         let working_dir_for_waiter = working_dir.to_string();
@@ -1262,6 +1315,12 @@ impl ClaudeSession {
 
             // Transition to Closed
             state_for_waiter.force_close();
+            // The process is gone, and so is anything queued for it: drop the
+            // queue and this instance's pending-prompt registration, so an
+            // exited session is never reported (`Drop` skips `close()` once
+            // the state is already Closed, so this is the only place it runs
+            // for a session that exits on its own).
+            super::queued::discard_all(&pending_for_waiter, &instance_key_for_waiter);
             info!(
                 "Session {} process exited, state -> Closed (rate_limited={})",
                 session_id_for_waiter, is_rate_limited
@@ -1330,6 +1389,8 @@ impl ClaudeSession {
         }
 
         Ok(Self {
+            pinned_cli_session_id,
+            instance_key,
             session_id: session_id.to_string(),
             holder_name,
             state_tracker,
@@ -1423,18 +1484,34 @@ impl ClaudeSession {
 
     /// Send the initial prompt to start the first turn.
     /// Transitions from Ready to Processing.
+    ///
+    /// Written through the SDK queue's lock ([`super::queued::submit_initial`],
+    /// `SdkMessageCaller::ExecutorFirstMessage`, session-internal).
+    ///
+    /// **Call it BEFORE registering the session with `SessionManager`** — every
+    /// caller does (the runner, `POST /sessions`, `POST /task-runs/ai-session`,
+    /// the relay chat, resume, promotion and the rate-limit restart). An
+    /// unregistered session is reachable by nothing, so no other message can
+    /// start a turn first and this cannot be refused by a race. The refusal
+    /// (another turn in flight, or something queued) stays as a defence: it is
+    /// returned naming the race rather than writing a second turn, and the
+    /// caller closes the still-unregistered session.
     pub fn send_initial_prompt(&self, prompt: &str) -> Result<(), String> {
-        let state = self.state_tracker.get();
-        if state != SessionState::Ready {
-            return Err(format!("Cannot send initial prompt in state: {}", state));
-        }
-
-        let user_msg = UserInputMessage::new(prompt, "default");
-        self.stdin_writer.write_message(&user_msg)?;
-
-        self.state_tracker
-            .transition(SessionState::Processing)
-            .map_err(|e| format!("State transition failed: {}", e))?;
+        let msg = super::queued::QueuedMessage::new(
+            prompt,
+            crate::quiet_barrier::SdkMessageCaller::ExecutorFirstMessage,
+            &self.session_id,
+            self.barrier_target_ids(),
+            &self.instance_key,
+        );
+        let sink = dispatcher::LiveSink {
+            state: &self.state_tracker,
+            writer: &self.stdin_writer,
+            interacted: &self.user_has_interacted,
+            mark_interacted: false,
+            emit: None,
+        };
+        super::queued::submit_initial(&self.pending_messages, msg, &sink)?;
 
         info!(
             "Sent initial prompt ({} chars), session {} -> Processing",
@@ -1445,53 +1522,78 @@ impl ClaudeSession {
         Ok(())
     }
 
+    /// The ids the quiet-barrier requester exemption matches: the runner
+    /// session id, plus the pinned Claude CLI session id when there is one.
+    fn barrier_target_ids(&self) -> Vec<String> {
+        let mut ids = vec![self.session_id.clone()];
+        if let Some(pinned) = self.pinned_cli_session_id.as_ref() {
+            if !pinned.is_empty() && *pinned != self.session_id {
+                ids.push(pinned.clone());
+            }
+        }
+        ids
+    }
+
+    /// This instance's key in the quiet-barrier pending registry.
+    pub fn pending_registry_key(&self) -> &str {
+        &self.instance_key
+    }
+
+    /// The quiet-barrier gate [`Self::send_user_message`] runs.
+    fn wake_gate(&self, caller: crate::quiet_barrier::SdkMessageCaller) -> Result<(), String> {
+        crate::quiet_barrier::sdk_wake_gate(caller, &self.session_id, &self.barrier_target_ids())
+    }
+
     /// Send a user message. If Ready, sends immediately. If Processing, queues it.
     /// Returns true if sent immediately, false if queued.
-    pub fn send_user_message(&self, message: &str) -> Result<bool, String> {
-        let state = self.state_tracker.get();
-
-        if !state.can_send_message() {
-            return Err(format!("Cannot send message in state: {}", state));
-        }
-
-        if state == SessionState::Ready {
-            // Send immediately
-            let user_msg = UserInputMessage::new(message, "default");
-            self.stdin_writer.write_message(&user_msg)?;
-            self.user_has_interacted.store(true, Ordering::Relaxed);
-
-            self.state_tracker
-                .transition(SessionState::Processing)
-                .map_err(|e| format!("State transition failed: {}", e))?;
-
-            info!(
-                "Sent user message immediately ({} chars), session {} -> Processing",
-                message.len(),
-                self.session_id
-            );
-            Ok(true)
-        } else {
-            // Queue the message (Processing state)
-            let mut queue = self
-                .pending_messages
-                .lock()
-                .map_err(|e| format!("Failed to lock message queue: {}", e))?;
-
-            if queue.len() >= MAX_PENDING_MESSAGES {
-                return Err(format!(
-                    "Message queue full ({} messages). Wait for the current turn to complete.",
-                    MAX_PENDING_MESSAGES
-                ));
-            }
-
-            queue.push_back(message.to_string());
-            info!(
-                "Queued user message ({} chars, {} in queue)",
-                message.len(),
-                queue.len()
-            );
-            Ok(false)
-        }
+    ///
+    /// `caller` names the door (see [`crate::quiet_barrier::SdkMessageCaller`]).
+    /// This is the ONE funnel every SDK message goes through, so the quiet
+    /// barrier (plan `2026-09-29-quiet-on-demand-…`, D4) is consulted here:
+    /// an `Autonomous` caller under an open `runner-restart` barrier (or an
+    /// unknown store) is refused BEFORE anything is written or queued, with the
+    /// typed `QUIET_BARRIER_DEFERRED` error naming the barrier — the caller
+    /// keeps the work and retries after release. Operator and session-internal
+    /// callers pass without reading the barrier store.
+    pub fn send_user_message(
+        &self,
+        message: &str,
+        caller: crate::quiet_barrier::SdkMessageCaller,
+    ) -> Result<bool, String> {
+        self.wake_gate(caller)?;
+        // Decided and written under the queue lock, in the same order as the
+        // turn-end drain and the heartbeat retry (`queued` module docs): no
+        // double send, and a message submitted while anything is queued goes
+        // behind it (FIFO among autonomous messages).
+        let msg = super::queued::QueuedMessage::new(
+            message,
+            caller,
+            &self.session_id,
+            self.barrier_target_ids(),
+            &self.instance_key,
+        );
+        let sink = dispatcher::LiveSink {
+            state: &self.state_tracker,
+            writer: &self.stdin_writer,
+            interacted: &self.user_has_interacted,
+            mark_interacted: true,
+            emit: None,
+        };
+        let outcome = super::queued::submit(
+            &self.pending_messages,
+            msg,
+            MAX_PENDING_MESSAGES,
+            &sink,
+            &super::queued::live_gate,
+        )?;
+        let now = outcome == super::queued::Submitted::Now;
+        info!(
+            "{} user message ({} chars), session {}",
+            if now { "Sent" } else { "Queued" },
+            message.len(),
+            self.session_id
+        );
+        Ok(now)
     }
 
     /// Send an interrupt request.
@@ -1698,6 +1800,13 @@ impl ClaudeSession {
         if let Some(ref tx) = self.stop_heartbeat {
             let _ = tx.send(());
         }
+        // Close the STATE first, so a `submit` racing this close is refused by
+        // `can_accept` instead of re-queueing (and re-registering) after the
+        // clear below; THEN drop whatever is still queued (it dies with the
+        // session) and this instance's pending-prompt registration. Under the
+        // queue lock, so a heartbeat drain already running finishes first.
+        self.state_tracker.force_close();
+        super::queued::discard_all(&self.pending_messages, &self.instance_key);
 
         // Flush any remaining unpersisted output before closing.
         // Set persisted_output_len to MAX first to prevent the dispatcher from

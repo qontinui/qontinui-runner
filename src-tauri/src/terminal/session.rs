@@ -1044,6 +1044,44 @@ impl PtyWriteCaller {
             Self::Test => "test",
         })
     }
+
+    /// Which barrier class this producer's writes belong to (plan
+    /// `2026-09-29-quiet-on-demand-…`, D4). The funnels ([`TerminalSession::write`],
+    /// [`TerminalSession::submit_prompt`]) hold an `Autonomous` write while a
+    /// `runner-restart` quiet barrier is open; every other class passes.
+    ///
+    /// Exhaustive with NO `_` arm on purpose: a variant added later does not
+    /// compile until someone decides whether it may wake a session that a
+    /// restart is waiting to find idle.
+    pub fn wake_class(&self) -> crate::quiet_barrier::WakeClass {
+        use crate::quiet_barrier::WakeClass;
+        match self {
+            // A human's keystrokes — never swallowed (UX: predictability).
+            Self::TauriTerminalWrite => WakeClass::Operator,
+            Self::WebSocketInput => WakeClass::Operator,
+            Self::RemoteTerminalInput => WakeClass::Operator,
+            // Programmatic prompts into a live session — deferred, not dropped.
+            Self::HttpSubmitPrompt => WakeClass::Autonomous,
+            Self::HttpWrite => WakeClass::Autonomous,
+            Self::TauriInvokeProxy => WakeClass::Autonomous,
+            Self::SessionMessagePoller => WakeClass::Autonomous,
+            Self::AutoResponse { .. } => WakeClass::Autonomous,
+            Self::AccountMigration => WakeClass::Autonomous,
+            Self::LoopingAgentNudge => WakeClass::Autonomous,
+            Self::WorkerSession => WakeClass::Autonomous,
+            // The session's own launch / transport / exit plumbing. Spawn-time
+            // writes are governed at spawn by the drain, and `GracefulExit` is
+            // wind-down's own `/exit`, which must never be barrier-blocked.
+            Self::LaunchInitialCommand => WakeClass::SessionInternal,
+            Self::HttpCreateInitialCommand => WakeClass::SessionInternal,
+            Self::StewardLaunchCommand => WakeClass::SessionInternal,
+            Self::PtyTransport => WakeClass::SessionInternal,
+            Self::ClaudeCliTransport => WakeClass::SessionInternal,
+            Self::GracefulExit => WakeClass::SessionInternal,
+            #[cfg(test)]
+            Self::Test => WakeClass::Test,
+        }
+    }
 }
 
 impl std::fmt::Display for PtyWriteCaller {
@@ -3346,6 +3384,11 @@ impl TerminalSession {
         // funnel for terminal input, and where every future write surface
         // inherits it for free.
         self.liveness_gate()?;
+        // -- QUIET-BARRIER GATE (D4) -------------------------------------
+        // After liveness (a dead pane's refusal is the more useful answer),
+        // before a byte moves. Cheap for keystrokes: only `Autonomous`
+        // producers consult the (cached) barrier store.
+        self.quiet_barrier_gate(&caller)?;
         {
             let mut writer = self
                 .writer
@@ -3424,6 +3467,45 @@ impl TerminalSession {
             ));
         }
         Ok(())
+    }
+
+    /// The D4 wake gate both funnels share: an `Autonomous` producer writing
+    /// while a `runner-restart` quiet barrier is open (or the barrier store is
+    /// UNKNOWN) is refused with a typed [`crate::quiet_barrier::QUIET_BARRIER_DEFERRED`]
+    /// error naming the barrier — a deferral the caller must keep and retry,
+    /// never a silent drop. The session's own ids are passed so the barrier's
+    /// requester is not held by its own barrier.
+    fn quiet_barrier_gate(&self, caller: &PtyWriteCaller) -> Result<(), String> {
+        if caller.wake_class() != crate::quiet_barrier::WakeClass::Autonomous {
+            return Ok(());
+        }
+        let mut own_ids: Vec<String> = Vec::with_capacity(2);
+        if !self.pinned_session_id.is_empty() {
+            own_ids.push(self.pinned_session_id.clone());
+        }
+        if let Some(id) = self.coord_session_id() {
+            own_ids.push(id.to_string());
+        }
+        match crate::quiet_barrier::wake_allowed(caller, &own_ids) {
+            crate::quiet_barrier::WakeDecision::Allow => Ok(()),
+            crate::quiet_barrier::WakeDecision::Defer { barrier_id, reason } => {
+                // debug, not info: a deferred producer retries every tick for
+                // as long as the barrier holds; the refusal it returns is the
+                // record.
+                debug!(
+                    terminal_id = %self.id,
+                    caller = %caller,
+                    barrier_id = %barrier_id,
+                    "terminal write deferred by quiet barrier"
+                );
+                Err(crate::quiet_barrier::deferred_error(
+                    &barrier_id,
+                    &caller.tag(),
+                    &self.id,
+                    &reason,
+                ))
+            }
+        }
     }
 
     /// A snapshot of who last wrote to this PTY, through either choke point.
@@ -3553,6 +3635,10 @@ impl TerminalSession {
                 }
             ));
         }
+
+        // Same QUIET-BARRIER GATE as `write` (D4): `submit_prompt` does not
+        // route through `write`, so it does not inherit it.
+        self.quiet_barrier_gate(&caller)?;
 
         // Frame + neutralize BEFORE taking the writer lock — the body is
         // untrusted (the `POST /terminals/{id}/submit-prompt` route is
@@ -8363,5 +8449,189 @@ mod tests {
             0,
             "no byte reached the parser — the old gate signal is blind to this"
         );
+    }
+
+    // ── Quiet-barrier wake gating (plan 2026-09-29-quiet-on-demand, D4) ────
+
+    use crate::quiet_barrier::{
+        parse_record, with_test_state, BarrierState, FileRecord, WakeClass,
+        QUIET_BARRIER_DEFERRED,
+    };
+
+    fn open_runner_restart_barrier() -> BarrierState {
+        let FileRecord::Recorded(b) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        BarrierState::Open(b)
+    }
+
+    /// The D4 table, spelled out literally per variant (deriving it from
+    /// `wake_class()` would restate the implementation).
+    #[test]
+    fn wake_class_matches_the_d4_table() {
+        use WakeClass::*;
+        let table: Vec<(PtyWriteCaller, WakeClass)> = vec![
+            (PtyWriteCaller::TauriTerminalWrite, Operator),
+            (PtyWriteCaller::WebSocketInput, Operator),
+            (PtyWriteCaller::RemoteTerminalInput, Operator),
+            (PtyWriteCaller::HttpSubmitPrompt, Autonomous),
+            (PtyWriteCaller::HttpWrite, Autonomous),
+            (PtyWriteCaller::TauriInvokeProxy, Autonomous),
+            (PtyWriteCaller::SessionMessagePoller, Autonomous),
+            (
+                PtyWriteCaller::AutoResponse {
+                    rule_id: "r".to_string(),
+                },
+                Autonomous,
+            ),
+            (PtyWriteCaller::AccountMigration, Autonomous),
+            (PtyWriteCaller::LoopingAgentNudge, Autonomous),
+            (PtyWriteCaller::WorkerSession, Autonomous),
+            (PtyWriteCaller::LaunchInitialCommand, SessionInternal),
+            (PtyWriteCaller::HttpCreateInitialCommand, SessionInternal),
+            (PtyWriteCaller::StewardLaunchCommand, SessionInternal),
+            (PtyWriteCaller::PtyTransport, SessionInternal),
+            (PtyWriteCaller::ClaudeCliTransport, SessionInternal),
+            (PtyWriteCaller::GracefulExit, SessionInternal),
+            (PtyWriteCaller::Test, Test),
+        ];
+        for (caller, class) in &table {
+            assert_eq!(caller.wake_class(), *class, "{caller}");
+        }
+        // Every production producer is in the table.
+        for caller in every_production_caller() {
+            assert!(
+                table
+                    .iter()
+                    .any(|(c, _)| std::mem::discriminant(c) == std::mem::discriminant(&caller)),
+                "{caller} missing from the D4 table"
+            );
+        }
+    }
+
+    fn autonomous_callers() -> Vec<PtyWriteCaller> {
+        every_production_caller()
+            .into_iter()
+            .filter(|c| c.wake_class() == WakeClass::Autonomous)
+            .collect()
+    }
+
+    /// Every `Autonomous` producer is DEFERRED under an open runner-restart
+    /// barrier — through both funnels, with nothing on the wire and a typed
+    /// refusal naming the barrier — and delivered once the barrier is gone.
+    #[test]
+    fn every_autonomous_write_is_deferred_under_a_barrier_and_delivered_after_release() {
+        let autonomous = autonomous_callers();
+        assert_eq!(autonomous.len(), 8, "{autonomous:?}");
+        for caller in autonomous {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let session = LiveTestSession::new(buf.clone());
+            with_test_state(open_runner_restart_barrier(), || {
+                let err = session
+                    .submit_prompt("wake up", caller.clone())
+                    .expect_err("submit must be deferred");
+                assert!(err.starts_with(QUIET_BARRIER_DEFERRED), "{caller}: {err}");
+                assert_eq!(
+                    crate::quiet_barrier::deferred_barrier_id(&err),
+                    Some("rr-20260929T101500Z-a1b2c3"),
+                    "{caller}"
+                );
+                let err = session
+                    .write(b"x", caller.clone())
+                    .expect_err("write must be deferred");
+                assert!(err.starts_with(QUIET_BARRIER_DEFERRED), "{caller}: {err}");
+            });
+            assert!(buf.lock().unwrap().is_empty(), "{caller}: bytes leaked");
+            let slots = session.last_input();
+            assert!(
+                slots.last_write.is_none() && slots.last_submit.is_none(),
+                "{caller}: a deferred write must not read as input"
+            );
+            // Released: the same write lands.
+            session
+                .submit_prompt("wake up", caller.clone())
+                .unwrap_or_else(|e| panic!("{caller} after release: {e}"));
+            assert!(!buf.lock().unwrap().is_empty(), "{caller}: not delivered");
+        }
+    }
+
+    /// An UNKNOWN barrier store (a fresh corrupt file) fails closed on wakes.
+    #[test]
+    fn an_unknown_barrier_store_defers_autonomous_writes() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        let err = with_test_state(BarrierState::Unknown("corrupt.json".into()), || {
+            session
+                .submit_prompt("x", PtyWriteCaller::SessionMessagePoller)
+                .expect_err("deferred")
+        });
+        assert_eq!(
+            crate::quiet_barrier::deferred_barrier_id(&err),
+            Some(crate::quiet_barrier::UNKNOWN_BARRIER_ID)
+        );
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
+    /// Operator keystrokes and session-internal plumbing pass an open barrier.
+    #[test]
+    fn operator_and_session_internal_writes_pass_an_open_barrier() {
+        let mut passing: Vec<PtyWriteCaller> = every_production_caller()
+            .into_iter()
+            .filter(|c| c.wake_class() != WakeClass::Autonomous)
+            .collect();
+        passing.push(PtyWriteCaller::GracefulExit);
+        passing.push(PtyWriteCaller::Test);
+        assert_eq!(passing.len(), 10, "{passing:?}");
+        for caller in passing {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let session = LiveTestSession::new(buf.clone());
+            with_test_state(open_runner_restart_barrier(), || {
+                session
+                    .write(b"k", caller.clone())
+                    .unwrap_or_else(|e| panic!("{caller} write: {e}"));
+                session
+                    .submit_prompt("p", caller.clone())
+                    .unwrap_or_else(|e| panic!("{caller} submit: {e}"));
+            });
+            assert!(!buf.lock().unwrap().is_empty(), "{caller}");
+        }
+    }
+
+    /// A remote operator's keystroke (`RemoteTerminalInput`, acked end to end
+    /// by `remote_terminal::apply_terminal_input`) is `Operator`: it lands under
+    /// an open barrier, so the target acks it `accepted: true`, and the write
+    /// probe (`probe_writable`, which carries no caller) agrees with it — a
+    /// probe must never answer "writable" for a write the gate would defer, or
+    /// the reverse.
+    #[test]
+    fn remote_input_and_its_write_probe_both_pass_an_open_barrier() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        with_test_state(open_runner_restart_barrier(), || {
+            session
+                .probe_writable()
+                .expect("the probe answers writable under a barrier");
+            session
+                .write(b"k", PtyWriteCaller::RemoteTerminalInput)
+                .expect("remote operator input is never deferred");
+        });
+        assert_eq!(&*buf.lock().unwrap(), b"k");
+    }
+
+    /// A dead pane still answers `TERMINAL_EXITED` under a barrier: liveness
+    /// is checked first, so the more useful refusal wins.
+    #[test]
+    fn liveness_refusal_outranks_the_barrier_deferral() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf);
+        let err = with_test_state(open_runner_restart_barrier(), || {
+            session
+                .submit_prompt("x", PtyWriteCaller::HttpSubmitPrompt)
+                .expect_err("dead pane")
+        });
+        assert!(err.starts_with(TERMINAL_EXITED), "{err}");
     }
 }

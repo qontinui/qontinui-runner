@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "target-20260929T100500Z-c3d4e5",
+  "scope": "target:/home/fixture/qontinui-runner/target-agent",
+  "purpose": "cargo sweep",
+  "requester": {"session_id": "aaaaaaaa-0000-4000-8000-000000000003", "device": "11111111-2222-3333-4444-555555555555"},
+  "opened_at": "2026-09-29T10:05:00Z",
+  "until": "2026-09-29T10:25:00Z",
+  "max_until": "2026-09-29T12:05:00Z",
+  "straggler_policy": "wait",
+  "state": "open"
+}

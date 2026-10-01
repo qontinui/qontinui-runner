@@ -2031,6 +2031,14 @@ pub struct SendMessageRequest {
 
 /// Send a user message to an active AI session via HTTP.
 ///
+/// **Who calls it: an operator typing.** The web dashboard's chat box
+/// (qontinui-web `AiConversationWidget`) and the mobile chat (qontinui-mobile
+/// `ChatClient`) post here, so the quiet barrier classifies it `Operator`
+/// (`SdkMessageCaller::HttpTaskRunMessage`) and never defers it — an
+/// operator's keystroke is never swallowed (plan `2026-09-29-quiet-on-demand-…`,
+/// D4). Agents that message a session use `POST /sessions/{id}/message`, which
+/// is `Autonomous` and answers `409 QUIET_BARRIER_DEFERRED` under a barrier.
+///
 /// This is the HTTP equivalent of the `send_user_message` Tauri command.
 /// It emits an ai-output event, persists to output_log, handles first
 /// interaction detection, and forwards the message to the Claude session.
@@ -2128,7 +2136,10 @@ pub async fn send_message_to_session(
         prefix_parts.join("\n\n")
     };
 
-    match session.send_user_message(&effective_message) {
+    match session.send_user_message(
+        &effective_message,
+        crate::quiet_barrier::SdkMessageCaller::HttpTaskRunMessage,
+    ) {
         Ok(sent_immediately) => {
             let queued = !sent_immediately;
             let new_state = session.state();
@@ -2426,17 +2437,6 @@ pub async fn create_ai_session(
         Ok(session) => {
             let session = Arc::new(session);
 
-            // Register with session manager
-            if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
-                warn!("Failed to register AI session: {}", e);
-                return Ok(Json(serde_json::json!({
-                    "id": task_run_id,
-                    "task_name": req.task_name,
-                    "state": "error",
-                    "error": format!("Session registration failed: {}", e)
-                })));
-            }
-
             // Emit initial ready state
             crate::commands::ai_session::emit_session_state(
                 &state.app_handle,
@@ -2445,14 +2445,31 @@ pub async fn create_ai_session(
                 session.state(),
             );
 
-            // Send the system prompt as initial prompt
+            // Send the system prompt as initial prompt, THEN register (plan `2026-09-29-quiet-on-demand-…`, D4): an
+            // unregistered session is reachable by nothing — not the poller, the
+            // conductor nor HTTP — so `send_initial_prompt` cannot lose a race to
+            // another turn and be refused, leaving a registered session that never
+            // gets its brief. Same order as promotion and the rate-limit restart.
             if let Err(e) = session.send_initial_prompt(&system_prompt) {
                 warn!("Failed to send initial prompt for AI session: {}", e);
+                let _ = session.close();
                 return Ok(Json(serde_json::json!({
                     "id": task_run_id,
                     "task_name": req.task_name,
                     "state": "error",
                     "error": format!("Failed to send initial prompt: {}", e)
+                })));
+            }
+
+            // Register with session manager
+            if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
+                warn!("Failed to register AI session: {}", e);
+                let _ = session.close();
+                return Ok(Json(serde_json::json!({
+                    "id": task_run_id,
+                    "task_name": req.task_name,
+                    "state": "error",
+                    "error": format!("Session registration failed: {}", e)
                 })));
             }
 
@@ -3248,6 +3265,36 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: `POST /task-runs/{id}/message`
+    /// is the web dashboard's and the mobile app's chat — an operator typing —
+    /// so it PASSES an open barrier (and an unknown store): the gate the door's
+    /// `send_user_message` runs answers `Ok`, never a deferral.
+    #[test]
+    fn the_task_run_chat_door_passes_an_open_barrier() {
+        use crate::quiet_barrier::{
+            parse_record, sdk_wake_gate, sdk_wake_refusal, with_test_state, BarrierState,
+            FileRecord, SdkMessageCaller, WakeClass,
+        };
+        let FileRecord::Recorded(barrier) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        let caller = SdkMessageCaller::HttpTaskRunMessage;
+        assert_eq!(caller.wake_class(), WakeClass::Operator);
+        for state in [
+            BarrierState::Open(barrier),
+            BarrierState::Unknown("corrupt".into()),
+        ] {
+            assert_eq!(sdk_wake_refusal(caller, &state, "task-run-1", &[]), None);
+            assert_eq!(
+                with_test_state(state, || sdk_wake_gate(caller, "task-run-1", &[])),
+                Ok(())
+            );
+        }
+    }
 
     /// The layout rule: `.dev-logs` sits directly under the workspace root, one
     /// level ABOVE the repo checkouts — not under the runner repo, and not

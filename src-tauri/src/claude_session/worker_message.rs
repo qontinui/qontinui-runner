@@ -30,10 +30,15 @@ use tracing::warn;
 /// Returns whether the injection actually landed: failures are warn-logged AND
 /// surfaced as `Err`, because some callers (the PR shepherd's one-per-head
 /// notify claim) must not treat a swallowed failure as a delivered message.
+///
+/// `caller` names the door for the quiet-barrier gate inside
+/// `send_user_message`; a barrier deferral comes back VERBATIM (unwrapped) so
+/// the caller's `deferred_barrier_id` still recognises it.
 pub(crate) async fn send_message_to_worker_via_handle(
     app_handle: &tauri::AppHandle,
     session_id: &str,
     message: &str,
+    caller: crate::quiet_barrier::SdkMessageCaller,
 ) -> Result<(), String> {
     let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>()
     {
@@ -46,8 +51,9 @@ pub(crate) async fn send_message_to_worker_via_handle(
 
     if let Some(session) = session_manager.get(session_id) {
         // Ok(true) = sent immediately, Ok(false) = queued — both delivered.
-        return match session.send_user_message(message) {
+        return match session.send_user_message(message, caller) {
             Ok(_) => Ok(()),
+            Err(e) if crate::quiet_barrier::deferred_barrier_id(&e).is_some() => Err(e),
             Err(e) => {
                 warn!(
                     "send_message_to_worker: send_user_message failed for {}: {}",

@@ -759,10 +759,20 @@ impl Dispatcher for AiSessionDispatcher {
         let session = mgr
             .get(&task_run_id.to_string())
             .ok_or_else(|| format!("reprompt: no session for {task_run_id}"))?;
+        // An autonomous wake: a runner-restart quiet barrier defers it. The
+        // deferral is returned VERBATIM (not wrapped) so `apply_tick` can tell
+        // it from a real failure and retry on a later tick.
         session
-            .send_user_message(message)
+            .send_user_message(
+                message,
+                crate::quiet_barrier::SdkMessageCaller::ConductorReprompt,
+            )
             .map(|_| ())
-            .map_err(|e| format!("reprompt: send_user_message: {e}"))
+            .map_err(|e| {
+                crate::quiet_barrier::wrap_unless_deferred(e, |e| {
+                    format!("reprompt: send_user_message: {e}")
+                })
+            })
     }
 }
 
@@ -913,11 +923,12 @@ pub struct TickOutcome {
     pub apply_failures: Vec<String>,
     /// `task_id`s whose side effect failed TRANSIENTLY — attempted, did not
     /// land, and will land on its own once a condition outside this run clears.
-    /// Today that is exactly the two dispatch outcomes
-    /// [`DispatchError::transient`] reads `true` for: the fleet's declared
-    /// `parallel_fanout` bound being fully occupied
-    /// ([`DispatchError::Transient`]), and coord having drained this device
-    /// ([`DispatchError::DeferredByDrain`]).
+    /// Today that is the two dispatch outcomes [`DispatchError::transient`]
+    /// reads `true` for — the fleet's declared `parallel_fanout` bound being
+    /// fully occupied ([`DispatchError::Transient`]) and coord having drained
+    /// this device ([`DispatchError::DeferredByDrain`]) — plus a step-5
+    /// re-prompt a runner-restart quiet barrier deferred
+    /// ([`record_reprompt_result`]).
     ///
     /// [`tick_exit`] REPLACES the row's stall-fingerprint entries with a single
     /// `T:<task_id>`: it removes the key first — dropping the `R:` the same
@@ -1815,6 +1826,54 @@ fn drain_defer_log() -> std::sync::MutexGuard<'static, DrainDeferLog> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Record one step-5 re-prompt's result into the tick outcome.
+///
+/// - **Landed:** arm the second §5 deadline (`reprompted_at`).
+/// - **Deferred by a runner-restart quiet barrier** (plan
+///   `2026-09-29-quiet-on-demand-…`, D4): nothing reached the worker, the
+///   deadline is NOT armed, and the row is a TRANSIENT failure — it waits on a
+///   condition outside this run (the barrier is released or expires, bounded
+///   by its own cap), so `tick_exit` puts it on the long transient window and
+///   the next tick re-decides the same re-prompt. Deferred, not dropped.
+/// - **Did not land for any other reason:** an `apply_failures` entry. A
+///   re-prompt that did not land is the §5 recovery path failing OPEN, and it
+///   is unbounded on its own: `reprompted_at` is only inserted on success, so
+///   the SECOND deadline — the one that FAILS the row — is never armed, and the
+///   next tick re-decides the identical re-prompt forever. Nothing else reaches
+///   the row either: it is `Working` with a `task_run_id` (so the fingerprint
+///   excludes it) and the worker is `ReadyIdle` (so the silence deadline was
+///   cleared). It holds its concurrency slot for the life of the run, which
+///   then excludes every other ready row as "waiting on a slot".
+fn record_reprompt_result(
+    tid: &str,
+    trid: Uuid,
+    result: Result<(), String>,
+    outcome: &mut TickOutcome,
+    timers: &mut ReadyIdleTimers,
+) {
+    match result {
+        Ok(()) => {
+            info!("conductor: re-prompted {tid} ({trid}) for missing report");
+            timers.reprompted_at.insert(trid, Utc::now().timestamp());
+        }
+        Err(e) => {
+            if let Some(barrier_id) = crate::quiet_barrier::deferred_barrier_id(&e) {
+                // `debug!`: this repeats every tick (5 s) per row for the
+                // life of the barrier (up to 1 h); the `T:` stall entry is the
+                // durable record.
+                debug!(
+                    "conductor: re-prompt of {tid} ({trid}) deferred by quiet barrier \
+                     {barrier_id} — retried on a later tick"
+                );
+                outcome.transient_failures.push(tid.to_string());
+            } else {
+                warn!("apply_tick: reprompt {tid}: {e}");
+                outcome.apply_failures.push(format!("reprompt:{tid}"));
+            }
+        }
+    }
+}
+
 /// Apply a computed [`TickPlan`] against the DB + dispatcher (side effects).
 /// Returns what actually LANDED — see [`TickOutcome`], which is what stall
 /// accounting reads.
@@ -1917,26 +1976,8 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
         Emit your completion report NOW via the orchestration_report_subtask \
         tool (run_id + task_id + a CompletionReport), then print [TASK_COMPLETE].";
     for (tid, trid) in &plan.to_reprompt {
-        match dispatcher.reprompt(*trid, reprompt_msg).await {
-            Ok(()) => {
-                info!("conductor: re-prompted {tid} ({trid}) for missing report");
-                timers.reprompted_at.insert(*trid, Utc::now().timestamp());
-            }
-            Err(e) => {
-                // A re-prompt that did not land is the §5 recovery path failing
-                // OPEN, and it is unbounded on its own: `reprompted_at` is only
-                // inserted on success, so the SECOND deadline — the one that
-                // FAILS the row — is never armed, and the next tick re-decides
-                // the identical re-prompt forever. Nothing else reaches the row
-                // either: it is `Working` with a `task_run_id` (so the
-                // fingerprint excludes it) and the worker is `ReadyIdle` (so
-                // the silence deadline was cleared). It holds its concurrency
-                // slot for the life of the run, which then excludes every other
-                // ready row as "waiting on a slot".
-                warn!("apply_tick: reprompt {tid}: {e}");
-                outcome.apply_failures.push(format!("reprompt:{tid}"));
-            }
-        }
+        let result = dispatcher.reprompt(*trid, reprompt_msg).await;
+        record_reprompt_result(tid, *trid, result, &mut outcome, timers);
     }
 
     // Dispatches (step 3).
@@ -3288,6 +3329,43 @@ mod tests {
 
     fn cfg() -> OrchestrationRunConfig {
         OrchestrationRunConfig::default()
+    }
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: a re-prompt the quiet barrier
+    /// deferred is TRANSIENT (retried on a later tick, deadline not armed) and
+    /// never an `apply_failures` entry; any other refusal still is; a landed
+    /// one arms the deadline.
+    #[test]
+    fn a_barrier_deferred_reprompt_is_transient_and_retried_not_failed() {
+        let trid = Uuid::new_v4();
+        let deferred = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "conductor_reprompt",
+            &trid.to_string(),
+            "held",
+        );
+        let mut outcome = TickOutcome::default();
+        let mut timers = ReadyIdleTimers::default();
+        record_reprompt_result("A", trid, Err(deferred), &mut outcome, &mut timers);
+        assert_eq!(outcome.transient_failures, vec!["A".to_string()]);
+        assert!(outcome.apply_failures.is_empty());
+        assert!(timers.reprompted_at.is_empty(), "the second deadline is not armed");
+
+        let mut outcome = TickOutcome::default();
+        record_reprompt_result(
+            "B",
+            trid,
+            Err("reprompt: send_user_message: stdin write failed".into()),
+            &mut outcome,
+            &mut timers,
+        );
+        assert_eq!(outcome.apply_failures, vec!["reprompt:B".to_string()]);
+        assert!(outcome.transient_failures.is_empty());
+
+        let mut outcome = TickOutcome::default();
+        record_reprompt_result("C", trid, Ok(()), &mut outcome, &mut timers);
+        assert!(timers.reprompted_at.contains_key(&trid));
+        assert!(outcome.apply_failures.is_empty() && outcome.transient_failures.is_empty());
     }
 
     // --- topo / readiness -------------------------------------------------

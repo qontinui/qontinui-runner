@@ -80,7 +80,7 @@ pub fn dispatch_line(
     line_buffer: &mut String,
     state_tracker: &SessionStateTracker,
     stdin_writer: &Arc<StdinWriter>,
-    pending_messages: &Arc<std::sync::Mutex<VecDeque<String>>>,
+    pending_messages: &Arc<std::sync::Mutex<VecDeque<super::queued::QueuedMessage>>>,
     accumulated_output: &Arc<std::sync::Mutex<String>>,
     user_has_interacted: &std::sync::atomic::AtomicBool,
     turn_persist_tx: &Option<super::session::TurnPersistSender>,
@@ -738,47 +738,80 @@ fn short_path(path: &str) -> String {
     }
 }
 
+/// The live [`super::queued::TurnSink`]: a session's state tracker and stdin
+/// writer. `emit` (when set) announces the `Processing` transition to the UI —
+/// the drain does; `send_user_message`'s callers emit themselves.
+pub(crate) struct LiveSink<'a> {
+    pub state: &'a SessionStateTracker,
+    pub writer: &'a StdinWriter,
+    pub interacted: &'a std::sync::atomic::AtomicBool,
+    /// Whether a written turn counts as user interaction. `false` only for the
+    /// initial prompt, which (as before) must not flip the session into
+    /// interactive mode — that flag decides whether the CLI is closed at the
+    /// end of its turn.
+    pub mark_interacted: bool,
+    pub emit: Option<(&'a tauri::AppHandle, Option<&'a AiSessionContext>)>,
+}
+
+impl super::queued::TurnSink for LiveSink<'_> {
+    fn can_accept(&self) -> Result<(), String> {
+        let state = self.state.get();
+        if state.can_send_message() {
+            Ok(())
+        } else {
+            Err(format!("Cannot send message in state: {}", state))
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state.get() == SessionState::Ready
+    }
+
+    fn write_turn(&self, m: &super::queued::QueuedMessage) -> Result<(), String> {
+        let user_msg = crate::claude_protocol::types::UserInputMessage::new(&m.text, "default");
+        self.writer.write_message(&user_msg)?;
+        if self.mark_interacted {
+            self.interacted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.state
+            .transition(SessionState::Processing)
+            .map_err(|e| format!("State transition failed: {}", e))?;
+        if let Some((app_handle, session_ctx)) = self.emit {
+            emit_state_if_possible(app_handle, session_ctx, SessionState::Processing);
+        }
+        Ok(())
+    }
+}
+
 /// Check pending messages and send the next one if the session is Ready.
-fn send_next_pending_message(
+///
+/// The drain is a wake in its own right, so it re-runs the quiet-barrier gate
+/// per entry: an `Autonomous` entry a `runner-restart` barrier defers STAYS
+/// QUEUED and the session is let end its turn (plan
+/// `2026-09-29-quiet-on-demand-…`, D4); `Operator` and session-internal entries
+/// drain normally. Runs under the queue lock in the same order as
+/// `send_user_message` ([`super::queued::drain_one`]), so the stdout reader at
+/// turn end, the heartbeat's retry and a direct send never double-send.
+pub(crate) fn send_next_pending_message(
     state_tracker: &SessionStateTracker,
     stdin_writer: &Arc<StdinWriter>,
-    pending_messages: &Arc<std::sync::Mutex<VecDeque<String>>>,
+    pending_messages: &Arc<std::sync::Mutex<VecDeque<super::queued::QueuedMessage>>>,
     user_has_interacted: &std::sync::atomic::AtomicBool,
     app_handle: &tauri::AppHandle,
     session_ctx: Option<&AiSessionContext>,
 ) {
-    if state_tracker.get() != SessionState::Ready {
-        return;
-    }
-
-    let next_msg = pending_messages.lock().ok().and_then(|mut q| q.pop_front());
-
-    if let Some(message) = next_msg {
-        info!("Sending queued user message ({} chars)", message.len());
-
-        // Build the user input message
-        let user_msg = crate::claude_protocol::types::UserInputMessage::new(&message, "default");
-
-        match stdin_writer.write_message(&user_msg) {
-            Ok(()) => {
-                user_has_interacted.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Transition to Processing
-                match state_tracker.transition(SessionState::Processing) {
-                    Ok(_) => {
-                        emit_state_if_possible(app_handle, session_ctx, SessionState::Processing);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to transition to Processing after sending queued message: {}",
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to send queued user message: {}", e);
-            }
-        }
+    let sink = LiveSink {
+        state: state_tracker,
+        writer: stdin_writer,
+        interacted: user_has_interacted,
+        mark_interacted: true,
+        emit: Some((app_handle, session_ctx)),
+    };
+    match super::queued::drain_one(pending_messages, &sink, &super::queued::live_gate) {
+        Some((m, Ok(()))) => info!("Sent queued user message ({} chars)", m.text.len()),
+        Some((_, Err(e))) => warn!("Failed to send queued user message: {}", e),
+        None => {}
     }
 }
 

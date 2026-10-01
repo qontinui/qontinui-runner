@@ -4,9 +4,16 @@
 //! `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`,
 //! Phase 6.
 //!
-//! **Report-only.** `GET /restart-readiness` renders the aggregate as
-//! `live_claude.by_activity`; nothing reads it into a verdict. An idle session
-//! still dies on a restart, so "idle" here never means "safe to kill".
+//! **Report-only for `safe_to_restart`.** `GET /restart-readiness` renders the
+//! aggregate as `live_claude.by_activity`, and `safe_to_restart` never reads
+//! it. An idle session still dies on a restart, so "idle" here never means
+//! "safe to kill". The one consumer is the quiet-barrier `resume`
+//! classification (plan `2026-09-29-quiet-on-demand-…`, D2), which reads the
+//! per-process class as its "idle at a turn boundary" condition. That block is
+//! computed only under an open `runner-restart` barrier, while the autonomous
+//! wake doors defer (the PTY funnel, the SDK message funnel and both Stop-hook
+//! arms — see `quiet_barrier`), and the boot restore brings an idle session
+//! back. "Idle" still never means "safe to kill" on its own.
 //!
 //! # Two evidence sources, in precedence order
 //!
