@@ -1182,7 +1182,9 @@ async fn dispatch_to_app_inner(
         .dispatch(app_id, &req.action, Method::POST, "/dispatch", payload)
         .await
     {
-        Ok(data) => (StatusCode::OK, ApiResponse::success(data)),
+        // This handler wraps in its own `ApiResponse`, so it takes the body
+        // raw (the HTTP arm's envelope stays nested, as it always has).
+        Ok(data) => (StatusCode::OK, ApiResponse::success(data.into_raw())),
         Err(DispatchError::NotRegistered(_)) => (
             StatusCode::NOT_FOUND,
             ApiResponse::error("app not registered"),

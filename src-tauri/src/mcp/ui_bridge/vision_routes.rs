@@ -1719,8 +1719,15 @@ async fn vision_raw_handler(
 // now answers HTTP 200 with an `Observation` whose `status` is `measured`,
 // `absent` or `unknown` (with a typed `unknown.code`), decided by the fixed
 // rules on `judge_extraction` / `judge_description`. Non-2xx is kept only for
-// a malformed request (a region outside the frame, an element id that does
-// not resolve).
+// a malformed request (a region outside the frame, an element id or a
+// `target` that does not resolve — 404 on every vision route).
+//
+// ONE code rule for capture failures, on extract, describe, analyze and
+// assert alike: a capture that was attempted and failed (window gone, device
+// capture HTTP error, element-rect lookup failure, encode error) is
+// `producer_failed`, with a detail that names the capture rather than the
+// model. `input_missing` is reserved for an input the caller or the page did
+// not supply (no bbox, no `elements`), never for a failed capture.
 // ============================================================================
 
 /// Producer id of `POST /ui-bridge/vision/extract` (wire contract).
@@ -1985,9 +1992,9 @@ fn judge_extraction(
     )
 }
 
-/// Run OCR over a captured image and judge the answer. A capture that
-/// produced no image is `unknown{input_missing}` with `observedAt: null`:
-/// no sample was taken.
+/// Run OCR over a captured image and judge the answer. A capture that was
+/// attempted and failed is `unknown{producer_failed}` (the detail says it was
+/// the capture, not the model) with `observedAt: null`: no sample was taken.
 pub(super) async fn run_extract(
     client: &OcrClient,
     captured: Result<CapturedImage, String>,
@@ -1997,8 +2004,8 @@ pub(super) async fn run_extract(
         Ok(c) => c,
         Err(detail) => {
             return Observation::unknown(
-                UnknownCode::InputMissing,
-                format!("no image to read: {detail}"),
+                UnknownCode::ProducerFailed,
+                format!("frame capture failed, so there was no image to read: {detail}"),
                 Provenance::new(
                     runner_producer(EXTRACT_PRODUCER_ID),
                     chrono::Utc::now(),
@@ -2107,9 +2114,11 @@ fn judge_description(
         vision_ai::StructuredTwin::Invalid(reason) => {
             let unmeasured =
                 UnmeasuredDimension::new("structured", 1, UnknownCode::ModelReplyUnparseable);
+            // The image was not measured IN FULL (its twin is missing), so it
+            // is counted unmeasured: measured + Σ unmeasured.count == considered.
             outer_coverage = ObservationCoverage {
                 considered: 1,
-                measured: 1,
+                measured: 0,
                 unmeasured: vec![unmeasured.clone()],
             };
             Observation::unknown(
@@ -2148,8 +2157,8 @@ pub(super) async fn run_describe(
         Ok(c) => c,
         Err(detail) => {
             return Observation::unknown(
-                UnknownCode::InputMissing,
-                format!("no image to describe: {detail}"),
+                UnknownCode::ProducerFailed,
+                format!("frame capture failed, so there was no image to describe: {detail}"),
                 Provenance::new(
                     runner_producer(DESCRIBE_PRODUCER_ID),
                     chrono::Utc::now(),
@@ -2173,8 +2182,16 @@ pub(super) async fn run_describe(
 /// A handler's non-2xx answer.
 type HandlerError = (StatusCode, Json<ApiResponse<()>>);
 
+/// The non-2xx for a `target` no frame source resolves — a malformed request,
+/// exactly like an `element` id that does not resolve, and answered the same
+/// way (404) on every vision route.
+fn unknown_target_rejection(detail: String) -> HandlerError {
+    (StatusCode::NOT_FOUND, Json(api_error(detail)))
+}
+
 /// Capture for a model route, splitting a malformed request (kept non-2xx)
-/// from an unavailable image (answered as `unknown{input_missing}`).
+/// from a capture that was attempted and failed (answered as
+/// `unknown{producer_failed}`).
 async fn capture_for_model(
     state: &Arc<ApiState>,
     region: &Option<RegionRequest>,
@@ -2184,7 +2201,7 @@ async fn capture_for_model(
     match capture_and_encode_png(state, region, element, target).await {
         Ok(c) => Ok(Ok(c)),
         Err(CaptureFailure::Request(code, msg)) => Err((code, Json(api_error(msg)))),
-        Err(CaptureFailure::Unavailable(msg)) => Ok(Err(msg)),
+        Err(CaptureFailure::Failed(msg)) => Ok(Err(msg)),
     }
 }
 
@@ -2298,8 +2315,9 @@ enum CaptureFailure {
     /// region outside it, an element id that does not resolve). Answered
     /// non-2xx: it is the caller's input that is wrong, not the page.
     Request(StatusCode, String),
-    /// No frame could be obtained or encoded — the model has no input.
-    Unavailable(String),
+    /// A capture was attempted and failed (window gone, device capture HTTP
+    /// error, element lookup IPC failure, encode error).
+    Failed(String),
 }
 
 /// The frame-source projection every observation's `provenance.source`
@@ -2356,18 +2374,18 @@ async fn capture_and_encode_png(
 ) -> Result<CapturedImage, CaptureFailure> {
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(CaptureFailure::Unavailable)?;
+        .map_err(|e| CaptureFailure::Request(StatusCode::NOT_FOUND, e))?;
     let frame = provider
         .frame(state)
         .await
-        .map_err(CaptureFailure::Unavailable)?;
+        .map_err(CaptureFailure::Failed)?;
     let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
         .await
         .map_err(|(code, msg)| {
             if code.is_client_error() {
                 CaptureFailure::Request(code, msg)
             } else {
-                CaptureFailure::Unavailable(msg)
+                CaptureFailure::Failed(msg)
             }
         })?;
     let observed_at = frame.source.captured_at;
@@ -2381,7 +2399,7 @@ async fn capture_and_encode_png(
     pipeline = pipeline.push(Stage::Encode(EncodedFormat::Png));
     let png = pipeline
         .run(frame)
-        .map_err(|e| CaptureFailure::Unavailable(format!("pipeline: {e}")))?;
+        .map_err(|e| CaptureFailure::Failed(format!("pipeline: {e}")))?;
     Ok(CapturedImage {
         png,
         observed_at,
@@ -2593,9 +2611,10 @@ pub struct AnalyzeResponse {
     /// Where this answer came from, in the Observation envelope's provenance
     /// shape (every key always present). `producer` is
     /// `vision-core/<analyzer>` at the linked vision-core version;
-    /// `coverage` restates the verdict (`considered: 1`; `measured: 0` when
-    /// blocked; a degraded or blocked verdict names the analyzer as the
-    /// unmeasured dimension with the verdict's code); `observedAt` is the
+    /// `coverage` restates the verdict (`considered: 1`; `checked` is
+    /// `measured: 1`, while `degraded` and `blocked` are `measured: 0` and name
+    /// the analyzer as the unmeasured dimension with the verdict's code, so
+    /// `measured + Σ unmeasured.count == considered` always holds); `observedAt` is the
     /// frame's capture time for the two pixel analyzers (color, dynamic) and
     /// `null` for the snapshot-only ones, whose snapshot carries no time;
     /// `confidence` is the weakest finding confidence, `null` when every
@@ -2638,9 +2657,10 @@ pub struct AnalyzeResponse {
     /// The frame this call captured, as ONE observation with three states
     /// (it replaced an optional frame plus a separate error-string key,
     /// two keys that could disagree). `measured` carries the frame's provenance; `unknown`
-    /// carries why there were no pixels — `input_missing` when no frame
-    /// source resolved for the target, `producer_failed` when the source
-    /// failed to capture — with the error as `unknown.detail`. The
+    /// carries why there were no pixels — `producer_failed`: a capture was
+    /// attempted and failed (window gone, device capture error) — with the
+    /// error as `unknown.detail`. An unknown `target` never reaches here: it
+    /// is a malformed request, answered 404 like an unknown `element`. The
     /// snapshot-only analyzers (layout, typography, elements) ran either way.
     pub frame: Observation<AnalyzedFrameInfo>,
     /// When this analyzer finished, on the runner's clock. Stamped the
@@ -2783,38 +2803,30 @@ impl AnalyzeResponse {
     }
 }
 
-/// Why the best-effort frame capture of `vision/analyze` / `vision/assert`
-/// produced no frame.
-#[derive(Debug, Clone)]
-pub(super) enum FrameFailure {
-    /// No frame source resolved for the requested target.
-    Unresolved(String),
-    /// A source resolved and failed to capture.
-    CaptureFailed(String),
-}
-
 /// Capture the frame for `target`, best-effort.
+///
+/// Outer `Err`: the `target` resolves to no frame source — a malformed
+/// request, answered 404 ([`unknown_target_rejection`]). Inner `Err`: a
+/// capture was attempted and failed; the analysis continues snapshot-only and
+/// the frame observation says why.
 async fn capture_frame(
     state: &Arc<ApiState>,
     target: &Option<String>,
-) -> Result<Frame, FrameFailure> {
+) -> Result<Result<Frame, String>, HandlerError> {
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(FrameFailure::Unresolved)?;
-    provider
-        .frame(state)
-        .await
-        .map_err(FrameFailure::CaptureFailed)
+        .map_err(unknown_target_rejection)?;
+    Ok(provider.frame(state).await)
 }
 
 /// Project a capture attempt onto the wire as an observation, stamped now.
 ///
 /// `measured`: the frame's [`AnalyzedFrameInfo`], `observedAt` = its capture
-/// time, `source` = [`frame_source_projection`]. `unknown`: `input_missing`
-/// for [`FrameFailure::Unresolved`], `producer_failed` for
-/// [`FrameFailure::CaptureFailed`], `observedAt: null` (no sample was taken).
+/// time, `source` = [`frame_source_projection`]. `unknown`:
+/// `producer_failed` — the capture was attempted and failed — with the error
+/// as detail and `observedAt: null` (no sample was taken).
 fn frame_observation(
-    frame: Result<&Frame, &FrameFailure>,
+    frame: Result<&Frame, &String>,
     target: &Option<String>,
 ) -> Observation<AnalyzedFrameInfo> {
     let evaluated_at = chrono::Utc::now();
@@ -2826,17 +2838,11 @@ fn frame_observation(
                 .with_observed_at(f.source.captured_at)
                 .with_source(frame_source_projection(f, target, None)),
         ),
-        Err(failure) => {
-            let (code, detail) = match failure {
-                FrameFailure::Unresolved(e) => (UnknownCode::InputMissing, e.clone()),
-                FrameFailure::CaptureFailed(e) => (UnknownCode::ProducerFailed, e.clone()),
-            };
-            Observation::unknown(
-                code,
-                detail,
-                Provenance::new(producer, evaluated_at, ObservationCoverage::default()),
-            )
-        }
+        Err(e) => Observation::unknown(
+            UnknownCode::ProducerFailed,
+            format!("frame capture failed: {e}"),
+            Provenance::new(producer, evaluated_at, ObservationCoverage::default()),
+        ),
     }
 }
 
@@ -3158,9 +3164,13 @@ fn analyze_provenance(
     use qontinui_vision_core::{Analyzer as A, AnalyzerVerdict as V};
     let coverage = match verdict {
         V::Checked => ObservationCoverage::full(1),
+        // Degraded: the findings stand, but the question was not measured IN
+        // FULL, so it counts as unmeasured — `measured + Σ unmeasured.count ==
+        // considered`, the canonical reading of `ObservationCoverage`. The
+        // verdict, not the coverage, is what separates degraded from blocked.
         V::Degraded { code, .. } => ObservationCoverage {
             considered: 1,
-            measured: 1,
+            measured: 0,
             unmeasured: vec![UnmeasuredDimension::new(analyzer.name(), 1, *code)],
         },
         V::Blocked { code, .. } => ObservationCoverage {
@@ -3199,7 +3209,7 @@ fn assert_provenance(
     for r in results {
         match (r.outcome, r.code) {
             (qontinui_vision_core::AssertionOutcome::Unknown, code) => {
-                let code = code.unwrap_or(UnknownCode::InputMissing);
+                let code = code.expect("vision-core guarantees a code on every unknown outcome");
                 match by_code.iter_mut().find(|(c, _)| *c == code) {
                     Some((_, n)) => *n += 1,
                     None => by_code.push((code, 1)),
@@ -3304,9 +3314,9 @@ async fn vision_analyze_handler(
     // (`frontendState: "window_missing"`, a headless or crashed UI) the
     // occlusion and overlap checks 500'd with "Runner window not found"
     // rather than answering from the snapshot in hand.
-    let frame_result = capture_frame(&state, &req.target).await;
+    let frame_result = capture_frame(&state, &req.target).await?;
     if let Err(e) = &frame_result {
-        warn!("vision/analyze: frame capture failed, continuing snapshot-only: {e:?}");
+        warn!("vision/analyze: frame capture failed, continuing snapshot-only: {e}");
     }
     let frame_obs = frame_observation(frame_result.as_ref(), &req.target);
     let frame = frame_result.ok();
@@ -3361,9 +3371,9 @@ async fn vision_assert_handler(
     // registry. Capturing a frame was a hard precondition for a value the
     // evaluator never consulted, which made `no_overlap` and `no_clipping`
     // unavailable on a headless runner for no reason at all.
-    let frame_result = capture_frame(&state, &req.target).await;
+    let frame_result = capture_frame(&state, &req.target).await?;
     if let Err(e) = &frame_result {
-        warn!("vision/assert: frame capture failed, continuing snapshot-only: {e:?}");
+        warn!("vision/assert: frame capture failed, continuing snapshot-only: {e}");
     }
     let frame_obs = frame_observation(frame_result.as_ref(), &req.target);
     let frame = frame_result.ok();
@@ -3613,12 +3623,7 @@ mod tests {
 
     /// A frame observation for a call that captured no frame.
     fn no_frame() -> Observation<AnalyzedFrameInfo> {
-        frame_observation(
-            Err(&FrameFailure::Unresolved(
-                "test: no frame source".to_string(),
-            )),
-            &None,
-        )
+        frame_observation(Err(&"test: capture failed".to_string()), &None)
     }
 
     /// The `/vision/assert` 422 hint is the only place the assertion DSL's
@@ -3924,12 +3929,7 @@ mod tests {
         let v = serde_json::to_value(AnalyzeResponse::of(
             qontinui_vision_core::Analyzer::Layout,
             result,
-            frame_observation(
-                Err(&FrameFailure::CaptureFailed(
-                    "Runner window not found".to_string(),
-                )),
-                &None,
-            ),
+            frame_observation(Err(&"Runner window not found".to_string()), &None),
             Some(&snapshot),
             chrono::Utc::now(),
         ))
@@ -3961,7 +3961,10 @@ mod tests {
         // capture error as detail — and no value key at all.
         assert_eq!(v["frame"]["status"], "unknown");
         assert_eq!(v["frame"]["unknown"]["code"], "producer_failed");
-        assert_eq!(v["frame"]["unknown"]["detail"], "Runner window not found");
+        assert_eq!(
+            v["frame"]["unknown"]["detail"],
+            "frame capture failed: Runner window not found"
+        );
         assert!(v["frame"].get("value").is_none());
         assert!(v["frame"]["provenance"]["observedAt"].is_null());
         assert_eq!(
@@ -4733,6 +4736,24 @@ mod observation_tests {
         serde_json::to_value(ApiResponse::success(obs)).expect("serialize")["data"].clone()
     }
 
+    /// The canonical coverage invariant: `measured + Σ unmeasured.count ==
+    /// considered`.
+    fn assert_coverage_sums(cov: &serde_json::Value) {
+        let considered = cov["considered"].as_u64().expect("considered");
+        let measured = cov["measured"].as_u64().expect("measured");
+        let unmeasured: u64 = cov["unmeasured"]
+            .as_array()
+            .expect("unmeasured")
+            .iter()
+            .map(|d| d["count"].as_u64().expect("count"))
+            .sum();
+        assert_eq!(
+            measured + unmeasured,
+            considered,
+            "measured + unmeasured must equal considered: {cov}"
+        );
+    }
+
     /// Every provenance key is always present — `null` is a statement.
     fn assert_full_provenance(v: &serde_json::Value) {
         let p = v["provenance"]
@@ -4852,16 +4873,20 @@ mod observation_tests {
         assert!(v.get("value").is_none());
     }
 
-    /// A capture that produced no image is `input_missing`, with no sample
-    /// time — nothing was sampled.
+    /// Window gone on `/vision/extract`: a capture that was attempted and
+    /// failed is `producer_failed` (the detail names the capture), with no
+    /// sample time — nothing was sampled.
     #[tokio::test]
-    async fn no_image_is_input_missing_with_null_observed_at() {
+    async fn extract_with_the_window_gone_is_producer_failed_with_null_observed_at() {
         let client = OcrClient::new(closed_port_endpoint(), "paddleocr");
         let v = envelope_wire(
             &run_extract(&client, Err("Runner window not found".to_string()), 0.5).await,
         );
         assert_eq!(v["status"], "unknown");
-        assert_eq!(v["unknown"]["code"], "input_missing");
+        assert_eq!(v["unknown"]["code"], "producer_failed");
+        assert!(v["unknown"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("frame capture failed")));
         assert!(v["provenance"]["observedAt"].is_null());
         assert!(v["provenance"]["source"].is_null());
         assert_full_provenance(&v);
@@ -5205,8 +5230,9 @@ mod observation_tests {
         assert_full_provenance(&v);
     }
 
-    /// The fixed outcome precedence failed > unknown > passed, over real
-    /// evaluator output rather than hand-set flags.
+    /// The fixed outcome precedence failed > unknown > passed, over results
+    /// built by hand with each outcome (and its `code` on the unknown one) —
+    /// this pins the aggregation, not the evaluator.
     #[test]
     fn assert_outcome_follows_failed_over_unknown_over_passed() {
         use qontinui_vision_core::AssertionOutcome as O;
@@ -5225,7 +5251,7 @@ mod observation_tests {
             let v = serde_json::to_value(AssertResponse::of(
                 rs,
                 None,
-                frame_observation(Err(&FrameFailure::Unresolved("no source".into())), &None),
+                frame_observation(Err(&"no source".to_string()), &None),
                 sample_time(),
             ))
             .expect("serialize");
@@ -5236,7 +5262,7 @@ mod observation_tests {
         let v = serde_json::to_value(AssertResponse::of(
             vec![r(O::Passed), r(O::Unknown), r(O::Failed)],
             None,
-            frame_observation(Err(&FrameFailure::Unresolved("no source".into())), &None),
+            frame_observation(Err(&"no source".to_string()), &None),
             sample_time(),
         ))
         .expect("serialize");
@@ -5257,21 +5283,200 @@ mod observation_tests {
         assert_eq!(outcome_of(vec![]).0, "unknown");
     }
 
-    /// Frame resolution failure and capture failure carry different codes.
+    /// One code rule for capture failures on every vision route: a capture
+    /// that was attempted and failed is `producer_failed` (the detail says it
+    /// was the capture), and an unknown `target` is a malformed request — 404,
+    /// never an observation.
     #[test]
-    fn frame_failures_are_typed_by_cause() {
-        let unresolved = serde_json::to_value(frame_observation(
-            Err(&FrameFailure::Unresolved("unknown target 'x'".into())),
-            &Some("x".into()),
-        ))
-        .expect("serialize");
-        assert_eq!(unresolved["unknown"]["code"], "input_missing");
-        let failed = serde_json::to_value(frame_observation(
-            Err(&FrameFailure::CaptureFailed("xcap: boom".into())),
-            &None,
-        ))
-        .expect("serialize");
+    fn a_failed_capture_is_producer_failed_and_an_unknown_target_is_404() {
+        let failed = serde_json::to_value(frame_observation(Err(&"xcap: boom".to_string()), &None))
+            .expect("serialize");
         assert_eq!(failed["unknown"]["code"], "producer_failed");
-        assert_eq!(failed["unknown"]["detail"], "xcap: boom");
+        assert_eq!(
+            failed["unknown"]["detail"],
+            "frame capture failed: xcap: boom"
+        );
+        assert!(failed["provenance"]["observedAt"].is_null());
+
+        let (status, body) = unknown_target_rejection("unknown vision target 'x'".into());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body = serde_json::to_value(&body.0).expect("serialize");
+        assert_eq!(body["success"], false);
+    }
+
+    /// Window gone on `/vision/analyze`: the analysis still answers from the
+    /// snapshot, and the frame observation is `producer_failed`.
+    #[test]
+    fn analyze_with_the_window_gone_reports_producer_failed_on_frame() {
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Layout,
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+            frame_observation(Err(&"Runner window not found".to_string()), &None),
+            None,
+            sample_time(),
+        ))
+        .expect("serialize");
+        assert_eq!(v["frame"]["status"], "unknown");
+        assert_eq!(v["frame"]["unknown"]["code"], "producer_failed");
+        assert_coverage_sums(&v["provenance"]["coverage"]);
+    }
+
+    /// Window gone on `/vision/assert`: same rule.
+    #[test]
+    fn assert_with_the_window_gone_reports_producer_failed_on_frame() {
+        let v = serde_json::to_value(AssertResponse::of(
+            vec![],
+            None,
+            frame_observation(Err(&"Runner window not found".to_string()), &None),
+            sample_time(),
+        ))
+        .expect("serialize");
+        assert_eq!(v["frame"]["unknown"]["code"], "producer_failed");
+    }
+
+    /// Window gone on `/vision/describe`: same rule as extract.
+    #[tokio::test]
+    async fn describe_with_the_window_gone_is_producer_failed() {
+        let client = VlmClient::new(closed_port_endpoint(), "vlm");
+        let v = envelope_wire(
+            &run_describe(
+                &client,
+                Err("Runner window not found".to_string()),
+                None,
+                256,
+            )
+            .await,
+        );
+        assert_eq!(v["status"], "unknown");
+        assert_eq!(v["unknown"]["code"], "producer_failed");
+        assert!(v["provenance"]["observedAt"].is_null());
+    }
+
+    /// `measured + Σ unmeasured.count == considered` on every arm that names
+    /// an unmeasured dimension: a degraded extract, an invalid describe twin
+    /// (outer and inner), a degraded and a blocked analyze, and an assert with
+    /// an unknown.
+    #[tokio::test]
+    async fn coverage_sums_hold_on_every_degraded_arm() {
+        let mixed = stub_model(
+            r#"[{"bbox":{"x":0,"y":0,"w":10,"h":10},"text":"Save","confidence":0.9},
+                {"bbox":{"x":0,"y":20,"w":10,"h":10},"text":"Cancel","confidence":0.1}]"#,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let degraded = envelope_wire(&extract_against(&mixed, 0.5).await);
+        assert_eq!(degraded["status"], "measured");
+        assert_coverage_sums(&degraded["provenance"]["coverage"]);
+
+        let invalid = stub_model(
+            r#"{"description":"d","structured":{"layout":"sidebar","confidence":0.8}}"#,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let v = envelope_wire(
+            &run_describe(
+                &VlmClient::new(invalid, "vlm"),
+                Ok(image(sample_time())),
+                None,
+                256,
+            )
+            .await,
+        );
+        assert_eq!(v["provenance"]["coverage"]["measured"], 0);
+        assert_coverage_sums(&v["provenance"]["coverage"]);
+        assert_coverage_sums(&v["value"]["structured"]["provenance"]["coverage"]);
+
+        for result in [
+            qontinui_vision_core::AnalyzerResult::degraded(
+                UnknownCode::InputMissing,
+                "no stacking order",
+                None,
+                vec![],
+            ),
+            qontinui_vision_core::AnalyzerResult::blocked(
+                UnknownCode::InputMissing,
+                "no bbox",
+                None,
+                vec![],
+            ),
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+        ] {
+            let v = serde_json::to_value(AnalyzeResponse::of(
+                qontinui_vision_core::Analyzer::Layout,
+                result,
+                frame_observation(Err(&"no window".to_string()), &None),
+                None,
+                sample_time(),
+            ))
+            .expect("serialize");
+            assert_coverage_sums(&v["provenance"]["coverage"]);
+        }
+    }
+
+    /// `color` reads the frame, so its answer is observed when the frame was
+    /// captured; `layout` does not, so its `observedAt` is null.
+    #[test]
+    fn a_pixel_analyzer_takes_observed_at_from_the_frame() {
+        let frame = Frame::from_rgba(
+            RgbaImage::new(2, 2),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Window,
+                scale_factor: 1.0,
+                captured_at: sample_time(),
+                capture_backend: Some(qontinui_vision_core::CaptureBackend::MonitorCrop),
+            },
+        );
+        let of = |analyzer| {
+            serde_json::to_value(AnalyzeResponse::of(
+                analyzer,
+                qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+                frame_observation(Ok(&frame), &None),
+                None,
+                sample_time(),
+            ))
+            .expect("serialize")
+        };
+        assert_eq!(
+            of(qontinui_vision_core::Analyzer::Color)["provenance"]["observedAt"],
+            "2026-09-30T10:00:00Z"
+        );
+        assert!(of(qontinui_vision_core::Analyzer::Layout)["provenance"]["observedAt"].is_null());
+    }
+
+    /// A describe cache hit round-trips the nested `structured` observation
+    /// intact — status, value and provenance — rather than flattening it.
+    #[tokio::test]
+    async fn describe_cache_hit_round_trips_the_nested_structured_observation() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let endpoint = stub_model(
+            r#"{"description":"d","structured":{"elements":[],"modals":[],"overlays":[],"layout":"grid","confidence":0.8}}"#,
+            hits.clone(),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache =
+            qontinui_vision_core::VisionCache::new(dir.path(), 8 * 1024 * 1024).expect("cache");
+        let key = qontinui_vision_core::sha256_of(b"v=2|describe|test");
+        let client = VlmClient::new(endpoint, "vlm");
+        let call = || async {
+            serve_cached_observation::<_, std::convert::Infallible, _, _>(
+                &cache,
+                &key,
+                false,
+                "vision/describe",
+                || async {
+                    Ok(run_describe(&client, Ok(image(chrono::Utc::now())), None, 256).await)
+                },
+            )
+            .await
+            .expect("infallible")
+        };
+        let first = envelope_wire(&call().await);
+        let second = envelope_wire(&call().await);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the model ran once");
+        assert_eq!(second["provenance"]["cache"]["hit"], true);
+        assert_eq!(second["value"]["structured"]["status"], "measured");
+        assert_eq!(second["value"]["structured"], first["value"]["structured"]);
+        assert_eq!(second["value"]["structured"]["value"]["layout"], "grid");
     }
 }

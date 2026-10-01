@@ -1014,9 +1014,10 @@ fn element_is_visible(el: &serde_json::Value) -> bool {
 /// | discover reply | answer |
 /// |---|---|
 /// | IPC failed | `unknown{producer_failed}` (the error as detail) |
-/// | no `elements` array | `unknown{input_missing}` |
+/// | no `elements` array | `unknown{input_missing}`, `observedAt: null` (no sample) |
 /// | `elements: []` | `unknown{producer_not_run}` — nothing is registered to look at |
-/// | ≥ 1 element | `measured`, the report as value |
+/// | visible elements, none carrying `normalizedRect` | `unknown{input_missing}` — no geometry to place (mirrors the SDK's `page-health.ts`) |
+/// | otherwise | `measured`, the report as value |
 ///
 /// Coverage: `considered` = visible elements, `measured` = those carrying a
 /// `normalizedRect`, and the difference is named as unmeasured `geometry` —
@@ -1046,10 +1047,12 @@ pub(crate) fn page_health_observation(
         }
     };
     let Some(elements) = data.get("elements").and_then(|v| v.as_array()) else {
+        // No element list = no sample of the page: `observedAt` stays null,
+        // as the SDK's implementation answers.
         return Observation::unknown(
             UnknownCode::InputMissing,
             "the discover reply carried no `elements` array, so no element was seen",
-            provenance(ObservationCoverage::default()).with_observed_at(observed_at),
+            provenance(ObservationCoverage::default()),
         );
     };
     if elements.is_empty() {
@@ -1088,6 +1091,19 @@ pub(crate) fn page_health_observation(
             Vec::new()
         },
     };
+    if considered > 0 && measured == 0 {
+        // Every visible element lacks geometry: the grid has nothing to place,
+        // so a spatial-coverage verdict would be a statement about missing
+        // DATA, not about the page.
+        return Observation::unknown(
+            UnknownCode::InputMissing,
+            format!(
+                "{considered} visible element(s) and none carries a normalizedRect, so the \
+                 layout could not be measured"
+            ),
+            provenance(coverage).with_observed_at(observed_at),
+        );
+    }
     Observation::measured(
         page_health_report(elements),
         provenance(coverage).with_observed_at(observed_at),
@@ -2469,6 +2485,37 @@ mod page_health_observation_tests {
         }
         assert!(data["provenance"]["confidence"].is_null());
         assert!(data["provenance"]["cache"].is_null());
+        assert!(
+            data["provenance"]["observedAt"].is_null(),
+            "no element list means no sample was taken"
+        );
+    }
+
+    /// Visible elements exist but none carries geometry: `input_missing`, not
+    /// a CRITICAL empty page; the coverage names all of them as unmeasured.
+    #[test]
+    fn visible_elements_with_no_geometry_at_all_are_unknown_input_missing() {
+        let elements = vec![
+            element(true, false),
+            element(true, false),
+            element(true, false),
+        ];
+        let (v, text) = wire(page_health_observation(
+            Ok(serde_json::json!({ "elements": elements })),
+            at(),
+            at(),
+        ));
+        assert_eq!(v["data"]["status"], "unknown");
+        assert_eq!(v["data"]["unknown"]["code"], "input_missing");
+        assert!(!text.contains("CRITICAL") && !text.contains("unhealthy"));
+        let cov = &v["data"]["provenance"]["coverage"];
+        assert_eq!(cov["considered"], 3);
+        assert_eq!(cov["measured"], 0);
+        assert_eq!(cov["unmeasured"][0]["count"], 3);
+        assert_eq!(
+            v["data"]["provenance"]["observedAt"],
+            "2026-09-30T12:00:00Z"
+        );
     }
 
     /// Zero registered elements with the key present: nothing to look at yet,
@@ -2531,6 +2578,11 @@ mod page_health_observation_tests {
         assert_eq!(cov["unmeasured"][0]["dimension"], "geometry");
         assert_eq!(cov["unmeasured"][0]["count"], 3);
         assert_eq!(cov["unmeasured"][0]["code"], "input_missing");
+        assert_eq!(
+            cov["measured"].as_u64().unwrap() + cov["unmeasured"][0]["count"].as_u64().unwrap(),
+            cov["considered"].as_u64().unwrap(),
+            "measured + unmeasured must equal considered"
+        );
         assert_eq!(data["value"]["element_count"], 6);
         assert_eq!(data["value"]["visible_count"], 2);
         assert_eq!(data["provenance"]["observedAt"], "2026-09-30T12:00:00Z");

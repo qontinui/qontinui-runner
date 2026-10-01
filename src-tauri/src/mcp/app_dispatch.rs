@@ -122,6 +122,67 @@ impl DispatchError {
 /// Matches the legacy `sdk_request` cache window.
 const RESPONSIVENESS_CACHE_MS: i64 = 10_000;
 
+/// A dispatch's answer, tagged with the transport that produced it.
+///
+/// The two arms answer in DIFFERENT SHAPES, and that difference is why the
+/// tag exists. The HTTP arm returns the SDK server's body verbatim — its
+/// `{success, data, …}` API envelope. The WebSocket arm returns the wrapper's
+/// bare `result`, with no envelope at all. A proxy that forwards "the answer"
+/// without knowing which arm produced it therefore hands a WS-transport app's
+/// caller a body with no `success` key, which a strict reader (`success ===
+/// true`) must — correctly — read as a failure. [`Self::into_envelope`] is the
+/// one normalization; [`Self::into_raw`] is for internal consumers that
+/// parse the payload themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dispatched {
+    /// The wrapper's bare `result` from the relay.
+    Websocket(serde_json::Value),
+    /// The SDK server's HTTP response body, verbatim.
+    Http(serde_json::Value),
+}
+
+impl Dispatched {
+    /// The answer in the HTTP arm's `{success, data}` envelope shape.
+    pub fn into_envelope(self) -> serde_json::Value {
+        match self {
+            Self::Http(body) => body,
+            Self::Websocket(result) => ws_result_envelope(result),
+        }
+    }
+
+    /// The body as the transport delivered it, unnormalized.
+    pub fn into_raw(self) -> serde_json::Value {
+        match self {
+            Self::Http(v) | Self::Websocket(v) => v,
+        }
+    }
+}
+
+/// Wrap a WebSocket wrapper's bare `result` in the `{success, data}` envelope
+/// the HTTP arm answers with.
+///
+/// The relay only resolves `Ok` when the wrapper's frame said `success:
+/// true`, so the COMMAND succeeded. But some actions return an outcome object
+/// of their own (an element action's `{success: false, error}`); its
+/// `success` is the answer's, so it is lifted — never overwritten by the
+/// command-level `true` — along with its `error`.
+pub fn ws_result_envelope(result: serde_json::Value) -> serde_json::Value {
+    let inner_success = result.get("success").and_then(serde_json::Value::as_bool);
+    let inner_error = if inner_success == Some(false) {
+        result.get("error").cloned()
+    } else {
+        None
+    };
+    let mut env = serde_json::json!({
+        "success": inner_success.unwrap_or(true),
+        "data": result,
+    });
+    if let (Some(err), Some(obj)) = (inner_error, env.as_object_mut()) {
+        obj.insert("error".to_string(), err);
+    }
+    env
+}
+
 /// A reusable wrapper bundling the registry + relay + http client so handlers
 /// can inject one `Arc<AppDispatcher>` via `ApiState`.
 pub struct AppDispatcher {
@@ -161,7 +222,7 @@ impl AppDispatcher {
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
-    ) -> Result<serde_json::Value, DispatchError> {
+    ) -> Result<Dispatched, DispatchError> {
         // `get_live`, not `get`: the registry retains an expired row for its
         // reservation window so the id stays held for its owner, and routing
         // must not follow a row that stopped heartbeating.
@@ -221,7 +282,9 @@ impl AppDispatcher {
                     .touch(app_id, entry.websocket_conn_id, &entry.principal)
                     .await;
                 let response = self.command_relay.dispatch(app_id, action, payload).await?;
-                Ok(response.result.unwrap_or(serde_json::Value::Null))
+                Ok(Dispatched::Websocket(
+                    response.result.unwrap_or(serde_json::Value::Null),
+                ))
             }
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
@@ -256,7 +319,9 @@ impl AppDispatcher {
                         body,
                     });
                 }
-                serde_json::from_str(&body).map_err(|_| DispatchError::InvalidJson(body))
+                serde_json::from_str(&body)
+                    .map(Dispatched::Http)
+                    .map_err(|_| DispatchError::InvalidJson(body))
             }
         }
     }
@@ -440,7 +505,7 @@ impl AppDispatcher {
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
-    ) -> Result<serde_json::Value, DispatchError> {
+    ) -> Result<Dispatched, DispatchError> {
         // 1. Snapshot the active connection. Drop the lock before any await
         //    on a remote — responsiveness probe + HTTP request must not pin
         //    the manager Mutex.
@@ -470,7 +535,9 @@ impl AppDispatcher {
                     .command_relay
                     .dispatch(&app_id, action, payload)
                     .await?;
-                return Ok(response.result.unwrap_or(serde_json::Value::Null));
+                return Ok(Dispatched::Websocket(
+                    response.result.unwrap_or(serde_json::Value::Null),
+                ));
             }
         }
 
@@ -486,6 +553,7 @@ impl AppDispatcher {
             payload,
         )
         .await
+        .map(Dispatched::Http)
     }
 }
 
@@ -576,7 +644,59 @@ mod tests {
             .await;
 
         let out = handle.await.unwrap().unwrap();
-        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(out, Dispatched::Websocket(json!({"ok": true})));
+        // The WS arm's bare result is normalized to the HTTP arm's envelope.
+        assert_eq!(
+            out.into_envelope(),
+            json!({"success": true, "data": {"ok": true}})
+        );
+    }
+
+    /// The WS error arm: a wrapper frame answering `success: false` is an
+    /// `Err`, never an `Ok` with a null result — which every proxy handler
+    /// turns into its `{success: false, error}` body.
+    #[tokio::test]
+    async fn websocket_wrapper_error_is_an_err_not_an_envelope() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "http://unused"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry, relay.clone());
+        let dispatcher2 = dispatcher.clone();
+        let handle = tokio::spawn(async move {
+            dispatcher2
+                .dispatch("wapp", "snap", Method::GET, "/ignored", json!({}))
+                .await
+        });
+        let frame = outbound_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let command_id = v["commandId"].as_str().unwrap().to_string();
+        relay
+            .resolve(
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                super::super::command_relay::CommandResponse {
+                    command_id,
+                    success: false,
+                    result: None,
+                    error: Some("element not found".to_string()),
+                },
+            )
+            .await;
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("element not found"),
+            "the wrapper's error must survive to the proxy's failure body: {err}"
+        );
     }
 
     fn manager_with_active(
@@ -670,7 +790,12 @@ mod tests {
             .await;
 
         let out = handle.await.unwrap().unwrap();
-        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(out, Dispatched::Websocket(json!({"ok": true})));
+        // The WS arm's bare result is normalized to the HTTP arm's envelope.
+        assert_eq!(
+            out.into_envelope(),
+            json!({"success": true, "data": {"ok": true}})
+        );
     }
 
     #[tokio::test]
@@ -761,5 +886,30 @@ mod tests {
     fn app_answered_failure_ignores_non_failures() {
         assert!(answered(json!({"success": true, "code": "X"})).is_none());
         assert!(answered(json!({"error": "no success field"})).is_none());
+    }
+
+    /// A WS-shaped bare result is enveloped as a success, and an outcome
+    /// object's own `success: false` is lifted with its error rather than
+    /// being overwritten by the command-level success.
+    #[test]
+    fn ws_result_envelope_matches_the_http_arms_shape() {
+        assert_eq!(
+            ws_result_envelope(json!({"elements": []})),
+            json!({"success": true, "data": {"elements": []}})
+        );
+        assert_eq!(
+            ws_result_envelope(serde_json::Value::Null),
+            json!({"success": true, "data": null})
+        );
+        assert_eq!(
+            ws_result_envelope(json!({"success": false, "error": "not clickable"})),
+            json!({
+                "success": false,
+                "error": "not clickable",
+                "data": {"success": false, "error": "not clickable"}
+            })
+        );
+        let http = json!({"success": true, "data": {"x": 1}});
+        assert_eq!(Dispatched::Http(http.clone()).into_envelope(), http);
     }
 }
