@@ -15,8 +15,9 @@
 //!
 //! `/tenant/active` (every method) is on
 //! `mcp::origin_guard::CREDENTIAL_DOORS`: a `PUT` re-points which tenant this
-//! device's NEW sessions and device-level surfaces write into, which is a
-//! credential-selection change. So no browser origin other than the runner's
+//! device's NEW sessions, device-level surfaces AND running sessions that hold
+//! no pinned tenant (their next coord-mcp request reads the new pin) write
+//! into, which is a credential-selection change. So no browser origin other than the runner's
 //! own webview reaches it, under every route policy, and it is NOT on
 //! `TRUSTED_DOOR_GRACE` — the qontinui-web dev frontend is refused too. A
 //! loopback agent, script or curl (`OriginClass::NonBrowser`) reaches it
@@ -96,9 +97,14 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 async fn put_active_tenant(
     Json(body): Json<PutActiveTenant>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, HandlerError> {
+    // The census in `applied_payload` locks both proxy registries, so it runs
+    // here on the blocking pool with the write, not on the async executor.
     let result = spawn_blocking_tracked(move || {
         let previous = current_machine_pin();
-        apply_active_tenant(&body.tenant_id).map(|written| (written, previous))
+        apply_active_tenant(&body.tenant_id).map(|written| {
+            let payload = applied_payload(&written, previous.clone());
+            (written, previous, payload)
+        })
     })
     .await
     .map_err(|e| {
@@ -110,15 +116,13 @@ async fn put_active_tenant(
     })?;
 
     match result {
-        Ok((written, previous)) => {
+        Ok((written, previous, payload)) => {
             info!(
                 active_tenant_id = %written,
                 previous = ?previous,
                 "tenant: active tenant pinned via PUT /tenant/active"
             );
-            Ok(Json(ApiResponse::success(applied_payload(
-                &written, previous,
-            ))))
+            Ok(Json(ApiResponse::success(payload)))
         }
         Err(e) => {
             warn!(code = e.code(), "tenant: PUT /tenant/active refused: {e}");
@@ -314,8 +318,12 @@ mod tests {
         for s in surfaces {
             let name = s["surface"].as_str().expect("surface name");
             assert!(
-                s["evidence"].as_str().is_some_and(|e| !e.trim().is_empty()),
-                "{name}: evidence must be named"
+                s["evidence"].as_array().is_some_and(|e| {
+                    !e.is_empty()
+                        && e.iter()
+                            .all(|r| r.as_str().is_some_and(|r| r.contains(".rs::")))
+                }),
+                "{name}: evidence must name <path>.rs::<fn> readers"
             );
             assert!(s["detail"].as_str().is_some(), "{name}: detail");
             match s["timing"].as_str() {
@@ -330,6 +338,7 @@ mod tests {
             next_start,
             [
                 "coord_mcp_nonce_restore",
+                "coord_mcp_on_disk_nonce_adoption",
                 "session_coordination_dual_write_gate"
             ],
             "exactly the startup readers are next_start"

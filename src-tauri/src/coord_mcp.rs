@@ -5401,7 +5401,7 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
         .unwrap_or(TenantPin::Unpinned)
 }
 
-/// How this process's live DEVICE coord-mcp bindings hold their tenant — the
+/// How this process's live DEVICE coord-mcp keys hold their tenant — the
 /// population a machine-pin switch does or does not move.
 ///
 /// Plan `2026-09-23-remote-create-residuals-after-coord-registration-confirm`
@@ -5411,24 +5411,35 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
 /// 1a–4 and re-reads the LIVE pin on each request — unless its workspace
 /// declares a tenant, which this census does not read (it would mean a file
 /// read per binding), so `follows_machine_pin` is an upper bound.
+///
+/// Graced keys count too. A device key evicted into [`graced_nonces`] — the
+/// normal path whenever a second session or terminal re-mints `.mcp.json` in
+/// the same cwd — keeps serving requests for [`DEVICE_EVICTED_NONCE_GRACE_TTL`]
+/// (hours, not moments), and [`proxy_session_pin_for_nonce`] resolves it
+/// `Pinned` only when it carries a `session_tenant`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct DeviceSessionPinCensus {
-    /// Bindings frozen `Pinned` at mint/restore: they keep that tenant.
+    /// Keys frozen `Pinned` at mint/restore (live or graced): they keep that
+    /// tenant.
     pub(crate) pinned_at_creation: usize,
-    /// Bindings with no frozen tenant: they follow the machine pin on their
-    /// next coord-mcp request (upper bound — see the type docs).
+    /// Keys with no frozen tenant (live or graced): they follow the machine pin
+    /// on their next coord-mcp request (upper bound — see the type docs).
     pub(crate) follows_machine_pin: usize,
 }
 
-/// Count the live (non-expired) DEVICE bindings by [`DeviceSessionPinCensus`]
-/// class. Agent principals present their own JWT and are not counted; nor are
-/// graced (evicted) nonces, which age out within the grace TTL.
-pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
+/// The census over the two registries as given — pure, so a test can seed
+/// registry-shaped maps without racing the process-global ones. Agent
+/// principals present their own JWT and are not counted (they are never graced
+/// either); an expired ephemeral or an expired graced key serves nothing and is
+/// not counted.
+fn device_session_pin_census_over<'a>(
+    live: impl IntoIterator<Item = &'a NonceBinding>,
+    graced: impl IntoIterator<Item = &'a GracedNonce>,
+    now: std::time::Instant,
+) -> DeviceSessionPinCensus {
     use crate::session::tenant_pin::TenantPin;
-    let now = std::time::Instant::now();
-    let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
     let mut census = DeviceSessionPinCensus::default();
-    for binding in map.values() {
+    for binding in live {
         if binding.principal != ProxyPrincipal::Device {
             continue;
         }
@@ -5442,7 +5453,164 @@ pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
             TenantPin::Unpinned | TenantPin::Unresolvable => census.follows_machine_pin += 1,
         }
     }
+    for g in graced {
+        if g.expires_at <= now {
+            continue;
+        }
+        // Mirrors `proxy_session_pin_for_nonce`'s graced arm exactly.
+        match g.session_tenant {
+            Some(_) => census.pinned_at_creation += 1,
+            None => census.follows_machine_pin += 1,
+        }
+    }
     census
+}
+
+/// [`device_session_pin_census_over`] the process-global registries. The two
+/// locks are taken one after the other, never nested.
+pub(crate) fn device_session_pin_census() -> DeviceSessionPinCensus {
+    let now = std::time::Instant::now();
+    let live = device_session_pin_census_over(
+        proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .values(),
+        std::iter::empty(),
+        now,
+    );
+    let graced = device_session_pin_census_over(
+        std::iter::empty(),
+        graced_nonces()
+            .lock()
+            .expect("graced nonce map poisoned")
+            .values(),
+        now,
+    );
+    DeviceSessionPinCensus {
+        pinned_at_creation: live.pinned_at_creation + graced.pinned_at_creation,
+        follows_machine_pin: live.follows_machine_pin + graced.follows_machine_pin,
+    }
+}
+
+#[cfg(test)]
+mod device_session_pin_census_tests {
+    use super::*;
+    use crate::session::tenant_pin::TenantPin;
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn device(pin: TenantPin, lifetime: NonceLifetime) -> NonceBinding {
+        NonceBinding {
+            workdir: "/census".into(),
+            principal: ProxyPrincipal::Device,
+            lifetime,
+            session_pin: pin,
+            pin_origin: PinOrigin::MachineSampled,
+            terminal_id: None,
+            minted_at: SystemTime::now(),
+            expected: Default::default(),
+        }
+    }
+
+    fn graced(expires_at: Instant, session_tenant: Option<Uuid>) -> GracedNonce {
+        GracedNonce {
+            expires_at,
+            grace_until: SystemTime::now(),
+            workdir: "/census".into(),
+            terminal_id: None,
+            session_tenant,
+            pin_origin: PinOrigin::MachineSampled,
+        }
+    }
+
+    #[test]
+    fn census_classifies_every_key_shape() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3600);
+        let earlier = now - Duration::from_secs(1);
+        let t = Uuid::from_u128(0xA);
+
+        let mut live: HashMap<String, NonceBinding> = HashMap::new();
+        // Pinned -> kept.
+        live.insert(
+            "pinned".into(),
+            device(TenantPin::Pinned(t), NonceLifetime::Persistent),
+        );
+        // Unpinned and Unresolvable -> follow the machine pin.
+        live.insert(
+            "unpinned".into(),
+            device(TenantPin::Unpinned, NonceLifetime::Persistent),
+        );
+        live.insert(
+            "unresolvable".into(),
+            device(TenantPin::Unresolvable, NonceLifetime::Persistent),
+        );
+        // A live ephemeral counts; an expired one serves nothing.
+        live.insert(
+            "eph-live".into(),
+            device(
+                TenantPin::Unpinned,
+                NonceLifetime::Ephemeral { expires_at: later },
+            ),
+        );
+        live.insert(
+            "eph-expired".into(),
+            device(
+                TenantPin::Pinned(t),
+                NonceLifetime::Ephemeral {
+                    expires_at: earlier,
+                },
+            ),
+        );
+        // Agent principals present their own JWT: excluded.
+        live.insert(
+            "agent".into(),
+            super::teardown_poison_tests::agent_nonce_binding(Uuid::from_u128(0xB)),
+        );
+
+        let mut grace: HashMap<String, GracedNonce> = HashMap::new();
+        grace.insert("g-pinned".into(), graced(later, Some(t)));
+        grace.insert("g-unpinned".into(), graced(later, None));
+        grace.insert("g-expired".into(), graced(earlier, None));
+
+        let census = device_session_pin_census_over(live.values(), grace.values(), now);
+        assert_eq!(
+            census,
+            DeviceSessionPinCensus {
+                // pinned + g-pinned
+                pinned_at_creation: 2,
+                // unpinned + unresolvable + eph-live + g-unpinned
+                follows_machine_pin: 4,
+            }
+        );
+    }
+
+    /// The graced classification must agree with what the request path
+    /// actually resolves a graced key to.
+    #[test]
+    fn graced_census_agrees_with_proxy_session_pin_for_nonce() {
+        let t = Uuid::from_u128(0xC);
+        let later = Instant::now() + Duration::from_secs(3600);
+        let pinned_key = format!("census-g-pinned-{}", Uuid::now_v7().simple());
+        let unpinned_key = format!("census-g-unpinned-{}", Uuid::now_v7().simple());
+        {
+            let mut map = graced_nonces().lock().unwrap();
+            map.insert(pinned_key.clone(), graced(later, Some(t)));
+            map.insert(unpinned_key.clone(), graced(later, None));
+        }
+        assert_eq!(
+            proxy_session_pin_for_nonce(&pinned_key),
+            TenantPin::Pinned(t)
+        );
+        assert_eq!(
+            proxy_session_pin_for_nonce(&unpinned_key),
+            TenantPin::Unpinned
+        );
+        {
+            let mut map = graced_nonces().lock().unwrap();
+            map.remove(&pinned_key);
+            map.remove(&unpinned_key);
+        }
+    }
 }
 
 /// A typed tenant/bearer-selection refusal: HTTP status, stable `code`, whether
@@ -13528,7 +13696,8 @@ mod tests {
 
         // Re-provisioning the same workdir mints a FRESH nonce and moves the
         // prior one onto the grace TTL (plan 2026-07-07 Change 3): the old nonce
-        // is dropped from the LIVE map but stays valid briefly so an in-flight
+        // is dropped from the LIVE map but stays valid for the grace TTL (hours,
+        // `DEVICE_EVICTED_NONCE_GRACE_TTL`) so an in-flight
         // client that cached it rides through until it reconnects — rather than
         // hard-401ing the instant `.mcp.json` is rewritten. Both nonces resolve
         // to the same Device principal, so there is no scope-elevation surface.
