@@ -1586,11 +1586,7 @@ mod tests {
     /// but two different quantities sharing a unit.
     #[test]
     fn the_memory_floor_reads_the_published_snapshot_field() {
-        const SRC: &str = include_str!("admission.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(a, _)| a)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("admission.rs"));
         assert!(
             !prod.contains("available_memory()"),
             "ci_node must resolve its memory floor from \

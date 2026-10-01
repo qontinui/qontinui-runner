@@ -6108,16 +6108,9 @@ mod session_tenant_resolution_tests {
         // Wiring: the async door the four `mcp_api` sites call routes its join
         // result through the mapping. Comment lines are dropped first, so a
         // needle left in a comment cannot satisfy it.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
-        let start = text
-            .find("async fn session_bearer_and_tenant_or_refuse(")
-            .expect("session_bearer_and_tenant_or_refuse exists");
-        let end = text[start..]
-            .find("\n}\n")
-            .map(|i| start + i)
-            .expect("its body ends");
-        let code: String = text[start..end]
+        let text = crate::source_pin::ProdSource::read_own("coord_mcp.rs");
+        let code: String = text
+            .item_of("async fn session_bearer_and_tenant_or_refuse(", 150..20_000)
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -12894,7 +12887,7 @@ mod tests {
         // shipped that way and CI caught it. `concat!` keeps the needle itself
         // off the haystack; the comment filter handles the header.
         const RETIRED_FLAG: &str = concat!("QONTINUI_SESSION_COORD_", "IDENTITY_ENABLED");
-        let src = include_str!("coord_mcp.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("coord_mcp.rs"));
         let offenders: Vec<String> = src
             .lines()
             .enumerate()
@@ -22961,8 +22954,9 @@ mod runner_credential_tests {
     /// becomes two.
     #[test]
     fn the_two_credential_breadcrumb_sites_share_one_literal() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
-        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        // The production half: a copy of the literal in a test must neither
+        // count toward nor hide a production call site.
+        let text = crate::source_pin::ProdSource::read_own("coord_mcp.rs");
         let occurrences = text.matches(RUNNER_CREDENTIAL_BREADCRUMB_REASON).count();
         assert_eq!(
             occurrences, 3,

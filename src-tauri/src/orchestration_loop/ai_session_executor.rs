@@ -1182,7 +1182,7 @@ mod tests {
     /// back up.
     #[test]
     fn the_task_run_id_is_minted_below_the_admission_check() {
-        let src = include_str!("ai_session_executor.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("ai_session_executor.rs"));
         let f = src
             .find("pub async fn dispatch_subtask(")
             .expect("dispatch_subtask");

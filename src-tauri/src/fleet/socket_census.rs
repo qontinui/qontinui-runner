@@ -857,11 +857,7 @@ unix  2      [ ACC ]     STREAM     LISTENING     12345 /run/foo.sock
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn collect_never_returns_the_unavailable_source() {
-        const SRC: &str = include_str!("socket_census.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("socket_census.rs"));
         let start = prod
             .find("pub(crate) fn collect(")
             .expect("the collector must exist");
@@ -880,11 +876,7 @@ unix  2      [ ACC ]     STREAM     LISTENING     12345 /run/foo.sock
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_probe_is_bounded_and_kills_what_it_times_out_on() {
-        const SRC: &str = include_str!("socket_census.rs");
-        let prod = SRC
-            .split_once("\n#[cfg(test)]")
-            .map(|(before, _)| before)
-            .unwrap_or(SRC);
+        let prod = crate::source_pin::ProdSource::of(include_str!("socket_census.rs"));
         let start = prod.find("fn run_bounded(").expect("the runner must exist");
         let rest = &prod[start..];
         let end = rest

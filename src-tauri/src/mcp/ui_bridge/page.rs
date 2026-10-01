@@ -3695,7 +3695,7 @@ mod close_door_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_close_request_probe_join_is_wrapped_in_a_timeout() {
-        let src = include_str!("page.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("page.rs"));
         let start = src
             .find("async fn event_loop_verdict()")
             .expect("event_loop_verdict must exist");
@@ -3735,7 +3735,7 @@ mod close_door_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_close_door_reads_the_latch_through_the_same_guard_as_health() {
-        let src = include_str!("page.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("page.rs"));
         let start = src
             .find("async fn event_loop_verdict()")
             .expect("event_loop_verdict must exist");
@@ -3953,7 +3953,7 @@ mod refresh_response_honesty_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_hard_refresh_handler_is_not_stamped() {
-        let src = include_str!("page.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("page.rs"));
         let start = src
             .find("pub async fn ui_bridge_page_hard_refresh_handler")
             .expect("the hard-refresh handler is in this file");

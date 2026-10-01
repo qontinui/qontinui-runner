@@ -3562,7 +3562,7 @@ pub mod emergency_quit {
             reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
         )]
         fn force_close_marks_quitting_and_stops_pg_before_every_hard_exit() {
-            let src = include_str!("ai_session.rs");
+            let src = crate::source_pin::ProdSource::of(include_str!("ai_session.rs"));
             let start = src
                 .find("pub fn request_force_close(")
                 .expect("request_force_close must exist");

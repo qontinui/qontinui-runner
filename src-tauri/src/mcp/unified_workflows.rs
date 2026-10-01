@@ -3110,10 +3110,12 @@ mod tests {
 
     /// This module's own source, so the roster can be checked against the code
     /// that consumes it without a database, a server, or a hand-kept list.
-    const THIS_SOURCE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/mcp/unified_workflows.rs"
-    ));
+    fn this_source() -> crate::source_pin::ProdSource<'static> {
+        crate::source_pin::ProdSource::of(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mcp/unified_workflows.rs"
+        )))
+    }
 
     /// The body of `run_unified_workflow` ALONE, ending at its closing brace.
     ///
@@ -3130,39 +3132,16 @@ mod tests {
     /// the inline executor would satisfy the scans while this endpoint still
     /// ignored the key.
     ///
-    /// Two known fragilities, both latent on the current file and both caught
-    /// loudly rather than silently by `the_scanned_body_is_exactly_one_function`:
-    /// braces inside string literals, char literals and comments are not
-    /// excluded (today every brace in this range is a balanced `{}` format
-    /// placeholder), and the opening brace is located by the first ` {\n` after
-    /// the signature, which a reformatted signature or a `where` clause could
-    /// move. This is a source scan, not a parser.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
-    fn run_unified_workflow_body() -> &'static str {
-        let start = THIS_SOURCE
-            .find("pub async fn run_unified_workflow(")
-            .expect("run_unified_workflow not found — this scan is looking at the wrong function");
-        let rest = &THIS_SOURCE[start..];
-        let open = rest
-            .find(" {\n")
-            .expect("run_unified_workflow has no body brace");
-        let mut depth = 0i32;
-        for (offset, ch) in rest[open..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &rest[..open + offset + 1];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("unbalanced braces scanning run_unified_workflow");
+    /// The slice comes from [`crate::source_pin::ProdSource::item_of`]: the
+    /// PRODUCTION half only (this test module names the signature too — the
+    /// occurrence-17 shape), the signature required to occur exactly once, and
+    /// braces matched over code only, so braces in string literals, char
+    /// literals and comments cannot move the end. The two-sided length bound
+    /// (the function was ~21 KB on 2026-09-30) refuses a runaway slice.
+    fn run_unified_workflow_body() -> String {
+        this_source()
+            .item_of("pub async fn run_unified_workflow(", 10_000..60_000)
+            .to_string()
     }
 
     /// Every identifier read as `overrides.get("<ident>")` in `source`.
@@ -3203,7 +3182,7 @@ mod tests {
     /// drift this roster can be held to without a parser.
     #[test]
     fn runtime_override_keys_are_all_applied() {
-        let applied = applied_override_keys(run_unified_workflow_body());
+        let applied = applied_override_keys(&run_unified_workflow_body());
         for key in RUNTIME_OVERRIDE_KEYS {
             assert!(
                 applied.contains(&key.to_string()),
@@ -3224,7 +3203,7 @@ mod tests {
     /// roster silently became a fiction.
     #[test]
     fn every_applied_override_key_is_on_the_roster() {
-        let applied = applied_override_keys(run_unified_workflow_body());
+        let applied = applied_override_keys(&run_unified_workflow_body());
         assert_eq!(
             applied.len(),
             RUNTIME_OVERRIDE_KEYS.len(),
@@ -3278,7 +3257,7 @@ mod tests {
     fn the_scanned_body_is_exactly_one_function() {
         let body = run_unified_workflow_body();
         assert!(
-            body.len() < THIS_SOURCE.len(),
+            body.len() < this_source().len(),
             "the slice is the whole file"
         );
         assert!(
@@ -3302,7 +3281,7 @@ mod tests {
         // reintroduce the inert-key defect with every test in this module green.
         const FOLLOWING_ITEM: &str = "static LAST_INLINE_WORKFLOW";
         assert!(
-            THIS_SOURCE.contains(FOLLOWING_ITEM),
+            this_source().contains(FOLLOWING_ITEM),
             "`{}` is gone, so the next assertion proves nothing — re-pin it on \
              whatever now follows run_unified_workflow",
             FOLLOWING_ITEM

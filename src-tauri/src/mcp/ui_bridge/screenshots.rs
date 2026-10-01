@@ -1639,8 +1639,8 @@ mod visibility_sweep_payload_tests {
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn visibility_handler_body() -> &'static str {
-        let source = include_str!("screenshots.rs");
+    fn visibility_handler_body() -> String {
+        let source = crate::source_pin::ProdSource::of(include_str!("screenshots.rs"));
         let start = source
             .find("pub async fn ui_bridge_visibility_handler")
             .expect("the visibility handler is in this file");
@@ -1649,7 +1649,7 @@ mod visibility_sweep_payload_tests {
         let end = rest
             .find("\n// =====")
             .expect("the routes banner follows the handler");
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     #[test]
@@ -2031,7 +2031,7 @@ mod visibility_min_ratio_contract_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_handler_validates_before_it_discovers() {
-        let src = include_str!("screenshots.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("screenshots.rs"));
         let start = src
             .find("pub async fn ui_bridge_visibility_handler")
             .expect("the visibility handler is in this file");
@@ -2164,13 +2164,9 @@ mod sweep_discover_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn discover_payload_is_shared_by_every_sweep() {
-        // Scan only the PRODUCTION half of the file: everything below the
-        // `#[cfg(test)]` marker is this module, which necessarily mentions the
-        // word it is guarding.
-        let source = include_str!("screenshots.rs");
-        let production = &source[..source
-            .find("#[cfg(test)]")
-            .expect("this test module's own cfg(test) marker is in the file")];
+        // Scan only the PRODUCTION half of the file: the test modules
+        // necessarily mention the word this pin is guarding.
+        let production = crate::source_pin::ProdSource::of(include_str!("screenshots.rs"));
 
         let mut sites = 0usize;
         for (at, _) in production.match_indices("\"discover\"") {
@@ -2182,7 +2178,7 @@ mod sweep_discover_tests {
             }
             sites += 1;
             assert!(
-                site_asks_for_every_element(production, at),
+                site_asks_for_every_element(&production, at),
                 "a `discover` request site in screenshots.rs does not ask for the \
                  full element set. Every page-wide sweep must ask the SAME \
                  question — `includeHidden: true` AND `interactiveOnly: false` — \

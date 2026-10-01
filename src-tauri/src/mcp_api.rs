@@ -15119,7 +15119,11 @@ mod coord_mcp_body_gate_tests {
                 .is_ok(),
             "membership is a binary_search, so the entry must sit in sorted position"
         );
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+        let parsed =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
             .expect("mcp_api.rs parses");
         assert_eq!(
             parsed
@@ -15826,7 +15830,11 @@ mod coord_mcp_body_gate_tests {
     /// silently against the one file it exists to read.
     #[test]
     fn trunk_policy_parser_round_trips_this_files_consts() {
-        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+        let p =
+            crate::build_drift::parse_tool_policy_consts(&crate::source_pin::ProdSource::whole(
+                include_str!("mcp_api.rs"),
+                "production's drift parser reads the whole trunk file",
+            ))
             .expect("mcp_api.rs parses");
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
@@ -16680,10 +16688,9 @@ mod coord_claims_proxy_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
-        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
-        // from anywhere.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        // From CARGO_MANIFEST_DIR (inside `read_own`), never the CWD: a test
+        // binary can be run from anywhere.
+        let text = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -16822,8 +16829,7 @@ mod coord_claims_proxy_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
-        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let text = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let start = text
             .find("async fn coord_mcp_proxy_handler(")
             .expect("coord_mcp_proxy_handler exists");
@@ -17799,7 +17805,7 @@ mod coord_provision_session_gate_tests {
     /// `the_health_handler_emits_the_supervised_workers_block`).
     #[test]
     fn the_health_handler_emits_the_active_tenant_fields() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()
@@ -17842,7 +17848,7 @@ mod coord_provision_session_gate_tests {
     /// pin the active-tenant fields use.
     #[test]
     fn the_health_handler_emits_the_thread_census_and_the_tails_gauge() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()
@@ -19918,7 +19924,7 @@ mod oauth_dcr_surface_absent_tests {
     /// match it.
     #[test]
     fn no_oauth_or_dcr_route_is_registered_in_this_router() {
-        let src = include_str!("mcp_api.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("mcp_api.rs"));
         for (_, path) in OAUTH_PATHS {
             let needle = format!(".route(\"{path}\"");
             assert!(
@@ -20334,10 +20340,7 @@ mod supervised_workers_health_tests {
 
     #[test]
     fn the_health_handler_emits_the_supervised_workers_block() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
-        )
-        .expect("read mcp_api.rs");
+        let src = crate::source_pin::ProdSource::read_own("mcp_api.rs");
         let lines: Vec<&str> = src.lines().collect();
         let start = lines
             .iter()

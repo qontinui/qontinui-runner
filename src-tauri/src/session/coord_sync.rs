@@ -3379,7 +3379,7 @@ mod tests {
     /// OTHER kind reaching this list without an arm is a silent data-loss bug.
     #[test]
     fn every_session_outbox_kind_has_a_dispatch_arm() {
-        let src = include_str!("coord_sync.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("coord_sync.rs"));
         // Isolate the dispatch match so an arm name appearing in a doc comment
         // elsewhere cannot satisfy the assertion.
         let dispatch = src
@@ -3422,7 +3422,7 @@ mod tests {
     /// which on a multi-session box is usually a peer's row.
     #[test]
     fn finished_rides_the_path_addressed_patch_not_a_device_wide_write() {
-        let src = include_str!("coord_sync.rs");
+        let src = crate::source_pin::ProdSource::of(include_str!("coord_sync.rs"));
         let dispatch = src
             .split_once("async fn push_record")
             .expect("the dispatch function must exist")
@@ -6758,8 +6758,8 @@ mod tests {
     ///   retargeted every guard at the wrong function while still passing;
     /// * it asserts the declaration is UNIQUE, so that retargeting is a named
     ///   failure rather than a silent one.
-    fn tenant_policy_fetch_body() -> &'static str {
-        let src = include_str!("coord_sync.rs");
+    fn tenant_policy_fetch_body() -> String {
+        let src = crate::source_pin::ProdSource::of(include_str!("coord_sync.rs"));
         // Assembled at runtime: a literal here would appear in `src` itself.
         let needle = format!("async fn {}(", "fetch_session_coordination_flag");
         assert_eq!(
@@ -6775,6 +6775,7 @@ mod tests {
             .split_once("\n}\n")
             .expect("the fetch body must terminate")
             .0
+            .to_string()
     }
 
     /// SOURCE GUARD — the call-site half of the mutation proof for this phase.
