@@ -248,6 +248,7 @@ mod provenance;
 mod provision_exclude;
 /// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
+mod quiet_barrier; // Plan 2026-09-29-quiet-on-demand Phase 4 — runner-restart barrier reader + PTY wake gating
 mod rag;
 mod recording;
 mod reflection;

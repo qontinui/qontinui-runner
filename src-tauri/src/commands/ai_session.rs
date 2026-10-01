@@ -341,7 +341,12 @@ pub async fn send_user_message(
         prefix_parts.join("\n\n")
     };
 
-    match session.send_user_message(&effective_message) {
+    // The operator typing into the runner's own session view: `Operator`, so
+    // a quiet barrier never holds it (D4).
+    match session.send_user_message(
+        &effective_message,
+        crate::quiet_barrier::SdkMessageCaller::TauriAiSessionMessage,
+    ) {
         Ok(sent_immediately) => {
             let queued = !sent_immediately;
 
@@ -2060,8 +2065,9 @@ pub async fn resume_ai_sessions(
         let working_dir_for_spawn = working_dir;
         let resume_from_transcript = can_full_resume;
         // The re-acquired claim context (Some only when re-acquire succeeded).
-        // Moved into the spawn closure and parked on the resumed session AFTER
-        // register, so its Drop releases the claim when the session ends.
+        // Moved into the spawn closure and parked on the resumed session right
+        // after spawn — before the initial prompt and the register — so its
+        // Drop releases the claim when the session ends, early failure included.
         let reacquired_ctx_for_spawn = reacquired_ctx;
 
         // R2 — re-register the resumed session with coord BEFORE spawn (the R6
@@ -2130,20 +2136,13 @@ pub async fn resume_ai_sessions(
                 }
             };
 
-            if let Err(e) = sm.register(&trid, session.clone()) {
-                // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
-                return Err(ResumeSpawnFailure {
-                    message: format!("register failed: {}", e),
-                    child_started: true,
-                    ctx: reacquired_ctx_for_spawn.map(Box::new),
-                });
-            }
-
-            // Park the re-acquired worktree claim on the now-registered
-            // session so the heartbeat lives for its lifetime and the claim
-            // RELEASES (via the context's Drop) when the session closes — the
-            // P3 fix for the `mem::forget` leak that orphaned the claim past
-            // session end. `None` (worktree mode off / shared-checkout
+            // Park the re-acquired worktree claim on the session so the
+            // heartbeat lives for its lifetime and the claim RELEASES (via the
+            // context's Drop) when the session closes — the P3 fix for the
+            // `mem::forget` leak that orphaned the claim past session end.
+            // Parked before anything below can fail, so a failure's remover
+            // takes it back (`take_isolated_edit_ctx`). `None` (worktree mode
+            // off / shared-checkout
             // fallback / peer-conflict degrade) is a no-op.
             if let Some(ctx) = reacquired_ctx_for_spawn {
                 session.set_isolated_edit_ctx(ctx);
@@ -2158,8 +2157,15 @@ pub async fn resume_ai_sessions(
             // user message still triggers the first-interaction context-switch
             // note. It does not append to output_log, so the next restart's
             // replay won't double-count.
+            //
+            // Sent BEFORE registering (plan `2026-09-29-quiet-on-demand-…`, D4): an
+            // unregistered session is reachable by nothing — not the poller, the
+            // conductor nor HTTP — so `send_initial_prompt` cannot lose a race to
+            // another turn and be refused, leaving a registered session that never
+            // gets its brief. Same order as promotion and the rate-limit restart.
             if let Some(prompt) = initial_for_spawn.as_deref() {
                 if let Err(e) = session.send_initial_prompt(prompt) {
+                    let _ = session.close();
                     // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
                     return Err(ResumeSpawnFailure {
                         message: format!("send_initial_prompt failed: {}", e),
@@ -2168,6 +2174,16 @@ pub async fn resume_ai_sessions(
                         ctx: session.take_isolated_edit_ctx().map(Box::new),
                     });
                 }
+            }
+
+            if let Err(e) = sm.register(&trid, session.clone()) {
+                let _ = session.close();
+                // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
+                return Err(ResumeSpawnFailure {
+                    message: format!("register failed: {}", e),
+                    child_started: true,
+                    ctx: session.take_isolated_edit_ctx().map(Box::new),
+                });
             }
 
             // Emit the state event with resumed=true so the frontend can

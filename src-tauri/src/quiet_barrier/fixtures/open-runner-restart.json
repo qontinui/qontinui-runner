@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "rr-20260929T101500Z-a1b2c3",
+  "scope": "runner-restart",
+  "purpose": "runner rebuild+swap",
+  "requester": {"session_id": "aaaaaaaa-0000-4000-8000-000000000001", "device": "11111111-2222-3333-4444-555555555555"},
+  "opened_at": "2026-09-29T10:15:00Z",
+  "until": "2026-09-29T10:35:00Z",
+  "max_until": "2026-09-29T11:15:00Z",
+  "straggler_policy": "wait",
+  "state": "open"
+}

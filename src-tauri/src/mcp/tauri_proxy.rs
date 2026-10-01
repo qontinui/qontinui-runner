@@ -225,6 +225,25 @@ impl TauriInvokeResponse {
     }
 }
 
+/// A refused proxied `terminal_write`: a quiet-barrier deferral answers `409`
+/// with the barrier id in `data` (the error string carries it too); every other
+/// refusal keeps the proxy's `200 {success:false}` shape.
+fn terminal_write_refusal(e: String) -> TauriInvokeResponse {
+    match crate::quiet_barrier::deferred_barrier_id(&e).map(str::to_string) {
+        Some(barrier_id) => TauriInvokeResponse {
+            success: false,
+            data: Some(serde_json::json!({
+                "reason": crate::quiet_barrier::QUIET_BARRIER_DEFERRED,
+                "barrierId": barrier_id,
+            })),
+            error: Some(e),
+            code: None,
+            status: Some(StatusCode::CONFLICT),
+        },
+        None => TauriInvokeResponse::err(e),
+    }
+}
+
 // ============================================================================
 // 403 body
 // ============================================================================
@@ -496,7 +515,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 crate::terminal::session::PtyWriteCaller::TauriInvokeProxy,
             ) {
                 Ok(()) => TauriInvokeResponse::ok(serde_json::json!({ "success": true })),
-                Err(e) => TauriInvokeResponse::err(e),
+                Err(e) => terminal_write_refusal(e),
             }
         }
 
@@ -959,5 +978,34 @@ mod terminal_create_coord_wiring_tests {
             .unwrap_or_else(|| panic!("coord-session must be non-null: {body}"));
         let coord = uuid::Uuid::parse_str(coord).expect("a uuid");
         assert_eq!(tm.get(&id).unwrap().coord_session_id(), Some(coord));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: a proxied `terminal_write`
+    /// the quiet barrier deferred answers `409` naming the barrier; any other
+    /// refusal keeps the proxy's `200 {success:false}` contract.
+    #[test]
+    fn a_barrier_deferred_write_answers_409_with_the_barrier_id() {
+        let deferred = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "tauri_invoke_proxy",
+            "term-1",
+            "held",
+        );
+        let r = terminal_write_refusal(deferred);
+        assert_eq!(r.status, Some(StatusCode::CONFLICT));
+        assert!(!r.success);
+        let body = serde_json::to_value(&r).unwrap();
+        assert_eq!(body["data"]["barrierId"], "rr-20260929T101500Z-a1b2c3");
+        assert_eq!(body["data"]["reason"], "QUIET_BARRIER_DEFERRED");
+        assert!(body.get("status").is_none(), "status is not on the wire");
+
+        let r = terminal_write_refusal("TERMINAL_EXITED: gone".to_string());
+        assert_eq!(r.status, None);
+        assert!(r.data.is_none());
     }
 }

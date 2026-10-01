@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "repo-20260929T100000Z-e5f6a7",
+  "scope": "repo:qontinui-coord",
+  "purpose": "bundle resync",
+  "requester": {"session_id": "aaaaaaaa-0000-4000-8000-000000000005", "device": "11111111-2222-3333-4444-555555555555"},
+  "opened_at": "2026-09-29T10:00:00Z",
+  "until": "2026-09-29T10:40:00Z",
+  "max_until": "2026-09-29T12:00:00Z",
+  "straggler_policy": "wait",
+  "state": "released"
+}
