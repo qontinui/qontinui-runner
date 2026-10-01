@@ -1044,8 +1044,15 @@ mod tests {
         let is_mod = next.starts_with("mod ")
             || next.starts_with("pub mod ")
             || next.starts_with("pub(crate) mod ");
-        if !is_mod || next.trim_end().ends_with(';') {
+        // Judge the declaration on its code alone: `mod x; // why` is still
+        // out-of-line.
+        let code = next.split("//").next().unwrap_or("").trim_end();
+        if !is_mod || code.ends_with(';') {
             return None;
+        }
+        // A one-line body (`mod x {}` / `mod x { ... }`) ends on this line.
+        if code.contains('{') && code.matches('{').count() == code.matches('}').count() {
+            return Some(j + 1);
         }
         let mut k = j + 1;
         while k < lines.len() && lines[k] != "}" {
@@ -1057,8 +1064,11 @@ mod tests {
     /// Every `(path::fn)` whose body reads the pin, outside test modules.
     ///
     /// Heuristics, stated so a failure is readable: a column-0
-    /// `#[cfg(test)]` followed by a column-0 `mod` skips to the next
-    /// column-0 `}`; files named `tests.rs` or under a `tests/` dir are
+    /// `#[cfg(test)]` followed by a column-0 `mod` WITH A BODY skips to the
+    /// next column-0 `}` (or past its own line, for a one-line body); an
+    /// out-of-line `mod name;` (trailing `//` comment allowed) is not skipped,
+    /// because its code lives in another file the walk visits on its own
+    /// ([`test_mod_skip_end`]); files named `tests.rs` or under a `tests/` dir are
     /// skipped; `//` lines are skipped; the enclosing function is the last
     /// `fn <name>` seen above the use.
     fn scan_pin_readers() -> std::collections::BTreeSet<String> {
@@ -1237,6 +1247,17 @@ mod tests {
             "}",
         ];
         assert_eq!(test_mod_skip_end(&out_of_line, 0), None);
+        // ...including one carrying a trailing comment, a style main.rs uses.
+        let commented = [
+            "#[cfg(test)]",
+            "mod runner_spawn_sites; // spawn-site census",
+            "fn boot() { let _ = resolve_tenant_pin(); }",
+            "}",
+        ];
+        assert_eq!(test_mod_skip_end(&commented, 0), None);
+        // A one-line body is skipped past its own line only.
+        let one_line = ["#[cfg(test)]", "mod t {}", "fn after() {}", "}"];
+        assert_eq!(test_mod_skip_end(&one_line, 0), Some(2));
         // And a non-module `#[cfg(test)]` item is not a module skip either.
         assert_eq!(
             test_mod_skip_end(&["#[cfg(test)]", "fn helper() {}"], 0),
