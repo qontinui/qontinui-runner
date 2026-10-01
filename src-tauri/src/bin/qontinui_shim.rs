@@ -1119,21 +1119,9 @@ fn exec_real_child_env(
     args: &[String],
     env_remove: &[&str],
 ) -> Option<i32> {
-    let mut cmd = real_tool_command(real, name, args, env_remove);
-    match cmd.status() {
-        Ok(st) => st.code(),
-        Err(_) => Some(127), // command-not-found surrogate; never panic
-    }
-}
-
-/// The guarded real-tool [`Command`] [`exec_real_child_env`] runs — split out
-/// so which variables it strips is assertable without spawning anything.
-fn real_tool_command(
-    real: &Option<PathBuf>,
-    name: &str,
-    args: &[String],
-    env_remove: &[&str],
-) -> Command {
+    // The receiver is built HERE, not by a helper, so the wait below keeps its
+    // baselined program token (`dyn:p`) in
+    // `scripts/untimed-subprocess-baseline.json`.
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
@@ -1141,6 +1129,17 @@ fn real_tool_command(
         // re-entry to a pure passthrough — no infinite loop.)
         None => Command::new(name),
     };
+    guard_real_tool_command(&mut cmd, args, env_remove);
+    match cmd.status() {
+        Ok(st) => st.code(),
+        Err(_) => Some(127), // command-not-found surrogate; never panic
+    }
+}
+
+/// Configure the guarded real-tool [`Command`] [`exec_real_child_env`] runs —
+/// split out so which variables it strips is assertable without spawning
+/// anything.
+fn guard_real_tool_command(cmd: &mut Command, args: &[String], env_remove: &[&str]) {
     for var in env_remove {
         cmd.env_remove(var);
     }
@@ -1149,7 +1148,6 @@ fn real_tool_command(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    cmd
 }
 
 // ===========================================================================
@@ -1835,7 +1833,8 @@ mod tests {
         );
 
         let strip_refs: Vec<&str> = strip.iter().map(String::as_str).collect();
-        let cmd = real_tool_command(&None, "claude", &[], &strip_refs);
+        let mut cmd = Command::new("claude");
+        guard_real_tool_command(&mut cmd, &[], &strip_refs);
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, v)| v.is_none())
