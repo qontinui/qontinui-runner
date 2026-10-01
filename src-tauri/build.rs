@@ -510,7 +510,16 @@ fn ensure_dist_placeholder() {
 /// The `bundle.externalBin` sidecars, spelled exactly as `tauri.conf.json`
 /// spells them. Keep in sync with it (a test pins that) and with
 /// `scripts/bundle-profile-sidecar.mjs` `SIDECAR_BINS`.
-const EXTERNAL_BIN_SIDECARS: &[&str] = &["binaries/qontinui_profile", "binaries/qontinui-pr"];
+///
+/// `qontinui-pty-holder` is the per-pane PTY holder (plan
+/// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2):
+/// a bin of the `crates/pty-holder` package, not of this crate, which the
+/// runner locates beside its own executable.
+const EXTERNAL_BIN_SIDECARS: &[&str] = &[
+    "binaries/qontinui_profile",
+    "binaries/qontinui-pr",
+    "binaries/qontinui-pty-holder",
+];
 
 /// Hide `bundle.externalBin` from `tauri_build::build()` on EVERY run. Must
 /// run before `tauri_build::build()`.
@@ -1423,7 +1432,11 @@ mod sidecar_scope_tests {
         assert_eq!(external_bin, EXTERNAL_BIN_SIDECARS);
         assert_eq!(
             EXTERNAL_BIN_SIDECARS,
-            &["binaries/qontinui_profile", "binaries/qontinui-pr"]
+            &[
+                "binaries/qontinui_profile",
+                "binaries/qontinui-pr",
+                "binaries/qontinui-pty-holder"
+            ]
         );
     }
 

@@ -155,6 +155,37 @@ impl ScrubbedCommand {
     pub(crate) fn as_command(&self) -> &CommandBuilder {
         &self.0
     }
+
+    /// The child spec an out-of-process PTY holder runs this command from
+    /// (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27: "the holder's spawn path builds its child
+    /// through `ScrubbedCommand::seal` — the proof travels in the type"). This
+    /// is the ONLY constructor of a holder spec from a runner command, so a
+    /// holder child's environment is always one that went through the scrub;
+    /// the holder clears its own environment and sets exactly these pairs.
+    ///
+    /// argv and cwd are copied as OS strings. The environment is copied
+    /// through `CommandBuilder::iter_full_env_as_str`, the builder's only
+    /// whole-environment iterator, which SKIPS any variable whose name or
+    /// value is not valid UTF-8 — such a variable does not reach a holder pane
+    /// (it does reach a `LocalPty` one). Ring size and exit linger are left at
+    /// the holder's defaults.
+    pub(crate) fn to_holder_spec(&self, cols: u16, rows: u16) -> qontinui_pty_holder::spec::ChildSpec {
+        let b = &self.0;
+        let mut spec = qontinui_pty_holder::spec::ChildSpec::new(if b.is_default_prog() {
+            Vec::new()
+        } else {
+            b.get_argv().clone()
+        });
+        spec.cwd = b.get_cwd().cloned();
+        spec.env = b
+            .iter_full_env_as_str()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        spec.cols = cols.max(1);
+        spec.rows = rows.max(1);
+        spec
+    }
 }
 
 /// A PTY pair that has been opened but not yet given a child.
@@ -549,6 +580,38 @@ mod tests {
             Some("yes"),
             "the seal removes credentials and nothing else"
         );
+    }
+
+    /// Plan 2026-09-12 D6: a holder spec built from a sealed command carries
+    /// the scrubbed environment — no credential value reaches an
+    /// out-of-process pane — plus argv, cwd and the size.
+    #[test]
+    fn pty_holder_spec_from_a_sealed_command_is_scrubbed() {
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.arg("--resume");
+        cmd.cwd("/work/tree");
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+        cmd.env("KEEP_ME", "yes");
+        let spec = ScrubbedCommand::seal(cmd).to_holder_spec(120, 0);
+
+        assert_eq!(
+            spec.argv,
+            vec![std::ffi::OsString::from("claude"), "--resume".into()]
+        );
+        assert_eq!(spec.cwd, Some("/work/tree".into()));
+        assert_eq!((spec.cols, spec.rows), (120, 1), "a zero size is clamped");
+        for (k, v) in &spec.env {
+            assert!(
+                !crate::terminal::CREDENTIAL_VALUE_ENV_VARS
+                    .iter()
+                    .any(|n| k == *n),
+                "credential {k:?} reached the holder spec"
+            );
+            assert_ne!(v, "hunter2");
+        }
+        assert!(spec.env.iter().any(|(k, v)| k == "KEEP_ME" && v == "yes"));
     }
 
     /// The inert double answers the way the old `NoopMaster` placeholder did:
