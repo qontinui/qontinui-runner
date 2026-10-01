@@ -840,11 +840,11 @@ impl Reporter {
                 // A guest's VM-wide counter moves between guests (see
                 // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
                 // owner this tick must not keep a baseline it no longer tracks.
-                carry_oom_baseline: !(o.base.kind == "wsl_guest" && !o.base.attach_device),
+                carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
                 // A runner INSIDE a WSL guest (its own computer is the guest)
                 // reports only unit-attributed kills; the VM-wide remainder is
                 // the Windows host's to report.
-                report_unattributed_oom: !(o.base.kind == "wsl_guest" && o.base.attach_device),
+                report_unattributed_oom: o.base.kind != "wsl_guest" || !o.base.attach_device,
             };
             let (evs, mut next) = events::derive(state.computers.get(id), &input, now);
             next.kind = Some(o.base.kind.clone());
