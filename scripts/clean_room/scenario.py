@@ -18,7 +18,8 @@ evidence_ref, detail}` per step:
   start_session           the card's "Work on it" action binds a live session
                           to the foreign repo
   session_lists_commands  that session was provisioned with slash commands
-                          (the v1.0.10 regression, as a permanent assertion)
+                          (the v1.0.10 regression, as a permanent assertion:
+                          every terminal spawn provisions its cwd since v1.0.11)
   author_plan             a plan can be authored through the UI with no plans
                           directory configured (unknown until a plan-authoring
                           control is named: no substring search is a measurement)
@@ -161,13 +162,14 @@ NEXT_ACTION_KINDS = frozenset(
 
 DRAIN_CODES = ("drain_unreadable", "device_drained")
 
-# The tenant-pairing refusal names itself: its code (`tenant_not_paired`) or a
-# message naming both the tenant and the pairing. Any other refusal on the
-# probe (a drain, a bad working directory, a 404, a 500) is NOT the refusal the
+# The tenant-pairing refusal names itself by its code (`tenant_not_paired`),
+# found anywhere in the body (a bare `error` string carries it as a prefix).
+# Any other refusal on the probe (a drain, a bad working directory, a 404, a 500) is NOT the refusal the
 # step is about, and is reported as unknown(refusal_not_observed).
-_PAIRING_REFUSAL = re.compile(
-    r"tenant_not_paired|tenant[^\n]{0,120}pair|pair[^\n]{0,120}tenant", re.IGNORECASE
-)
+# Matched on the CODE only: other refusals' messages also mention a tenant and
+# pairing (`tenant_credential_store_unreadable` says "... credential for tenant
+# ... unpaired"), so a message match would grade a different refusal as this one.
+_PAIRING_REFUSAL = re.compile(r"\btenant_not_paired\b")
 
 
 def parse_next_action_kinds(refusal_rs: str) -> frozenset[str]:
@@ -206,6 +208,8 @@ class Config:
     session_timeout_s: float = 60.0
     drain_retry_s: float = 60.0
     close_timeout_s: float = 60.0
+    stop_reason_timeout_s: float = 20.0
+    provision_timeout_s: float = 10.0
     poll_s: float = 1.0
 
 
@@ -605,9 +609,17 @@ class Scenario:
 
     def step_session_lists_commands(self) -> StepResult:
         cmd_dir = self.config.fixture_path / ".claude" / "commands"
-        names = sorted(p.name for p in cmd_dir.glob("*.md")) if cmd_dir.is_dir() else []
+
+        def listed() -> list[str]:
+            return sorted(p.name for p in cmd_dir.glob("*.md")) if cmd_dir.is_dir() else []
+
+        # Provisioning runs at spawn and is fail-soft; give it a moment.
+        names = self._wait(self.config.provision_timeout_s, listed) or []
         ref = self.runner.observer.observe(
-            "session_lists_commands", "provisioned-commands", "\n".join(names)
+            "session_lists_commands",
+            "provisioned-commands",
+            "\n".join(names),
+            kind="disk",
         )
         if names:
             return passed(
@@ -615,6 +627,11 @@ class Scenario:
                 f"{len(names)} slash command(s) provisioned into the session",
                 ref,
             )
+        # Every terminal spawn (the operator tab and HTTP /terminals alike)
+        # provisions its cwd's `.claude/commands/` through the terminal
+        # chokepoint (`acquire_for_terminal` -> `provision_session_cwd`), and
+        # the generated fixture carries no tracked `.claude/` that would skip
+        # it. An empty directory is therefore the v1.0.10 regression itself.
         return failed(
             "session_lists_commands",
             "the session was provisioned with no slash commands (the v1.0.10 regression shape)",
@@ -681,11 +698,14 @@ class Scenario:
                 self.runner.request(
                     "DELETE", f"/terminals/{data['id']}", None, timeout=30
                 )
+            # The box is unpaired by construction (fresh install, no QONTINUI_*,
+            # no credential handed to it), so a 2xx is not "the runner is
+            # paired": the release accepted a tenant it holds nothing for.
             return unknown(
                 "unpaired_refusal",
-                "unexpectedly_paired",
+                "tenant_scope_not_refused",
                 ref,
-                "the tenant-scoped session was created",
+                f"status {resp.status}: the tenant-scoped session was created on an unpaired box",
             )
         if resp.json is None:
             return unknown(
@@ -736,7 +756,7 @@ class Scenario:
 
     def step_glossary(self) -> StepResult:
         resp, ref = self.runner.get("/glossary", timeout=30)
-        if resp.status == 404:
+        if resp.status == 404 and _route_not_served(resp):
             return unknown(
                 "glossary",
                 "feature_not_released",
@@ -760,27 +780,43 @@ class Scenario:
         )
 
     def step_stop_reason(self) -> StepResult:
-        self.runner.request(
+        d_resp, d_ref = self.runner.request(
             "DELETE", f"/terminals/{self.terminal_id}", None, timeout=30
         )
-        resp, ref = self.runner.get(
-            f"/sessions/{self.terminal_id}/stop-reason", timeout=30
-        )
-        code = self._code_of(resp.json)
-        if resp.status == 404:
-            low = code.lower()
-            if "session" in low and ("not_found" in low or "unknown" in low):
-                return failed(
-                    "stop_reason",
-                    "the route exists but does not know the session this run just ended",
-                    ref,
-                    code,
-                )
+        if not 200 <= d_resp.status < 300:
+            # The session was not ended, so there is no stop to ask about.
             return unknown(
                 "stop_reason",
-                "feature_not_released",
+                "prior_step_not_passed",
+                d_ref,
+                f"DELETE /terminals/{self.terminal_id} answered {d_resp.status}",
+            )
+        last: dict[str, Any] = {}
+
+        def probe() -> bool:
+            # The close is recorded asynchronously; a handler 404 is retried
+            # until the deadline, a route-level 404 or any other answer is final.
+            r, rref = self.runner.get(
+                f"/sessions/{self.terminal_id}/stop-reason", timeout=30
+            )
+            last["resp"], last["ref"] = r, rref
+            return not (r.status == 404 and not _route_not_served(r))
+
+        self._wait(self.config.stop_reason_timeout_s, probe)
+        resp, ref = last["resp"], last["ref"]
+        if resp.status == 404:
+            if _route_not_served(resp):
+                return unknown(
+                    "stop_reason",
+                    "feature_not_released",
+                    ref,
+                    "GET /sessions/{id}/stop-reason is not served by this release",
+                )
+            return failed(
+                "stop_reason",
+                "the route exists but does not know the session this run just ended",
                 ref,
-                "GET /sessions/{id}/stop-reason is not served by this release",
+                self._code_of(resp.json),
             )
         if resp.status != 200 or not isinstance(resp.envelope_data, dict):
             return failed("stop_reason", f"stop-reason answered {resp.status}", ref)
@@ -834,6 +870,20 @@ class Scenario:
         )
 
 
+def _route_not_served(resp: Any) -> bool:
+    """A 404 from the runner's route FALLBACK (`not_found_handler`: "No route
+    for <METHOD> <path>"), or one with no JSON body at all -- the route does not
+    exist in this release. Any other 404 is a handler's own answer: the route
+    exists and said "not found", which is a measurement, not an absence."""
+    if resp.status != 404:
+        return False
+    body = resp.json
+    if not isinstance(body, dict):
+        return True
+    err = body.get("error")
+    return isinstance(err, str) and err.startswith("No route for ")
+
+
 def find_next_action(body: Any) -> dict | None:
     """The first `next_action` object anywhere in a response body."""
     if isinstance(body, dict):
@@ -868,6 +918,7 @@ def fleet_noun_report(
             "scanned_texts": 0,
             "ui_texts_scanned": 0,
             "http_texts_scanned": 0,
+            "disk_texts_scanned": 0,
             "hits": [],
         }
     hits = []
@@ -884,11 +935,15 @@ def fleet_noun_report(
                 }
             )
     ui = sum(1 for obs, _ in observer.texts if obs.kind == "ui")
-    http = len(observer.texts) - ui
+    http = sum(1 for obs, _ in observer.texts if obs.kind == "http")
+    # What the product wrote to disk (the provisioned command listing) is
+    # scanned too, but it is neither rendered UI text nor a served response.
+    disk = len(observer.texts) - ui - http
     out: dict[str, Any] = {
         "scanned_texts": len(observer.texts),
         "ui_texts_scanned": ui,
         "http_texts_scanned": http,
+        "disk_texts_scanned": disk,
         "hits": hits,
     }
     if hits:

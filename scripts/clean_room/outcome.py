@@ -31,7 +31,7 @@ UNKNOWN_REASONS: dict[str, str] = {
     "ui_element_not_found": "the UI Bridge answered but no element matching the step's selectors is registered; the harness could not locate the control",
     "feature_not_released": "the runner route this step reads is not served by this release (route-level 404), so the capability could not be measured",
     "refusal_not_observed": "the probe was refused, but not with the pairing refusal the step is about (a drain, a bad request, a 404/500), so the pairing envelope was not observed",
-    "unexpectedly_paired": "the deliberate unpaired-coord refusal did not happen because the runner holds a coord credential, so the refusal envelope could not be observed",
+    "tenant_scope_not_refused": "the unpaired box CREATED the tenant-scoped session instead of refusing it: the release either does not read a session's tenant (it predates tenant-scoped sessions) or did not enforce it, and the harness cannot tell which from outside, so the pairing refusal envelope was not observed",
     "transport_error": "a request timed out or the connection failed mid-step, after the runner had been reachable",
     "response_unparseable": "the runner answered with a body that is not the JSON envelope the step reads",
     "harness_error": "the harness itself raised while running the step; the message is in evidence",

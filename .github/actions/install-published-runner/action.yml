@@ -13,11 +13,11 @@ description: >-
 # Phase E), with three mechanical changes a composite action forces:
 #   * `secrets.GITHUB_TOKEN` -> `github.token` (composite actions cannot read
 #     the secrets context; `github.token` is the same token).
-#   * the install step's `timeout-minutes: 15` and the stop step's
-#     `continue-on-error: true` are gone: composite steps accept neither. The
-#     CALLER bounds the whole action with a step-level `timeout-minutes`, and
-#     the stop step already ends in `exit 0`. The installer's own inner bound
-#     (WaitForExit 600s + kill) is unchanged.
+#   * the install step's `timeout-minutes: 15` is gone: composite steps do not
+#     accept it. The CALLER bounds the whole action with a step-level
+#     `timeout-minutes`. The installer's own inner bound (WaitForExit 600s +
+#     kill) is unchanged. The stop step keeps `continue-on-error: true`, which
+#     composite steps do accept.
 #   * the resolved tag is an action OUTPUT, so callers keep reading
 #     `steps.<id>.outputs.tag`.
 # Sets SETUP_EXE in the job env (the verified installer path), as before.
@@ -242,9 +242,29 @@ runs:
     # not rename it to productName), so the installed one is told apart by
     # its path: never anything under a cargo target/ directory.
     - name: Stop any auto-launched published runner
+      # The auto-launched instance can still be starting when this runs, so
+      # one Stop-Process pass is not enough: repeat for up to 30 s until no
+      # installed runner process remains and nothing listens on the product
+      # port. Whatever survives is reported, and the scenario's first_launch
+      # then refuses to measure it.
+      continue-on-error: true
       run: |
-        Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
-          Where-Object { $_.Path -and $_.Path -notlike '*\target\*' } |
-          ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+        $deadline = (Get-Date).AddSeconds(30)
+        $quiet = 0
+        do {
+          $procs = @(Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path -notlike '*\target\*' })
+          $procs | ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+          $listening = @(Get-NetTCPConnection -LocalPort 9876 -State Listen -ErrorAction SilentlyContinue)
+          # Break only after three consecutive quiet passes (~4 s), so an
+          # instance the installer has not spawned YET is still caught.
+          if ($procs.Count -eq 0 -and $listening.Count -eq 0) { $quiet++ } else { $quiet = 0 }
+          if ($quiet -ge 3) { break }
+          Start-Sleep -Seconds 2
+        } while ((Get-Date) -lt $deadline)
+        $left = @(Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
+          Where-Object { $_.Path -and $_.Path -notlike '*\target\*' })
+        if ($left.Count -gt 0) { Write-Host "::warning::$($left.Count) installed runner process(es) survived the stop step" }
+        if ($listening.Count -gt 0) { Write-Host "::warning::something still listens on 9876 after the stop step" }
         exit 0
       shell: pwsh

@@ -118,7 +118,7 @@ class OutcomeTests(unittest.TestCase):
                 "ui_element_not_found",
                 "feature_not_released",
                 "refusal_not_observed",
-                "unexpectedly_paired",
+                "tenant_scope_not_refused",
                 "transport_error",
                 "response_unparseable",
                 "harness_error",
@@ -531,7 +531,9 @@ class FakeRunner:
         refusal_status=400,
         glossary=None,
         stop_reason=None,
-        paired=False,
+        tenant_ignored=True,
+        stop_reason_status=200,
+        delete_status=200,
         project_id="p1",
         exits_on_close=True,
         occupied_before_launch=False,
@@ -544,7 +546,11 @@ class FakeRunner:
         self.refusal_status = refusal_status
         self.glossary = glossary
         self.stop_reason = stop_reason
-        self.paired = paired
+        # Today's release (v1.0.11) has no `tenantId` on CreateTerminalRequest,
+        # so it ignores the field and creates the session.
+        self.tenant_ignored = tenant_ignored
+        self.stop_reason_status = stop_reason_status
+        self.delete_status = delete_status
         self.project_id = project_id
         self.exits_on_close = exits_on_close
         self.occupied_before_launch = occupied_before_launch
@@ -609,6 +615,8 @@ class FakeRunner:
         return self.ok(None)
 
     def _work_on_it(self, payload):
+        # The real runner provisions `.claude/commands/` on every terminal
+        # spawn (v1.0.11+); `provision=False` models the v1.0.10 regression.
         self.terminals.append(
             {"id": "t1", "workingDir": str(self.fixture), "isAlive": True}
         )
@@ -619,10 +627,10 @@ class FakeRunner:
         return self.ok({"ok": True})
 
     def _create_terminal(self, payload):
-        if self.paired:
-            return self.ok({"id": "t9"})
         if self.refusal is not None:
             return self.refusal_status, json.dumps(self.refusal)
+        if self.tenant_ignored:
+            return self.ok({"id": "t9"})
         return 400, json.dumps(
             {
                 "success": False,
@@ -657,6 +665,10 @@ class FakeRunner:
         if any(p == base for (_, p) in routes):
             return 405, ""
         if method == "DELETE" and base.startswith("/terminals/"):
+            if self.delete_status != 200:
+                return self.delete_status, json.dumps(
+                    {"success": False, "error": "terminal busy", "code": "CONFLICT"}
+                )
             for t in self.terminals:
                 t["isAlive"] = False
             return self.ok({"closed": True})
@@ -667,11 +679,14 @@ class FakeRunner:
             and base.endswith("/stop-reason")
             and self.stop_reason is not None
         ):
+            if self.stop_reason_status != 200:
+                return self.stop_reason_status, json.dumps(self.stop_reason)
             return self.ok(self.stop_reason)
+        # The runner's route fallback (`not_found_handler`), verbatim shape.
         return 404, json.dumps(
             {
                 "success": False,
-                "error": f"no route {method} {path}",
+                "error": f"No route for {method} {path}",
                 "code": "NOT_FOUND",
             }
         )
@@ -771,8 +786,10 @@ class ScenarioTests(unittest.TestCase):
         # No known plan-authoring control: not measured, so not a fail.
         self.assertEqual(got["author_plan"], ("unknown", "ui_element_not_found"))
         self.assertIn('"projects"', steps["author_plan"].detail)
-        self.assertEqual(got["unpaired_refusal"][0], "fail")
-        self.assertIn("no next_action", steps["unpaired_refusal"].reason)
+        # Today's release ignores tenantId and creates the session.
+        self.assertEqual(
+            got["unpaired_refusal"], ("unknown", "tenant_scope_not_refused")
+        )
         # Unreleased runner features are NEVER pass.
         self.assertEqual(got["glossary"], ("unknown", "feature_not_released"))
         self.assertEqual(got["stop_reason"], ("unknown", "feature_not_released"))
@@ -931,6 +948,45 @@ class ScenarioTests(unittest.TestCase):
         steps, _ = self._run(FakeRunner(self.fixture, provision=False))
         self.assertEqual(steps["session_lists_commands"].outcome, "fail")
 
+    def test_provisioned_commands_pass(self):
+        steps, _ = self._run(FakeRunner(self.fixture, provision=True))
+        self.assertEqual(steps["session_lists_commands"].outcome, "pass")
+
+    def test_a_bare_pairing_refusal_without_an_envelope_fails(self):
+        steps, _ = self._run(FakeRunner(self.fixture, tenant_ignored=False))
+        self.assertEqual(steps["unpaired_refusal"].outcome, "fail")
+        self.assertIn("no next_action", steps["unpaired_refusal"].reason)
+
+    def test_a_message_naming_tenant_and_pairing_is_not_the_pairing_code(self):
+        refusal = {
+            "success": False,
+            "code": "tenant_credential_store_unreadable",
+            "error": "this runner holds a coord credential for tenant x but is unpaired",
+            "next_action": {"kind": "report_defect"},
+        }
+        steps, _ = self._run(FakeRunner(self.fixture, refusal=refusal))
+        self.assertEqual(steps["unpaired_refusal"].reason, "refusal_not_observed")
+
+    def test_a_handler_404_from_stop_reason_fails_after_polling(self):
+        fake = FakeRunner(
+            self.fixture,
+            stop_reason={"success": False, "error": "no session", "code": "SESSION_NOT_FOUND"},
+            stop_reason_status=404,
+        )
+        steps, _ = self._run(fake)
+        self.assertEqual(steps["stop_reason"].outcome, "fail")
+        polls = [c for c in fake.calls if c[1].endswith("/stop-reason")]
+        self.assertGreater(len(polls), 1)
+
+    def test_a_failed_session_end_leaves_stop_reason_unknown(self):
+        steps, _ = self._run(
+            FakeRunner(self.fixture, stop_reason={"code": "x"}, delete_status=409)
+        )
+        self.assertEqual(
+            (steps["stop_reason"].outcome, steps["stop_reason"].reason),
+            ("unknown", "prior_step_not_passed"),
+        )
+
     def test_structured_refusal_and_released_doors_pass(self):
         refusal = {
             "success": False,
@@ -1016,11 +1072,11 @@ class ScenarioTests(unittest.TestCase):
         steps, _ = self._run(FakeRunner(self.fixture, refusal=refusal))
         self.assertEqual(steps["unpaired_refusal"].reason, "refusal_not_observed")
 
-    def test_a_paired_runner_cannot_show_the_refusal(self):
-        steps, _ = self._run(FakeRunner(self.fixture, paired=True))
+    def test_a_created_tenant_session_is_not_called_paired(self):
+        steps, _ = self._run(FakeRunner(self.fixture, tenant_ignored=True))
         self.assertEqual(
             (steps["unpaired_refusal"].outcome, steps["unpaired_refusal"].reason),
-            ("unknown", "unexpectedly_paired"),
+            ("unknown", "tenant_scope_not_refused"),
         )
 
     def test_glossary_without_terms_fails_not_passes(self):
@@ -1060,7 +1116,10 @@ class ScenarioTests(unittest.TestCase):
         )
 
     def test_absent_vocabulary_makes_the_dynamic_list_unknown(self):
-        sc = self._scenario(vocabulary=str(self.tmp / "nope.toml"))
+        sc = self._scenario(
+            FakeRunner(self.fixture, tenant_ignored=False),
+            vocabulary=str(self.tmp / "nope.toml"),
+        )
         steps = sc.run()
         block = scenario.build_block(
             sc,

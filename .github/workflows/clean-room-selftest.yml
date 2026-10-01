@@ -15,8 +15,11 @@ name: Clean-room harness selftest
 # declared adaptation PR is honoured); the test FAILS, never skips, when they
 # are absent.
 #
-# NOT a merge gate: deliberately absent from the ruleset's required contexts,
-# like the harness it tests. Hermetic apart from the sibling checkout.
+# Not a REQUIRED context on the ruleset. It is still a check on the PR, and
+# coord's merge train holds a PR on any red check, required or not -- so a red
+# selftest holds a PR that touches the harness. That is intended: the harness's
+# own tests should be green before it lands. The clean-room RUN (the nightly in
+# published-parity.yml) gates nothing. Hermetic apart from the sibling checkout.
 
 on:
   push:
@@ -27,6 +30,8 @@ on:
       - "scripts/tests/fixtures/clean_room_fake_runner.py"
       - ".github/workflows/clean-room-selftest.yml"
       - ".github/workflows/published-parity.yml"
+      - ".github/sibling-pins.conf"
+      - ".github/actions/checkout-sibling/**"
   pull_request:
     branches: [main]
     paths:
@@ -35,6 +40,8 @@ on:
       - "scripts/tests/fixtures/clean_room_fake_runner.py"
       - ".github/workflows/clean-room-selftest.yml"
       - ".github/workflows/published-parity.yml"
+      - ".github/sibling-pins.conf"
+      - ".github/actions/checkout-sibling/**"
   workflow_dispatch:
 
 permissions:
@@ -42,8 +49,14 @@ permissions:
 
 jobs:
   selftest:
-    name: Clean-room harness selftest
-    runs-on: ubuntu-latest
+    name: Clean-room harness selftest (${{ matrix.os }})
+    # Windows too: the nightly runs these tests on windows-latest first, and a
+    # Windows-only failure there would silence every night's run.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -66,4 +79,4 @@ jobs:
 
       - name: Clean-room harness unit tests (no network)
         shell: bash
-        run: python3 scripts/tests/test_clean_room.py
+        run: python scripts/tests/test_clean_room.py
