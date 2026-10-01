@@ -384,7 +384,7 @@ pub async fn terminal_create(
                 // which fires once the session's identity is long past
                 // changing.
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit_code| {
+                session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -399,7 +399,7 @@ pub async fn terminal_create(
                         &close_registry,
                         coord_id,
                         Some(&exit_pinned_session_id),
-                        exit_code,
+                        exit.agent_exit_code(),
                     );
                 }));
 
@@ -2354,7 +2354,7 @@ pub(crate) fn create_terminal_session_backend(
                 let exited_terminal_id = info.id.clone();
                 let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit_code| {
+                session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
                             coord_session = %coord_id,
@@ -2365,6 +2365,7 @@ pub(crate) fn create_terminal_session_backend(
                     crate::agent_runtime::notify_continuation_terminal_exit(
                         &exited_terminal_id,
                         exit_rt_handle.as_ref(),
+                        Some(exit),
                     );
                     // Trigger 4 (session_exit) — plan
                     // 2026-08-27-operator-touch-observation-runner-emitter,
@@ -2373,7 +2374,7 @@ pub(crate) fn create_terminal_session_backend(
                         &close_registry,
                         coord_id,
                         Some(&exit_pinned_session_id),
-                        exit_code,
+                        exit.agent_exit_code(),
                     );
                 }));
                 let rx = session.subscribe_output();
