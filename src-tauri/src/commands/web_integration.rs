@@ -762,13 +762,11 @@ async fn finish_explicit_pairing(command: &str, tenants: &[uuid::Uuid]) {
     // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
     // stores a working credential and the next refresher pass re-reads the stale
     // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
-    let default_binding = crate::auth::default_binding_tenant();
-    for tenant_id in tenants {
-        crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
-            *tenant_id,
-            default_binding,
-        );
-    }
+    //
+    // Both steps below are blocking file I/O under locks (the streak file's
+    // lock; the credential store's cross-process lock, which may wait on a
+    // heartbeat reconcile), so they run OFF the async runtime — for every
+    // door that shares this helper.
 
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
@@ -788,8 +786,23 @@ async fn finish_explicit_pairing(command: &str, tenants: &[uuid::Uuid]) {
     // `persist_pairing` also on purpose: the background device-JWT refresher
     // writes the same credential slots, and clearing on that path would silently
     // un-logout the operator on the next refresh cycle.
-    if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
-        warn!("{command}: could not clear the interactive sign-out marker: {e}");
+    let tenants_owned = tenants.to_vec();
+    let command_owned = command.to_string();
+    let blocking = spawn_blocking_tracked(move || {
+        let default_binding = crate::auth::default_binding_tenant();
+        for tenant_id in &tenants_owned {
+            crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+                *tenant_id,
+                default_binding,
+            );
+        }
+        if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
+            warn!("{command_owned}: could not clear the interactive sign-out marker: {e}");
+        }
+    })
+    .await;
+    if let Err(e) = blocking {
+        warn!("{command}: post-pairing streak/marker task failed: {e}");
     }
 
     // Promote to Tier 2 (qontinui_account) now that a device JWT is in

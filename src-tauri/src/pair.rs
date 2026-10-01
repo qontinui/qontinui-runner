@@ -7350,6 +7350,81 @@ mod pair_multi_collect_tests {
         assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
     }
 
+    /// Phase 3 gate (D4): every slot write of a pair-all runs under the
+    /// cross-process store lock, so a refresher-style write for ANOTHER tenant,
+    /// racing it from another thread through its OWN `SecureStorage` handle on
+    /// the same `.enc`, survives a pair-all persistence of N tenants — and all N
+    /// survive it. Repeated to give the race many chances.
+    #[test]
+    fn a_concurrent_refresher_write_for_another_tenant_survives_a_pair_all() {
+        const T_D: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let enc = dir.path().join("tokens.enc");
+            let mgr = test_mgr(dir.path());
+            let path = dir.path().join("paired_user.json");
+            // Seed the store so both writers merge into a readable one.
+            mgr.store_tenant_device_jwt(&t(T_D), "jwt.d.0").unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let refresher = {
+                let enc = enc.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let other = crate::auth::AuthManager::with_storage(
+                        crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
+                    );
+                    barrier.wait();
+                    for i in 1..=5 {
+                        other
+                            .store_tenant_device_jwt(&t(T_D), &format!("jwt.d.{i}"))
+                            .unwrap();
+                    }
+                })
+            };
+            let resp = PairCollectResponse {
+                device_id: None,
+                results: vec![
+                    minted(T_A, "jwt.a"),
+                    minted(T_B, "jwt.b"),
+                    minted(T_C, "jwt.c"),
+                ],
+            };
+            barrier.wait();
+            let outcomes = persist_collected_pairings_with(
+                &mgr,
+                &path,
+                &resp,
+                &[t(T_A), t(T_B), t(T_C)],
+                DEVICE,
+                None,
+            );
+            refresher.join().unwrap();
+
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| o.status == TenantPairStatus::Connected),
+                "round {round}: {outcomes:?}"
+            );
+            let reader = crate::auth::AuthManager::with_storage(
+                crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
+            );
+            for (tenant, tag) in [(T_A, "jwt.a"), (T_B, "jwt.b"), (T_C, "jwt.c")] {
+                assert_eq!(
+                    reader.get_tenant_device_jwt(&t(tenant)).unwrap(),
+                    Some(tok(tenant, tag)),
+                    "round {round}: pair-all slot {tenant} lost"
+                );
+            }
+            assert_eq!(
+                reader.get_tenant_device_jwt(&t(T_D)).unwrap().as_deref(),
+                Some("jwt.d.5"),
+                "round {round}: the concurrent refresher write was lost"
+            );
+        }
+    }
+
     /// A token minted for another tenant is never written into this row's slot.
     #[test]
     fn a_token_for_another_tenant_is_refused() {
