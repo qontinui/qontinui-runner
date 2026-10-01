@@ -597,7 +597,7 @@
       "class": "os_bound_tooling",
       "file": "src/crash_observability.rs",
       "symbol": "format_harvest_breadcrumb",
-      "excerpt": "flipping its shutdown marker to clean:true (crash, OOM kill, taskkill /F,\\n\\",
+      "excerpt": "abort, OOM kill, taskkill /F, or power loss). This artifact was\\n\\",
       "count": 1,
       "disposition": "unreviewed"
     },
