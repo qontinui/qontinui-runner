@@ -66,6 +66,43 @@ pub fn read_device_id() -> Result<String, String> {
     read_device_id_at(&path)
 }
 
+/// The device id the device-JWT refresher's credential doors present:
+/// `QONTINUI_MACHINE_ID` (the per-instance override) first, then
+/// `machine.json`. `None` when neither resolves. Never mints.
+///
+/// One resolution for every step that names the device — the
+/// pending-redeem poll, the redeem it triggers, and the anchor the secure
+/// store keeps — because a code web bound to one id is refused for another.
+///
+/// Under `cfg(test)` it reads only [`set_test_device_id`]'s thread-local
+/// value: the real `machine.json` is ambient state a test must not reach.
+pub fn resolve_device_id() -> Option<String> {
+    #[cfg(test)]
+    {
+        TEST_DEVICE_ID.with(|c| c.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var("QONTINUI_MACHINE_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| read_device_id().ok())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEVICE_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam for [`resolve_device_id`], scoped to the calling thread.
+#[cfg(test)]
+pub fn set_test_device_id(id: Option<&str>) {
+    TEST_DEVICE_ID.with(|c| *c.borrow_mut() = id.map(str::to_string));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
