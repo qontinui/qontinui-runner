@@ -89,11 +89,13 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// A write failure after the checks passed is 500 `MACHINE_JSON_WRITE_FAILED`.
 ///
 /// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
-/// consumer with `timing` `live` or `next_start` (the dual-write gate and the
-/// coord-mcp nonce restore read the pin once at startup).
-/// `data.existing_sessions` counts running coord-mcp bindings: those pinned at
-/// creation keep their tenant, and those that were unpinned follow the new pin
-/// on their next request.
+/// consumer with `timing` `live` or `next_start`. Three surfaces are
+/// `next_start`, read once at startup: the dual-write gate, the coord-mcp
+/// nonce restore and the boot reconcile's on-disk nonce adoption.
+/// `data.existing_sessions` counts this process's device coord-mcp keys, live
+/// AND graced (an evicted key keeps serving for the grace TTL): those pinned
+/// at creation keep their tenant, and those that were unpinned follow the new
+/// pin on their next request.
 async fn put_active_tenant(
     Json(body): Json<PutActiveTenant>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, HandlerError> {

@@ -233,10 +233,12 @@ pub(crate) enum PinTiming {
 pub(crate) struct PinSurface {
     pub surface: &'static str,
     pub timing: PinTiming,
-    /// Every function that reads the pin for this surface, as
+    /// The functions that read the pin DIRECTLY for this surface, as
     /// `<path under src-tauri/src>::<fn>`. Structured (one reader per entry)
-    /// so the source-scan guard can check it: a pin read in a function named
-    /// neither here nor in [`PIN_READER_EXCLUSIONS`] fails the build's tests.
+    /// so the source-scan guard can check it: a direct read of one of the five
+    /// pin tokens in a function named neither here nor in
+    /// [`PIN_READER_EXCLUSIONS`] fails the tests. Callers of a WRAPPER are not
+    /// checked; see [`PIN_SURFACES`] for that limit.
     #[serde(rename = "evidence")]
     pub readers: &'static [&'static str],
     pub detail: &'static str,
@@ -244,12 +246,21 @@ pub(crate) struct PinSurface {
 
 /// Every consumer of the machine pin, classified per-use vs startup.
 ///
-/// Kept honest by `commands::tenant::tests::every_pin_reader_is_classified`,
-/// which scans `src-tauri/src` (test modules excluded) for each call or path
-/// reference to `resolve_tenant_pin`, `resolve_active_tenant_id`,
+/// Partly guarded by `commands::tenant::tests::every_pin_reader_is_classified`,
+/// which scans `src-tauri/src` (inline test modules excluded) for each DIRECT
+/// call or path reference to `resolve_tenant_pin`, `resolve_active_tenant_id`,
 /// `active_tenant_uuid`, `active_tenant_id_str` and `machine_pin_tenant`, and
 /// requires the enclosing function to be named here or in
 /// [`PIN_READER_EXCLUSIONS`].
+///
+/// **What the guard does NOT catch.** It sees direct readers only. A new
+/// caller of a WRAPPER — the per-module `resolve_tenant_id`s,
+/// `read_active_tenant_id`, `current_machine_pin`, `resolve_new_session_tenant`
+/// and the like — is not checked, so a new startup-time caller of a wrapper
+/// would be misreported as live. Nor would it notice a wrapper that started
+/// caching its read (a `LazyLock`/`OnceLock` behind it). The wrappers' current
+/// callers were classified by reading them; the guard keeps the DIRECT set
+/// complete, not the transitive one.
 ///
 /// Sessions that ALREADY exist are not a surface here. Whether one moves
 /// depends on how its tenant was held at creation, which is what the
@@ -339,12 +350,11 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
     PinSurface {
         surface: "session_coordination_dual_write_gate",
         timing: PinTiming::NextStart,
-        readers: &[
-            "session/dual_write.rs::new",
-            "session/coord_sync.rs::start_flag_poll_task",
-        ],
-        detail: "DualWriteGate::new resolves its tenant once at construction and the flag poll \
-                 is started only for that tenant; this process keeps both",
+        readers: &["session/dual_write.rs::new"],
+        detail: "DualWriteGate::new resolves its tenant once at construction and this process \
+                 keeps it. CoordSync::start_flag_poll_task (session/coord_sync.rs) does not read \
+                 the pin: it consumes that frozen value, so the flag poll runs only for the \
+                 tenant read at startup",
     },
     PinSurface {
         surface: "coord_mcp_nonce_restore",
@@ -1014,6 +1024,36 @@ mod tests {
         false
     }
 
+    /// If `lines[i]` opens an INLINE column-0 test module (`#[cfg(test)]`,
+    /// further attributes, then `mod name {`), the index just past its
+    /// column-0 closing `}`; otherwise `None`.
+    ///
+    /// An OUT-OF-LINE declaration (`mod name;`) has no body here — its code
+    /// lives in another file, which the walk visits on its own — so it is not
+    /// skipped. Treating it as a body swallowed the production code after it
+    /// up to the next column-0 `}` (477 lines and 11 fns of `main.rs`).
+    fn test_mod_skip_end(lines: &[&str], i: usize) -> Option<usize> {
+        if lines.get(i).copied() != Some("#[cfg(test)]") {
+            return None;
+        }
+        let mut j = i + 1;
+        while lines.get(j).is_some_and(|l| l.starts_with("#[")) {
+            j += 1;
+        }
+        let next = lines.get(j).copied().unwrap_or("");
+        let is_mod = next.starts_with("mod ")
+            || next.starts_with("pub mod ")
+            || next.starts_with("pub(crate) mod ");
+        if !is_mod || next.trim_end().ends_with(';') {
+            return None;
+        }
+        let mut k = j + 1;
+        while k < lines.len() && lines[k] != "}" {
+            k += 1;
+        }
+        Some(k + 1)
+    }
+
     /// Every `(path::fn)` whose body reads the pin, outside test modules.
     ///
     /// Heuristics, stated so a failure is readable: a column-0
@@ -1050,23 +1090,9 @@ mod tests {
                 let mut i = 0;
                 while i < lines.len() {
                     let line = lines[i];
-                    if line == "#[cfg(test)]" {
-                        let mut j = i + 1;
-                        while j < lines.len() && lines[j].starts_with("#[") {
-                            j += 1;
-                        }
-                        let next = lines.get(j).copied().unwrap_or("");
-                        if next.starts_with("mod ")
-                            || next.starts_with("pub mod ")
-                            || next.starts_with("pub(crate) mod ")
-                        {
-                            i = j + 1;
-                            while i < lines.len() && lines[i] != "}" {
-                                i += 1;
-                            }
-                            i += 1;
-                            continue;
-                        }
+                    if let Some(resume) = test_mod_skip_end(&lines, i) {
+                        i = resume;
+                        continue;
                     }
                     if line.trim_start().starts_with("//") {
                         i += 1;
@@ -1143,7 +1169,6 @@ mod tests {
             [
                 "coord_mcp.rs::adopt_on_disk_nonce",
                 "coord_mcp.rs::restore_proxy_nonces_from",
-                "session/coord_sync.rs::start_flag_poll_task",
                 "session/dual_write.rs::new",
             ]
             .into_iter()
@@ -1185,5 +1210,37 @@ mod tests {
             Some("foo_bar")
         );
         assert_eq!(fn_name_on("let f = |x| x;"), None);
+
+        // An inline test module is skipped to its column-0 `}`...
+        let inline = [
+            "#[cfg(test)]",
+            "mod tests {",
+            "    fn t() {}",
+            "}",
+            "fn after() {}",
+        ];
+        assert_eq!(test_mod_skip_end(&inline, 0), Some(4));
+        // ...with stacked attributes too...
+        let attrs = [
+            "#[cfg(test)]",
+            "#[allow(dead_code)]",
+            "pub(crate) mod t {",
+            "}",
+        ];
+        assert_eq!(test_mod_skip_end(&attrs, 0), Some(4));
+        // ...but an OUT-OF-LINE declaration is not, so the production code
+        // after it stays visible to the scan.
+        let out_of_line = [
+            "#[cfg(test)]",
+            "mod runner_spawn_sites;",
+            "fn boot() { let _ = resolve_tenant_pin(); }",
+            "}",
+        ];
+        assert_eq!(test_mod_skip_end(&out_of_line, 0), None);
+        // And a non-module `#[cfg(test)]` item is not a module skip either.
+        assert_eq!(
+            test_mod_skip_end(&["#[cfg(test)]", "fn helper() {}"], 0),
+            None
+        );
     }
 }
