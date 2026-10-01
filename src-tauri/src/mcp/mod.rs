@@ -83,6 +83,7 @@ pub mod generation_rules_api;
 pub mod generator_eval;
 pub mod git_supervision_api;
 pub mod github_budget_api;
+pub mod glossary;
 pub mod goals;
 pub mod graph_api;
 pub mod gui_config;
