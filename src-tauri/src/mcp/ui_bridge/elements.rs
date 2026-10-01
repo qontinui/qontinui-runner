@@ -2228,6 +2228,8 @@ pub(crate) async fn try_ws_dispatch_for_app(
         dispatcher
             .dispatch(app_id, action, http_method, http_path, payload)
             .await
+            // WS-only by the guard above: the bare result, as before.
+            .map(crate::mcp::app_dispatch::Dispatched::into_raw)
             .map_err(|e| e.to_user_message()),
     )
 }
@@ -2258,6 +2260,7 @@ async fn ws_collect_components(
             .await
         {
             Ok(value) => {
+                let value = value.into_raw();
                 // Wrappers may either return a bare array or wrap it in
                 // `{success, data}` / `{components: [...]}`. Accept any of
                 // those shapes and append the contained items.
