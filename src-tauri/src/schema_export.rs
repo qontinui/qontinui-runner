@@ -50,6 +50,33 @@ impl<T: schemars::JsonSchema> schemars::JsonSchema for Nullable<T> {
     }
 }
 
+/// Schema-only stand-in for a free `String` field whose KNOWN values are the
+/// closed vocabulary `V`, but which is open at runtime — serde accepts and
+/// round-trips any string (user rows, imports, community payloads).
+///
+/// Used as `#[schemars(with = "crate::schema_export::OpenVocab<V>")]`. The
+/// schema is `V | string`: the vocabulary stays named and published (so `V`'s
+/// own binding is still there to narrow against), while the field's binding
+/// admits the foreign values the wire really carries instead of overstating
+/// them as impossible. Serde is untouched; the field stays `String`.
+pub struct OpenVocab<V>(std::marker::PhantomData<V>);
+
+impl<V: schemars::JsonSchema> schemars::JsonSchema for OpenVocab<V> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("OpenVocab_{}", V::schema_name()).into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "anyOf": [generator.subschema_for::<V>(), { "type": "string" }]
+        })
+    }
+}
+
 // ============================================================================
 // Export function
 // ============================================================================

@@ -25,8 +25,11 @@ use serde::{Deserialize, Serialize};
 
 /// Schema-only stand-in for the free-form JSON-object fields
 /// (`detection_config`, `verification_step_template`, `step_template`). The
-/// Rust field stays `serde_json::Value`; the schema narrows it to an object,
-/// which is what every producer writes and what the TS mirror always declared.
+/// Rust field stays `serde_json::Value`; the schema narrows it to an object —
+/// the shape the in-tree producers write and the hand-authored TS mirror always
+/// declared. That narrowing is a schema CLAIM, not something serde enforces: a
+/// caller of the `known_issues` commands can still store a non-object value,
+/// and it would read back as one.
 type JsonObject = serde_json::Map<String, serde_json::Value>;
 
 /// Category of a known issue.
@@ -260,6 +263,7 @@ impl IssueProvenance {
 
 /// A persistent known issue that survives across workflow runs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct KnownIssue {
     pub id: String,
     pub title: String,
@@ -302,6 +306,7 @@ pub struct KnownIssue {
 
 /// Request to create a new known issue.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct CreateKnownIssueRequest {
     pub title: String,
     pub description: String,
@@ -326,6 +331,7 @@ pub struct CreateKnownIssueRequest {
 
 /// Request to update an existing known issue.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct UpdateKnownIssueRequest {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -349,6 +355,7 @@ pub struct UpdateKnownIssueRequest {
 
 /// Query parameters for listing known issues.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ListKnownIssuesQuery {
     pub scope_type: Option<String>,
     pub scope_value: Option<String>,
@@ -361,6 +368,7 @@ pub struct ListKnownIssuesQuery {
 
 /// An issue pattern template for reusable detection strategies.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct IssuePatternTemplate {
     pub id: String,
     pub name: String,
@@ -380,6 +388,7 @@ pub struct IssuePatternTemplate {
 
 /// Request to create a new pattern template.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct CreatePatternTemplateRequest {
     pub name: String,
     pub description: String,
@@ -390,6 +399,7 @@ pub struct CreatePatternTemplateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "IssuePatternTemplateParameter")]
 pub struct TemplateParameter {
     pub name: String,
