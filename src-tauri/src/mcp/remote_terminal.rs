@@ -4710,9 +4710,10 @@ pub async fn supervise_reattach(
                 if renewals >= policy.max_renewals {
                     break Some(Err(err));
                 }
-                let (Some(renewer), Some(session)) =
-                    (client.grant_renewer(), pane.session_id().map(str::to_string))
-                else {
+                let (Some(renewer), Some(session)) = (
+                    client.grant_renewer(),
+                    pane.session_id().map(str::to_string),
+                ) else {
                     break Some(Err(err));
                 };
                 match renewer.renew(&session).await {
@@ -4917,11 +4918,11 @@ fn parse_attached(data: &Value) -> Option<AttachedReply> {
 mod tests {
     use super::*;
     use crate::terminal::pane_io::PaneIo;
-    use std::sync::Mutex as StdMutex;
     use crate::terminal::remote_pane_io::{
         REATTACHED_MARKER, RELAY_LOST_MARKER, TARGET_NOT_CONNECTED_MARKER,
     };
     use std::io::Write as _;
+    use std::sync::Mutex as StdMutex;
 
     /// Plan 2026-09-16 Phase 1: the pump state reads "attached" exactly while
     /// a connection holds `lock_outbound`, and a new connection bumps the
@@ -7755,7 +7756,9 @@ mod tests {
         for _ in 0..3 {
             let f = pump.recv().await.unwrap();
             assert_eq!(f["request_id"], "reattach:jti-1");
-            assert!(client.handle_inbound("error", &reattach_refusal("jti-1", "target_not_connected")));
+            assert!(
+                client.handle_inbound("error", &reattach_refusal("jti-1", "target_not_connected"))
+            );
         }
         let f = pump.recv().await.unwrap();
         assert_eq!(f["request_id"], "reattach:jti-1");
@@ -7897,7 +7900,11 @@ mod tests {
         sup.await.unwrap();
         assert!(pane.is_finished());
         let out = read_all(&pane);
-        assert!(!contains(&out, b"OTHER"), "{}", String::from_utf8_lossy(&out));
+        assert!(
+            !contains(&out, b"OTHER"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
         assert!(contains(&out, b"attach_terminal_mismatch"));
     }
 
@@ -7917,7 +7924,10 @@ mod tests {
                 "remote_terminal_error",
                 &json!({"type": "remote_terminal_error", "grant_jti": "jti-1", "code": code, "message": "m"})
             ));
-            assert!(!pane.is_finished(), "{code} closed a pane a supervisor owns");
+            assert!(
+                !pane.is_finished(),
+                "{code} closed a pane a supervisor owns"
+            );
         }
         assert!(client.handle_inbound(
             "remote_terminal_attached",
@@ -7946,7 +7956,11 @@ mod tests {
         assert!(client.handle_inbound("remote_terminal_error", &frame));
         assert!(client.handle_inbound("remote_terminal_error", &frame));
         let reqs = client.take_reattach_requests();
-        assert_eq!(reqs.len(), 1, "a second refusal does not start a second supervisor");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "a second refusal does not start a second supervisor"
+        );
         assert!(reqs[0].announced_target_down);
         assert!(reqs[0].first.is_none());
         assert!(!pane.is_finished());
