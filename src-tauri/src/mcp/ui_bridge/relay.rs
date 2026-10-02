@@ -141,7 +141,9 @@ pub struct TabCandidate {
 pub enum DispatchError {
     /// No tab currently holds a live SSE listener.
     NoTabConnected,
-    /// No `tabId` was supplied and more than one tab is connected.
+    /// No `tabId` was supplied and more than one tab is connected, or (R8,
+    /// under `active_binding = enforce`) one is connected while a tab under a
+    /// different principal was seen within the reservation window.
     AmbiguousTab(Vec<TabCandidate>),
     /// The named tab is unknown or has no live SSE listener.
     TabNotFound(String),
@@ -530,16 +532,21 @@ impl RelayRegistry {
                     // principal is, or was within the reservation window,
                     // connected. Otherwise a fresh foreign tab attaching while
                     // the real one reconnects would capture the command.
+                    // `binding = off` disables R8 with every other rule, as it
+                    // does R6 and R9-unkeyed.
                     let sole = (connected.len() == 1).then(|| connected[0].clone());
-                    let rival = sole.as_ref().is_some_and(|id| {
-                        let mine = inner.tabs.get(id).and_then(|t| t.principal.as_ref());
-                        inner.tabs.iter().any(|(other, t)| {
-                            other != id
-                                && now.saturating_sub(t.last_seen_ms) < BINDING_TOMBSTONE_MS as u64
-                                && !matches!((mine, t.principal.as_ref()),
+                    let checked = binding.config.binding != BindingMode::Off;
+                    let rival = checked
+                        && sole.as_ref().is_some_and(|id| {
+                            let mine = inner.tabs.get(id).and_then(|t| t.principal.as_ref());
+                            inner.tabs.iter().any(|(other, t)| {
+                                other != id
+                                    && now.saturating_sub(t.last_seen_ms)
+                                        < BINDING_TOMBSTONE_MS as u64
+                                    && !matches!((mine, t.principal.as_ref()),
                                     (Some(a), Some(b)) if a.same(b))
-                        })
-                    });
+                            })
+                        });
                     if sole.is_some() && !rival {
                         sole.expect("checked is_some")
                     } else {
@@ -1591,5 +1598,73 @@ mod tests {
         assert_eq!(tabs[0]["tabId"], "tab-first");
         assert_eq!(tabs[0]["isPrimary"], true);
         assert_eq!(tabs[1]["isPrimary"], false);
+    }
+
+    /// R8 at the registry: one tab connected, a differently-bound tab seen
+    /// within the reservation window. `shadow` resolves and counts, `enforce`
+    /// is ambiguous with each candidate's verified origin, and `binding = off`
+    /// disables the rule (no count) like every other rule.
+    #[tokio::test]
+    async fn untargeted_dispatch_with_recent_rival_meters_r8_per_mode() {
+        use crate::mcp::origin_guard::{NormOrigin, OriginClass};
+        let browser = |o: &str| Principal::Browser {
+            class: OriginClass::Foreign,
+            origin: NormOrigin::parse(o).expect("a parseable origin"),
+        };
+        let cases = [
+            (BindingMode::Enforce, BindingMode::Shadow, Some(false), 1),
+            (BindingMode::Enforce, BindingMode::Enforce, Some(true), 0),
+            (BindingMode::Off, BindingMode::Enforce, None, 0),
+        ];
+        for (mode, active, ambiguous, would_refuse) in cases {
+            let binding = RelayBinding::new(BindingConfig {
+                binding: mode,
+                active_binding: active,
+            });
+            let registry = RelayRegistry::new();
+            let (_own, _own_rx) = registry
+                .connect_stream(&binding, &browser("https://app.example"), "tab-own")
+                .unwrap();
+            let (rival, _rival_rx) = registry
+                .connect_stream(&binding, &browser("https://evil.example"), "tab-rival")
+                .unwrap();
+            registry.disconnect_stream("tab-rival", rival);
+
+            let err = registry
+                .dispatch(
+                    &binding,
+                    None,
+                    "ping",
+                    serde_json::Value::Null,
+                    Duration::from_millis(20),
+                )
+                .await
+                .expect_err("nobody answers the command");
+            match (&err, ambiguous) {
+                (DispatchError::AmbiguousTab(candidates), Some(true)) => {
+                    let got: Vec<(&str, Option<&str>)> = candidates
+                        .iter()
+                        .map(|c| (c.id.as_str(), c.verified_origin.as_deref()))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        vec![
+                            ("tab-own", Some("https://app.example")),
+                            ("tab-rival", Some("https://evil.example")),
+                        ],
+                        "{mode:?}/{active:?}"
+                    );
+                }
+                (DispatchError::Timeout { .. }, Some(false) | None) => {}
+                other => panic!("{mode:?}/{active:?}: unexpected {other:?}"),
+            }
+            let r8 = binding.counters.get(RULE_R8);
+            assert_eq!(r8.would_refuse, would_refuse, "{mode:?}/{active:?}");
+            assert_eq!(
+                r8.refused,
+                u64::from(ambiguous == Some(true)),
+                "{mode:?}/{active:?}"
+            );
+        }
     }
 }

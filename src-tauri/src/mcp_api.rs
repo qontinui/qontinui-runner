@@ -20432,6 +20432,16 @@ mod ui_bridge_binding_health_tests {
         );
         assert_eq!(v["rules"]["R1"]["refused"], 1, "{v}");
         assert_eq!(v["rules"]["R6"]["wouldRefuse"], 1, "{v}");
+        // A rule that never fired is served zeroed, not absent: Phase 4
+        // graduates R8 and R9-unkeyed on a zero it must be able to read.
+        for rule in crate::mcp::relay_binding::ALL_RULES {
+            assert!(v["rules"][rule]["wouldRefuse"].is_u64(), "{rule}: {v}");
+        }
+        assert_eq!(
+            v["rules"]["R8"],
+            serde_json::json!({ "wouldRefuse": 0, "refused": 0 }),
+            "{v}"
+        );
         assert!(
             v["recent"].is_array(),
             "the (rule, class, route) tuples: {v}"

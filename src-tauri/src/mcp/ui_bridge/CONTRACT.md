@@ -129,7 +129,7 @@ Routes (all under the `/ui-bridge` base the inject CLI is pointed at via
   silent-drop recovery signal.
 - `GET /ui-bridge/tabs` — registry listing,
   `{success, data:{count, tabs:[{tabId, connected, isPrimary, lastHeartbeat,
-  lastSeen, …}], staleTabEvictMs}}`; this is what `ui-bridge-headless`'s
+  lastSeen, verifiedOrigin, principalClass, …}], staleTabEvictMs}}`; this is what `ui-bridge-headless`'s
   `waitForUiBridgeRegistration` polls. Stale tabs (no listener + no sign of
   life for `staleTabEvictMs`) are evicted lazily, on the next registry
   operation. Read the bound against `lastSeen`, never `lastHeartbeat`: a tab
@@ -142,9 +142,14 @@ Routes (all under the `/ui-bridge` base the inject CLI is pointed at via
 - `POST /ui-bridge/relay/dispatch` — runner-side command entry point
   (`{tabId?, action, payload?, timeoutMs?}`): queues a frame onto the tab's
   SSE stream and awaits its result POST. With no `tabId` it targets the sole
-  connected tab; errors are structured envelopes — `NO_TAB_CONNECTED` 503,
-  `AMBIGUOUS_TAB` 409, `TAB_NOT_FOUND` 404, `TAB_DISCONNECTED` 502,
-  `TIMEOUT` 504. A pinned dispatch NEVER falls through to another tab (the
+  connected tab — unless (R8) a tab bound to a different principal was seen
+  within the reservation window, which is ambiguous under
+  `QONTINUI_RUNNER_UIBRIDGE_ACTIVE_BINDING=enforce` and counted as
+  `uiBridgeBinding.rules.R8.wouldRefuse` on `/health` under the default
+  `shadow`. Errors are structured envelopes — `NO_TAB_CONNECTED` 503,
+  `AMBIGUOUS_TAB` 409 (its `hint.candidates` lists each `{tabId,
+  verifiedOrigin}`, so an agent can pick the tab whose origin it navigated),
+  `TAB_NOT_FOUND` 404, `TAB_DISCONNECTED` 502, `TIMEOUT` 504. A pinned dispatch NEVER falls through to another tab (the
   shared-cache silent-fallback bug class from item 1 of the plan).
 
 These are relay ADAPTER routes: the SDK serves them from its nextjs/express

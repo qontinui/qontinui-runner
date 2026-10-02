@@ -98,6 +98,24 @@ pub const RULE_R5_KEEP_ALIVE: &str = "R5-keepAlive";
 /// one counter. (It does not reduce ring pressure — both ids share the ring.)
 pub const RULE_R1_SLOT: &str = "R1-slot";
 pub const RULE_OPAQUE: &str = "R-opaque";
+
+/// Every rule id a verdict is metered under. `/health` serves each of them,
+/// zeroed until it first fires: Phase 4 graduates R6, R8 and R9-unkeyed on
+/// `rules.<id>.wouldRefuse == 0`, and an absent key would not tell "never
+/// fired" from "this build predates the rule".
+pub const ALL_RULES: &[&str] = &[
+    RULE_R1,
+    RULE_R1_SLOT,
+    RULE_R2,
+    RULE_R3,
+    RULE_R4,
+    RULE_R5,
+    RULE_R5_KEEP_ALIVE,
+    RULE_R6,
+    RULE_R8,
+    RULE_R9_UNKEYED,
+    RULE_OPAQUE,
+];
 /// Not a rule id: the label [`Refusal::registry_full`] carries so the denial
 /// payload still names what refused it. It is deliberately NOT one of the
 /// `R*` ids and is never passed to [`RelayBinding::meter`], because a
@@ -511,12 +529,13 @@ impl BindingCounters {
 
     fn rules_json(&self) -> Value {
         let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = serde_json::Map::new();
+        let count = |c: &RuleCount| json!({ "wouldRefuse": c.would_refuse, "refused": c.refused });
+        let mut out: serde_json::Map<String, Value> = ALL_RULES
+            .iter()
+            .map(|rule| ((*rule).to_string(), count(&RuleCount::default())))
+            .collect();
         for (rule, c) in rules.iter() {
-            out.insert(
-                (*rule).to_string(),
-                json!({ "wouldRefuse": c.would_refuse, "refused": c.refused }),
-            );
+            out.insert((*rule).to_string(), count(c));
         }
         Value::Object(out)
     }
