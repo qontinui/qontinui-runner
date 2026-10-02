@@ -270,6 +270,9 @@ pub struct RemotePaneIo {
     /// The coord session this pane views — what a grant renewal mints for.
     /// `None` for a pane built without one, which therefore cannot renew.
     session_id: Option<String>,
+    /// The device the pane was attached to. A renewal coord now places on a
+    /// different device is refused rather than silently followed.
+    target_device_id: Option<String>,
     /// A reattach supervisor owns this pane right now (at most one does).
     reattaching: AtomicBool,
     /// A "relay lost" / "target not connected" notice is the pane's latest
@@ -334,6 +337,7 @@ impl RemotePaneIo {
             })),
             terminal_id: terminal_id.into(),
             session_id: None,
+            target_device_id: None,
             reattaching: AtomicBool::new(false),
             awaiting_reattach: AtomicBool::new(false),
             sink,
@@ -518,6 +522,17 @@ impl RemotePaneIo {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Record the device this pane is attached to, so a grant renewal can
+    /// refuse a session coord has since placed elsewhere.
+    pub fn with_target_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.target_device_id = Some(device_id.into());
+        self
+    }
+
+    pub fn target_device_id(&self) -> Option<&str> {
+        self.target_device_id.as_deref()
     }
 
     pub fn grant_jti(&self) -> String {

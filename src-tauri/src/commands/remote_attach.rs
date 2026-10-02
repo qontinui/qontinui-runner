@@ -427,26 +427,9 @@ pub async fn terminal_attach_remote(
 // ---------------------------------------------------------------------------
 
 /// How long the source keeps re-presenting the SAME grant while the target has
-/// not recorded it yet.
-///
-/// **Sized against the TARGET's catch-up poll, which is a property of the
-/// target's BUILD and therefore not shortenable from here.** A target learns a
-/// grant from a push on `qontinui.sessions.<tenant>.<device>.attach_request`
-/// or from its catch-up `GET /sessions/attach-requests`; a target whose runner
-/// predates the on-demand re-read has only those two, so a dropped push leaves
-/// the poll as the only feed. That poll is 15 s on a runner carrying
-/// [`crate::session::attach::POLL_INTERVAL`] as it now stands, and **60 s on
-/// every build that predates it** — which is the population this window exists
-/// for. 80 s covers one whole 60 s tick plus the catch-up GET's own budget and
-/// clock skew, against a grant coord gives 900 s of life, so the wait spends a
-/// small fraction of the capability it is waiting on.
-///
-/// It bounds the RE-PRESENTATION schedule, not the wall clock: each
-/// presentation carries its own [`ATTACH_TIMEOUT`] (20 s), so a final attempt
-/// that times out can carry the total to ~100 s. A timeout is a settled stop
-/// (see [`present_grant_until_target_records_it`]), so that happens at most
-/// once and never compounds.
-pub(crate) const GRANT_LEARN_WINDOW: Duration = Duration::from_secs(80);
+/// not recorded it yet. Defined beside the reattach supervisor, which uses the
+/// same window after a grant renewal, so the two cannot drift; see its doc.
+pub(crate) use crate::mcp::remote_terminal::GRANT_LEARN_WINDOW;
 
 /// Gap between two presentations of the same grant. Short enough that a 15 s
 /// poll is caught within a tick of recording the row, long enough that the
@@ -751,6 +734,10 @@ pub(crate) async fn open_remote_tab(
         ));
     }
 
+    let target_id = minted
+        .target_device_id
+        .clone()
+        .unwrap_or_else(|| device_id.clone());
     let pane = Arc::new(
         RemotePaneIo::new(
             minted.grant_jti.clone(),
@@ -761,7 +748,8 @@ pub(crate) async fn open_remote_tab(
             rows,
             attached.ring,
         )
-        .with_session_id(session_uuid.to_string()),
+        .with_session_id(session_uuid.to_string())
+        .with_target_device_id(target_id.clone()),
     );
     // So a reattach that finds this grant expired can mint the next one.
     client().set_grant_renewer(Arc::new(CoordGrantRenewer {
@@ -769,10 +757,6 @@ pub(crate) async fn open_remote_tab(
     }));
     client().register_pane(pane.clone());
 
-    let target_id = minted
-        .target_device_id
-        .clone()
-        .unwrap_or_else(|| device_id.clone());
     let device_label = non_blank(device_label).unwrap_or_else(|| short_id(&target_id));
     let title = format!(
         "{}: {}",
@@ -854,7 +838,10 @@ pub(crate) async fn open_remote_tab(
 /// The same mint the picker uses, so the same issuance policy applies: a
 /// session coord no longer places in this tenant, or a device that stopped
 /// accepting remote attach, is refused here exactly as a fresh attach would
-/// be, and the reattach supervisor closes the tab with that refusal.
+/// be, and the reattach supervisor closes the tab with that refusal. The
+/// placement check a fresh attach makes (`coord_places_session_on`) is made
+/// here too: a session coord now places on a different device is refused with
+/// that reason, rather than surfacing later as a terminal mismatch.
 struct CoordGrantRenewer {
     app: tauri::AppHandle,
 }
@@ -863,6 +850,7 @@ impl GrantRenewer for CoordGrantRenewer {
     fn renew<'a>(
         &'a self,
         session_id: &'a str,
+        target_device_id: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
     > {
@@ -870,6 +858,15 @@ impl GrantRenewer for CoordGrantRenewer {
             let session = uuid::Uuid::parse_str(session_id)
                 .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
             let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
+            if let Some(attached_to) = target_device_id {
+                if !coord_places_session_on(attached_to, minted.target_device_id.as_deref()) {
+                    let now_on = minted.target_device_id.as_deref().unwrap_or("<unreported>");
+                    return Err(format!(
+                        "remote_attach:target_mismatch: coord now places session {session} on \
+                         device {now_on}, not {attached_to} — the session moved"
+                    ));
+                }
+            }
             info!(
                 session = %session,
                 grant_jti = %minted.grant_jti,
