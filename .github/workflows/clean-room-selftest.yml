@@ -1,0 +1,82 @@
+name: Clean-room harness selftest
+
+# The offline half of the clean-room acceptance run (plan
+# 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# Phase E): scripts/tests/test_clean_room.py, at PR time.
+#
+# The run itself is a nightly/release job in published-parity.yml on a
+# GitHub-hosted Windows box; its unit tests run first there too. They also run
+# HERE, on every PR that touches the harness, so a change that would turn an
+# `unknown` into a `pass`, miss a planted fleet noun, or let a dirty box through
+# the preflight is caught before it lands rather than on the next night.
+#
+# The fleet-noun vocabulary and the NextActionKind enum are read from the
+# qontinui-schemas sibling (checked out through the shared action, so a
+# declared adaptation PR is honoured); the test FAILS, never skips, when they
+# are absent.
+#
+# Not a REQUIRED context on the ruleset. It is still a check on the PR, and
+# coord's merge train holds a PR on any red check, required or not -- so a red
+# selftest holds a PR that touches the harness. That is intended: the harness's
+# own tests should be green before it lands. The clean-room RUN (the nightly in
+# published-parity.yml) gates nothing. Hermetic apart from the sibling checkout.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/clean_room/**"
+      - "scripts/tests/test_clean_room.py"
+      - "scripts/tests/fixtures/clean_room_fake_runner.py"
+      - ".github/workflows/clean-room-selftest.yml"
+      - ".github/workflows/published-parity.yml"
+      - ".github/sibling-pins.conf"
+      - ".github/actions/checkout-sibling/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/clean_room/**"
+      - "scripts/tests/test_clean_room.py"
+      - "scripts/tests/fixtures/clean_room_fake_runner.py"
+      - ".github/workflows/clean-room-selftest.yml"
+      - ".github/workflows/published-parity.yml"
+      - ".github/sibling-pins.conf"
+      - ".github/actions/checkout-sibling/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Clean-room harness selftest (${{ matrix.os }})
+    # Windows too: the nightly runs these tests on windows-latest first, and a
+    # Windows-only failure there would silence every night's run.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The fixture's failing test is only proven failing when Go is present;
+      # without it that one test skips. Pin the toolchain so it always runs.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Clean-room harness unit tests (no network)
+        shell: bash
+        run: python scripts/tests/test_clean_room.py

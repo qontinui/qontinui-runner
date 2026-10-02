@@ -90,6 +90,10 @@ jobs:
   published-parity:
     name: Published-build parity (windows)
     runs-on: windows-latest
+    # Read by `publish-report` below, which joins the clean-room block into
+    # this job's artifact by name.
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     # 150, matching ci.yml's windows leg, which runs this SAME
     # `pnpm run tauri build --debug --no-bundle` and sized itself from 90
     # sampled successful runs (windows p90 87.2m, max 110.6m). This job's
@@ -314,225 +318,17 @@ jobs:
         run: pnpm run tauri build --debug --no-bundle
 
       # -----------------------------------------------------------------------
-      # The PUBLISHED leg's artifact: download, VERIFY, then install.
-      # -----------------------------------------------------------------------
-      - name: Resolve the release to compare against
+      # The PUBLISHED leg's artifact: resolve, download, VERIFY, install, and
+      # stop any auto-launched instance. Shared with the clean-room job below
+      # through one composite action, so both measure the same artifact by the
+      # same rules. The bound that the install step used to carry
+      # (`timeout-minutes: 15`) is on this `uses:` step now, widened by the
+      # download and verify it also covers; the installer's own 600s inner
+      # bound is unchanged.
+      - name: Resolve, verify and install the published build
         id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Bound through env rather than spliced in with ${{ }}: a tag name may
-          # contain backticks, $(), ; and | (git check-ref-format permits them),
-          # which inside double quotes would be command substitution. Same
-          # reasoning as release.yml's RELEASE_VERSION binding.
-          INPUT_TAG: ${{ github.event.inputs.release_tag }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          tag="$EVENT_TAG"
-          if [ -z "$tag" ]; then tag="$INPUT_TAG"; fi
-          if [ -z "$tag" ]; then
-            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName) || tag=""
-          fi
-          if [ -z "$tag" ]; then
-            echo "::error::Could not resolve a release tag to compare against. This is NOT a parity result — the comparison did not run."
-            exit 1
-          fi
-          echo "Comparing against release: $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-      - name: Download the published installer and its checksums
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          mkdir -p published-artifact
-          gh release download "$TAG" --repo "${{ github.repository }}" \
-            --dir published-artifact \
-            --pattern 'Qontinui.Runner_*_x64-setup.exe' \
-            --pattern 'checksums-windows-x64.txt'
-          ls -l published-artifact
-        shell: bash
-
-      # An unverified installer is never executed. This step is the one place in
-      # this workflow that is allowed to fail the job outright: refusing to run
-      # an unverified binary is not a parity verdict, it is a refusal to measure.
-      #
-      # FORMAT NOTE — the checksums file is NOT `sha256sum` output. release.yml
-      # generates the Windows one with `certutil -hashfile nsis/*.exe SHA256`,
-      # which writes three lines:
-      #
-      #     SHA256 hash of nsis\Qontinui.Runner_1.0.10_x64-setup.exe:
-      #     <64 hex chars>            (older Windows builds space-separate them)
-      #     CertUtil: -hashfile command completed successfully.
-      #
-      # so `sha256sum -c` cannot read it. We strip CR and spaces and take the
-      # first line that is exactly 64 hex characters. If no such line exists the
-      # file is unparseable and we REFUSE — an unverifiable checksum is not a
-      # pass.
-      - name: Verify the installer against the release checksums
-        run: |
-          set -euo pipefail
-          setup=$(ls published-artifact/Qontinui.Runner_*_x64-setup.exe 2>/dev/null | head -1)
-          if [ -z "$setup" ]; then
-            echo "::error::No Qontinui.Runner_*_x64-setup.exe on release ${{ steps.release.outputs.tag }}. Nothing to compare against."
-            exit 1
-          fi
-          sums="published-artifact/checksums-windows-x64.txt"
-          if [ ! -f "$sums" ]; then
-            echo "::error::Release ${{ steps.release.outputs.tag }} carries no checksums-windows-x64.txt. Refusing to run an unverified installer."
-            exit 1
-          fi
-
-          expected=$(tr -d ' \r' < "$sums" | grep -oiE '^[0-9a-f]{64}$' | head -1 || true)
-          if [ -z "$expected" ]; then
-            echo "::error::Could not parse a SHA-256 digest out of checksums-windows-x64.txt. An unverifiable checksum is not a pass; refusing to install."
-            echo "--- file contents ---"; cat "$sums"
-            exit 1
-          fi
-          actual=$(sha256sum "$setup" | cut -d' ' -f1)
-          expected=$(echo "$expected" | tr 'A-F' 'a-f')
-          actual=$(echo "$actual" | tr 'A-F' 'a-f')
-          echo "expected: $expected"
-          echo "actual  : $actual"
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::Checksum MISMATCH for $setup. Refusing to install or run it."
-            exit 1
-          fi
-          echo "Checksum verified."
-          echo "SETUP_EXE=$setup" >> "$GITHUB_ENV"
-        shell: bash
-
-      # NSIS silent install. Tauri declares no bundle.windows section at all
-      # (no nsis block, no installMode pin — verified 2026-09-02), so the
-      # installer runs on Tauri's defaults and the install directory is NOT
-      # decided in this repo. Nothing here hardcodes it: the locator in
-      # scripts/lib/installed-runner.ps1 probes %LOCALAPPDATA%, %ProgramFiles%
-      # and %ProgramFiles(x86)% in order and THROWS naming every path it tried.
-      #
-      # BOUNDED. Run 35318462832 (2026-09-18, the first nightly on the #1564
-      # workflow) got through the build and the checksum in 30 minutes, then
-      # sat on `"./$SETUP_EXE" /S || true` under git bash for TWO HOURS until
-      # the job's 150-minute budget cancelled it — steps 17-21 skipped, the
-      # count UNKNOWN. What the cancel sweep found alive was the INSTALLER
-      # itself (`Qontinui.Runner_1.0.11_x64-setup`, one pid), no launched app,
-      # and "Installed after" never printed: the installer never finished, and
-      # a bash foreground wait has no bound. `Start-Process` + `WaitForExit(ms)`
-      # bounds the wait, the timed-out installer is killed (a hung NSIS holds
-      # its install-dir handles and its single-instance mutex through both
-      # parity legs otherwise, and if it inherited this step's stdout it would
-      # hold the step open past pwsh's own exit), `timeout-minutes` bounds the
-      # step, and the still-alive process listing with its window title is the
-      # diagnostic for WHY it hung. The step itself never fails: a missing exe
-      # is the locator's to refuse, downstream, naming every path it probed.
-      # (`Start-Process` also gives the installer its own handles, so a process
-      # it launches cannot hold this step open either — covered, not the
-      # measured cause.)
-      - name: Install the published build silently
-        timeout-minutes: 15
-        run: |
-          $p = $null
-          try {
-            $setup = (Resolve-Path -LiteralPath $env:SETUP_EXE).Path
-            Write-Host "Installing $setup"
-            $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru
-          } catch {
-            Write-Host "::warning::Could not launch installer '$($env:SETUP_EXE)': $($_.Exception.Message) -- continuing to the exe probe; the locator downstream fails typed."
-          }
-          if ($p -and $p.WaitForExit(600000)) {
-            if ($p.ExitCode -ne 0) {
-              Write-Host "::warning::Installer exited with code $($p.ExitCode) (NSIS: 1 = aborted, 2 = script aborted)."
-            } else {
-              Write-Host "Installer exited with code 0."
-            }
-          } elseif ($p) {
-            $p.Refresh()
-            Write-Host "::warning::Installer (pid $($p.Id)) still running after 600s; main window: '$($p.MainWindowTitle)'. Killing it and continuing to the exe probe."
-            Get-Process -ErrorAction SilentlyContinue |
-              Where-Object { $_.ProcessName -match 'Qontinui|setup' } |
-              ForEach-Object { Write-Host ("alive: pid {0} {1} window='{2}'" -f $_.Id, $_.ProcessName, $_.MainWindowTitle) }
-            # The name filter above cannot see what the installer is WAITING ON
-            # when that is a child it spawned under another name — the NSIS
-            # uninstaller of a prior version runs as `Au_.exe`, a prerequisite
-            # bootstrapper under its own. Walk the installer's own descendants by
-            # ParentProcessId (so nothing outside its tree is listed or touched),
-            # print each with its command line, then stop them leaf-first by exact
-            # pid: an orphaned child would otherwise keep holding the install dir
-            # through both parity legs after its parent is gone.
-            $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-            $tree = [System.Collections.Generic.List[object]]::new()
-            $frontier = @($p.Id)
-            while ($frontier.Count -gt 0) {
-              $children = @($all | Where-Object { $frontier -contains $_.ParentProcessId -and $_.ProcessId -ne $p.Id })
-              $children | ForEach-Object { $tree.Add($_) }
-              $frontier = @($children | ForEach-Object { $_.ProcessId })
-            }
-            if ($tree.Count -eq 0) { Write-Host "installer has no live descendants." }
-            foreach ($c in $tree) {
-              $window = (Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue).MainWindowTitle
-              Write-Host ("descendant: pid {0} parent {1} {2} window='{3}' cmd={4}" -f $c.ProcessId, $c.ParentProcessId, $c.Name, $window, $c.CommandLine)
-            }
-            for ($j = $tree.Count - 1; $j -ge 0; $j--) {
-              Stop-Process -Id $tree[$j].ProcessId -Force -ErrorAction SilentlyContinue
-            }
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          }
-
-          # NSIS /S can return before the files are fully written, so poll for
-          # the exe rather than sleeping a fixed amount. A base that is unset
-          # (a service-account runner with no profile) contributes no candidate
-          # rather than a Join-Path binding error. The three bases are the
-          # locator's own (scripts/lib/installed-runner.ps1), in its order, so
-          # this poll never gives up on an install the locator would then find.
-          $bases = @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})
-          $candidates = foreach ($base in $bases) {
-            if ($base) { Join-Path $base 'Qontinui Runner\qontinui-runner.exe' }
-          }
-          $installed = $false
-          for ($i = 1; $i -le 60; $i++) {
-            foreach ($c in $candidates) {
-              if (Test-Path -LiteralPath $c) { Write-Host "Installed after ${i}s: $c"; $installed = $true; break }
-            }
-            if ($installed) { break }
-            Start-Sleep -Seconds 1
-          }
-
-          # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
-          # what actually finds the exe, and it throws naming every path probed
-          # rather than falling back to anything.
-          # The install dir's top-level entries, not a name filter: on run
-          # 35429143803 a filter for 'Qontinui Runner*' printed the directory
-          # and nothing else, which is how the exe's real name (the cargo
-          # binary name, qontinui-runner.exe -- Tauri 2 does not rename it to
-          # productName) stayed unmeasured for one more run.
-          foreach ($base in $bases) {
-            $dir = if ($base) { Join-Path $base 'Qontinui Runner' } else { $null }
-            if ($dir -and (Test-Path -LiteralPath $dir)) {
-              Write-Host "Install dir ${dir}:"
-              Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  {0}{1}" -f $_.Name, $(if ($_.PSIsContainer) { '\' } else { '' })) }
-            }
-          }
-        shell: pwsh
-
-      # The Tauri NSIS installer can launch the app when it finishes. A running
-      # instance would take the port and could make the single-instance path
-      # short-circuit the instances the parity harness boots. Stop any leftover.
-      #
-      # SAFE HERE AND NOWHERE ELSE: this is an ephemeral GitHub-hosted image
-      # with no fleet sessions on it, and the filter is the exact product image
-      # name — never `node.exe`, never `powershell.exe`, never a process-tree
-      # flag. Do not copy this step onto a developer or operator machine; the
-      # fleet's runner-lifecycle rule forbids exactly that.
-      # The image name is the cargo binary name on both builds (Tauri 2 does
-      # not rename it to productName), so the installed one is told apart by
-      # its path: never anything under a cargo target/ directory.
-      - name: Stop any auto-launched published runner
-        run: |
-          Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -and $_.Path -notlike '*\target\*' } |
-            ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
-          exit 0
-        shell: pwsh
-        continue-on-error: true
+        timeout-minutes: 25
+        uses: ./.github/actions/install-published-runner
 
       # -----------------------------------------------------------------------
       # AXIS 1 — the capability manifest.
@@ -767,3 +563,272 @@ jobs:
             echo "::warning::No parity count was produced. The comparison refused (schema mismatch) or could not run. This is UNKNOWN, not zero."
           fi
         shell: bash
+
+  # ===========================================================================
+  # CLEAN-ROOM ACCEPTANCE RUN (plan
+  # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+  # Phase E).
+  # ===========================================================================
+  #
+  # The published build, installed on a FOREIGN box and driven through the UI
+  # Bridge only, against a foreign repo that is not a Qontinui repo: the first
+  # hour of an external operator. Same schedule, same release resolution, same
+  # verified install (the composite action above), same artifact -- no second
+  # harness. It is its own JOB because the parity job above is, by design, not
+  # foreign: it checks out qontinui-schemas and ui-bridge beside the runner and
+  # boots a dev build, and a clean-room run on that box would be
+  # unknown(box_not_clean) every night.
+  #
+  # UNPAIRED (the plan's Fork 3): no coord credential, no tenant. The scenario
+  # asserts the product is useful and honest with none, and that the pairing
+  # refusal names a next action. A paired scenario needs a CI-held credential,
+  # its rotation and a spend ceiling -- an operator decision, not taken here.
+  #
+  # WINDOWS ONLY today (Fork 5): this workflow has no Linux leg to ride; the
+  # Linux clean-room leg arrives with the sibling plan's Linux parity asset.
+  #
+  # GATES NOTHING, like the job above. Every reporting step is
+  # continue-on-error; the only steps allowed to fail are the harness's own
+  # unit tests (a broken classifier is a false green, not a verdict) and the
+  # composite action's refusal to run an unverified installer.
+  clean-room:
+    name: Clean-room acceptance run (windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The vocabulary is qontinui-schemas `fleet-nouns.toml`, fetched as ONE
+      # FILE at a recorded commit -- never a checkout: a sibling checkout on
+      # this box is exactly what the preflight exists to refuse. The commit is
+      # carried into the clean_room block so a hit can be traced to the
+      # vocabulary that produced it.
+      - name: Fetch the fleet-noun vocabulary (one file, pinned)
+        id: vocab
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # cygpath -m: a D:/a/_temp spelling that both git-bash and the Windows
+          # python below read; the raw $RUNNER_TEMP is backslashed.
+          dir="$(cygpath -m "$RUNNER_TEMP")/clean-room-vocabulary"
+          mkdir -p "$dir"
+          sha=$(gh api repos/qontinui/qontinui-schemas/commits/main --jq .sha)
+          gh api "repos/qontinui/qontinui-schemas/contents/fleet-nouns.toml?ref=$sha" \
+            -H "Accept: application/vnd.github.raw" > "$dir/fleet-nouns.toml"
+          test -s "$dir/fleet-nouns.toml"
+          # The NextActionKind enum the refusal assertion pins against, from the
+          # SAME commit (read by the unit tests only).
+          gh api "repos/qontinui/qontinui-schemas/contents/rust/src/refusal.rs?ref=$sha" \
+            -H "Accept: application/vnd.github.raw" > "$dir/refusal.rs"
+          test -s "$dir/refusal.rs"
+          echo "path=$dir/fleet-nouns.toml" >> "$GITHUB_OUTPUT"
+          echo "refusal_rs=$dir/refusal.rs" >> "$GITHUB_OUTPUT"
+          echo "source=qontinui/qontinui-schemas@$sha:fleet-nouns.toml" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # FIRST, before any install: the harness's own tests. Not
+      # continue-on-error -- the dangerous failure of this harness is a FALSE
+      # GREEN (an unknown counted as a pass, a planted fleet noun missed).
+      - name: Clean-room harness unit tests
+        env:
+          CLEAN_ROOM_VOCABULARY: ${{ steps.vocab.outputs.path }}
+          CLEAN_ROOM_REFUSAL_RS: ${{ steps.vocab.outputs.refusal_rs }}
+          # The NextActionKind pin is HARD at PR time (clean-room-selftest.yml).
+          # Here it would let an upstream schemas variant stop the nightly
+          # measurement; the scenario parses refusal.rs instead and records
+          # any drift in the block.
+          CLEAN_ROOM_NIGHTLY: "1"
+        run: python scripts/tests/test_clean_room.py
+        shell: bash
+
+      - name: Generate the foreign fixture repo
+        run: |
+          python scripts/clean_room/fixture.py \
+            --parent "$(cygpath -m "$RUNNER_TEMP")/clean-room-foreign" \
+            --vocabulary "${{ steps.vocab.outputs.path }}" \
+            --out "$(cygpath -m "$RUNNER_TEMP")/clean-room-fixture.json"
+        shell: bash
+
+      # BEFORE the install: the installer auto-launches the runner, which would
+      # occupy the product port the preflight requires to be free.
+      - name: Preflight -- assert the box is foreign
+        run: |
+          python scripts/clean_room/preflight.py \
+            --vocabulary "${{ steps.vocab.outputs.path }}" \
+            --probe-root "$(cygpath -m "$RUNNER_TEMP")/clean-room-foreign" \
+            --harness-checkout "$(cygpath -m "$GITHUB_WORKSPACE")" \
+            --out clean-room-report/preflight.json
+        shell: bash
+
+      - name: Resolve, verify and install the published build
+        id: release
+        timeout-minutes: 25
+        uses: ./.github/actions/install-published-runner
+
+      # The ONE locator, with its never-the-dev-binary guard. A throw is
+      # recorded (the install step reports it as a fail) rather than stopping
+      # the job: an installer that produced no exe is a finding.
+      - name: Locate the installed exe
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path clean-room-report | Out-Null
+          . scripts/lib/installed-runner.ps1
+          try {
+            $exe = Find-InstalledRunnerExe
+            @{ exe = $exe; error = $null } | ConvertTo-Json | Set-Content -Encoding utf8 clean-room-report/install.json
+            Write-Host "installed exe: $exe"
+          } catch {
+            @{ exe = $null; error = "$($_.Exception.Message)" } | ConvertTo-Json | Set-Content -Encoding utf8 clean-room-report/install.json
+            Write-Host "::warning::installed exe not located: $($_.Exception.Message)"
+          }
+        shell: pwsh
+
+      - name: Clean-room scenario (UI Bridge only)
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          python scripts/clean_room/scenario.py \
+            --install clean-room-report/install.json \
+            --preflight clean-room-report/preflight.json \
+            --fixture "$(cygpath -m "$RUNNER_TEMP")/clean-room-fixture.json" \
+            --vocabulary "${{ steps.vocab.outputs.path }}" \
+            --vocabulary-source "${{ steps.vocab.outputs.source }}" \
+            --refusal-rs "${{ steps.vocab.outputs.refusal_rs }}" \
+            --artifact-version "$TAG" \
+            --platform windows-x64 \
+            --harness-sha "$GITHUB_SHA" \
+            --out clean-room-report/clean-room.json
+        shell: bash
+
+      - name: Upload the clean-room report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-room-${{ steps.release.outputs.tag }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: clean-room-report/
+
+  # Joins the clean-room block into the parity artifact, so ONE download
+  # (`published-parity-<tag>`) carries both measurements: published-parity.json
+  # gains a `clean_room` key. Runs whatever the two jobs concluded (not on a
+  # cancelled workflow). A missing half is STATED in the joined file -- a stub
+  # block when the clean-room job produced none, `parity_report: null` with the
+  # reason when the parity report could not be obtained -- never read as clean.
+  # The parity job's own artifact is overwritten ONLY when it was downloaded
+  # and its report found; otherwise the joined file is uploaded beside it under
+  # its own name and the original is left untouched.
+  publish-report:
+    name: Join the clean-room block into the parity artifact
+    needs: [published-parity, clean-room]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the parity artifact
+        id: dl_parity
+        if: needs.published-parity.outputs.tag != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: published-parity-${{ needs.published-parity.outputs.tag }}
+          path: joined
+
+      - name: Download the clean-room report
+        id: dl_clean_room
+        if: needs.clean-room.outputs.tag != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: clean-room-${{ needs.clean-room.outputs.tag }}
+          path: joined/clean-room-report
+
+      - name: Join
+        id: join
+        continue-on-error: true
+        env:
+          PARITY_TAG: ${{ needs.published-parity.outputs.tag }}
+          CLEAN_ROOM_TAG: ${{ needs.clean-room.outputs.tag }}
+          PARITY_RESULT: ${{ needs.published-parity.result }}
+          CLEAN_ROOM_RESULT: ${{ needs.clean-room.result }}
+          PARITY_DL: ${{ steps.dl_parity.outcome }}
+        run: |
+          set -euo pipefail
+          # 1. The clean-room half. Absent -> a stub block that says so.
+          block_args=()
+          if [ -f joined/clean-room-report/clean-room.json ]; then
+            block_args=(--block joined/clean-room-report/clean-room.json)
+          else
+            reason="the clean-room job produced no block (job result: ${CLEAN_ROOM_RESULT}, tag: '${CLEAN_ROOM_TAG}')"
+            echo "::warning::${reason}. The clean-room acceptance run is UNKNOWN, not clean."
+            block_args=(--stub-reason "$reason" --artifact-version "${CLEAN_ROOM_TAG:-${PARITY_TAG:-unknown}}" --harness-sha "$GITHUB_SHA")
+          fi
+
+          # 2. The parity half. Both jobs resolve "latest" independently; a
+          # release published between them would pair two different artifacts.
+          overwrite=false
+          parity_args=()
+          if [ -z "$PARITY_TAG" ]; then
+            parity_args=(--parity-unavailable-reason "the parity job resolved no release tag (job result: ${PARITY_RESULT})")
+          elif [ -n "$CLEAN_ROOM_TAG" ] && [ "$PARITY_TAG" != "$CLEAN_ROOM_TAG" ]; then
+            echo "::warning::The parity job measured '$PARITY_TAG' and the clean-room job '$CLEAN_ROOM_TAG'. Not joining two different releases."
+            parity_args=(--parity-unavailable-reason "the parity job measured a different release ($PARITY_TAG) than the clean-room run ($CLEAN_ROOM_TAG)")
+          elif [ "$PARITY_DL" != "success" ]; then
+            parity_args=(--parity-unavailable-reason "the parity artifact published-parity-$PARITY_TAG could not be downloaded (download step: ${PARITY_DL:-skipped})")
+          else
+            # upload-artifact roots an archive at the common ancestor of the
+            # files that existed, so the report's depth inside it varies.
+            found=$(find joined -path joined/clean-room-report -prune -o -name published-parity.json -print | head -1)
+            if [ -n "$found" ]; then
+              parity_args=(--parity "$found")
+              overwrite=true
+            else
+              parity_args=(--parity-unavailable-reason "the parity artifact published-parity-$PARITY_TAG was downloaded but holds no published-parity.json (parity job result: ${PARITY_RESULT})")
+            fi
+          fi
+
+          out="joined/published-parity.json"
+          if [ "$overwrite" = "true" ]; then out="$found"; fi
+          python scripts/clean_room/artifact.py "${block_args[@]}" "${parity_args[@]}" \
+            --out "$out" --summary-out "$GITHUB_STEP_SUMMARY"
+          echo "overwrite=$overwrite" >> "$GITHUB_OUTPUT"
+          echo "tag=${CLEAN_ROOM_TAG:-${PARITY_TAG:-unknown}}" >> "$GITHUB_OUTPUT"
+          echo "joined=true" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # `overwrite: true` replaces the parity job's upload with the same files
+      # plus the joined JSON and the clean-room report -- only when that upload
+      # was actually downloaded and its report found above.
+      - name: Upload the joined parity artifact (replacing the parity job's)
+        if: steps.join.outputs.joined == 'true' && steps.join.outputs.overwrite == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-${{ steps.join.outputs.tag }}
+          overwrite: true
+          retention-days: 30
+          path: joined/
+
+      - name: Upload the joined report beside the parity artifact
+        if: steps.join.outputs.joined == 'true' && steps.join.outputs.overwrite != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-joined-${{ steps.join.outputs.tag }}
+          retention-days: 30
+          path: joined/
