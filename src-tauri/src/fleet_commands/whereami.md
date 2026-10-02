@@ -123,7 +123,7 @@ Three things this card exists to stop you concluding:
 - **`QONTINUI_RUNNER_ID` names WHICH runner, not WHETHER you are inside one.**
   It is live and stable in a real session (`primary` on this box), but the
   supervisor sets it on the runner process
-  (`qontinui-supervisor/src/process/env_forwarders.rs:810`) and the session
+  (`qontinui-supervisor/src/process/env_forwarders.rs:1058`) and the session
   inherits it — so it carries no attributable build marker and answers a
   different question. Step 1 prints it as context, and it is never the
   predicate. (An earlier note here claimed unit tests could poison it with
@@ -470,8 +470,16 @@ PROBE_URL="http://127.0.0.1:$RPORT/health"; probe
 printf 'runner  :%s  %s\n' "$RPORT" "$PROBE_VERDICT"
 RUNNER_VERDICT="$PROBE_VERDICT"
 
-PROBE_URL="http://127.0.0.1:9875/health"; probe
-printf 'supervisor :9875  %s\n' "$PROBE_VERDICT"
+# The dev-only supervisor. The product has none, so this row is CONDITIONAL:
+# probe it only when QONTINUI_RUNNER_ID is set, which the supervisor stamps on
+# every runner it spawns. Unset (outside any runner, or under one no supervisor
+# spawned) - print n/a, never DOWN, since nothing was expected to listen.
+if [ -n "$(printenv QONTINUI_RUNNER_ID 2>/dev/null)" ]; then
+  PROBE_URL="http://127.0.0.1:9875/health"; probe
+  printf 'supervisor (dev)  %s\n' "$PROBE_VERDICT"
+else
+  printf 'supervisor (dev)  n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)\n'
+fi
 ```
 
 ## Step 3 — which `.mcp.json` holds a LIVE coord proxy
@@ -485,14 +493,24 @@ that must not be conflated: its nonce was evicted (the instance is up and says
 Probe each candidate against **its own url** with **its own nonce**.
 
 ```bash
-# Workspace root: $QONTINUI_ROOT wins; else the parent of the MAIN checkout via
-# --git-common-dir (NOT --show-toplevel, which inside a linked worktree names the
-# worktree container and makes this sweep probe nothing); else $PWD.
-ROOT="${QONTINUI_ROOT:-}"
+# Your workspace root: $WORKSPACE_ROOT wins ($QONTINUI_ROOT is accepted too);
+# else the first directory, from the MAIN checkout upward, that holds sibling
+# repo checkouts - a child whose `.git` is a DIRECTORY (a linked worktree's
+# `.git` is a file). The main checkout comes from --git-common-dir, NOT
+# --show-toplevel, which inside a linked worktree names the worktree container
+# and makes this sweep probe nothing. Else the main checkout's parent; else $PWD.
+ROOT="${WORKSPACE_ROOT:-${QONTINUI_ROOT:-}}"
 if [ -z "$ROOT" ]; then
   GC="$(git rev-parse --git-common-dir 2>/dev/null)"
   [ -n "$GC" ] && GC="$(cd "$GC" 2>/dev/null && pwd)"
-  [ -n "$GC" ] && ROOT="$(dirname "$(dirname "$GC")")"
+  if [ -n "$GC" ]; then
+    MAIN="$(dirname "$GC")"; D="$MAIN"
+    while [ -n "$D" ] && [ "$D" != "/" ] && [ "$D" != "." ]; do
+      for c in "$D"/*/.git; do [ -d "$c" ] && { ROOT="$D"; break 2; }; done
+      D="$(dirname "$D")"
+    done
+    [ -z "$ROOT" ] && ROOT="$(dirname "$MAIN")"
+  fi
 fi
 [ -z "$ROOT" ] || [ "$ROOT" = "." ] && ROOT="$PWD"
 
@@ -527,7 +545,7 @@ hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' 
 # python.exe cannot open an MSYS `/<drive>/...` path, and under an inherited
 # MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL the automatic argv conversion is OFF
 # (verified 2026-08-18: MSYS_NO_PATHCONV=1 -> FileNotFoundError on the MSYS
-# spelling of <workspace-root>/.../.mcp.json; the same call with `cygpath -w`
+# spelling of a `/<drive>/.../.mcp.json` path; the same call with `cygpath -w`
 # returned the url).
 # `2>/dev/null` then swallows the traceback, the url comes back empty, and the
 # candidate is silently skipped - a fabricated negative. So convert, exactly as
@@ -565,6 +583,17 @@ else
   exit 1
 fi
 
+# ENV REFERENCES: the runner writes the nonce as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}` (plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages). Expand
+# it from THIS shell's environment exactly as Claude Code does, through the one
+# bash owner - never stage the literal reference as a bearer. The _for_url form
+# reads the environment only for a strictly-loopback $url (else the default), so
+# a sibling .mcp.json naming another host never receives an environment value.
+# Without the helper a key carrying a reference is skipped; a literal key still works.
+MCP_ENV_REF_LIB="$ROOT/qontinui-claude-config/scripts/lib/mcp-env-ref.sh"
+if [ -r "$MCP_ENV_REF_LIB" ]; then . "$MCP_ENV_REF_LIB"; else MCP_ENV_REF_LIB=""; fi
+
 RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 for f in "${CANDIDATES[@]}"; do
   [ -r "$f" ] || continue
@@ -572,6 +601,11 @@ for f in "${CANDIDATES[@]}"; do
   url="$(mcp_url)"; key="$(mcp_key)"
   case "$url" in *"/coord-mcp"*) ;; *) continue ;; esac
   [ -n "$key" ] || { printf '%-70s no nonce\n' "$f"; continue; }
+  if [ -n "$MCP_ENV_REF_LIB" ]; then
+    mcp_expand_env_ref_for_url key "$url" "$key" || continue   # names UNEXPANDED_ENV_REF <NAME>
+  else
+    case "$key" in *'${'*'}'*) echo "skip: $f -> its nonce is a \${...} reference and mcp-env-ref.sh is not reachable" >&2; continue ;; esac
+  fi
   # Fingerprint, never the nonce itself.
   fp="$(printf '%s' "$key" | sha256sum 2>/dev/null | cut -c1-8)"
   { printf '%s: %s\n' "$(mcp_keyhdr)" "$key" > "$HDR"; } 2>/dev/null
@@ -1146,9 +1180,14 @@ $port = $vals['QONTINUI_RUNNER_API_PORT']; if (-not $port) { $port = '9876' }
 # one endpoint - the tag cannot fix that, and the card should be read with the
 # announced port in mind.)
 $runnerBody = ''
-foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor'; Port = '9875' })) {
+# The dev-only supervisor row is CONDITIONAL, as in the bash twin: probed only
+# when QONTINUI_RUNNER_ID shows a supervisor spawned this runner.
+$probes = @(@{ Role = 'runner'; Port = $port })
+if ($vals['QONTINUI_RUNNER_ID']) { $probes += @{ Role = 'supervisor'; Port = '9875' } }
+foreach ($probe in $probes) {
   $p = $probe.Port
-  $row = '{0,-10} :{1}' -f $probe.Role, $p
+  # Row labels match the bash twin exactly: `runner  :<port>`, `supervisor (dev)`.
+  $row = if ($probe.Role -eq 'runner') { "runner  :$p" } else { 'supervisor (dev)' }
   try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$p/health" -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
     if ($probe.Role -eq 'runner') { $runnerBody = $r.Content }
@@ -1169,6 +1208,7 @@ foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor';
     else { "$row  UNKNOWN ($st - not evidence of absence)" }
   }
 }
+if (-not $vals['QONTINUI_RUNNER_ID']) { 'supervisor (dev)  n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)' }
 'live coord proxy   not swept (Step 3 has no PowerShell twin - not a verdict)'
 'tenancy            not read (Step 5 has no PowerShell twin - UNKNOWN, not agreement)'
 
@@ -1248,8 +1288,8 @@ Two limitations of this block, stated rather than left to be inferred:
   out of a `503` and returns a real verdict — run Step 4 if you need one from a
   wedged-but-answering runner.
 - **`cwd` is spelled differently by the two renders** — msys bash gives the
-  POSIX spelling (`/<drive>/<workspace-root>/…`), PowerShell the native one
-  (`<Drive>:\<workspace-root>\…`). Same directory; not a disagreement.
+  POSIX spelling (`/<drive>/<dir>/…`), PowerShell the native one
+  (`<Drive>:\<dir>\…`). Same directory; not a disagreement.
 
 ## Output shape
 
@@ -1282,7 +1322,7 @@ cwd           : <repo> <branch>@<sha12> behind=<n> as-of=<ts> dirty=<m> | same c
 
 === REACHABILITY (now, <timestamp>) ===
 runner  :9876       up (HTTP 200)
-supervisor :9875    DOWN (connection refused)
+supervisor (dev)    DOWN (connection refused) | n/a - not probed: QONTINUI_RUNNER_ID is unset (no supervisor-spawned runner started this session; the product ships no supervisor)
 live coord proxy    <path/to/.mcp.json>  (nonce#<fp>) | not swept
 build cross-check   AGREE | DISAGREE | UNKNOWN
 default tenant      pinned <uuid> | unpinned (...) | unresolvable - <why> | UNKNOWN - <why>
