@@ -188,7 +188,7 @@ async fn embedding_service_health() -> serde_json::Value {
 /// sub-millisecond round-trip on a healthy DB, and when the DB is down the 2s
 /// ceiling bounds the cost — surfacing the outage on the very next `/health`
 /// poll is the whole point (the B-5 observability gap the plan calls out).
-async fn pg_liveness_probe() -> Option<bool> {
+pub(crate) async fn pg_liveness_probe() -> Option<bool> {
     let pg = crate::database::pg::PgDb::try_global()?;
     let probe = async move {
         let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
@@ -201,6 +201,91 @@ async fn pg_liveness_probe() -> Option<bool> {
         Ok(Ok(())) => Some(true),
         Ok(Err(_)) => Some(false),
         Err(_) => Some(false),
+    }
+}
+
+/// Fixed, minimal set of relations the runner cannot work without. `schema_ok`
+/// (plan `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`,
+/// Phase 1) checks exactly these via `to_regclass()` — never a migration
+/// check, never a table scan. `project.task_runs` is the concrete relation
+/// named by the originating finding (`get_running_task_runs`, one of the four
+/// `runner-lifecycle` idle signals); `public.alembic_version` is the marker
+/// that alembic's chain was ever applied at all, so an unmigrated-from-scratch
+/// database is caught even before any app table is queried.
+const SCHEMA_PROBE_REQUIRED_RELATIONS: &[&str] = &["project.task_runs", "public.alembic_version"];
+
+/// Bounded schema probe for `/health` (Phase 1 of the plan above), run ONLY
+/// when [`pg_liveness_probe`] already returned `Some(true)` — a connect
+/// failure must never be re-tried here, it is reported as `schema_ok: None`
+/// by [`derive_schema_health`] instead. Like `pg_liveness_probe` this is
+/// intentionally UNCACHED rather than kept in a background-refreshed slot:
+/// `to_regclass()` is a catalog lookup (sub-millisecond on a healthy DB), it
+/// only ever runs after a connect has already succeeded, and it is bounded by
+/// the same 2s ceiling so a wedged probe can never hang `/health`.
+///
+/// Returns `Ok(None)` when every relation in [`SCHEMA_PROBE_REQUIRED_RELATIONS`]
+/// resolves, `Ok(Some(name))` naming the FIRST one that does not (`to_regclass`
+/// returns SQL NULL for an absent relation — not an error), or `Err(reason)`
+/// when the probe itself could not complete (pool exhaustion on the second
+/// checkout, a query error distinct from "table absent", or the 2s ceiling).
+///
+/// `pub(crate)`: Phase 2 of the same plan (`crate::mcp::restart_readiness`)
+/// calls this directly rather than re-deriving the same check, so `/restart-
+/// readiness` can report its AI/task-run plane as unobtainable on the same
+/// evidence `/health`'s `schema_ok` uses.
+pub(crate) async fn pg_schema_probe() -> Result<Option<String>, String> {
+    let pg =
+        crate::database::pg::PgDb::try_global().ok_or_else(|| "no PG configured".to_string())?;
+    let probe = async move {
+        let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
+        for rel in SCHEMA_PROBE_REQUIRED_RELATIONS {
+            let row = conn
+                .query_one("SELECT to_regclass($1)::text", &[rel])
+                .await
+                .map_err(|e| e.to_string())?;
+            let resolved: Option<String> = row.try_get(0).map_err(|e| e.to_string())?;
+            if resolved.is_none() {
+                return Ok(Some((*rel).to_string()));
+            }
+        }
+        Ok(None)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(result) => result,
+        Err(_) => Err("probe timeout".to_string()),
+    }
+}
+
+/// Pure decision logic behind the `/health` `schema_ok` / `schema_detail`
+/// pair — split out of the async plumbing above so the three arms are
+/// unit-testable with no live Postgres connection. `reachable` is the SAME
+/// value already published as `database.reachable`; `schema_probe` is
+/// `None` when the caller skipped running [`pg_schema_probe`] at all (because
+/// `reachable != Some(true)`), and `Some(result)` otherwise.
+///
+/// `schema_ok: false` must NEVER be derived from a connect failure —
+/// `reachable != Some(true)` always yields `None`, never `Some(false)`, per
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`.
+pub(crate) fn derive_schema_health(
+    reachable: Option<bool>,
+    schema_probe: Option<Result<Option<String>, String>>,
+) -> (Option<bool>, Option<String>) {
+    if reachable != Some(true) {
+        let label = match reachable {
+            Some(true) => unreachable!("handled by the branch condition above"),
+            Some(false) => "false",
+            None => "unknown",
+        };
+        return (None, Some(format!("not attempted: reachable={label}")));
+    }
+    match schema_probe {
+        None => (
+            None,
+            Some("not attempted: schema probe did not run".to_string()),
+        ),
+        Some(Ok(None)) => (Some(true), None),
+        Some(Ok(Some(missing))) => (Some(false), Some(format!("missing relation: {missing}"))),
+        Some(Err(reason)) => (None, Some(format!("probe error: {reason}"))),
     }
 }
 
@@ -1132,6 +1217,17 @@ async fn health(
     let pg_probe_started = std::time::Instant::now();
     let pg_reachable = pg_liveness_probe().await;
     let pg_probe_ms = pg_probe_started.elapsed().as_millis() as u64;
+    // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`:
+    // `reachable` only proves a connect+auth handshake, not that the schema
+    // the runner needs exists. Only attempt the schema probe once the connect
+    // already succeeded — a connect failure is reported as `schema_ok: None`
+    // below, never silently re-tried or turned into `false`.
+    let schema_probe_result = if pg_reachable == Some(true) {
+        Some(pg_schema_probe().await)
+    } else {
+        None
+    };
+    let (schema_ok, schema_detail) = derive_schema_health(pg_reachable, schema_probe_result);
 
     let main_window = {
         use tauri::Manager;
@@ -1417,6 +1513,17 @@ async fn health(
             // /health and has nothing to do with the UI thread — the 2026-08-19
             // confound, now reported instead of inferred.
             "probeMs": pg_probe_ms,
+            // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-
+            // probe-not-a-schema-probe`: does the SCHEMA the runner needs
+            // actually exist, not just "can we connect". `Some(true)` only
+            // when every relation in `SCHEMA_PROBE_REQUIRED_RELATIONS`
+            // resolves via `to_regclass()` — never a migration check, never a
+            // table scan. `None` means "could not determine" (the connect
+            // probe itself failed/is unknown, or the schema probe errored) —
+            // it must NEVER be read as `false`; `schema_detail` always
+            // explains whichever non-`Some(true)` state this is.
+            "schema_ok": schema_ok,
+            "schema_detail": schema_detail,
         },
         // Native message-loop liveness (plan
         // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5).
@@ -19599,6 +19706,74 @@ mod pr_credential_probe_tests {
             "{unbound}"
         );
         assert!(!unbound.contains("127.0.0.1"), "{unbound}");
+    }
+}
+
+#[cfg(test)]
+mod database_schema_health_tests {
+    use super::*;
+
+    /// The `false` arm: connect succeeded, but the probe found a missing
+    /// relation — `schema_ok` is `Some(false)` and `schema_detail` names it.
+    #[test]
+    fn missing_relation_yields_schema_ok_false_naming_it() {
+        let (schema_ok, schema_detail) =
+            derive_schema_health(Some(true), Some(Ok(Some("project.task_runs".to_string()))));
+        assert_eq!(schema_ok, Some(false));
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("missing relation: project.task_runs")
+        );
+    }
+
+    /// The all-present arm: connect succeeded and every required relation
+    /// resolved — `schema_ok` is `Some(true)` with no detail needed.
+    #[test]
+    fn all_relations_present_yields_schema_ok_true() {
+        let (schema_ok, schema_detail) = derive_schema_health(Some(true), Some(Ok(None)));
+        assert_eq!(schema_ok, Some(true));
+        assert_eq!(schema_detail, None);
+    }
+
+    /// The `null`/`None` arm via an unreachable connect: `reachable: false`
+    /// must NEVER be silently inherited as `schema_ok: false` — it stays
+    /// `None`, with a reason naming the connect state, not "probe error".
+    #[test]
+    fn unreachable_connect_yields_schema_ok_none_never_false() {
+        let (schema_ok, schema_detail) = derive_schema_health(Some(false), None);
+        assert_eq!(schema_ok, None, "a connect failure must not become `false`");
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("not attempted: reachable=false")
+        );
+    }
+
+    /// Same `None` arm, but for an UNPROBED/unconfigured PG (`reachable`
+    /// itself is `None`, not `Some(false)`) — still `schema_ok: None`, with a
+    /// distinct reason so the two unknown causes are not conflated.
+    #[test]
+    fn unknown_connect_state_yields_schema_ok_none() {
+        let (schema_ok, schema_detail) = derive_schema_health(None, None);
+        assert_eq!(schema_ok, None);
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("not attempted: reachable=unknown")
+        );
+    }
+
+    /// A schema probe that ran (because `reachable` was `Some(true)`) but hit
+    /// a genuine query-level error distinct from "table absent" must also
+    /// report `schema_ok: None`, never `Some(false)` — that would misreport an
+    /// infra hiccup as an unmigrated schema.
+    #[test]
+    fn probe_error_yields_schema_ok_none_not_false() {
+        let (schema_ok, schema_detail) =
+            derive_schema_health(Some(true), Some(Err("pool exhausted".to_string())));
+        assert_eq!(schema_ok, None);
+        assert_eq!(
+            schema_detail.as_deref(),
+            Some("probe error: pool exhausted")
+        );
     }
 }
 
