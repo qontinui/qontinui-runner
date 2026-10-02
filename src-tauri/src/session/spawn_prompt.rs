@@ -970,7 +970,7 @@ mod script_tests {
 
     /// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test
     /// reports its own assertion instead of cascading into the rest.
-    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
+    // test-lock: standalone — module-private; its holders take no other test lock and never take `env_lock` or any other test lock
     fn exe_guard() -> std::sync::MutexGuard<'static, ()> {
         EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

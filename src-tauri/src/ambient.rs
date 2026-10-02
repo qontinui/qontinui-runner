@@ -805,6 +805,13 @@ pub mod test_support {
 
     /// The guard [`env_lock`] returns. Opaque on purpose — see that function
     /// for why it is not a bare `MutexGuard`.
+    ///
+    /// Drop guards on a thread in REVERSE acquisition order. The real mutex
+    /// lives in whichever guard was acquired FIRST on the thread (including
+    /// one embedded in a child test-lock guard), so dropping that outer guard
+    /// early releases `ENV_LOCK` while later guards still count as nested —
+    /// a silent loss of exclusion, not a deadlock.
+    #[must_use = "a test-lock guard locks nothing once dropped; bind it for the whole test body"]
     pub struct EnvLockGuard {
         /// `Some` only for the OUTERMOST acquisition on this thread; a nested
         /// one holds nothing and so releases nothing when it drops.
@@ -861,6 +868,7 @@ pub mod test_support {
     /// Field order is load-bearing — fields drop in declaration order, so the
     /// child is released BEFORE the env lock, the reverse of acquisition, which
     /// is also the LIFO order [`EnvLockGuard`]'s per-thread depth needs.
+    #[must_use = "a test-lock guard locks nothing once dropped; bind it for the whole test body"]
     pub struct TestLockGuard {
         _child: MutexGuard<'static, ()>,
         _env: EnvLockGuard,
