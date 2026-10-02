@@ -344,10 +344,15 @@ pub struct ScanDivergence {
     /// `origin/main` on a repo whose default is something else would produce a
     /// confidently wrong divergence number, which is worse than none.
     pub default_ref: Option<String>,
-    /// What `default_ref` points at in this clone, **as of its last fetch**.
-    /// Phase 1 never fetches, so a long-unfetched clone reports a stale ref
-    /// and a small divergence honestly rather than a fresh one it did not earn.
-    /// How long ago that fetch was is [`Self::ref_age_secs`].
+    /// What `default_ref` points at, as resolved through the cycle's
+    /// [`CycleRefPin`] — the SAME object id the cycle's `ref` census is listed
+    /// at, so the scan-root report names one commit. On a writing cycle that is
+    /// the ref as this cycle's own fetch left it; on a withheld cycle (which
+    /// fetches nothing) and on a cycle whose fetch FAILED it is the ref as this
+    /// clone last fetched it, so a long-unfetched clone still reports a stale
+    /// ref and a small divergence honestly rather than a fresh one it did not
+    /// earn. How long ago that refresh was is [`Self::ref_age_secs`], read from
+    /// the refresh records, never assumed from the fetch.
     pub ref_sha: Option<String>,
     /// What the scanned work tree's `HEAD` points at.
     pub head_sha: Option<String>,
@@ -710,7 +715,38 @@ pub fn measure_scan_divergence(
     git: &dyn GitRefReader,
     now_unix: i64,
 ) -> ScanDivergence {
-    measure_unstamped(plans_dir, git, now_unix).observed_at(now_unix)
+    measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
+}
+
+/// [`measure_scan_divergence`] resolving the default ref through the cycle's
+/// [`CycleRefPin`] — the tick's door, so the reading's `ref_sha` / `behind` /
+/// `ahead` / `ref_age_secs` describe the commit the cycle's `ref` census is
+/// listed at (plan `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
+///
+/// `clock` is read AFTER the pin resolves, never before: on a writing pin the
+/// first resolution performs the cycle's fetch (up to `SCAN_FETCH_TIMEOUT`), and
+/// a clock read ahead of it would stamp `observed_at` before the ref state the
+/// reading describes and age the fresh refresh records as future-dated. With
+/// `pin: None` the ref is resolved by this function alone, exactly as before the
+/// pin existed.
+///
+/// The pin's three answers:
+/// - `Ok(Some(sha))` — measured at that sha.
+/// - `Err` — the pin's fetch FAILED. The cycle publishes nothing and lists no
+///   census, so the reading falls back to the clone's own `rev_parse`: the
+///   as-found ref, honestly aged by its refresh records.
+/// - `Ok(None)` — fetched, but the ref would not resolve. UNKNOWN, and NOT a
+///   fallback: the census IS listed on that arm (at the ref name, sha UNKNOWN),
+///   and a fallback `rev_parse` that succeeded against a ref moved meanwhile
+///   would re-create the mismatched pair this door exists to remove.
+pub fn measure_scan_divergence_pinned(
+    plans_dir: Option<&Path>,
+    git: &dyn GitRefReader,
+    pin: Option<&CycleRefPin>,
+    clock: &dyn Fn() -> i64,
+) -> ScanDivergence {
+    let (reading, now_unix) = measure_unstamped(plans_dir, git, pin, clock);
+    reading.observed_at(now_unix)
 }
 
 /// The tick's measurement: [`measure_scan_divergence`] plus the reading's
@@ -721,10 +757,15 @@ pub fn measure_scan_divergence(
 /// — work that does not belong on the single-worker runtime the scan-root
 /// report is later posted from. Kept out of [`measure_scan_divergence`] so
 /// that stays pure over its fake reader.
-fn measure_scan_source(dir: &Path, git: &dyn GitRefReader, now_unix: i64) -> ScanDivergence {
+fn measure_scan_source(
+    dir: &Path,
+    git: &dyn GitRefReader,
+    pin: Option<&CycleRefPin>,
+    clock: &dyn Fn() -> i64,
+) -> ScanDivergence {
     ScanDivergence {
         source_repo: super::body_push::derive_source_repo(dir),
-        ..measure_scan_divergence(Some(dir), git, now_unix)
+        ..measure_scan_divergence_pinned(Some(dir), git, pin, clock)
     }
 }
 
@@ -743,41 +784,50 @@ fn probe_task_failure_detail(e: &tokio::task::JoinError) -> &'static str {
     }
 }
 
-/// [`measure_scan_divergence`] without the `observed_at` stamp, so the stamp
-/// is applied in ONE place and no arm can return a reading without it.
+/// [`measure_scan_divergence_pinned`] without the `observed_at` stamp, so the
+/// stamp is applied in ONE place and no arm can return a reading without it.
+/// Returns the clock reading the stamp takes, read once per measurement — after
+/// the ref resolved, on every arm that resolves one.
 fn measure_unstamped(
     plans_dir: Option<&Path>,
     git: &dyn GitRefReader,
-    now_unix: i64,
-) -> ScanDivergence {
+    pin: Option<&CycleRefPin>,
+    clock: &dyn Fn() -> i64,
+) -> (ScanDivergence, i64) {
     let Some(dir) = plans_dir else {
-        return ScanDivergence::not_scanning();
+        return (ScanDivergence::not_scanning(), clock());
     };
     let dir_str = dir.display().to_string();
     let root = match git.work_tree_root(dir) {
         Ok(Some(root)) => root,
         Ok(None) => {
-            return ScanDivergence {
-                plans_dir: Some(dir_str.clone()),
-                detail: Some(format!(
-                    "the configured plans dir `{dir_str}` is not inside a git work tree, so \
+            return (
+                ScanDivergence {
+                    plans_dir: Some(dir_str.clone()),
+                    detail: Some(format!(
+                        "the configured plans dir `{dir_str}` is not inside a git work tree, so \
                      there is no ref to compare the scanned files against (this is a supported \
                      configuration, not a fault — it is reported so it cannot be mistaken for \
                      agreement with a ref)"
-                )),
-                ..ScanDivergence::blank(ScanDivergenceState::NotAGitWorkTree)
-            }
+                    )),
+                    ..ScanDivergence::blank(ScanDivergenceState::NotAGitWorkTree)
+                },
+                clock(),
+            )
         }
         // NOT `NotAGitWorkTree`: we never established that it isn't one.
         Err(e) => {
-            return ScanDivergence {
-                plans_dir: Some(dir_str.clone()),
-                detail: Some(format!(
-                    "cannot tell whether the configured plans dir `{dir_str}` is inside a git \
+            return (
+                ScanDivergence {
+                    plans_dir: Some(dir_str.clone()),
+                    detail: Some(format!(
+                        "cannot tell whether the configured plans dir `{dir_str}` is inside a git \
                      work tree, so nothing about the scan source is established: {e}"
-                )),
-                ..ScanDivergence::blank(ScanDivergenceState::Unknown)
-            }
+                    )),
+                    ..ScanDivergence::blank(ScanDivergenceState::Unknown)
+                },
+                clock(),
+            )
         }
     };
     let root_str = root.display().to_string();
@@ -790,13 +840,16 @@ fn measure_unstamped(
     let default_ref = match git.default_ref(&root) {
         Ok(r) => r,
         Err(e) => {
-            return ScanDivergence {
-                detail: Some(format!(
+            return (
+                ScanDivergence {
+                    detail: Some(format!(
                     "cannot resolve the default branch of `{root_str}`, so there is nothing to \
                      measure against: {e}"
                 )),
-                ..base
-            }
+                    ..base
+                },
+                clock(),
+            )
         }
     };
     let base = ScanDivergence {
@@ -804,24 +857,42 @@ fn measure_unstamped(
         ..base
     };
 
-    let ref_sha = match git.rev_parse(&root, &default_ref) {
+    // Resolved through the cycle's pin when there is one — see
+    // [`measure_scan_divergence_pinned`] for the three answers. The clock is
+    // read only once this resolution (and, on a writing pin, its fetch) is done.
+    let resolved = match pin.map(|p| p.resolve_ref(git, &root, &default_ref)) {
+        Some(Ok(Some(sha))) => Ok(sha),
+        Some(Ok(None)) => {
+            Err("the cycle fetched it, but it would not resolve to an object id".to_string())
+        }
+        // The pin's fetch failed (or there is no pin): the as-found ref.
+        Some(Err(_)) | None => git.rev_parse(&root, &default_ref),
+    };
+    let now_unix = clock();
+    let ref_sha = match resolved {
         Ok(s) => s,
         Err(e) => {
-            return ScanDivergence {
-                detail: Some(format!(
-                    "cannot resolve `{default_ref}` in `{root_str}`: {e}"
-                )),
-                ..base
-            }
+            return (
+                ScanDivergence {
+                    detail: Some(format!(
+                        "cannot resolve `{default_ref}` in `{root_str}`: {e}"
+                    )),
+                    ..base
+                },
+                now_unix,
+            )
         }
     };
     let head_sha = match git.rev_parse(&root, "HEAD") {
         Ok(s) => s,
         Err(e) => {
-            return ScanDivergence {
-                detail: Some(format!("cannot resolve `HEAD` in `{root_str}`: {e}")),
-                ..base
-            }
+            return (
+                ScanDivergence {
+                    detail: Some(format!("cannot resolve `HEAD` in `{root_str}`: {e}")),
+                    ..base
+                },
+                now_unix,
+            )
         }
     };
     let base = ScanDivergence {
@@ -830,7 +901,10 @@ fn measure_unstamped(
         ..base
     };
 
-    match git.count_behind_ahead(&root, &default_ref, "HEAD") {
+    // Counted against the RESOLVED sha, not the ref name: these are separate
+    // `git` processes, and a peer fetch between a `rev_parse` and a by-name
+    // count would report counts taken against a commit other than `ref_sha`.
+    let counted = match git.count_behind_ahead(&root, &ref_sha, "HEAD") {
         Ok((behind, ahead)) => {
             // The counts are real either way; the age decides only whether
             // they are current or floors. So an age that cannot be read keeps
@@ -891,7 +965,8 @@ fn measure_unstamped(
             )),
             ..base
         },
-    }
+    };
+    (counted, now_unix)
 }
 
 /// Build the symmetric-difference range for the ahead/behind count.
@@ -1917,6 +1992,10 @@ pub fn read_plans_for_cycle(
     pin: &CycleRefPin,
 ) -> Result<CycleScan, String> {
     use super::ref_scan::{read_ref_dir_at, ScanSource};
+    debug_assert!(
+        pin.fetches(),
+        "read_plans_for_cycle publishes from the ref, so it must read through a FETCHING pin"
+    );
     match pin.resolve_source(git, dir) {
         ScanSource::WorkTree => {
             let scan = scan_plan_dir(dir, conv);
@@ -2162,11 +2241,18 @@ fn ref_census_from_names(
 ///   a FAULT, so the caller logs it (deduped — a clone with no `origin/HEAD`
 ///   is one unchanging fault, and a WARN a minute for it is how the line that
 ///   matters gets missed) [policy: `unknown-must-not-render-as-a-default`].
+///
+/// `pin` is the cycle's [`CycleRefPin`] — a [`CycleRefPin::listing_only`] one
+/// on the withheld cycle, so this still fetches nothing — through which the
+/// scan-divergence probe resolved the same ref a moment earlier. Listing at the
+/// pinned sha makes the census and the probe's `ref_sha` one commit even when a
+/// peer fetch moves the shared clone between the two reads.
 pub fn ref_census_only(
     dir: &Path,
     git: &dyn GitRefReader,
+    pin: &CycleRefPin,
 ) -> Result<Option<super::body_push::PlanSlugCensus>, String> {
-    use super::ref_scan::{list_ref_plan_names, resolve_ref_listing_source, ScanSource};
+    use super::ref_scan::{list_ref_plan_names_at, resolve_ref_listing_source, ScanSource};
     match resolve_ref_listing_source(git, dir) {
         // Not in a repo: the same `None` the WorkTree arm of
         // `read_plans_for_cycle` reports. There is no ref, so there is no ref
@@ -2178,7 +2264,13 @@ pub fn ref_census_only(
             repo_root,
             ref_name,
             rel_dir,
-        } => match list_ref_plan_names(git, &repo_root, &ref_name, &rel_dir) {
+        } => match list_ref_plan_names_at(
+            git,
+            &repo_root,
+            &ref_name,
+            pin.resolve_ref(git, &repo_root, &ref_name)?,
+            &rel_dir,
+        ) {
             Ok(listing) => Ok(Some(ref_census_from_names(&listing.names, listing.ref_sha))),
             Err(e) => Err(format!(
                 "could not list `{ref_name}:{rel_dir}` in {}: {e}",
@@ -3742,62 +3834,19 @@ impl LoopState {
             self.apply_resolution(resolved.clone(), metrics);
         }
 
-        // Measure the scan source against the ref it should be reading —
-        // BEFORE the early return below, so the idle cycle records
-        // `NotScanning` instead of leaving the last reading (or nothing at
-        // all) standing. A tier-off machine that reports silence is
-        // indistinguishable from one whose scan is in step, and that
-        // indistinguishability is the whole defect.
-        //
-        // Same RT-P0 reasoning as the scan itself: these are `git` subprocess
-        // reads, blocking, on a runtime built with `worker_threads(1)`. They
-        // go to the blocking pool for the same reason `read_plan_dir` does —
-        // parking that single worker also stops its time driver.
-        let divergence = match resolved.plans.clone() {
-            // Nothing configured: the answer is `NotScanning` and it needs no
-            // git at all, so it is computed INLINE. Hopping an unarmed tick to
-            // the blocking pool would buy nothing and cost every idle runner a
-            // pool round-trip per minute.
-            None => ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
-            Some(dir) => {
-                let git = std::sync::Arc::clone(&self.git);
-                match tokio::task::spawn_blocking(move || {
-                    // The clock is read HERE, on the blocking thread, just as
-                    // the measurement starts — at argument evaluation, so a
-                    // moment BEFORE the git probes run, not between them. The
-                    // probes are local reads (milliseconds; bounded at 20 s),
-                    // far inside the freshness window's resolution, so the
-                    // ref's age and the reading's `observed_at` are as of the
-                    // measurement rather than of the tick's start, and the
-                    // function itself stays pure over the clock.
-                    measure_scan_source(
-                        Path::new(&dir),
-                        git.as_ref(),
-                        chrono::Utc::now().timestamp(),
-                    )
-                })
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // Logged with the full error (it carries a per-run task
-                        // id); the READING gets only the stable half.
-                        tracing::warn!(
-                            error = %e,
-                            "plan adapter: the scan-divergence probe task did not complete"
-                        );
-                        ScanDivergence::unknown(
-                            resolved.plans.clone(),
-                            probe_task_failure_detail(&e),
-                        )
-                        .observed_at(chrono::Utc::now().timestamp())
-                    }
-                }
-            }
-        };
-        record_scan_divergence(divergence, metrics);
-
-        let Some(dir) = resolved.plans.map(PathBuf::from) else {
+        let Some(dir) = resolved.plans.clone().map(PathBuf::from) else {
+            // Nothing configured: the reading is `NotScanning`, recorded HERE,
+            // before the early return, so the idle cycle never leaves the last
+            // reading (or nothing at all) standing. A tier-off machine that
+            // reports silence is indistinguishable from one whose scan is in
+            // step, and that indistinguishability is the whole defect. It
+            // needs no git, so it is computed INLINE — hopping an unarmed tick
+            // to the blocking pool would cost every idle runner a pool
+            // round-trip per minute for nothing.
+            record_scan_divergence(
+                ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
+                metrics,
+            );
             // Nothing is scanned — but a device whose plans dir was just
             // cleared must SAY so to the read side, or its last `measured` row
             // keeps being quoted until it ages out. The body sync's library
@@ -3883,6 +3932,63 @@ impl LoopState {
             self.bulk_seeded = false;
         }
         self.last_write_posture = Some(posture);
+
+        // ONE ref state for this whole cycle (see [`CycleRefPin`]). Created
+        // here, after the posture and BEFORE the scan-divergence probe, so the
+        // probe, the stem census and — on a writing cycle — both publishing
+        // halves all read one object id, and the scan-root report names one
+        // commit. A writing cycle's pin FETCHES on first use (the probe's
+        // resolution is that first use; the scan below reuses its answer). A
+        // withheld cycle's pin is listing-only: it fetches nothing, exactly as
+        // the withheld census never has, and still resolves the ref once, so
+        // the probe and the census cannot straddle a peer's fetch either.
+        // Dropped with the cycle, so the next cycle fetches afresh.
+        let pin = std::sync::Arc::new(if posture == WorkUnitWritePosture::Write {
+            CycleRefPin::default()
+        } else {
+            CycleRefPin::listing_only()
+        });
+
+        // Measure the scan source against the ref the cycle pinned. Same RT-P0
+        // reasoning as the scan itself: these are `git` subprocess reads
+        // (and, on a writing pin, the cycle's fetch), blocking, on a runtime
+        // built with `worker_threads(1)`, so they go to the blocking pool —
+        // parking that single worker also stops its time driver.
+        let divergence = {
+            let git = std::sync::Arc::clone(&self.git);
+            let probe_dir = dir.clone();
+            let pin = std::sync::Arc::clone(&pin);
+            match tokio::task::spawn_blocking(move || {
+                // The clock is read on the blocking thread AFTER the pin has
+                // resolved the ref — so after the fetch on a writing pin, which
+                // can run up to `SCAN_FETCH_TIMEOUT`. Read before it, the
+                // reading's `observed_at` would predate the ref state it
+                // describes and the fetch's own refresh records would be
+                // future-dated. The remaining probes are local reads
+                // (milliseconds; bounded at 20 s), far inside the freshness
+                // window's resolution, and the function stays pure over the
+                // clock.
+                measure_scan_source(&probe_dir, git.as_ref(), Some(pin.as_ref()), &|| {
+                    chrono::Utc::now().timestamp()
+                })
+            })
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    // Logged with the full error (it carries a per-run task
+                    // id); the READING gets only the stable half.
+                    tracing::warn!(
+                        error = %e,
+                        "plan adapter: the scan-divergence probe task did not complete"
+                    );
+                    ScanDivergence::unknown(resolved.plans.clone(), probe_task_failure_detail(&e))
+                        .observed_at(chrono::Utc::now().timestamp())
+                }
+            }
+        };
+        record_scan_divergence(divergence, metrics);
+
         if posture != WorkUnitWritePosture::Write {
             metrics
                 .work_unit_writes_withheld_total
@@ -3906,8 +4012,11 @@ impl LoopState {
             let ref_census = {
                 let scan_dir = dir.clone();
                 let git = std::sync::Arc::clone(&self.git);
-                match tokio::task::spawn_blocking(move || ref_census_only(&scan_dir, git.as_ref()))
-                    .await
+                let pin = std::sync::Arc::clone(&pin);
+                match tokio::task::spawn_blocking(move || {
+                    ref_census_only(&scan_dir, git.as_ref(), pin.as_ref())
+                })
+                .await
                 {
                     Ok(Ok(census)) => {
                         // Listed something, so the next unavailability is news
@@ -3978,19 +4087,17 @@ impl LoopState {
         // the scan duration. That is the mechanism behind a 20s keepalive firing
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
-        // ONE ref state for this whole cycle: the work-unit scan below resolves
-        // through this pin, and the body sync further down reads through the
-        // SAME one, so the census reported and the bodies published are listed
-        // at one commit however long the reconcile between them runs and
-        // whoever fetches the shared checkout meanwhile. Dropped with the
-        // cycle, so the next cycle fetches afresh. See [`CycleRefPin`].
-        let pin = std::sync::Arc::new(CycleRefPin::default());
+        // The work-unit scan below resolves through the cycle's pin (created
+        // above, before the probe), and the body sync further down reads
+        // through the SAME one, so the census reported and the bodies
+        // published are listed at one commit however long the reconcile
+        // between them runs and whoever fetches the shared checkout meanwhile.
         let active_scan = {
             let scan_dir = dir.clone();
             let conv = self.conv.clone();
             let pin = std::sync::Arc::clone(&pin);
             // The loop's OWN git reader, not a hardcoded `ProcessGit`: the
-            // divergence probe two statements up already uses it, and a scan
+            // divergence probe above already uses it, and a scan
             // that can look at a different reader than the probe measuring it
             // is a reading of nothing. It is also the only thing that makes
             // the publish-nothing arm reachable from a test.
@@ -5202,6 +5309,10 @@ impl BodySync {
         ref_census: Option<super::body_push::PlanSlugCensus>,
         pin: std::sync::Arc<CycleRefPin>,
     ) {
+        debug_assert!(
+            pin.fetches(),
+            "the body sync publishes from the ref, so it must read through a FETCHING pin"
+        );
         let verdict = (self.capture_gate)();
         if let Some(message) = capture_gate_message(self.last_gate_open, verdict) {
             tracing::info!(capture_enabled = verdict.is_open(), capture_verdict = ?verdict, "{message}");
@@ -8209,7 +8320,7 @@ Body.
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("plans")).unwrap();
         let plans = repo.join("plans");
-        let d = measure_scan_source(&plans, &FakeGit::healthy(0, 0), NOW);
+        let d = measure_scan_source(&plans, &FakeGit::healthy(0, 0), None, &|| NOW);
         assert_eq!(d.source_repo.as_deref(), Some("qontinui-dev-notes/plans"));
         assert_eq!(
             d.source_repo,
@@ -9840,6 +9951,351 @@ Body.
             listed[0], listed[2],
             "the second cycle must read the moved ref, not the first cycle's pin: {listed:?}"
         );
+    }
+
+    // ---- the scan-divergence probe reads the cycle's pin
+    //      (plan 2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin) ----
+
+    /// Run one tick over `MovingRef` with the posture `binding_count` gives,
+    /// and hand back what the scan-root report carried: the report's own
+    /// `ref_sha` (the probe's), the `ref` census's `ref_sha`, the reading the
+    /// tick recorded in the metrics, and the reader for its counters.
+    async fn tick_and_read_the_report(
+        local: usize,
+        coord: Option<usize>,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        std::sync::Arc<MovingRef>,
+    ) {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let git = std::sync::Arc::new(MovingRef::at(dir.path()));
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| CaptureVerdict::Open) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        .with_binding_count(local, coord)
+        .with_git(git.clone());
+
+        let metrics = AdapterMetrics::default();
+        state.tick(&FakeSink::default(), &metrics).await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "one scan-root report for the cycle: {sent:?}"
+        );
+        let report = &sent[0];
+        let census_sha = report
+            .censuses
+            .iter()
+            .flatten()
+            .find(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_REF)
+            .expect("the cycle listed the ref, so a `ref` census travels")
+            .ref_sha
+            .clone();
+        let recorded = metrics
+            .snapshot()
+            .scan_divergence
+            .expect("the tick recorded a reading")
+            .ref_sha;
+        (report.ref_sha.clone(), census_sha, recorded, git)
+    }
+
+    /// **T1 — a writing cycle reports ONE commit for the probe and the census.**
+    ///
+    /// `MovingRef` advances `origin/main` on every resolution, which is a peer
+    /// fetch (or this cycle's own) landing between any two reads. The probe
+    /// used to resolve the ref for itself, before the pin existed, so its
+    /// `ref_sha` was a different commit from the one the census was listed at
+    /// — and the web pairs the census's sha with the reading's `ref_age_secs`.
+    ///
+    /// Neuter check: in `LoopState::tick`, pass `None` instead of
+    /// `Some(pin.as_ref())` to `measure_scan_source`. The probe then resolves
+    /// `origin/main` itself and reports the first sha while the census lists at
+    /// the second — this fails on the report's pair.
+    #[tokio::test]
+    async fn the_tick_reports_one_commit_for_the_probe_and_the_ref_census() {
+        let (report_sha, census_sha, recorded, git) = tick_and_read_the_report(1, Some(1)).await;
+        assert!(report_sha.is_some(), "a measured reading carries a sha");
+        assert_eq!(
+            report_sha, census_sha,
+            "the scan-root report names one commit for the probe and the census"
+        );
+        assert_eq!(
+            recorded, report_sha,
+            "the recorded reading is the one reported"
+        );
+        assert_eq!(git.fetches(), 1, "still one fetch for the whole cycle");
+    }
+
+    /// **T2 — a withheld cycle reports one commit and the probe and census add
+    /// no fetch.** The withheld census never fetched, and the probe's pin on
+    /// that cycle is listing-only, so it does not start fetching now. The one
+    /// fetch the reader sees is the body sync's OWN pin (`run_cycle` builds a
+    /// fetching one for its bodies), which is deliberately unpinned to the
+    /// listing and out of scope here.
+    ///
+    /// Neuter checks: (1) make `ref_census_only` resolve the ref for itself
+    /// (`list_ref_plan_names_at(.., resolve_ref_sha(..), ..)` instead of the
+    /// pin) — it then lists at a moved sha and this fails on the pair; (2) build
+    /// the withheld cycle's pin with `CycleRefPin::default()` — the probe then
+    /// fetches too, and this fails on the count (2).
+    #[tokio::test]
+    async fn a_withheld_tick_reports_one_commit_and_adds_no_fetch() {
+        let (report_sha, census_sha, recorded, git) = tick_and_read_the_report(2, Some(2)).await;
+        assert!(report_sha.is_some(), "a measured reading carries a sha");
+        assert_eq!(
+            report_sha, census_sha,
+            "the withheld cycle's report names one commit for the probe and the census"
+        );
+        assert_eq!(recorded, report_sha);
+        assert_eq!(
+            git.fetches(),
+            1,
+            "only the body sync's own pin fetches; the probe and the census add none"
+        );
+    }
+
+    /// [`FakeGit`] plus two recordings the pinned probe's tests need: the
+    /// `reference` every `count_behind_ahead` was asked for, and a number of
+    /// leading `origin/main` resolutions to FAIL (the pin's own `rev_parse`
+    /// comes first, so failing exactly one makes the pin answer `Ok(None)`
+    /// while a later fallback would succeed).
+    struct ProbeGit {
+        inner: FakeGit,
+        counted_against: Mutex<Vec<String>>,
+        fail_ref_resolutions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProbeGit {
+        fn over(inner: FakeGit) -> Self {
+            Self {
+                inner,
+                counted_against: Mutex::new(Vec::new()),
+                fail_ref_resolutions: Default::default(),
+            }
+        }
+    }
+
+    impl GitRefReader for ProbeGit {
+        fn work_tree_root(&self, d: &Path) -> Result<Option<PathBuf>, String> {
+            self.inner.work_tree_root(d)
+        }
+        fn default_ref(&self, r: &Path) -> Result<String, String> {
+            self.inner.default_ref(r)
+        }
+        fn rev_parse(&self, r: &Path, rev: &str) -> Result<String, String> {
+            if rev == "origin/main"
+                && self
+                    .fail_ref_resolutions
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err("transiently unresolvable".to_string());
+            }
+            self.inner.rev_parse(r, rev)
+        }
+        fn count_behind_ahead(&self, r: &Path, a: &str, b: &str) -> Result<(u64, u64), String> {
+            self.counted_against.lock().unwrap().push(a.to_string());
+            self.inner.count_behind_ahead(r, a, b)
+        }
+        fn ref_refresh_stamps(
+            &self,
+            r: &Path,
+            d: &str,
+            s: &str,
+        ) -> Vec<Result<Option<i64>, String>> {
+            self.inner.ref_refresh_stamps(r, d, s)
+        }
+        fn fetch_default(&self, r: &Path, d: &str) -> Result<(), String> {
+            self.inner.fetch_default(r, d)
+        }
+        fn list_ref_dir(&self, r: &Path, n: &str, d: &str) -> Result<Vec<RefDirEntry>, String> {
+            self.inner.list_ref_dir(r, n, d)
+        }
+        fn read_blobs(&self, r: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+            self.inner.read_blobs(r, ids)
+        }
+    }
+
+    /// **T3 — the probe counts against the sha it reports.** `behind`/`ahead`
+    /// were counted against the ref NAME, a second `git` process after the
+    /// `rev_parse` that produced `ref_sha`; a peer fetch between the two made
+    /// the counts describe a commit other than the reported one.
+    ///
+    /// Neuter check: in `measure_unstamped`, pass `&default_ref` to
+    /// `count_behind_ahead` again — the recorded reference is then
+    /// `origin/main`, and this fails.
+    #[test]
+    fn the_probe_counts_against_the_sha_it_reports() {
+        let git = ProbeGit::over(FakeGit::healthy(3, 1));
+        let pin = CycleRefPin::default();
+        let d = measure_scan_divergence_pinned(
+            Some(Path::new("/repo/plans")),
+            &git,
+            Some(&pin),
+            &|| NOW,
+        );
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(
+            git.counted_against.lock().unwrap().clone(),
+            vec!["a".repeat(40)],
+            "behind/ahead were counted against the object id the reading reports"
+        );
+        // The pin is the one the cycle's census then reads through: no second
+        // resolution is possible.
+        assert_eq!(
+            pin.resolve_ref(&git, Path::new("/repo"), "origin/main"),
+            Ok(Some("a".repeat(40)))
+        );
+    }
+
+    /// **T4 — a failed fetch still yields an honest as-found reading.** The
+    /// cycle publishes nothing and lists no census on that arm, so there is
+    /// nothing for the reading to disagree with — and an offline box's drift is
+    /// exactly what a reader most wants to see.
+    ///
+    /// Neuter check: in `measure_unstamped`, map the pin's `Err` to an error
+    /// instead of falling back to the clone's own `rev_parse` — the reading is
+    /// then `Unknown`, and this fails.
+    #[test]
+    fn a_failed_fetch_still_yields_an_as_found_reading() {
+        let git = FakeGit {
+            fetch: Err("offline".to_string()),
+            ..FakeGit::healthy(4, 0)
+        };
+        let pin = CycleRefPin::default();
+        let d = measure_scan_divergence_pinned(
+            Some(Path::new("/repo/plans")),
+            &git,
+            Some(&pin),
+            &|| NOW,
+        );
+        assert_eq!(d.state, ScanDivergenceState::Measured, "{d:?}");
+        assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(d.behind, Some(4));
+        // And the cycle that pin belongs to publishes nothing.
+        assert!(matches!(
+            pin.resolve_source(&git, Path::new("/repo/plans")),
+            super::super::ref_scan::ScanSource::Unavailable { .. }
+        ));
+    }
+
+    /// **T5 — a fetched ref that will not resolve is UNKNOWN, not a fallback.**
+    /// On `Ok(None)` the census IS listed (at the ref name, sha UNKNOWN), so a
+    /// fallback `rev_parse` that succeeded against a moved ref would rebuild the
+    /// mismatched pair this change removes.
+    ///
+    /// Neuter check: in `measure_unstamped`, fall back to the clone's own
+    /// `rev_parse` on `Some(Ok(None))` as well — the second resolution succeeds,
+    /// the reading is `Measured`, and this fails.
+    #[test]
+    fn a_fetched_ref_that_will_not_resolve_is_unknown_not_a_fallback() {
+        let git = ProbeGit::over(FakeGit::healthy(0, 0));
+        git.fail_ref_resolutions.store(1, Ordering::SeqCst);
+        let pin = CycleRefPin::default();
+        let d = measure_scan_divergence_pinned(
+            Some(Path::new("/repo/plans")),
+            &git,
+            Some(&pin),
+            &|| NOW,
+        );
+        assert_eq!(d.state, ScanDivergenceState::Unknown, "{d:?}");
+        assert_eq!(d.ref_sha, None);
+        assert!(
+            d.detail
+                .as_deref()
+                .is_some_and(|t| t.contains("would not resolve")),
+            "{d:?}"
+        );
+    }
+
+    /// The clock is read AFTER the pin resolved — i.e. after a writing pin's
+    /// fetch — so `observed_at` never predates the ref state it describes.
+    ///
+    /// Neuter check: read `clock()` before the pin resolution in
+    /// `measure_unstamped` — the stamp is then the pre-fetch reading, and this
+    /// fails.
+    #[test]
+    fn the_probe_reads_the_clock_after_the_pin_resolves() {
+        struct SlowFetch(FakeGit, std::sync::Arc<std::sync::atomic::AtomicI64>);
+        impl GitRefReader for SlowFetch {
+            fn work_tree_root(&self, d: &Path) -> Result<Option<PathBuf>, String> {
+                self.0.work_tree_root(d)
+            }
+            fn default_ref(&self, r: &Path) -> Result<String, String> {
+                self.0.default_ref(r)
+            }
+            fn rev_parse(&self, r: &Path, rev: &str) -> Result<String, String> {
+                self.0.rev_parse(r, rev)
+            }
+            fn count_behind_ahead(&self, r: &Path, a: &str, b: &str) -> Result<(u64, u64), String> {
+                self.0.count_behind_ahead(r, a, b)
+            }
+            fn ref_refresh_stamps(
+                &self,
+                r: &Path,
+                d: &str,
+                s: &str,
+            ) -> Vec<Result<Option<i64>, String>> {
+                self.0.ref_refresh_stamps(r, d, s)
+            }
+            fn fetch_default(&self, _: &Path, _: &str) -> Result<(), String> {
+                // The fetch "takes" 90 s of wall clock.
+                self.1.fetch_add(90, Ordering::SeqCst);
+                Ok(())
+            }
+            fn list_ref_dir(&self, r: &Path, n: &str, d: &str) -> Result<Vec<RefDirEntry>, String> {
+                self.0.list_ref_dir(r, n, d)
+            }
+            fn read_blobs(&self, r: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+                self.0.read_blobs(r, ids)
+            }
+        }
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+        let git = SlowFetch(FakeGit::healthy(0, 0), clock.clone());
+        let pin = CycleRefPin::default();
+        let d = measure_scan_divergence_pinned(
+            Some(Path::new("/repo/plans")),
+            &git,
+            Some(&pin),
+            &|| clock.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            d.observed_at_unix,
+            Some(NOW + 90),
+            "stamped after the fetch"
+        );
+        // Refreshed at NOW - 60 by the canned stamp, read at NOW + 90.
+        assert_eq!(d.ref_age_secs, Some(150));
+    }
+
+    /// A listing-only pin resolves once and never fetches; a default pin
+    /// fetches. The withheld cycle depends on the first, every publishing read
+    /// on the second.
+    #[test]
+    fn a_listing_only_pin_resolves_once_and_never_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = MovingRef::at(tmp.path());
+        let listing = CycleRefPin::listing_only();
+        assert!(!listing.fetches());
+        let first = listing.resolve_ref(&git, tmp.path(), "origin/main");
+        let second = listing.resolve_ref(&git, tmp.path(), "origin/main");
+        assert_eq!(first, second, "one resolution per cycle");
+        assert_eq!(git.fetches(), 0, "a listing-only pin never fetches");
+        assert!(CycleRefPin::default().fetches());
     }
 
     // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----
