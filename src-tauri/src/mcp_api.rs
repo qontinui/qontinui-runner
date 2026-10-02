@@ -13329,10 +13329,9 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod transport_rung_counter_tests {
     use super::{
-        declared_failure_class, hand_off_transport_rung, hand_off_transport_rung_in,
-        record_event_lane_miss, record_event_lane_miss_in, transport_rung_health_snapshot,
-        transport_rung_health_snapshot_in, transport_rung_snapshot_from, EventLaneMiss,
-        TransportRungCounters, LANE_MISS_SLOTS,
+        declared_failure_class, hand_off_transport_rung_in, record_event_lane_miss_in,
+        transport_rung_health_snapshot, transport_rung_health_snapshot_in,
+        transport_rung_snapshot_from, EventLaneMiss, TransportRungCounters, LANE_MISS_SLOTS,
     };
     use std::sync::atomic::Ordering;
 
@@ -13509,14 +13508,11 @@ mod transport_rung_counter_tests {
     /// and the observation really reaches the outbox, so this is the hand-off
     /// counted, not a bare counter bump.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn successful_emit_increments_emitted() {
-        // `hand_off_transport_rung` bumps the process-global `emitted`
-        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
-        // every test that hands off serialises on the module lock. Held across
-        // the bounded outbox wait: each `#[tokio::test]` owns its own
-        // current-thread runtime, so a parked peer cannot starve this one.
-        let _serialised = series_lock();
+        // Every hand-off here drives a PRIVATE `TransportRungCounters`, so
+        // nothing touches a process-global counter and no module lock has to
+        // be held across the bounded outbox wait (Phase 4 of plan
+        // `2026-09-17-runner-tests-share-in-process-mutable-state`).
         use crate::session::coord_transport_rung::{RungEmitter, TRANSPORT_HEADER};
         use crate::session::local_store::OutboxWriter;
 
@@ -13581,14 +13577,11 @@ mod transport_rung_counter_tests {
     /// from hand-typed header names, so the config writer and the proxy reader
     /// are proven to agree end to end.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn proxied_call_with_the_http_arm_headers_is_tagged_native_mcp() {
-        // `hand_off_transport_rung` bumps the process-global `emitted`
-        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
-        // every test that hands off serialises on the module lock. Held across
-        // the bounded outbox wait: each `#[tokio::test]` owns its own
-        // current-thread runtime, so a parked peer cannot starve this one.
-        let _serialised = series_lock();
+        // Every hand-off here drives a PRIVATE `TransportRungCounters`, so
+        // nothing touches a process-global counter and no module lock has to
+        // be held across the bounded outbox wait (Phase 4 of plan
+        // `2026-09-17-runner-tests-share-in-process-mutable-state`).
         use crate::session::coord_transport_rung::RungEmitter;
         use crate::session::local_store::OutboxWriter;
 
@@ -13612,7 +13605,8 @@ mod transport_rung_counter_tests {
             );
         }
 
-        hand_off_transport_rung(
+        hand_off_transport_rung_in(
+            &TransportRungCounters::new(),
             emitter,
             lane,
             &headers,
@@ -13646,14 +13640,11 @@ mod transport_rung_counter_tests {
     /// the payload's own `failure_class` key through the proxy's header read —
     /// validated, and never in the runner-observed `failure_reason`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn proxied_failure_class_declaration_lands_in_failure_class() {
-        // `hand_off_transport_rung` bumps the process-global `emitted`
-        // counter, which `successful_emit_increments_emitted` asserts EXACTLY;
-        // every test that hands off serialises on the module lock. Held across
-        // the bounded outbox wait: each `#[tokio::test]` owns its own
-        // current-thread runtime, so a parked peer cannot starve this one.
-        let _serialised = series_lock();
+        // Every hand-off here drives a PRIVATE `TransportRungCounters`, so
+        // nothing touches a process-global counter and no module lock has to
+        // be held across the bounded outbox wait (Phase 4 of plan
+        // `2026-09-17-runner-tests-share-in-process-mutable-state`).
         use crate::session::coord_transport_rung::{
             RungEmitter, ATTEMPTED_HEADER, FAILURE_CLASS_HEADER, TRANSPORT_HEADER,
         };
@@ -13669,7 +13660,8 @@ mod transport_rung_counter_tests {
         headers.insert(ATTEMPTED_HEADER, "native_mcp".parse().unwrap());
         headers.insert(FAILURE_CLASS_HEADER, "Runner_Nonce".parse().unwrap());
 
-        hand_off_transport_rung(
+        hand_off_transport_rung_in(
+            &TransportRungCounters::new(),
             emitter,
             uuid::Uuid::new_v4(),
             &headers,
@@ -16286,9 +16278,89 @@ mod memory_search_enrichment_tests {
 /// wrapper that still reads as a one-liner.
 #[cfg(test)]
 mod counter_handle_pins {
-    fn prod_part(src: &str) -> &str {
-        src.split_once("\n#[cfg(test)]\nmod ")
-            .map_or(src, |(before, _)| before)
+    /// The production half: every `#[cfg(test)] mod … { … }` block REMOVED,
+    /// wherever it sits in the file.
+    ///
+    /// This used to truncate at the FIRST such module and call the result a
+    /// prefix. That is only the production half while every test module sits
+    /// BELOW every pinned item, and nothing enforced that: main's
+    /// `33844e8fb` added `mod coord_mcp_doctor_scope_tests` above the
+    /// wrappers this pin inspects, so the "production half" ended before
+    /// them and the pin panicked that it could not find a signature that was
+    /// right there. Stripping instead of truncating removes the ordering
+    /// assumption. A module's end is the next line that is exactly `}` at
+    /// column 0, because every item nested inside a top-level module is
+    /// indented — which is also why this does not try to brace-match
+    /// (a `format!("{{{x}")` in test code is deliberately unbalanced).
+    ///
+    /// CONTRACT FOR THE NEXT PIN WRITTEN AGAINST THIS: it is safe only for an
+    /// assertion that fails on BOTH sides of a mis-slice — an exact count
+    /// (`assert_eq!(mentions, 2)`) or a `find` that panics by name. A leak
+    /// raises an exact count and an over-strip lowers it, so either direction
+    /// reds. A POSITIVE CONTAINMENT pin (`assert!(prod.contains(…))`) does not
+    /// have that property: a leak satisfies it silently, and the shapes this
+    /// heuristic cannot see — a `#[cfg(test)]` with another attribute stacked
+    /// before its `mod` (the form at `wedge_diagnostics.rs:1756`), a bodyless
+    /// `mod foo;`, or a column-0 `}` inside a fixture string — would then pass
+    /// vacuously instead of failing. If you need a containment pin here, give
+    /// this function the production-symbol anchor set that
+    /// `production_constructs_exactly_one_relay_binding` carries first.
+    fn prod_part(src: &str) -> String {
+        const OPEN: &str = "\n#[cfg(test)]\nmod ";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find(OPEN) {
+            // `str::get`, not `&rest[..]`: `clippy::string_slice` is deny-tier in
+            // this crate and only sites PREDATING that gate are grandfathered
+            // (`expect_ratchet.rs`), so a site landing now migrates instead. Each
+            // index is a char boundary by construction — `at` is where `find`
+            // matched, the byte there is the ASCII `\n` that opens `OPEN`, and
+            // `"\n}\n"` is three ASCII bytes — so the `expect`s are unreachable
+            // and say which invariant would have to break first.
+            out.push_str(rest.get(..at).expect("`find` returns a char boundary"));
+            out.push('\n');
+            let after = rest
+                .get(at + 1..)
+                .expect("the byte at the match is the ASCII newline opening OPEN");
+            match after.find("\n}\n") {
+                Some(end) => {
+                    rest = after
+                        .get(end + 3..)
+                        .expect("`\\n}\\n` is three ASCII bytes");
+                }
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The regression for the bug above: production code BELOW an early test
+    /// module must still be in the pin's reach, and the test module must not.
+    #[test]
+    fn a_test_module_above_the_production_code_is_stripped_not_truncated_at() {
+        const SRC: &str = "\nfn before() {}\n#[cfg(test)]\nmod early {\n    #[test]\n    fn t() {}\n}\nfn after() {}\n";
+        let prod = prod_part(SRC);
+        // Shadow the owned half with its own `&str`: every pin below was
+        // written against a borrowed slice, and the strip has to allocate.
+        let prod = prod.as_str();
+        assert!(
+            prod.contains("fn before()"),
+            "code above the module must survive"
+        );
+        assert!(
+            prod.contains("fn after()"),
+            "code BELOW an early test module must survive — truncating here is the \
+             defect this fixture pins"
+        );
+        assert!(
+            !prod.contains("mod early"),
+            "the test module itself must be stripped"
+        );
+        assert!(!prod.contains("fn t()"), "and its contents with it");
     }
     fn squeezed_code(src: &str) -> String {
         src.lines()
@@ -16362,15 +16434,24 @@ fn not_a_static() {}
                  silently stops guarding anything."
             )
         });
+        // `str::get`, not `&prod[..]`, for the same deny-tier reason as
+        // `prod_part` above: every index here is a `find` result, so each
+        // `expect` names an invariant that cannot break.
         let body_start = start
-            + prod[start..]
+            + prod
+                .get(start..)
+                .expect("a `find` result is a char boundary")
                 .find('{')
                 .expect("the wrapper must have a body");
         let body_end = body_start
-            + prod[body_start..]
+            + prod
+                .get(body_start..)
+                .expect("a `find` result is a char boundary")
                 .find("\n}\n")
                 .expect("the wrapper's body must be closed at column 0");
-        let raw = &prod[body_start..body_end];
+        let raw = prod
+            .get(body_start..body_end)
+            .expect("both ends are `find` results");
         let squeezed = squeezed_code(raw);
         // Both bounds, loose on top: a collapsed slice asserts nothing, and a
         // slice that ran away past several fns is a parse failure rather than
@@ -16395,9 +16476,13 @@ fn not_a_static() {}
     fn the_public_enrich_api_only_delegates() {
         const SRC: &str = include_str!("mcp_api.rs");
         let prod = prod_part(SRC);
+        // Shadow the owned half with its own `&str`: every pin below was
+        // written against a borrowed slice, and the strip has to allocate.
+        let prod = prod.as_str();
         assert!(
             prod.len() < SRC.len(),
-            "the production half must be a strict prefix: this file has test modules"
+            "stripping the test modules must remove something: this file has them, so an \
+             unchanged length means the stripper matched nothing"
         );
 
         for (signature, expected) in [
@@ -16428,10 +16513,14 @@ fn not_a_static() {}
             .find("struct MemoryEnrichCounters(")
             .expect("the counter struct must be in the production half");
         let block_end = block_start
-            + prod[block_start..]
+            + prod
+                .get(block_start..)
+                .expect("a `find` result is a char boundary")
                 .find("\nfn degraded_body(")
                 .expect("`degraded_body` must follow the counter block");
-        let block = &prod[block_start..block_end];
+        let block = prod
+            .get(block_start..block_end)
+            .expect("both ends are `find` results");
         let statics = declared_statics(block);
         assert_eq!(
             statics,
@@ -16474,6 +16563,9 @@ fn not_a_static() {}
     fn the_public_transport_rung_api_only_delegates() {
         const SRC: &str = include_str!("mcp_api.rs");
         let prod = prod_part(SRC);
+        // Shadow the owned half with its own `&str`: every pin below was
+        // written against a borrowed slice, and the strip has to allocate.
+        let prod = prod.as_str();
 
         for (signature, expected) in [
             (
@@ -16504,10 +16596,14 @@ fn not_a_static() {}
             .find("struct TransportRungCounters {")
             .expect("the counter struct must be in the production half");
         let block_end = block_start
-            + prod[block_start..]
+            + prod
+                .get(block_start..)
+                .expect("a `find` result is a char boundary")
                 .find("\nfn record_event_lane_miss(")
                 .expect("`record_event_lane_miss` must follow the counter block");
-        let block = &prod[block_start..block_end];
+        let block = prod
+            .get(block_start..block_end)
+            .expect("both ends are `find` results");
         let statics = declared_statics(block);
         assert_eq!(
             statics,
