@@ -843,6 +843,57 @@ pub mod test_support {
         EnvLockGuard { _inner: inner }
     }
 
+    /// How many [`EnvLockGuard`]s THIS thread holds right now — `0` means it
+    /// does not hold the env lock at all.
+    ///
+    /// A probe for the test-lock hierarchy: every cross-module test lock (the
+    /// plan-capture pin, `posture_test_lock`, …) takes [`env_lock`] BEFORE its
+    /// own mutex and holds it for the guard's life, so "this thread holds child
+    /// lock X" must imply a depth of at least 1 here. Tests assert exactly
+    /// that. Plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`.
+    pub fn env_lock_depth() -> usize {
+        ENV_LOCK_DEPTH.with(|d| d.get())
+    }
+
+    /// The guard of a CHILD lock in the test-lock hierarchy: the child mutex's
+    /// guard plus the [`env_lock`] guard held beneath it.
+    ///
+    /// Field order is load-bearing — fields drop in declaration order, so the
+    /// child is released BEFORE the env lock, the reverse of acquisition, which
+    /// is also the LIFO order [`EnvLockGuard`]'s per-thread depth needs.
+    pub struct TestLockGuard {
+        _child: MutexGuard<'static, ()>,
+        _env: EnvLockGuard,
+    }
+
+    /// Acquire a cross-module test lock as a child of [`env_lock`]: the env
+    /// lock FIRST, then `child`, both held until the returned guard drops.
+    ///
+    /// **Why every shared test lock goes through this.** `env_lock` is the
+    /// root of the test-lock hierarchy. It is reentrant per thread, so a thread
+    /// that holds a child already holds `env_lock`, and a later `env_lock()` /
+    /// `isolated_ambient()` on that thread nests instead of waiting; and any
+    /// thread waiting on a child mutex also holds `env_lock`, so the child's
+    /// holder cannot be on another thread. A test may therefore take a child
+    /// and the env lock in EITHER order without an AB/BA deadlock. A child
+    /// mutex taken WITHOUT `env_lock` first is a sibling, and two siblings taken
+    /// in opposite orders on two threads hang `cargo test` — which the
+    /// plan-capture pin and `env_lock` did (plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`).
+    /// `env_test_lock_hierarchy_guard.rs` (runner bin) enforces it.
+    ///
+    /// Poison-recovering, like [`env_lock`]: the child protects a test
+    /// ordering, so one panicking holder must not cascade into its siblings.
+    pub fn hierarchy_lock(child: &'static Mutex<()>) -> TestLockGuard {
+        let env = env_lock();
+        let child = child.lock().unwrap_or_else(|p| p.into_inner());
+        TestLockGuard {
+            _child: child,
+            _env: env,
+        }
+    }
+
     /// RAII guard that restores the captured env vars to their pre-capture
     /// values on drop (including the panic path). Use for tests that mutate a
     /// process-global var which may already be set in the environment (e.g.

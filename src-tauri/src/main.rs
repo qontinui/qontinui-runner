@@ -353,6 +353,13 @@ mod tier_matrix_tests;
 // Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
 #[cfg(test)]
 mod env_write_lock_guard;
+// Source invariant: every test-lock constructor takes `env_lock()` FIRST (a
+// child of the env lock in the test-lock hierarchy) or is marked and audited
+// standalone, so no two test locks can be taken in opposite orders and hang
+// `cargo test`. Plan
+// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`.
+#[cfg(test)]
+mod env_test_lock_hierarchy_guard;
 // Source-scan ratchets for the deny lints that grandfather sites with a
 // fn-level `#[expect]` (`clippy::disallowed_methods` for `Row::get`,
 // `clippy::string_slice`): each count only falls, and each gate stays wired.

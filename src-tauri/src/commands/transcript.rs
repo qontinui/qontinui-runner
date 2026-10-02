@@ -1536,6 +1536,7 @@ mod tests {
     /// each other's entry. Every test that touches the cache takes this first.
     static CACHE_TESTS_ARE_SERIAL: StdMutex<()> = StdMutex::new(());
 
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
         CACHE_TESTS_ARE_SERIAL
             .lock()

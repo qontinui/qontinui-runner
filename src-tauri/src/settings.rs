@@ -5857,12 +5857,13 @@ static PERF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire the performance-cache test lock. Poison is ignored: a panicking
 /// test must not wedge every other test that touches the cache.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first): it is shared across three modules, so a future holder that
+/// also touches env cannot invert the order against an env-first one.
 #[cfg(test)]
-pub fn perf_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    match PERF_TEST_LOCK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+pub fn perf_test_lock() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&PERF_TEST_LOCK)
 }
 
 fn store_performance_cache(entry: CachedPerformance) {

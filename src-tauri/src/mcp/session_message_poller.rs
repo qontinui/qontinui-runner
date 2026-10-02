@@ -2472,6 +2472,7 @@ mod tests {
     /// cascade into the next one's lock.
     static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
         COUNTER_TEST_LOCK
             .lock()

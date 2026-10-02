@@ -3690,10 +3690,15 @@ pub fn coord_credential_posture() -> Option<CoordCredentialStatus> {
 ///
 /// Poisoning is recovered rather than propagated: one failing test must not
 /// convert every sibling into a panic-on-lock and hide the real failure.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first and holds it beneath this one): `terminal`'s briefing tests
+/// hold this AND `isolated_ambient()` AND the plan-capture pin, so as a sibling
+/// it would be one inverted call site away from an AB/BA deadlock.
 #[cfg(test)]
-pub(crate) fn posture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn posture_test_lock() -> crate::test_env::TestLockGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::test_env::hierarchy_lock(&LOCK)
 }
 
 #[cfg(test)]
@@ -6826,7 +6831,7 @@ mod tenant_slot_refresh_tests {
     ///
     /// Poisoning is recovered rather than propagated: one failing test must not
     /// convert every sibling into a panic-on-lock and hide the real failure.
-    fn health_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn health_lock() -> crate::test_env::TestLockGuard {
         // THE crate-wide lock — the `mcp_api` forwarder-wiring tests take the
         // same one, so the two suites serialise against each other and not
         // merely within themselves.

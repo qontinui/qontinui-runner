@@ -13211,6 +13211,7 @@ mod transport_rung_counter_tests {
     /// assert that NO OTHER series moved, so they serialise on one lock —
     /// same defect class and same remedy as `series_lock` in the memory-search
     /// tests below.
+    // test-lock: standalone — module-private; its holders take no other test lock (no env_lock, pin or posture lock)
     fn series_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -15989,6 +15990,7 @@ mod memory_search_enrichment_tests {
     /// Same defect and same remedy as `device_jwt_refresher`'s `health_lock`
     /// (commit `4ea9a9e61`) — a second instance of the class in a second
     /// module, so the lock is copied rather than re-derived.
+    // test-lock: standalone — module-private; its holders take no other test lock (no env_lock, pin or posture lock)
     fn series_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -18393,6 +18395,11 @@ mod coord_read_proxy_tests {
     /// come back unreshaped — including a non-200 coord verdict.
     #[tokio::test]
     async fn forward_coord_get_injects_bearer_and_passes_through_verbatim() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
@@ -19715,6 +19722,11 @@ mod coord_write_proxy_tests {
     /// a non-200 coord verdict.
     #[tokio::test]
     async fn forward_coord_write_post_injects_bearer_and_passes_through_verbatim() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
@@ -19834,6 +19846,11 @@ mod coord_write_proxy_tests {
     /// Coord unreachable → 502 from the runner with the distinct upstream code.
     #[tokio::test]
     async fn forward_coord_write_post_unreachable_coord_is_502() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         // Bind then drop a listener so the port actively refuses connections.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -19980,6 +19997,11 @@ mod coord_write_proxy_tests {
     /// spooled, and the answer says so without claiming a gate exists.
     #[tokio::test]
     async fn transport_failure_spools_the_gate_and_answers_honestly() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let (spool, _dir) = test_spool();
         // Bind then drop a listener so the port actively refuses connections.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -20044,6 +20066,11 @@ mod coord_write_proxy_tests {
     /// is the opposite and IS spooled, with coord's own status preserved.
     #[tokio::test]
     async fn a_4xx_never_spools_but_a_5xx_does() {
+        // The forwarder files coord's verdict into the PROCESS-GLOBAL upstream
+        // signal (`note_coord_upstream_verdict`), so this test writes state the
+        // posture tests assert on. Serialize on their lock, or a mock 2xx here
+        // resets a streak `device_jwt_refresher`'s tests just built.
+        let _posture = crate::mcp::device_jwt_refresher::posture_test_lock();
         let (spool, _dir) = test_spool();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
