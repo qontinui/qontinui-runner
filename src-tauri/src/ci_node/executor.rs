@@ -1112,6 +1112,7 @@ mod tests {
             vec![vec![
                 "rm".to_string(),
                 "-f".to_string(),
+                "-v".to_string(),
                 "qontinui-ci-0198f2b4-2222-7aaa-bbbb-cccccccccccc-redis".to_string()
             ]],
             "cleanup must tear down the dispatch's service containers"
