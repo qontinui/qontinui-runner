@@ -181,34 +181,43 @@ The plans directory does not have to be inside a git repo. Where this skill comm
 first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; if that fails, the edit
 on disk is the whole ritual.
 
-**Precondition — if the plan you are about to vet is untracked, commit and push it
-first**, stamped `DRAFT`, from a worktree (never the primary/shared checkout); then
-vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
+**Precondition — if the plan you are about to vet is untracked, publish it
+first**, stamped `DRAFT`, with the helper below (it builds the commit on a separate
+index, so it never touches the primary/shared checkout); then vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
 `conflict_check`, unreadable by any peer, and outside the durable record. Plans are
 supposed to be authored at `DRAFT` and committed at creation; committing one here is
 repairing that, not replacing it.
 
-**And the push is not the publication — assert a PR carries that branch's push.** On a
-coord-merge-authority repo (`qontinui-dev-notes` is one) a branch pushed with no
-pull request never reaches `main`, so the plan is on `origin` and still unreadable
+**And a push is not the publication — land the DRAFT with the helper.** Publish
+the committed plan with
+`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: add <plan-stem> (DRAFT)"`
+— the same helper §5 uses — rather than pushing a branch by hand. Whether the
+plans repo needs a pull request is decided by the helper's ruleset probe of that
+repo's default branch, never by a sentence in a command: with no PR-requiring
+rule it lands the blob directly and prints `LANDED …`; with one, or when the
+probe cannot tell, it cuts a fresh branch, opens a new PR with `gh pr create`
+(the only opener it runs; a line-anchored `Plan: <stem>` marker ends the body)
+and prints `PROPOSED …`. A caller holding coord's MCP door that wants
+`coord_create_pr` sets `LAND_PLAN_STAMP_NO_PR=1` — the helper then pushes and
+reads back the branch, prints it, and opens nothing — and opens the PR itself
+in `/implement-plan` Step 4.5b's served door order (the runner's loopback door
+sits between the coord door and the `gh` fallback). A non-zero exit means the plan is NOT published. The failure this
+guards is real: a branch pushed with no pull request, onto a repo that needs one,
+never reaches the default branch, so the plan is on `origin` and still unreadable
 to every peer who reads `origin/main` — which defeats the same attestation this
 precondition exists to enable. Measured 2026-09-02, **9** plan stems were pushed to `origin`
 and never proposed at all — no PR in any state, on any branch carrying the stem.
-After the push, and again after any later push to the same branch, read
-`gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`.
-Then apply `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a
-branch whose PR may already have landed". `--state all` matters for two reasons:
+**On the `PROPOSED` arm**, read
+`gh pr list --repo <owner/repo> --head <branch> --state all --json number,url,state,headRefOid`
+for the branch the line names. `--state all` matters for two reasons:
 an empty open-only answer cannot tell never-proposed from closed-under-you, and
-a CLOSED or MERGED PR carries nothing pushed after its close. When the section
-says no PR carries the push and commits remain unlanded, take its fresh-branch
-path and open the new PR — **`coord_create_pr` first, then `gh pr create`** —
-with a line-anchored `Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`.**
-Open it in `/implement-plan` Step 4.5b's served door order (the runner's loopback
-door sits between the coord door and the `gh` fallback), then READ it back —
-`gh pr list --repo <owner/repo> --head <branch> --state all --json
-number,url,state,headRefOid` — and take the PR number only from a row whose
-`headRefOid` is the head you pushed, never from the create call's exit status or
-output.
+a CLOSED or MERGED PR carries nothing pushed after its close. Take the PR number
+only from a row whose `headRefOid` is the head the helper pushed (read it with `git -C <plans-repo-root> rev-parse origin/<branch>`, the ref the helper's own fetch leaves; its `PROPOSED` line names the branch, not the sha), never from the
+create call's exit status or output. Any later stamp goes through the helper
+again, which cuts its own fresh branch; a NON-stamp push to an existing branch
+stays governed by
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a
+branch whose PR may already have landed". **Never `gh pr merge`, never `--admin`.**
 That marker is an **indexability** claim, not a delivery one: once plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
 (authored 2026-09-04, not deployed as of that date), coord classifies a citation
@@ -1704,6 +1713,27 @@ improvement. Stamping on agreement buys nothing and costs that. So:
 The Single-stamp invariant above does not touch this line — it governs
 `> **Status:` blockquotes only.
 
+**Land the stamped plan with the helper — a stamp on disk is not a published
+stamp.** When the plans directory is inside a git repo, publish the stamped file
+with:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: stamp <plan-stem> VETTED"
+```
+
+It lands the one blob directly on the plans repo's default branch when that
+branch's ruleset requires no PR, and otherwise cuts a FRESH branch and opens a
+NEW PR — it never pushes to an existing branch, so a stamp cannot ride a branch
+whose PR coord already landed (plan
+`2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the stamp is published;
+quote it in the §6 report. **A non-zero exit means the stamp is NOT published**:
+report the exit and the failure it names, and do not describe the plan as
+VETTED-on-`origin` until a later run prints the line.
+
 After stamping, fire the clearing `POST /coord/status` documented in
 Step 0 with `current_task: null` so the dashboard tile stops showing
 this vet session as in-flight.
@@ -1763,14 +1793,17 @@ unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
 > canonical's favour; the sibling copy in `/implement-plan` survived. Finding
 > `80e43042`.)*
 
-A VETTED plan is **ready, dispatchable work** — not a human decision. When you
+A VETTED plan is **ready, dispatchable work** — not a human decision — UNLESS
+the vet's own verdict holds every remaining phase behind a live trigger gate
+(step 6's **hold-gate skip**): such a plan is vetted-but-held, and neither gate
+below is registered for it. When you
 stamp VETTED **on a standalone vet**, register (or **refresh** an existing)
 `unit_ready` gate (coord
 tracks the plan as a generic **work unit**) so coord holds the ready plan as
 watched, dispatchable work instead of letting it rot until someone clicks. On
 **every** arm, standalone and `/vet-imp` alike, also register the safety-net gate
 (**step 6**, always, unless step 2 finds no
-`device_id`) whose queued continuation dispatches into a session the operator can
+`device_id` or step 6's hold-gate skip applies) whose queued continuation dispatches into a session the operator can
 **see** if nobody picks the plan up — under `/vet-imp` that net is the ONLY gate
 this section writes. This **replaces** the old
 `operator_approval`-bootstrap gate that used to queue ready work: a work queue is
@@ -1785,6 +1818,10 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > | **standalone `/vet-plan`** | **register it** | register it |
 > | **standalone `/vet-plan`, §5.4 REFUSED** | **DO NOT register it** | register it |
 > | **under `/vet-imp`** | **DO NOT register it** | register it |
+>
+> On EVERY row, a plan that takes step 6's **hold-gate skip** registers
+> NEITHER gate: it is not ready work, so there is nothing to record as ready
+> and nothing for a 30-minute net to dispatch.
 >
 > **Why the record gate is skipped under `/vet-imp`.** Its predicate can only be
 > satisfied while the unit is still at the vetted status AND no unmuted sibling
@@ -2073,9 +2110,11 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > vetting session to predict its own death — and a session that could predict that
 > would not need the net. Case (2) already covers BOTH standalone vetting and
 > `/vet-imp`, which between them are every way `/vet-plan` is ever invoked. So the
-> net gate is **UNCONDITIONAL in §5.4**, with exactly one skip, and that skip is a
+> net gate is **UNCONDITIONAL in §5.4**, with exactly two skips, and each is a
 > fact you can READ rather than a future you must guess: **no `device_id`
-> resolves** (step 2), leaving a `continuation_spawn` with no target. The
+> resolves** (step 2), leaving a `continuation_spawn` with no target; or the plan
+> is **held behind an open, armed trigger gate** (step 6's hold-gate skip), so
+> the plan already has a net keyed on its real trigger. The
 > `unit_ready` record gate is registered either way and is continuation-less
 > either way.
 >
@@ -2175,10 +2214,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    UUID): env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json`
    and parse `"device_id"` (fall back to `"machine_id"` if present).
    This step is **unconditional**, because step 6 is — see the correction in the
-   exception blockquote above. If neither source yields a UUID, that — and only
-   that — is the one case where the net gate is skipped: a `continuation_spawn`
-   has no target without it. Then still register the `unit_ready` record gate
-   (per step 5's conditions), and **say in your report that the net was skipped because no `device_id`
+   exception blockquote above. If neither source yields a UUID, that is one of the
+   two cases where the net gate is skipped (the other is step 6's hold-gate
+   skip): a `continuation_spawn` has no target without it. Then still register
+   the `unit_ready` record gate (per step 5's conditions, which exclude a held
+   plan), and **say in your report that the net was skipped because no `device_id`
    resolved**, naming both sources you tried. A skipped net that goes unreported
    is the silent strand this whole section exists to prevent.
 3. **Check for existing gates** anchored to this work unit
@@ -2186,7 +2226,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    `unit_ready` record gate for this plan, and any OPEN net gate beside it). If
    one exists, **refresh** it rather than creating a duplicate. **Before
    refreshing, retire the prior net gate** so the old queued runner-terminal spawn
-   does not fire alongside the new one: for any OPEN row in that GET carrying a
+   does not fire alongside the new one: for any OPEN **prior net** row in that GET — an
+   armed `time_elapsed` gate under `phase_name` `vet→implement safety net` (or
+   under a non-canonical name, per step 8) — carrying a
    `continuation_spawn` that is not yet consumed or cancelled — **pre-dispatch
    rows included**, which under the 30-minute net is the usual state — **withdraw
    it**: `coord_withdraw_gate` `{gate_id, reason}`, or its HTTP twin, the bare
@@ -2211,7 +2253,24 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    Best-effort: a 409 `already_consumed` on the cancel = a spawn already happened
    (report it, don't pretend the cancel landed; still withdraw).
    (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
-4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms.** This
+
+   **Evaluate step 6's hold-gate skip from THIS read, BEFORE any retirement — and
+   never cancel, mute or withdraw a hold gate.** When the skip applies and this read also
+   finds an OPEN `unit_ready` record gate left by an earlier standalone vet,
+   withdraw it (`coord_withdraw_gate`): it publishes the held plan as ready
+   work, and withdrawal only un-pins a unit that is not meant to be ready.
+   Report the withdrawn `gate_id`. A gate that holds this plan behind its
+   trigger carries an armed continuation BY DESIGN; it is the plan's real net.
+   Withdrawing, cancelling or muting it here would leave the plan with no trigger, and a
+   later re-read would then register a 30-minute net onto forbidden work.
+4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms, and
+   under the hold-gate skip too.** A held plan still ATTEMPTS the vetted
+   transition (a refusal leaves the status unchanged, exactly as for any plan): the runner's plan adapter re-derives the status from the file's
+   `VETTED` stamp and would revert any other word, and the unit cannot derive
+   `ready` while the hold gate is open (it is a counted gate, so
+   `total != cleared`). Once the hold gate clears it CAN derive `ready` — that
+   is intended, and `/implement-plan` Step 0.45's all-cleared arm still defers
+   to an owed re-vet continuation. The hold lives in the gate, not the status. This
    is the "Set the work unit's registry status" block below
    (read current → ONE `→ vetted` call carrying the `independence` declaration
    and the manifest → on refusal, status unchanged and the attestation OWED); do
@@ -2226,7 +2285,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    leaves the status unchanged BY DESIGN — that is the arm below, not a skipped
    step. What this warning forbids is never attempting the transition at all.
    The attempt is unconditional; only step 5's gate is caller-scoped.
-5. **Register the RECORD gate — STANDALONE VETS ONLY. Under `/vet-imp`, SKIP
+5. **Register the RECORD gate — STANDALONE VETS ONLY, and never under step 6's
+   hold-gate skip** (a held plan is not ready work; a record gate would publish
+   it as ready). **Under `/vet-imp`, SKIP
    this step entirely** and go straight to step 6; say in your report that the
    record gate was deliberately not registered, per the caller table at the top
    of this section. (Skipping it is the fix for a gate that is unclearable ~24%
@@ -2360,12 +2421,67 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      loophole. Full vocabulary and the "when to classify" rule: the `gate_class`
      bullet in the flagged-items section below, canonical
      `_gate-registration` → "`gate_class`".
-6. **Register the SAFETY-NET gate — a SECOND gate, ALWAYS** (the sole exception
-   is step 2's: no `device_id` resolved, so a `continuation_spawn` has no
-   target). This step is **not** conditional on which skill invoked the vet:
-   `/vet-imp` and standalone vetting both take it, and between them that is every
-   invocation. Same door and same transport cascade as step 5, same work unit,
-   **different `phase_name`**.
+6. **Register the SAFETY-NET gate — a SECOND gate, ALWAYS** (two exceptions,
+   both facts you READ rather than futures you guess: step 2's — no `device_id`
+   resolved, so a `continuation_spawn` has no target — and the **hold-gate skip**
+   defined just below). This step is **not** conditional on which skill invoked
+   the vet: `/vet-imp` and standalone vetting both take it, and between them that
+   is every invocation. Same door and same transport cascade as step 5, same work
+   unit, **different `phase_name`**.
+
+   **The hold-gate skip — a plan whose remaining work is DELIBERATELY held.** Some
+   vetted plans are not ready work at all: the vet's own verdict defers every
+   remaining phase until an observable trigger fires (a measurement-first plan
+   whose Phase 1 returned DEFER, with the re-measure trigger registered as a
+   gate). The net's premise — *"vetted means dispatchable; if nobody picks it up
+   in 30 minutes, dispatch a session"* — is false for such a plan, and arming it
+   **manufactures** the wrong work: `/implement-plan` correctly stands down
+   without stamping IN PROGRESS, so nothing retires the net, and 30
+   minutes later it spawns a visible terminal to implement phases the plan
+   forbids implementing. (`/implement-plan` stands down on a held plan at its
+   Step 0.45 check 1, so it never stamps IN PROGRESS and never retires the net.) Skip the net — register nothing in this step — when
+   **all three** hold, each read rather than assumed:
+   - **The plan's status block defers ALL remaining phases behind one or more
+     named gates** — it cites each `gate_id` and says not to implement until it
+     clears. A plan with ANY phase that is dispatchable now does not qualify:
+     that phase is ready work and the net covers it. This vet writes that block,
+     so it is the weakest of the three; the next two are what make the skip a
+     READ fact, and EVERY cited gate must pass both.
+   - **A read of this `work_unit_id`'s gates returned that gate, and it is
+     OPEN** — not cleared, failed, misconfigured, muted or withdrawn. Use step
+     3's read, **re-issued if this vet registered the trigger gate itself** (a
+     read taken before the registration cannot contain it). A cited gate you did
+     not find is not a hold; register the net. A hold gate anchored by claim
+     (`claim_kind` + `resource_key`) never appears in this read, so the skip does
+     not apply to it — register the net.
+   - **That gate's continuation is ARMED to come back to this plan** —
+     `armed && will_dispatch` on the row (`has_continuation` on
+     `coord_gate_inspect`), dispatching `/vet-imp` or `/implement-plan` on it.
+     This is what makes skipping safe: the plan already has a net, and it is
+     keyed on the real trigger instead of on a 30-minute clock.
+
+   **Every case that fails these conjuncts is answered with a net, and that is
+   safe by design:** a cited gate not found (including a claim-anchored one,
+   invisible to a `work_unit_id` read), open but unarmed, or armed toward some
+   other target. The session the net dispatches reaches `/implement-plan` Step
+   0.45 check 1, which STOPS on any cited hold gate that is still open, armed or
+   not, and ASKS (Abort / Proceed anyway) on one it cannot find or read. The
+   cost is one wasted session, never a silent wrong implementation. The two
+   rules differ on purpose: skipping the net needs proof the plan already has a
+   working trigger; refusing to implement needs only that a cited hold is live.
+
+   Say in your report that the net was skipped **because the plan is held
+   behind gate `<gate_id>`**, quote that gate's verdict and `will_dispatch` as
+   read, and step 8 then asserts the net is **absent** rather than present. Do
+   NOT use this skip to avoid a net on work you merely expect to defer; the
+   trigger must already be a registered, armed gate. And the converse: when a re-vet
+   (typically the one the hold gate's own continuation dispatched) concludes
+   PROCEED, rewrite the status block so it NO LONGER defers behind that gate —
+   a stamp that still says "do not implement until gate X clears" makes
+   `/implement-plan` Step 0.45 stop on the chain's own implement half. Measured 2026-09-26 on
+   `2026-08-07-web-memory-records-quota-incremental-counter` (DEFER behind
+   `metric_threshold` gate `92009421`, `run_skill /vet-imp` armed) — coord
+   finding `e0014717`.
 
    **Copy these two literals verbatim — do not paraphrase either.** They are a
    wire contract with `/implement-plan`, not description:
@@ -2403,8 +2519,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 
      > **What a divergent `phase_name` does NOT do — stated because the obvious
      > guess is wrong.** It does not orphan the net. `/implement-plan` Step 0.5
-     > retires the net by acting on *"whichever row carries a
-     > `continuation_spawn`"*, not by matching this string, so a validly-armed
+     > retires the net by matching the armed `time_elapsed` predicate, not
+     > this string, so a validly-armed
      > net under an odd name is still withdrawn at the IN PROGRESS
      > stamp. The cost is addressability and legibility, not a stranded gate.
      > Do not read the paragraph above as a stronger claim than it makes.
@@ -2510,18 +2626,24 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    top of this section: **standalone `/vet-plan` asserts TWO when step 5
    registered the record gate (the attestation landed, or Step A found the unit
    already past you); ONE (the net) otherwise — §5.4 ended REFUSED, Step A's
-   status was UNKNOWN, or the vet ran under `/vet-imp`.** Report each one's
+   status was UNKNOWN, or the vet ran under `/vet-imp`.** Under step 6's **hold-gate skip** every
+   count is ZERO on every arm: assert both absent — no row that is open and
+   neither muted nor withdrawn, since this `open_only: false` read also returns
+   the rows step 3 retired — and assert every cited hold gate still `open` with
+   `armed && will_dispatch`. An open `unit_ready` row under the hold is
+   remedied as in step 3: withdraw it and report its `gate_id`. Report each one's
    `gate_id` **in full**
    [policy: `coordination` `record-gate-ids-in-full`]:
 
    | expected row | how to recognise it | if it is MISSING |
    |---|---|---|
    | the **record** gate — **standalone only** | `predicate_kind: unit_ready`, continuation `armed: false` | standalone, attestation landed: step 5 did not land — re-issue it, and never report §5.4 done without it. **Under `/vet-imp` its absence is CORRECT** — assert it is absent, and do not re-issue it. **On the REFUSED arm its absence is CORRECT** — assert it absent, do not re-issue; quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`) |
-   | the **net** gate — **always** | `predicate_kind: time_elapsed` **and** continuation `armed: true` **and** `will_dispatch: true` | step 6 did not land — re-issue it; if it still will not register, report **NO NET** explicitly with the reason, per step 6's honesty rule |
+   | the **net** gate — **always, unless step 6's hold-gate skip applied** | `predicate_kind: time_elapsed` **and** continuation `armed: true` **and** `will_dispatch: true` | step 6 did not land — re-issue it; if it still will not register, report **NO NET** explicitly with the reason, per step 6's honesty rule. **Under the hold-gate skip its absence is CORRECT** — assert it is absent and that the hold gate you cited is still open and armed |
 
    ⚠️ **Under `/vet-imp`, a `unit_ready` row PRESENT on this unit is the defect,
    not the success signal.** It means step 5 was run anyway; say so, and leave
-   it alone — do **not** withdraw it: withdrawal removes it from the count, and
+   it alone unless the plan is HELD (then withdraw it, per step 3 — a held plan
+   is not meant to derive `ready`); otherwise do **not** withdraw it: withdrawal removes it from the count, and
    if it is the unit's last counted gate `total = 0` makes `ready` vacuously
    false (see the caller table's ⛔ note). **The same holds on the REFUSED arm
    of a standalone vet:** a `unit_ready` row present there means step 5 ran
@@ -3140,7 +3262,9 @@ leave it in the report.
   (the §5.4 refresh rule applies to any continuation-carrying gate too) —
   `GET .../coord/agent-gates?work_unit_id=<id>` for OPEN rows
   carrying a `continuation_spawn` with `continuation_consumed_at == null ∧
-  continuation_cancelled_at == null` (**including pre-dispatch rows**), then
+  continuation_cancelled_at == null` (**including pre-dispatch rows**) — **never a hold
+  gate** (step 6's hold-gate skip: it is the plan's real net; retire only the prior
+  gate you are re-registering or the `vet→implement safety net` row) — then
   **withdraw** it — `coord_withdraw_gate` `{gate_id, reason}` (native MCP) or
   `POST .../coord/gates/:gate_id/withdraw {reason}` (its HTTP twin, bare and
   device-authed — no `/agent/` infix exists for withdraw). One call sets the
@@ -3176,7 +3300,9 @@ gate rots open until a human clicks it).
   `gate_id` — works from a device session since attest takes no upsert); fall back to
   the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, or `Authorization: Bearer <nonce>` on configs
-  written after the Phase 2 header move — no body bearer; maskless fallback), then the
+  written after the Phase 2 header move, a `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}`
+  value expanded from your own environment first — `mcp_expand_env_ref`,
+  `scripts/lib/mcp-env-ref.sh`, never sent literally — no body bearer; maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
   gate with `clearance_audience = 'agent'` in the caller's own tenant; coord flips
@@ -3219,11 +3345,17 @@ this same session, on this same plan. So:
   the SAME assistant turn, with the Skill call last.
 - The VETTED stamp is a **midpoint**, not a finish line. Treat reaching it as
   the trigger to continue, not as a deliverable.
+- **The one exception: §5.4 step 6's hold-gate skip.** Then the plan is
+  VETTED-HELD and `/vet-imp` Step 3 ends the chain at its Step 5 instead of
+  invoking `/implement-plan`. Still hand the report back without ending the
+  turn, but say HELD in it and carry the hold line below.
 
 Brief — under 150 words. State:
 - What the plan was about (one sentence)
 - The 2–5 material defects found, each with the section they were in
 - What you changed (referenced by section name, not full diff)
+- **If §5.4 step 6's hold-gate skip applied:** `HELD — net skipped, plan held
+  behind gate <gate_id> (verdict <v>, will_dispatch <b>)`, one per cited gate
 - The status stamp you added — `Status: VETTED <date>, against <repo>
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
