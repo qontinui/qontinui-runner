@@ -431,6 +431,20 @@ pub const TRUSTED_DOOR_GRACE: &[(&str, &str)] = &[
 /// loses it.
 pub const EXTENSION_ONLY_ROUTES: &[(&str, &str)] = &[("GET", "/ui-bridge/control/elements")];
 
+/// The three routes that choose which app every untargeted UI Bridge call
+/// reaches (`/ui-bridge/sdk/{connect,switch,disconnect}`). Refused to
+/// [`OriginClass::Foreign`] and [`OriginClass::Extension`] in EVERY route
+/// policy, `off` and the shadowing policies included — a page that can pick the
+/// active app can redirect every agent action (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`, R7). `Trusted`
+/// (qontinui-web, the supervisor UI) keeps them: they are on
+/// [`TRUSTED_ROUTES`], which a tripwire test pins.
+pub const ACTIVE_SELECTION_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/ui-bridge/sdk/connect"),
+    ("POST", "/ui-bridge/sdk/switch"),
+    ("POST", "/ui-bridge/sdk/disconnect"),
+];
+
 /// `(METHOD, MatchedPath pattern)` pairs reachable from ANY browser origin
 /// (Foreign, Extension and Trusted) under `enforce`. Derived from the Phase 0 caller
 /// census: the ui-bridge extension's content scripts (which send the visited
@@ -774,6 +788,8 @@ enum Verdict {
     RefuseDoor,
     /// An [`EXTENSION_ONLY_ROUTES`] route from a web page origin.
     RefuseExtensionOnly,
+    /// An [`ACTIVE_SELECTION_ROUTES`] route from a Foreign or Extension origin.
+    RefuseActiveSelection,
     /// Not on the class's allowlist, and the policy enforces for the class.
     RefuseRoute,
 }
@@ -787,6 +803,7 @@ impl Verdict {
             Self::RefuseHost => "refused_host",
             Self::RefuseDoor => "refused_credential_door",
             Self::RefuseExtensionOnly => "refused_extension_only",
+            Self::RefuseActiveSelection => "refused_active_selection",
             Self::RefuseRoute => "refused_route_policy",
         }
     }
@@ -1015,6 +1032,11 @@ impl OriginGuard {
                 mk(Verdict::RefuseExtensionOnly)
             };
         }
+        if listed(ACTIVE_SELECTION_ROUTES, &method, route)
+            && matches!(class, OriginClass::Foreign | OriginClass::Extension)
+        {
+            return mk(Verdict::RefuseActiveSelection);
+        }
         if is_credential_door(&method, route) {
             if class == OriginClass::Trusted
                 && self.route_policy == RoutePolicy::EnforceDoors
@@ -1236,7 +1258,10 @@ async fn origin_guard_middleware(
                 None,
             )
         }
-        Verdict::RefuseDoor | Verdict::RefuseExtensionOnly | Verdict::RefuseRoute => {
+        Verdict::RefuseDoor
+        | Verdict::RefuseExtensionOnly
+        | Verdict::RefuseActiveSelection
+        | Verdict::RefuseRoute => {
             tracing::warn!(
                 origin = ?d.origin,
                 class = d.class.as_str(),
@@ -1248,6 +1273,7 @@ async fn origin_guard_middleware(
             let message = match d.verdict {
                 Verdict::RefuseDoor => "This route returns credentials, reads caller-named paths, makes caller-directed requests or executes code, and is not reachable from a browser origin other than the runner's own webview",
                 Verdict::RefuseExtensionOnly => "This route is reachable only from the runner's webview and the ui-bridge extension's own pages, not from a web page origin",
+                Verdict::RefuseActiveSelection => "This route chooses which app every untargeted UI Bridge call reaches and is not reachable from a web page or extension origin",
                 _ => "This route is not on the allowlist for this origin class",
             };
             let echo = (d.class == OriginClass::Trusted)

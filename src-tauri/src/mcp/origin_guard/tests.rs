@@ -1263,6 +1263,28 @@ fn grace_and_extension_only_lists_are_well_formed() {
     }
 }
 
+/// R7 tripwire: every active-selection route is a registered route and is on
+/// `TRUSTED_ROUTES` (qontinui-web and the supervisor UI keep them), so the
+/// Foreign/Extension refusal is the only thing this list changes.
+#[test]
+fn active_selection_routes_are_registered_and_trusted() {
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(!ACTIVE_SELECTION_ROUTES.is_empty());
+    for (m, p) in ACTIVE_SELECTION_ROUTES {
+        assert!(
+            registered
+                .iter()
+                .any(|(rm, rp)| rp == p && (rm == m || rm == "ANY")),
+            "active-selection entry not registered: {m} {p}"
+        );
+        assert!(
+            TRUSTED_ROUTES.contains(&(*m, *p)),
+            "active-selection entry not on TRUSTED_ROUTES: {m} {p}"
+        );
+        assert!(!is_credential_door(m, p));
+    }
+}
+
 /// S6 tripwire: nothing is routed after `origin_guard::apply` in
 /// `create_router` (it would bypass the guard). Proven on synthetic source.
 #[test]

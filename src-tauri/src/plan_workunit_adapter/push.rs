@@ -323,6 +323,11 @@ pub struct UpsertBody {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// RFC 7396 merge-patch onto the stored metadata. Mirrors coord's
+    /// `UpsertRequest.metadata_patch` (mutually exclusive with `metadata`;
+    /// coord refuses both together). Keys the patch omits are left as stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_patch: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by_actor: Option<String>,
     /// When the plan was authored, RFC 3339 (`YYYY-MM-DDT00:00:00Z`), derived
@@ -371,6 +376,37 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
         m["area"] = serde_json::Value::String(area.clone());
     }
     m
+}
+
+/// Which coord metadata arm a plan push uses: `(metadata, metadata_patch)`,
+/// exactly one `Some`.
+///
+/// * Phases detected: the full [`build_metadata`] object as a wholesale
+///   `metadata` replace (attestations are carried forward by coord).
+/// * NO phases detected: a scan that found none has no information about the
+///   stored list, so sending `phases: []` would erase a good one (the
+///   2026-09-16 wipe). Send a `metadata_patch` that omits `phases`. `area` is
+///   sent as `null` when the plan declares none, which RFC 7396 reads as
+///   "delete the key" — preserving the plan-is-sole-author-of-area rule that
+///   the wholesale replace gave. `archive_path` is likewise sent as `null`, so
+///   a phase-less plan restored from the archive dir clears a stale one.
+///
+///   Accepted trade-off: a plan whose phases are removed on purpose (or whose
+///   headings stop parsing) no longer clears the stored phase list from the
+///   adapter push — that now needs a manual coord edit or a wholesale
+///   `metadata` replace. Chosen because a wiped list is unrecoverable data
+///   loss while a stale list is visible and recoverable.
+pub fn metadata_arms(u: &ParsedWorkUnit) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    if !u.phases.is_empty() {
+        return (Some(build_metadata(u)), None);
+    }
+    let mut patch = build_metadata(u);
+    if let Some(obj) = patch.as_object_mut() {
+        obj.remove("phases");
+        obj.entry("area").or_insert(serde_json::Value::Null);
+        obj.insert("archive_path".to_string(), serde_json::Value::Null);
+    }
+    (None, Some(patch))
 }
 
 /// The pure edge-trigger decision: given the file's parsed status and the
@@ -692,7 +728,7 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     status_write: StatusWrite,
     scope: TenantScope,
 ) -> Result<PushOutcome> {
-    let metadata = build_metadata(u);
+    let (metadata, metadata_patch) = metadata_arms(u);
     // Slug-derived, so the same value on every upsert this push emits — the
     // status-less refreshes included, since coord COALESCEs it on conflict.
     let authored_at = authored_at_from_stem(&u.slug);
@@ -797,7 +833,8 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                             slug: u.slug.clone(),
                             title: u.title.clone(),
                             status: None,
-                            metadata: Some(metadata.clone()),
+                            metadata: metadata.clone(),
+                            metadata_patch: metadata_patch.clone(),
                             by_actor: Some(ADAPTER_ACTOR.to_string()),
                             authored_at: authored_at.clone(),
                         },
@@ -901,7 +938,8 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                     slug: u.slug.clone(),
                     title: u.title.clone(),
                     status: sent.clone(),
-                    metadata: Some(metadata),
+                    metadata,
+                    metadata_patch,
                     by_actor: Some(ADAPTER_ACTOR.to_string()),
                     authored_at,
                 },
@@ -918,7 +956,8 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                     slug: u.slug.clone(),
                     title: u.title.clone(),
                     status: None,
-                    metadata: Some(metadata),
+                    metadata,
+                    metadata_patch,
                     by_actor: Some(ADAPTER_ACTOR.to_string()),
                     authored_at,
                 },
@@ -1018,7 +1057,8 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                     slug: u.slug.clone(),
                     title: u.title.clone(),
                     status: None,
-                    metadata: Some(metadata),
+                    metadata,
+                    metadata_patch,
                     by_actor: Some(ADAPTER_ACTOR.to_string()),
                     authored_at,
                 },
@@ -1060,16 +1100,16 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
-/// The archive stamp's `metadata`: `archive_path`, plus the plan's `area` when
-/// its status block declares one. coord replaces `metadata` wholesale, so an
-/// archive stamp without the area would erase it from the unit — the same
-/// omit-when-`None` rule as [`build_metadata`].
-fn archive_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
-    let mut m = serde_json::json!({ "archive_path": u.source_path });
-    if let Some(area) = &u.area {
-        m["area"] = serde_json::Value::String(area.clone());
-    }
-    m
+/// The archive stamp as an RFC 7396 `metadata_patch`: `archive_path`, plus the
+/// plan's `area` — `null` (delete) when its status block declares none, so the
+/// plan file stays the sole author of `area`. A patch, never a wholesale
+/// `metadata` replace: a replace would drop the stored `phases`, `source_path`
+/// and `depends_on` of a plan found in the archive directory.
+fn archive_metadata_patch(u: &ParsedWorkUnit) -> serde_json::Value {
+    serde_json::json!({
+        "archive_path": u.source_path,
+        "area": u.area,
+    })
 }
 
 /// Stamp `metadata.archive_path` for a plan found in the archive directory —
@@ -1098,7 +1138,8 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
             title: u.title.clone(),
             // NEVER a status write from the archive scan (D4).
             status: None,
-            metadata: Some(archive_metadata(u)),
+            metadata: None,
+            metadata_patch: Some(archive_metadata_patch(u)),
             by_actor: Some(ADAPTER_ACTOR.to_string()),
             // Harmless under coord's COALESCE, and it means a plan that only ever
             // exists in the archive still gets dated.
@@ -1520,7 +1561,7 @@ mod tests {
         assert_eq!(ups.len(), 1, "exactly one metadata-only upsert");
         assert!(ups[0].status.is_none(), "archive upsert carries NO status");
         assert_eq!(
-            ups[0].metadata.as_ref().unwrap()["archive_path"],
+            ups[0].metadata_patch.as_ref().unwrap()["archive_path"],
             serde_json::json!(u.source_path),
             "archive_path stamped to the archived file path"
         );
@@ -1711,11 +1752,31 @@ mod tests {
             .unwrap();
 
         let ups = sink.upserts.lock().unwrap();
-        let first = ups[0].metadata.as_ref().unwrap();
+        let first = ups[0].metadata_patch.as_ref().unwrap();
         assert_eq!(first["area"], serde_json::json!("ci-runners"));
         assert_eq!(first["archive_path"], serde_json::json!(u.source_path));
-        let second = ups[1].metadata.as_ref().unwrap();
-        assert!(!second.as_object().unwrap().contains_key("area"));
+        // Undeclared area is an explicit null (RFC 7396 delete).
+        let second = ups[1].metadata_patch.as_ref().unwrap();
+        assert!(second["area"].is_null());
+    }
+
+    /// The archive stamp is a PATCH: no wholesale `metadata` on the wire, and
+    /// no `phases`/`source_path`/`depends_on` key for coord to overwrite.
+    #[tokio::test]
+    async fn archive_stamp_is_a_patch_that_cannot_drop_stored_phases() {
+        let sink = FakeSink::default();
+        let u = unit("2026-01-01-archived", "shipped");
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
+        let ups = sink.upserts.lock().unwrap();
+        let wire = serde_json::to_value(&ups[0]).unwrap();
+        assert!(!wire.as_object().unwrap().contains_key("metadata"));
+        let p = wire["metadata_patch"].as_object().unwrap();
+        assert_eq!(p["archive_path"], serde_json::json!(u.source_path));
+        for k in ["phases", "source_path", "depends_on"] {
+            assert!(!p.contains_key(k), "{k} must not be in the archive patch");
+        }
     }
 
     #[tokio::test]
@@ -1725,6 +1786,7 @@ mod tests {
             title: None,
             status: None,
             metadata: None,
+            metadata_patch: None,
             by_actor: None,
             authored_at: None,
         };
@@ -1985,6 +2047,7 @@ mod tests {
             title: None,
             status: None,
             metadata: None,
+            metadata_patch: None,
             by_actor: None,
             authored_at: None,
         };
@@ -2131,6 +2194,66 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "p4");
         assert_eq!(calls[0].1, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    /// Phases detected: the full object rides as a wholesale `metadata`
+    /// replace, exactly as before, and no patch is sent (coord refuses both).
+    #[tokio::test]
+    async fn detected_phases_push_wholesale_metadata_with_the_phase_list() {
+        let sink = FakeSink::default();
+        push_work_unit(&sink, &unit("s", "vetted"), None, TenantScope::Unresolved)
+            .await
+            .unwrap();
+        let ups = sink.upserts.lock().unwrap();
+        assert!(ups[0].metadata_patch.is_none());
+        let m = ups[0].metadata.as_ref().expect("metadata sent");
+        assert_eq!(m["phases"][0]["index"], 1);
+        let wire = serde_json::to_value(&ups[0]).unwrap();
+        assert!(!wire.as_object().unwrap().contains_key("metadata_patch"));
+    }
+
+    /// No phases detected: never a `phases: []` replace. The push sends a
+    /// `metadata_patch` that has no `phases` key, so coord keeps its stored
+    /// list; the other keys still flow and an undeclared `area` is `null`
+    /// (RFC 7396 delete).
+    #[tokio::test]
+    async fn no_detected_phases_sends_a_patch_that_omits_phases_on_every_upsert() {
+        let none = ParsedWorkUnit {
+            phases: vec![],
+            ..unit("s", "vetted")
+        };
+        // Create, refresh, and transition-refresh all build the same arm.
+        for last in [None, Some("vetted"), Some("draft")] {
+            let sink = FakeSink::default();
+            push_work_unit(&sink, &none, last, TenantScope::Unresolved)
+                .await
+                .unwrap();
+            let ups = sink.upserts.lock().unwrap();
+            assert!(!ups.is_empty());
+            for up in ups.iter() {
+                assert!(up.metadata.is_none(), "no wholesale replace: {up:?}");
+                let p = up.metadata_patch.as_ref().expect("patch sent");
+                assert!(!p.as_object().unwrap().contains_key("phases"), "{p}");
+                assert_eq!(p["source_path"], "plans/s.md");
+                assert_eq!(p["depends_on"][0], "2026-01-01-dep");
+                assert!(p["area"].is_null());
+                assert!(
+                    p.as_object().unwrap().contains_key("archive_path")
+                        && p["archive_path"].is_null(),
+                    "a stale archive_path must be cleared: {p}"
+                );
+                let wire = serde_json::to_value(up).unwrap();
+                assert!(!wire.as_object().unwrap().contains_key("metadata"));
+            }
+        }
+        // A declared area rides as a value in the patch.
+        let with = ParsedWorkUnit {
+            area: Some("published-parity".to_string()),
+            ..none
+        };
+        let (m, p) = metadata_arms(&with);
+        assert!(m.is_none());
+        assert_eq!(p.unwrap()["area"], "published-parity");
     }
 
     #[tokio::test]

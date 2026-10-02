@@ -37,6 +37,13 @@ export type SkipReason =
   | "main-merge"
   | "grace"
   | "not-a-candidate"
+  /** coord's census of the path is out of date; it defers until re-observed. */
+  | "stale-census"
+  /** No coord allocation record — removal is never authorized (does not clear with time). */
+  | "undeclared-not-removable"
+  /** Landed, clean and idle — coord offers only a rejunction, never a removal. */
+  | "landed-idle-not-removable"
+  /** coord gave no reason — it serves no blocked list, never evaluated the path, or sent an unknown token. */
   | "not-cleared"
   | "coord-unreachable"
   | "absent"
@@ -166,6 +173,9 @@ export const REASON_LABEL: Record<SkipReason, string> = {
   "main-merge": "main merge",
   grace: "grace period",
   "not-a-candidate": "in use",
+  "stale-census": "census stale",
+  "undeclared-not-removable": "undeclared",
+  "landed-idle-not-removable": "idle, keep-only",
   "not-cleared": "not cleared",
   "coord-unreachable": "coord offline",
   absent: "gone",
