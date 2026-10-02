@@ -13,6 +13,8 @@ import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { windowTitleCounts } from "../sessionCounts";
+import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
+import { planRestart } from "../restartResume";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
@@ -28,7 +30,13 @@ type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
  */
 export type RestartOutcome =
   | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+  | {
+      restarted: false;
+      reason: "not-restartable" | "spawn-failed" | "resume-unsafe";
+      state?: string;
+      /** Why a resume was refused (`resume-unsafe`). */
+      detail?: string;
+    };
 
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
   handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
@@ -46,7 +54,15 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   // TerminalCore + SessionState pair. `stateTracking` shape is
   // preserved via spread in `useTerminalSession()`'s value-object.
   const session = useTerminalSession();
-  const { tabs, createTerminal, closeTerminal, zoneLayout, terminalRefs, pageId } = session;
+  const {
+    tabs,
+    createTerminal,
+    closeTerminal,
+    zoneLayout,
+    terminalRefs,
+    pageId,
+    shellIntegration,
+  } = session;
   const stateTracking = session;
   const { labelsAndTags, addHistoryEvent } = useZoneMetadata();
 
@@ -86,6 +102,17 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
    * session — deterministically, instead of waiting out the poll's debounce —
    * kills the PTY, and re-syncs the tab list against the backend afterwards.
    *
+   * WHAT THE REPLACEMENT IS. A pane that hosted a Claude session (its tab carries
+   * `claudeSessionId`) is RESUMED: `claude --resume <id>`, through the same
+   * `handleResumeSession` path Past Sessions -> Resume takes, not replaced by a
+   * bare shell. The chip's "Restart? Session errored" promised a restart and
+   * delivered an empty `powershell.exe`. Only a pane with no Claude session gets
+   * a shell. The old pane's close record is harmless to the resumed session: the
+   * resume re-opens the record under the NEW terminal first, and a close naming
+   * the old terminal then resolves against that terminal, not the session id.
+   * If a live process already hosts the id (or liveness cannot be read) the
+   * restart is refused rather than forking the transcript.
+   *
    * Ordering: the replacement is created FIRST and the old pane retired only
    * once it exists. The spawn can legitimately fail (the resource gate refuses
    * below the free-commit floor, and the operator can decline the override), and
@@ -101,10 +128,21 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
         return { restarted: false, reason: "not-restartable", state };
       }
       const label = labelsAndTags.zoneLabels[zoneIdx];
-      const tabId = await createTerminal(
-        oldTab?.title ? `${oldTab.title} (2)` : undefined,
-        oldTab?.workingDir ?? undefined,
+      // Liveness is only consulted for a pane that hosted a Claude session.
+      const plan = planRestart(
+        oldTab,
+        oldTab?.claudeSessionId ? await fetchLiveClaudeSessionIds() : new Set(),
       );
+      if (plan.kind === "blocked") {
+        return { restarted: false, reason: "resume-unsafe", state, detail: plan.detail };
+      }
+      const tabId =
+        plan.kind === "resume"
+          ? await shellIntegration.handleResumeSession(plan.session)
+          : await createTerminal(
+              oldTab?.title ? `${oldTab.title} (2)` : undefined,
+              oldTab?.workingDir ?? undefined,
+            );
       if (tabId) {
         zoneLayout.assignTabToZone(zoneIdx, tabId);
         zoneLayout.setFocusedZone(zoneIdx);
@@ -134,6 +172,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       labelsAndTags.setZoneLabel,
       createTerminal,
       closeTerminal,
+      shellIntegration,
     ],
   );
 
