@@ -86,6 +86,16 @@
 //!   its mailbox by hand (`coord_inbox`) removes the row from `pending`, which
 //!   erases the surfacing tracker's clock for it — the counter is what is
 //!   left to say "push missed N times" after that.
+//! - **Woken by coord, polled as the catch-up.** Coord rings
+//!   [`crate::session::message_wake`]'s doorbell with a `message_enqueued`
+//!   directive when it commits a row for a session on this device; the loop
+//!   waits on that doorbell beside its [`POLL_INTERVAL`] timer
+//!   ([`wait_next_tick`]), so an idle hosted recipient sees a message in about
+//!   a second instead of up to ten. The poll stays, so a dropped push costs
+//!   only today's latency. `data.sessionMessages.delivered_trigger` says which
+//!   of the two woke the tick that delivered (plan
+//!   `2026-10-02-a-sent-coord-message-does-not-wake-its-recipient-session`,
+//!   Phase 4).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -109,6 +119,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// source (e.g. a merge wave red-ing many PRs authored by one session) cannot
 /// spam a single session with back-to-back prompts. Messages held off by the
 /// cooldown stay UNACKED and are retried on a later tick.
+///
+/// The one exception is a `blocking` message ([`skips_cooldown`]): the sender
+/// declared it urgent, so it is not held behind a recent inject. A push wake
+/// never bypasses the cooldown by itself — it is the spam bound the doorbell
+/// must not defeat.
 const PER_SESSION_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Idle-gate quiescence debounce. The PTY idle gate reads the grid, waits this
@@ -375,12 +390,36 @@ impl DeliveredArm {
     }
 }
 
+/// What woke the tick that ran a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickTrigger {
+    /// Coord's `message_enqueued` doorbell
+    /// ([`crate::session::message_wake`]).
+    Push,
+    /// The [`POLL_INTERVAL`] timer — the catch-up (and the first tick at boot).
+    Poll,
+}
+
+impl TickTrigger {
+    /// Every trigger, for rendering the counter family with no series absent.
+    const ALL: [TickTrigger; 2] = [TickTrigger::Push, TickTrigger::Poll];
+
+    /// The `/health` key and the log label for this trigger.
+    fn as_str(self) -> &'static str {
+        match self {
+            TickTrigger::Push => "push",
+            TickTrigger::Poll => "poll",
+        }
+    }
+}
+
 /// Slot layout of [`push_counters`]: `push_ok`, one per [`BlockReason`], one
-/// per [`DeliveredArm`].
+/// per [`DeliveredArm`], one per [`TickTrigger`].
 const PUSH_OK_SLOT: usize = 0;
 const PUSH_MISS_SLOT_BASE: usize = 1;
 const DELIVERED_ARM_SLOT_BASE: usize = PUSH_MISS_SLOT_BASE + BlockReason::ALL.len();
-const PUSH_COUNTER_SLOTS: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
+const DELIVERED_TRIGGER_SLOT_BASE: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
+const PUSH_COUNTER_SLOTS: usize = DELIVERED_TRIGGER_SLOT_BASE + TickTrigger::ALL.len();
 
 fn push_counters() -> &'static [std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS] {
     static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS]> =
@@ -404,16 +443,25 @@ fn arm_slot(arm: DeliveredArm) -> usize {
             .expect("every DeliveredArm is in DeliveredArm::ALL")
 }
 
+fn trigger_slot(trigger: TickTrigger) -> usize {
+    DELIVERED_TRIGGER_SLOT_BASE
+        + TickTrigger::ALL
+            .iter()
+            .position(|t| *t == trigger)
+            .expect("every TickTrigger is in TickTrigger::ALL")
+}
+
 /// One more tick on which a message could not be pushed, for `reason`.
 fn record_push_miss(reason: BlockReason) {
     push_counters()[miss_slot(reason)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// One more successful inject, through `arm`. Bumps `push_ok` and the arm's
-/// own series.
-fn record_push_ok(arm: DeliveredArm) {
+/// One more successful inject, through `arm`, on a tick woken by `trigger`.
+/// Bumps `push_ok`, the arm's own series and the trigger's own series.
+fn record_push_ok(arm: DeliveredArm, trigger: TickTrigger) {
     push_counters()[PUSH_OK_SLOT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     push_counters()[arm_slot(arm)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    push_counters()[trigger_slot(trigger)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The `data.sessionMessages` block of `GET /health`:
@@ -421,8 +469,15 @@ fn record_push_ok(arm: DeliveredArm) {
 /// ```json
 /// { "push_ok": n,
 ///   "push_miss": { "target_not_live": n, "pty_never_idle": n },
-///   "delivered_arm": { "sdk": n, "terminal": n } }
+///   "delivered_arm": { "sdk": n, "terminal": n },
+///   "delivered_trigger": { "push": n, "poll": n } }
 /// ```
+///
+/// `delivered_trigger` attributes each inject to what woke its tick: coord's
+/// `message_enqueued` doorbell (`push`) or the catch-up timer (`poll`). A
+/// message that the push woke for but that waited on a busy terminal and went
+/// in on a later timer tick counts as `poll` — the series answers "which
+/// trigger delivered", not "was a push ever sent".
 ///
 /// Every series is present even at zero — an absent key would read as "this
 /// never happens", which is the ambiguity the family exists to remove.
@@ -443,10 +498,18 @@ pub(crate) fn health_snapshot() -> serde_json::Value {
             serde_json::json!(counters[arm_slot(arm)].load(Relaxed)),
         );
     }
+    let mut delivered_trigger = serde_json::Map::new();
+    for trigger in TickTrigger::ALL {
+        delivered_trigger.insert(
+            trigger.as_str().to_string(),
+            serde_json::json!(counters[trigger_slot(trigger)].load(Relaxed)),
+        );
+    }
     serde_json::json!({
         "push_ok": counters[PUSH_OK_SLOT].load(Relaxed),
         "push_miss": serde_json::Value::Object(push_miss),
         "delivered_arm": serde_json::Value::Object(delivered_arm),
+        "delivered_trigger": serde_json::Value::Object(delivered_trigger),
     })
 }
 
@@ -1264,6 +1327,8 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
     let mut tracker = SurfacingTracker::default();
     // Edge-trigger the "killed" / "unpaired" steady-state logs.
     let mut last_killed_logged = false;
+    // The boot tick is the catch-up for anything enqueued while down.
+    let mut trigger = TickTrigger::Poll;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1284,7 +1349,7 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
                 last_killed_logged = false;
             }
             // Fail-open: a tick error NEVER panics the loop.
-            if let Err(e) = deliver_once(&api_state, &mut guard, &mut tracker).await {
+            if let Err(e) = deliver_once(&api_state, &mut guard, &mut tracker, trigger).await {
                 // `{e:#}` — anyhow's ALTERNATE Display, which renders the whole
                 // context chain. A bare `{e}` prints only the outermost layer,
                 // so a `reqwest` transport fault reached this WARN as the
@@ -1312,14 +1377,46 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
             guard.prune(Instant::now());
         }
 
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
+        match wait_next_tick(
+            &mut shutdown_rx,
+            crate::session::message_wake::wake(),
+            POLL_INTERVAL,
+        )
+        .await
+        {
+            Some(next) => trigger = next,
+            None => {
                 info!("session_message_poller shutting down");
                 return;
             }
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
         }
     }
+}
+
+/// Wait for whatever starts the next tick: coord's `message_enqueued`
+/// doorbell (`wake`), the catch-up timer (`interval`), or shutdown (`None`).
+///
+/// `wake` is [`tokio::sync::Notify`], whose `notify_one` stores a permit when
+/// nobody is waiting — so a push that rang while the previous tick was still
+/// running returns here at once rather than being lost, and a burst of pushes
+/// coalesces into a single tick.
+async fn wait_next_tick(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    wake: &tokio::sync::Notify,
+    interval: Duration,
+) -> Option<TickTrigger> {
+    tokio::select! {
+        _ = shutdown_rx.changed() => None,
+        _ = wake.notified() => Some(TickTrigger::Push),
+        _ = tokio::time::sleep(interval) => Some(TickTrigger::Poll),
+    }
+}
+
+/// Does `priority` skip the per-session cooldown? Only `blocking`: the sender
+/// declared it urgent. Read from the PENDING row — the authorized read — so
+/// the exception holds whether the push or the catch-up poll woke the tick.
+fn skips_cooldown(priority: &str) -> bool {
+    priority.trim().eq_ignore_ascii_case("blocking")
 }
 
 /// The injectable form of a resolved target once the idle gate has run:
@@ -1392,6 +1489,7 @@ async fn deliver_once(
     api_state: &Arc<ApiState>,
     guard: &mut DeliveryGuard,
     tracker: &mut SurfacingTracker,
+    trigger: TickTrigger,
 ) -> anyhow::Result<()> {
     // Device JWT — unpaired ⇒ skip the tick quietly (no spam).
     let token = match crate::auth::AuthManager::new().get_access_token() {
@@ -1472,7 +1570,9 @@ async fn deliver_once(
         };
 
         // Rate-limit: a session in cooldown waits — leave the message pending.
-        if guard.in_cooldown(to_session, now) {
+        // A `blocking` message is the one exception (see
+        // `PER_SESSION_COOLDOWN`).
+        if guard.in_cooldown(to_session, now) && !skips_cooldown(&msg.priority) {
             debug!(
                 "session_message_poller: session {to_session} in cooldown — deferring msg {}",
                 msg.message_id
@@ -1583,7 +1683,7 @@ async fn deliver_once(
                 continue;
             }
         };
-        record_push_ok(arm);
+        record_push_ok(arm, trigger);
 
         // 4. Mark delivered. Record locally FIRST (cooldown + delivered-set)
         // so even if the ack POST fails we won't re-inject within the TTL.
@@ -1611,9 +1711,11 @@ async fn deliver_once(
         } else {
             delivered += 1;
             info!(
-                "session_message_poller: delivered msg {} to session {to_session} via {}",
+                "session_message_poller: delivered msg {} to session {to_session} via {} \
+                 (woken by {})",
                 msg.message_id,
-                arm.as_str()
+                arm.as_str(),
+                trigger.as_str()
             );
         }
     }
@@ -2582,12 +2684,16 @@ mod tests {
             k
         };
         let snap = health_snapshot();
-        assert_eq!(keys(&snap), ["delivered_arm", "push_miss", "push_ok"]);
+        assert_eq!(
+            keys(&snap),
+            ["delivered_arm", "delivered_trigger", "push_miss", "push_ok"]
+        );
         assert_eq!(
             keys(&snap["push_miss"]),
             ["pty_never_idle", "target_not_live"]
         );
         assert_eq!(keys(&snap["delivered_arm"]), ["sdk", "terminal"]);
+        assert_eq!(keys(&snap["delivered_trigger"]), ["poll", "push"]);
 
         // A bump moves exactly its own series. Exact deltas on a
         // process-global counter are only sound under the serial lock —
@@ -2595,7 +2701,7 @@ mod tests {
         let _serial = counter_test_guard();
         let before = health_snapshot();
         record_push_miss(BlockReason::PtyNeverIdle);
-        record_push_ok(DeliveredArm::Terminal);
+        record_push_ok(DeliveredArm::Terminal, TickTrigger::Push);
         let after = health_snapshot();
         let u = |v: &serde_json::Value, path: &[&str]| -> u64 {
             let mut cur = v;
@@ -2618,12 +2724,115 @@ mod tests {
             u(&before, &["delivered_arm", "sdk"]),
             "an inject through one arm must not move another"
         );
+        assert_eq!(
+            u(&after, &["delivered_trigger", "push"]),
+            u(&before, &["delivered_trigger", "push"]) + 1
+        );
+        assert_eq!(
+            u(&after, &["delivered_trigger", "poll"]),
+            u(&before, &["delivered_trigger", "poll"]),
+            "an inject on a push-woken tick must not move the poll series"
+        );
     }
 
     #[test]
     fn delivered_arm_labels_match_health_keys() {
         assert_eq!(DeliveredArm::Sdk.as_str(), "sdk");
         assert_eq!(DeliveredArm::Terminal.as_str(), "terminal");
+        assert_eq!(TickTrigger::Push.as_str(), "push");
+        assert_eq!(TickTrigger::Poll.as_str(), "poll");
+    }
+
+    // ---- push wake (plan 2026-10-02-…-does-not-wake-its-recipient-session) --
+
+    /// A doorbell ring starts the next tick at once, long before the poll
+    /// interval, and is attributed to `Push`.
+    #[tokio::test]
+    async fn wait_next_tick_wakes_on_the_doorbell_before_the_interval() {
+        let (_tx, mut rx) = watch::channel(false);
+        let wake = tokio::sync::Notify::new();
+        let started = Instant::now();
+        let waiter = wait_next_tick(&mut rx, &wake, Duration::from_secs(60));
+        tokio::pin!(waiter);
+        // Not ready before the ring.
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+            .await
+            .is_err());
+        wake.notify_one();
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the ring must end the wait");
+        assert_eq!(got, Some(TickTrigger::Push));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A ring that lands while no tick is waiting (the previous tick was still
+    /// running) is kept as a permit — the next wait returns immediately rather
+    /// than losing it to the 10 s sleep.
+    #[tokio::test]
+    async fn a_ring_during_a_tick_is_not_lost() {
+        let (_tx, mut rx) = watch::channel(false);
+        let wake = tokio::sync::Notify::new();
+        wake.notify_one();
+        wake.notify_one(); // a burst coalesces into one permit
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_next_tick(&mut rx, &wake, Duration::from_secs(60)),
+        )
+        .await
+        .expect("a stored permit must end the wait at once");
+        assert_eq!(got, Some(TickTrigger::Push));
+        // The burst left no second permit: the following wait falls to the
+        // timer.
+        let got = wait_next_tick(&mut rx, &wake, Duration::from_millis(20)).await;
+        assert_eq!(got, Some(TickTrigger::Poll));
+    }
+
+    /// With no ring, the catch-up timer still ticks; shutdown ends the wait.
+    #[tokio::test]
+    async fn wait_next_tick_falls_back_to_the_poll_and_honours_shutdown() {
+        let (tx, mut rx) = watch::channel(false);
+        let wake = tokio::sync::Notify::new();
+        let got = wait_next_tick(&mut rx, &wake, Duration::from_millis(20)).await;
+        assert_eq!(got, Some(TickTrigger::Poll));
+
+        tx.send(true).expect("receiver alive");
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_next_tick(&mut rx, &wake, Duration::from_secs(60)),
+        )
+        .await
+        .expect("shutdown must end the wait");
+        assert_eq!(got, None);
+    }
+
+    /// The loop waits on the process-global doorbell the `/ws` arm rings —
+    /// not on a private `Notify` that nothing would ever notify.
+    #[test]
+    fn poller_loop_waits_on_the_message_wake_doorbell() {
+        let src = include_str!("session_message_poller.rs");
+        let start = src
+            .find("async fn poller_loop(")
+            .expect("poller_loop is defined in this file");
+        let end = src
+            .get(start..)
+            .expect("char boundary")
+            .find("async fn wait_next_tick(")
+            .map(|i| start + i)
+            .expect("wait_next_tick follows poller_loop");
+        let loop_src = src.get(start..end).expect("char boundaries");
+        assert!(loop_src.contains("wait_next_tick("));
+        assert!(loop_src.contains("crate::session::message_wake::wake()"));
+    }
+
+    /// Only `blocking` skips the per-session cooldown.
+    #[test]
+    fn only_blocking_skips_the_cooldown() {
+        assert!(skips_cooldown("blocking"));
+        assert!(skips_cooldown(" Blocking "));
+        assert!(!skips_cooldown("normal"));
+        assert!(!skips_cooldown("fyi"));
+        assert!(!skips_cooldown(""));
     }
 
     // ---- typed-terminal gate ------------------------------------------------

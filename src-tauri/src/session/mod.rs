@@ -68,6 +68,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod message_wake; // Session-message doorbell: the `message_enqueued` directive arm that wakes the in-session delivery poller out of its 10 s sleep (plan 2026-10-02-a-sent-coord-message-does-not-wake-its-recipient-session, Phase 4)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;

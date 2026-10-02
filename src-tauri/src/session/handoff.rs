@@ -781,6 +781,11 @@ async fn handle_push_frame(
     // grant arms are disjoint in both directions (asserted in `create`'s
     // tests), so an attach grant can never land in the create table.
     super::create::handle_push_frame(device_id, text);
+    // The MESSAGE-WAKE arm — fifth suffix on the same socket
+    // (`.message_enqueued`), same disambiguation. Rings the session-message
+    // poller's doorbell; materializes and records nothing (the payload is ids
+    // only — the body stays behind the poller's authorized pending read).
+    super::message_wake::handle_push_frame(device_id, text);
 
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;
