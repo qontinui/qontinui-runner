@@ -238,8 +238,8 @@ export function buildSessionOpenArgs(params: {
  * Durable-close reasons a FRONTEND caller may record. Mirrors
  * `useTerminalManager`'s `FrontendCloseReason` — both arms have a live tab, so
  * a frontend writer can only ever be recording one of these two. The backend
- * additionally mints reasons no frontend can (`poll-dead`, `never-started`,
- * `no-terminal`, `migrated`, `superseded-terminal-reuse`); they are
+ * additionally mints reasons no frontend can (the other `CLOSE_REASON_*`
+ * constants in `src-tauri/src/session/session_lifecycle_store.rs`); they are
  * deliberately NOT in this union.
  */
 export type FrontendSessionCloseReason = "explicit" | "pty-exit";

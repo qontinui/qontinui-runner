@@ -89,6 +89,7 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod stop_reason; // "Why did my session stop?" — the typed answer behind GET /sessions/{id}/stop-reason (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, C5)
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;
