@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use super::CommandResponse;
 use crate::mcp::remote_terminal::{
-    client, AttachError, AttachRefusal, AttachedReply, ATTACH_TIMEOUT,
+    client, AttachError, AttachRefusal, AttachedReply, GrantRenewer, RenewedGrant, ATTACH_TIMEOUT,
 };
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
@@ -751,15 +751,22 @@ pub(crate) async fn open_remote_tab(
         ));
     }
 
-    let pane = Arc::new(RemotePaneIo::new(
-        minted.grant_jti.clone(),
-        attached.terminal_id.clone(),
-        minted.grant.clone(),
-        client().sink(),
-        cols,
-        rows,
-        attached.ring,
-    ));
+    let pane = Arc::new(
+        RemotePaneIo::new(
+            minted.grant_jti.clone(),
+            attached.terminal_id.clone(),
+            minted.grant.clone(),
+            client().sink(),
+            cols,
+            rows,
+            attached.ring,
+        )
+        .with_session_id(session_uuid.to_string()),
+    );
+    // So a reattach that finds this grant expired can mint the next one.
+    client().set_grant_renewer(Arc::new(CoordGrantRenewer {
+        app: app_handle.clone(),
+    }));
     client().register_pane(pane.clone());
 
     let target_id = minted
@@ -838,6 +845,43 @@ pub(crate) async fn open_remote_tab(
             client().discard_pending_output(&minted.grant_jti);
             Err(format!("remote_attach:session_spawn_failed: {e}"))
         }
+    }
+}
+
+/// Renews an expired attach grant for a live remote tab — plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches` (D2).
+///
+/// The same mint the picker uses, so the same issuance policy applies: a
+/// session coord no longer places in this tenant, or a device that stopped
+/// accepting remote attach, is refused here exactly as a fresh attach would
+/// be, and the reattach supervisor closes the tab with that refusal.
+struct CoordGrantRenewer {
+    app: tauri::AppHandle,
+}
+
+impl GrantRenewer for CoordGrantRenewer {
+    fn renew<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let session = uuid::Uuid::parse_str(session_id).map_err(|e| {
+                format!("remote_attach:invalid_session_id: {session_id:?}: {e}")
+            })?;
+            let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
+            info!(
+                session = %session,
+                grant_jti = %minted.grant_jti,
+                expires_at = ?minted.expires_at,
+                "remote attach: grant renewed for a reattach"
+            );
+            Ok(RenewedGrant {
+                grant: minted.grant,
+                grant_jti: minted.grant_jti,
+            })
+        })
     }
 }
 
