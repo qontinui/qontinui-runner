@@ -764,25 +764,51 @@ pub struct FinishSessionRequest {
 /// `POST /sessions/{id}/finish` — mark a session's WORK as complete, or unmark
 /// it with `{"finished": false}`.
 ///
-/// This is the LOCAL rung of the `/finish-session` transport cascade: it works
-/// with coord unreachable, writing the marker locally with `finishSynced:false`
-/// so the outbox carries it to coord when coord returns. A local-only mark is a
-/// legitimate terminal state, not a failure.
+/// The runner-local, PATH-ADDRESSED rung of the `/finish-session` cascade: the
+/// target is the URL path, so no spelling of it can land on a peer, and it
+/// names no work unit. It works with coord unreachable — the marker is written
+/// locally and the outbox carries it to coord when coord returns.
 ///
-/// **Metadata only — never touches the process.** Its one behavioural effect is
-/// that `restorable_records` stops offering the session for resume, which is
-/// what makes a rebuilt runner bring back only the UNFINISHED sessions.
+/// **Metadata only — never touches the process.** Its one local behavioural
+/// effect is that `restorable_records` stops offering the session for resume,
+/// which is what makes a rebuilt runner bring back only the UNFINISHED
+/// sessions.
 ///
-/// `404` when the id is unknown or the marker was already in the requested
-/// state; the store reports a no-op as `None`, and a no-op must not read as a
-/// successful write.
+/// Responses:
+/// - `404` — the id is unknown to this runner's lifecycle registry (a session
+///   no runner plane tracks, or a different runner instance's). Only that:
+///   an unreadable registry is a `500`, never a `404`.
+/// - `500` — the lifecycle registry is unavailable (its lock is poisoned),
+///   so whether the id is known is itself unknown.
+/// - `503` — this runner manages no lifecycle store at all (not in Tauri
+///   state: an early-boot window or a build/instance that never attached
+///   one). Nothing was read or written.
+/// - `200` otherwise, INCLUDING a re-run whose marker was already in the
+///   requested state. The body ([`FinishOutcome::response_json`]) says what
+///   changed (`"marker"`, `"reason_only"`, `"none"`) and whether coord was
+///   told (`coord.queued`, `coord.coordSessionId`, `coord.reason`), beside the
+///   record's own `finishSynced`. A `200` is never by itself evidence coord
+///   heard: `coord.queued: false` means the resume set is corrected and coord
+///   is NOT told. `changed: "none"` wrote nothing locally; on a mark coord
+///   has not ACKed it RE-OFFERS the owed coord write (the retry door) and
+///   reports that attempt's verdict, while on a synced mark it queues nothing
+///   (`reason: "not_requeued"`) — read `session.finishSynced` for the current
+///   verdict.
+///
+/// Honest local-only cases: a session whose harness id changed inside the
+/// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
+/// in-process `/resume` picker, or an adoption whose hook posted `startup`
+/// (the Windows `.cmd` shim) or never fired — records no predecessor, so its
+/// mark answers `coord.queued: false` (`reason: "no_coord_session"`) until
+/// that id gets a coord row of its own.
+///
+/// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 async fn finish_session(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     body: Option<Json<FinishSessionRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    let finished = req.finished.unwrap_or(true);
 
     let store = state
         .app_handle
@@ -792,25 +818,51 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    match store.set_finished(&id, finished, req.reason) {
-        Some(rec) => {
-            info!(
-                claude_session_id = %id,
-                finished,
-                "sessions: finished marker updated"
-            );
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "session": rec,
-            })))
-        }
-        None => Err((
+    apply_finish(store.inner(), &id, req).map(Json)
+}
+
+/// The finish route's body, minus axum — pure over the store so the response
+/// contract is unit-testable without an app handle.
+fn apply_finish(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let finished = req.finished.unwrap_or(true);
+    let outcome = store
+        .set_finished(id, finished, req.reason)
+        .map_err(|e| finish_error_response(id, e))?;
+    info!(
+        claude_session_id = %id,
+        finished,
+        changed = outcome.changed.as_str(),
+        coord = ?outcome.coord,
+        "sessions: finished marker request"
+    );
+    Ok(outcome.response_json())
+}
+
+/// The finish route's error status for a [`SetFinishedError`]: an unknown id
+/// is a `404`, an unreadable registry a `500` — never collapsed into each
+/// other.
+///
+/// [`SetFinishedError`]: crate::session::session_lifecycle_store::SetFinishedError
+fn finish_error_response(
+    id: &str,
+    e: crate::session::session_lifecycle_store::SetFinishedError,
+) -> (StatusCode, String) {
+    use crate::session::session_lifecycle_store::SetFinishedError;
+    match e {
+        SetFinishedError::UnknownSession => (
             StatusCode::NOT_FOUND,
-            format!(
-                "no session `{id}` in the lifecycle registry, or its finished marker was \
-                 already in that state"
-            ),
-        )),
+            format!("no session `{id}` in the lifecycle registry"),
+        ),
+        SetFinishedError::Unavailable => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session lifecycle registry unavailable (lock poisoned) — whether \
+             the session exists is unknown"
+                .to_string(),
+        ),
     }
 }
 
@@ -1123,6 +1175,210 @@ async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // POST /sessions/{id}/finish — the response contract
+    //
+    // Plan `2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-
+    // is-disowned-by-both-closeout-commands` Phase 1.
+    // =========================================================================
+
+    use crate::claude_session::coord_register::AiCoordRegistrar;
+    use crate::session::session_lifecycle_store::{self as lifecycle, SessionLifecycleStore};
+
+    /// A store wired the way main.rs wires it: the finish observer forwards to
+    /// a real registrar, whose terminal-plane lookup answers `terminal_coord`
+    /// for every id (or nothing).
+    fn finish_fixture(
+        terminal_coord: Option<uuid::Uuid>,
+    ) -> (
+        Arc<SessionLifecycleStore>,
+        AiCoordRegistrar,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| terminal_coord);
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+        (store, reg, dir)
+    }
+
+    /// An unreadable registry is a 500 that says "unknown", never the 404
+    /// an unknown id gets.
+    #[test]
+    fn finish_error_response_maps_unavailable_to_500_and_unknown_to_404() {
+        use crate::session::session_lifecycle_store::SetFinishedError;
+        let (status, msg) = finish_error_response("s", SetFinishedError::Unavailable);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(msg.contains("unknown"), "{msg}");
+        let (status, msg) = finish_error_response("s", SetFinishedError::UnknownSession);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(msg.contains("`s`"), "{msg}");
+    }
+
+    fn finish_req(reason: Option<&str>) -> FinishSessionRequest {
+        FinishSessionRequest {
+            reason: reason.map(str::to_string),
+            finished: None,
+        }
+    }
+
+    #[test]
+    fn finish_response_names_a_local_only_mark() {
+        let (store, _reg, _dir) = finish_fixture(None);
+
+        let body = apply_finish(&store, "s", finish_req(None)).expect("a known id is 200");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["changed"], "marker");
+        assert_eq!(
+            body["coord"]["queued"], false,
+            "no plane knows a coord row — coord was NOT told: {body}"
+        );
+        assert_eq!(body["coord"]["reason"], "no_coord_session");
+        assert!(body["coord"]["coordSessionId"].is_null());
+        assert!(
+            body["session"]["finishedAt"].is_i64(),
+            "the local mark landed"
+        );
+        assert_eq!(body["session"]["finishSynced"], false);
+    }
+
+    #[test]
+    fn a_terminal_plane_finish_reports_the_coord_row_it_queued_for() {
+        let coord_id = uuid::Uuid::new_v4();
+        let (store, _reg, _dir) = finish_fixture(Some(coord_id));
+
+        let body = apply_finish(&store, "s", finish_req(Some("done"))).unwrap();
+        assert_eq!(body["changed"], "marker");
+        assert_eq!(body["coord"]["queued"], true);
+        assert_eq!(body["coord"]["coordSessionId"], coord_id.to_string());
+        assert!(body["coord"]["reason"].is_null());
+    }
+
+    #[test]
+    fn re_finishing_is_200_changed_none_not_404() {
+        let (store, _reg, _dir) = finish_fixture(None);
+        apply_finish(&store, "s", finish_req(None)).unwrap();
+
+        let again = apply_finish(&store, "s", finish_req(None))
+            .expect("a re-run on a known id is 200, not 404");
+        assert_eq!(again["changed"], "none", "nothing was written: {again}");
+        assert_eq!(again["coord"]["queued"], false);
+        assert_eq!(
+            again["coord"]["reason"], "no_coord_session",
+            "the unsynced mark's owed write was re-offered, and still no coord row \
+             resolves: {again}"
+        );
+        assert_eq!(
+            again["session"]["finishSynced"], false,
+            "the re-run reads the CURRENT sync verdict"
+        );
+
+        let unmark = FinishSessionRequest {
+            reason: None,
+            finished: Some(false),
+        };
+        assert_eq!(
+            apply_finish(&store, "s", unmark).unwrap()["changed"],
+            "marker"
+        );
+        let unmark_again = FinishSessionRequest {
+            reason: None,
+            finished: Some(false),
+        };
+        assert_eq!(
+            apply_finish(&store, "s", unmark_again).unwrap()["changed"],
+            "none"
+        );
+
+        let (status, _) = apply_finish(&store, "ghost", finish_req(None))
+            .expect_err("an unknown id is still an error");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The retry door: a no-op re-finish on a mark coord has NOT ACKed
+    /// re-offers the owed write instead of reporting `not_requeued` forever.
+    /// A mark that went local-only (no coord row yet) is pushed once a row
+    /// resolves, by re-running the same call.
+    #[test]
+    fn re_finishing_an_unsynced_mark_retries_the_coord_write() {
+        let coord_id = uuid::Uuid::new_v4();
+        let resolves = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None);
+        {
+            let resolves = resolves.clone();
+            reg.attach_terminal_coord_lookup(move |_| {
+                resolves
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(coord_id)
+            });
+        }
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+
+        let first = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(first["coord"]["queued"], false, "no coord row yet: {first}");
+
+        resolves.store(true, std::sync::atomic::Ordering::SeqCst);
+        let again = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(
+            again["changed"], "none",
+            "nothing local was written: {again}"
+        );
+        assert_eq!(
+            again["coord"]["queued"], true,
+            "the owed write is retried on a no-op re-run of an UNSYNCED mark: {again}"
+        );
+        assert_eq!(again["coord"]["coordSessionId"], coord_id.to_string());
+        assert_eq!(
+            again["session"]["finishedAt"], first["session"]["finishedAt"],
+            "the retry does not restamp the mark"
+        );
+    }
+
+    #[test]
+    fn re_finishing_with_a_reason_on_a_synced_mark_says_coord_was_not_told() {
+        let coord_id = uuid::Uuid::new_v4();
+        let (store, _reg, _dir) = finish_fixture(Some(coord_id));
+        let first = apply_finish(&store, "s", finish_req(Some("first"))).unwrap();
+        assert_eq!(first["coord"]["queued"], true);
+        store.mark_finish_synced("s", first["session"]["finishedAt"].as_i64());
+
+        let again = apply_finish(&store, "s", finish_req(Some("second"))).unwrap();
+        assert_eq!(again["changed"], "reason_only");
+        assert_eq!(
+            again["session"]["finishReason"], "second",
+            "the local rewrite landed"
+        );
+        assert_eq!(
+            again["coord"]["queued"], false,
+            "an ACKed mark is not re-queued, so coord never hears the new reason: {again}"
+        );
+        assert_eq!(again["coord"]["reason"], "not_requeued");
+        assert_eq!(again["session"]["finishSynced"], true);
+    }
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
 

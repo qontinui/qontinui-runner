@@ -4205,14 +4205,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // ACK stamps `finish_synced` back so the boot reconcile can
                 // tell a synced mark from one coord has not seen. Weak handles
                 // for the same Arc-cycle reason as the close observer above.
+                //
+                // The registrar resolves the coord row across BOTH runner
+                // planes: its own index (AI/task-run + sniffed panes), then
+                // the terminal plane through the lookup injected here — a
+                // terminal-hosted `claude` registers through `SessionRegistry`
+                // and its coord id lives only on the terminal. That lookup
+                // keys on the PINNED harness id alone. A session the provider
+                // adopted after `/clear` resolves as its PREDECESSOR does
+                // (`TerminalSessionRecord::adopted_from`, walked by the
+                // registrar), so a `/clear` in the pinned session reaches the
+                // terminal's row while a `/clear` in a typed `claude --resume
+                // X` reaches X's own row, never the pane's. The observer's
+                // verdict is RETURNED to `set_finished`, so the finish route
+                // reports whether coord was told instead of dropping it. And
+                // every terminal binding re-delivers a mark made before the
+                // terminal had a coord row, for each record whose chain
+                // resolves to that terminal's pinned id — the in-process
+                // window between `record_open` and the bind only: a finished
+                // session is not restored on boot, so nothing re-binds for it
+                // after a restart (the terminal-plane twin of the registrar's
+                // own late-registration re-enqueue).
+                //
+                // Lock order: the finish observer runs inside `set_finished`
+                // AFTER the store's map guard is released (its `finish_forward`
+                // serializer is still held) and receives the record; walking
+                // its adoption chain reads the store (`get`, map lock only),
+                // which is safe there. The bind observer runs outside every
+                // store lock.
                 {
+                    let tm = std::sync::Arc::downgrade(&term_for_session);
+                    ai_coord_registrar.attach_terminal_coord_lookup(move |csid| {
+                        tm.upgrade()?.coord_session_id_for_pinned(csid)
+                    });
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    term_for_session.attach_coord_bind_observer(
+                        move |pinned, terminal_id, coord_id| {
+                            if let Some(r) = reg.upgrade() {
+                                r.deliver_owed_finish(pinned, terminal_id, coord_id);
+                            }
+                        },
+                    );
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     lifecycle_store.attach_finish_observer(move |rec| {
-                        if let Some(r) = reg.upgrade() {
-                            match rec.finished_at {
-                                Some(at) => r.finish_session(&rec.claude_session_id, Some(at)),
-                                None => r.unfinish_session(&rec.claude_session_id),
-                            };
+                        use session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
+                        match reg.upgrade() {
+                            Some(r) => r.forward_finish_change(rec),
+                            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
                         }
                     });
                     let store = std::sync::Arc::downgrade(&lifecycle_store);

@@ -383,6 +383,7 @@ fn bind_record(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     }
 }
 
@@ -1367,6 +1368,7 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     }
 }
 
@@ -1812,6 +1814,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -2227,6 +2230,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         };
         store.record_open(phantom);
 
@@ -2395,6 +2399,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];
@@ -2483,6 +2488,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];

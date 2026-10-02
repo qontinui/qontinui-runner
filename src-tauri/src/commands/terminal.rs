@@ -368,7 +368,7 @@ pub async fn terminal_create(
 
             // Store the coord session id on the terminal so close can clean up.
             if let Some(session) = terminal_manager.get(&info.id) {
-                session.set_coord_session_id(coord_id);
+                terminal_manager.bind_coord_session(&session, coord_id);
 
                 // R1 — install the on-exit hook so the PTY waiter thread
                 // closes the coord session mirror the instant the process
@@ -1254,6 +1254,7 @@ pub fn terminal_session_record_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -1461,10 +1462,16 @@ pub fn terminal_session_record_close(
 ///
 /// Reversible: pass `finished: false` to unmark.
 ///
-/// `success: false` with `data: null` means the session id is unknown OR the
-/// marker was already in the requested state — the store reports a no-op as
-/// `None`, and reporting a no-op as a successful write would let a caller
-/// believe it changed something it did not.
+/// `success: false` with `data: null` means the session id is unknown — and
+/// only that: an unreadable (lock-poisoned) registry is an `Err`, never an
+/// unknown id. For a
+/// known id `data` is the same body `POST /sessions/{id}/finish` answers
+/// ([`FinishOutcome::response_json`]): what changed (`"marker"`,
+/// `"reason_only"`, or `"none"` for a no-op that wrote nothing) and whether
+/// coord was told (`coord.queued` / `coordSessionId` / `reason`), so neither a
+/// no-op nor a local-only mark can read as a coord write.
+///
+/// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 #[tauri::command]
 pub fn terminal_session_set_finished(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1472,19 +1479,23 @@ pub fn terminal_session_set_finished(
     finished: bool,
     reason: Option<String>,
 ) -> Result<CommandResponse, String> {
+    use crate::session::session_lifecycle_store::SetFinishedError;
     match store.set_finished(&claude_session_id, finished, reason) {
-        Some(rec) => Ok(CommandResponse {
+        Ok(outcome) => Ok(CommandResponse {
             success: true,
             message: None,
-            data: serde_json::to_value(&rec).ok(),
+            data: Some(outcome.response_json()),
         }),
-        None => Ok(CommandResponse {
+        Err(SetFinishedError::UnknownSession) => Ok(CommandResponse {
             success: false,
-            message: Some(
-                "no such session, or the finished marker was already in that state".to_string(),
-            ),
+            message: Some("no such session in the lifecycle registry".to_string()),
             data: None,
         }),
+        Err(SetFinishedError::Unavailable) => Err(
+            "session lifecycle registry unavailable (lock poisoned) — whether the \
+             session exists is unknown"
+                .to_string(),
+        ),
     }
 }
 
@@ -2296,7 +2307,7 @@ pub(crate) fn create_terminal_session_backend(
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
             if let Some(session) = terminal_manager.get(&info.id) {
-                session.set_coord_session_id(coord_id);
+                terminal_manager.bind_coord_session(&session, coord_id);
                 let close_registry = session_registry.clone();
                 // Capacity-freed re-poll: capture this terminal's id so the exit
                 // hook can tell `agent_runtime` a continuation slot just freed and
@@ -2552,6 +2563,7 @@ async fn poll_and_record_session<F>(
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
             };
             store.record_open(record);
             info!(
@@ -2644,6 +2656,7 @@ pub(crate) fn record_pinned_session_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2840,6 +2853,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
