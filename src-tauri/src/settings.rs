@@ -2562,8 +2562,16 @@ mod session_guard_tests {
         let g = load("null", "null");
         assert_eq!((g.warn_thread_count, g.critical_thread_count), (None, None));
 
-        // And unset round-trips as unset — never re-materialised as a number.
+        // And unset round-trips as unset — never re-materialised as a number,
+        // and written as an ABSENT key, not `null`: an older runner build reads
+        // these as a plain `usize` and fails the whole document on a `null`.
         let json = serde_json::to_string(&Settings::default()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let guard = value["session_guard"]
+            .as_object()
+            .expect("session_guard object");
+        assert!(!guard.contains_key("warn_thread_count"), "{json}");
+        assert!(!guard.contains_key("critical_thread_count"), "{json}");
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_guard.warn_thread_count, None);
         assert_eq!(back.session_guard.critical_thread_count, None);
@@ -3023,14 +3031,31 @@ pub struct SessionGuardSettings {
     /// longer expressible — it reads back as the machine default. An operator who
     /// wants exactly today's number on a box whose default has risen writes 255
     /// or 257.
-    #[serde(default, deserialize_with = "deserialize_warn_thread_ceiling")]
+    ///
+    /// ## `None` is written as an ABSENT key, never `null`
+    ///
+    /// Older runner builds read this field as a plain `usize` with a serde
+    /// default. They accept a missing key, but a `null` fails the parse of the
+    /// WHOLE `Settings` document — which they then treat as unreadable, losing
+    /// every setting. `settings.json` is shared with secondary, temp and
+    /// rolled-back runners, so the new build must never write a shape an older
+    /// one cannot load: `skip_serializing_if` keeps "unset" as no key at all.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_warn_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub warn_thread_count: Option<usize>,
     /// The operator's own critical (refusal) ceiling, or `None` for this
     /// machine's default. Always overridable at the point of refusal. Same
     /// `Option` semantics and the same load migration as
     /// [`Self::warn_thread_count`], against the old 400 default
     /// ([`SHIPPED_CRITICAL_THREAD_CEILING`]).
-    #[serde(default, deserialize_with = "deserialize_critical_thread_ceiling")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_critical_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub critical_thread_count: Option<usize>,
     /// Master switch for the whole guard — **both lanes**, the free-commit
     /// floors and the thread ceilings alike. Default **TRUE**, unlike

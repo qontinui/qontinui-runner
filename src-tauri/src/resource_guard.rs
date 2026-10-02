@@ -380,9 +380,13 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// over-shifting is an admission the machine cannot honour.
 ///
 /// Past it the shift stops growing, so the hardcoded FLOOR of the machine
-/// default caps at `512 + 105 = 617` warn and `512 + 249 = 761` critical (the
-/// scaled term is capped the same way — it uses this bound on the baseline too —
-/// and every ceiling is bounded by [`THREAD_CEILING_ABS_MAX`]). That bound is the
+/// default caps at `512 + 105 = 617` warn and `512 + 249 = 761` critical. The
+/// scaled term uses this same cap on its baseline, but is NOT capped by it as a
+/// whole: its session-capacity arm grows with `per_session × capacity`, which
+/// is bounded by the machine (cores, `MemTotal`) and by
+/// [`MAX_THREADS_PER_SESSION`] — so a leak in a `terminal-*` family cannot
+/// inflate the multiplier — and its pool arm by the live session-thread count.
+/// Every ceiling is bounded by [`THREAD_CEILING_ABS_MAX`]. That bound is the
 /// whole answer to "does a slow leak eventually disable this lane?" — it does
 /// not: the lane keeps refusing above the cap rather than chasing the leak
 /// upward, and refusing work is then correct, because the next thing to fail is
@@ -403,8 +407,9 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// minus the threads the census NAMES as per-session
 /// ([`session_thread_attribution`]). This constant survives in two places
 /// only: the subtrahend on a platform with no name census (macOS, or a walk
-/// that failed), and [`ThreadCapacityInputs::per_session_threads`]'s fallback
-/// when no tick has measured threads-per-session.
+/// that failed), and — through `min(3, MAX_THREADS_PER_SESSION)` — the input
+/// to [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the family count,
+/// because there it is a multiplier and the larger number would loosen.
 ///
 /// **3, from the control's own documentation**, not from the thread-name census.
 /// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc derives
@@ -662,12 +667,16 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
 /// - **No session count** (`live_sessions = None`): `None`. Without it neither
 ///   the name tally's plausibility nor the fallback can be judged, and
 ///   substituting `0` would inflate the floor — see [`record_at_rest_sample`].
-/// - **Census present, both families absent, sessions > 0**: `None`. Every live
-///   terminal holds both threads for its whole life, so zero named session
-///   threads beside N terminals is a mis-read on one side or the other.
-///   Treating it as `0` would attribute nothing, RAISE the baseline and loosen
-///   the guard — served policy `verification-and-evidence`
-///   `unknown-must-not-render-as-a-default`.
+/// - **Census present, FEWER named session threads than live terminals**
+///   (`named < sessions`, which includes both families absent): `None`. Every
+///   live terminal holds both threads for its whole life, so fewer than one
+///   named thread per terminal is a mis-read on one side or the other — most
+///   often the 30 s memoized census lagging a fresh session count after a spawn
+///   burst. Under-attributing would RAISE the baseline and loosen the guard —
+///   served policy `verification-and-evidence`
+///   `unknown-must-not-render-as-a-default`. Same rule as
+///   [`per_session_threads_from`]'s zero arm, so the two never disagree about
+///   which observations are coherent.
 /// - **Census present otherwise**: the named tally, as read. (Named session
 ///   threads with a registry reading of zero sessions is a teardown race; the
 ///   threads are still session threads by name, and subtracting them is the
@@ -683,21 +692,56 @@ pub(crate) fn session_thread_attribution(
 ) -> Option<usize> {
     let sessions = live_sessions?;
     match census_session_threads {
-        Some(0) if sessions > 0 => None,
+        Some(named) if census_misread(named, sessions) => None,
         Some(named) => Some(named),
         None => Some(sessions.saturating_mul(THREADS_PER_SESSION)),
     }
 }
 
+/// `true` when a census names fewer per-session threads than there are live
+/// terminals — an observation no live runner can produce, i.e. a mis-read.
+/// The one predicate [`session_thread_attribution`],
+/// [`per_session_threads_from`] and the census-misread provenance share.
+fn census_misread(named: usize, sessions: usize) -> bool {
+    named < sessions
+}
+
+/// The most threads one terminal can legitimately hold: the number of
+/// per-session families (`terminal-reader`, `terminal-waiter`) — **2**.
+///
+/// A measured ratio above it is not a fatter terminal; it is a teardown race
+/// (threads of terminals the registry already dropped) or a leak in a
+/// `terminal-*` family. Both are exactly the conditions under which the guard
+/// must NOT loosen, and threads-per-session is a MULTIPLIER on the
+/// session-capacity arm of [`scaled_thread_ceilings`] — so it is capped here.
+pub(crate) const MAX_THREADS_PER_SESSION: usize =
+    qontinui_runner_lib::wedge_diagnostics::SESSION_THREAD_FAMILIES.len();
+
+/// The threads-per-session [`scaled_thread_ceilings`] multiplies by when no
+/// fresh tick measured one: `min(THREADS_PER_SESSION, MAX_THREADS_PER_SESSION)`
+/// = **2**.
+///
+/// Not [`THREADS_PER_SESSION`]'s 3. "3 is strict" holds for the at-rest
+/// baseline, where the figure is SUBTRACTED (over-subtracting lowers the
+/// floor). Here it is MULTIPLIED into a ceiling, where the larger number is
+/// the looser one — so the fallback takes the smaller of the two.
+pub(crate) const PER_SESSION_THREADS_FALLBACK: usize =
+    if THREADS_PER_SESSION < MAX_THREADS_PER_SESSION {
+        THREADS_PER_SESSION
+    } else {
+        MAX_THREADS_PER_SESSION
+    };
+
 /// Threads per live terminal as one observation measures them, or `None` when
 /// it cannot. PURE.
 ///
-/// Integer division, rounding DOWN: this feeds the session-capacity arm of
-/// [`scaled_thread_ceilings`] as a multiplier, and a smaller multiplier is a
-/// lower (stricter) ceiling. A tally that rounds to zero — fewer named threads
-/// than terminals, which no live runner can carry — is a mis-read and reads
-/// `None`, as does any UNKNOWN half and a box with no terminals (nothing to
-/// divide by). `None` falls back to [`THREADS_PER_SESSION`] downstream.
+/// Integer division, rounding DOWN, and capped at [`MAX_THREADS_PER_SESSION`]:
+/// this feeds the session-capacity arm of [`scaled_thread_ceilings`] as a
+/// multiplier, and a smaller multiplier is a lower (stricter) ceiling — so a
+/// teardown race or a leaked `terminal-*` thread can never inflate it. Fewer
+/// named threads than terminals ([`census_misread`]) reads `None`, as does any
+/// UNKNOWN half and a box with no terminals (nothing to divide by). `None`
+/// falls back to [`PER_SESSION_THREADS_FALLBACK`] downstream.
 pub(crate) fn per_session_threads_from(
     census_session_threads: Option<usize>,
     live_sessions: Option<usize>,
@@ -705,10 +749,10 @@ pub(crate) fn per_session_threads_from(
     let (Some(named), Some(sessions)) = (census_session_threads, live_sessions) else {
         return None;
     };
-    if sessions == 0 {
+    if sessions == 0 || census_misread(named, sessions) {
         return None;
     }
-    Some(named / sessions).filter(|&n| n > 0)
+    Some((named / sessions).min(MAX_THREADS_PER_SESSION))
 }
 
 /// The most recent tick's measured threads-per-session, stamped with when it
@@ -727,6 +771,14 @@ static SESSION_THREAD_SAMPLE: Mutex<Option<(std::time::Instant, usize)>> = Mutex
 /// [`SESSION_THREAD_SAMPLE`]. An observation that measures nothing leaves the
 /// previous sample to age out on its own rather than overwriting it.
 fn note_session_thread_sample(census_session_threads: Option<usize>, live_sessions: Option<usize>) {
+    // The mis-read flag is set by an incoherent tick and cleared by any tick
+    // that can judge coherence and finds it, so `/health` names the state the
+    // census is in NOW rather than one it was in once.
+    if let (Some(named), Some(sessions)) = (census_session_threads, live_sessions) {
+        if let Ok(mut flag) = SESSION_CENSUS_MISREAD.lock() {
+            *flag = census_misread(named, sessions).then(std::time::Instant::now);
+        }
+    }
     let Some(per_session) = per_session_threads_from(census_session_threads, live_sessions) else {
         return;
     };
@@ -735,9 +787,28 @@ fn note_session_thread_sample(census_session_threads: Option<usize>, live_sessio
     }
 }
 
+/// When the most recent tick last found the census contradicting the session
+/// count ([`census_misread`]), or `None` when the latest judgeable tick was
+/// coherent. Aged by [`AT_REST_SAMPLE_MAX_AGE`] on read like every other
+/// tick-fed value.
+static SESSION_CENSUS_MISREAD: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// `true` while a fresh tick reports the census as a mis-read. A poisoned lock
+/// reads `false`: the flag only RELABELS provenance (the numbers are the floor
+/// either way), so it is never a reason to change a verdict.
+fn session_census_misread_now() -> bool {
+    SESSION_CENSUS_MISREAD
+        .lock()
+        .ok()
+        .and_then(|flag| *flag)
+        .is_some_and(|at| {
+            std::time::Instant::now().saturating_duration_since(at) <= AT_REST_SAMPLE_MAX_AGE
+        })
+}
+
 /// The measured threads-per-session, or `None` when no fresh tick measured
 /// one (or the lock is poisoned) — UNKNOWN, which
-/// [`scaled_thread_ceilings`] renders as [`THREADS_PER_SESSION`].
+/// [`scaled_thread_ceilings`] renders as [`PER_SESSION_THREADS_FALLBACK`].
 pub(crate) fn measured_per_session_threads() -> Option<usize> {
     let slot = SESSION_THREAD_SAMPLE.lock().ok()?;
     let (at, per_session) = (*slot)?;
@@ -1331,6 +1402,10 @@ pub(crate) struct ThreadCapacityInputs {
     /// Named per-session threads in the census right now
     /// ([`ThreadNameCensus::session_threads`]).
     pub(crate) session_threads_now: Option<usize>,
+    /// The latest tick found the census naming fewer session threads than
+    /// there are live terminals ([`census_misread`]). Its session tally is not
+    /// to be believed, so the scaled term is UNKNOWN.
+    pub(crate) session_census_misread: bool,
 }
 
 /// Why the scaled machine default could not be computed. Each arm names the
@@ -1350,6 +1425,10 @@ pub(crate) enum ScaledUnknown {
     /// would be the session-capacity arm alone, which is the over-loosening
     /// the `min` exists to prevent.
     SessionThreadsNow,
+    /// The census named fewer session threads than there are live terminals
+    /// on the latest tick — a mis-read, so its session tally is UNKNOWN even
+    /// though a number was read.
+    SessionCensusMisread,
 }
 
 impl ScaledUnknown {
@@ -1359,6 +1438,7 @@ impl ScaledUnknown {
             ScaledUnknown::Cores => "cores_unknown",
             ScaledUnknown::MemTotal => "mem_total_unknown",
             ScaledUnknown::SessionThreadsNow => "session_threads_unknown",
+            ScaledUnknown::SessionCensusMisread => "session_census_misread",
         }
     }
 }
@@ -1378,8 +1458,9 @@ pub(crate) struct ScaledThreadCeilings {
     /// The baseline actually used: the measured floor capped at
     /// [`AT_REST_BASELINE_MAX`], or [`CALIBRATION_BASELINE`] when UNKNOWN.
     pub(crate) baseline_used: usize,
-    /// The threads-per-session actually used: measured, or
-    /// [`THREADS_PER_SESSION`] when UNKNOWN.
+    /// The threads-per-session actually used: measured and capped at
+    /// [`MAX_THREADS_PER_SESSION`], or [`PER_SESSION_THREADS_FALLBACK`] when
+    /// UNKNOWN.
     pub(crate) per_session_threads_used: usize,
 }
 
@@ -1409,7 +1490,8 @@ pub(crate) struct ScaledThreadCeilings {
 /// falls back to the hardcoded floor — exactly the pre-scaling behaviour. An
 /// UNKNOWN baseline is NOT an error: it uses [`CALIBRATION_BASELINE`], the
 /// floor the shipped ceilings were derived against, and an UNKNOWN
-/// per-session figure uses [`THREADS_PER_SESSION`].
+/// per-session figure uses [`PER_SESSION_THREADS_FALLBACK`]. A measured one is
+/// capped at [`MAX_THREADS_PER_SESSION`].
 pub(crate) fn scaled_thread_ceilings(
     inputs: &ThreadCapacityInputs,
 ) -> Result<ScaledThreadCeilings, ScaledUnknown> {
@@ -1418,11 +1500,19 @@ pub(crate) fn scaled_thread_ceilings(
     let session_threads_now = inputs
         .session_threads_now
         .ok_or(ScaledUnknown::SessionThreadsNow)?;
+    if inputs.session_census_misread {
+        return Err(ScaledUnknown::SessionCensusMisread);
+    }
     let baseline = inputs
         .baseline
         .map(|b| b.min(AT_REST_BASELINE_MAX))
         .unwrap_or(CALIBRATION_BASELINE);
-    let per_session = inputs.per_session_threads.unwrap_or(THREADS_PER_SESSION);
+    // Capped even when "measured": the input is a plain field, and the cap is
+    // what makes a leaked or racing `terminal-*` thread unable to loosen this.
+    let per_session = inputs
+        .per_session_threads
+        .map(|n| n.min(MAX_THREADS_PER_SESSION))
+        .unwrap_or(PER_SESSION_THREADS_FALLBACK);
 
     let reserve = MEM_RESERVE_MIN_BYTES.max(mem_total / MEM_RESERVE_DIVISOR);
     let mem_sessions = usize::try_from(mem_total.saturating_sub(reserve) / PER_SESSION_RSS_BYTES)
@@ -1484,6 +1574,11 @@ pub(crate) enum CeilingSource {
     /// The critical ceiling, raised to the warn ceiling because the fold
     /// composed an inverted ladder ([`coerce_ceiling_ladder`]).
     Ladder,
+    /// The hardcoded floor, because the census contradicted the session count
+    /// ([`ScaledUnknown::SessionCensusMisread`]). The number is the same as
+    /// [`CeilingSource::Floor`]'s; the label says it stands on an UNKNOWN, not on
+    /// a sized default that happened to come out lower.
+    CensusMisread,
 }
 
 impl CeilingSource {
@@ -1498,6 +1593,7 @@ impl CeilingSource {
             CeilingSource::ClampMin => "clamp_min",
             CeilingSource::ClampMax => "clamp_max",
             CeilingSource::Ladder => "ladder",
+            CeilingSource::CensusMisread => "census_misread",
         }
     }
 }
@@ -1605,6 +1701,16 @@ pub(crate) fn merge_thread_ceilings(
     if coercion.is_some() {
         critical_source = CeilingSource::Ladder;
     }
+    // Same numbers, honest label: a floor that won only because the census
+    // was a mis-read is UNKNOWN-backed, not a sized default.
+    let relabel = |source: CeilingSource| match (&scaled, source) {
+        (Err(ScaledUnknown::SessionCensusMisread), CeilingSource::Floor) => {
+            CeilingSource::CensusMisread
+        }
+        _ => source,
+    };
+    let warn_source = relabel(warn_source);
+    let critical_source = relabel(critical_source);
     EffectiveThreadCeilings {
         ceilings: ThreadCeilings { warn, critical },
         warn_source,
@@ -1703,6 +1809,7 @@ impl EffectiveThreadCeilings {
                 "baseline": self.inputs.baseline,
                 "perSessionThreads": self.inputs.per_session_threads,
                 "sessionThreadsNow": self.inputs.session_threads_now,
+                "sessionCensusMisread": self.inputs.session_census_misread,
             },
             "ladderCoerced": self.coercion.is_some(),
         })
@@ -1902,6 +2009,7 @@ fn live_thread_capacity_inputs(census: Option<&ThreadNameCensus>) -> ThreadCapac
         baseline: at_rest_thread_baseline(),
         per_session_threads: measured_per_session_threads(),
         session_threads_now: census.map(|c| c.session_threads),
+        session_census_misread: session_census_misread_now(),
     }
 }
 
@@ -4270,12 +4378,86 @@ mod tests {
         );
     }
 
+    /// **A leak cannot loosen the ceiling.** 20 live sessions and 300 leaked
+    /// `terminal-reader` threads (340 named): the measured ratio would be 17
+    /// per session, but no terminal holds more than the two family threads, so
+    /// it is capped at [`MAX_THREADS_PER_SESSION`] — and even a raw 17 handed
+    /// straight to the scaled term is capped there. The ceiling stays at the
+    /// 2-per-session value.
+    #[test]
+    fn leaked_session_threads_do_not_raise_the_ceiling_past_two_per_session() {
+        assert_eq!(MAX_THREADS_PER_SESSION, 2);
+        assert_eq!(per_session_threads_from(Some(340), Some(20)), Some(2));
+
+        let honest = ThreadCapacityInputs {
+            per_session_threads: Some(2),
+            session_threads_now: Some(340),
+            ..merytshost_loaded()
+        };
+        let leaked = ThreadCapacityInputs {
+            per_session_threads: Some(17),
+            ..honest
+        };
+        let honest_scaled = scaled_thread_ceilings(&honest).unwrap();
+        let leaked_scaled = scaled_thread_ceilings(&leaked).unwrap();
+        assert_eq!(leaked_scaled.per_session_threads_used, 2);
+        assert_eq!(leaked_scaled.ceilings, honest_scaled.ceilings);
+        // …and that value is the 2-per-session session-capacity arm: 171 + 2 ×
+        // (192 warn | 288 critical).
+        assert!(leaked_scaled.ceilings.warn <= 171 + 2 * 192);
+        assert!(leaked_scaled.ceilings.critical <= 171 + 2 * 288);
+        let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &leaked);
+        assert!(merged.ceilings.warn <= 171 + 2 * 192, "{merged:?}");
+    }
+
+    /// When the census contradicts the session count, the scaled term is
+    /// UNKNOWN and the floor is enforced — and provenance SAYS it stands on a
+    /// mis-read rather than presenting it as an ordinary floor. Same numbers.
+    #[test]
+    fn a_census_misread_labels_the_floor_as_unknown_backed() {
+        let misread = ThreadCapacityInputs {
+            session_census_misread: true,
+            ..merytshost_loaded()
+        };
+        assert_eq!(
+            scaled_thread_ceilings(&misread),
+            Err(ScaledUnknown::SessionCensusMisread)
+        );
+        let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &misread);
+        assert_eq!(
+            merged.ceilings,
+            ThreadCeilings {
+                warn: 276,
+                critical: 420
+            }
+        );
+        assert_eq!(merged.warn_source, CeilingSource::CensusMisread);
+        assert_eq!(merged.critical_source, CeilingSource::CensusMisread);
+        let v = merged.to_json(true);
+        assert_eq!(v["provenance"]["warn"], "census_misread");
+        assert_eq!(v["scaledUnknown"], "session_census_misread");
+        assert_eq!(v["inputs"]["sessionCensusMisread"], true);
+
+        // An operator value is still the operator's — only a FLOOR is relabelled.
+        let local = merge_thread_ceilings(
+            &local_threads(Some(300), None),
+            SessionFloors::default(),
+            &misread,
+        );
+        assert_eq!(local.warn_source, CeilingSource::Local);
+        assert_eq!(local.critical_source, CeilingSource::CensusMisread);
+    }
+
     /// Both per-session families ABSENT while terminals are live is a mis-read,
     /// and a mis-read is UNKNOWN — never zero. Zero would attribute nothing,
     /// raise the baseline to the whole graded count and LOOSEN the guard.
     #[test]
     fn a_census_naming_no_session_threads_beside_live_terminals_is_unknown() {
         assert_eq!(session_thread_attribution(Some(0), Some(164)), None);
+        // FEWER named threads than terminals is the same mis-read — typically
+        // the 30 s memoized census lagging a fresh count after a spawn burst.
+        assert_eq!(session_thread_attribution(Some(100), Some(164)), None);
+        assert_eq!(session_thread_attribution(Some(164), Some(164)), Some(164));
         assert_eq!(
             at_rest_estimate(Some(499), session_thread_attribution(Some(0), Some(164))),
             None
@@ -4291,7 +4473,7 @@ mod tests {
         assert_eq!(
             per_session_threads_from(Some(100), Some(164)),
             None,
-            "rounds to 0"
+            "a mis-read"
         );
         assert_eq!(per_session_threads_from(Some(328), Some(0)), None);
         assert_eq!(per_session_threads_from(None, Some(164)), None);
@@ -4452,6 +4634,7 @@ mod tests {
             baseline: Some(171),
             per_session_threads: Some(2),
             session_threads_now: Some(328),
+            session_census_misread: false,
         }
     }
 
@@ -4505,6 +4688,7 @@ mod tests {
                     baseline: Some(151),
                     per_session_threads: Some(2),
                     session_threads_now: Some(126),
+                    session_census_misread: false,
                 },
                 scaled: (277, 277),
                 enforced: (277, 400),
@@ -4519,6 +4703,7 @@ mod tests {
                     baseline: Some(151),
                     per_session_threads: Some(2),
                     session_threads_now: Some(20),
+                    session_census_misread: false,
                 },
                 scaled: (183, 191),
                 enforced: (256, 400),
@@ -4628,7 +4813,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stand_ins.baseline_used, CALIBRATION_BASELINE);
-        assert_eq!(stand_ins.per_session_threads_used, THREADS_PER_SESSION);
+        assert_eq!(
+            stand_ins.per_session_threads_used,
+            PER_SESSION_THREADS_FALLBACK
+        );
+        assert_eq!(
+            PER_SESSION_THREADS_FALLBACK, 2,
+            "the multiplier's fallback is min(3, families): the larger number would loosen"
+        );
     }
 
     /// The operator's knob now works in BOTH directions; the fleet's still only
@@ -4718,6 +4910,7 @@ mod tests {
             baseline: Some(500),
             per_session_threads: Some(2),
             session_threads_now: Some(1_000_000),
+            session_census_misread: false,
         };
         let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &enormous);
         assert_eq!(

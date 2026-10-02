@@ -103,8 +103,9 @@ interface TauriResult<T> {
 export interface SessionGuardSettingsValue {
   warn_free_commit_bytes: number;
   critical_free_commit_bytes: number;
-  warn_thread_count: number | null;
-  critical_thread_count: number | null;
+  /** Absent (or `null`) when the operator left it on the machine default. */
+  warn_thread_count?: number | null;
+  critical_thread_count?: number | null;
   enabled: boolean;
 }
 
@@ -165,12 +166,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   // drafts while being edited (committed on blur and on save, like the
   // concurrency input), and the runner's report of what it ENFORCES for the
   // last SAVED pair — re-fetched after every save, never recomputed here.
-  const [warnThreads, setWarnThreads] = useState<number | null>(
-    DEFAULT_SESSION_GUARD.warn_thread_count,
-  );
-  const [criticalThreads, setCriticalThreads] = useState<number | null>(
-    DEFAULT_SESSION_GUARD.critical_thread_count,
-  );
+  const [warnThreads, setWarnThreads] = useState<number | null>(null);
+  const [criticalThreads, setCriticalThreads] = useState<number | null>(null);
   const [warnThreadsDraft, setWarnThreadsDraft] = useState<string | null>(null);
   const [criticalThreadsDraft, setCriticalThreadsDraft] = useState<string | null>(null);
   const [threadReport, setThreadReport] = useState<ThreadCeilingsReport | null>(null);
@@ -214,9 +211,12 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           const g = { ...DEFAULT_SESSION_GUARD, ...persisted };
           setWarnGib(bytesToGib(g.warn_free_commit_bytes));
           setCriticalGib(bytesToGib(g.critical_free_commit_bytes));
-          setWarnThreads(g.warn_thread_count);
-          setCriticalThreads(g.critical_thread_count);
-          setSavedThreads({ warn: g.warn_thread_count, critical: g.critical_thread_count });
+          // An unset override arrives as an absent key, not `null`.
+          const warn = g.warn_thread_count ?? null;
+          const critical = g.critical_thread_count ?? null;
+          setWarnThreads(warn);
+          setCriticalThreads(critical);
+          setSavedThreads({ warn, critical });
           setThreadReport(thread_ceilings ?? null);
           setGuardEnabled(g.enabled);
           onLog("debug", "Session-guard settings loaded");
@@ -303,12 +303,13 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         return;
       }
       const { thread_ceilings, ...persisted } = result.data;
-      setWarnThreads(persisted.warn_thread_count);
-      setCriticalThreads(persisted.critical_thread_count);
-      setSavedThreads({
-        warn: persisted.warn_thread_count,
-        critical: persisted.critical_thread_count,
-      });
+      // An unset override is an ABSENT key on the wire (the runner never writes
+      // `null`, which older builds cannot parse), so normalise it here.
+      const warn = persisted.warn_thread_count ?? null;
+      const critical = persisted.critical_thread_count ?? null;
+      setWarnThreads(warn);
+      setCriticalThreads(critical);
+      setSavedThreads({ warn, critical });
       setThreadReport(thread_ceilings ?? null);
     } catch (err) {
       onLog("warning", `Could not re-read the enforced thread ceilings: ${String(err)}`);

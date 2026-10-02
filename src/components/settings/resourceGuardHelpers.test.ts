@@ -233,6 +233,7 @@ describe("thread ceilings — the panel renders the runner's fold, never its own
       baseline: 171,
       perSessionThreads: 2,
       sessionThreadsNow: 328,
+      sessionCensusMisread: false,
     },
     ladderCoerced: false,
     ...over,
@@ -285,6 +286,16 @@ describe("thread ceilings — the panel renders the runner's fold, never its own
         report({ provenance: { warn: "local", critical: "ladder" } }),
       ),
     ).toMatch(/warn ceiling/);
+    expect(
+      threadCeilingSourceText(
+        "warn",
+        report({
+          provenance: { warn: "census_misread", critical: "census_misread" },
+          scaled: null,
+          scaledUnknown: "session_census_misread",
+        }),
+      ),
+    ).toMatch(/census disagreed/);
   });
 });
 
