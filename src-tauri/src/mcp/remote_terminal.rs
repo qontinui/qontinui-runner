@@ -2331,6 +2331,8 @@ pub struct ReattachRequest {
     pub first: Option<oneshot::Receiver<Result<(), AttachError>>>,
     /// The "remote machine is not connected" notice is already in the pane.
     pub announced_target_down: bool,
+    /// The relay generation `first` was sent on (meaningless without one).
+    pub sent_generation: u64,
 }
 
 /// A grant minted to replace a pane's expired one.
@@ -3504,6 +3506,7 @@ impl RemoteAttachClient {
                         pane,
                         first: None,
                         announced_target_down: true,
+                        sent_generation: self.reconnect_gen.load(Ordering::Acquire),
                     });
                     return;
                 }
@@ -3545,7 +3548,7 @@ impl RemoteAttachClient {
         // Before any frame: a supervisor that sees this generation move after
         // it sent its attempt knows that attempt went out on the OLD
         // connection and presents again.
-        self.reconnect_gen.fetch_add(1, Ordering::AcqRel);
+        let generation = self.reconnect_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -3581,6 +3584,7 @@ impl RemoteAttachClient {
                 pane,
                 first,
                 announced_target_down: false,
+                sent_generation: generation,
             });
         }
         self.reconnected.notify_waiters();
@@ -3626,8 +3630,10 @@ fn classify_reattach_error(code: &str, just_renewed: bool) -> ReattachStep {
 /// is down the supervisor waits for the reconnect and the window is PAUSED
 /// (not restarted — a relay that flaps does not buy a dead target unlimited
 /// retries), so an outage on OUR side never closes a tab whose target is
-/// fine. An attempt whose reply lands after a
-/// reconnect it was not sent on is presented again on the new connection.
+/// fine. An attempt whose reply lands after a reconnect it was not sent on is
+/// presented again on the new connection — and so is a pane whose reconnect
+/// landed between this supervisor's success and its release (that reconnect
+/// found the pane claimed and skipped it), in this same task.
 pub async fn supervise_reattach(
     client: &RemoteAttachClient,
     req: ReattachRequest,
@@ -3635,22 +3641,62 @@ pub async fn supervise_reattach(
 ) {
     let ReattachRequest {
         pane,
-        mut first,
+        first,
         announced_target_down,
+        sent_generation,
     } = req;
+    let mut first = first.map(|rx| (rx, sent_generation));
+    let mut announced = announced_target_down;
+    loop {
+        let (outcome, presented_generation) =
+            supervise_once(client, &pane, first.take(), announced, &policy).await;
+        announced = false;
+        let succeeded = matches!(outcome, Some(Ok(())));
+        if let Some(Err(e)) = outcome {
+            if !pane.is_finished() {
+                pane.mark_error(&e.code, &e.message);
+            }
+            client.drop_pane(&pane.grant_jti());
+        }
+        pane.end_reattach();
+        // A reconnect that landed between the success and the release just
+        // now found the pane still claimed and skipped it, so nothing has
+        // presented on the new connection. Take the pane back and go again;
+        // the next round checks the pump before it sends anything.
+        let missed_a_reconnect =
+            client.reconnect_gen.load(Ordering::Acquire) != presented_generation;
+        if !(succeeded && missed_a_reconnect && !pane.is_finished() && pane.try_begin_reattach()) {
+            return;
+        }
+        debug!(
+            grant_jti = %pane.grant_jti(),
+            "remote attach: a reconnect landed as the reattach finished — presenting again"
+        );
+    }
+}
+
+/// One supervision round of [`supervise_reattach`]: the outcome (`None` when
+/// the pane closed under it) and the relay generation a successful attempt
+/// was presented on. `first` is a reattach already sent, with the generation
+/// it was sent on.
+async fn supervise_once(
+    client: &RemoteAttachClient,
+    pane: &Arc<RemotePaneIo>,
+    mut first: Option<(oneshot::Receiver<Result<(), AttachError>>, u64)>,
+    announced_target_down: bool,
+    policy: &ReattachPolicy,
+) -> (Option<Result<(), AttachError>>, u64) {
     let mut started = tokio::time::Instant::now();
     // When our relay went down, if it is down now: that span is added back
     // to `started` when it returns, pausing the window.
     let mut relay_down_since: Option<tokio::time::Instant> = None;
-    // The relay generation the successful attempt was presented on.
-    let mut presented_generation = 0;
     let mut announced = announced_target_down;
     let mut attempt: u32 = 0;
     let mut renewals: u32 = 0;
     let mut renewed_at: Option<tokio::time::Instant> = None;
-    let outcome: Option<Result<(), AttachError>> = loop {
+    loop {
         if pane.is_finished() {
-            break None;
+            return (None, 0);
         }
         // Armed BEFORE the pump check and the attempt, so a reconnect that
         // lands anywhere after this point still wakes this supervisor.
@@ -3671,15 +3717,22 @@ pub async fn supervise_reattach(
         if let Some(down) = relay_down_since.take() {
             started += down.elapsed();
         }
-        let generation = client.reconnect_gen.load(Ordering::Acquire);
-        let sent = match first.take() {
-            Some(rx) => Ok(rx),
-            None => client.send_reattach(&pane),
+        // The generation this attempt goes out on: for a frame sent before
+        // this supervisor ran, the one it was SENT on, not the current one.
+        let (sent, generation) = match first.take() {
+            Some((rx, generation)) => (Ok(rx), generation),
+            None => {
+                let generation = client.reconnect_gen.load(Ordering::Acquire);
+                (client.send_reattach(pane), generation)
+            }
         };
         let result = match sent {
             Ok(rx) => {
                 let outcome = tokio::select! {
-                    r = client.await_reattach(&pane, rx, policy.reply_timeout) => Some(r),
+                    // A reply that is already in wins over a reconnect that
+                    // is also in; the generation check below handles it.
+                    biased;
+                    r = client.await_reattach(pane, rx, policy.reply_timeout) => Some(r),
                     _ = &mut reconnected => None,
                 };
                 match outcome {
@@ -3700,42 +3753,53 @@ pub async fn supervise_reattach(
             // have re-bound on the OLD connection only, so present again.
             Ok(()) if client.reconnect_gen.load(Ordering::Acquire) != generation => continue,
             Ok(()) => {
-                presented_generation = generation;
-                break Some(Ok(()));
+                info!(
+                    grant_jti = %pane.grant_jti(),
+                    attempts = attempt + 1,
+                    renewals,
+                    "remote attach: reattach supervisor done — pane live"
+                );
+                return (Some(Ok(())), generation);
             }
             Err(e) => e,
         };
         if pane.is_finished() {
-            break None;
+            return (None, 0);
         }
         let just_renewed = renewed_at.is_some_and(|t| t.elapsed() < policy.learn_window);
         match classify_reattach_error(&err.code, just_renewed) {
             ReattachStep::Retry => {}
-            ReattachStep::Fatal => break Some(Err(err)),
+            ReattachStep::Fatal => return (Some(Err(err)), 0),
             ReattachStep::Renew => {
                 if renewals >= policy.max_renewals {
-                    break Some(Err(err));
+                    return (Some(Err(err)), 0);
                 }
                 let (Some(renewer), Some(session)) = (
                     client.grant_renewer(),
                     pane.session_id().map(str::to_string),
                 ) else {
-                    break Some(Err(err));
+                    return (Some(Err(err)), 0);
                 };
                 let target = pane.target_device_id().map(str::to_string);
                 match renewer.renew(&session, target.as_deref()).await {
-                    Ok(_) if pane.is_finished() => break None,
+                    Ok(_) if pane.is_finished() => return (None, 0),
                     Ok(renewed) => {
-                        client.swap_grant(&pane, &renewed);
+                        client.swap_grant(pane, &renewed);
                         renewals += 1;
                         renewed_at = Some(tokio::time::Instant::now());
                         continue;
                     }
                     Err(e) => {
-                        break Some(Err(AttachError {
-                            code: "attach_grant_renew_failed".to_string(),
-                            message: format!("{} — renewing the grant failed: {e}", err.message),
-                        }))
+                        return (
+                            Some(Err(AttachError {
+                                code: "attach_grant_renew_failed".to_string(),
+                                message: format!(
+                                    "{} — renewing the grant failed: {e}",
+                                    err.message
+                                ),
+                            })),
+                            0,
+                        )
                     }
                 }
             }
@@ -3746,15 +3810,18 @@ pub async fn supervise_reattach(
         }
         attempt += 1;
         if started.elapsed() >= policy.window {
-            break Some(Err(AttachError {
-                code: "reattach_gave_up".to_string(),
-                message: format!(
-                    "no reattach after {}s and {attempt} attempts; last answer {} ({})",
-                    policy.window.as_secs(),
-                    err.code,
-                    err.message
-                ),
-            }));
+            return (
+                Some(Err(AttachError {
+                    code: "reattach_gave_up".to_string(),
+                    message: format!(
+                        "no reattach after {}s and {attempt} attempts; last answer {} ({})",
+                        policy.window.as_secs(),
+                        err.code,
+                        err.message
+                    ),
+                })),
+                0,
+            );
         }
         debug!(
             grant_jti = %pane.grant_jti(),
@@ -3766,39 +3833,6 @@ pub async fn supervise_reattach(
             _ = tokio::time::sleep(policy.delay(attempt)) => {}
             _ = &mut reconnected => {}
         }
-    };
-    let succeeded = matches!(outcome, Some(Ok(())));
-    match outcome {
-        Some(Ok(())) => info!(
-            grant_jti = %pane.grant_jti(),
-            attempts = attempt + 1,
-            renewals,
-            "remote attach: reattach supervisor done — pane live"
-        ),
-        Some(Err(e)) => {
-            if !pane.is_finished() {
-                pane.mark_error(&e.code, &e.message);
-            }
-            client.drop_pane(&pane.grant_jti());
-        }
-        None => {}
-    }
-    pane.end_reattach();
-    // A reconnect that landed between the success above and the release just
-    // now found the pane still claimed and skipped it, so nothing presented on
-    // the new connection. Present here and hand it to a fresh supervisor,
-    // which the relay's next inbound frame starts.
-    if succeeded
-        && client.reconnect_gen.load(Ordering::Acquire) != presented_generation
-        && !pane.is_finished()
-        && pane.try_begin_reattach()
-    {
-        let first = client.send_reattach(&pane).ok();
-        client.queue_reattach(ReattachRequest {
-            pane,
-            first,
-            announced_target_down: false,
-        });
     }
 }
 
