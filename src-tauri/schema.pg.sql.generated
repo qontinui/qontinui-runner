@@ -2414,6 +2414,69 @@ ALTER SEQUENCE coord.client_telemetry_observations_id_seq OWNED BY coord.client_
 
 
 --
+-- Name: commit_land_proofs; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.commit_land_proofs (
+    repo text NOT NULL,
+    commit_sha text NOT NULL,
+    verdict text NOT NULL,
+    method text,
+    landed_sha text,
+    trunk text NOT NULL,
+    trunk_tip text,
+    patch_id text,
+    changed_lines integer,
+    touched_files text[],
+    abstain_reason text,
+    detail text,
+    proven_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT commit_land_proofs_commit_sha_full_hex CHECK ((commit_sha ~ '^[0-9a-f]{40}$'::text)),
+    CONSTRAINT commit_land_proofs_landed_names_its_sha CHECK (((verdict <> 'landed'::text) OR (landed_sha IS NOT NULL))),
+    CONSTRAINT commit_land_proofs_landed_sha_full_hex CHECK (((landed_sha IS NULL) OR (landed_sha ~ '^[0-9a-f]{40}$'::text))),
+    CONSTRAINT commit_land_proofs_method_check CHECK ((method = ANY (ARRAY['ancestor'::text, 'patch_id'::text]))),
+    CONSTRAINT commit_land_proofs_method_iff_landed CHECK (((verdict = 'landed'::text) = (method IS NOT NULL))),
+    CONSTRAINT commit_land_proofs_trunk_tip_full_hex CHECK (((trunk_tip IS NULL) OR (trunk_tip ~ '^[0-9a-f]{40}$'::text))),
+    CONSTRAINT commit_land_proofs_verdict_check CHECK ((verdict = ANY (ARRAY['landed'::text, 'abstain'::text])))
+);
+
+
+--
+-- Name: TABLE commit_land_proofs; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.commit_land_proofs IS 'coord-proven land verdicts for a single commit (repo, commit_sha): landed by ancestor or patch_id against the resolved trunk, or abstain with a reason. coord is the SOLE writer; no agent-reachable door writes here, so a row is proof rather than a claim. Intentionally tenant-less: a land is a fact about a repo and a commit, not a tenant, and the table is read only by joining through a tenant''s own citation row in coord.work_unit_pr_citations.';
+
+
+--
+-- Name: COLUMN commit_land_proofs.commit_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.commit_land_proofs.commit_sha IS 'Full 40-hex commit sha as cited.';
+
+
+--
+-- Name: COLUMN commit_land_proofs.method; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.commit_land_proofs.method IS 'How the land was proven: ancestor (commit_sha is on trunk) or patch_id (a path-scoped twin with the same patch id is on trunk). NULL on abstain.';
+
+
+--
+-- Name: COLUMN commit_land_proofs.landed_sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.commit_land_proofs.landed_sha IS 'The sha actually on trunk: equals commit_sha for ancestor, the twin for patch_id.';
+
+
+--
+-- Name: COLUMN commit_land_proofs.touched_files; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.commit_land_proofs.touched_files IS 'Audit and the document_only disclosure only; never a retirement input.';
+
+
+--
 -- Name: commit_lineage; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3649,6 +3712,7 @@ CREATE TABLE coord.displaced_pr_rows (
     displaced_by_pr_number integer,
     displaced_at timestamp with time zone DEFAULT now() NOT NULL,
     last_refreshed_at timestamp with time zone DEFAULT now() NOT NULL,
+    pr_state_observed_at timestamp with time zone,
     CONSTRAINT displaced_pr_rows_source_check CHECK ((source = ANY (ARRAY['rebind'::text, 'first_observation'::text])))
 );
 
@@ -3707,6 +3771,13 @@ COMMENT ON COLUMN coord.displaced_pr_rows.displaced_at IS 'When the row was firs
 --
 
 COMMENT ON COLUMN coord.displaced_pr_rows.last_refreshed_at IS 'When a writer last wrote this row. The default covers INSERT only; every ON CONFLICT DO UPDATE must set it explicitly.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.pr_state_observed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.pr_state_observed_at IS 'The archived row''s PR-state observation stamp, carried from coord.repo_branches on rebind and re-stamped only by a PR-state authority. NULL = not observed since the column existed.';
 
 
 --
@@ -6419,7 +6490,8 @@ CREATE TABLE coord.repo_branches (
     required_checks_walk_at timestamp with time zone,
     required_checks_walk_truncated boolean,
     required_checks_walk_head_sha text,
-    touched_files_authoritative_at timestamp with time zone
+    touched_files_authoritative_at timestamp with time zone,
+    pr_state_observed_at timestamp with time zone
 );
 
 
@@ -6442,6 +6514,13 @@ COMMENT ON COLUMN coord.repo_branches.pr_state IS 'open | draft | merged | close
 --
 
 COMMENT ON COLUMN coord.repo_branches.touched_files_authoritative_at IS 'Set by coord''s citation re-enrich pass when touched_files on a TERMINAL PR row was hydrated from GitHub''s PR-files API; a stamped row is never re-selected.';
+
+
+--
+-- Name: COLUMN repo_branches.pr_state_observed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.repo_branches.pr_state_observed_at IS 'When a PR-state authority (a GitHub pull_request webhook, a live GitHub read, or coord''s own land record) last observed this row''s pr_state. NULL = not observed since the column existed; a non-authority pr_state write clears it.';
 
 
 --
@@ -18232,6 +18311,14 @@ ALTER TABLE ONLY coord.claude_account_usage
 
 ALTER TABLE ONLY coord.client_telemetry_observations
     ADD CONSTRAINT client_telemetry_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: commit_land_proofs commit_land_proofs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.commit_land_proofs
+    ADD CONSTRAINT commit_land_proofs_pkey PRIMARY KEY (repo, commit_sha);
 
 
 --
