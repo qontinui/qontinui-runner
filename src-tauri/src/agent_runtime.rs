@@ -2179,7 +2179,10 @@ enum SpawnDecision {
     /// Carries a human-readable cause for the WARN log, and how far the claim
     /// provably got — which decides what a seam refusal after this spawn
     /// records (see [`failed_spawn_disposition`]).
-    SpawnDespiteClaimError { cause: String, claim_sent: ClaimSent },
+    SpawnDespiteClaimError {
+        cause: String,
+        claim_sent: ClaimSent,
+    },
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
     /// spawn; leave the row pending for the backstop poll, like `AtCap`.
@@ -6122,9 +6125,17 @@ impl std::fmt::Display for SpawnRefusal {
             SpawnRefusal::ResourceGuard {
                 severity,
                 observation,
-            } => write!(f, "resource guard refusal: {}", observation.clause(severity)),
+            } => write!(
+                f,
+                "resource guard refusal: {}",
+                observation.clause(severity)
+            ),
             SpawnRefusal::ClaudeCliUnlaunchable { path, fault } => {
-                write!(f, "claude CLI at {path} is not launchable ({})", fault.wire())
+                write!(
+                    f,
+                    "claude CLI at {path} is not launchable ({})",
+                    fault.wire()
+                )
             }
         }
     }
@@ -6148,8 +6159,10 @@ impl SpawnRefusal {
                 observation,
             }),
             crate::terminal::session::SpawnSeamCause::ProgramUnlaunchable { program, fault } => {
-                (program == claude_bin)
-                    .then_some(SpawnRefusal::ClaudeCliUnlaunchable { path: program, fault })
+                (program == claude_bin).then_some(SpawnRefusal::ClaudeCliUnlaunchable {
+                    path: program,
+                    fault,
+                })
             }
         }
     }
@@ -6577,7 +6590,6 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-
     // Step 1c: the `claude` binary this continuation will exec, resolved ONCE
     // and threaded to the spawn, so the readiness probe below and the spawn
     // name the same file by construction. Resolved in the RUNNER's env, which
@@ -6618,8 +6630,7 @@ async fn run_gate_continuation_inner(
     let errored_claim = decision
         .as_ref()
         .and_then(SpawnDecision::errored_claim_sent);
-    if let (ConsumeTarget::Gate(gate_id, _), Some(decision)) = (consume_target, decision.as_ref())
-    {
+    if let (ConsumeTarget::Gate(gate_id, _), Some(decision)) = (consume_target, decision.as_ref()) {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -16293,7 +16304,10 @@ mod tests {
             run_pre_claim_counted(ConsumeTarget::Gate(gate, 0), claude_bin, readiness).await;
         match &result {
             PreClaim::Deferred { .. } => {
-                assert_eq!(deferrals, 1, "a deferral must post through the deferral poster once")
+                assert_eq!(
+                    deferrals, 1,
+                    "a deferral must post through the deferral poster once"
+                )
             }
             PreClaim::Ready { .. } => assert_eq!(deferrals, 0, "a ready dispatch defers nothing"),
         }
@@ -16323,7 +16337,10 @@ mod tests {
             let gate = uuid::Uuid::now_v7();
             assert!(claim_gate_dispatch(gate), "the dispatcher's claim");
             let (result, calls) = run_pre_claim(gate, "/abs/claude", resource_only(resource)).await;
-            assert_eq!(calls, 0, "{class}: a refused readiness must not post the claim");
+            assert_eq!(
+                calls, 0,
+                "{class}: a refused readiness must not post the claim"
+            );
             match result {
                 PreClaim::Deferred { stamp } => assert!(stamp.starts_with(class), "{stamp}"),
                 other => panic!("{class}: expected a deferral, got {other:?}"),
@@ -16340,8 +16357,12 @@ mod tests {
     #[tokio::test]
     async fn pre_claim_warn_resource_defers_without_claiming() {
         let gate = uuid::Uuid::now_v7();
-        let (result, calls) =
-            run_pre_claim(gate, "/abs/claude", resource_only(thread_verdict(Some(300)))).await;
+        let (result, calls) = run_pre_claim(
+            gate,
+            "/abs/claude",
+            resource_only(thread_verdict(Some(300))),
+        )
+        .await;
         assert_eq!(calls, 0);
         assert_eq!(
             result,
@@ -16392,7 +16413,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pre_claim_unresolved_cli_defers_on_unix() {
-        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
+        let (result, calls) =
+            run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
         assert_eq!(calls, 0);
         assert_eq!(
             result,
@@ -16407,7 +16429,8 @@ mod tests {
     #[cfg(not(unix))]
     #[tokio::test]
     async fn pre_claim_unresolved_cli_proceeds_on_windows() {
-        let (result, calls) = run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
+        let (result, calls) =
+            run_pre_claim(uuid::Uuid::now_v7(), "claude", cli_only("claude")).await;
         assert_eq!(calls, 1);
         assert_eq!(
             result,
@@ -16453,8 +16476,7 @@ mod tests {
         let dispatch = uuid::Uuid::now_v7();
         assert!(claim_dispatch_dispatch(dispatch), "the dispatcher's claim");
         let (result, claims, deferrals) =
-            run_pre_claim_counted(ConsumeTarget::Dispatch(dispatch), "/abs/claude", failing)
-                .await;
+            run_pre_claim_counted(ConsumeTarget::Dispatch(dispatch), "/abs/claude", failing).await;
         assert!(matches!(result, PreClaim::Deferred { .. }), "{result:?}");
         assert_eq!(claims, 0, "a Dispatch target posts no claim");
         assert_eq!(deferrals, 1);
@@ -16571,7 +16593,11 @@ mod tests {
                 observation: observation_of(threads_critical()),
             }),
         );
-        assert_eq!(resource.to_string(), resource_text, "the detail text is unchanged");
+        assert_eq!(
+            resource.to_string(),
+            resource_text,
+            "the detail text is unchanged"
+        );
         let memory = seam_error(
             "resource_guard:critical: …".to_string(),
             Some(SpawnRefusal::ResourceGuard {
@@ -16639,7 +16665,11 @@ mod tests {
         };
         let missing = |_: &std::path::Path| Err(ExecFault::NotFound);
         let present = |_: &std::path::Path| Ok(());
-        assert_eq!(exec_failure_cause(Some("claude"), &missing), None, "bare name");
+        assert_eq!(
+            exec_failure_cause(Some("claude"), &missing),
+            None,
+            "bare name"
+        );
         assert_eq!(exec_failure_cause(None, &missing), None, "shell pane");
         assert_eq!(
             exec_failure_cause(Some(absolute), &present),
@@ -16746,7 +16776,11 @@ mod tests {
         for (label, error, stamp) in [
             ("pty", pty(), "claude_cli_unavailable:eacces"),
             ("headless", headless(), "claude_cli_unavailable:eacces"),
-            ("resource", resource(), "thread_pressure:critical:540_over_400"),
+            (
+                "resource",
+                resource(),
+                "thread_pressure:critical:540_over_400",
+            ),
         ] {
             let (disposition, outcomes, deferrals) =
                 settle_counted(Some(ClaimSent::NotSent), &error).await;
@@ -16759,13 +16793,24 @@ mod tests {
             assert!(outcomes.is_empty(), "{label}: no spawn_failed outcome");
         }
 
-        for (label, error) in [("pty", pty()), ("headless", headless()), ("resource", resource())]
-        {
+        for (label, error) in [
+            ("pty", pty()),
+            ("headless", headless()),
+            ("resource", resource()),
+        ] {
             let (disposition, outcomes, deferrals) =
                 settle_counted(Some(ClaimSent::Unknown), &error).await;
-            assert_eq!(disposition, FailedSpawnDisposition::PostSpawnFailed, "{label}");
+            assert_eq!(
+                disposition,
+                FailedSpawnDisposition::PostSpawnFailed,
+                "{label}"
+            );
             assert_eq!(outcomes.len(), 1, "{label}: spawn_failed posted once");
-            assert_eq!(outcomes[0], first_line(&error.to_string()), "{label}: seam detail");
+            assert_eq!(
+                outcomes[0],
+                first_line(&error.to_string()),
+                "{label}: seam detail"
+            );
             assert!(deferrals.is_empty(), "{label}: nothing deferred");
         }
         // The PTY detail #2674 classifies is the seam's own text, unrenamed.
@@ -16780,7 +16825,10 @@ mod tests {
     async fn d5_deferral_releases_the_redelivery_attempt_it_ran_under() {
         let gate = uuid::Uuid::now_v7();
         let device = uuid::Uuid::now_v7();
-        assert!(claim_gate_dispatch_attempt(gate, 2), "the dispatcher's claim");
+        assert!(
+            claim_gate_dispatch_attempt(gate, 2),
+            "the dispatcher's claim"
+        );
         let error = seam_error(
             "Failed to spawn shell: Unable to spawn /x/claude because it doesn't exist on the \
              filesystem or is not executable (ENOENT: No such file or directory)"
@@ -16826,7 +16874,10 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
         let t0 = std::time::Instant::now();
         assert!(should_post_deferred_stamp(gate, t0));
-        assert!(!should_post_deferred_stamp(gate, t0), "held while provisional");
+        assert!(
+            !should_post_deferred_stamp(gate, t0),
+            "held while provisional"
+        );
         rollback_deferred_stamp(gate, t0);
         assert!(
             should_post_deferred_stamp(gate, t0 + Duration::from_secs(1)),
@@ -16844,8 +16895,16 @@ mod tests {
     /// binary when re-resolution falls back to a bare name.
     #[test]
     fn a_bare_reresolution_does_not_replace_an_absolute_binary() {
-        let abs = if cfg!(windows) { "C:\\x\\claude.exe" } else { "/x/claude" };
-        let other = if cfg!(windows) { "C:\\y\\claude.exe" } else { "/y/claude" };
+        let abs = if cfg!(windows) {
+            "C:\\x\\claude.exe"
+        } else {
+            "/x/claude"
+        };
+        let other = if cfg!(windows) {
+            "C:\\y\\claude.exe"
+        } else {
+            "/y/claude"
+        };
         assert_eq!(
             adopt_reresolved_claude_bin(abs.into(), other.into()),
             other,
@@ -16918,8 +16977,14 @@ mod tests {
     /// unanswered attempt is `Unreached` (and rolled back).
     #[test]
     fn deferred_stamp_post_classification() {
-        assert_eq!(classify_deferred_stamp_status(Some(200)), DeferredStampPost::Posted);
-        assert_eq!(classify_deferred_stamp_status(Some(204)), DeferredStampPost::Posted);
+        assert_eq!(
+            classify_deferred_stamp_status(Some(200)),
+            DeferredStampPost::Posted
+        );
+        assert_eq!(
+            classify_deferred_stamp_status(Some(204)),
+            DeferredStampPost::Posted
+        );
         for rejected in [400, 404, 409, 422, 499] {
             assert_eq!(
                 classify_deferred_stamp_status(Some(rejected)),
@@ -17955,7 +18020,6 @@ mod tests {
         );
         assert_eq!(last_output_line("\r\n  \n"), None);
     }
-
 
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
     /// `dispatch_id` and has NO `coord.gates` row, so every producer must be
