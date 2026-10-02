@@ -226,6 +226,11 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
+    /// Intent-derived display name coord stamps for this spawn (e.g.
+    /// `post-merge-runner#1863`). Becomes `claude --name`, the tab title and the
+    /// commit `Session-Name` trailer. Absent on a coord that predates it.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// The gate row's id. Used to (1) dedupe a continuation delivered by BOTH
     /// the WS fast-path and the poll backstop against the process-wide
     /// [`dispatched_gate_ids`] set, (2) POST the `continuation-consumed` ack so
@@ -645,6 +650,11 @@ pub struct ConditionCheckPayload {
     /// this field wins with no further change here.
     #[serde(default)]
     pub report_token: Option<String>,
+    /// Human name of the condition being checked, when coord supplies one.
+    /// Drives the spawn name `check-<name>`; absent ⇒ the `Condition check <id8>`
+    /// label and no `--name`.
+    #[serde(default)]
+    pub condition_name: Option<String>,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -6074,6 +6084,9 @@ pub(crate) fn pick_continuation_page(
 pub(crate) fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
+    // The display name for `claude --name` (the same string the tab is titled
+    // with). `None` ⇒ no `--name`, today's argv. Sanitised by the launch seam.
+    session_name: Option<&str>,
     add_dir_args: Vec<String>,
     prompt: String,
     // The system-prompt carrier: the composed `--append-system-prompt-file`
@@ -6137,6 +6150,7 @@ pub(crate) fn build_continuation_claude_command(
     let spec = LaunchSpec {
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
+        name: session_name.map(str::to_string),
         extra_required,
         ..Default::default()
     };
@@ -6242,10 +6256,16 @@ async fn run_continuation_terminal(
     // to the operator and would otherwise require a reassignment step.
 
     // Title: prefer the anchor_key, else a generic gate-continuation label.
-    let title = payload
-        .anchor_key
-        .clone()
-        .unwrap_or_else(|| "Gate continuation".to_string());
+    let spawn_name = payload
+        .session_name
+        .as_deref()
+        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+    let title = spawn_name.clone().unwrap_or_else(|| {
+        payload
+            .anchor_key
+            .clone()
+            .unwrap_or_else(|| "Gate continuation".to_string())
+    });
 
     // Resolve `claude` to an ABSOLUTE launchable path, same as the
     // condition-check terminal and for the same reason: this spawns via the
@@ -6376,6 +6396,7 @@ async fn run_continuation_terminal(
             config_dir: selected_config_dir.clone(),
             working_dir: workdir.to_string(),
             title: title.clone(),
+            spawn_name: spawn_name.clone(),
             page_id: Some(target_page.clone()),
             // Matches the `--session-id` in the spawn argv → synchronous record.
             claude_session_id: Some(pinned_session_id.clone()),
@@ -6451,6 +6472,7 @@ async fn run_continuation_terminal(
         let argv = build_continuation_claude_command(
             claude_bin.clone(),
             &pinned_session_id,
+            spawn_name.as_deref(),
             add_dir_args.clone(),
             payload.initial_prompt.clone(),
             prompt_carrier,
@@ -7343,7 +7365,16 @@ async fn run_condition_check_terminal(
 
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
-    let title = format!("Condition check {run_id_short}");
+    // `check-<condition name>` when coord supplies one, else the run-id label.
+    let spawn_name = payload
+        .condition_name
+        .as_deref()
+        .and_then(|n| {
+            crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
+        });
+    let title = spawn_name
+        .clone()
+        .unwrap_or_else(|| format!("Condition check {run_id_short}"));
 
     // A condition check does not edit code, so no worktree isolation — run from
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
@@ -7407,6 +7438,7 @@ async fn run_condition_check_terminal(
     let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
+        spawn_name.as_deref(),
         Vec::new(),
         payload.initial_prompt.clone(),
         prompt_carrier,
@@ -7454,6 +7486,7 @@ async fn run_condition_check_terminal(
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
         title: title.clone(),
+        spawn_name: spawn_name.clone(),
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id.clone()),
@@ -10497,6 +10530,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
+            condition_name: None,
         }
     }
 
@@ -11147,10 +11181,39 @@ mod tests {
     /// the `--` terminator and the trailing positional prompt, with
     /// attached-form `--add-dir=` siblings preserved in between.
     #[test]
+    fn continuation_command_name_precedes_terminator_and_is_one_token() {
+        let build = |name: Option<&str>| {
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                name,
+                vec![],
+                "-p do \"it\"".to_string(),
+                None,
+                Vec::new(),
+                &crate::claude_session::launch_spec::LaunchConfig::default(),
+            )
+        };
+        let without = build(None);
+        assert!(!without.iter().any(|a| a == "--name"));
+        let with = build(Some("check-login page"));
+        let n = with.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(with[n + 1], "check-login page");
+        let dd = with.iter().position(|a| a == "--").unwrap();
+        assert!(n < dd);
+        assert_eq!(with.last().unwrap(), "-p do \"it\"");
+        // Dropping the name returns today's argv exactly.
+        let mut stripped = with.clone();
+        stripped.drain(n..n + 2);
+        assert_eq!(stripped, without);
+    }
+
+    #[test]
     fn continuation_command_pins_session_id_before_positional_prompt() {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
@@ -11174,6 +11237,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![
                 "--add-dir=D:/wt/coord".to_string(),
                 "--add-dir=D:/wt/web".to_string(),
@@ -11206,6 +11270,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "-prompt with dash".to_string(),
             None,
@@ -11228,6 +11293,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11282,6 +11348,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11318,6 +11385,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11354,6 +11422,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             None,
@@ -11376,6 +11445,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -11408,6 +11478,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(carrier),
@@ -11442,6 +11513,7 @@ mod tests {
             build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 Some(carrier.clone()),
@@ -11486,6 +11558,7 @@ mod tests {
             let cmd = build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 carrier.clone(),
@@ -12704,6 +12777,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             Vec::new(),
             "run /babysit-prs".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -13387,6 +13461,7 @@ mod tests {
             presentation: Presentation::Headless,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: anchor.map(|s| s.to_string()),
+            session_name: None,
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
@@ -13433,6 +13508,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
+            session_name: None,
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
@@ -16386,6 +16462,7 @@ mod tests {
                 presentation: Presentation::Terminal,
                 source: GATE_CONTINUATION_SOURCE.to_string(),
                 anchor_key: Some("unit:00000000-0000-0000-0000-000000000000:phase-1".to_string()),
+                session_name: None,
                 gate_id,
                 dispatch_id,
                 target_instance_name: None,

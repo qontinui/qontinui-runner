@@ -98,10 +98,38 @@ pub struct LaunchSpec {
     /// Caller-provided model ⇒ `--model <m>`; subsumes model overrides and any
     /// failover sniff. When set, drops any `--model` from the template.
     pub model: Option<String>,
+    /// Display name ⇒ `--name <v>` (shown in the prompt box, `/resume` picker and
+    /// terminal title). Passed through [`sanitize_session_name`]; a name that
+    /// sanitises to nothing is omitted. When set, drops any `--name` / `-n` (and
+    /// attached `--name=…`) from the template.
+    pub name: Option<String>,
     /// Other non-negotiable trailing args, verbatim and in order — carries the
     /// `--append-system-prompt <s>`, `--add-dir <d>`, and the trailing
     /// `-- <prompt>` positional. Never reordered or deduped within.
     pub extra_required: Vec<String>,
+}
+
+/// Maximum length (chars) of a `--name` value.
+pub const MAX_SESSION_NAME_CHARS: usize = 40;
+
+/// Make `raw` safe to hand to `claude --name`: control characters and newlines
+/// become spaces, whitespace runs collapse to one space, leading `-` is stripped
+/// (a value starting with `-` could be parsed as a flag), and the result is
+/// capped at [`MAX_SESSION_NAME_CHARS`] chars. `None` when nothing is left.
+pub fn sanitize_session_name(raw: &str) -> Option<String> {
+    let spaced: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_start_matches('-').trim_start();
+    let capped: String = trimmed.chars().take(MAX_SESSION_NAME_CHARS).collect();
+    let capped = capped.trim_end().to_string();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
 }
 
 /// A parsed template flag and the value tokens that follow it (arity inferred:
@@ -245,6 +273,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let pin = spec.resume_id.as_deref().or(spec.session_id.as_deref());
     let provided = provided_flag_names(&spec.extra_required);
     let caller_owns_append_prompt = provides_append_prompt_flag(&spec.extra_required);
+    let name = spec.name.as_deref().and_then(sanitize_session_name);
 
     let mut template_model: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
@@ -265,6 +294,10 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 "--permission-mode" | "--dangerously-skip-permissions" => {}
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
+                // Name is spec-owned when the caller supplies one: drop the
+                // template's `--name` / `-n` (either spelling) so two never ship.
+                "--name" | "-n" if name.is_some() => {}
+                n if name.is_some() && n.starts_with("--name=") => {}
                 // Session flags: when the operator positioned the id via the
                 // `{sessionId}` placeholder, keep the flag in place; otherwise the
                 // spec owns session and we drop the template's.
@@ -320,6 +353,12 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
             out.push("--session-id".to_string());
             out.push(session.clone());
         }
+    }
+
+    // 3b. Display name — a separate token pair, like `--session-id`.
+    if let Some(n) = name {
+        out.push("--name".to_string());
+        out.push(n);
     }
 
     // 4. Remaining operator template flags, in template order (includes a
@@ -605,6 +644,77 @@ mod tests {
             "claude",
         );
         assert_eq!(value_after(&argv, "--session-id"), Some("abc-123"));
+    }
+
+    #[test]
+    fn name_absent_emits_no_name_flag() {
+        let argv = render_argv(&spec(), &LaunchConfig::default(), "claude");
+        assert!(!argv.iter().any(|a| a == "--name"));
+    }
+
+    #[test]
+    fn name_rendered_as_separate_token_pair_before_extra_required() {
+        let mut s = spec();
+        s.session_id = Some("sid".to_string());
+        s.name = Some("post-merge-runner#1863".to_string());
+        s.extra_required = vec!["--".to_string(), "do it".to_string()];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(value_after(&argv, "--name"), Some("post-merge-runner#1863"));
+        let n = argv.iter().position(|a| a == "--name").unwrap();
+        let dd = argv.iter().position(|a| a == "--").unwrap();
+        assert!(n < dd, "--name must precede the `--` terminator: {argv:?}");
+    }
+
+    #[test]
+    fn name_with_spaces_quotes_and_leading_dash_is_one_safe_token() {
+        let mut s = spec();
+        s.name = Some("  -\"--evil\"   it's\nfine ".to_string());
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        let v = value_after(&argv, "--name").unwrap();
+        assert!(!v.starts_with('-'), "leading dash must be stripped: {v:?}");
+        assert_eq!(v, "\"--evil\" it's fine");
+        assert_eq!(argv.iter().filter(|a| *a == "--name").count(), 1);
+    }
+
+    #[test]
+    fn name_that_sanitises_to_nothing_is_omitted() {
+        let mut s = spec();
+        s.name = Some(" \n\t --- ".to_string());
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert!(!argv.iter().any(|a| a == "--name"));
+    }
+
+    #[test]
+    fn spec_name_drops_template_name_in_every_spelling() {
+        for t in [
+            "claude --name old",
+            "claude -n old",
+            "claude --name=old",
+            "claude --name old --model sonnet",
+        ] {
+            let mut s = spec();
+            s.name = Some("new".to_string());
+            let argv = render_argv(&s, &tmpl(t), "claude");
+            assert_eq!(value_after(&argv, "--name"), Some("new"), "{t}");
+            assert!(!argv.iter().any(|a| a.contains("old") || a == "-n"), "{t}: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn template_name_kept_when_spec_has_none() {
+        let argv = render_argv(&spec(), &tmpl("claude --name old"), "claude");
+        assert_eq!(value_after(&argv, "--name"), Some("old"));
+    }
+
+    #[test]
+    fn sanitize_session_name_strips_collapses_and_caps() {
+        assert_eq!(sanitize_session_name("a\u{7}b\r\nc   d"), Some("a b c d".to_string()));
+        assert_eq!(sanitize_session_name("---x"), Some("x".to_string()));
+        assert_eq!(sanitize_session_name("   "), None);
+        let long = "x".repeat(100);
+        assert_eq!(sanitize_session_name(&long).unwrap().chars().count(), MAX_SESSION_NAME_CHARS);
+        let multi = "é".repeat(100);
+        assert_eq!(sanitize_session_name(&multi).unwrap().chars().count(), MAX_SESSION_NAME_CHARS);
     }
 
     #[test]
