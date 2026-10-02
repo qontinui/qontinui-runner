@@ -136,6 +136,13 @@ pub async fn terminal_create(
     // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P1).
     let spawn_tenant_id = admit_spawn_tenant(tenant_id.as_deref())?;
 
+    // Attended: an operator click (and, until plan
+    // `2026-10-01-runner-local-spawns-and-restore-take-coord-admission-leases`
+    // tags the restore seam, every restored tab too, which the frontend recreates
+    // through this same command). Reported so coord's live count includes the
+    // bare shells its session table never sees; never refused by coord.
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::OperatorTerminal);
+
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
     // (`page_id`, `title`, original `working_dir`). Computed BEFORE
@@ -1839,6 +1846,9 @@ pub async fn terminal_migrate_session_account(
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
+    // The operator's "move this session to another account": a fresh pane is
+    // spawned for it, so it is reported as an attended spawn.
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::OperatorTerminal);
 
     let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
     Ok(CommandResponse {

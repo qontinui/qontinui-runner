@@ -298,6 +298,7 @@ pub(crate) async fn launch(
         spec.max_turns,
     );
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Scheduler);
     let (mut child, _preconditions) =
         crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
             .await

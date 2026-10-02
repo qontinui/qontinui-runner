@@ -1189,6 +1189,8 @@ async fn start_steward(
         ));
     }
 
+    crate::admission::record_spawn(origin);
+
     // Claim the start slot BEFORE the running-check, and hold it for the rest
     // of this handler (released on drop). Checking first and claiming later
     // would leave exactly the window this claim exists to close — see

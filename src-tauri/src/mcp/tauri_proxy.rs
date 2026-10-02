@@ -294,6 +294,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 spawn_tenant_key.as_deref(),
             );
 
+            crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
             match tm.create(
                 a.title,
                 working_dir,

@@ -1814,6 +1814,7 @@ fn spawn_run_task(payload: LaunchPayload) {
         // nonce, a live agent token and daemons, and a panic inside it must not
         // leak them. See [`AgentRunTeardown`].
         let teardown = AgentRunTeardown::global(agent_id);
+        crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::CoordDispatch);
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
@@ -2554,6 +2555,14 @@ fn settle_claim_decision(
 /// NOT count toward this cap: the COUNT stays the steady-state bound described
 /// above, while the ANCHOR is now held check-to-register. The paragraph above
 /// still describes the count.
+///
+/// **The burst itself is now bounded upstream of this cap**, by coord spawn
+/// admission: [`dispatch_gate_continuation`] takes a permit per row BEFORE the
+/// per-row `tokio::spawn` ([`admit_continuation_or_defer`]), so a backlog
+/// drains at the admitted rate rather than every row reading the pre-burst
+/// registry at once. This cap and the thread defer remain the local backstops
+/// for whatever admission lets through — and run BEFORE a permit is asked
+/// ([`run_local_continuation_guards`]), so a row they turn away spends none.
 ///
 /// `QONTINUI_CONTINUATION_SESSION_CAP` remains the operator override, unchanged
 /// and in both directions (a bigger number is as settable as a smaller one).
@@ -4170,13 +4179,35 @@ async fn dispatch_gate_continuation(
             );
             return DispatchOutcome::AlreadyDispatched;
         }
+        // Local guards, then coord spawn admission, BEFORE the run task exists
+        // (see `admit_continuation_or_defer`). A skip releases the in-process
+        // claim it just took and leaves the row pending at coord.
+        let (reservation, permit) = match admit_continuation_or_defer(
+            &payload,
+            crate::coord_drain_state::SpawnOrigin::GateContinuation,
+            ConsumeTarget::Gate(gate_id),
+            device_id,
+        )
+        .await
+        {
+            Ok(admitted) => admitted,
+            Err(outcome) => return outcome,
+        };
+        let outcome = dispatched_outcome(&permit);
         // One task owns the whole claim → spawn → outcome handshake. The #469
-        // local guards run FIRST inside `run_gate_continuation_inner`, then the
-        // consume-CLAIM is awaited (contract item 4: claim only after the local
-        // cap passes), then spawn-or-skip, then the outcome POST.
+        // local guards and spawn admission have already passed (above, in
+        // `admit_continuation_or_defer`); inside the task the consume-CLAIM is
+        // awaited (contract item 4: claim only after the local cap passes),
+        // then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
-            if let Err(e) =
-                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Gate(gate_id)).await
+            if let Err(e) = run_gate_continuation_inner(
+                payload,
+                device_id,
+                ConsumeTarget::Gate(gate_id),
+                reservation,
+                permit,
+            )
+            .await
             {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
                 // An errored run is no longer in-flight and posted no successful
@@ -4185,7 +4216,7 @@ async fn dispatch_gate_continuation(
                 release_gate_dispatch(gate_id);
             }
         });
-        DispatchOutcome::Dispatched
+        outcome
     } else if let Some(dispatch_id) = payload.dispatch_id {
         // Work-unit DAG dispatch: reuses the `gate_continuation` spawn frame but
         // is keyed on `dispatch_id` (no gate_id). Applies on BOTH the live WS
@@ -4202,6 +4233,18 @@ async fn dispatch_gate_continuation(
             );
             return DispatchOutcome::AlreadyDispatched;
         }
+        let (reservation, permit) = match admit_continuation_or_defer(
+            &payload,
+            crate::coord_drain_state::SpawnOrigin::UnitContinuation,
+            ConsumeTarget::Dispatch(dispatch_id),
+            device_id,
+        )
+        .await
+        {
+            Ok(admitted) => admitted,
+            Err(outcome) => return outcome,
+        };
+        let outcome = dispatched_outcome(&permit);
         // One task owns spawn → consume-ack. Unlike the gate path there is NO
         // claim-before-spawn: the scheduler's `metadata.dispatched_at` CAS is the
         // single dispatch authority (at-most-once-create); this record is only the
@@ -4213,6 +4256,8 @@ async fn dispatch_gate_continuation(
                 payload,
                 device_id,
                 ConsumeTarget::Dispatch(dispatch_id),
+                reservation,
+                permit,
             )
             .await
             {
@@ -4225,10 +4270,14 @@ async fn dispatch_gate_continuation(
                 release_dispatch_dispatch(dispatch_id);
             }
         });
-        DispatchOutcome::Dispatched
+        outcome
     } else {
         // Legacy coord: neither gate_id nor dispatch_id → no dedupe-by-id and no
-        // claim/outcome. Dispatch once with no coord handshake (unchanged).
+        // claim/outcome. Dispatch once with no coord handshake. Spawn admission
+        // is NOT asked here: a legacy frame has no re-delivery, so a deferral
+        // would DROP the work rather than postpone it (the reason the boot-time
+        // presentation deferral excludes this path too). The 64 cap and the
+        // thread defer inside the run still apply.
         spawn_gate_continuation_task(payload, device_id);
         DispatchOutcome::Dispatched
     }
@@ -4251,6 +4300,33 @@ enum DispatchOutcome {
     /// has disabled them with a `block`/`degrade` disposition. No coord claim
     /// is taken, so the row stays re-listable if the user opts in later.
     Denied,
+    /// Coord spawn admission did not grant a permit (coord refused, or coord
+    /// could not answer and the local bucket was empty). The in-process claim
+    /// was released (no stamp — see `admit_continuation_or_defer`); the row
+    /// stays pending and the admission re-poll re-lists it, so a backlog drains
+    /// at the admitted rate.
+    AdmissionDeferred,
+    /// A local guard (target mismatch, presentation still booting, duplicate
+    /// anchor, thread pressure, the 64 cap) skipped the row before admission
+    /// was asked. Before admission these ran inside the spawned task and the
+    /// row counted as `Dispatched`; it was never spawned, so it is now counted
+    /// as the skip it is.
+    LocallyDeferred,
+    /// A run task was spawned WITHOUT admission, because coord answered 404 on
+    /// the admission route and has never served it in this process (it
+    /// predates admission). Counted as dispatched AND as
+    /// `spawn_admission_route_absent`, so a fleet still on such a coord shows.
+    DispatchedWithoutAdmission,
+}
+
+/// The dispatched outcome for an admitted row — see
+/// [`DispatchOutcome::DispatchedWithoutAdmission`].
+fn dispatched_outcome(permit: &crate::admission::AdmissionPermit) -> DispatchOutcome {
+    if permit.passed_through_absent_route() {
+        DispatchOutcome::DispatchedWithoutAdmission
+    } else {
+        DispatchOutcome::Dispatched
+    }
 }
 
 /// Poll coord for gate-continuation dispatches that landed while this runner was
@@ -4324,16 +4400,27 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         listed_n: body.pending.len(),
         ..Default::default()
     };
-    for row in body.pending {
+    let (outcomes, held) = replay_with_admission_close(body.pending, |row| {
         // The row's gate_id is authoritative; stamp it onto the payload so the
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
-        match dispatch_gate_continuation(payload, device_id).await {
+        dispatch_gate_continuation(payload, device_id)
+    })
+    .await;
+    log_admission_close("pending-continuations", held);
+    for outcome in outcomes {
+        match outcome {
             DispatchOutcome::Dispatched => counts.dispatched_n += 1,
             DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
             DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
             DispatchOutcome::Denied => counts.spawn_authorization_denied += 1,
+            DispatchOutcome::AdmissionDeferred => counts.spawn_admission_deferred += 1,
+            DispatchOutcome::LocallyDeferred => counts.local_guard_deferred += 1,
+            DispatchOutcome::DispatchedWithoutAdmission => {
+                counts.dispatched_n += 1;
+                counts.spawn_admission_route_absent += 1;
+            }
         }
     }
     post_continuation_poll_report(device_id, counts).await;
@@ -4358,6 +4445,18 @@ struct PollRunCounts {
     /// standing continuations" apart from a dedupe drop or a dead poll loop —
     /// the two look identical in `skipped_n` alone.
     spawn_authorization_denied: usize,
+    /// Deferred by coord spawn admission (refused, or unknown with the local
+    /// bucket empty). Separate from the registry refusal because the cure is
+    /// different: this one clears by itself as permits refill.
+    spawn_admission_deferred: usize,
+    /// Skipped by a local guard before admission was asked (see
+    /// [`DispatchOutcome::LocallyDeferred`]).
+    local_guard_deferred: usize,
+    /// Dispatched WITHOUT admission because coord does not serve the route.
+    /// NOT a skip — these rows are inside `dispatched_n` — but reported under
+    /// `skip_reasons`, the only extensible map coord's poll-report row
+    /// persists (an unknown top-level field is dropped by its deserializer).
+    spawn_admission_route_absent: usize,
     fetch_failed: bool,
 }
 
@@ -4395,6 +4494,18 @@ impl ContinuationPollReportBody {
             skip_reasons.insert(
                 "spawn_authorization_denied",
                 counts.spawn_authorization_denied,
+            );
+        }
+        if counts.spawn_admission_deferred > 0 {
+            skip_reasons.insert("spawn_admission_deferred", counts.spawn_admission_deferred);
+        }
+        if counts.local_guard_deferred > 0 {
+            skip_reasons.insert("local_guard_deferred", counts.local_guard_deferred);
+        }
+        if counts.spawn_admission_route_absent > 0 {
+            skip_reasons.insert(
+                "spawn_admission_route_absent",
+                counts.spawn_admission_route_absent,
             );
         }
         if counts.fetch_failed {
@@ -4551,14 +4662,73 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
          replaying",
         body.pending.len()
     );
-    for row in body.pending {
+    // Outcome counts are aggregated only on the gate-continuations poll; the
+    // admission close still applies, so a refusing coord is asked once here too.
+    // Rows held here are therefore counted in NO poll report — the
+    // `log_admission_close` line below is their only trace on this side.
+    let (_, held) = replay_with_admission_close(body.pending, |row| {
         // The row's dispatch_id is authoritative; stamp it onto the payload so the
         // shared seam dedupes by dispatch_id + acks the unit consume route even if
         // coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
-        // Outcome counts are aggregated only on the gate-continuations poll.
-        let _ = dispatch_gate_continuation(payload, device_id).await;
+        dispatch_gate_continuation(payload, device_id)
+    })
+    .await;
+    log_admission_close("pending-unit-dispatches", held);
+}
+
+/// Replay a poll's listed rows through `dispatch`, in order, CLOSING spawn
+/// admission for the rest of the poll at the first
+/// [`DispatchOutcome::AdmissionDeferred`].
+///
+/// Why close: a coord that refused (or a local bucket that ran dry) on row k
+/// will refuse row k+1 a millisecond later — the bucket cannot have refilled.
+/// Asking anyway costs one acquire round trip (up to 3 s), one in-process claim
+/// and one local-guard pass per remaining row, and a log line each; against a
+/// loaded coord that is N requests per poll for no grant. So the remaining rows
+/// are not dispatched at all — no dedupe claim and no anchor reservation is
+/// taken for them, so there is nothing to release — and are counted as
+/// `AdmissionDeferred`; they stay pending at coord and are listed again by the
+/// admission re-poll ([`schedule_admission_repoll`]) when the first deferral
+/// scheduled one (its `retry_after` was `Some`), otherwise — nothing will
+/// refill — by the periodic backstop poll. Returns every row's outcome and how
+/// many were held this way. The unit-dispatch poll discards the outcomes, so
+/// rows held there appear in no poll report; only the summary log line names
+/// them.
+async fn replay_with_admission_close<T, F, Fut>(
+    rows: Vec<T>,
+    mut dispatch: F,
+) -> (Vec<DispatchOutcome>, usize)
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = DispatchOutcome>,
+{
+    let mut outcomes = Vec::with_capacity(rows.len());
+    let mut held = 0usize;
+    let mut closed = false;
+    for row in rows {
+        if closed {
+            held += 1;
+            outcomes.push(DispatchOutcome::AdmissionDeferred);
+            continue;
+        }
+        let outcome = dispatch(row).await;
+        closed = outcome == DispatchOutcome::AdmissionDeferred;
+        outcomes.push(outcome);
+    }
+    (outcomes, held)
+}
+
+/// The ONE summary line for the rows [`replay_with_admission_close`] held —
+/// instead of a deferral line per row.
+fn log_admission_close(poll: &str, held: usize) {
+    if held > 0 {
+        info!(
+            "agent_runtime: {poll} poll: spawn admission deferred a row, so {held} more were \
+             left pending without asking — the admission re-poll (or, with nothing to refill, \
+             the backstop poll) lists them again"
+        );
     }
 }
 
@@ -5122,9 +5292,10 @@ fn first_line(msg: &str) -> String {
     msg.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// The shared tail of EVERY local-guard deferral in
-/// [`run_gate_continuation_inner`]'s step 1: stamp coord with a non-consuming
-/// reason, then release the in-process dedupe claim.
+/// The shared tail of EVERY local-guard deferral — [`run_local_continuation_guards`]
+/// and the drain / consume-claim deferrals inside [`run_gate_continuation_inner`]:
+/// release the in-process dedupe claim, then stamp coord with a non-consuming
+/// reason from a detached task.
 ///
 /// One helper rather than three copies of the same eight lines, because the two
 /// invariants it encodes are the ones the 2026-07 delivery-stall incident was
@@ -5164,27 +5335,265 @@ fn first_line(msg: &str) -> String {
 /// `thread_pressure:<severity>:<observed>_over_<limit>`, `at_cap:<cap>`) and one
 /// predates it (`spawn_authorization_<label>`). Callers log their own
 /// human-readable line first, at the severity their verdict deserves.
-async fn defer_continuation_unclaimed(
+fn defer_continuation_unclaimed(
     consume_target: ConsumeTarget,
     device_id: uuid::Uuid,
     reason: String,
 ) {
+    // Release FIRST, and independently of the stamp: the release is the
+    // delivery-stall fix and must never wait on (or be lost with) a POST.
+    release_local_dispatch_claim(consume_target);
     if let ConsumeTarget::Gate(gate_id) = consume_target {
         if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-            post_continuation_deferred(gate_id, device_id, reason).await;
+            // Detached: these guards now run on the dispatcher's path, and the
+            // poll replays rows one after another — a 5 s stamp POST per
+            // deferred row would serialise the whole poll behind coord's
+            // latency. The stamp is best-effort telemetry; a lost one costs a
+            // null reason on coord until the next deferral restamps it.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(post_continuation_deferred(gate_id, device_id, reason));
+                }
+                Err(_) => debug!(
+                    "agent_runtime: continuation-deferred stamp for gate {gate_id} not posted \
+                     (no tokio runtime)"
+                ),
+            }
         }
     }
-    release_local_dispatch_claim(consume_target);
+}
+
+/// Admit one continuation for spawning: the cheap LOCAL guards first, then
+/// coord spawn admission — both in [`dispatch_gate_continuation`], AFTER its
+/// in-process dedupe claim and BEFORE the per-row `tokio::spawn`. Plan
+/// `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+/// Phase 2.
+///
+/// **Why before the spawn.** Every row of a `poll_pending_continuations`
+/// backlog used to get its own task at once, and every task read the
+/// continuation registry as it stood BEFORE the burst — so the 64-session cap
+/// bound none of them ([`DEFAULT_CONTINUATION_SESSION_CAP`]'s doc, "It is a
+/// steady-state bound, NOT a semaphore"). A permit taken here, sequentially per
+/// row, is the per-machine rate that window lacked. The rows it defers stay
+/// pending at coord, and [`schedule_admission_repoll`] re-polls as soon as the
+/// next permit could be granted, so a 130-row backlog drains at the admitted
+/// rate (coord's grant rate, or while coord cannot answer the local bucket's
+/// 4 + 4/min) instead of one burst per 300 s backstop poll.
+///
+/// **Why the local guards come first.** A row the anchor dedup, the thread
+/// defer or the 64 cap would turn away must not burn a coord permit or a local
+/// token on its way to being turned away.
+///
+/// **Why after the dedupe claim.** A duplicate delivery (the same gate on the
+/// WS fast-path and the replay poll) must not burn a permit either; the claim
+/// drops it before it asks.
+///
+/// **The anchor reservation is held across the admission await** (up to
+/// [`crate::admission::ACQUIRE_TIMEOUT`]). A same-anchor twin arriving in that
+/// window reads `DuplicateAnchor(Reserved)` and is stamped
+/// `duplicate_anchor:reserved` even if this row then defers on admission and
+/// gives the anchor back — so that stamp reason means "reserved at the time",
+/// not "a live session holds it"; the twin is re-listed by the next poll.
+///
+/// `Ok((reservation, permit))` proceeds. `Err(outcome)` means the row was
+/// skipped and fully settled here (in-process claim released, row left pending
+/// at coord): [`DispatchOutcome::LocallyDeferred`] for a local guard (which
+/// posted its usual rate-limited stamp), [`DispatchOutcome::AdmissionDeferred`]
+/// for admission — which posts NO `continuation-deferred` stamp, see
+/// [`crate::admission::ContinuationAdmission::Deferred`] for why.
+async fn admit_continuation_or_defer(
+    payload: &GateContinuationPayload,
+    origin: crate::coord_drain_state::SpawnOrigin,
+    consume_target: ConsumeTarget,
+    device_id: uuid::Uuid,
+) -> Result<(AnchorReservation, crate::admission::AdmissionPermit), DispatchOutcome> {
+    let Some(reservation) = run_local_continuation_guards(payload, device_id, consume_target).await
+    else {
+        return Err(DispatchOutcome::LocallyDeferred);
+    };
+    let work_key = match consume_target {
+        ConsumeTarget::Gate(g) => format!("gate:{g}"),
+        ConsumeTarget::Dispatch(d) => format!("dispatch:{d}"),
+        ConsumeTarget::None => "legacy".to_string(),
+    };
+    match crate::admission::admit_continuation(origin, &work_key).await {
+        crate::admission::ContinuationAdmission::Admitted(permit) => Ok((reservation, permit)),
+        crate::admission::ContinuationAdmission::Deferred {
+            key,
+            detail,
+            retry_after,
+        } => {
+            warn!(
+                "agent_runtime: continuation {work_key} deferred by spawn admission ({key}) — \
+                 {detail}; the row stays pending and is re-polled"
+            );
+            release_local_dispatch_claim(consume_target);
+            if let Some(delay) = retry_after {
+                schedule_admission_repoll(device_id, delay);
+            }
+            Err(DispatchOutcome::AdmissionDeferred)
+        }
+    }
+}
+
+/// Floor on an admission re-poll delay, so a coord answering `retry_after: 0`
+/// cannot turn the re-poll into a hammer.
+const ADMISSION_REPOLL_MIN: Duration = Duration::from_secs(5);
+
+/// The admission re-poll's single-flight state.
+///
+/// ONE re-poll task exists at a time, across its whole execution — the sleep
+/// AND the poll. A deferral that arrives while it is sleeping or polling does
+/// not start a second task; it records a re-arm request, and the running task
+/// loops once more when its poll returns. Clearing the flag before polling (the
+/// first version) let a long poll plus a short delay run pollers in parallel —
+/// a feedback loop against exactly the loaded coord that was refusing.
+#[derive(Debug, Default)]
+struct RepollGate {
+    /// A re-poll task is alive (sleeping or polling).
+    active: bool,
+    /// A deferral asked for another re-poll while one was active: the shortest
+    /// delay asked for.
+    rearm: Option<Duration>,
+}
+
+impl RepollGate {
+    /// A deferral wants a re-poll after `delay`. `true` = the caller must start
+    /// the task; `false` = one is active and will loop once more.
+    fn request(&mut self, delay: Duration) -> bool {
+        if self.active {
+            self.rearm = Some(self.rearm.map_or(delay, |d| d.min(delay)));
+            false
+        } else {
+            self.active = true;
+            true
+        }
+    }
+
+    /// The task's poll returned. `Some(delay)` = run once more after `delay`
+    /// (stay active); `None` = done, the gate is free.
+    fn finish(&mut self) -> Option<Duration> {
+        let next = self.rearm.take();
+        if next.is_none() {
+            self.active = false;
+        }
+        next
+    }
+}
+
+fn repoll_gate() -> &'static std::sync::Mutex<RepollGate> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<RepollGate>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(RepollGate::default()))
+}
+
+/// PURE: the delay an admission re-poll waits — `retry_after` clamped to
+/// [`ADMISSION_REPOLL_MIN`] and to the backstop cadence (past which the
+/// periodic backstop poll would fire first anyway).
+fn admission_repoll_delay(retry_after: Duration, backstop: Duration) -> Duration {
+    retry_after.clamp(ADMISSION_REPOLL_MIN, backstop.max(ADMISSION_REPOLL_MIN))
+}
+
+/// Re-poll pending continuations and unit dispatches once `retry_after` has
+/// passed — the earliest a deferred row could be admitted (one refill period,
+/// or coord's own hint when later). Requested at the moment of EVERY admission
+/// deferral, from the poll path and the WS path alike.
+///
+/// Without it a backlog drained at one burst per 300 s backstop poll, not at
+/// the refill rate the bucket advertises. Single-flight across the whole
+/// execution ([`RepollGate`]): each re-poll lists the whole backlog again, so
+/// one in flight is always enough, and its own deferrals re-arm it. A lost
+/// re-poll costs one backstop interval, which is the pre-existing worst case.
+fn schedule_admission_repoll(device_id: uuid::Uuid, retry_after: Duration) {
+    let backstop = Duration::from_secs(continuation_backstop_poll_secs());
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    run_single_flight_repoll(
+        &handle,
+        repoll_gate(),
+        admission_repoll_delay(retry_after, backstop),
+        move |d| admission_repoll_delay(d, backstop),
+        move || async move {
+            poll_pending_continuations(device_id).await;
+            poll_pending_unit_dispatches(device_id).await;
+        },
+    );
+}
+
+/// The single-flight machinery behind [`schedule_admission_repoll`], with the
+/// gate, the delay clamp and the poll injected so a test can drive it.
+fn run_single_flight_repoll<C, P, Fut>(
+    handle: &tokio::runtime::Handle,
+    gate: &'static std::sync::Mutex<RepollGate>,
+    delay: Duration,
+    clamp: C,
+    poll: P,
+) where
+    C: Fn(Duration) -> Duration + Send + 'static,
+    P: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    if !lock_recover(gate, "admission_repoll_gate").request(delay) {
+        debug!("agent_runtime: admission re-poll already in flight — re-arm recorded");
+        return;
+    }
+    debug!(
+        "agent_runtime: admission re-poll scheduled in {}s",
+        delay.as_secs()
+    );
+    handle.spawn(async move {
+        // Frees the gate if this task ends any way OTHER than its own clean
+        // `finish() == None` — a panicking poll unwinds through it, and a
+        // runtime shutdown drops the task with it. Without it the gate stays
+        // `active` forever and every later deferral only records a re-arm that
+        // nothing will ever run: admission re-polls would silently stop for the
+        // process lifetime, leaving only the backstop.
+        let mut guard = RepollGateRelease { gate, armed: true };
+        let mut delay = delay;
+        loop {
+            tokio::time::sleep(delay).await;
+            poll().await;
+            let mut g = lock_recover(gate, "admission_repoll_gate");
+            match g.finish() {
+                Some(next) => delay = clamp(next),
+                None => {
+                    // `finish` already freed the gate, under this same lock. Disarm
+                    // BEFORE releasing the lock: a request arriving right after may
+                    // start a NEW task, whose `active` this guard must not clear.
+                    guard.armed = false;
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Drop guard for the re-poll task — see the comment where it is armed.
+struct RepollGateRelease {
+    gate: &'static std::sync::Mutex<RepollGate>,
+    armed: bool,
+}
+
+impl Drop for RepollGateRelease {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut g = lock_recover(self.gate, "admission_repoll_gate");
+            g.active = false;
+            g.rearm = None;
+        }
+    }
 }
 
 /// Spawn the run task for a gate continuation WITHOUT the coord claim/outcome
 /// handshake (the legacy no-`gate_id` path). Unlike the agent-spawn path, the
 /// device-local resources (worktree, claim, JWT) are NOT supplied by coord —
-/// they are acquired inside [`run_gate_continuation_inner`].
+/// they are acquired inside [`run_gate_continuation_inner`], after
+/// [`run_local_continuation_guards`] passes inside the same task.
 ///
 /// Reached only from [`dispatch_gate_continuation`]'s legacy branch (a coord
 /// that omits `gate_id`): no `dispatched_gate_ids` dedupe-by-id, no claim, no
-/// outcome. The #469 local guards still run inside the run fn.
+/// outcome, and no spawn admission (a legacy frame has no re-delivery, so a
+/// deferral would drop it). The #469 local guards still run, inside the task.
 fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uuid::Uuid) {
     info!(
         "agent_runtime: gate-continuation received (legacy, no gate_id) target_device_id={} \
@@ -5195,37 +5604,48 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
         payload.anchor_key,
     );
     tokio::spawn(async move {
-        if let Err(e) = run_gate_continuation_inner(payload, device_id, ConsumeTarget::None).await {
+        let Some(reservation) =
+            run_local_continuation_guards(&payload, device_id, ConsumeTarget::None).await
+        else {
+            return;
+        };
+        if let Err(e) = run_gate_continuation_inner(
+            payload,
+            device_id,
+            ConsumeTarget::None,
+            reservation,
+            crate::admission::AdmissionPermit::not_required(),
+        )
+        .await
+        {
             error!("agent_runtime: run_gate_continuation (legacy) failed: {e:#}");
         }
     });
 }
 
-/// End-to-end run of one continuation (gate OR work-unit dispatch), with the
-/// coord ack handshake selected by `consume_target`:
+/// The LOCAL guards of one continuation, run by the dispatcher BEFORE it asks
+/// coord for a spawn-admission permit and before the per-row `tokio::spawn`:
 ///
-/// 0. `target_device_id` sanity check.
-/// 1. Local guards (anchor_key dedup, machine thread pressure, concurrency cap)
-///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
-///    (contract item 4), and so a machine already out of threads never pays a
-///    `git worktree add` before being told to wait.
-/// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
-///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
-///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
-///    scheduler CAS is the dispatch authority), so this is skipped for it.
-/// 3. Acquire a device-local worktree (+ claim heartbeat) and dispatch on
-///    `presentation` (terminal / headless) to produce the REAL spawn result.
-/// 4. **ACK** — [`ConsumeTarget::Gate`]: POST the typed `spawned`/`spawn_failed`
-///    OUTCOME. [`ConsumeTarget::Dispatch`]: POST the idempotent unit consume only
-///    on a SUCCESSFUL handle (a failed spawn stays un-consumed → re-listed next
-///    reconnect). Both best-effort, 5s timeout.
+/// * step 0 — the `target_device_id` sanity check;
+/// * step 0b — is the presentation's runtime in place yet (boot-time deferral)?
+/// * step 1 — anchor dedup, machine thread pressure and the concurrency cap.
 ///
-/// [`ConsumeTarget::None`] is the legacy path: steps 2 and 4 are skipped.
-async fn run_gate_continuation_inner(
-    payload: GateContinuationPayload,
+/// Ahead of admission on purpose (plan
+/// `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+/// review LOW 1): a row these cheap checks would defer must never burn a coord
+/// permit or a local-bucket token. Every skip here does exactly what it did
+/// when these steps opened [`run_gate_continuation_inner`] — releases the
+/// in-process claim and, where it always did, posts the rate-limited
+/// `continuation-deferred` stamp.
+///
+/// `Some(reservation)` proceeds, carrying the anchor reservation the guard
+/// took (dropping it on any later exit gives the anchor back); `None` means the
+/// row was skipped and fully settled here.
+async fn run_local_continuation_guards(
+    payload: &GateContinuationPayload,
     device_id: uuid::Uuid,
     consume_target: ConsumeTarget,
-) -> anyhow::Result<()> {
+) -> Option<AnchorReservation> {
     info!(
         "agent_runtime: continuation dispatch target_device_id={} presentation={:?} \
          repos={} anchor_key={:?} consume_target={consume_target:?}",
@@ -5245,7 +5665,7 @@ async fn run_gate_continuation_inner(
         // Local skip, row left pending on coord → release the in-process claim
         // (invariant: claimed only while in-flight or after the consume claim).
         release_local_dispatch_claim(consume_target);
-        return Ok(());
+        return None;
     }
 
     // Step 0b: is the runtime this presentation needs in place yet? A terminal
@@ -5279,7 +5699,7 @@ async fn run_gate_continuation_inner(
             payload.anchor_key
         );
         release_local_dispatch_claim(consume_target);
-        return Ok(());
+        return None;
     }
 
     // Step 1: the local guards (P3 anchor_key dedup + thread pressure + P4
@@ -5304,12 +5724,13 @@ async fn run_gate_continuation_inner(
     //
     // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
     // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
-    // `reservation` carries it from here, and dropping it on ANY exit below —
-    // the authorization refusal, the two consume-claim skips (and a
-    // `SpawnDespiteClaimError` that proceeds, so it does NOT release), a
-    // worktree failure, a presentation fn's early return — gives the anchor
-    // back. The
-    // two spawn successes disarm it explicitly inside the presentation fns.
+    // `reservation` carries it OUT of this fn — through the dispatcher's
+    // admission await, into `run_gate_continuation_inner` — and dropping it on
+    // ANY later exit (an admission deferral, the authorization refusal, the two
+    // consume-claim skips (a `SpawnDespiteClaimError` proceeds, so it does NOT
+    // release), a worktree failure, a presentation fn's early return) gives the
+    // anchor back. The two spawn successes disarm it explicitly inside the
+    // presentation fns.
     let (guard_verdict, reservation) =
         evaluate_continuation_guard_live(payload.anchor_key.as_deref(), &live_terminal_predicate());
     match guard_verdict {
@@ -5355,9 +5776,8 @@ async fn run_gate_continuation_inner(
                 consume_target,
                 device_id,
                 duplicate_anchor_stamp_reason(&holder),
-            )
-            .await;
-            return Ok(());
+            );
+            return None;
         }
         ContinuationGuard::ThreadPressure {
             severity,
@@ -5391,9 +5811,8 @@ async fn run_gate_continuation_inner(
                 consume_target,
                 device_id,
                 thread_pressure_stamp_reason(severity, &observation),
-            )
-            .await;
-            return Ok(());
+            );
+            return None;
         }
         ContinuationGuard::AtCap(cap) => {
             // The deferred continuation stays pending on coord; the periodic
@@ -5405,11 +5824,48 @@ async fn run_gate_continuation_inner(
                  reached — re-delivered when a slot frees (anchor_key={:?})",
                 payload.anchor_key
             );
-            defer_continuation_unclaimed(consume_target, device_id, at_cap_stamp_reason(cap)).await;
-            return Ok(());
+            defer_continuation_unclaimed(consume_target, device_id, at_cap_stamp_reason(cap));
+            return None;
         }
     }
+    Some(reservation)
+}
 
+/// End-to-end run of one continuation (gate OR work-unit dispatch) that has
+/// passed [`run_local_continuation_guards`] and coord spawn admission, with the
+/// coord ack handshake selected by `consume_target`:
+///
+/// Step 1b, agent-registry authorization, runs first as a backstop (the
+/// dispatcher already checked). Then:
+///
+/// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
+///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
+///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
+///    scheduler CAS is the dispatch authority), so this is skipped for it.
+/// 3. Acquire a device-local worktree (+ claim heartbeat) and dispatch on
+///    `presentation` (terminal / headless) to produce the REAL spawn result.
+/// 4. **ACK** — [`ConsumeTarget::Gate`]: POST the typed `spawned`/`spawn_failed`
+///    OUTCOME. [`ConsumeTarget::Dispatch`]: POST the idempotent unit consume only
+///    on a SUCCESSFUL handle (a failed spawn stays un-consumed → re-listed next
+///    reconnect). Both best-effort, 5s timeout.
+///
+/// [`ConsumeTarget::None`] is the legacy path: steps 2 and 4 are skipped.
+async fn run_gate_continuation_inner(
+    payload: GateContinuationPayload,
+    device_id: uuid::Uuid,
+    consume_target: ConsumeTarget,
+    // The anchor reservation [`run_local_continuation_guards`] left behind.
+    // Dropping it on ANY exit below — the authorization refusal, the consume-
+    // claim skips, a worktree failure, a presentation fn's early return — gives
+    // the anchor back; the two spawn successes disarm it inside the
+    // presentation fns.
+    reservation: AnchorReservation,
+    // The coord spawn-admission permit the dispatcher took before spawning this
+    // task. The presentation fns convert it the moment the session exists, and
+    // any earlier exit drops it, which returns the lease to coord with
+    // `used = 0`.
+    permit: crate::admission::AdmissionPermit,
+) -> anyhow::Result<()> {
     // Step 1b: agent-registry spawn authorization (plan
     // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
     // `agent-spawn-authorization`). Placed with the other LOCAL guards and
@@ -5443,7 +5899,7 @@ async fn run_gate_continuation_inner(
                 .unwrap_or("deferred by the coord device drain"),
             payload.anchor_key
         );
-        defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class)).await;
+        defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class));
         return Ok(());
     }
     if !authz.allows_spawn() {
@@ -5470,18 +5926,17 @@ async fn run_gate_continuation_inner(
         // here, where deleting the superseded arm's release call broke no test
         // and stranded the loser's gate id for the process lifetime.
         //
-        // The drain deferral is the one outcome whose side effect cannot live
-        // in that fn: `defer_continuation_unclaimed` is async and posts to
-        // coord, while `settle_claim_decision` is pure-sync and unit-driven.
-        // So the DECISION (log + whether the claim is settled here) stays
-        // there and only the await lands at this call site.
+        // The drain deferral is the one outcome whose side effect does not
+        // live in that fn: `defer_continuation_unclaimed` spawns a coord POST,
+        // while `settle_claim_decision` is pure and unit-driven with no
+        // runtime. So the DECISION (log + whether the claim is settled here)
+        // stays there and only the side effect lands at this call site.
         let decision = post_continuation_claim(gate_id, device_id).await;
         match settle_claim_decision(&decision, consume_target, gate_id) {
             ClaimOutcome::Spawn => {}
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
-                defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))
-                    .await;
+                defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class));
                 return Ok(());
             }
         }
@@ -5547,11 +6002,27 @@ async fn run_gate_continuation_inner(
     // the honest outcome sourced from the REAL spawn result. The presentation
     // fns return `Ok(())` once the terminal/subprocess is actually created and
     // running (`spawned`) and `Err(_)` on a spawn failure (`spawn_failed`).
+    // Every guard, the claim and the workdir are behind us: this continuation
+    // is starting now. Count it for coord's live count (Phase 0 reporter).
+    crate::admission::record_spawn(match consume_target {
+        ConsumeTarget::Dispatch(_) => crate::coord_drain_state::SpawnOrigin::UnitContinuation,
+        ConsumeTarget::Gate(_) | ConsumeTarget::None => {
+            crate::coord_drain_state::SpawnOrigin::GateContinuation
+        }
+    });
     let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx, reservation)
-                .await
+            run_continuation_terminal(
+                agent_id,
+                &workdir,
+                &payload,
+                device_id,
+                ctx,
+                reservation,
+                permit,
+            )
+            .await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5568,8 +6039,14 @@ async fn run_gate_continuation_inner(
                 &payload.initial_prompt,
                 payload.brief.as_ref(),
             );
-            let res =
-                run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
+            let res = run_continuation_headless(
+                agent_id,
+                &workdir,
+                &headless_prompt,
+                reservation,
+                permit,
+            )
+            .await;
             drop(ctx);
             res
         }
@@ -5783,6 +6260,10 @@ async fn run_continuation_terminal(
     // drops it, which releases the anchor; the `Ok` arm hands it to the
     // registry once the live entry exists.
     reservation: AnchorReservation,
+    // The coord spawn-admission permit, on the same lifecycle as `reservation`:
+    // converted beside the registry hand-over, released (used = 0) by any early
+    // `Err` dropping it.
+    permit: crate::admission::AdmissionPermit,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
 
@@ -6089,6 +6570,9 @@ async fn run_continuation_terminal(
             // observe the anchor held by neither — and the permit is consumed,
             // so nothing of this dispatch's can touch the anchor again.
             reservation.handed_to_registry(terminal_id.clone(), reportable_gate);
+            // The session now exists and counts for itself in coord's live
+            // count: convert the admission permit rather than hold it to TTL.
+            permit.converted();
             // The session is intentionally left on `main` (docked, visible) — no
             // pop-out window was opened, so there is nothing to reassign it to.
             info!(
@@ -6531,6 +7015,8 @@ async fn run_condition_check_terminal(
         // the two for per-run attribution.
         return Ok(());
     }
+
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::CoordDispatch);
 
     // A condition check is inherently operator-visible; there is no headless
     // variant. Log if coord ever asks for headless, then spawn a terminal anyway.
@@ -7066,6 +7552,10 @@ async fn run_continuation_headless(
     // in the continuation registry (headless sessions are outside P3/P4), so
     // it is released the moment the child exists; a spawn `Err` drops it.
     reservation: AnchorReservation,
+    // The coord spawn-admission permit: converted the moment the child exists
+    // (NOT when it exits — a headless child can run for hours and the permit
+    // lapses at coord's 120 s TTL), released (used = 0) by a spawn `Err`.
+    permit: crate::admission::AdmissionPermit,
 ) -> anyhow::Result<()> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -7098,6 +7588,7 @@ async fn run_continuation_headless(
             // same-anchor dispatch would read `DuplicateAnchor` for its whole
             // lifetime (headless sessions are not P3/P4 population).
             reservation.release();
+            permit.converted();
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
             // check for its lifetime — it legitimately has no lifecycle
@@ -12559,6 +13050,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             None,
             AnchorReservation::none(),
+            crate::admission::AdmissionPermit::not_required(),
         )
         .await;
         assert!(
@@ -12663,6 +13155,7 @@ mod tests {
             &workdir,
             "echo gate-continuation-proof",
             AnchorReservation::none(),
+            crate::admission::AdmissionPermit::not_required(),
         )
         .await;
         match prev_tier {
@@ -13196,6 +13689,217 @@ mod tests {
         );
     }
 
+    /// A refusing coord is asked ONCE per poll however long the backlog: after
+    /// the first admission deferral the remaining rows are held without being
+    /// dispatched (so without an acquire), and counted as admission deferrals.
+    #[tokio::test]
+    async fn a_refusing_coord_sees_one_acquire_per_poll_for_a_backlog() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (outcomes, held) = replay_with_admission_close((0..10).collect::<Vec<_>>(), |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { DispatchOutcome::AdmissionDeferred }
+        })
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(held, 9);
+        assert_eq!(outcomes.len(), 10);
+        assert!(outcomes
+            .iter()
+            .all(|o| *o == DispatchOutcome::AdmissionDeferred));
+
+        // Rows before the first deferral dispatch normally; the close starts AT it.
+        let script = [
+            DispatchOutcome::Dispatched,
+            DispatchOutcome::LocallyDeferred,
+            DispatchOutcome::AdmissionDeferred,
+        ];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (outcomes, held) = replay_with_admission_close((0..6).collect::<Vec<usize>>(), |i| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let o = script[i];
+            async move { o }
+        })
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(held, 3);
+        assert_eq!(&outcomes[..3], &script[..]);
+    }
+
+    /// The admission re-poll is single-flight across its WHOLE execution: a
+    /// deferral arriving while a re-poll's poll is in flight starts no second
+    /// poller — it re-arms the running one, which polls once more afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferral_during_an_in_flight_repoll_starts_no_second_poller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        static GATE: std::sync::OnceLock<std::sync::Mutex<RepollGate>> = std::sync::OnceLock::new();
+        let gate = GATE.get_or_init(|| std::sync::Mutex::new(RepollGate::default()));
+
+        let first_polls = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::runtime::Handle::current();
+        let poll = {
+            let (first_polls, in_flight, max_in_flight, started, release) = (
+                first_polls.clone(),
+                in_flight.clone(),
+                max_in_flight.clone(),
+                started.clone(),
+                release.clone(),
+            );
+            move || {
+                let (first_polls, in_flight, max_in_flight, started, release) = (
+                    first_polls.clone(),
+                    in_flight.clone(),
+                    max_in_flight.clone(),
+                    started.clone(),
+                    release.clone(),
+                );
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    if first_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        };
+        run_single_flight_repoll(&handle, gate, Duration::from_millis(5), |d| d, poll);
+        started.notified().await;
+
+        // A deferral lands while the first poll is in flight.
+        let second_polls = Arc::new(AtomicUsize::new(0));
+        let sp = second_polls.clone();
+        run_single_flight_repoll(
+            &handle,
+            gate,
+            Duration::from_millis(5),
+            |d| d,
+            move || {
+                let sp = sp.clone();
+                async move {
+                    sp.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+        release.notify_one();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (first_polls.load(Ordering::SeqCst) < 2 || lock_recover(gate, "t").active)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            second_polls.load(Ordering::SeqCst),
+            0,
+            "no second poller started"
+        );
+        assert_eq!(
+            first_polls.load(Ordering::SeqCst),
+            2,
+            "the re-arm polled once more"
+        );
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "never two polls at once"
+        );
+        assert!(
+            !lock_recover(gate, "t").active,
+            "the gate is free afterwards"
+        );
+    }
+
+    /// A panicking poll must not leave the gate held: the drop guard frees it
+    /// on unwind, so the next deferral starts a fresh re-poll task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_repoll_frees_the_gate_for_the_next_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        static GATE: std::sync::OnceLock<std::sync::Mutex<RepollGate>> = std::sync::OnceLock::new();
+        let gate = GATE.get_or_init(|| std::sync::Mutex::new(RepollGate::default()));
+        let handle = tokio::runtime::Handle::current();
+
+        run_single_flight_repoll(
+            &handle,
+            gate,
+            Duration::from_millis(300),
+            |d| d,
+            || async {
+                panic!("simulated re-poll panic (expected in this test)");
+            },
+        );
+        // A deferral while the doomed task is alive (still in its 300 ms sleep,
+        // long enough that a loaded box cannot let it finish first) records a
+        // re-arm.
+        assert!(!lock_recover(gate, "t").request(Duration::from_millis(5)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock_recover(gate, "t").active && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let g = lock_recover(gate, "t");
+            assert!(!g.active, "the panic freed the gate");
+            assert_eq!(g.rearm, None, "and dropped the re-arm with it");
+        }
+
+        // The next request starts a FRESH task, which actually polls.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        run_single_flight_repoll(
+            &handle,
+            gate,
+            Duration::from_millis(5),
+            |d| d,
+            move || {
+                let p = p.clone();
+                async move {
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while polls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "a fresh re-poll ran");
+    }
+
+    #[test]
+    fn the_repoll_gate_rearms_with_the_shortest_delay_and_frees_when_idle() {
+        let s = Duration::from_secs;
+        let mut g = RepollGate::default();
+        assert!(g.request(s(15)), "the first request starts the task");
+        assert!(!g.request(s(30)));
+        assert!(!g.request(s(10)));
+        assert_eq!(
+            g.finish(),
+            Some(s(10)),
+            "re-armed with the shortest delay asked"
+        );
+        assert!(g.active, "still active while the re-arm runs");
+        assert_eq!(g.finish(), None);
+        assert!(!g.active);
+        assert!(g.request(s(5)), "a later deferral starts a fresh task");
+    }
+
+    /// The admission re-poll waits the deferral's retry hint, floored so a zero
+    /// hint cannot hammer coord, and capped at the backstop cadence.
+    #[test]
+    fn admission_repoll_delay_is_floored_and_capped_at_the_backstop() {
+        let s = Duration::from_secs;
+        assert_eq!(admission_repoll_delay(s(15), s(300)), s(15));
+        assert_eq!(admission_repoll_delay(s(0), s(300)), ADMISSION_REPOLL_MIN);
+        assert_eq!(admission_repoll_delay(s(3600), s(300)), s(300));
+        // A backstop configured under the floor never inverts the clamp.
+        assert_eq!(admission_repoll_delay(s(10), s(1)), ADMISSION_REPOLL_MIN);
+    }
+
     /// The poll self-report body serializes to the locked wire shape:
     /// `{device_id, listed_n, dispatched_n, skipped_n, skip_reasons:{…}}` with
     /// `skipped_n = listed − dispatched` and only non-zero skip reasons keyed.
@@ -13210,6 +13914,9 @@ mod tests {
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
                 spawn_authorization_denied: 0,
+                spawn_admission_deferred: 0,
+                local_guard_deferred: 0,
+                spawn_admission_route_absent: 0,
                 fetch_failed: false,
             },
         );
@@ -13250,6 +13957,43 @@ mod tests {
                 "skipped_n": 3,
                 "skip_reasons": { "spawn_authorization_denied": 3 },
             })
+        );
+
+        // Spawn-admission deferrals (plan
+        // `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+        // Phase 2) get their own reason too: they clear by themselves as permits
+        // refill, unlike a registry refusal.
+        let admission = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 10,
+                dispatched_n: 4,
+                spawn_admission_deferred: 6,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&admission).unwrap()["skip_reasons"],
+            serde_json::json!({ "spawn_admission_deferred": 6 })
+        );
+
+        // Route-absent pass-throughs are dispatched (inside dispatched_n, so not
+        // in skipped_n) but still keyed; local-guard skips are real skips.
+        let mixed = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 5,
+                dispatched_n: 3,
+                spawn_admission_route_absent: 3,
+                local_guard_deferred: 2,
+                ..Default::default()
+            },
+        );
+        let v = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(v["skipped_n"], 2);
+        assert_eq!(
+            v["skip_reasons"],
+            serde_json::json!({ "local_guard_deferred": 2, "spawn_admission_route_absent": 3 })
         );
 
         // Zero-skip run: skip_reasons is an EMPTY object, not omitted.

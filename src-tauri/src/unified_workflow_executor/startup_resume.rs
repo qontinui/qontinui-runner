@@ -448,6 +448,9 @@ pub async fn resume_interrupted_workflows(
                     let url_lock = Some(app_state.url_lock_manager.clone());
                     let file_registry = Some(app_state.file_registry_manager.clone());
                     let file_lock = Some(app_state.file_lock_manager.clone());
+                    crate::admission::record_spawn(
+                        crate::coord_drain_state::SpawnOrigin::BootResume,
+                    );
                     super::spawn_workflow_with_panic_guard(
                         task_id.clone(),
                         task_name.clone(),
@@ -675,6 +678,9 @@ pub async fn resume_interrupted_workflows(
                     let file_registry2 = Some(app_state.file_registry_manager.clone());
                     let file_lock2 = Some(app_state.file_lock_manager.clone());
                     let pg_db_for_spawn = app_state.pg_db.clone();
+                    crate::admission::record_spawn(
+                        crate::coord_drain_state::SpawnOrigin::BootResume,
+                    );
                     super::spawn_workflow_with_panic_guard(
                         task_id.clone(),
                         task_name.clone(),

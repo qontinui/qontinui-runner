@@ -278,6 +278,9 @@ async fn spawn_session(
         };
         return Err((status, refusal));
     }
+
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
+
     let authz_warning = match &decision {
         crate::agent_authorization::SpawnDecision::Warn { reason } => Some(reason.clone()),
         _ => None,

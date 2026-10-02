@@ -631,6 +631,8 @@ async fn materialize(
         return Err(RespawnError::DeferredByDrain(reason));
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Respawn);
+
     // 1. The id being resumed. An explicit null is UNKNOWN — refuse.
     let claude_session_id = respawn
         .claude_code_session_id

@@ -167,6 +167,12 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // redundant. The token is single-shot (coord clears it on the UPDATE), which
     // is safe only because every caller is a path where the session definitively
     // did not spawn.
+    // `admission::post_json` — the one POST behind coord's spawn-admission
+    // routes (acquire, release, report; plan
+    // `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`).
+    // Fails CLOSED: with no device JWT the caller reads admission UNKNOWN and
+    // sends nothing, where the fail-soft helper would send it anonymously.
+    ("admission.rs", "device-jwt-required", 1),
     ("agent_runtime.rs", "capability-token", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),

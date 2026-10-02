@@ -28,6 +28,10 @@ mod agent_daemons;
 // exact sibling of `agent_commands`. Named `agent_skills`, never `skills`:
 // `crate::skills` is the automation-template registry.
 mod agent_skills;
+// Plan `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+// — the spawn reporter, coord's spawn-admission lease client, and the local
+// token bucket that throttles unattended spawns while coord cannot answer.
+mod admission;
 // One process-wide pooled `reqwest::Client` for the per-agent coord
 // daemons. Replaces per-request `Client::new()` on the tick paths, which
 // reuses no connection and burned the machine's whole ephemeral port
@@ -1935,6 +1939,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // boot resume awaits it; the heartbeat below keeps it fresh.
                 tokio::spawn(coord_drain_state::boot_read());
                 fleet::spawn_heartbeat();
+                // Plan `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+                // Phase 0: the 30 s spawn report rides this thread for the
+                // heartbeat's reason — a cadence coord ages to UNKNOWN when it
+                // stops must not be starved by the publisher runtime's sweeps.
+                tokio::spawn(admission::run_reporter());
                 // Budget re-assert rides THIS thread, not `fleet-publishers`,
                 // for the same reason the heartbeat does: the publisher
                 // runtime's sweeps block their only worker for minutes at a

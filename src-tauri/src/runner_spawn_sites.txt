@@ -21,6 +21,13 @@
 #     runner_spawn_sites::a_bare_gate_call_whose_result_is_discarded_fails_the_guard
 # prove it can fail), and
 #     runner_spawn_sites::every_operator_site_is_a_tauri_command
+# and — every `autonomous` and `operator` row also COUNTS its spawn for coord's
+# spawn-admission live count (plan
+# 2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine, Phase 0):
+#     runner_spawn_sites::every_autonomous_and_operator_site_reports_its_spawn
+# (an autonomous row reports when any fn on its chain calls `record_spawn(` or holds
+# through `held_until_allowed(`, which records; its mutation twin is
+#     runner_spawn_sites::removing_the_spawn_report_from_a_site_fails_the_guard)
 #
 # Columns:  file (relative to src/) | fn | class | detail
 #

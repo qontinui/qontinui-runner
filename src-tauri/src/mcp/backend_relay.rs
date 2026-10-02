@@ -3969,6 +3969,8 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
         }));
     }
 
+    crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, &task_name)
@@ -5042,6 +5044,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
+        crate::admission::record_spawn(crate::coord_drain_state::SpawnOrigin::Unknown);
         match tm.create(
             title,
             working_dir,

@@ -9,6 +9,12 @@
 //! path is therefore red until it declares how the drain applies to it — the
 //! mechanism coord's `spawn_admission_sites.txt` applies to coord's publish seam.
 //!
+//! Every `autonomous` and `operator` site must also REPORT its spawn to coord's
+//! spawn-admission live count ([`crate::admission::record_spawn`], plan
+//! `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+//! Phase 0) — see [`sites_that_do_not_report`]. The roster is the inventory for
+//! both properties, so a new spawn path cannot be gated but uncounted.
+//!
 //! Test-only: the whole module is `#[cfg(test)]` in `main.rs`.
 //!
 //! ## Known limits (a source scan, not a type check)
@@ -71,6 +77,12 @@ const GATE_CALLS: &[&str] = &[
 /// The [`GATE_CALLS`] that HOLD rather than answer: a bare `.await;` of one is
 /// the whole point, not a discarded verdict.
 const HOLD_CALLS: &[&str] = &["wait_until_allowed(", "held_until_allowed("];
+
+/// Calls that count a spawn for coord's spawn-admission live count.
+/// `held_until_allowed` records inside itself, at the moment the held launch
+/// starts (see its body), so a site that holds through it reports by
+/// construction.
+const REPORT_CALLS: &[&str] = &["record_spawn(", "held_until_allowed("];
 
 /// Text that makes a gate call NOT a drain gate for an autonomous site.
 const GATE_DEFEATERS: &[&str] = &[
@@ -483,6 +495,50 @@ fn autonomous_sites_bypassing_the_gate(sources: &Sources, rows: &Rows) -> Vec<St
     out
 }
 
+/// `autonomous` and `operator` rows that never count their spawn for coord.
+/// PURE over the sources.
+///
+/// An `autonomous` row reports when ANY fn on its chain — the gate hops and the
+/// site itself — calls a [`REPORT_CALLS`] token: the count belongs wherever the
+/// spawn is decided, which for a door is often the gate fn and for a recipe the
+/// site. An `operator` row must call it in its own body (it has no chain).
+/// `helper` rows are counted at their callers, which are rows of their own;
+/// `exempt` rows continue work that is already running and was counted when it
+/// started.
+///
+/// What this does NOT prove: that the call sits on the path that actually
+/// spawns, rather than beside it. Like the drain guard, it is a source scan
+/// over a declared roster, not a type check.
+fn sites_that_do_not_report(sources: &Sources, rows: &Rows) -> Vec<String> {
+    let mut out = Vec::new();
+    for ((file, func), row) in rows
+        .iter()
+        .filter(|(_, r)| r.class == "autonomous" || r.class == "operator")
+    {
+        let mut chain: Vec<(&str, &str)> = if row.class == "autonomous" {
+            row.detail
+                .split('>')
+                .map(str::trim)
+                .filter(|h| !h.is_empty() && *h != "-")
+                .map(|h| resolve_hop(h, file))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        chain.push((file.as_str(), func.as_str()));
+        let reports = chain.iter().any(|(f, fun)| {
+            sources
+                .get(*f)
+                .and_then(|s| fn_body(s, fun))
+                .is_some_and(|b| REPORT_CALLS.iter().any(|c| token_re(c).is_match(&b)))
+        });
+        if !reports {
+            out.push(format!("{file}:{func}"));
+        }
+    }
+    out
+}
+
 /// Operator rows that are not a `#[tauri::command]`.
 fn operator_sites_not_tauri_commands(sources: &Sources, rows: &Rows) -> Vec<String> {
     let decl = fn_decl_re();
@@ -659,6 +715,53 @@ fn every_autonomous_site_passes_the_drain_gate() {
     assert!(
         violations.is_empty(),
         "autonomous spawn sites that bypass the coord device drain gate: {violations:#?}"
+    );
+}
+
+#[test]
+fn every_autonomous_and_operator_site_reports_its_spawn() {
+    let rows = load_rows();
+    let violations = sites_that_do_not_report(&load_sources(), &rows);
+    assert!(
+        violations.is_empty(),
+        "spawn sites that never call `crate::admission::record_spawn(origin)` (or hold \
+         through `held_until_allowed`, which records) — coord's spawn-admission live count \
+         cannot see them: {violations:#?}"
+    );
+}
+
+/// Mutation twins for the control above: delete the report from one
+/// autonomous door and from one operator command, and the guard must name
+/// exactly those two rows — so it can fail, and fails precisely.
+#[test]
+fn removing_the_spawn_report_from_a_site_fails_the_guard() {
+    let mut sources = load_sources();
+    let rows = load_rows();
+    for (file, decl) in [
+        ("mcp/terminals.rs", "async fn create_terminal_handler("),
+        ("commands/terminal.rs", "async fn terminal_create("),
+    ] {
+        let src = sources.get(file).expect("source").clone();
+        let marker = "record_spawn(";
+        // `split_once` + `replacen`, not byte offsets: no str slicing, so no
+        // `clippy::string_slice` exemption for the expect ratchet to count.
+        let (head, tail) = src
+            .split_once(decl)
+            .unwrap_or_else(|| panic!("{file} declares {decl}"));
+        assert!(tail.contains(marker), "{file} reports in {decl}");
+        let mutated = format!(
+            "{head}{decl}{}",
+            tail.replacen(marker, "removed_report(", 1)
+        );
+        sources.insert(file.to_string(), mutated);
+    }
+    assert_eq!(
+        sites_that_do_not_report(&sources, &rows),
+        vec![
+            "commands/terminal.rs:terminal_create".to_string(),
+            "mcp/terminals.rs:create_terminal_handler".to_string(),
+        ],
+        "exactly the two mutated sites must be reported"
     );
 }
 
