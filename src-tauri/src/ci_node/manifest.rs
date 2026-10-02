@@ -1042,13 +1042,19 @@ check = ["cargo", "test", "workspace_assumptions"]
     fn repair_refuses_an_unknown_key() {
         let text = WITH_REPAIR.replace("kind = \"format\"", "kind = \"format\"\nfoo = 1");
         let err = parse_and_validate(&text).expect_err("unknown key");
-        assert!(err.contains("unknown field") && err.contains("foo"), "{err}");
+        assert!(
+            err.contains("unknown field") && err.contains("foo"),
+            "{err}"
+        );
     }
 
     #[test]
     fn repair_rejects_bad_declarations() {
         let cases = [
-            (WITH_REPAIR.replace("kind = \"format\"", "kind = \"rewrite\""), "parse error"),
+            (
+                WITH_REPAIR.replace("kind = \"format\"", "kind = \"rewrite\""),
+                "parse error",
+            ),
             (
                 WITH_REPAIR.replace("check = [\"cargo\", \"fmt\"", "chek = [\"cargo\", \"fmt\""),
                 "parse error",
@@ -1058,7 +1064,10 @@ check = ["cargo", "test", "workspace_assumptions"]
                 "parent/root",
             ),
             (WITH_REPAIR.replace("[\"**/*.rs\"]", "[]"), "must name what"),
-            (WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"\"]"), "must not be empty"),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"\"]"),
+                "must not be empty",
+            ),
             (
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"{src,../../etc}/**\"]"),
                 "braces or backslashes",
@@ -1067,10 +1076,19 @@ check = ["cargo", "test", "workspace_assumptions"]
                 WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"..\\\\x\\\\*.rs\"]"),
                 "braces or backslashes",
             ),
-            (WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**\"]"), "whole repository"),
-            (WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git/hooks/*\"]"), ".git"),
             (
-                WITH_REPAIR.replace("check = [\"cargo\", \"fmt\", \"--all\", \"--\", \"--check\"]", "check = []"),
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\"**\"]"),
+                "whole repository",
+            ),
+            (
+                WITH_REPAIR.replace("[\"**/*.rs\"]", "[\".git/hooks/*\"]"),
+                ".git",
+            ),
+            (
+                WITH_REPAIR.replace(
+                    "check = [\"cargo\", \"fmt\", \"--all\", \"--\", \"--check\"]",
+                    "check = []",
+                ),
                 "check must be a non-empty argv",
             ),
             (
@@ -1078,14 +1096,20 @@ check = ["cargo", "test", "workspace_assumptions"]
                 "command must be a non-empty argv",
             ),
             (
-                WITH_REPAIR.replace("step = \"workspace assumptions\"\nkind = \"regen\"", "step = \"fmt\"\nkind = \"format\""),
+                WITH_REPAIR.replace(
+                    "step = \"workspace assumptions\"\nkind = \"regen\"",
+                    "step = \"fmt\"\nkind = \"format\"",
+                ),
                 "a second [[repair]]",
             ),
             (
                 WITH_REPAIR.replace(".github/scripts/repair-fmt.sh", "a|b"),
                 "banned shell metacharacter",
             ),
-            (WITH_REPAIR.replace("step = \"fmt\"", "step = \" \""), "step must name"),
+            (
+                WITH_REPAIR.replace("step = \"fmt\"", "step = \" \""),
+                "step must name",
+            ),
         ];
         for (text, want) in cases {
             let err = parse_and_validate(&text).expect_err(want);
