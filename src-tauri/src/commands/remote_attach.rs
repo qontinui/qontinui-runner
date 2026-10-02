@@ -858,14 +858,12 @@ impl GrantRenewer for CoordGrantRenewer {
             let session = uuid::Uuid::parse_str(session_id)
                 .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
             let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
-            if let Some(attached_to) = target_device_id {
-                if !coord_places_session_on(attached_to, minted.target_device_id.as_deref()) {
-                    let now_on = minted.target_device_id.as_deref().unwrap_or("<unreported>");
-                    return Err(format!(
-                        "remote_attach:target_mismatch: coord now places session {session} on \
-                         device {now_on}, not {attached_to} — the session moved"
-                    ));
-                }
+            if let Some(refusal) = renewal_placement_refusal(
+                &session.to_string(),
+                target_device_id,
+                minted.target_device_id.as_deref(),
+            ) {
+                return Err(refusal);
             }
             info!(
                 session = %session,
@@ -879,6 +877,27 @@ impl GrantRenewer for CoordGrantRenewer {
             })
         })
     }
+}
+
+/// Why a renewed grant must be refused, or `None` when it may be used: the
+/// pane was attached to `attached_to`, and coord now places the session on
+/// `minted_target`. The same `coord_places_session_on` rule a fresh attach
+/// applies — an unreported placement is refused too. A pane that recorded no
+/// device (`None`) is not checked.
+pub(crate) fn renewal_placement_refusal(
+    session: &str,
+    attached_to: Option<&str>,
+    minted_target: Option<&str>,
+) -> Option<String> {
+    let attached_to = attached_to?;
+    if coord_places_session_on(attached_to, minted_target) {
+        return None;
+    }
+    let now_on = minted_target.unwrap_or("<unreported>");
+    Some(format!(
+        "remote_attach:target_mismatch: coord now places session {session} on device \
+         {now_on}, not {attached_to} — the session moved"
+    ))
 }
 
 /// What closing a remote tab did about the relay's `(target, terminal)`
@@ -1846,6 +1865,28 @@ mod interactivity_command_tests {
         ] {
             assert!(d.get(key).is_some(), "missing {key} in {d}");
         }
+    }
+
+    /// Plan 2026-10-02, review round 2: a renewal coord now places on another
+    /// device (or does not place at all) is refused; the same device passes.
+    #[test]
+    fn a_renewal_placed_on_another_device_is_refused() {
+        use super::renewal_placement_refusal;
+        assert_eq!(
+            renewal_placement_refusal("s", Some("dev-a"), Some("DEV-A")),
+            None
+        );
+        let moved = renewal_placement_refusal("s", Some("dev-a"), Some("dev-b")).unwrap();
+        assert!(
+            moved.starts_with("remote_attach:target_mismatch"),
+            "{moved}"
+        );
+        assert!(
+            moved.contains("dev-b") && moved.contains("dev-a"),
+            "{moved}"
+        );
+        assert!(renewal_placement_refusal("s", Some("dev-a"), None).is_some());
+        assert_eq!(renewal_placement_refusal("s", None, Some("dev-b")), None);
     }
 
     /// Plan 2026-10-02 (vet): after the reattach supervisor renews the grant,

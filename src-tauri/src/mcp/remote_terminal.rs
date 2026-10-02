@@ -3623,9 +3623,10 @@ fn classify_reattach_error(code: &str, just_renewed: bool) -> ReattachStep {
 /// 15 minutes, left the tab on "relay connection lost" for good.
 ///
 /// The window counts only time this runner's relay was connected: while it
-/// is down the supervisor waits for the reconnect without spending any, and
-/// the window restarts when the relay returns, so an outage on OUR side never
-/// closes a tab whose target is fine. An attempt whose reply lands after a
+/// is down the supervisor waits for the reconnect and the window is PAUSED
+/// (not restarted — a relay that flaps does not buy a dead target unlimited
+/// retries), so an outage on OUR side never closes a tab whose target is
+/// fine. An attempt whose reply lands after a
 /// reconnect it was not sent on is presented again on the new connection.
 pub async fn supervise_reattach(
     client: &RemoteAttachClient,
@@ -3638,7 +3639,11 @@ pub async fn supervise_reattach(
         announced_target_down,
     } = req;
     let mut started = tokio::time::Instant::now();
-    let mut relay_was_down = false;
+    // When our relay went down, if it is down now: that span is added back
+    // to `started` when it returns, pausing the window.
+    let mut relay_down_since: Option<tokio::time::Instant> = None;
+    // The relay generation the successful attempt was presented on.
+    let mut presented_generation = 0;
     let mut announced = announced_target_down;
     let mut attempt: u32 = 0;
     let mut renewals: u32 = 0;
@@ -3656,16 +3661,15 @@ pub async fn supervise_reattach(
             // Our own relay is down: nothing reaches the target, so wait for
             // it to return without spending the window (looking up now and
             // then only to notice a closed tab).
-            relay_was_down = true;
+            relay_down_since.get_or_insert_with(tokio::time::Instant::now);
             tokio::select! {
                 _ = &mut reconnected => {}
                 _ = tokio::time::sleep(RELAY_DOWN_RECHECK) => {}
             }
             continue;
         }
-        if relay_was_down {
-            relay_was_down = false;
-            started = tokio::time::Instant::now();
+        if let Some(down) = relay_down_since.take() {
+            started += down.elapsed();
         }
         let generation = client.reconnect_gen.load(Ordering::Acquire);
         let sent = match first.take() {
@@ -3695,7 +3699,10 @@ pub async fn supervise_reattach(
             // A reconnect landed after this attempt was sent: the target may
             // have re-bound on the OLD connection only, so present again.
             Ok(()) if client.reconnect_gen.load(Ordering::Acquire) != generation => continue,
-            Ok(()) => break Some(Ok(())),
+            Ok(()) => {
+                presented_generation = generation;
+                break Some(Ok(()));
+            }
             Err(e) => e,
         };
         if pane.is_finished() {
@@ -3760,6 +3767,7 @@ pub async fn supervise_reattach(
             _ = &mut reconnected => {}
         }
     };
+    let succeeded = matches!(outcome, Some(Ok(())));
     match outcome {
         Some(Ok(())) => info!(
             grant_jti = %pane.grant_jti(),
@@ -3776,6 +3784,22 @@ pub async fn supervise_reattach(
         None => {}
     }
     pane.end_reattach();
+    // A reconnect that landed between the success above and the release just
+    // now found the pane still claimed and skipped it, so nothing presented on
+    // the new connection. Present here and hand it to a fresh supervisor,
+    // which the relay's next inbound frame starts.
+    if succeeded
+        && client.reconnect_gen.load(Ordering::Acquire) != presented_generation
+        && !pane.is_finished()
+        && pane.try_begin_reattach()
+    {
+        let first = client.send_reattach(&pane).ok();
+        client.queue_reattach(ReattachRequest {
+            pane,
+            first,
+            announced_target_down: false,
+        });
+    }
 }
 
 /// Start a supervisor for every queued reattach request on the process-wide
@@ -5847,6 +5871,51 @@ mod tests {
         assert!(client.handle_inbound(
             "remote_terminal_attached",
             &attached_frame(rid_of(&f), "jti-1", b"", 0)
+        ));
+        sup.await.unwrap();
+        assert!(!pane.is_finished());
+        assert!(!pane.is_reattaching());
+    }
+
+    /// Review round 2, finding 2: a reconnect that lands while an attempt is
+    /// in flight (or right after its reply) is presented on again — the
+    /// attempt went out on the old connection, and leaving it would keep the
+    /// tab on the relay-lost notice.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_during_an_attempt_presents_again() {
+        let client = leaked_client();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            ReattachPolicy::default(),
+        ));
+        let f1 = pump.recv().await.unwrap();
+        // Let the supervisor reach its wait on the reply.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The reply and a second reconnect both land before the supervisor
+        // runs again.
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f1), "jti-1", b"", 0)
+        ));
+        client.on_relay_connected();
+        assert!(
+            client.take_reattach_requests().is_empty(),
+            "the owned pane is not given a second supervisor"
+        );
+        let f2 = pump.recv().await.unwrap();
+        assert_ne!(
+            rid_of(&f1),
+            rid_of(&f2),
+            "presented again on the new connection"
+        );
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f2), "jti-1", b"", 0)
         ));
         sup.await.unwrap();
         assert!(!pane.is_finished());
