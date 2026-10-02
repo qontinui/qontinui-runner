@@ -17090,15 +17090,36 @@ mod tests {
         }
     }
 
-    /// Review round 3 #2: with no coord configured (tests deflect
-    /// `connected_coord_base` to `None`) nothing is sent, which is
+    /// Review round 3 #2: with no coord configured nothing is sent, which is
     /// `Unreached` — so the provisional record is rolled back and the gate's
     /// window stays OPEN for the next deferral. Inverting the rollback
     /// condition (or treating no-coord as answered) fails this.
-    #[tokio::test]
-    async fn a_stamp_with_no_coord_configured_leaves_the_window_open() {
+    ///
+    /// "No coord configured" is established by this test's OWN
+    /// `IsolatedAmbient` guard (empty home, `COORD_HTTP_URL` removed, an
+    /// unknown profile), not by the unguarded-read canary: the canary deflects
+    /// only while no other guard is live, so without a guard of its own this
+    /// test could read a concurrent guarded test's `COORD_HTTP_URL` and make a
+    /// real POST. Sync with its own runtime so the guard's lock is never held
+    /// across an `.await` of the test harness's runtime.
+    #[test]
+    fn a_stamp_with_no_coord_configured_leaves_the_window_open() {
+        let _ambient = crate::test_env::isolated_ambient();
+        assert_eq!(
+            connected_coord_base(),
+            None,
+            "precondition: the isolated ambient has no coord configured"
+        );
         let gate = uuid::Uuid::now_v7();
-        post_deferred_stamp_rate_limited(gate, uuid::Uuid::now_v7(), "at_cap:64".into()).await;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(post_deferred_stamp_rate_limited(
+                gate,
+                uuid::Uuid::now_v7(),
+                "at_cap:64".into(),
+            ));
         assert!(
             should_post_deferred_stamp(gate, std::time::Instant::now()),
             "an unsent stamp must not hold the hourly window"
