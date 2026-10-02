@@ -404,7 +404,8 @@ pub struct StatusChangeEvent {
 
 /// One event on the `execution-status` Tauri channel, tagged by `type`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+// No `deny_unknown_fields` here: schemars ignores it on newtype variants. Each
+// variant struct carries its own, which is what closes the generated union.
 #[serde(tag = "type", rename_all = "snake_case")]
 #[schemars(title = "RawExecutionStatusEvent")]
 pub enum ExecutionStatusEvent {

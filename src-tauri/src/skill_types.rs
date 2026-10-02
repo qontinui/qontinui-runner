@@ -22,15 +22,17 @@
 //! enums are never constructed; they exist for `JsonSchema` alone, and each is
 //! attached in one of two ways:
 //!
-//! - **Closed** (`#[schemars(with = "V")]`) where the runtime value really is
-//!   confined to `V`: parameter `type`, `approval_status`, manifest
-//!   `content_type`.
-//! - **Open** (`#[schemars(with = "OpenVocab<V>")]`, schema `V | string`) where
-//!   a foreign value reaches the wire today: `category`, `allowed_phases` and
-//!   `source` are read back from user rows and imported or community payloads
-//!   written by other program versions (`SkillSource::Other` exists precisely
-//!   to round-trip such a `source`, and the approval panel already filters on
-//!   `source === "auto"`, which no closed vocabulary here names).
+//! - **Closed** (`#[schemars(with = "V")]`) only where the runtime value really
+//!   is confined to `V`: manifest `content_type`, which only the export route
+//!   produces and always as `"skills"`.
+//! - **Open** (`#[schemars(with = "OpenVocab<V>")]`, schema `V | string`)
+//!   everywhere a foreign value reaches the wire today: `category`,
+//!   `allowed_phases`, `source`, parameter `type` and `approval_status` are all
+//!   read back from playbook/prompt frontmatter, user rows, and imported or
+//!   community payloads written by other program versions, none of which
+//!   validates them (`SkillSource::Other` exists precisely to round-trip such a
+//!   `source`, and the approval panel already filters on `source === "auto"`,
+//!   which no vocabulary here names).
 //!
 //! Likewise every `Option` field that is skipped when `None` is schema'd as its
 //! inner type, so the binding reads `?: T` (absent, never `null` — what the
@@ -52,6 +54,8 @@ pub enum SkillCategory {
     Deployment,
     Composition,
     Custom,
+    /// The playbook parser's default when frontmatter names no category.
+    DomainKnowledge,
 }
 
 /// Schema-only: `SkillParameter.type`.
@@ -165,7 +169,7 @@ pub fn humanize_param_name(name: &str) -> String {
 pub struct SkillParameter {
     pub name: String,
     #[serde(rename = "type")]
-    #[schemars(with = "SkillParameterType")]
+    #[schemars(with = "crate::schema_export::OpenVocab<SkillParameterType>")]
     pub param_type: String,
     pub label: String,
     pub description: String,
@@ -441,7 +445,7 @@ pub struct SkillDefinition {
     #[schemars(with = "u64")]
     pub usage_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "SkillApprovalStatus")]
+    #[schemars(with = "crate::schema_export::OpenVocab<SkillApprovalStatus>")]
     pub approval_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]

@@ -1109,6 +1109,42 @@ mod tests {
     }
 
     #[test]
+    fn session_4e_schema_shapes_are_pinned() {
+        // The generated bindings depend on these three schemars behaviours;
+        // pin them here so a schemars upgrade cannot change them unnoticed.
+        let schemas = export_all_schemas();
+
+        // OpenVocab<V> is `anyOf [V, string]`.
+        let category = &schemas["SkillDefinition"]["properties"]["category"];
+        let any_of = category["anyOf"].as_array().expect("category is anyOf");
+        assert_eq!(any_of.len(), 2, "{category}");
+        assert_eq!(any_of[1], serde_json::json!({ "type": "string" }));
+
+        // Nullable<T> is required AND nullable.
+        let routing = &schemas["RawRoutingDecisionPayload"];
+        let required = routing["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("prompt_preview")));
+        assert!(routing["properties"]["prompt_preview"]["type"]
+            .as_array()
+            .is_some_and(|t| t.contains(&serde_json::json!("null"))));
+
+        // Every execution-status variant is a closed object that still names
+        // its `type` tag, so `additionalProperties: false` cannot reject it.
+        let variants = schemas["RawExecutionStatusEvent"]["oneOf"]
+            .as_array()
+            .expect("tagged union is oneOf");
+        assert_eq!(variants.len(), 7);
+        for v in variants {
+            assert_eq!(v["additionalProperties"], serde_json::json!(false), "{v}");
+            assert!(v["properties"]["type"].is_object(), "{v}");
+            assert!(v["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("type")));
+        }
+    }
+
+    #[test]
     fn test_worker_output_schema_has_properties() {
         let schemas = export_all_schemas();
         let worker = &schemas["WorkerOutput"];

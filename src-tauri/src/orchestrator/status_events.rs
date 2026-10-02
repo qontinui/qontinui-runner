@@ -242,8 +242,6 @@ impl StatusEventEmitter {
         result: &HookResult,
         trigger: HookTrigger,
     ) {
-        let trigger_str = trigger_to_string(trigger);
-
         let event = HookExecutionEvent {
             task_run_id: task_run_id.to_string(),
             timestamp: Self::now_ms(),
@@ -264,7 +262,9 @@ impl StatusEventEmitter {
 
         info!(
             "Emitting hook execution: {} ({}) - success={}",
-            result.hook_name, trigger_str, result.success
+            result.hook_name,
+            trigger.display_name(),
+            result.success
         );
 
         Self::emit(app_handle, &ExecutionStatusEvent::HookExecution(event));
@@ -278,8 +278,6 @@ impl StatusEventEmitter {
         hook_name: &str,
         trigger: HookTrigger,
     ) {
-        let trigger_str = trigger_to_string(trigger);
-
         let event = HookStartedEvent {
             task_run_id: task_run_id.to_string(),
             timestamp: Self::now_ms(),
@@ -288,7 +286,11 @@ impl StatusEventEmitter {
             trigger,
         };
 
-        debug!("Emitting hook started: {} ({})", hook_name, trigger_str);
+        debug!(
+            "Emitting hook started: {} ({})",
+            hook_name,
+            trigger.display_name()
+        );
 
         Self::emit(app_handle, &ExecutionStatusEvent::HookStarted(event));
     }
@@ -315,40 +317,5 @@ impl StatusEventEmitter {
         );
 
         Self::emit(app_handle, &ExecutionStatusEvent::StatusChange(event));
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Convert HookTrigger to string
-fn trigger_to_string(trigger: HookTrigger) -> String {
-    match trigger {
-        HookTrigger::PreExecution => "pre_execution".to_string(),
-        HookTrigger::PostExecution => "post_execution".to_string(),
-        HookTrigger::OnError => "on_error".to_string(),
-        HookTrigger::OnVerificationFail => "on_verification_fail".to_string(),
-        HookTrigger::OnComplete => "on_complete".to_string(),
-        HookTrigger::PreIteration => "pre_iteration".to_string(),
-        HookTrigger::PostIteration => "post_iteration".to_string(),
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_trigger_to_string() {
-        assert_eq!(
-            trigger_to_string(HookTrigger::PreExecution),
-            "pre_execution"
-        );
-        assert_eq!(trigger_to_string(HookTrigger::OnError), "on_error");
     }
 }
