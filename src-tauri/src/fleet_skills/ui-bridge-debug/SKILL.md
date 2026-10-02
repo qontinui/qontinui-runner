@@ -22,8 +22,8 @@ browser **host** the Bridge is driven through is fine and already shipped —
 that is exactly what the `ui-bridge-inject` and `ui-bridge-login-web` recipes
 below do, and the observations still come from `/control/*`. Same reason you do
 not hand-roll a driver: the wrapper already ships it. Canonical rule, with the
-checkable examples:
-`qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md` →
+checkable examples, in the maintainers' knowledge base:
+`knowledge-base/qontinui-specific/ui-bridge.md` →
 "The UI Bridge Is the Only Frontend-Inspection Tool".
 
 ## Endpoints
@@ -31,7 +31,8 @@ checkable examples:
 | Application | UI Bridge Base URL |
 |-------------|-------------------|
 | **Runner** (Tauri webview) | `http://127.0.0.1:9876/ui-bridge/control/*` |
-| **qontinui-web** (Next.js) | `http://localhost:3001/api/ui-bridge/control/*` |
+| **Your web app** (embeds the SDK) | `<origin><apiPath>/control/*` — its own origin plus its configured `apiPath` (`/api/ui-bridge` in the SDK's Next.js setup) |
+| **qontinui-web** (Qontinui's own web app, maintainers' dev server) | `http://localhost:3001/api/ui-bridge/control/*` |
 
 Note (2026-05-13, Phase 2 of the UI Bridge vision-pipeline plan): the legacy
 `/ui-bridge/control/screenshot`, `/ui-bridge/control/annotated-screenshot`,
@@ -192,7 +193,7 @@ export UIB_LOGIN_PASSWORD=$(aws ssm get-parameter --region eu-central-1 --name /
 $LOGIN_WEB --url "https://qontinui.io/login?next=%2Fdigital-twin" --success /digital-twin --email "$EMAIL" --expect-text "Delivery"
 ```
 
-**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + `qontinui-dev-notes/plans/2026-06-05-ui-bridge-authed-web-drive-harness.md`.
+**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + Qontinui's plan `2026-06-05-ui-bridge-authed-web-drive-harness`.
 
 ### Multi-step driving: act by id, wait for registration, script in JS (don't reinvent these)
 
@@ -240,8 +241,8 @@ const snap = await ctx.snapshot();
   Playwright — no locators, no bespoke DOM checks, no ad-hoc screenshot offered
   as evidence; if the Bridge cannot answer it, fix the Bridge. Playwright as the
   browser **host** the Bridge is driven through (`ui-bridge-inject`,
-  `ui-bridge-login-web`) is allowed — full rule in
-  `qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md`
+  `ui-bridge-login-web`) is allowed — full rule in the maintainers' knowledge
+  base, `knowledge-base/qontinui-specific/ui-bridge.md`
 - **ALWAYS** call discover before reading elements
 - **PREFER** element rects to verify layout — only reach for `/vision/capture` when an actual image is required
 - **ALWAYS** set the correct BASE URL for the target application

@@ -1,6 +1,6 @@
 ---
 name: tag-session
-description: "Set the current Claude Code session's display name so it appears as a `Session-Name: <name>` trailer on every subsequent commit. Persists to `~/.qontinui/session-names/$CLAUDE_CODE_SESSION_ID`, which the per-clone `prepare-commit-msg` hook (qontinui-claude-config/scripts/git-hooks/) reads — the skill checks that hook is installed here, because without it neither trailer appears. Pair with /rename — /rename sets the UI label; /tag-session sets the commit-trailer value."
+description: "Set the current Claude Code session's display name so it appears as a `Session-Name: <name>` trailer on every subsequent commit. Persists to `~/.qontinui/session-names/$CLAUDE_CODE_SESSION_ID`, which the per-clone `prepare-commit-msg` hook (the maintainers' guard-hooks tooling installs it) reads — the skill checks that hook is installed here, because without it neither trailer appears. Pair with /rename — /rename sets the UI label; /tag-session sets the commit-trailer value."
 user-invocable: true
 ---
 
@@ -24,9 +24,9 @@ up; in an unhooked one nothing happens, silently.
 > Writing the marker file does nothing on a clone whose `.git/hooks/` has no
 > `prepare-commit-msg`, and that is the default state of every fresh clone.
 > Between 2026-06-07 and 2026-08-06 it was the state of *every* clone, because
-> the hook had been deleted from qontinui-dev-notes while its CI gate and its
-> three consumers stayed live (see
-> `qontinui-dev-notes/plans/2026-08-06-session-id-trailer-hook-delivery.md`).
+> the hook had been deleted from the repository that then carried it while its
+> CI gate and its three consumers stayed live (Qontinui's plan
+> `2026-08-06-session-id-trailer-hook-delivery`).
 >
 > Run this **from inside the clone you are asking about** — it reports what git
 > would do in the current repo, and says so rather than guessing when there is
@@ -40,11 +40,13 @@ up; in an unhooked one nothing happens, silently.
 > if [ -z "$hooks" ]; then echo "UNKNOWN — not inside a git repo"
 > elif head -5 "$hooks/prepare-commit-msg" 2>/dev/null \
 >        | grep -qF "Qontinui Session-Id trailer auto-injector"; then echo "installed"
-> else echo "NOT installed (absent or foreign) — run the installer"; fi
+> else echo "NOT installed (absent or foreign) — run the installer, where one resolves"; fi
 > ```
 >
-> To install, pass `--git-repo` so the run stays scoped to this clone — without
-> it the installer sweeps every repo under the workspace root:
+> The installer ships only in the maintainers' configuration checkout; on a
+> device without one there is no install path, and the block under "How to run"
+> says so. Where it exists, pass `--git-repo` so the run stays scoped to this
+> clone — without it the installer sweeps every repo under the workspace root:
 >
 > ```bash
 > bash <workspace-root>/qontinui-claude-config/scripts/install-guard-hooks.sh --git-repo "$(git rev-parse --show-toplevel)"
@@ -187,26 +189,49 @@ HOOK="$HOOKS_DIR/prepare-commit-msg"
 # worktree: its `.git` is a file, which the installer's `-e` test accepts, and
 # the hooks dir resolves to the MAIN checkout's either way.
 THIS_REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || true
-INSTALLER="<workspace-root>/qontinui-claude-config/scripts/install-guard-hooks.sh"
+# The installer ships only in the maintainers' configuration checkout, which a
+# device the runner provisioned this skill onto usually does not have. Resolve
+# it rather than assume it: the workspace root is the directory holding this
+# clone's MAIN checkout (`--git-common-dir` resolves a linked worktree to it),
+# and when no installer is there, print why there is no repair here instead of
+# a command that cannot run.
+WS_ROOT=""
+if GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" \
+   && GIT_COMMON="$(cd "$GIT_COMMON" 2>/dev/null && pwd -P)"; then
+  WS_ROOT="$(dirname "$(dirname "$GIT_COMMON")")"
+fi
+INSTALLER="${WS_ROOT:-<workspace-root>}/qontinui-claude-config/scripts/install-guard-hooks.sh"
+NO_INSTALLER="  No installer at $INSTALLER (where a configuration checkout beside
+  this clone would carry it). The trailer hook is maintainers' tooling with no
+  other install path: unless you know of such a checkout elsewhere, the name is
+  stored but appears in no commit made here."
 if [[ -z "$HOOKS_DIR" ]]; then
   echo "? Not inside a git repo here — could not check for the hook."
   echo "  The name is stored regardless; it applies to whichever clone you commit in."
 elif [[ ! -f "$HOOK" ]]; then
   echo "WARNING: this clone has NO prepare-commit-msg hook ($HOOKS_DIR)."
   echo "  NEITHER trailer will appear — the name above is being written into a void."
-  echo "  Install it here (idempotent; covers this clone and every worktree off it):"
-  echo "    bash $INSTALLER --git-repo \"$THIS_REPO\""
-  echo "  Omit --git-repo to sweep every repo under the workspace root instead."
-  echo "  Either form also sets machine-global git config init.templatedir,"
-  echo "  and installs the rest of the guard-hooks component (idempotent)."
+  if [[ ! -f "$INSTALLER" ]]; then
+    echo "$NO_INSTALLER"
+  else
+    echo "  Install it here (idempotent; covers this clone and every worktree off it):"
+    echo "    bash $INSTALLER --git-repo \"$THIS_REPO\""
+    echo "  Omit --git-repo to sweep every repo under the workspace root instead."
+    echo "  Either form also sets machine-global git config init.templatedir,"
+    echo "  and installs the rest of the guard-hooks component (idempotent)."
+  fi
 elif ! head -5 "$HOOK" 2>/dev/null | grep -qF "$HOOK_MARKER"; then
   echo "WARNING: a FOREIGN prepare-commit-msg hook is installed here ($HOOK)."
   echo "  It is not the Qontinui trailer injector, so NEITHER trailer will appear."
-  echo "  The installer skips a foreign hook rather than clobbering it. Inspect it,"
-  echo "  then — only if it is safe to REPLACE — re-run scoped to this clone:"
-  echo "    bash $INSTALLER --force --git-repo \"$THIS_REPO\""
-  echo "  Do NOT drop that flag: bare --force overwrites the foreign hook in every"
-  echo "  repo under the workspace root, not just this one."
+  if [[ ! -f "$INSTALLER" ]]; then
+    echo "$NO_INSTALLER"
+  else
+    echo "  The installer skips a foreign hook rather than clobbering it. Inspect it,"
+    echo "  then — only if it is safe to REPLACE — re-run scoped to this clone:"
+    echo "    bash $INSTALLER --force --git-repo \"$THIS_REPO\""
+    echo "  Do NOT drop that flag: bare --force overwrites the foreign hook in every"
+    echo "  repo under the workspace root, not just this one."
+  fi
 elif [[ ! -x "$HOOK" ]]; then
   echo "WARNING: the Qontinui hook is present here but NOT EXECUTABLE ($HOOK)."
   echo "  git will not run it, so NEITHER trailer will appear. The installer"
@@ -255,7 +280,7 @@ cat ~/.qontinui/session-names/<uuid>
   source of the hook that reads the marker file. This is the
   template, not an installed hook: it does nothing until the
   installer copies it into a clone. It **moved here from
-  `qontinui-dev-notes` on 2026-09-03** (plan
+  Qontinui's notes repository on 2026-09-03** (plan
   `2026-09-03-session-id-gate-rejects-the-provenance-the-fleet-actually-writes`,
   Phase 2), because its standalone installer over there was wired into
   no installer script anywhere and therefore reached almost no machine.
@@ -268,7 +293,5 @@ cat ~/.qontinui/session-names/<uuid>
   `--check` reports `absent` / `stale` / `stamped` / `foreign` per
   target; a foreign `prepare-commit-msg` is never clobbered without
   `--force`.
-- `qontinui-dev-notes/memory/current_session_id.md` — long-form
-  session log; the trailers make it easier to keep up to date.
 - `/rename <name>` — Claude Code built-in; sets the UI label.
   `/tag-session <name>` mirrors it into the commit trailers.

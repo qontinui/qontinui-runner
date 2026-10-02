@@ -658,11 +658,11 @@ mod tests {
         // every fleet device, so a path rooted on one operator's machine is a
         // dead pointer everywhere else.
         //
-        // Deliberately NOT forbidding `qontinui-dev-notes/plans` the way the
-        // command guard does: five of these skills cite a design plan as further
-        // reading, in the documented `<workspace-root>/…` form, and a citation is
-        // not an instruction to read a path. See this module's PR for the
-        // separate question of whether those citations should be slug-only.
+        // The maintainers' plans repo name is NOT listed here: no bundled body
+        // names it since qontinui-claude-config#1387 (design plans are cited by
+        // slug only), and the ratchet that keeps it so is that repo's check #71
+        // over the canonical `.claude/skills/`, which this bundle is a byte copy
+        // of (check #33).
         const FORBIDDEN: &[&str] = &[
             "D:/qontinui-root",
             "D:\\qontinui-root",

@@ -39,8 +39,8 @@ often stamped with the wrong one, and coord's own ownership check
 (`COORD_LABEL_INGEST_OWNERSHIP_MODE`) defaults to `shadow`, which writes under
 it anyway. Measured 2026-09-23: `coord:stacked-on=` rows written under
 meryts-2-0 for `qontinui/*` PRs, and cross-repo `upstream-of`/`downstream-of`
-refused as "not registered to this tenant". Same class as
-qontinui-claude-config#1104 (`handoff-stuck-pr.sh`).
+refused as "not registered to this tenant". Same class as the earlier
+`handoff-stuck-pr.sh` fix, which made it mint for the repo owner's tenant.
 
 The skill validates the label against the namespace before either call
 fires, so invalid labels never make it to GitHub or coord.
@@ -116,10 +116,12 @@ fires, so invalid labels never make it to GitHub or coord.
 `coord:specialist-decision=*` — those are coord-set (read-only via
 this skill). The skill rejects them with a clear error.
 
-See `<workspace-root>/qontinui-dev-notes/docs/coord/pr-merge-labels.md`
-for the full namespace + semantics + conflict-resolution rules (if
-`<workspace-root>/qontinui-dev-notes` is not checked out, skip the
-reference — the summary above is sufficient).
+The summary above is sufficient to use this skill, plus one precedence
+rule: when a `Coord-*:` trailer in the PR body and a `coord:*` label
+disagree, the label wins. The authoritative namespace + semantics live in
+coord's own label validator and trailer parser (see "See Also");
+the long-form conflict-resolution notes are Qontinui's maintainer
+documentation and do not ship with the product.
 
 ## Inputs
 
@@ -148,7 +150,7 @@ reference — the summary above is sufficient).
 
 `set-label.sh` sits next to this SKILL.md, so every invocation below spells its
 path relative to THIS SKILL DIR — `<path-to-this-skill-dir>/set-label.sh` — and
-never through a `qontinui-claude-config` checkout. The skill is delivered by
+never through a configuration-repository checkout. The skill is delivered by
 being copied into `<session-workdir>/.claude/skills/coord-pr-label/`, on devices
 that have no such checkout and in worktrees that have no such subtree, so a
 config-repo path is a step that resolves in the operator's tree and fails
@@ -190,15 +192,15 @@ QONTINUI_AGENT_ID=<uuid> \
 bash <path-to-this-skill-dir>/set-label.sh \
   --repo qontinui/qontinui-coord \
   --pr 75 \
-  --label "coord:downstream-of=qontinui/qontinui-dev-notes#1234" \
+  --label "coord:downstream-of=qontinui/example-plans-repo#1234" \
   --dry-run
 ```
 
 ```
 error: label is 52 characters; GitHub caps a label name at 50
-       "coord:downstream-of=qontinui/qontinui-dev-notes#1234"
+       "coord:downstream-of=qontinui/example-plans-repo#1234"
        drop the owner -- coord restores it via coord.tenant_repos:
-         --label "coord:downstream-of=qontinui-dev-notes#1234"   (43 chars)
+         --label "coord:downstream-of=example-plans-repo#1234"   (43 chars)
        NOTE: gh reports this as "'<label>' not found", which is NOT a
        missing-label problem -- gh label create cannot succeed either.
 ```
@@ -267,7 +269,7 @@ fits**.
 > the supported short form, canonicalized at coord's write surface via
 > `coord.tenant_repos`. It is not a workaround; it is the grammar's own
 > owner-optional arm. First hit 2026-08-19 wiring
-> qontinui-claude-config#296 to qontinui-dev-notes#167 (51 chars, one over).
+> a PR to `qontinui/<an 18-character repo name>#167` (51 chars, one over).
 >
 > **You do not have to count characters** — `set-label.sh` pre-flights the
 > ceiling before it calls `gh` and, for a dep label carrying an owner, prints
@@ -399,14 +401,14 @@ sending anything — followed by the one thing a dry run structurally cannot
 establish:
 
 ```
-ok: label "coord:downstream-of=qontinui-dev-notes#167" is valid (42/50 chars) -- dry run, nothing sent
-note: NOT checked -- whether "coord:downstream-of=qontinui-dev-notes#167" exists as a label in qontinui/qontinui-claude-config.
+ok: label "coord:downstream-of=example-plans-repo#167" is valid (42/50 chars) -- dry run, nothing sent
+note: NOT checked -- whether "coord:downstream-of=example-plans-repo#167" exists as a label in your-org/your-repo.
       A dry run sends nothing, so it cannot ask. This is the one cause of
       "'<label>' not found" the ceiling check above does not cover.
       This key is open-valued, so its labels are not created on demand --
       a dep label's value is unique to the PR pair it wires. If nobody has
       created this one, a real send fails until you run:
-        gh label create "coord:downstream-of=qontinui-dev-notes#167" --repo qontinui/qontinui-claude-config
+        gh label create "coord:downstream-of=example-plans-repo#167" --repo your-org/your-repo
 ```
 
 The `gh label create` half appears only for an **open-valued key** —
@@ -529,13 +531,16 @@ it, run `gh api -X DELETE "repos/<owner>/<repo>/issues/<pr>/labels/<url-encoded 
 
 ## See Also
 
-These references live in repos you may not have checked out
-(`qontinui-dev-notes`, `qontinui-coord`); skip any whose repo is absent
-under `<workspace-root>/`.
+These references live in coord's source repository (`qontinui/qontinui-coord`,
+private, so you may not be able to read it); nothing above depends on them.
 
-- `<workspace-root>/qontinui-dev-notes/docs/coord/pr-merge-labels.md` —
-  full namespace + trailer equivalents + conflict resolution.
-- `<workspace-root>/qontinui-coord/crates/coord/src/pr_merge/labels_routes.rs` —
-  coord-side validator + ingest handler (single source of truth).
-- `<workspace-root>/qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md` —
-  Phase 2 D2.6 spec.
+- `crates/coord/src/pr_merge/labels_routes.rs` —
+  coord-side validator + ingest handler (single source of truth for the
+  label namespace and its semantics).
+- `crates/coord/src/pr_merge/trailers.rs` in the same repo — the `Coord-*:`
+  PR-body trailer equivalents.
+
+The label grammar's design record is Qontinui's own plan
+`2026-05-21-pr-merge-orchestrator-design` (Phase 2 D2.6). It is held in the
+maintainers' plan corpus, not yours: it resolves only for a session working
+in the tenant that authored it, and nothing above depends on reading it.

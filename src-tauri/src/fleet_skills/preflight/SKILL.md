@@ -258,8 +258,8 @@ The response has **three** states, not two:
 **No row is UNKNOWN, and UNKNOWN is silent.** The events come from
 `pre-checkout-coord-guard.sh` (qontinui-stack) observing a `git checkout -b` /
 `git switch -c` — **not** from `git-guard.sh`, which has carried no
-`checkout`/`switch` arm since qontinui-claude-config #567 narrowed it to coord's
-merge authority. So a machine whose harness
+`checkout`/`switch` arm since it was narrowed to its merge-authority block
+(its later arms are advisory, and none covers checkout/switch). So a machine whose harness
 installs no PreToolUse hooks (pi, Codex) and a branch a human created in a
 terminal outside any Claude Code tool each produce nothing at all. Do **not**
 emit "no concluded PR found", or any other reassuring line, on an empty read:
@@ -724,14 +724,16 @@ Either way, the second agent stops **before** implementing.
 
 ## See Also
 
-These references live in repos you may not have checked out
-(`qontinui-dev-notes`, `qontinui-coord`); skip any whose repo is absent
-under `<workspace-root>/`.
+The tool-shape reference below lives in coord's source repository
+(`qontinui/qontinui-coord`, private, so you may not be able to read it);
+nothing above depends on it.
 
-- `<workspace-root>/qontinui-dev-notes/plans/2026-06-13-coord-parallel-duplication-prevention.md` —
-  the source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
-- `<workspace-root>/qontinui-coord/crates/coord/src/mcp/tools.rs` — `coord_reserve_resource`
-  (`:3183`), `coord_conflict_check`, `coord_declare_intent` (single source of
+- Qontinui's plan `2026-06-13-coord-parallel-duplication-prevention` — the
+  source plan (Layer A pre-flight + Layer B conventions + Layer C server work).
+  It is held in the maintainers' plan corpus, not yours, and nothing above
+  depends on reading it.
+- `crates/coord/src/mcp/tools.rs` in that repository — `coord_reserve_resource`,
+  `coord_conflict_check`, `coord_declare_intent` (single source of
   truth for the tool shapes above).
 - `coord-pr-label` skill — declare cross-repo PR dependencies once you're cleared
   to proceed and have a PR open.

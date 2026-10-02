@@ -61,8 +61,9 @@ raw coverage numbers; the LLM must apply the layout-aware gate before escalating
 # Runner
 curl -s -X POST http://127.0.0.1:9876/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'
 
-# Web frontend
-curl -s -X POST http://localhost:3001/api/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'
+# A web app that embeds the UI Bridge SDK — ITS OWN base: the app's origin plus
+# its configured `apiPath` (`/api/ui-bridge` in the SDK's Next.js setup)
+curl -s -X POST <web-app-ui-bridge-base>/control/page-health -H "Content-Type: application/json" -d '{}'
 
 # A paired device (phone / app) — hit ITS OWN endpoint directly
 curl -s -X POST http://<device-ip>:8087/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'
