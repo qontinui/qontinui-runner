@@ -1972,7 +1972,7 @@ pub fn read_plans_for_cycle(
 ) -> Result<CycleScan, String> {
     use super::ref_scan::{read_ref_dir_at, ScanSource};
     debug_assert!(
-        pin.fetches(),
+        pin.is_fetching(),
         "read_plans_for_cycle publishes from the ref, so it must read through a FETCHING pin"
     );
     match pin.resolve_source(git, dir) {
@@ -5289,7 +5289,7 @@ impl BodySync {
         pin: std::sync::Arc<CycleRefPin>,
     ) {
         debug_assert!(
-            pin.fetches(),
+            pin.is_fetching(),
             "the body sync publishes from the ref, so it must read through a FETCHING pin"
         );
         let verdict = (self.capture_gate)();
@@ -10267,12 +10267,12 @@ Body.
         let tmp = tempfile::tempdir().unwrap();
         let git = MovingRef::at(tmp.path());
         let listing = CycleRefPin::listing_only();
-        assert!(!listing.fetches());
+        assert!(!listing.is_fetching());
         let first = listing.resolve_ref(&git, tmp.path(), "origin/main");
         let second = listing.resolve_ref(&git, tmp.path(), "origin/main");
         assert_eq!(first, second, "one resolution per cycle");
         assert_eq!(git.fetches(), 0, "a listing-only pin never fetches");
-        assert!(CycleRefPin::default().fetches());
+        assert!(CycleRefPin::default().is_fetching());
     }
 
     // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----

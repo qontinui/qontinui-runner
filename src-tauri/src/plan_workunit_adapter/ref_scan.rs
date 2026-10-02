@@ -107,7 +107,7 @@ pub enum ScanSource {
 /// the withheld-posture cycle, whose stem listing *"neither needs nor deserves a
 /// fetch"* ([`resolve_ref_listing_source`]). It still resolves the ref ONCE, so
 /// the probe and the census of that cycle share one `rev_parse`. A
-/// listing-only pin must never feed a publishing read. [`Self::fetches`] lets
+/// listing-only pin must never feed a publishing read. [`Self::is_fetching`] lets
 /// those readers assert it.
 ///
 /// A failed fetch is one answer for the whole repo for the whole cycle: every
@@ -148,7 +148,7 @@ impl CycleRefPin {
 
     /// Whether this pin fetches before resolving. A reader that PUBLISHES from
     /// the ref asserts this: a listing-only pin would publish an unfetched ref.
-    pub fn fetches(&self) -> bool {
+    pub fn is_fetching(&self) -> bool {
         self.fetch
     }
 
