@@ -867,9 +867,8 @@ impl GrantRenewer for CoordGrantRenewer {
         Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let session = uuid::Uuid::parse_str(session_id).map_err(|e| {
-                format!("remote_attach:invalid_session_id: {session_id:?}: {e}")
-            })?;
+            let session = uuid::Uuid::parse_str(session_id)
+                .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
             let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
             info!(
                 session = %session,
