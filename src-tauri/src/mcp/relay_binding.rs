@@ -19,15 +19,18 @@
 //! - [`BindingCounters`] — per-rule `wouldRefuse` / `refused` counts, held on
 //!   the one shared [`RelayBinding`] instance, never in a process global.
 //!
-//! # Phase 1 (this state of the file)
+//! # Who consults it
 //!
 //! [`Principal`], [`Principal::same`], [`Refusal`] and
-//! [`RelayBinding::meter`] land here, and the WebSocket relay plus the app
-//! registry consult them (R1, R2, R3-WS, R4, R5, R-opaque).
-//! [`RelayBinding::health_json`] is served by the production `/health`
-//! handler. The HTTP relay tabs (R1/R3/R5 for tabs, R9) are Phase 2, and the
-//! active-connection rules (R6, R7, R8) are Phase 3; `relay_binding/tests.rs`
-//! carries their acceptance tests, `#[ignore]`d red until then.
+//! [`RelayBinding::meter`] live here. The WebSocket relay and the app registry
+//! consult them for R1, R2, R3-WS, R4, R5 and R-opaque. The HTTP relay tabs
+//! (`mcp/ui_bridge/relay.rs`) consult them for R1, R3 and R5 on tabs and for
+//! R9, the tab key. R6 (`ws_relay::install_ws_sdk_connection`) and R8
+//! (untargeted dispatch, `ui_bridge/relay.rs`) are metered through it under
+//! the active-binding switch. R7 is not here: it is the origin guard's
+//! `ACTIVE_SELECTION_ROUTES`. [`RelayBinding::health_json`] is served by the
+//! production `/health` handler, and Phase 4 decides from those counters
+//! whether R6, R8 and R9-unkeyed graduate from `shadow` to `enforce`.
 //!
 //! [`RequesterPrincipal`]: crate::mcp::origin_guard::RequesterPrincipal
 
@@ -261,7 +264,7 @@ pub enum Principal {
     },
     /// R9: a tab that presented `X-UI-Bridge-Tab-Key`. Bound to the key's
     /// digest whatever its origin, because a pinned injected tab crosses
-    /// origins by design. Consulted by the tab routes in Phase 2.
+    /// origins by design. Consulted by the HTTP relay tab routes.
     TabKey { digest: String },
     /// A browser-class request with no usable `Origin`. It has NO principal:
     /// it is `same` as nothing, not even another `Opaque`. Reached only under
