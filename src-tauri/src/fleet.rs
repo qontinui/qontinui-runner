@@ -51,6 +51,13 @@ use crate::database::pg::PgDb;
 /// module docs.
 pub(crate) mod resource_sample;
 
+/// The machine's capability — commit limit, physical RAM, cores, and the
+/// pagefile's size and growability (plan
+/// `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`,
+/// Phase 1). Served on `/health`; the input the resource guard's shadow ladder
+/// scale divides.
+pub(crate) mod machine_capability;
+
 /// TCP socket-state census for one port, split by which side owns the fd
 /// (plan `2026-08-31-devops-runner-9876-accept-path-starved-by-close-wait-sockets`,
 /// Phase 1). Consumed by [`resource_sample`]'s host lane; see its module docs

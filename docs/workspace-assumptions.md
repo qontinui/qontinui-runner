@@ -13,7 +13,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `supervisor_dependency` | 50 | 50 | 0 | 40 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
 | `tenant_literal` | 1 | 1 | 0 | 1 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 110 | 111 | 110 | 0 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
 
 ## `repo_layout` (55 rows)
@@ -206,7 +206,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 |---|---|---|---:|---|
 | `src/ai_provider/oauth_refresh.rs` | `const CLIENT_ID` | `const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";` | 1 | fallback_correct — Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install. |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (110 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -247,6 +247,11 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/execution_core/unified_tools.rs` | `execute_shell_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/fleet.rs` | `build_host_capabilities` | `caps.push("shell:powershell".to_string());` | 1 | unreviewed |
 | `src/fleet.rs` | `powershell_on_path` | `binary_on_path("pwsh") \|\| binary_on_path("powershell")` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `booted_at` | `cfg(windows)-only fn 'booted_at' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `config_written_at` | `cfg(windows)-only fn 'config_written_at' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `live` | `cfg(windows)-only fn 'live' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `memory_management` | `cfg(windows)-only fn 'memory_management' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/fleet/machine_capability.rs` | `reading` | `cfg(windows)-only fn 'reading' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `attach_wsl_disk` | `cfg(windows)-only fn 'attach_wsl_disk' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `decode_utf16le` | `cfg(windows)-only fn 'decode_utf16le' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/fleet/resource_sample.rs` | `resolve_wsl_distro` | `cfg(windows)-only fn 'resolve_wsl_distro' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
