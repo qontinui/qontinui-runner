@@ -864,6 +864,18 @@ pub fn export_all_schemas() -> Value {
     add!("HelperAnswerSchema", qht::HelperAnswerSchema);
     add!("HelperTaskSource", qht::HelperTaskSource);
 
+    // ── qontinui-types: glossary + refusal (the next-action contract) ──
+    // Plan 2026-09-20-the-published-product-works-without-knowing-a-
+    // development-environment-exists, C1/D1. `GlossaryTerm` is the typed id
+    // union a refusal cites; the definitions table itself is data, which
+    // JSON Schema cannot carry.
+    add!("GlossaryTerm", qontinui_types::glossary::GlossaryTerm);
+    add!("Refusal", qontinui_types::refusal::Refusal);
+    add!("RefusalCode", qontinui_types::refusal::RefusalCode);
+    add!("RefusalSource", qontinui_types::refusal::RefusalSource);
+    add!("NextAction", qontinui_types::refusal::NextAction);
+    add!("NextActionKind", qontinui_types::refusal::NextActionKind);
+
     Value::Object(m)
 }
 
