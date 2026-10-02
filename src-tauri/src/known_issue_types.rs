@@ -34,10 +34,14 @@ use serde::{Deserialize, Serialize};
 /// check existed is not rewritten.
 type JsonObject = serde_json::Map<String, serde_json::Value>;
 
-/// Refuse a JSON-object field that holds anything but an object.
+/// Refuse a JSON-object field that holds anything but an object. `null` is
+/// read as ABSENT, not refused: serde already maps a JSON `null` to `None` on
+/// every request it decodes, and the import path builds requests from a plain
+/// `Value`, so refusing `Some(Null)` there would drop issues an export of an
+/// older row legitimately carries. The writer treats it as absent too.
 fn ensure_object(field: &str, value: Option<&serde_json::Value>) -> Result<(), String> {
     match value {
-        Some(v) if !v.is_object() => Err(format!(
+        Some(v) if !v.is_object() && !v.is_null() => Err(format!(
             "{field} must be a JSON object, got {}",
             json_kind(v)
         )),
@@ -477,6 +481,16 @@ mod validate_tests {
     fn create_accepts_an_object_or_absent_config() {
         assert!(create(serde_json::json!({"k": 1})).validate().is_ok());
         assert!(create(serde_json::Value::Null).validate().is_ok());
+    }
+
+    /// The import path builds requests from a plain `Value`, so a `null` from
+    /// an export arrives as `Some(Null)` rather than `None`; it is absent.
+    #[test]
+    fn create_reads_an_explicit_null_as_absent() {
+        let mut req = create(serde_json::json!({}));
+        req.detection_config = Some(serde_json::Value::Null);
+        req.verification_step_template = Some(serde_json::Value::Null);
+        assert!(req.validate().is_ok());
     }
 
     #[test]
