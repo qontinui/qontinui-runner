@@ -1072,6 +1072,25 @@ pub fn terminal_remote_interactivity(
     })
 }
 
+/// The grant jti a remote tab's pane presents RIGHT NOW.
+///
+/// The tab identity records the jti the tab was opened with, but the reattach
+/// supervisor renews an expired grant and re-keys the client's routing table
+/// under the new jti (plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches`, D2). The
+/// manager-held pane carries the current one, so resolve through it and fall
+/// back to the identity's only when the manager holds no pane.
+fn current_grant_jti(
+    terminal_manager: &TerminalManager,
+    terminal_id: &str,
+    identity: &RemoteTabIdentity,
+) -> String {
+    terminal_manager
+        .remote_pane(terminal_id)
+        .map(|pane| pane.grant_jti())
+        .unwrap_or_else(|| identity.grant_jti.clone())
+}
+
 /// The body of [`terminal_remote_interactivity`], with the live-pane lookup
 /// injected so it is testable without the process-wide client.
 pub(crate) fn remote_interactivity_response(
@@ -1084,7 +1103,7 @@ pub(crate) fn remote_interactivity_response(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = live_pane(&identity.grant_jti) else {
+    let Some(pane) = live_pane(&current_grant_jti(terminal_manager, terminal_id, &identity)) else {
         return Ok(CommandResponse {
             success: false,
             message: Some("the remote pane behind this tab is closed".to_string()),
@@ -1121,7 +1140,8 @@ pub async fn terminal_remote_history_load(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = client().pane(&identity.grant_jti) else {
+    let grant_jti = current_grant_jti(&terminal_manager, &terminal_id, &identity);
+    let Some(pane) = client().pane(&grant_jti) else {
         return Err(format!(
             "remote_attach:pane_gone: the remote pane behind terminal {terminal_id} is closed"
         ));
@@ -1145,7 +1165,7 @@ pub async fn terminal_remote_history_load(
     let end = start.saturating_add(reply.ring.buffer.len() as u64);
     info!(
         terminal_id = %terminal_id,
-        grant_jti = %identity.grant_jti,
+        grant_jti = %grant_jti,
         requested_from = from,
         requested_to = to,
         got_from = start,
@@ -1829,5 +1849,32 @@ mod interactivity_command_tests {
         ] {
             assert!(d.get(key).is_some(), "missing {key} in {d}");
         }
+    }
+
+    /// Plan 2026-10-02 (vet): after the reattach supervisor renews the grant,
+    /// the routing table knows the pane only by the NEW jti while the tab
+    /// identity still names the old one. The lookup must follow the pane, or a
+    /// live, renewed tab reports itself closed.
+    #[test]
+    fn a_renewed_pane_is_found_by_its_current_jti() {
+        let tm = TerminalManager::new();
+        tm.set_remote_identity("tab-1", identity());
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "rt-1",
+            "g",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        tm.set_remote_pane("tab-1", pane.clone());
+        pane.set_grant("jti-2", "g2");
+        let r = remote_interactivity_response(&tm, "tab-1", |jti| {
+            (jti == "jti-2").then(|| pane.clone())
+        })
+        .unwrap();
+        assert!(r.success, "a renewed pane was reported closed");
     }
 }
