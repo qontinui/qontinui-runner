@@ -870,12 +870,9 @@ fn measure_unstamped(
     // root, say) is `Unavailable` to the scan without a fetch, so the probe
     // must not be the thing that fetches for it every cycle; it reads the
     // as-found ref instead, and no census travels to disagree with it.
-    let pin = pin.filter(|_| {
-        matches!(
-            super::ref_scan::resolve_ref_listing_source(git, dir),
-            super::ref_scan::ScanSource::Ref { .. }
-        )
-    });
+    // Judged on the `root` this measurement already resolved (no second git
+    // probe that could answer differently from the first).
+    let pin = pin.filter(|_| super::ref_scan::relative_dir(&root, dir).is_some());
     let resolved = match pin.map(|p| (p.is_fetching(), p.resolve_ref(git, &root, &default_ref))) {
         Some((_, Ok(Some(sha)))) => Ok(sha),
         Some((fetching, Ok(None))) => Err(format!(
