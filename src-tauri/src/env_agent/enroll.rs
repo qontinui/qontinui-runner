@@ -493,6 +493,7 @@ mod tests {
     /// test that reaches [`with_enroll_slot`] (directly or via [`run_enroll`])
     /// holds this for its whole body. Poison-recovering so a panicking test
     /// cannot cascade-fail the rest (the panic-path test panics BY DESIGN).
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn slot_lock() -> std::sync::MutexGuard<'static, ()> {
         static SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         SLOT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())

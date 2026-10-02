@@ -10047,9 +10047,12 @@ mod tests {
         // same reason, as `runner_context_briefing_is_appended_to_the_argv` and
         // `terminal::the_api_port_reaches_the_rendered_briefing`.
         //
-        // Order is env_lock → pin, deliberately and consistently: nothing in the
-        // crate takes them the other way round, so there is one global ordering
-        // and no deadlock to introduce later.
+        // Either order is safe: the pin takes `env_lock` itself before its own
+        // mutex (a child of `env_lock` in the test-lock hierarchy), so here it
+        // nests on the env lock already held above. An earlier comment here
+        // claimed "env_lock → pin, nothing takes them the other way round" while
+        // `plan_library`'s tests took exactly the other way round — a live
+        // AB/BA deadlock until the hierarchy replaced per-site ordering.
         let _pin = crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test("off");
         let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
         let _bound = BoundPortRestore::capture();
