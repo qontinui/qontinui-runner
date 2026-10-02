@@ -4105,7 +4105,11 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// * reads — `coord_fleet_drain_status` (a session that cannot see a drain
 ///   reads a quiesced machine as idle), `coord_next_step_settings_effective`
 ///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
-///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
+///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`,
+///   `coord_operator_touches` (the operator-touch read, plan
+///   `2026-08-27-operator-touch-read-and-surface`: device-default and read-only,
+///   it points agents at the agent-question tools above for every
+///   `agent_dispatchable` touch);
 /// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
 ///   fixer takes before acting on a PR it did not author),
 ///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
@@ -4198,6 +4202,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_next_step_settings_effective",
     "coord_notify_sensitive_action",
     "coord_operator_touch_classify",
+    "coord_operator_touches",
     "coord_orient",
     "coord_pending_agent_questions",
     "coord_post_finding",
@@ -15729,6 +15734,7 @@ mod coord_mcp_body_gate_tests {
             "coord_land_provenance_backfill",
             "coord_next_step_settings_effective",
             "coord_operator_touch_classify",
+            "coord_operator_touches",
             "coord_pending_agent_questions",
             "coord_primary_tree_branch_status",
             "coord_withdraw_agent_question",
