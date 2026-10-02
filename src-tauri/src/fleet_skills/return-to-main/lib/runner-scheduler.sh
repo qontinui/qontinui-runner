@@ -57,7 +57,28 @@
 #                     the reports print (`act` / `shadow`, `write` / `report`)
 # After parsing it sets AT (HH:MM) -- or RS_CRON, a whole 5-field cron that
 # overrides AT for a cadence that is not once a day --, ROOT_ARG, DISABLED, PROMPT, MAX_TURNS,
-# TIMEOUT_SECONDS and DESC, then calls:
+# TIMEOUT_SECONDS and DESC. Two optional overrides, for a schedule that is not
+# a cron at all (schedule-return-to-main.sh's probe-gated Condition mode):
+#   RS_SCHEDULE_JSON  the whole `schedule` object, e.g.
+#                     {"type":"Condition","value":{"rearmDelayMinutes":120}};
+#                     it wins over RS_CRON / AT, and drift compares it
+#                     byte-for-byte with the runner's compact serialization
+#   RS_CONDITIONS_JSON the task's `conditions` object, sent on create AND
+#                     update. `{}` is the explicit "none" -- the runner's
+#                     update route reads a JSON null as "not supplied", so
+#                     `{}` is the only spelling that CLEARS a stored block --
+#                     and drift then flags any stored conditions; any other
+#                     value must appear verbatim in the stored task.
+#   rs_conditions_drift() (a function) replaces the verbatim `conditions`
+#                     compare with the caller's own FIELD-WISE one (it calls
+#                     drift_add), for a block whose serialized key order the
+#                     caller does not want to depend on.
+#   rs_check_extra()  (a function) called by --check with the found task's
+#                     JSON after the report and before exit 0; it may print
+#                     and exit with its own code (return-to-main uses it to
+#                     refuse a probe-gated task on a runner that no longer
+#                     enforces the probe).
+# Then it calls:
 #   rs_resolve_workdir  -> ROOT, WORKDIR (skipped for --uninstall)
 #   rs_build_bodies     -> CRON, WANT_ENABLED, CREATE_BODY, UPDATE_BODY
 #   rs_dispatch <verb>  -> do_dry_run | do_install | do_check | do_uninstall
@@ -183,15 +204,20 @@ rs_build_bodies() {
     # --at: it is how a caller registers a cadence that is not once a day
     # (scripts/schedule-fleet-bundle-sync.sh: every N hours). Unset, the cron
     # is the one fixed daily time --at names, exactly as before.
-    if [ -n "${RS_CRON:-}" ]; then
-        CRON="$RS_CRON"
+    if [ -n "${RS_SCHEDULE_JSON:-}" ]; then
+        CRON=""
+        SCHEDULE_JSON="$RS_SCHEDULE_JSON"
     else
-        CRON="$((10#${AT#*:})) $((10#${AT%%:*})) * * *"
+        if [ -n "${RS_CRON:-}" ]; then
+            CRON="$RS_CRON"
+        else
+            CRON="$((10#${AT#*:})) $((10#${AT%%:*})) * * *"
+        fi
+        SCHEDULE_JSON="{\"type\":\"Cron\",\"value\":\"$CRON\"}"
     fi
     if [ "${DISABLED:-0}" = 1 ]; then WANT_ENABLED=false; else WANT_ENABLED=true; fi
-    SCHEDULE_JSON="{\"type\":\"Cron\",\"value\":\"$CRON\"}"
     TASK_JSON="{\"task_type\":\"RemoteAgent\",\"prompt\":\"$(jesc "$PROMPT")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"max_turns\":$MAX_TURNS,\"timeout_seconds\":$TIMEOUT_SECONDS}"
-    COMMON_JSON="\"schedule\":$SCHEDULE_JSON,\"task\":$TASK_JSON,\"skipIfCompleted\":false,\"autoFixOnFailure\":false,\"catchUpPolicy\":\"run_once\""
+    COMMON_JSON="\"schedule\":$SCHEDULE_JSON,\"task\":$TASK_JSON,\"skipIfCompleted\":false,\"autoFixOnFailure\":false,\"catchUpPolicy\":\"run_once\"${RS_CONDITIONS_JSON:+,\"conditions\":$RS_CONDITIONS_JSON}"
     CREATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",$COMMON_JSON}"
     UPDATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",\"enabled\":$WANT_ENABLED,$COMMON_JSON}"
 }
@@ -283,11 +309,28 @@ compute_drift() { # <task json>
     [ "$v" = "$WANT_ENABLED" ] || drift_add "enabled is $v, intended $WANT_ENABLED"
     v="$(jstr "$c" description)" || v="<absent>"
     [ "$v" = "$(jesc "$DESC")" ] || drift_add "description differs"
-    if [[ $c =~ $RE_SCHED ]]; then
+    if [ -n "${RS_SCHEDULE_JSON:-}" ]; then
+        case "$c" in
+            *"\"schedule\":$RS_SCHEDULE_JSON"*) ;;
+            *) drift_add "schedule is $(rs_sched_of "$c"), intended $RS_SCHEDULE_JSON" ;;
+        esac
+    elif [[ $c =~ $RE_SCHED ]]; then
         [ "${BASH_REMATCH[1]}" = Cron ] && [ "${BASH_REMATCH[2]}" = "$CRON" ] \
             || drift_add "schedule is ${BASH_REMATCH[1]} '$(junesc "${BASH_REMATCH[2]}")', intended Cron '$CRON'"
     else
-        drift_add "schedule is not a Cron string (intended Cron '$CRON')"
+        drift_add "schedule is $(rs_sched_of "$c"), not a Cron string (intended Cron '$CRON')"
+    fi
+    if [ "${RS_CONDITIONS_JSON:-}" = "{}" ]; then
+        case "$c" in *'"conditions":{"'*) drift_add "task carries conditions, intended none" ;; esac
+    elif [ -n "${RS_CONDITIONS_JSON:-}" ]; then
+        if declare -F rs_conditions_drift >/dev/null 2>&1; then
+            rs_conditions_drift "$c"
+        else
+            case "$c" in
+                *"\"conditions\":$RS_CONDITIONS_JSON"*) ;;
+                *) drift_add "conditions differ from the intended $RS_CONDITIONS_JSON" ;;
+            esac
+        fi
     fi
     v="$(jstr "$c" task_type)" || v="<absent>"
     [ "$v" = RemoteAgent ] || drift_add "task_type is $v, intended RemoteAgent"
@@ -308,6 +351,23 @@ compute_drift() { # <task json>
     [ "$v" = false ] || drift_add "autoFixOnFailure is $v, intended false"
     v="$(jstr "$c" catchUpPolicy)" || v="<absent>"
     [ "$v" = run_once ] || drift_add "catchUpPolicy is $v, intended run_once"
+}
+
+# rs_sched_of <task json> -> its schedule, for a report: `Cron '<expr>'`, or
+# the raw object of any other type (read up to the first `}}`, which closes a
+# Condition's one-level value).
+rs_sched_of() {
+    if [[ $1 =~ $RE_SCHED ]]; then
+        printf "%s '%s'" "${BASH_REMATCH[1]}" "$(junesc "${BASH_REMATCH[2]}")"
+    elif [[ $1 =~ \"schedule\":(\{\"type\":\"[A-Za-z]+\",\"value\":\{[^\}]*\}\}) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '<unreadable>'
+    fi
+}
+# rs_sched_label -> the intended schedule, for a one-line report.
+rs_sched_label() {
+    if [ -n "${RS_SCHEDULE_JSON:-}" ]; then printf 'schedule=%s' "$RS_SCHEDULE_JSON"; else printf "cron='%s'" "$CRON"; fi
 }
 
 # ---- reporting helpers ------------------------------------------------------
@@ -347,7 +407,7 @@ report_task() {
     printf '  enabled:           %s\n' "$en"
     printf '  mode:              %s\n' "$(prompt_mode "$prompt")"
     printf '  prompt:            %s\n' "$prompt"
-    printf '  cron:              %s\n' "${cron:-<not a Cron schedule>}"
+    printf '  cron:              %s\n' "${cron:-<not a Cron schedule: $(rs_sched_of "$c")>}"
     printf '  working_directory: %s\n' "$wd"
     printf '  max_turns:         %s   timeout_seconds: %s   catch_up_policy: %s\n' "$mt" "$ts" "$cp"
     chm="$(cron_hhmm "$cron")"
@@ -372,7 +432,7 @@ report_task() {
 
 # ---- verbs ------------------------------------------------------------------
 do_dry_run() {
-    say "DRY-RUN -- nothing was sent to the runner and nothing was touched"
+    say "DRY-RUN -- no write was sent to the runner and nothing was touched"
     printf '  runner:            %s\n' "$BASE"
     printf '  workspace root:    %s (working_directory %s)\n' "$ROOT" "$WORKDIR"
     printf '  mode:              %s\n' "$(prompt_mode "$PROMPT")"
@@ -421,21 +481,21 @@ do_install() {
         list_named
         [ "${#TASKS[@]}" -eq 1 ] && [ "$(task_id "${TASKS[0]}")" = "$id" ] \
             || die_conflict "MISMATCH -- created task $id (it reads back by id), but GET /scheduler/tasks lists ${#TASKS[@]} task(s) named $TASK_NAME; the next --install could not find it by name. Not retrying."
-        say "CREATED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") cron='$CRON' at $BASE"
+        say "CREATED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") $(rs_sched_label) at $BASE"
         exit 0
     fi
     c="${TASKS[0]}"
     id="$(task_id "$c")"
     compute_drift "$c"
     if [ -z "$DRIFT" ]; then  # unchanged
-        say "UNCHANGED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") cron='$CRON' at $BASE"
+        say "UNCHANGED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") $(rs_sched_label) at $BASE"
         exit 0
     fi
     local was="$DRIFT"
     api PUT "/scheduler/tasks/$id" "$UPDATE_BODY" || die_unknown "PUT $BASE/scheduler/tasks/$id got no answer (curl exit $API_RC) -- whether it was updated is UNKNOWN; run --check"
     case "$API_CODE" in 200|201|204) ;; *) die_unknown "PUT $BASE/scheduler/tasks/$id answered HTTP $API_CODE: $(snip "$API_BODY")" ;; esac
     verify_by_id "$id"
-    say "UPDATED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") cron='$CRON' at $BASE (was: $was)"
+    say "UPDATED id=$id enabled=$WANT_ENABLED mode=$(prompt_mode "$PROMPT") $(rs_sched_label) at $BASE (was: $was)"
     exit 0
 }
 
@@ -458,6 +518,7 @@ do_check() {
     else
         printf '  drift:             %s -- --install with the same options would rewrite it\n' "$DRIFT"
     fi
+    if declare -F rs_check_extra >/dev/null 2>&1; then rs_check_extra "${TASKS[0]}"; fi
     exit 0
 }
 

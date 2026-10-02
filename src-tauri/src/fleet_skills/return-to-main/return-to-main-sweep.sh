@@ -536,6 +536,26 @@
 #                      `dirty-provenance.sh` proves every one of them already
 #                      on the upstream default branch, or residue.
 #                      Repeatable. See 1e.
+#   --per-repo-quiet   gate every move on the caller's PER-REPO quiet verdicts
+#                      (plan 2026-09-29-quiet-is-measured-by-session-existence-
+#                      and-machine-wide-so-a-24x7-box-never-gets-one, Phase 3):
+#                      a fast-forward or a residue restore of REPO needs
+#                      `--quiet-ff REPO`, a return (a switch off a parked
+#                      branch) needs `--quiet-return REPO` AND `--quiet-ff
+#                      REPO` (it ends in a fast-forward); anything else is
+#                      ABSTAINED `not_quiet_for_checkout_ff` /
+#                      `not_quiet_for_checkout_return`, dry run or not. The
+#                      lists are what `machine-quiesce-check.sh --for
+#                      checkout-ff` / `--for checkout-return` read QUIET. An
+#                      EMPTY list is a real answer (nothing is quiet), which is
+#                      why the gate is its own flag rather than implied by the
+#                      lists. Without it the sweep does not gate at all: the
+#                      caller's machine-wide verdict is the gate.
+#   --quiet-ff REPO    (repeatable; implies --per-repo-quiet) REPO read QUIET
+#                      for checkout-ff.
+#   --quiet-return REPO
+#                      (repeatable; implies --per-repo-quiet) REPO read QUIET
+#                      for checkout-return.
 #   --root DIR         workspace root (default: resolved; $QONTINUI_ROOT wins).
 #   --log FILE         JSONL log path (default <root>/.dev-logs/
 #                      return-to-main-sweep.log). `--log -` disables the log —
@@ -656,6 +676,9 @@ ADJ_SHAS=()
 ADJ_KINDS=()   # "landed" | "superseded" -- the WORD the row will record
 EVIDENCE=""
 RESIDUE_REPOS=()
+PER_REPO_QUIET=0
+QUIET_FF=()
+QUIET_RETURN=()
 
 _usage_err() { echo "return-to-main-sweep: $1 (see --help)" >&2; exit 2; }
 
@@ -712,6 +735,13 @@ while [ $# -gt 0 ]; do
             EVIDENCE="$1"; shift ;;
     --restore-residue) shift; [ $# -gt 0 ] || _usage_err "--restore-residue needs a repo name"
             RESIDUE_REPOS+=("$1"); shift ;;
+    --per-repo-quiet) PER_REPO_QUIET=1; shift ;;
+    --quiet-ff|--quiet-return)
+            _q_flag="$1"; shift; [ $# -gt 0 ] || _usage_err "$_q_flag needs a repo name"
+            case "$1" in ''|*/*|*\\*) _usage_err "$_q_flag: '$1' is not a checkout directory name" ;; esac
+            PER_REPO_QUIET=1
+            if [ "$_q_flag" = --quiet-ff ]; then QUIET_FF+=("$1"); else QUIET_RETURN+=("$1"); fi
+            shift ;;
     # Print the header up to the sentinel rather than a hard-coded line range,
     # which silently truncated on every header edit in the sibling scripts.
     -h|--help) sed -n '2,/^# ---- END HELP/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
@@ -1029,7 +1059,8 @@ for _i in ${ADJ_REPOS[@]+"${!ADJ_REPOS[@]}"}; do
 done
 _adj_json+="]"
 
-log_line "{\"ts\":$(js "$(now_iso)"),\"event\":\"run_start\",\"tool\":\"return-to-main-sweep.sh\",\"schema\":2,\"host\":$(js "$(hostname 2>/dev/null || printf unknown)"),\"root\":$(js "$ROOT"),\"mode\":$(js "$MODE_WORD"),\"candidates\":$(jn "$TOTAL"),\"capped_out\":$(jn "$CAPPED"),\"classifier\":$(js "$CLASSIFIER"),\"dirty_provenance\":$(jsn "$DIRTY_PROV"),\"run_from\":$(js "$_rtm_dir"),\"source_dir\":$(js "$_RTM_SOURCE_DIR"),\"copy\":$(jb "$_RTM_IS_COPY"),\"fetch\":$(jb "$FETCH"),\"fetch_timeout_sec\":$(jn "$FETCH_TIMEOUT"),\"adjudicated\":$_adj_json,\"evidence\":$(jsn "$EVIDENCE"),\"evidence_sha256\":$(jsn "$EVIDENCE_SHA"),\"restore_residue\":$(ja ${RESIDUE_REPOS[@]+"${RESIDUE_REPOS[@]}"}),\"session_id\":$(jsn "${CLAUDE_CODE_SESSION_ID:-}")}"
+_prq_json="{\"enabled\":$(jb "$PER_REPO_QUIET"),\"checkout_ff\":$(ja ${QUIET_FF[@]+"${QUIET_FF[@]}"}),\"checkout_return\":$(ja ${QUIET_RETURN[@]+"${QUIET_RETURN[@]}"})}"
+log_line "{\"ts\":$(js "$(now_iso)"),\"event\":\"run_start\",\"tool\":\"return-to-main-sweep.sh\",\"schema\":2,\"host\":$(js "$(hostname 2>/dev/null || printf unknown)"),\"root\":$(js "$ROOT"),\"mode\":$(js "$MODE_WORD"),\"candidates\":$(jn "$TOTAL"),\"capped_out\":$(jn "$CAPPED"),\"classifier\":$(js "$CLASSIFIER"),\"dirty_provenance\":$(jsn "$DIRTY_PROV"),\"run_from\":$(js "$_rtm_dir"),\"source_dir\":$(js "$_RTM_SOURCE_DIR"),\"copy\":$(jb "$_RTM_IS_COPY"),\"fetch\":$(jb "$FETCH"),\"fetch_timeout_sec\":$(jn "$FETCH_TIMEOUT"),\"adjudicated\":$_adj_json,\"evidence\":$(jsn "$EVIDENCE"),\"evidence_sha256\":$(jsn "$EVIDENCE_SHA"),\"restore_residue\":$(ja ${RESIDUE_REPOS[@]+"${RESIDUE_REPOS[@]}"}),\"per_repo_quiet\":$_prq_json,\"session_id\":$(jsn "${CLAUDE_CODE_SESSION_ID:-}")}"
 
 # ---------------------------------------------------------------------------
 # per-checkout work
@@ -1824,7 +1855,14 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
   [ "$FETCH" = 1 ] && _rtm_fetch
 
   # -- 1e: restore proven residue before classifying ----------------------
-  if [ "${#RESIDUE_REPOS[@]}" -gt 0 ] && in_list "$REPO" "${RESIDUE_REPOS[@]}"; then
+  # A restore rewrites tracked files in THIS checkout's working tree, so under
+  # --per-repo-quiet it needs the repo's checkout-ff verdict (a live edit
+  # there would be restored over).
+  if [ "${#RESIDUE_REPOS[@]}" -gt 0 ] && in_list "$REPO" "${RESIDUE_REPOS[@]}" \
+     && [ "$PER_REPO_QUIET" = 1 ] && ! in_list "$REPO" ${QUIET_FF[@]+"${QUIET_FF[@]}"}; then
+    RES_OUTCOME="abstained"
+    RES_REASON="not_quiet_for_checkout_ff: the per-repo quiet check did not read $REPO QUIET for checkout-ff, so no residue restore runs in it"
+  elif [ "${#RESIDUE_REPOS[@]}" -gt 0 ] && in_list "$REPO" "${RESIDUE_REPOS[@]}"; then
     BRANCH_PRE="$(gr rev-parse --abbrev-ref HEAD)"
     _rtm_restore_residue
     if [ "$RES_OUTCOME" = failed ]; then
@@ -2005,6 +2043,23 @@ for CO in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
         REASON="already on $DEFAULT_BRANCH and level with $UPSTREAM ($AGES)"
         N_NOCHANGE=$((N_NOCHANGE + 1))
         HEAD_AFTER="$HEAD_NOW"
+      elif [ "$PER_REPO_QUIET" = 1 ] && [ "$BRANCH" = "$DEFAULT_BRANCH" ] && [ "${DETACHED:-false}" != true ] \
+           && ! in_list "$REPO" ${QUIET_FF[@]+"${QUIET_FF[@]}"}; then
+        # The per-repo gate (--per-repo-quiet), BEFORE any ref is written: a
+        # repo the caller's check did not read QUIET for this move is not
+        # moved, and a dry run says so too -- its WOULD_* must be what a live
+        # run would do.
+        ACTION="ABSTAINED"
+        REASON="not_quiet_for_checkout_ff: on $DEFAULT_BRANCH, ${BEHIND:-an unknown number of commits} behind $UPSTREAM ($AGES), but the per-repo quiet check did not read $REPO QUIET for checkout-ff"
+        N_ABSTAIN=$((N_ABSTAIN + 1))
+      elif [ "$PER_REPO_QUIET" = 1 ] && { [ "$BRANCH" != "$DEFAULT_BRANCH" ] || [ "${DETACHED:-false}" = true ]; } \
+           && ! { in_list "$REPO" ${QUIET_RETURN[@]+"${QUIET_RETURN[@]}"} && in_list "$REPO" ${QUIET_FF[@]+"${QUIET_FF[@]}"}; }; then
+        # A return ENDS in a fast-forward of the default branch, so it needs
+        # the repo QUIET for both moves -- a --quiet-return without its
+        # --quiet-ff is not a licence to fast-forward.
+        ACTION="ABSTAINED"
+        REASON="not_quiet_for_checkout_return: parked on ${BRANCH:-<detached HEAD>} whose content is already on $UPSTREAM ($AGES), but the per-repo quiet check did not read $REPO QUIET for BOTH checkout-return and checkout-ff (a return ends in a fast-forward)"
+        N_ABSTAIN=$((N_ABSTAIN + 1))
       elif IGN_EXCLUDE=(); _rtm_ignored_collision "$BRANCH" "$DEFAULT_BRANCH" "$UPSTREAM" "${DETACHED:-false}"; then
         # git overwrites IGNORED files on checkout and merge; nothing snapshots
         # them. Refused before any ref is written.
