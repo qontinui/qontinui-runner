@@ -279,8 +279,9 @@ pub struct SetTabResponse {
     /// publishes. Visible means a non-zero bounding client rect, so unmounted
     /// and `display:none` views are skipped; greatest ancestor depth wins and
     /// ties go to the last in document order. Equals `page_id` when the page
-    /// publishes no nested id (Settings sub-tabs, for one, carry none). Null
-    /// when no wrapper is present or the wrapper is not visible.
+    /// publishes no nested id and the wrapper is visible (Settings sub-tabs,
+    /// for one, carry none). Null when no candidate inside the wrapper has a
+    /// non-zero rect.
     pub active_page_id: Option<String>,
     /// `data-page-id` values along the winning element's ancestor path, outer
     /// to inner, consecutive duplicates collapsed (the last entry equals
@@ -2155,7 +2156,10 @@ pub async fn ui_bridge_page_set_tab_handler(
         escaped_tab, SET_TAB_READBACK_JS
     );
 
-    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
+    // `await_promise` must be true: the expression is an async IIFE, and with
+    // false the helper stringifies the pending Promise (`"{}"`), so every
+    // read-back field would come back absent.
+    match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), true).await {
         Ok(result_str) => {
             let readback = parse_set_tab_readback(&result_str);
             Ok(Json(ApiResponse::success(SetTabResponse {

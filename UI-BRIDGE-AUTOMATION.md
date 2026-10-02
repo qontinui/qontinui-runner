@@ -153,17 +153,20 @@ calls `setActiveTab(tab_id)`.
 
 Both endpoints flip the same underlying `activeTab` state. Differences:
 
-|                                  | `/page/set-tab`                                                                                                                           | `/activate-tab/{tab_id}`                                      |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Tab id location                  | JSON body `{ "tab": "..." }`                                                                                                              | URL path segment                                              |
-| Transport                        | `page/evaluate` dispatching a JS `CustomEvent`                                                                                            | Native Tauri event                                            |
+|                                  | `/page/set-tab`                                     | `/activate-tab/{tab_id}`                                      |
+| -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------- |
+| Tab id location                  | JSON body `{ "tab": "..." }`                        | URL path segment                                              |
+| Transport                        | `page/evaluate` dispatching a JS `CustomEvent`      | Native Tauri event                                            |
 | Return                           | Waits ~100ms, returns `pageId` (outer wrapper), `activePageId` (deepest visible `data-page-id` inside the page wrapper) and `pageIdChain` | Returns 200 immediately (fire-and-forget)                     |
-| Works when webview is slow/stuck | Less reliable (needs JS eval round-trip)                                                                                                  | More reliable (no eval required)                              |
-| Settings sub-tab support         | Main-tab only; sub-tab stays on default                                                                                                   | Sub-tab propagates via `TabContent` → `<Settings defaultTab>` |
+| Works when webview is slow/stuck | Less reliable (needs JS eval round-trip)            | More reliable (no eval required)                              |
+| Settings sub-tab support         | Main-tab only; sub-tab stays on default             | Sub-tab propagates via `TabContent` → `<Settings defaultTab>` |
 
 Prefer `/activate-tab/` for automation; prefer `/page/set-tab` when you
 need the post-switch page-id readback (`pageId` / `activePageId` /
 `pageIdChain`) in a single round-trip.
+`activePageId` skips hidden views (unmounted or `display:none`, i.e. a zero
+rect) and equals `pageId` when the page publishes no nested id — Settings
+sub-tabs carry none, so it cannot tell you which Settings sub-tab is showing.
 
 ### Request
 
@@ -230,8 +233,8 @@ Response shape with `format=text`:
 Query forms (all on the same handler; `GET /terminals/{id}/output` is an
 alias for `/buffer`):
 
-| Query              | Returns                                                                          |
-| ------------------ | -------------------------------------------------------------------------------- |
+| Query              | Returns                                                                         |
+| ------------------ | ------------------------------------------------------------------------------- |
 | `?format=text`     | Canonical: UTF-8 lossy decode + ANSI/OSC stripped, nested `{ data: { text } }`   |
 | `?decoded=true`    | UTF-8 lossy decode, ANSI escape codes left intact (top-level string `data`)      |
 | `?strip_ansi=true` | Implies `decoded=true`; strips CSI/OSC + control bytes (top-level string `data`) |
@@ -250,7 +253,7 @@ SDK-parallel tests do not apply to them.
 ### StatusStrip seam: `seed-terminal-scenario`
 
 `POST /ui-bridge/test/seed-terminal-scenario` seeds injected sessions into the
-_transcript-list_ render path. `POST /ui-bridge/test/clear-injected` tears them
+*transcript-list* render path. `POST /ui-bridge/test/clear-injected` tears them
 down. This seam has no way to exercise the session-RESTORE path — that is what
 the lifecycle-store seam below is for.
 
@@ -263,11 +266,11 @@ against the wall clock — and one wrong field name used to discard the whole
 file, which looks exactly like a passing "restored nothing" run. These three
 routes replace that:
 
-| Route                                        | Does                                                                           |
-| -------------------------------------------- | ------------------------------------------------------------------------------ |
-| `POST /ui-bridge/test/seed-lifecycle-store`  | Writes this instance's store from `{"records":[…]}`. `400` on a malformed body |
-| `POST /ui-bridge/test/list-lifecycle-open`   | Reads it back — the `state == "open"` rows, the restore consumer's input       |
-| `POST /ui-bridge/test/clear-lifecycle-store` | Empties it — snapshot + sibling WAL + live-store reload                        |
+| Route | Does |
+|---|---|
+| `POST /ui-bridge/test/seed-lifecycle-store` | Writes this instance's store from `{"records":[…]}`. `400` on a malformed body |
+| `POST /ui-bridge/test/list-lifecycle-open` | Reads it back — the `state == "open"` rows, the restore consumer's input |
+| `POST /ui-bridge/test/clear-lifecycle-store` | Empties it — snapshot + sibling WAL + live-store reload |
 
 **Record shape.** Each entry in `records` is camelCase and carries
 `sessionId` and `state` (`"open"` / `"closed"`); everything else is optional —
