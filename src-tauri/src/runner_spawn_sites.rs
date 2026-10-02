@@ -207,8 +207,17 @@ fn code_braces(lines: &[&str]) -> Vec<(usize, usize)> {
                             i += 3;
                             continue;
                         }
+                        // `r"…"` / `r#"…"#`, also with a `b`/`c` prefix (`br#"…"#`):
+                        // the literal starts at the prefix, which must itself not
+                        // continue an identifier.
+                        let start = if i >= 1 && matches!(b[i - 1], b'b' | b'c') {
+                            i - 1
+                        } else {
+                            i
+                        };
                         if b[i] == b'r'
-                            && (i == 0 || !b[i - 1].is_ascii_alphanumeric() && b[i - 1] != b'_')
+                            && (start == 0
+                                || !b[start - 1].is_ascii_alphanumeric() && b[start - 1] != b'_')
                         {
                             let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
                             if b.get(i + 1 + hashes) == Some(&b'"') {
@@ -880,7 +889,7 @@ fn a_brace_inside_a_string_literal_does_not_end_a_test_module_early() {
     sources.insert(
         "shim.rs".to_string(),
         "#[cfg(test)]\nmod tests {\n    fn a() {\n        assert!(b.contains(\"\\\"name\\\":\\\"anyhow\\\"}\"));\n    }\n\
-         fn b() { let r = r#\"}\"#; let c = '}'; }\n\
+         fn b() { let r = r#\"}\"#; let c = '}'; let x = br#\"x\"y}\"#; }\n\
          fn c() {\n        let _ = ClaudeSession::spawn(x);\n    }\n}\n"
             .to_string(),
     );
