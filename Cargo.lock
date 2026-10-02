@@ -6888,7 +6888,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "3.1.0"
+version = "4.0.0"
 dependencies = [
  "chrono",
  "hex",
@@ -6909,6 +6909,7 @@ version = "0.1.2"
 dependencies = [
  "chrono",
  "image 0.25.10",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7958,6 +7959,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive 1.2.1",
