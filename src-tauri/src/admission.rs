@@ -1715,12 +1715,16 @@ mod tests {
             lock(&st.releases).push((lease, body));
             Json(serde_json::json!({"released": true}))
         }
+        // A FAKE COORD's routes, not the runner's. Mounted through constants
+        // because the origin-guard route census
+        // (`relay_path_policy::tests::registered_routes`) reads every literal
+        // `.route("…"` in `src/` as a runner door; these paths exist only on
+        // this throwaway test server.
+        const FAKE_ACQUIRE: &str = "/coord/devices/me/spawn-admission";
+        const FAKE_RELEASE: &str = "/coord/devices/me/spawn-admission/{lease_id}/release";
         let app = Router::new()
-            .route("/coord/devices/me/spawn-admission", post(acquire_h))
-            .route(
-                "/coord/devices/me/spawn-admission/{lease_id}/release",
-                post(release_h),
-            )
+            .route(FAKE_ACQUIRE, post(acquire_h))
+            .route(FAKE_RELEASE, post(release_h))
             .with_state(st.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

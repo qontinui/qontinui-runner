@@ -734,10 +734,6 @@ fn every_autonomous_and_operator_site_reports_its_spawn() {
 /// autonomous door and from one operator command, and the guard must name
 /// exactly those two rows — so it can fail, and fails precisely.
 #[test]
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
 fn removing_the_spawn_report_from_a_site_fails_the_guard() {
     let mut sources = load_sources();
     let rows = load_rows();
@@ -747,11 +743,16 @@ fn removing_the_spawn_report_from_a_site_fails_the_guard() {
     ] {
         let src = sources.get(file).expect("source").clone();
         let marker = "record_spawn(";
-        let at = src
-            .find(decl)
-            .and_then(|fn_at| src[fn_at..].find(marker).map(|m| fn_at + m))
-            .unwrap_or_else(|| panic!("{file} reports in {decl}"));
-        let mutated = format!("{}removed_report({}", &src[..at], &src[at + marker.len()..]);
+        // `split_once` + `replacen`, not byte offsets: no str slicing, so no
+        // `clippy::string_slice` exemption for the expect ratchet to count.
+        let (head, tail) = src
+            .split_once(decl)
+            .unwrap_or_else(|| panic!("{file} declares {decl}"));
+        assert!(tail.contains(marker), "{file} reports in {decl}");
+        let mutated = format!(
+            "{head}{decl}{}",
+            tail.replacen(marker, "removed_report(", 1)
+        );
         sources.insert(file.to_string(), mutated);
     }
     assert_eq!(
