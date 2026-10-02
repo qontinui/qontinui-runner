@@ -632,6 +632,44 @@ fn bold_span(s: &str) -> String {
     }
 }
 
+/// `rest` (the text after a line's opening `**`) is a BARE bold phase
+/// mention — `Phase N` or `Phase Nx`, nothing else inside the span — that
+/// the same line continues as sentence prose: right after the closing `**`
+/// comes `,` `.` `;`, or (after whitespace) a lowercase word.
+///
+/// Coord finding f4812a7f: the wrapped paragraph line
+/// `**Phase 6**, near-verbatim. **Resolved …** (see "Vet` cited ANOTHER
+/// plan's Phase 6 and was declared as this plan's phase 6, so the unit's
+/// phases read [1,2,6,3] and `phases_remaining` stayed [6] forever. A bare
+/// span used as a noun phrase is the shape of a citation; a title either
+/// ends the line (`**Phase 2**`), names itself through a separator, a
+/// parenthetical or a capitalised word (`**Phase 2** — x`, `**Phase 2**
+/// (small)`), or carries its name inside the span (`**Phase 1 — parser.**
+/// body`, `**Phase 2:** description` — both still declare). The rule is
+/// deliberately this narrow: a non-bare span is left to [`heading_rank`],
+/// whose sentence/title split already exists, and every other arm is
+/// untouched.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
+fn bold_phase_opens_a_sentence(rest: &str) -> bool {
+    static BARE_PHASE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+\d+[a-z]?$").expect("valid regex"));
+    let Some(close) = rest.find("**") else {
+        return false;
+    };
+    if !BARE_PHASE.is_match(rest[..close].trim()) {
+        return false;
+    }
+    let after = &rest[close + 2..];
+    if after.starts_with([',', '.', ';']) {
+        return true;
+    }
+    let word = after.trim_start();
+    after.len() != word.len() && word.starts_with(|c: char| c.is_lowercase())
+}
+
 /// A list item's ordinal and content: `- x` / `* x` / `+ x` → `(None, "x")`,
 /// `3. x` / `3) x` → `(Some(3), "x")`; `None` for a line that is not a list
 /// item. `t` is already trimmed. The marker must be followed by whitespace, so
@@ -902,8 +940,14 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
 
         // Arm A, bold form. A bold phase TITLE, or any column-0 bold line that
         // is not about a phase, ends the phase list; a bold SENTENCE about a
-        // phase (`**Phase 0 is a gate, not a step.**`) does not.
-        if let Some(rest) = t.strip_prefix("**") {
+        // phase (`**Phase 0 is a gate, not a step.**`) does not. A line that
+        // only OPENS with a bare bold phase mention inside sentence prose
+        // ([`bold_phase_opens_a_sentence`]) is not handled here at all: it is
+        // a paragraph, and falls through to be treated as one.
+        let bold_rest = t
+            .strip_prefix("**")
+            .filter(|rest| !bold_phase_opens_a_sentence(rest));
+        if let Some(rest) = bold_rest {
             match phase_index_at(rest) {
                 Some(index) => {
                     let name = bold_span(rest);
@@ -1521,6 +1565,54 @@ mod tests {
         let p = parse(body);
         assert_eq!(indices(body), vec![4]);
         assert_eq!(p.phases[0].name, "Phase 4 — tests");
+    }
+
+    /// Coord finding f4812a7f: a column-0 PROSE line that merely opens with a
+    /// bold phase mention — here a wrapped paragraph line citing ANOTHER plan's
+    /// Phase 6 — is a sentence about a phase, not a phase title. Declaring it
+    /// gave the unit phases [1,2,6,3] and pinned phases_remaining at [6].
+    #[test]
+    fn phases_bold_phase_mention_opening_a_prose_line_is_not_a_title() {
+        let body = "# T\n\n## Phase 1 — a\n\nx\n\n**Phase 6**, near-verbatim. **Resolved 2026-09-26: deliver it here** (see \"Vet\nfindings\").\n\n## Phase 2 — b\n\ny\n\n## Phase 3 — c\n";
+        assert_eq!(indices(body), vec![1, 2, 3]);
+    }
+
+    /// Variants of f4812a7f: the bare bold `**Phase N**` followed on the same
+    /// line by `,`, `.`, or a lowercase word is a noun phrase in a sentence.
+    #[test]
+    fn phases_bold_bare_phase_followed_by_sentence_prose_does_not_declare() {
+        for line in [
+            "**Phase 6** of the other plan covers this.",
+            "**Phase 6**, near-verbatim.",
+            "**Phase 6**. That is the other plan.",
+            "**Phase 6**; see below.",
+        ] {
+            let body = format!("# T\n\n## Phase 1 — a\n\n{line}\n\n## Phase 2 — b\n");
+            assert_eq!(indices(&body), vec![1, 2], "line: {line}");
+        }
+    }
+
+    /// The f4812a7f rule leaves real bold titles alone: a bare bold phase
+    /// alone on its line, or followed by a title separator, a parenthetical,
+    /// or a capitalised name, still declares.
+    #[test]
+    fn phases_bold_bare_phase_titles_still_declare() {
+        for (line, name) in [
+            ("**Phase 2**", "Phase 2"),
+            ("**Phase 2**  ", "Phase 2"),
+            ("**Phase 2**:", "Phase 2"),
+            ("**Phase 2:** description", "Phase 2:"),
+            ("**Phase 2** — make X", "Phase 2"),
+            ("**Phase 2 — make X**", "Phase 2 — make X"),
+            ("**Phase 2 — Title** (small)", "Phase 2 — Title"),
+            ("**Phase 2** (small)", "Phase 2"),
+            ("**Phase 2** Make X", "Phase 2"),
+        ] {
+            let body = format!("# T\n\n{line}\n");
+            let p = parse(&body);
+            assert_eq!(indices(&body), vec![2], "line: {line}");
+            assert_eq!(p.phases[0].name, name, "line: {line}");
+        }
     }
 
     /// A backtick fence's info string may not contain a backtick, so
