@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
+import { useDisplayTitleResolver } from "./displayTitle";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 
 interface ZoneTimelineProps {
@@ -46,6 +47,7 @@ export function ZoneTimeline({
   onClose,
 }: ZoneTimelineProps) {
   const [now] = useState(() => Date.now());
+  const resolveTitle = useDisplayTitleResolver();
 
   // Build per-zone timeline data from eventHistory
   const { zoneRows, timeRange } = useMemo(() => {
@@ -90,7 +92,7 @@ export function ZoneTimeline({
     }
 
     // Build rows for each occupied zone
-    const rows: { zoneIndex: number; title: string; segments: TimelineSegment[] }[] = [];
+    const rows: { zoneIndex: number; tab: TerminalTab; segments: TimelineSegment[] }[] = [];
 
     const occupiedZones = Object.entries(assignments)
       .map(([z, tabId]) => ({ zoneIndex: Number(z), tabId }))
@@ -105,7 +107,7 @@ export function ZoneTimeline({
         // No events for this zone — show idle for the whole range
         rows.push({
           zoneIndex,
-          title: tab.title,
+          tab,
           segments: [{ state: "idle", startFrac: 0, endFrac: 1 }],
         });
         continue;
@@ -138,7 +140,7 @@ export function ZoneTimeline({
         }
       }
 
-      rows.push({ zoneIndex, title: tab.title, segments });
+      rows.push({ zoneIndex, tab, segments });
     }
 
     return { zoneRows: rows, timeRange: range };
@@ -179,9 +181,9 @@ export function ZoneTimeline({
                 {/* Zone label */}
                 <div
                   className="text-[9px] text-[#565f89] font-mono w-16 shrink-0 truncate"
-                  title={`Zone ${row.zoneIndex + 1}: ${row.title}`}
+                  title={`Zone ${row.zoneIndex + 1}: ${resolveTitle(row.tab)}`}
                 >
-                  Z{row.zoneIndex + 1} {row.title}
+                  Z{row.zoneIndex + 1} {resolveTitle(row.tab)}
                 </div>
                 {/* Timeline bar */}
                 <div className="flex-1 h-3 rounded-xs overflow-hidden flex bg-[#1a1b26]">
