@@ -38,6 +38,7 @@ import { AlertTriangle, MessageSquareDashed, RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { AdvisorySlot } from "./AdvisoryStack";
 import type { TerminalTab } from "./useTerminalManager";
+import { TabTitle } from "./displayTitle";
 
 export interface ResumeFailedBannerProps {
   tabs: TerminalTab[];
@@ -105,7 +106,9 @@ export function ResumeFailedBanner({
                     data-terminal-id={t.id}
                     className="flex items-center gap-2 text-[11px] leading-snug"
                   >
-                    <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
+                    <span className="text-[#c0caf5] font-medium truncate flex-1">
+                      <TabTitle tab={t} />
+                    </span>
                     <button
                       type="button"
                       data-ui-bridge-id="terminal.resume-failed-retry"
@@ -146,7 +149,9 @@ export function ResumeFailedBanner({
                     data-terminal-id={t.id}
                     className="flex items-center gap-2 text-[11px] leading-snug"
                   >
-                    <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
+                    <span className="text-[#c0caf5] font-medium truncate flex-1">
+                      <TabTitle tab={t} />
+                    </span>
                     {onDismissTerminalOnly && (
                       <button
                         type="button"

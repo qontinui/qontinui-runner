@@ -122,7 +122,7 @@ pub fn sanitize_session_name(raw: &str) -> Option<String> {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_start_matches('-').trim_start();
+    let trimmed = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
     let capped: String = trimmed.chars().take(MAX_SESSION_NAME_CHARS).collect();
     let capped = capped.trim_end().to_string();
     if capped.is_empty() {
@@ -674,6 +674,15 @@ mod tests {
         assert!(!v.starts_with('-'), "leading dash must be stripped: {v:?}");
         assert_eq!(v, "\"--evil\" it's fine");
         assert_eq!(argv.iter().filter(|a| *a == "--name").count(), 1);
+    }
+
+    #[test]
+    fn name_with_interleaved_dashes_and_blanks_never_starts_with_a_dash() {
+        for raw in ["- -x", "-\u{7}-x", "- - - y", "\t-  -\n-z"] {
+            let got = sanitize_session_name(raw).unwrap();
+            assert!(!got.starts_with('-'), "{raw:?} -> {got:?}");
+            assert!(!got.starts_with(char::is_whitespace), "{raw:?} -> {got:?}");
+        }
     }
 
     #[test]
