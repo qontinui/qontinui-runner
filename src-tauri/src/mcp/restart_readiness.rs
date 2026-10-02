@@ -128,13 +128,40 @@
 //! `evaluate` body, over the same handles, keyed on the same
 //! `primary_boot_unix_millis`. Nothing here counts anything on its own.
 //!
+//! ## Database schema health gates the AI plane (2026-09-07)
+//!
+//! The AI/task-run plane is enriched with `age_s` from `project.task_runs`,
+//! and plan `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-
+//! schema-probe` names that exact relation as the concrete backing of one of
+//! the four independent idle signals `production-and-cost` `runner-lifecycle`
+//! requires before an operator-requested restart. `/health`'s
+//! `database.reachable` only proves a connect+auth handshake, not that
+//! `project.task_runs` (or the rest of the schema the runner needs) actually
+//! exists — so a reachable-but-unmigrated database answers every query
+//! against it with a continuous error while `reachable: true` gives no hint
+//! why, and a caller could misread that error as "zero active sessions"
+//! (exactly the `verification-and-evidence` `silent-empty-is-unknown` failure
+//! mode this plan exists to close).
+//!
+//! This endpoint reuses Phase 1's own probe rather than re-deriving it —
+//! `crate::mcp_api::{pg_liveness_probe, pg_schema_probe, derive_schema_health}`,
+//! widened to `pub(crate)` for exactly this call — fresh on every request, in
+//! keeping with D5 above. Whenever the resulting `schema_ok` is **not**
+//! `Some(true)` (i.e. `Some(false)` or `None`), the AI plane is reported as
+//! `ai_sessions: null` — UNOBTAINABLE, never a count, and never silently `0` —
+//! via the SAME `unknowns`/fail-closed path every other unresolved plane
+//! already uses, so `safe_to_restart` can never read `true` on an unknown
+//! schema. `schema_ok == Some(true)` changes nothing: the AI plane is built
+//! exactly as it was before this change.
+//!
 //! ## Fail closed
 //!
 //! `safe_to_restart` is `false` on every unknown — an unreadable process
 //! table, an unresolvable `SessionManager`/`TerminalManager`/lifecycle store,
-//! an uninitialized PID-reuse reference — with the cause named in `reason` and
-//! the affected plane serialized as `null` rather than `0`. This surface is
-//! consulted precisely when someone is about to do something destructive.
+//! an uninitialized PID-reuse reference, an unobtainable database schema
+//! health signal — with the cause named in `reason` and the affected plane
+//! serialized as `null` rather than `0`. This surface is consulted precisely
+//! when someone is about to do something destructive.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1024,6 +1051,30 @@ pub fn build_verdict(
     }
 }
 
+/// Whether the AI/task-run plane may be reported this request, given
+/// `/health`'s `schema_ok` derivation (plan `2026-09-07-health-database-
+/// reachable-is-a-connect-probe-not-a-schema-probe`, Phase 2) — pure and
+/// unit-testable apart from the handler's async plumbing.
+///
+/// `Ok(())` ONLY on `schema_ok == Some(true)`; every other value (`Some(false)`
+/// or `None`) is `Err` naming why, so the handler can push it straight into
+/// `unknowns` and report the plane as `None` — unobtainable, never a count,
+/// never a silent `0` — which forces `safe_to_restart: false` through the
+/// same fail-closed path every other unresolved plane already uses.
+pub fn ai_plane_schema_gate(
+    schema_ok: Option<bool>,
+    schema_detail: Option<&str>,
+) -> Result<(), String> {
+    if schema_ok == Some(true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the AI/task-run plane could not be determined: database schema unavailable ({})",
+            schema_detail.unwrap_or("no detail reported")
+        ))
+    }
+}
+
 /// `windDownCandidates` for a resolved terminal plane: top-level processes
 /// whose wind-down verdict is `eligible`. Computed whether or not the runner is
 /// drained, and THIS endpoint closes none of them — but since Phase 4 the
@@ -1058,6 +1109,22 @@ pub async fn restart_readiness_handler(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let app = &state.app_handle;
     let mut unknowns: Vec<String> = Vec::new();
+
+    // ── Database schema health (plan `2026-09-07-health-database-reachable-
+    //    is-a-connect-probe-not-a-schema-probe`, Phase 2) ───────────────────
+    //
+    // Computed fresh, every request (D5) — see the module docs under
+    // "Database schema health gates the AI plane". Reuses Phase 1's own
+    // probe/derivation (`mcp_api`, widened to `pub(crate)`) rather than
+    // re-deriving the same check.
+    let pg_reachable = crate::mcp_api::pg_liveness_probe().await;
+    let schema_probe_result = if pg_reachable == Some(true) {
+        Some(crate::mcp_api::pg_schema_probe().await)
+    } else {
+        None
+    };
+    let (schema_ok, schema_detail) =
+        crate::mcp_api::derive_schema_health(pg_reachable, schema_probe_result);
 
     // ── Drain state: reported, never performed ────────────────────────────
     let port = state
@@ -1193,7 +1260,23 @@ pub async fn restart_readiness_handler(
         .as_ref()
         .map(|p| p.report.ai_plane.clone())
         .unwrap_or_default();
-    let ai = ai_inputs.map(|inputs| ai_plane_from(&inputs, &ai_census, now_ms));
+    // `ai_plane_schema_gate` (plan `2026-09-07-health-database-reachable-is-a-
+    // connect-probe-not-a-schema-probe`, Phase 2): the AI plane's `age_s`
+    // enrichment and the broader `runner-lifecycle` idle signal it stands in
+    // for both depend on `project.task_runs` actually existing, not merely on
+    // a successful connect. On anything but `schema_ok == Some(true)`, report
+    // the plane as unobtainable (`None`) rather than a count that may be
+    // silently wrong or read as `0` — the SAME fail-closed path `build_verdict`
+    // already applies to every other unresolved plane. The `Ok(())` arm is a
+    // no-op, so `schema_ok == Some(true)` leaves this exactly as it was before
+    // this change.
+    let ai = match ai_plane_schema_gate(schema_ok, schema_detail.as_deref()) {
+        Ok(()) => ai_inputs.map(|inputs| ai_plane_from(&inputs, &ai_census, now_ms)),
+        Err(msg) => {
+            unknowns.push(msg);
+            None
+        }
+    };
 
     let drain = DrainInfo {
         already_drained,
@@ -3467,5 +3550,152 @@ mod tests {
                 .idle,
             9
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 of `2026-09-07-health-database-reachable-is-a-connect-probe-
+    // not-a-schema-probe`: the AI/task-run plane is reported as unobtainable
+    // — never a count, never a silent `0` — whenever `/health`'s `schema_ok`
+    // is anything but `Some(true)`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ai_plane_schema_gate_blocks_on_schema_ok_false() {
+        let err = ai_plane_schema_gate(Some(false), Some("missing relation: project.task_runs"))
+            .expect_err("schema_ok: false must gate the AI plane");
+        assert!(err.contains("database schema unavailable"));
+        assert!(err.contains("missing relation: project.task_runs"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_blocks_on_schema_ok_none() {
+        // `schema_ok: null` must never be read as safe any more than
+        // `schema_ok: false` — both are "not `Some(true)`".
+        let err = ai_plane_schema_gate(None, Some("not attempted: reachable=false"))
+            .expect_err("schema_ok: null must gate the AI plane, never read as safe");
+        assert!(err.contains("database schema unavailable"));
+        assert!(err.contains("not attempted: reachable=false"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_names_a_missing_detail_rather_than_panicking() {
+        let err = ai_plane_schema_gate(None, None).expect_err("still a gate with no detail string");
+        assert!(err.contains("no detail reported"));
+    }
+
+    #[test]
+    fn ai_plane_schema_gate_passes_only_on_schema_ok_true() {
+        assert_eq!(ai_plane_schema_gate(Some(true), None), Ok(()));
+    }
+
+    /// End-to-end through `build_verdict`, mirroring exactly what the handler
+    /// does with the gate's result: a `schema_ok: Some(false)` must make the
+    /// overall verdict unsafe via the SAME fail-closed `unknowns` path every
+    /// other unresolved plane uses — never `safe_to_restart: true` beside an
+    /// `ai_sessions: null`.
+    #[test]
+    fn schema_ok_false_forces_the_verdict_unsafe_with_ai_sessions_null() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai =
+            match ai_plane_schema_gate(Some(false), Some("missing relation: project.task_runs")) {
+                Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+                Err(msg) => {
+                    unknowns.push(msg);
+                    None
+                }
+            };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(
+            !v.safe_to_restart,
+            "an unobtainable AI plane must never read as safe: {v:?}"
+        );
+        assert!(
+            v.ai_sessions.is_none(),
+            "the AI plane must be reported null, never a count"
+        );
+        assert!(v.reason.contains("database schema unavailable"));
+        assert!(v.reason.contains("missing relation: project.task_runs"));
+        assert!(serde_json::to_value(&v).unwrap()["ai_sessions"].is_null());
+    }
+
+    /// Same end-to-end path, but for `schema_ok: None` (the probe itself could
+    /// not run, or `reachable` was not `Some(true)`) — equally unsafe, never
+    /// treated as "zero active sessions".
+    #[test]
+    fn schema_ok_none_forces_the_verdict_unsafe_with_ai_sessions_null() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai = match ai_plane_schema_gate(None, Some("not attempted: reachable=unknown")) {
+            Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+            Err(msg) => {
+                unknowns.push(msg);
+                None
+            }
+        };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(
+            !v.safe_to_restart,
+            "schema_ok: null must never read as safe: {v:?}"
+        );
+        assert!(v.ai_sessions.is_none());
+        assert!(v.reason.contains("database schema unavailable"));
+        assert!(v.reason.contains("not attempted: reachable=unknown"));
+    }
+
+    /// `schema_ok == Some(true)`: the gate is a no-op, so the AI plane is
+    /// built exactly as it was before this change. Smoke-level — the AI
+    /// plane's own shaping is already covered by the tests above.
+    #[test]
+    fn schema_ok_true_leaves_the_ai_plane_unaffected() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = empty_report(now_ms);
+        let open: Vec<TerminalSessionRecord> = vec![];
+        let mut unknowns = Vec::new();
+        let ai = match ai_plane_schema_gate(Some(true), None) {
+            Ok(()) => Some(ai_plane_from(&[], &[], now_ms)),
+            Err(msg) => {
+                unknowns.push(msg);
+                None
+            }
+        };
+        let v = verdict_from(
+            &report,
+            &open,
+            ai,
+            unknowns,
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+
+        assert!(v.safe_to_restart, "{}", v.reason);
+        assert!(
+            v.ai_sessions.is_some(),
+            "schema_ok: true must not gate the AI plane"
+        );
+        assert_eq!(v.ai_sessions.as_ref().unwrap().count, 0);
     }
 }
