@@ -239,8 +239,7 @@ pub(crate) fn inspect_binding_store_paths(
                  for tenant(s) {:?} carried by another copy — a credential with no binding \
                  store, so this process reports itself unpaired while it is not. Converge \
                  never synthesizes a canonical, so a restart will not clear this: re-pair \
-                 this runner (an automatic vanished-store heal is proposed in \
-                 qontinui-runner#1889 and is not on this build).{}",
+                 this runner.{}",
                 canonical.path,
                 sets.gap,
                 residue_suffix(&sets)
@@ -818,8 +817,8 @@ mod tests {
         assert_eq!(check.verdict, "fail", "{}", check.detail);
         assert!(check.detail.contains("re-pair"), "{}", check.detail);
         assert!(
-            !check.detail.contains("run the binding-store heal"),
-            "no such heal exists on this build; the remedy must not name one: {}",
+            check.detail.contains("re-pair this runner.") && !check.detail.contains("heal"),
+            "the remedy is a re-pair and names no heal mechanism this build may lack: {}",
             check.detail
         );
         assert!(
@@ -957,17 +956,6 @@ mod tests {
         assert!(check.copies.is_empty());
     }
 
-    // ------------------------------------------------------------------
-    // End to end — the regression #1756 introduced
-    // ------------------------------------------------------------------
-
-    /// Converge an instance runner's two-copy home with the PRODUCTION
-    /// predicate shape (`credentialed`), then inspect the result with the
-    /// same predicate. Converge merges the credentialed tenant, withholds the
-    /// uncredentialed one and retains the bare default — and the doctor must
-    /// then read that steady state as `report`, not `fail`. Under the
-    /// pairwise check this failed forever; it is the test that would have
-    /// caught the regression.
     /// A merge gap and an informational residue in the same pass: the verdict
     /// is the strongest (`fail`) and the detail names BOTH arms.
     #[test]
@@ -1011,6 +999,7 @@ mod tests {
         let gap = inspect_binding_store_paths(&paths, None, &second_answers(Some(true)));
         assert_eq!(gap.copies[1].role, "stray");
         assert_eq!(gap.verdict, "fail", "{}", gap.detail);
+        assert!(gap.detail.contains(SECOND_TENANT), "{}", gap.detail);
 
         let withheld = inspect_binding_store_paths(&paths, None, &second_answers(Some(false)));
         assert_eq!(withheld.verdict, "report", "{}", withheld.detail);
@@ -1020,6 +1009,17 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // End to end — the regression #1756 introduced
+    // ------------------------------------------------------------------
+
+    /// Converge an instance runner's two-copy home with the PRODUCTION
+    /// predicate shape (`credentialed`), then inspect the result with the
+    /// same predicate. Converge merges the credentialed tenant, withholds the
+    /// uncredentialed one and retains the bare default — and the doctor must
+    /// then read that steady state as `report`, not `fail`. Under the
+    /// pairwise check this failed forever; it is the test that would have
+    /// caught the regression.
     #[test]
     fn converge_then_inspect_an_override_home_with_a_withheld_tenant_is_not_a_fail() {
         let b = two_copies();
