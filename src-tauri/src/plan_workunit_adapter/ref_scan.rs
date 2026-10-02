@@ -89,17 +89,33 @@ pub enum ScanSource {
 /// would freeze the corpus at one ref state, so nothing stores one —
 /// `a_pin_does_not_outlive_its_cycle` pins that.
 ///
-/// What it does NOT cover: the scan-divergence probe. That runs earlier in the
-/// tick, fetches nothing, and resolves the ref for itself, so on a cycle whose
-/// fetch advances `origin/main` the scan-root report can carry the probe's
-/// `ref_sha` (pre-fetch) beside the census's (post-fetch). That predates this
-/// type and is not made worse by it; routing the probe through the pin would
-/// change what the probe measures, and is its own change.
+/// It also covers the scan-divergence probe (plan
+/// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`). The probe
+/// resolves `origin/<default>` through the same pin the census lists through,
+/// so the scan-root report's `ref_sha` / `behind` / `ahead` / `ref_age_secs`
+/// and its `ref` census's `ref_sha` name ONE commit. Before, the probe ran
+/// first, fetched nothing and resolved the ref for itself, so a cycle whose
+/// fetch advanced the ref reported the probe's pre-fetch sha (in effect the
+/// previous cycle's fetch, one cycle late) beside the census's post-fetch sha.
+/// The web read side pairs those two as one commit
+/// (`plan_scan_root_health.py` `_census_side`, `_census_sort_key`). The one arm
+/// in which the probe keeps an as-found reading is a FAILED fetch, and there no
+/// census travels at all.
+///
+/// Two modes. [`CycleRefPin::default`] fetches on first use: the writing cycle,
+/// which publishes from the ref. [`CycleRefPin::listing_only`] never fetches:
+/// the withheld-posture cycle, whose stem listing *"neither needs nor deserves a
+/// fetch"* ([`resolve_ref_listing_source`]). It still resolves the ref ONCE, so
+/// the probe and the census of that cycle share one `rev_parse`. A
+/// listing-only pin must never feed a publishing read. [`Self::fetches`] lets
+/// those readers assert it.
 ///
 /// A failed fetch is one answer for the whole repo for the whole cycle: every
 /// root in that repo is `Unavailable` together, and the next cycle retries.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CycleRefPin {
+    /// `false` for [`Self::listing_only`]: resolve without fetching.
+    fetch: bool,
     /// `(repo_root, ref_name)` -> this cycle's answer. `Ok(Some(sha))`: fetched
     /// and resolved. `Ok(None)`: fetched, but the ref would not resolve to an
     /// object id — listings fall back to the ref NAME and carry `ref_sha`
@@ -110,7 +126,32 @@ pub struct CycleRefPin {
     resolved: std::sync::Mutex<HashMap<(PathBuf, String), Result<Option<String>, String>>>,
 }
 
+impl Default for CycleRefPin {
+    /// A FETCHING pin — what a cycle that publishes from the ref uses.
+    fn default() -> Self {
+        Self {
+            fetch: true,
+            resolved: Default::default(),
+        }
+    }
+}
+
 impl CycleRefPin {
+    /// A pin that resolves each `(repo_root, ref_name)` once and NEVER fetches —
+    /// the withheld-posture cycle's, which lists stems and publishes nothing.
+    pub fn listing_only() -> Self {
+        Self {
+            fetch: false,
+            resolved: Default::default(),
+        }
+    }
+
+    /// Whether this pin fetches before resolving. A reader that PUBLISHES from
+    /// the ref asserts this: a listing-only pin would publish an unfetched ref.
+    pub fn fetches(&self) -> bool {
+        self.fetch
+    }
+
     /// Decide a scan source, fetching the default branch at most once per
     /// `(repo_root, ref_name)` for the life of this pin.
     ///
@@ -135,8 +176,8 @@ impl CycleRefPin {
         source
     }
 
-    /// The object id this cycle pinned `ref_name` to, resolving it (fetch, then
-    /// `rev_parse`) on first use. `Ok(None)` is a fetched ref that would not
+    /// The object id this cycle pinned `ref_name` to, resolving it (fetch — on a
+    /// fetching pin — then `rev_parse`) on first use. `Ok(None)` is a fetched ref that would not
     /// resolve — UNKNOWN, see [`Self::resolved`].
     pub fn resolve_ref(
         &self,
@@ -153,7 +194,12 @@ impl CycleRefPin {
         if let Some(answer) = resolved.get(&key) {
             return answer.clone();
         }
-        let answer = match git.fetch_default(repo_root, ref_name) {
+        let fetched = if self.fetch {
+            git.fetch_default(repo_root, ref_name)
+        } else {
+            Ok(())
+        };
+        let answer = match fetched {
             Err(e) => Err(format!("could not refresh {ref_name} before scanning: {e}")),
             Ok(()) => Ok(resolve_ref_sha(git, repo_root, ref_name)),
         };
@@ -409,7 +455,7 @@ struct RefEntryListing {
 
 /// The listing half of [`read_ref_dir`] — one `git ls-tree`, no blob read.
 ///
-/// Shared with [`list_ref_plan_names`] so the two doors cannot drift into two
+/// Shared with [`list_ref_plan_names_at`] so the two doors cannot drift into two
 /// different answers about which entries are plans, or about which object id
 /// they were listed at.
 fn list_ref_entries(
@@ -455,19 +501,23 @@ pub struct RefNameListing {
     pub ref_sha: Option<String>,
 }
 
-/// LIST the ref's plan names without reading a single blob.
+/// LIST the ref's plan names, at an object id the CALLER already resolved,
+/// without reading a single blob.
 ///
 /// The census-only door, for a cycle that is not going to publish a corpus and
 /// so must not pay ~1,100 blob reads to discard them — the withheld work-unit
 /// posture. It is the same listing [`read_ref_dir`] takes its own census from,
-/// by construction: both go through [`list_ref_entries`].
-pub fn list_ref_plan_names(
+/// by construction: both go through [`list_ref_entries`]. The caller resolves
+/// the sha through the cycle's [`CycleRefPin`], so the census names the commit
+/// the scan-divergence probe measured against. `ref_sha: None` lists at
+/// `ref_name` and carries the sha UNKNOWN, as [`read_ref_dir_at`] does.
+pub fn list_ref_plan_names_at(
     git: &dyn GitRefReader,
     repo_root: &Path,
     ref_name: &str,
+    ref_sha: Option<String>,
     rel_dir: &str,
 ) -> Result<RefNameListing, String> {
-    let ref_sha = resolve_ref_sha(git, repo_root, ref_name);
     let listing = list_ref_entries(git, repo_root, ref_name, ref_sha, rel_dir)?;
     Ok(RefNameListing {
         names: listing.entries.into_iter().map(|e| e.name).collect(),

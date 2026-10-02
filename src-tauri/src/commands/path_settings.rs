@@ -110,8 +110,9 @@ pub struct ScanDivergenceView {
     pub ref_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Commits on `default_ref` the scanned tree lacks: how stale the scan
-    /// source is. Measured as of that clone's last fetch — the adapter never
-    /// fetches.
+    /// source is. Counted against the commit the cycle pinned — the ref as the
+    /// cycle's own fetch left it on a writing cycle, and as the clone last
+    /// fetched it on a withheld cycle or one whose fetch failed.
     pub behind: Option<u64>,
     /// Commits the scanned tree has that `default_ref` does not.
     pub ahead: Option<u64>,
