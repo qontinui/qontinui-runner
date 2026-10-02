@@ -1614,8 +1614,7 @@ async fn deliver_once(
                 debug!(
                     "session_message_poller: msg {} to session {to_session} deferred by \
                      quiet barrier {} — stays pending",
-                    msg.message_id,
-                    barrier_id
+                    msg.message_id, barrier_id
                 );
                 continue;
             }

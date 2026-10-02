@@ -8454,8 +8454,7 @@ mod tests {
     // ── Quiet-barrier wake gating (plan 2026-09-29-quiet-on-demand, D4) ────
 
     use crate::quiet_barrier::{
-        parse_record, with_test_state, BarrierState, FileRecord, WakeClass,
-        QUIET_BARRIER_DEFERRED,
+        parse_record, with_test_state, BarrierState, FileRecord, WakeClass, QUIET_BARRIER_DEFERRED,
     };
 
     fn open_runner_restart_barrier() -> BarrierState {

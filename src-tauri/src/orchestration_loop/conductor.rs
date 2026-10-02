@@ -3349,7 +3349,10 @@ mod tests {
         record_reprompt_result("A", trid, Err(deferred), &mut outcome, &mut timers);
         assert_eq!(outcome.transient_failures, vec!["A".to_string()]);
         assert!(outcome.apply_failures.is_empty());
-        assert!(timers.reprompted_at.is_empty(), "the second deadline is not armed");
+        assert!(
+            timers.reprompted_at.is_empty(),
+            "the second deadline is not armed"
+        );
 
         let mut outcome = TickOutcome::default();
         record_reprompt_result(

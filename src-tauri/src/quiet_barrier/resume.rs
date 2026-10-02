@@ -214,10 +214,7 @@ pub fn classify(input: &SessionInput) -> Result<(), (&'static str, String)> {
     match input.activity {
         Activity::Idle => {}
         Activity::Working => {
-            return Err((
-                "busy",
-                "turn in progress (activity axis: `working`)".into(),
-            ))
+            return Err(("busy", "turn in progress (activity axis: `working`)".into()))
         }
         Activity::Stale => {
             return Err((
@@ -426,7 +423,11 @@ pub fn mcp_config_values_from_cmdline(cmdline: &str) -> Vec<String> {
 
 fn basename_lower(s: &str) -> String {
     let s = strip_quotes(s);
-    let base = s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase();
+    let base = s
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase();
     for ext in [".exe", ".cmd", ".bat"] {
         if let Some(stem) = base.strip_suffix(ext) {
             return stem.to_string();
@@ -913,7 +914,12 @@ mod tests {
     /// through.
     #[test]
     fn an_unreadable_record_is_an_unknown_straggler_never_resumable() {
-        for why in ["missing", "unparseable", "read timed out", "read skipped (in flight)"] {
+        for why in [
+            "missing",
+            "unparseable",
+            "read timed out",
+            "read skipped (in flight)",
+        ] {
             let input = SessionInput {
                 record: RecordWaitingRead::Unreadable(why.to_string()),
                 ..idle_input("u")
@@ -950,7 +956,10 @@ mod tests {
         };
         let (class, reason) = classify(&input).expect_err("not resumable");
         assert_eq!(class, "requester");
-        assert!(reason.contains("run the restart from outside this runner"), "{reason}");
+        assert!(
+            reason.contains("run the restart from outside this runner"),
+            "{reason}"
+        );
     }
 
     /// `wake_paths_gated` is carried, not hard-coded.
@@ -1047,9 +1056,15 @@ mod tests {
         assert!(!cmdline_matches("nodemon dist/server.js --stdio", &sigs));
         // The declared servers still match, including through a launcher.
         assert!(cmdline_matches("node dist/server.js --stdio", &sigs));
-        assert!(cmdline_matches("python3 /home/u/.qontinui/coord-mcp-shim.py", &sigs));
+        assert!(cmdline_matches(
+            "python3 /home/u/.qontinui/coord-mcp-shim.py",
+            &sigs
+        ));
         // A launcher with the declared arg only as part of a path: no token match.
-        assert!(!cmdline_matches("/usr/bin/python3 -I /root/.cache/uv/x/bin/server", &sigs));
+        assert!(!cmdline_matches(
+            "/usr/bin/python3 -I /root/.cache/uv/x/bin/server",
+            &sigs
+        ));
         assert!(cmdline_matches("python /x/uv/bin/tool server", &sigs));
 
         let mut parent_map: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1075,7 +1090,10 @@ mod tests {
                 "pkg"
             ]
         );
-        assert_eq!(split_windows_argv(r#"p a\\"b c" d"#), vec!["p", r"a\b c", "d"]);
+        assert_eq!(
+            split_windows_argv(r#"p a\\"b c" d"#),
+            vec!["p", r"a\b c", "d"]
+        );
         assert_eq!(split_windows_argv(r#"p a\"b"#), vec!["p", r#"a"b"#]);
         assert_eq!(split_windows_argv(r"p C:\x\y"), vec!["p", r"C:\x\y"]);
         assert_eq!(split_windows_argv(r#"p "a""b""#), vec!["p", r#"a"b"#]);
@@ -1097,7 +1115,10 @@ mod tests {
                 "s": { "command": "node", "args": ["/srv/it's/index.js", "--name=o'brien"] }
             }
         }));
-        assert!(cmdline_matches("/usr/bin/node /srv/it's/index.js --name=o'brien", &sigs));
+        assert!(cmdline_matches(
+            "/usr/bin/node /srv/it's/index.js --name=o'brien",
+            &sigs
+        ));
     }
 
     /// W4: Windows-shaped child command lines match their declared servers —
@@ -1137,7 +1158,11 @@ mod tests {
             &sigs,
             win
         ));
-        assert!(cmdline_matches_with(r"C:\tools\npx.cmd -y @modelcontextprotocol/server-x", &sigs, win));
+        assert!(cmdline_matches_with(
+            r"C:\tools\npx.cmd -y @modelcontextprotocol/server-x",
+            &sigs,
+            win
+        ));
         // Not MCP: a background job, quoted or cmd-wrapped.
         assert!(!cmdline_matches_with(
             r#""C:\Program Files\nodejs\node.exe" server.js"#,

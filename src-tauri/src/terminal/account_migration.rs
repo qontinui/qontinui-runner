@@ -1171,7 +1171,10 @@ mod tests {
         spawn_prompt_when_idle(tid.to_string(), "continue".to_string(), "continue-nudge");
         let pending = crate::quiet_barrier::pending::for_session(tid);
         assert_eq!(pending.len(), 1, "{pending:?}");
-        assert!(pending[0].starts_with("account_migration:continue-nudge"), "{pending:?}");
+        assert!(
+            pending[0].starts_with("account_migration:continue-nudge"),
+            "{pending:?}"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !crate::quiet_barrier::pending::for_session(tid).is_empty() {
             assert!(

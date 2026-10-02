@@ -775,7 +775,6 @@ async fn verdict_after_observe(
     mode: Mode,
     compliance: Option<crate::mcp::session_compliance::ComplianceNudge>,
 ) -> VerdictResponse {
-
     // Fast path: dark flag ⇒ allow with ZERO continuation coord traffic (the
     // hook is provisioned fleet-wide, so this is the hot path until the ramp).
     if mode == Mode::Off {
@@ -1219,7 +1218,11 @@ mod tests {
         assert_eq!(held.decision, "allow");
         assert!(!held.would_block);
         assert!(held.prompt.is_none());
-        assert!(held.reason.contains("rr-20260929T101500Z-a1b2c3"), "{}", held.reason);
+        assert!(
+            held.reason.contains("rr-20260929T101500Z-a1b2c3"),
+            "{}",
+            held.reason
+        );
 
         // An UNKNOWN store fails closed the same way.
         let unknown = with_test_state(BarrierState::Unknown("corrupt".into()), || {

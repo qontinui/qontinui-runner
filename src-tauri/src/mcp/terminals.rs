@@ -449,7 +449,9 @@ fn quiet_barrier_deferred_response(
         crate::mcp::ui_bridge::UiBridgeError {
             code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionFailed,
             message: message.to_string(),
-            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::RetryAfterMs(30_000)),
+            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::RetryAfterMs(
+                30_000,
+            )),
             context: Some(serde_json::json!({
                 "terminal_id": id,
                 "reason": crate::quiet_barrier::QUIET_BARRIER_DEFERRED,
