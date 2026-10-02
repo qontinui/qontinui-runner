@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { resolveDisplayTitle, isPathShapedTitle } from "./displayTitle";
-import { renameTabIn, spawnNameOf, type TerminalTab } from "./useTerminalManager";
+import { applySpawnNames, renameTabIn, spawnNameOf, type TerminalTab } from "./useTerminalManager";
 
 const base = { title: "Terminal 1", workingDir: "/home/u/proj" };
 
@@ -96,5 +96,27 @@ describe("spawnNameOf", () => {
     expect(spawnNameOf({})).toBeUndefined();
     expect(spawnNameOf({ spawnName: 5 })).toBeUndefined();
     expect(spawnNameOf(null)).toBeUndefined();
+  });
+});
+
+describe("applySpawnNames", () => {
+  const tab = (id: string, spawnName?: string) =>
+    ({ id, title: "t", spawnName }) as unknown as TerminalTab;
+
+  it("fills a missing spawn name from the map", () => {
+    const out = applySpawnNames([tab("a")], { a: "post-merge-runner#1863" });
+    expect(out[0].spawnName).toBe("post-merge-runner#1863");
+  });
+
+  it("never overwrites a name already held (immutable)", () => {
+    const tabs = [tab("a", "first")];
+    expect(applySpawnNames(tabs, { a: "second" })).toBe(tabs);
+  });
+
+  it("returns the same array when nothing changes", () => {
+    const tabs = [tab("a"), tab("b")];
+    expect(applySpawnNames(tabs, {})).toBe(tabs);
+    expect(applySpawnNames(tabs, { z: "x" })).toBe(tabs);
+    expect(applySpawnNames(tabs, { a: "   " })).toBe(tabs);
   });
 });

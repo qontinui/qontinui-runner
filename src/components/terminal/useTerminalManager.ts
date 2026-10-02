@@ -23,9 +23,11 @@ import {
 const logger = createLogger("TerminalManager");
 
 /**
- * The name the runner launched this terminal's session with (`--name`), as the
- * backend's terminal info carries it (`spawnName`, serialised from Rust
- * `spawn_name`). Read defensively: an older backend omits it.
+ * The name the runner launched this terminal's session with (`--name`), if the
+ * given terminal info happens to carry one. The shared `TerminalInfo` schema has
+ * no such field, so the real channels are the `terminal-spawn-name` event and
+ * `terminal_list`'s `spawnNamesByTerminal` (see `applySpawnNames`); this stays
+ * as a defensive read for a backend that ever serialises it on the info itself.
  */
 export function spawnNameOf(info: unknown): string | undefined {
   const v = (info as { spawnName?: unknown } | null | undefined)?.spawnName;
@@ -35,6 +37,35 @@ export function spawnNameOf(info: unknown): string | undefined {
 /** Pure `renameTab` reducer. Changes `title` ONLY — `spawnName` is immutable. */
 export function renameTabIn(tabs: TerminalTab[], id: string, title: string): TerminalTab[] {
   return tabs.map((t) => (t.id === id ? { ...t, title } : t));
+}
+
+/**
+ * Fill `spawnName` on tabs that lack one, from a `terminalId -> name` map
+ * (the Rust `terminal-spawn-name` event / `terminal_list`'s
+ * `spawnNamesByTerminal`). It NEVER overwrites a name already held — the spawn
+ * name is immutable — and returns the SAME array when nothing changed so
+ * callers do not churn renders.
+ */
+export function applySpawnNames(
+  tabs: TerminalTab[],
+  names: Record<string, string>,
+): TerminalTab[] {
+  let changed = false;
+  const next = tabs.map((t) => {
+    if (t.spawnName) return t;
+    const n = names[t.id];
+    if (typeof n !== "string" || n.trim().length === 0) return t;
+    changed = true;
+    return { ...t, spawnName: n.trim() };
+  });
+  return changed ? next : tabs;
+}
+
+type SpawnNamesByTerminal = Record<string, string>;
+
+function spawnNamesFrom(data: unknown): SpawnNamesByTerminal {
+  const m = (data as { spawnNamesByTerminal?: unknown } | null | undefined)?.spawnNamesByTerminal;
+  return m && typeof m === "object" ? (m as SpawnNamesByTerminal) : {};
 }
 
 export interface TerminalTab {
@@ -924,6 +955,26 @@ export function useTerminalManager(
     });
   }, []);
 
+  // Spawn name (`--name`) for a terminal the runner launched. Fired by Rust
+  // right after `terminal-created`; the tab may not exist yet, in which case
+  // the periodic `terminal_list` sweep (`reconcileClaudeSessionIds`) fills it.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    listen<{ terminalId: string; spawnName: string }>("terminal-spawn-name", (event) => {
+      const { terminalId, spawnName } = event.payload ?? {};
+      if (!terminalId || !spawnName) return;
+      setTabs((prev) => applySpawnNames(prev, { [terminalId]: spawnName }));
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Remote identity for a tab `terminal_attach_remote` opened (Phase 4). Fired
   // by Rust right after `terminal-created`; page-agnostic because the identity
   // is keyed by terminal id — for an id this page's manager never holds the
@@ -1124,6 +1175,9 @@ export function useTerminalManager(
       // spawns).
       const sessionIdsByTerminal =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
+      // The spawn name has no `TerminalInfo` field either (that type is the
+      // shared schema's); it rides beside the session ids.
+      const spawnNamesByTerminal = spawnNamesFrom(result.data);
 
       // Filter to terminals belonging to this page
       const pageTerminals = terminals.filter((t) => (t.pageId || "default") === pageId);
@@ -1162,7 +1216,7 @@ export function useTerminalManager(
         return {
           id: info.id,
           title: info.title,
-          spawnName: spawnNameOf(info),
+          spawnName: spawnNameOf(info) ?? spawnNamesByTerminal[info.id],
           pid: info.pid ?? null,
           isAlive: info.isAlive,
           exitCode: info.exitCode ?? null,
@@ -1218,8 +1272,14 @@ export function useTerminalManager(
       if (!result.success || !result.data) return;
       const map =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
-      if (Object.keys(map).length === 0) return;
-      setTabs((prev) => backfillClaudeSessionIds(prev, map));
+      const spawnNames = spawnNamesFrom(result.data);
+      if (Object.keys(map).length === 0 && Object.keys(spawnNames).length === 0) return;
+      setTabs((prev) =>
+        applySpawnNames(
+          Object.keys(map).length === 0 ? prev : backfillClaudeSessionIds(prev, map),
+          spawnNames,
+        ),
+      );
     } catch {
       // Best-effort backfill; the reconnect + transcript-poll writers still
       // cover the common cases if this sweep transiently fails.
