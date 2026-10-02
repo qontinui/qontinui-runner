@@ -4883,13 +4883,7 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         canonical,
         others,
         bare_default.as_deref(),
-        &|t: &uuid::Uuid, is_default: bool| {
-            crate::auth::holds_credential_for(
-                crate::auth::read_tenant_slot(&mgr, t).state(),
-                is_default,
-                crate::auth::read_legacy_slot(&mgr).state(),
-            )
-        },
+        &holds_credential_predicate(&mgr),
         &today,
     );
     if report.wrote_canonical
@@ -4920,6 +4914,39 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
         );
     }
     report
+}
+
+/// The production credential predicate — "does this process hold a credential
+/// for `tenant`?" — shared by [`converge_binding_store`] (which merges under it)
+/// and [`binding_store_check`] (which judges the merge under it), so the two can
+/// never disagree about "credentialed".
+///
+/// Answers [`crate::auth::holds_credential_for`] over the tenant's own
+/// per-tenant slot and the LEGACY `access_token` slot. The legacy slot is read
+/// at most ONCE per predicate (lazily, on the first tenant asked about): the
+/// doctor builds one of these on every `/coord-mcp/doctor` probe, and the
+/// legacy read can reach the OS keychain.
+///
+/// **What "credentialed" establishes, stated so it is not over-claimed.**
+/// Per-tenant slots are file storage scoped by `$QONTINUI_SECURE_STORAGE_DIR`,
+/// so they are this installation's own. The legacy slot is not entirely:
+/// [`crate::auth::read_legacy_slot`] goes through `probe_access_token`, whose
+/// chain can fall back to the OS keychain under the fixed service name
+/// `com.qontinui.runner` — shared by every instance on the box. So for the
+/// DEFAULT tenant this predicate can be answered by another installation's
+/// keychain token. That is what converge merges under, and the doctor uses the
+/// very same predicate so that it judges the merge by the merge's own rule.
+pub(crate) fn holds_credential_predicate(
+    mgr: &crate::auth::AuthManager,
+) -> impl Fn(&uuid::Uuid, bool) -> Option<bool> + '_ {
+    let legacy: std::cell::OnceCell<crate::auth::SlotState> = std::cell::OnceCell::new();
+    move |tenant: &uuid::Uuid, is_default: bool| {
+        crate::auth::holds_credential_for(
+            crate::auth::read_tenant_slot(mgr, tenant).state(),
+            is_default,
+            *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state()),
+        )
+    }
 }
 
 /// Path-parameterized core of [`converge_binding_store`] — explicit canonical
@@ -5383,10 +5410,20 @@ pub use binding_store_doctor::{binding_store_check, BindingStoreCheck, BindingSt
 //   2. both bindings survive the merge;
 //   3. the legacy single-tenant copy is migrated in place to v2;
 //   4. `bindings` gains NO tenant this runner has no credential for;
-//   5. the doctor check FAILS on a binding-set / `default_tenant_id`
-//      disagreement;
-//   6. the doctor check only REPORTS a `paired_at`-only difference;
-//   7. an unreadable copy reads as UNKNOWN, never as "no disagreement".
+//   5. the doctor check FAILS only on a MERGE GAP — a tenant another copy
+//      carries, that this process holds a credential for, and that the
+//      canonical lacks — or on a credential with no canonical store at all;
+//   6. the doctor check only REPORTS the expected one-way-merge residue
+//      (withheld / credential-unknown tenants, canonical-only tenants, a
+//      differing `default_tenant_id`, `paired_at` / `user_id` differences);
+//      two copies DIFFERING is the permanent, intended state under an
+//      override, so it is never by itself a fail;
+//   7. an unreadable copy reads as UNKNOWN, never as "nothing missing".
+//
+// Items 5-7 are asserted in `pair/binding_store_doctor.rs`'s tests, which
+// share this module's fixtures (hence the `pub(super)` items below); plan
+// 2026-10-02-binding-store-doctor-fails-forever-on-the-store-an-override-runner-must-retain
+// retired the pairwise "two copies must agree" rules these items used to state.
 #[cfg(test)]
 mod one_binding_store_tests {
     use super::*;
@@ -5397,12 +5434,12 @@ mod one_binding_store_tests {
     /// `7ac125b6…` on the operator box — Portofino, the second binding.
     pub(super) const SECOND_TENANT: &str = "7ac125b6-2222-4222-8222-222222222222";
     /// A tenant NO slot exists for. The merge must never admit it.
-    const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
+    pub(super) const UNCREDENTIALED_TENANT: &str = "deadbeef-3333-4333-8333-333333333333";
     pub(super) const USER: &str = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// The production predicate, with the store answers pinned: the two real
     /// tenants have slots, everything else does not.
-    fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
+    pub(super) fn credentialed(tenant: &uuid::Uuid, is_default: bool) -> Option<bool> {
         let slot = match tenant.to_string().as_str() {
             DEFAULT_TENANT | SECOND_TENANT => crate::auth::SlotState::Usable,
             _ => crate::auth::SlotState::Absent,
