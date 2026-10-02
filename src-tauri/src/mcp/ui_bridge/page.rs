@@ -274,16 +274,24 @@ pub struct SetTabResponse {
     /// pre-`activePageId` behaviour so existing callers do not break; read
     /// `active_page_id` when you need the innermost visible view.
     pub page_id: Option<String>,
-    /// `data-page-id` of the DEEPEST visible `[data-page-id]` element (non-zero
-    /// bounding client rect; greatest ancestor depth wins, ties go to the last
-    /// in document order). This is the sub-view a nested page publishes. Null
-    /// when no visible element carries the attribute.
+    /// `data-page-id` of the deepest VISIBLE `[data-page-id]` inside the page
+    /// wrapper (the wrapper itself included) — the sub-view a nested page
+    /// publishes. Visible means a non-zero bounding client rect, so unmounted
+    /// and `display:none` views are skipped; greatest ancestor depth wins and
+    /// ties go to the last in document order. Equals `page_id` when the page
+    /// publishes no nested id (Settings sub-tabs, for one, carry none). Null
+    /// when no wrapper is present or the wrapper is not visible.
     pub active_page_id: Option<String>,
     /// `data-page-id` values along the winning element's ancestor path, outer
-    /// to inner (the last entry equals `active_page_id`). Empty when
-    /// `active_page_id` is null.
+    /// to inner, consecutive duplicates collapsed (the last entry equals
+    /// `active_page_id`). Empty when `active_page_id` is null.
     pub page_id_chain: Vec<String>,
 }
+
+/// The read-back walk evaluated in the webview after a set-tab dispatch. It
+/// defines `readSetTabPageIds(doc)`; its vitest lives in
+/// `src/components/app/__tests__/set-tab-readback.test.ts`.
+const SET_TAB_READBACK_JS: &str = include_str!("set_tab_readback.js");
 
 /// The page-id fields read back from the webview after a set-tab dispatch.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -296,8 +304,10 @@ pub(crate) struct SetTabReadback {
 /// Parse the set-tab eval result (`{"pageId", "activePageId", "pageIdChain"}`
 /// as a JSON string). Every field is optional: an unparseable result, a
 /// missing key, or a non-string value reads as absent (and non-string chain
-/// entries are dropped) so an older webview bundle or a partial eval result
-/// degrades to `page_id`-only rather than failing the request.
+/// entries are dropped). The eval result is text produced inside the webview,
+/// where page script can shadow globals such as `JSON`, so it is parsed as
+/// untrusted input: a malformed read-back costs the verification signal, never
+/// the tab switch that already happened.
 pub(crate) fn parse_set_tab_readback(result_str: &str) -> SetTabReadback {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(result_str) else {
         return SetTabReadback::default();
@@ -2099,10 +2109,11 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 /// POST /ui-bridge/control/page/set-tab
 ///
 /// Dispatches `ui-bridge-set-tab`, waits 100 ms, then reads back three page-id
-/// signals: `pageId` (the first `[data-page-id]` in document order — the outer
-/// wrapper, unchanged), `activePageId` (the deepest visible `[data-page-id]`,
-/// i.e. the sub-view) and `pageIdChain` (outer → inner along that element's
-/// ancestors). See [`SetTabResponse`].
+/// signals via [`SET_TAB_READBACK_JS`]: `pageId` (the first `[data-page-id]`
+/// in document order — the outer wrapper, unchanged), `activePageId` (the
+/// deepest visible `[data-page-id]` inside that wrapper, i.e. the sub-view) and
+/// `pageIdChain` (outer → inner along that element's ancestors). See
+/// [`SetTabResponse`].
 pub async fn ui_bridge_page_set_tab_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<SetTabRequest>,
@@ -2138,26 +2149,10 @@ pub async fn ui_bridge_page_set_tab_handler(
         r#"(async () => {{
             window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
             await new Promise(r => setTimeout(r, 100));
-            var el = document.querySelector("[data-page-id]");
-            var pageId = el && el.getAttribute ? el.getAttribute("data-page-id") : null;
-            var best = null, bestDepth = -1;
-            var all = document.querySelectorAll("[data-page-id]");
-            for (var i = 0; i < all.length; i++) {{
-                var cand = all[i];
-                var rect = cand.getBoundingClientRect();
-                if (!rect || rect.width === 0 || rect.height === 0) continue;
-                var depth = 0;
-                for (var p = cand.parentElement; p; p = p.parentElement) depth++;
-                if (depth >= bestDepth) {{ best = cand; bestDepth = depth; }}
-            }}
-            var chain = [];
-            for (var n = best; n; n = n.parentElement) {{
-                if (n.hasAttribute && n.hasAttribute("data-page-id")) chain.unshift(n.getAttribute("data-page-id"));
-            }}
-            var activePageId = best ? best.getAttribute("data-page-id") : null;
-            return JSON.stringify({{ pageId: pageId, activePageId: activePageId, pageIdChain: chain }});
+            {}
+            return JSON.stringify(readSetTabPageIds(document));
         }})()"#,
-        escaped_tab
+        escaped_tab, SET_TAB_READBACK_JS
     );
 
     match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), false).await {
@@ -4039,6 +4034,11 @@ mod refresh_response_honesty_tests {
 #[cfg(test)]
 mod set_tab_readback_tests {
     use super::*;
+
+    #[test]
+    fn readback_js_defines_the_function_the_expression_calls() {
+        assert!(SET_TAB_READBACK_JS.contains("function readSetTabPageIds(doc)"));
+    }
 
     #[test]
     fn response_keeps_page_id_and_adds_active_fields() {
