@@ -20,7 +20,11 @@
 //! thing that is broken** (plan D-F). The one coord write it makes — a
 //! best-effort `POST /coord/agent-findings` — is gated on the read having
 //! SUCCEEDED on that same cycle, so it is only ever issued to a coord that
-//! just answered.
+//! just answered. A [`FaultClass::WorkerDead`] finding is additionally
+//! preceded by one `GET /coord/agent-findings` keyed `coord-worker:<name>`,
+//! which folds the same worker's death across every device and restart into
+//! one row per [`WORKER_DEAD_REREPORT_SECS`] (see [`carry_finding`]). That
+//! read can only suppress a post it SETTLES as redundant; an UNKNOWN posts.
 //!
 //! It **cannot restart coord and must not try**: served policy
 //! `production-and-cost` `runner-lifecycle` and the supervisor boundary both
@@ -181,6 +185,39 @@ pub const OBSERVER_FLAG: &str = "QONTINUI_COORD_OUTSIDE_OBSERVER";
 /// ~3 minutes of continuous evidence.
 pub const CADENCES_TO_FIRE: u32 = 3;
 
+/// How long a [`FaultClass::WorkerDead`] finding for one worker stands in for
+/// every other device's report of the same worker: 6 h.
+///
+/// Plan `2026-09-21-one-emitter-saturates-both-findings-retrieval-axes`
+/// Phase 2. The in-memory [`ObserverState::dead_notified`] latch already
+/// reports a worker once per episode PER PROCESS, but every device runs its
+/// own observer and every runner start begins with an empty latch, so one
+/// worker death was filed up to once per device per restart. Before posting,
+/// [`carry_finding`] reads coord for the newest live row keyed to that
+/// worker and skips the post when it is younger than this.
+///
+/// What the window does, and does not do: it folds the duplicates that
+/// several devices and several runner starts would each file for ONE death
+/// episode. It does not re-assert a worker that simply stays dead — each
+/// process's latch still posts once per episode, and a device whose read
+/// skipped stays latched — so a worker dead for longer than coord's ~14-day
+/// finding TTL can age out of the store with nothing replacing its row. A
+/// re-assertion comes only from a runner start (an empty latch) or a
+/// recover-then-die (a re-armed latch) that lands outside the window. Six
+/// hours is wide enough to cover the burst of per-device and per-restart
+/// reports of one episode. coord has no body or `last_seen` update, so this
+/// is a skip-if-recent, not a touch.
+///
+/// The read and the post are not atomic: two devices that read inside the
+/// same instant both see no row and both post. The fold is best-effort, and
+/// it fails OPEN — the cost of the race is one duplicate row, never a drop.
+pub const WORKER_DEAD_REREPORT_SECS: u64 = 6 * 3600;
+
+/// How many rows the re-report read asks coord for. Shared by the query and
+/// by [`rereport_decision`]'s full-page check, so the two cannot drift: a
+/// page this full with no matching row may have its match on page 2.
+const PRIOR_REPORT_READ_LIMIT: usize = 10;
+
 /// Target probe period. The host loop divides its own heartbeat cadence into
 /// this to pick N, so the probe stays at about one per minute however
 /// `QONTINUI_SESSION_HEARTBEAT_SECS` is tuned.
@@ -208,8 +245,26 @@ const UNOBSERVED_REWARN_EVERY: u32 = 60;
 /// `tools/list` — same door, a question with an answer in it.
 const WORKERS_TOOL: &str = "coord_query_workers";
 
-/// Topic every finding this module posts is filed under (plan Phase 3b.2).
-const FINDING_TOPIC: &str = "coord-merge-train";
+/// Topic every finding this module posts is filed under.
+///
+/// Its OWN topic, not `coord-merge-train`: plan
+/// `2026-09-21-one-emitter-saturates-both-findings-retrieval-axes` Phase 1.
+/// Filed there (as plan `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
+/// Phase 3b.2 first did), one observer per device supplied nine rows in ten of
+/// every `coord-merge-train` page, so the human and steward findings sharing
+/// that topic fell off a 100-row recency window within days. Topic matching is
+/// exact string equality, so a separate value separates the two tag spaces.
+/// It must satisfy coord's topic regex `^[a-z0-9][a-z0-9-]*(:[a-z0-9-]+)?$`.
+const FINDING_TOPIC: &str = "coord-worker-liveness";
+
+/// The `kind` every finding this module posts carries.
+const FINDING_KIND: &str = "investigation";
+
+/// The marker [`finding_title`] puts in every title this observer writes. It
+/// sits in the suffix, which the title cut never touches, so it is present
+/// on every observer row — and it is how [`rereport_decision`] tells the
+/// observer's own rows from a human or steward row under the same key.
+const FINDING_TITLE_MARKER: &str = " (observed from OUTSIDE coord by runner device ";
 
 /// coord's `FINDING_TITLE_MAX_BYTES` (`qontinui-coord` `findings.rs`): a
 /// longer title is a 400, never truncated server-side — and this observer
@@ -1213,6 +1268,11 @@ pub struct Report {
     /// so there is nothing to post to (plan Phase 3b.2 scopes the post to
     /// (ii) and (iii)).
     pub post_finding: bool,
+    /// The worker this report is about. `Some` only for
+    /// [`FaultClass::WorkerDead`], the one class that names a single worker;
+    /// it is what keys the finding to `coord-worker:<name>` and what the
+    /// fleet-wide re-report fold reads by ([`carry_finding`]).
+    pub worker: Option<String>,
 }
 
 /// Everything the observer carries between probes: the streaks the plan's
@@ -1336,6 +1396,7 @@ impl ObserverState {
             ),
             raw: reason.to_string(),
             post_finding: false,
+            worker: None,
         }]
     }
 
@@ -1411,6 +1472,7 @@ impl ObserverState {
             // identically to a finding POST, and the module's contract is to
             // write only to a coord that just ANSWERED a read.
             post_finding: false,
+            worker: None,
         }]
     }
 
@@ -1469,6 +1531,7 @@ impl ObserverState {
                 ),
                 raw: render_read(read),
                 post_finding: true,
+                worker: Some(worker.name.clone()),
             });
         }
         out
@@ -1546,6 +1609,7 @@ impl ObserverState {
             ),
             raw: render_read(read),
             post_finding: true,
+            worker: None,
         }]
     }
 }
@@ -1771,10 +1835,7 @@ fn surface(app: Option<&tauri::AppHandle>, report: &Report) {
 /// The CLAIM is what gets cut, never the suffix, and a cut says so and points
 /// at the body, which carries the summary in full ([`finding_body`]).
 fn finding_title(summary: &str, device_id: &str) -> String {
-    let suffix = format!(
-        " (observed from OUTSIDE coord by runner device {})",
-        truncate(device_id, 64)
-    );
+    let suffix = format!("{FINDING_TITLE_MARKER}{})", truncate(device_id, 64));
     const CUT: &str = "… [cut to fit; full text in the body]";
     let whole = format!("{summary}{suffix}");
     if whole.len() <= FINDING_TITLE_MAX_BYTES {
@@ -1862,6 +1923,257 @@ fn finding_body(report: &Report, door_url: &str) -> String {
     body
 }
 
+/// The resource key that names one worker's liveness findings, fleet-wide.
+///
+/// It is both the fold's read key ([`carry_finding`]) and a precise retrieval
+/// key for a human asking "has anyone reported worker X?" — the question the
+/// shared source-file key could only answer by paging through every worker.
+fn worker_resource_key(worker: &str) -> String {
+    format!("coord-worker:{worker}")
+}
+
+/// Every resource key a finding for `report` is filed under: the two this
+/// observer has always carried, plus the per-worker key when the report names
+/// a worker.
+fn finding_resource_keys(report: &Report) -> Vec<String> {
+    let mut keys = vec![
+        "qontinui-runner/src-tauri/src/coord_outside_observer.rs".to_string(),
+        "2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing".to_string(),
+    ];
+    if let Some(worker) = &report.worker {
+        keys.push(worker_resource_key(worker));
+    }
+    keys
+}
+
+/// What the fleet-wide re-report read got back from coord, before any
+/// judgement. Split from [`rereport_decision`] so the decision is pure.
+#[derive(Debug, Clone, PartialEq)]
+enum PriorReportRead {
+    /// coord answered 2xx with a JSON body. Whether that body SETTLES anything
+    /// is the decision's call, not the transport's.
+    Answered(JsonValue),
+    /// The request failed, coord answered non-2xx, or the body did not parse.
+    Failed(String),
+}
+
+/// Whether to post a [`FaultClass::WorkerDead`] finding, given what coord
+/// already holds for that worker.
+#[derive(Debug, Clone, PartialEq)]
+enum RereportDecision {
+    /// A live row for this worker is younger than
+    /// [`WORKER_DEAD_REREPORT_SECS`]: it already says what this post would.
+    Skip {
+        prior_finding_id: Option<String>,
+        age_secs: u64,
+    },
+    /// The read SETTLED that no recent row exists: none at all
+    /// (`prior_age_secs: None`), or only one older than the window.
+    Post { prior_age_secs: Option<u64> },
+    /// The read did not settle the question. Posts anyway: a skip on an
+    /// UNKNOWN is a silent drop (served policy `verification-and-evidence`
+    /// `silent-empty-is-unknown`), while a post on an UNKNOWN costs at most
+    /// one duplicate row.
+    PostReadUnknown { reason: String },
+}
+
+/// Decide the fold from a read of
+/// `GET /coord/agent-findings?resource_keys=coord-worker:<name>`. Pure.
+///
+/// Only a row this observer itself wrote counts: it carries `worker_key`, the
+/// observer's [`FINDING_TOPIC`] and [`FINDING_KIND`], and a title bearing
+/// [`FINDING_TITLE_MARKER`]. A human or steward row under the same key and
+/// topic must never suppress a real re-death, so the page is checked rather
+/// than trusted. Every arm that cannot conclude answers
+/// [`RereportDecision::PostReadUnknown`], never a skip: `available` not
+/// `true`, no `findings` array, a matching row with a missing or unparseable
+/// `created_at` (even beside a valid recent row), or a page of `limit` rows
+/// with no match, whose match may be on the next page.
+fn rereport_decision(
+    read: &PriorReportRead,
+    worker_key: &str,
+    limit: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RereportDecision {
+    let body = match read {
+        PriorReportRead::Failed(reason) => {
+            return RereportDecision::PostReadUnknown {
+                reason: reason.clone(),
+            }
+        }
+        PriorReportRead::Answered(body) => body,
+    };
+    if body.get("available").and_then(JsonValue::as_bool) != Some(true) {
+        return RereportDecision::PostReadUnknown {
+            reason: format!(
+                "coord did not answer `available: true` (got {}) — coord.findings is not \
+                 readable to this build's contract",
+                body.get("available").unwrap_or(&JsonValue::Null)
+            ),
+        };
+    }
+    let Some(rows) = body.get("findings").and_then(JsonValue::as_array) else {
+        return RereportDecision::PostReadUnknown {
+            reason: "coord's answer carried no `findings` array".to_string(),
+        };
+    };
+    let mut newest: Option<(chrono::DateTime<chrono::Utc>, Option<String>)> = None;
+    for row in rows {
+        let carries_key = row
+            .get("resource_keys")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(worker_key)));
+        let is_ours = row.get("topic").and_then(JsonValue::as_str) == Some(FINDING_TOPIC)
+            && row.get("kind").and_then(JsonValue::as_str) == Some(FINDING_KIND)
+            && row
+                .get("title")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|t| t.contains(FINDING_TITLE_MARKER));
+        if !(carries_key && is_ours) {
+            continue;
+        }
+        let Some(created_at) = row
+            .get("created_at")
+            .and_then(JsonValue::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+        else {
+            return RereportDecision::PostReadUnknown {
+                reason: format!(
+                    "a row keyed `{worker_key}` has a missing or unparseable `created_at` ({})",
+                    row.get("created_at").unwrap_or(&JsonValue::Null)
+                ),
+            };
+        };
+        let id = row
+            .get("finding_id")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        if newest.as_ref().is_none_or(|(t, _)| created_at > *t) {
+            newest = Some((created_at, id));
+        }
+    }
+    let Some((created_at, prior_finding_id)) = newest else {
+        if rows.len() >= limit {
+            return RereportDecision::PostReadUnknown {
+                reason: format!(
+                    "the page came back full ({} rows at limit {limit}) with no row of this \
+                     observer's for `{worker_key}` — a match may be on the next page",
+                    rows.len()
+                ),
+            };
+        }
+        return RereportDecision::Post {
+            prior_age_secs: None,
+        };
+    };
+    // Saturating, as coord's own age arithmetic is: a skewed clock that puts
+    // `created_at` in the future reads as age 0, never a negative age.
+    let age_secs = u64::try_from((now - created_at).num_seconds()).unwrap_or(0);
+    if age_secs < WORKER_DEAD_REREPORT_SECS {
+        RereportDecision::Skip {
+            prior_finding_id,
+            age_secs,
+        }
+    } else {
+        RereportDecision::Post {
+            prior_age_secs: Some(age_secs),
+        }
+    }
+}
+
+/// Read coord for the newest live finding keyed to `worker_key`.
+///
+/// Queried by `resource_keys` ALONE, not `&topic=` as well: coord ORs the two
+/// filters, so with the topic added a newer row about a DIFFERENT dead worker
+/// fills the page and hides this worker's row, and the fold never folds. The
+/// per-worker key is what narrows; [`rereport_decision`] checks the topic on
+/// the rows it gets. A few rows rather than one, so a human-filed row under the
+/// same key cannot shadow the observer's own.
+///
+/// The base and scope are parameters, as in [`probe_door`], so every arm is
+/// testable against a stub with no global state.
+async fn read_prior_worker_report(
+    client: &reqwest::Client,
+    base: &str,
+    scope: TenantScope,
+    worker_key: &str,
+) -> PriorReportRead {
+    let url = format!("{}/coord/agent-findings", base.trim_end_matches('/'));
+    let limit = PRIOR_REPORT_READ_LIMIT.to_string();
+    let rb = crate::auth::attach_device_auth_for(
+        client
+            .get(&url)
+            .query(&[("resource_keys", worker_key), ("limit", limit.as_str())]),
+        scope,
+    );
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => return PriorReportRead::Failed(format!("the read did not complete: {e}")),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return PriorReportRead::Failed(format!("coord answered HTTP {status}"));
+    }
+    match resp.json::<JsonValue>().await {
+        Ok(body) => PriorReportRead::Answered(body),
+        Err(e) => PriorReportRead::Failed(format!("coord's 2xx body did not parse: {e}")),
+    }
+}
+
+/// Carry one report to coord, folding [`FaultClass::WorkerDead`] fleet-wide.
+///
+/// Plan `2026-09-21-one-emitter-saturates-both-findings-retrieval-axes`
+/// Phase 2: every other class posts exactly as before. A `WorkerDead` report
+/// first reads coord, and is skipped only when that read SETTLES that a row for
+/// the same worker is younger than [`WORKER_DEAD_REREPORT_SECS`]. The
+/// operator card ([`surface`]) is not routed through here, so each device's
+/// operator still sees its own card.
+async fn carry_finding(
+    client: &reqwest::Client,
+    door: &qontinui_runner_lib::coord_doctor::CoordMcpDoor,
+    report: &Report,
+) {
+    let (FaultClass::WorkerDead, Some(worker)) = (&report.class, &report.worker) else {
+        post_finding(client, door, report).await;
+        return;
+    };
+    let key = worker_resource_key(worker);
+    let read = read_prior_worker_report(client, &door.base, scope_for(door.pin), &key).await;
+    match rereport_decision(&read, &key, PRIOR_REPORT_READ_LIMIT, chrono::Utc::now()) {
+        RereportDecision::Skip {
+            prior_finding_id,
+            age_secs,
+        } => info!(
+            worker = %worker,
+            prior_finding_id = prior_finding_id.as_deref().unwrap_or("unknown"),
+            age_secs,
+            window_secs = WORKER_DEAD_REREPORT_SECS,
+            "coord outside observer: worker-dead finding SKIPPED — coord already holds a recent \
+             one for this worker (fleet-wide re-report fold)"
+        ),
+        RereportDecision::Post { prior_age_secs } => {
+            info!(
+                worker = %worker,
+                prior_age_secs = ?prior_age_secs,
+                window_secs = WORKER_DEAD_REREPORT_SECS,
+                "coord outside observer: worker-dead finding POSTED — coord holds no recent one \
+                 for this worker"
+            );
+            post_finding(client, door, report).await;
+        }
+        RereportDecision::PostReadUnknown { reason } => {
+            warn!(
+                worker = %worker,
+                reason = %reason,
+                "coord outside observer: worker-dead finding POSTED because the re-report read \
+                 was UNKNOWN — a skip on an unknown would be a silent drop"
+            );
+            post_finding(client, door, report).await;
+        }
+    }
+}
+
 /// Carry the observation to coord as a finding, so a session arriving later
 /// finds it (plan Phase 3b.2).
 ///
@@ -1895,12 +2207,9 @@ async fn post_finding(
     let body = json!({
         "title": finding_title(&report.summary, &device_id),
         "body": finding,
-        "kind": "investigation",
+        "kind": FINDING_KIND,
         "topic": FINDING_TOPIC,
-        "resource_keys": [
-            "qontinui-runner/src-tauri/src/coord_outside_observer.rs",
-            "2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing",
-        ],
+        "resource_keys": finding_resource_keys(report),
     });
     let rb =
         crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope_for(door.pin));
@@ -2136,7 +2445,7 @@ impl CoordOutsideObserver {
             // `Unreachable` anyway, but the conjunction is what makes "never
             // write into a coord that may be broken" true by construction.
             if report.post_finding && coord_answered {
-                post_finding(&self.http, &door, report).await;
+                carry_finding(&self.http, &door, report).await;
             }
         }
     }
@@ -2593,6 +2902,7 @@ mod tests {
             summary: "coord reports 12 leader-gated workers with no leader.".to_string(),
             raw: "x".repeat(20_000),
             post_finding: true,
+            worker: None,
         };
         let finding = finding_body(&report, "https://coord.example/mcp");
         assert!(
@@ -4199,5 +4509,412 @@ mod tests {
             reports[0].raw.contains("work_unit_derive.sweep"),
             "the notification carries the raw read"
         );
+    }
+
+    // -- Phase 2: the fleet-wide worker-dead re-report fold ------------------
+
+    const FOLD_KEY: &str = "coord-worker:pr_merge.reconcile_once";
+
+    fn fold_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .expect("fixed instant")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn fold_row(created_at: &str, keys: &[&str]) -> JsonValue {
+        json!({
+            "finding_id": "11111111-2222-4333-8444-555555555555",
+            "topic": FINDING_TOPIC,
+            "kind": FINDING_KIND,
+            "title": finding_title("coord's leader-gated worker `x` rolls up `dead`", "dev-1"),
+            "created_at": created_at,
+            "resource_keys": keys,
+        })
+    }
+
+    fn fold_page(rows: Vec<JsonValue>) -> PriorReportRead {
+        PriorReportRead::Answered(json!({
+            "available": true,
+            "count": rows.len(),
+            "findings": rows,
+        }))
+    }
+
+    #[test]
+    fn the_topic_is_its_own_and_passes_coords_topic_regex() {
+        assert_eq!(FINDING_TOPIC, "coord-worker-liveness");
+        assert_ne!(FINDING_TOPIC, "coord-merge-train");
+        let mut parts = FINDING_TOPIC.splitn(2, ':');
+        let head = parts.next().unwrap();
+        let ok_head = head
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && head
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        let ok_tail = parts.next().is_none_or(|t| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        });
+        assert!(
+            ok_head && ok_tail,
+            "{FINDING_TOPIC} must match coord's topic regex"
+        );
+    }
+
+    #[test]
+    fn a_worker_dead_finding_carries_its_per_worker_key_and_others_do_not() {
+        let report = only_worker_dead_report(&tonight_body());
+        let worker = report.worker.clone().expect("WorkerDead names its worker");
+        let keys = finding_resource_keys(&report);
+        assert!(keys.contains(&format!("coord-worker:{worker}")), "{keys:?}");
+        assert!(keys.contains(&"qontinui-runner/src-tauri/src/coord_outside_observer.rs".into()));
+        assert!(
+            keys.contains(&"2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing".into())
+        );
+
+        let other = Report {
+            class: FaultClass::NoLeader,
+            summary: "s".into(),
+            raw: "r".into(),
+            post_finding: true,
+            worker: None,
+        };
+        assert_eq!(finding_resource_keys(&other).len(), 2);
+    }
+
+    #[test]
+    fn a_recent_row_for_the_worker_skips_the_post() {
+        let read = fold_page(vec![fold_row("2026-09-30T10:00:00Z", &[FOLD_KEY])]);
+        assert_eq!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::Skip {
+                prior_finding_id: Some("11111111-2222-4333-8444-555555555555".into()),
+                age_secs: 2 * 3600,
+            }
+        );
+    }
+
+    #[test]
+    fn a_row_older_than_the_window_posts() {
+        let read = fold_page(vec![fold_row("2026-09-30T05:59:59Z", &[FOLD_KEY])]);
+        assert_eq!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::Post {
+                prior_age_secs: Some(WORKER_DEAD_REREPORT_SECS + 1),
+            }
+        );
+    }
+
+    #[test]
+    fn the_newest_matching_row_decides_whatever_the_page_order() {
+        let read = fold_page(vec![
+            fold_row("2026-09-29T00:00:00Z", &[FOLD_KEY]),
+            fold_row("2026-09-30T11:00:00Z", &[FOLD_KEY]),
+        ]);
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::Skip { age_secs: 3600, .. }
+        ));
+    }
+
+    #[test]
+    fn no_row_posts() {
+        assert_eq!(
+            rereport_decision(
+                &fold_page(vec![]),
+                FOLD_KEY,
+                PRIOR_REPORT_READ_LIMIT,
+                fold_now()
+            ),
+            RereportDecision::Post {
+                prior_age_secs: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_read_posts_as_unknown() {
+        let read = PriorReportRead::Failed("coord answered HTTP 502".into());
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn available_false_posts_as_unknown_even_beside_a_recent_row() {
+        let read = PriorReportRead::Answered(json!({
+            "available": false,
+            "findings": [fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY])],
+        }));
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+        let absent = PriorReportRead::Answered(json!({ "findings": [] }));
+        assert!(matches!(
+            rereport_decision(&absent, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_body_with_no_findings_array_posts_as_unknown() {
+        let read = PriorReportRead::Answered(json!({ "available": true }));
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_recent_row_missing_the_per_worker_key_posts() {
+        // coord ORs its filters, so a row about a DIFFERENT worker (or a
+        // human's row on the topic) can come back; it must not fold this one.
+        let read = fold_page(vec![fold_row(
+            "2026-09-30T11:59:00Z",
+            &["coord-worker:branch_reap.cycle"],
+        )]);
+        assert_eq!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::Post {
+                prior_age_secs: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_recent_row_under_another_topic_does_not_fold() {
+        let mut row = fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]);
+        row["topic"] = json!("coord-merge-train");
+        assert_eq!(
+            rereport_decision(
+                &fold_page(vec![row]),
+                FOLD_KEY,
+                PRIOR_REPORT_READ_LIMIT,
+                fold_now()
+            ),
+            RereportDecision::Post {
+                prior_age_secs: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_matching_row_with_a_missing_or_bad_created_at_posts_as_unknown() {
+        let mut missing = fold_row("x", &[FOLD_KEY]);
+        missing.as_object_mut().unwrap().remove("created_at");
+        for row in [missing, fold_row("yesterday-ish", &[FOLD_KEY])] {
+            assert!(matches!(
+                rereport_decision(
+                    &fold_page(vec![row]),
+                    FOLD_KEY,
+                    PRIOR_REPORT_READ_LIMIT,
+                    fold_now()
+                ),
+                RereportDecision::PostReadUnknown { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_future_created_at_reads_as_age_zero_and_skips() {
+        let read = fold_page(vec![fold_row("2026-09-30T13:00:00Z", &[FOLD_KEY])]);
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::Skip { age_secs: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_human_row_under_the_same_key_and_topic_does_not_fold() {
+        // A steward or human filing under the observer's key and topic must
+        // never suppress a real re-death: kind and title decide it is theirs.
+        let mut other_kind = fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]);
+        other_kind["kind"] = json!("observation");
+        let mut other_title = fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]);
+        other_title["title"] = json!("reconcile_once looks dead again, investigating");
+        let mut no_title = fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]);
+        no_title.as_object_mut().unwrap().remove("title");
+        for row in [other_kind, other_title, no_title] {
+            assert_eq!(
+                rereport_decision(
+                    &fold_page(vec![row]),
+                    FOLD_KEY,
+                    PRIOR_REPORT_READ_LIMIT,
+                    fold_now()
+                ),
+                RereportDecision::Post {
+                    prior_age_secs: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_observers_own_title_carries_the_marker_even_when_cut() {
+        assert!(finding_title("short", "dev").contains(FINDING_TITLE_MARKER));
+        let long = "x".repeat(FINDING_TITLE_MAX_BYTES * 2);
+        assert!(finding_title(&long, "dev").contains(FINDING_TITLE_MARKER));
+    }
+
+    #[test]
+    fn a_full_page_with_no_match_posts_as_unknown() {
+        let rows: Vec<JsonValue> = (0..PRIOR_REPORT_READ_LIMIT)
+            .map(|_| {
+                let mut r = fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]);
+                r["kind"] = json!("observation");
+                r
+            })
+            .collect();
+        assert!(matches!(
+            rereport_decision(
+                &fold_page(rows),
+                FOLD_KEY,
+                PRIOR_REPORT_READ_LIMIT,
+                fold_now()
+            ),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_bad_created_at_beside_a_valid_recent_row_posts_as_unknown() {
+        // Pinned: an unreadable matching row makes the page inconclusive even
+        // when another row would settle a skip on its own.
+        let read = fold_page(vec![
+            fold_row("2026-09-30T11:59:00Z", &[FOLD_KEY]),
+            fold_row("not-a-timestamp", &[FOLD_KEY]),
+        ]);
+        assert!(matches!(
+            rereport_decision(&read, FOLD_KEY, PRIOR_REPORT_READ_LIMIT, fold_now()),
+            RereportDecision::PostReadUnknown { .. }
+        ));
+    }
+
+    /// A stub coord for the findings door: GETs answer `get_status` +
+    /// `get_body` and record their raw query; POSTs are counted.
+    async fn stub_findings_door(
+        get_status: u16,
+        get_body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use axum::extract::{RawQuery, State as AxumState};
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::Router;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        #[derive(Clone)]
+        struct Stub {
+            queries: Arc<Mutex<Vec<String>>>,
+            posts: Arc<AtomicU32>,
+        }
+        let stub = Stub {
+            queries: Arc::new(Mutex::new(Vec::new())),
+            posts: Arc::new(AtomicU32::new(0)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/agent-findings",
+                get(
+                    move |AxumState(s): AxumState<Stub>, RawQuery(q): RawQuery| async move {
+                        s.queries.lock().unwrap().push(q.unwrap_or_default());
+                        (StatusCode::from_u16(get_status).unwrap(), get_body)
+                    },
+                )
+                .post(|AxumState(s): AxumState<Stub>| async move {
+                    s.posts.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({ "posted": true }))
+                }),
+            )
+            .with_state(stub.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), stub.queries, stub.posts)
+    }
+
+    fn stub_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_prior_report_read_sends_the_worker_key_and_limit_and_no_topic() {
+        let (base, queries, _) =
+            stub_findings_door(200, r#"{"available": true, "findings": []}"#).await;
+        let read =
+            read_prior_worker_report(&stub_client(), &base, TenantScope::Device, FOLD_KEY).await;
+        assert!(matches!(read, PriorReportRead::Answered(_)), "{read:?}");
+        let sent = queries.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec![format!(
+                "resource_keys=coord-worker%3Apr_merge.reconcile_once&limit={PRIOR_REPORT_READ_LIMIT}"
+            )]
+        );
+        assert!(!sent[0].contains("topic"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_2xx_prior_report_read_is_failed() {
+        let (base, _, _) = stub_findings_door(503, "upstream unavailable").await;
+        let read =
+            read_prior_worker_report(&stub_client(), &base, TenantScope::Device, FOLD_KEY).await;
+        match read {
+            PriorReportRead::Failed(reason) => assert!(reason.contains("503"), "{reason}"),
+            other => panic!("a 503 must be Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_2xx_prior_report_read_is_failed() {
+        let (base, _, _) = stub_findings_door(200, "<html>maintenance</html>").await;
+        let read =
+            read_prior_worker_report(&stub_client(), &base, TenantScope::Device, FOLD_KEY).await;
+        assert!(
+            matches!(read, PriorReportRead::Failed(ref r) if r.contains("did not parse")),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_worker_dead_report_is_posted_without_the_prior_report_read() {
+        let (base, queries, posts) =
+            stub_findings_door(200, r#"{"available": true, "findings": []}"#).await;
+        let door = qontinui_runner_lib::coord_doctor::CoordMcpDoor {
+            url: format!("{base}/mcp"),
+            base,
+            base_source: qontinui_runner_lib::profiles::CoordBaseSource::Env,
+            pin: qontinui_runner_lib::tenant_pin::TenantPin::Unpinned,
+            tenant: None,
+            probed_slot: "test",
+        };
+        let report = Report {
+            class: FaultClass::NoLeader,
+            summary: "coord reports 3 leader-gated workers with no leader.".into(),
+            raw: "{}".into(),
+            post_finding: true,
+            worker: None,
+        };
+        carry_finding(&stub_client(), &door, &report).await;
+        assert!(
+            queries.lock().unwrap().is_empty(),
+            "a non-WorkerDead report must never issue the fold read"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "it is posted as before");
     }
 }

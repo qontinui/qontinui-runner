@@ -88,6 +88,18 @@ where
     Option::<String>::deserialize(d).map(Some)
 }
 
+/// A failed scheduler read. It is answered as a 500 rather than as an empty
+/// list or default settings, so a caller can tell "none" from "unknown".
+type ReadError = (StatusCode, Json<ApiResponse<()>>);
+
+fn read_failed(what: &str, e: impl std::fmt::Display) -> ReadError {
+    tracing::error!("Failed to read {}: {}", what, e);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(api_error(format!("Failed to read {}: {}", what, e))),
+    )
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -95,15 +107,13 @@ where
 /// List all scheduled tasks
 pub async fn list_scheduled_tasks(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<Vec<crate::scheduler::ScheduledTask>>> {
+) -> Result<Json<ApiResponse<Vec<crate::scheduler::ScheduledTask>>>, ReadError> {
     let pg = &state.app_state.pg_db;
-    match pg.get_all_scheduled_tasks().await {
-        Ok(tasks) => Json(ApiResponse::success(tasks)),
-        Err(e) => {
-            tracing::error!("Failed to get all scheduled tasks: {}", e);
-            Json(ApiResponse::success(Vec::new()))
-        }
-    }
+    let tasks = pg
+        .get_all_scheduled_tasks()
+        .await
+        .map_err(|e| read_failed("scheduled tasks", e))?;
+    Ok(Json(ApiResponse::success(tasks)))
 }
 
 /// Create a new scheduled task
@@ -338,31 +348,25 @@ pub async fn run_task_now(
 pub async fn get_task_history(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Json<ApiResponse<Vec<crate::scheduler::TaskExecutionRecord>>> {
+) -> Result<Json<ApiResponse<Vec<crate::scheduler::TaskExecutionRecord>>>, ReadError> {
     let pg = &state.app_state.pg_db;
-    match pg.get_execution_history(&id, 50).await {
-        Ok(history) => Json(ApiResponse::success(history)),
-        Err(e) => {
-            tracing::error!("Failed to get task history for {}: {}", id, e);
-            Json(ApiResponse::success(Vec::new()))
-        }
-    }
+    let history = pg
+        .get_execution_history(&id, 50)
+        .await
+        .map_err(|e| read_failed(&format!("task history for {id}"), e))?;
+    Ok(Json(ApiResponse::success(history)))
 }
 
 /// Get scheduler settings
 pub async fn get_scheduler_settings(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<crate::scheduler::SchedulerSettings>> {
+) -> Result<Json<ApiResponse<crate::scheduler::SchedulerSettings>>, ReadError> {
     let pg = &state.app_state.pg_db;
-    match pg.get_scheduler_settings().await {
-        Ok(settings) => Json(ApiResponse::success(settings)),
-        Err(e) => {
-            tracing::error!("Failed to get scheduler settings: {}", e);
-            Json(ApiResponse::success(
-                crate::scheduler::SchedulerSettings::default(),
-            ))
-        }
-    }
+    let settings = pg
+        .get_scheduler_settings()
+        .await
+        .map_err(|e| read_failed("scheduler settings", e))?;
+    Ok(Json(ApiResponse::success(settings)))
 }
 
 /// Update scheduler settings
@@ -440,10 +444,16 @@ pub async fn update_scheduler_settings(
 /// Get current scheduler status
 pub async fn get_scheduler_status(
     State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<crate::scheduler::SchedulerStatus>> {
+) -> Result<Json<ApiResponse<crate::scheduler::SchedulerStatus>>, ReadError> {
     let pg = &state.app_state.pg_db;
-    let tasks = pg.get_all_scheduled_tasks().await.unwrap_or_default();
-    let settings = pg.get_scheduler_settings().await.unwrap_or_default();
+    let tasks = pg
+        .get_all_scheduled_tasks()
+        .await
+        .map_err(|e| read_failed("scheduled tasks", e))?;
+    let settings = pg
+        .get_scheduler_settings()
+        .await
+        .map_err(|e| read_failed("scheduler settings", e))?;
 
     let running_tasks = tasks
         .iter()
@@ -473,7 +483,7 @@ pub async fn get_scheduler_status(
         pending_tasks,
         next_task,
     };
-    Json(ApiResponse::success(status))
+    Ok(Json(ApiResponse::success(status)))
 }
 
 /// Manually trigger the missed-run reconciler. Normally `reconcile_missed_runs`

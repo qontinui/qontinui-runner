@@ -864,6 +864,18 @@ pub fn export_all_schemas() -> Value {
     add!("HelperAnswerSchema", qht::HelperAnswerSchema);
     add!("HelperTaskSource", qht::HelperTaskSource);
 
+    // ── qontinui-types: glossary + refusal (the next-action contract) ──
+    // Plan 2026-09-20-the-published-product-works-without-knowing-a-
+    // development-environment-exists, C1/D1. `GlossaryTerm` is the typed id
+    // union a refusal cites; the definitions table itself is data, which
+    // JSON Schema cannot carry.
+    add!("GlossaryTerm", qontinui_types::glossary::GlossaryTerm);
+    add!("Refusal", qontinui_types::refusal::Refusal);
+    add!("RefusalCode", qontinui_types::refusal::RefusalCode);
+    add!("RefusalSource", qontinui_types::refusal::RefusalSource);
+    add!("NextAction", qontinui_types::refusal::NextAction);
+    add!("NextActionKind", qontinui_types::refusal::NextActionKind);
+
     Value::Object(m)
 }
 
@@ -928,10 +940,14 @@ mod tests {
         // Phase 2) = 553
         // + the 1 component_action target (UiBridgeComponentActionTarget —
         // plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url
-        // Phase 3) = 554.
-        // Independently corroborated by the codegen, which reports
-        // "Processing 554 top-level types" and emits 554 .d.ts files.
-        assert_eq!(obj.len(), 554, "Expected 554 schema entries");
+        // Phase 3) = 554
+        // + the 6 glossary/refusal types (GlossaryTerm, Refusal, RefusalCode,
+        // RefusalSource, NextAction, NextActionKind — plan
+        // 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+        // C1/D1) = 560.
+        // The codegen's "Processing N top-level types" line (last measured at
+        // 554, before the glossary/refusal six) should read 560 here.
+        assert_eq!(obj.len(), 560, "Expected 560 schema entries");
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

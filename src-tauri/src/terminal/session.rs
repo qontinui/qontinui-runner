@@ -4715,7 +4715,7 @@ impl Drop for TerminalSession {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -5147,7 +5147,7 @@ mod tests {
     /// is a `CapturingWriter` and whose other fields are inert. The
     /// reader/waiter threads are NOT spawned — `submit_prompt` only
     /// touches `self.writer`, so this is enough.
-    fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
+    pub(crate) fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
         TerminalSession {

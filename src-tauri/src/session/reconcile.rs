@@ -36,18 +36,27 @@
 //!    claimed-id set removes ids already bound to other live terminals, so two
 //!    same-second launches converge across ticks). The transcript proves the
 //!    session exists ⇒ `origin:"observed"` + confirmed ⇒ auto-resume eligible.
-//! 4. **Reconciled** (rung 4): the mtime guess, the disk-only recovery net below,
-//!    AND the degraded rung-3 case where NO start anchor could be resolved (the
-//!    process table yielded neither a claude nor a shell creation time). Without
-//!    the anchor the post-start filter is a no-op and "unique in this cwd" is the
-//!    only evidence left — which is exactly the guess this rung exists to
-//!    quarantine. Never auto-resumed. The grade follows the anchor, not the
-//!    uniqueness gate.
+//!
+//!    Rungs 2 and 3 both require a claude IMAGE in the pane's subtree. Accepted
+//!    narrowing: a shim-bypassed claude whose image is not detected as claude
+//!    (e.g. hosted under `node`) is no longer bound by this binder — such a
+//!    pane is left alone, and the lifecycle poll already treats it as
+//!    claude-absent. Likewise a freshly restored pane whose claude has not
+//!    started yet is skipped by the boot pass and picked up by the periodic
+//!    poll once its claude process appears.
+//! 4. **Reconciled** (rung 4): the mtime guess AND the degraded rung-3 case
+//!    where NO start anchor could be resolved (the process table yielded
+//!    neither a claude nor a shell creation time). Without the anchor the
+//!    post-start filter is a no-op and "unique in this cwd" is the only
+//!    evidence left — which is exactly the guess this rung exists to grade
+//!    down. Never auto-resumed: restore opens a plain terminal only. The
+//!    grade follows the anchor, not the uniqueness gate.
 //!
 //! The anchor is the **claude descendant**, not the shell: anchoring on shell
 //! start would admit a foreign same-cwd session started after the shell but
-//! before claude. The shell pid stays the FALLBACK anchor when no claude image
-//! resolves in the subtree.
+//! before claude. A pane with no claude image in its subtree is left alone —
+//! never bound. The shell pid's start is a fallback anchor ONLY when a claude
+//! image WAS found but its own start time is unknown.
 //!
 //! It also PRUNES the inverse: a **phantom** provisional record — an
 //! authoritative-but-unconfirmed row written at spawn for a plain shell that
@@ -90,13 +99,15 @@ pub struct LivePty {
     pub title: String,
     /// The claude-image descendant pid that anchors this PTY's correlation (its
     /// `--session-id` cmdline + its process start). `None` when no claude image
-    /// is present in the subtree — the shell `pid` above stays the fallback
-    /// start anchor. Callers may leave this `None`: [`run_reconcile_pass`]
-    /// resolves it from that pass's process snapshot.
+    /// is present in the subtree — [`run_reconcile`] then leaves the pane alone
+    /// (a shell with no claude is never bound to a transcript). Callers may
+    /// leave this `None`: [`run_reconcile_pass`] resolves it from that pass's
+    /// process snapshot.
     pub ai_pid: Option<u32>,
     /// The anchor process's creation time (epoch seconds). `None` (or `<= 0`)
-    /// disables the start filter — the correlation then degrades to the shell
-    /// anchor, and failing that to the uniqueness gate alone.
+    /// with `ai_pid` resolved means the claude's own start is unknown — the
+    /// correlation then degrades to the shell `pid`'s start, and failing that
+    /// to the uniqueness gate alone.
     pub ai_start_unix: Option<i64>,
 }
 
@@ -129,9 +140,9 @@ pub enum BindOrigin {
     /// creation time, so the post-start filter could not run and the only
     /// evidence left is "exactly one transcript lives in this cwd". That is the
     /// mtime-guess class: it can name a foreign session, so it is graded
-    /// `reconciled` and the frontend quarantines it behind the one-click
-    /// confirm. Auto-resume MUST follow the anchor, not the uniqueness gate
-    /// alone.
+    /// `reconciled`, which the frontend's `classifyRestoreAction` restores
+    /// `terminal-only` — a plain terminal, no resume typed for the guessed id.
+    /// Auto-resume MUST follow the anchor, not the uniqueness gate alone.
     Reconciled,
 }
 
@@ -196,8 +207,9 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 ///   >1 passes ⇒ `SkipAmbiguous` (retry next tick); 0 pass ⇒ `LeaveAlone`.
 /// - **Rung 4 (degraded):** `anchor_start_unix <= 0` disables the start filter
 ///   (the uniqueness gate still applies), so the bind rests on "unique in this
-///   cwd" alone. It is therefore graded `Reconciled` — QUARANTINED, not
-///   auto-resumed. The grade tracks the anchor; only an anchored bind earns
+///   cwd" alone. It is therefore graded `Reconciled` — restored as a plain
+///   terminal (`terminal-only`), never auto-resumed. The grade tracks the
+///   anchor; only an anchored bind earns
 ///   `Observed`.
 ///
 /// `anchor_start_unix` is the claude anchor's creation time (epoch seconds);
@@ -259,7 +271,7 @@ pub fn decide_bind_for_live_pty(
     // The grade follows the EVIDENCE, not the uniqueness gate. With a live
     // anchor the bind is start-filtered and earns `observed` (auto-resume). With
     // no anchor the filter above was a no-op, so "unique in this cwd" is all we
-    // have — the same guess `reconciled` exists to quarantine. Grading it
+    // have — the same guess `reconciled` exists to grade down. Grading it
     // `observed` would let the weakest evidence take the strongest path.
     let correlated_origin = if anchor_start_unix > 0 {
         BindOrigin::Observed
@@ -448,8 +460,25 @@ pub fn run_reconcile<I: TranscriptIndex>(
             continue;
         }
 
-        // Anchor on the CLAUDE descendant's start when resolved; fall back to
-        // the shell pid's start (weaker, but better than no anchor at all).
+        // A pane with NO claude image in its subtree is never bound. Without
+        // this, the shell's start time became the anchor and ANY same-cwd
+        // transcript started after the shell qualified — a bare shell pane got
+        // a confirmed `observed` row for an unrelated session (2026-09-30:
+        // shell d8d6a412 bound to 01bcee5d), and the next restore typed
+        // `claude --resume` into a fresh pane. A claude that is present but
+        // not detected by image name is confirmed by its pinned id + the
+        // SessionStart hook instead.
+        if pty.ai_pid.is_none() {
+            actions.push(ReconcileAction::LeaveAlone {
+                terminal_id: pty.terminal_id.clone(),
+            });
+            continue;
+        }
+
+        // Anchor on the CLAUDE descendant's start when resolved. The shell
+        // pid's start is a fallback ONLY for a present claude whose own start
+        // is unknown — dropping it would downgrade a real session from
+        // `Observed` (auto-resume) to `Reconciled`.
         let anchor_start = pty.ai_start_unix.filter(|s| *s > 0).unwrap_or_else(|| {
             pty.pid
                 .and_then(|pid| snapshot.creation_times.get(&pid).copied())
@@ -527,7 +556,9 @@ pub fn run_reconcile<I: TranscriptIndex>(
                     BindOrigin::Reconciled => {
                         // Degraded rung 4: no start anchor was resolvable, so the
                         // bind rests on the uniqueness gate alone and is written
-                        // QUARANTINED. Logged at info (not debug) because a
+                        // `reconciled`, which restore opens as a plain terminal
+                        // (terminal-only, never auto-resumed). Logged at info
+                        // (not debug) because a
                         // recurring one means the process table is failing to
                         // yield creation times — the anchor, not the bind, is the
                         // thing to fix.
@@ -535,7 +566,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
                             terminal_id = %pty.terminal_id,
                             claude_session = %session_id,
                             working_dir = %pty.working_dir,
-                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (quarantined, not auto-resumed)"
+                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (restores as a plain terminal, never auto-resumed)"
                         );
                     }
                 }
@@ -1020,11 +1051,12 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
 }
 
 /// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
-/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The shell pid
-/// is only a fallback: the correlation must anchor on when CLAUDE started, not on
-/// when its shell did (a foreign same-cwd session started after the shell but
-/// before claude would otherwise qualify). A PTY whose subtree hosts no claude
-/// image keeps `ai_pid: None` and degrades to the shell anchor.
+/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
+/// correlation must anchor on when CLAUDE started, not on when its shell did (a
+/// foreign same-cwd session started after the shell but before claude would
+/// otherwise qualify); the shell pid's start is only a fallback for a found
+/// claude whose own start is unknown. A PTY whose subtree hosts no claude image
+/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it.
 fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty> {
     let mut out = live.to_vec();
     for pty in out.iter_mut() {
@@ -1268,275 +1300,6 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
             _ => None,
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Disk-only transcript-derived restore net (session-restore-redesign
-// Phase 3 / G3).
-//
-// The boot-restore recovery layer (`terminal_session_list_open` →
-// `restorable_records`) is a projection of the REGISTRY, so it inherits every
-// registry gap. A session that was LIVE at crash but that the registry never
-// captured — the spawn-record AND the provider hook both missed, AND the crash
-// beat the next reconcile poll (which needs a LIVE PTY it no longer has) — has
-// no restorable row and is silently lost. The process-start-anchored reconcile
-// above cannot recover it either: with the runner dead there is no live PTY to
-// correlate. This net recovers it from the DISK side instead: scan every config
-// dir for transcripts recently active, and offer the registry-ABSENT ones as
-// QUARANTINE-tier candidates (weak provenance — the frontend gates them behind
-// the verified-resume handshake, never blind `--resume`). The account is the
-// config dir that holds each transcript — enumerated DYNAMICALLY via
-// `find_claude_config_dirs`, never a hardcoded account list (the defect
-// `snapshot.py` has).
-// ---------------------------------------------------------------------------
-
-/// Liveness window for the disk-only restore net. A transcript whose LAST
-/// ON-DISK ACTIVITY (file mtime) is within this window before `now` is treated
-/// as a crash-recovery candidate — a session that was plausibly live when the
-/// runner died but that the registry never captured. A transcript OLDER than
-/// this is a FINISHED session the operator walked away from; resurrecting it on
-/// every boot would be noise (and could re-offer stale foreign sessions), so it
-/// is excluded — do NOT resurrect ancient sessions.
-///
-/// 6h is a defensible middle ground: comfortably longer than any plausible
-/// crash→reboot gap (a genuine capture-miss during an active work session is
-/// still caught after a lunch-break-length outage), yet short enough that
-/// yesterday's finished sessions do not re-surface.
-///
-/// **What the window and the quarantine actually bound (corrected 2026-08-10).**
-/// This doc used to claim the window "only bounds how much is OFFERED; it never
-/// auto-resumes anything". The second half is true only of the `--resume`
-/// TYPING, and that is not the cost that matters. A disk-only candidate is
-/// `origin=reconciled`+unconfirmed, so the frontend quarantines it behind a
-/// one-click operator confirm that types the resume and verifies the handshake
-/// (parking on failure), never a blind `--resume` — that part holds. But
-/// [`disk_only_record`] stamps `terminal_id: ""`, meaning the frontend creates a
-/// FRESH TERMINAL per candidate, and `useTerminalInitialization.ts`'s
-/// `recordBelongsToRestore` short-circuits on a same-page match (`pageId ==
-/// "default"`) BEFORE any classification runs. So every offered candidate
-/// materializes a PTY whether or not it is ever resumed. The quarantine gates
-/// the resume; nothing gated the admission. On the primary that is bounded (the
-/// operator has real pages, so `"default"` records fall through to the orphan
-/// path); on a secondary — whose only page IS `"default"` — it was unbounded,
-/// which is why the net is now primary-only (see
-/// [`disk_only_restore_candidates`]).
-pub const DISK_ONLY_RESTORE_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
-
-/// Build the quarantine-tier [`TerminalSessionRecord`] for one disk-only
-/// transcript candidate: `origin = reconciled`, `confirmed_at = None` (weak
-/// provenance — the frontend never blind-`--resume`s it), `config_dir` = the
-/// transcript's account, `working_dir` = the real cwd recovered from the
-/// transcript, and DEFAULT page/zone (`page_id = "default"`,
-/// `zone_index = ` [`UNZONED_ZONE_INDEX`] — a crash-recovery candidate has no
-/// layout, and the sentinel is the honest value rather than a fabricated zone)
-/// since there is no recorded layout for a session the registry never saw —
-/// boot-restore rebuilds it. `terminal_id` is empty (no live PTY hosts it; the
-/// frontend creates a fresh terminal). `last_seen_at`/`opened_at` carry the
-/// transcript's last-activity so the record is honest about its recency.
-fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> TerminalSessionRecord {
-    TerminalSessionRecord {
-        claude_session_id: t.session_id.clone(),
-        config_dir: Some(t.config_dir.clone()),
-        working_dir: Some(t.working_dir.clone()),
-        page_id: "default".to_string(),
-        zone_index: UNZONED_ZONE_INDEX,
-        title: None,
-        terminal_id: String::new(),
-        opened_at: t.last_activity_ms,
-        last_seen_at: t.last_activity_ms,
-        state: "open".to_string(),
-        closed_at: None,
-        close_reason: None,
-        provider: DEFAULT_PROVIDER.to_string(),
-        origin: Some(ORIGIN_RECONCILED.to_string()),
-        restore_pending_at: None,
-        confirmed_at: None,
-        handle: None,
-        account_label: None,
-        account_wrapper: None,
-        session_name: None,
-        name_source: None,
-        tenant_id: None,
-        task_run_id: None,
-        bypass_permissions: None,
-        restored_from_boot_at: None,
-        restore_tier: None,
-        finished_at: None,
-        wind_down_outcome: None,
-        wind_down_at: None,
-        finish_reason: None,
-        finish_synced: false,
-        spawn_device_default: None,
-    }
-}
-
-/// Pure selection core for the disk-only restore net — unit-testable without
-/// disk. Given the recently-active on-disk transcripts (each with its
-/// last-activity ms), the set of session ids the registry ALREADY tracks, and
-/// `now`, return the disk-only candidates to ADD.
-///
-/// Filters, in order:
-/// - WINDOW: keep only transcripts within [`DISK_ONLY_RESTORE_WINDOW_MS`] of
-///   `now` (older = finished session, excluded).
-/// - REGISTRY DEDUP: drop any id in `registry_ids` — a restorable registry row
-///   wins (real page/zone/layout), and a non-restorable registry row already
-///   encodes a "do not restore" decision the net must honor (see
-///   [`SessionLifecycleStore::all_ids`]). Only registry-ABSENT ids survive.
-/// - CROSS-ACCOUNT DEDUP: the same session id under two config dirs is admitted
-///   ONCE (first wins) so a transcript copied between accounts is not offered
-///   twice.
-pub fn select_disk_only_candidates(
-    recent: &[crate::terminal::transcript::RecentTranscript],
-    registry_ids: &HashSet<String>,
-    now_ms: i64,
-) -> Vec<TerminalSessionRecord> {
-    let mut out = Vec::new();
-    let mut emitted: HashSet<&str> = HashSet::new();
-    for t in recent {
-        if now_ms.saturating_sub(t.last_activity_ms) > DISK_ONLY_RESTORE_WINDOW_MS {
-            continue; // older than the liveness window — a finished session
-        }
-        if registry_ids.contains(&t.session_id) {
-            continue; // the registry already tracks it — registry wins
-        }
-        if !emitted.insert(t.session_id.as_str()) {
-            continue; // same id under a second config dir — first wins
-        }
-        out.push(disk_only_record(t));
-    }
-    out
-}
-
-/// Build the disk-only restore candidates by SCANNING every Claude config dir
-/// for transcripts recently active (within [`DISK_ONLY_RESTORE_WINDOW_MS`]) and
-/// registry-ABSENT, returning them as quarantine-tier records to UNION into the
-/// boot-restore set (`terminal_session_list_open`). This is the transcript-
-/// DERIVED recovery net (G3): a session live at crash but never captured by the
-/// registry is still restorable — under the correct account, derived
-/// DYNAMICALLY from the config dir that holds its transcript.
-///
-/// **PRIMARY-ONLY.** On any non-primary instance this returns an empty `Vec`
-/// without scanning at all. The net recovers sessions that were live when THIS
-/// runner crashed; a freshly spawned secondary has none, so its recovery value
-/// is exactly zero while its cost is the machine's entire recent transcript
-/// corpus — and its only filter is `registry_ids`, which on a fresh temp runner
-/// is EMPTY, so nothing is filtered and every in-window transcript on the box is
-/// offered (each materializing a PTY — see [`DISK_ONLY_RESTORE_WINDOW_MS`]).
-/// Removing a capability that cannot fire is not a tradeoff. The predicate is
-/// [`crate::instance::owns_shared_root_state`], which fails CLOSED for a
-/// nameless secondary; see [`disk_only_restore_candidates_with`].
-///
-/// Note this does NOT gate the machine-global transcript INDEX
-/// ([`DiskTranscriptIndex`], the [`crate::session::snapshot_history::TranscriptProbe`]):
-/// that answers "does this id have a conversation on disk" for rows the instance
-/// already owns, a read that stays correct and cheap on a secondary.
-///
-/// Fail-open: any scan failure yields fewer (or zero) candidates, so the caller
-/// degrades to exactly today's registry-only restorable set — never worse.
-pub fn disk_only_restore_candidates(
-    now_ms: i64,
-    registry_ids: &HashSet<String>,
-) -> Vec<TerminalSessionRecord> {
-    disk_only_restore_candidates_with(
-        crate::instance::owns_shared_root_state(),
-        now_ms,
-        registry_ids,
-        scan_every_claude_config_dir,
-    )
-}
-
-/// TEST-ONLY invocation counter for [`scan_every_claude_config_dir`], so
-/// `production_wiring_uses_the_fail_closed_primary_predicate` can assert the
-/// property the guard actually encodes — that the machine-global scan NEVER
-/// RUNS on a secondary — instead of inferring it from an empty return value.
-///
-/// Inference from the output is vacuous on a clean CI runner: all four
-/// [`crate::terminal::transcript::find_claude_config_dirs`] sources are empty
-/// there (`CLAUDE_CONFIG_DIR` unset, no persisted settings, no
-/// `C:\claude\.claude-*`, no `%USERPROFILE%\.claude` — and on Linux
-/// `USERPROFILE` is not even set), so a runner whose guard had been swapped for
-/// the fail-OPEN `!is_secondary()` would still return `[]` and the test would
-/// pass. Counting invocations is red under that mutant on ANY machine.
-///
-/// Compiled out entirely in release (`#[cfg(test)]`).
-#[cfg(test)]
-pub(crate) static SCAN_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// The real machine-global scan behind [`disk_only_restore_candidates`]: every
-/// Claude config dir on the box (see
-/// [`crate::terminal::transcript::find_claude_config_dirs`] — including its
-/// hardcoded `C:\claude\.claude-*` sweep), each walked for transcripts active
-/// within [`DISK_ONLY_RESTORE_WINDOW_MS`].
-fn scan_every_claude_config_dir(now_ms: i64) -> Vec<crate::terminal::transcript::RecentTranscript> {
-    #[cfg(test)]
-    SCAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    let mut recent = Vec::new();
-    for dir in &config_dirs {
-        recent.extend(
-            crate::terminal::transcript::list_recent_sessions_all_projects(
-                dir,
-                now_ms,
-                DISK_ONLY_RESTORE_WINDOW_MS,
-            ),
-        );
-    }
-    recent
-}
-
-/// Gate + scan + select, with both the primary-ness verdict and the scan
-/// INJECTED so the gate is testable without disk or process-global env.
-///
-/// `owns_shared_root_state` is [`crate::instance::owns_shared_root_state`] in
-/// production — deliberately NOT `instance::is_secondary`, which is
-/// `instance_name().is_some()` and therefore fails OPEN: a secondary the
-/// supervisor spawned without `QONTINUI_INSTANCE_NAME` would read as PRIMARY
-/// and re-open the machine-global net. `owns_shared_root_state` routes through
-/// `resolve_data_subdir`, which also detects a secondary by
-/// `QONTINUI_PRIMARY_PORT` or a non-default API port, so a nameless secondary
-/// fails CLOSED.
-fn disk_only_restore_candidates_with(
-    owns_shared_root_state: bool,
-    now_ms: i64,
-    registry_ids: &HashSet<String>,
-    scan: impl FnOnce(i64) -> Vec<crate::terminal::transcript::RecentTranscript>,
-) -> Vec<TerminalSessionRecord> {
-    if !owns_shared_root_state {
-        // BEFORE the scan, deliberately: the multi-config-dir walk plus a stat
-        // per row is the cost, and it runs synchronously on the IPC thread on
-        // EVERY `terminal_session_list_open`. Filtering its output would leave
-        // the saturation in place.
-        // Emitted at info! ONCE per process, then debug!. This runs on every
-        // `terminal_session_list_open` — i.e. every frontend mount, observed 3×
-        // in ~3 minutes — so an unconditional multi-line info! would itself
-        // become log noise in the file an operator reads to diagnose load.
-        static SKIP_LOGGED: std::sync::Once = std::sync::Once::new();
-        let instance = crate::instance::instance_name();
-        let instance = instance.as_deref().unwrap_or("<unnamed>");
-        // Deliberately hedged. It is NOT true that a secondary can never have
-        // capture-miss candidates of its own: a NAMED secondary up for days
-        // that then crashes genuinely does, and this branch knowingly drops
-        // that backstop for it. Claiming otherwise would mislead exactly the
-        // operator debugging such a lost session (`ux-priorities` — honesty
-        // about uncertainty).
-        let msg = "disk-only restore net SKIPPED: this runner is not the primary, so the \
-                   machine-global transcript scan is disabled by design — a secondary's \
-                   candidates are overwhelmingly other instances'. The registry-backed \
-                   restorable set is unaffected. Note a long-lived NAMED secondary can have \
-                   genuine capture-miss candidates of its own; those are not recovered here.";
-        let mut first = false;
-        SKIP_LOGGED.call_once(|| {
-            first = true;
-            tracing::info!(instance, "{msg}");
-        });
-        if !first {
-            tracing::debug!(instance, "{msg}");
-        }
-        return Vec::new();
-    }
-    let recent = scan(now_ms);
-    select_disk_only_candidates(&recent, registry_ids, now_ms)
 }
 
 #[cfg(test)]
@@ -2121,7 +1884,8 @@ mod tests {
         let p = pty("term-1", None, "C:/repo");
         // Single candidate, anchor unknown → the start filter could not run, so
         // the only evidence is "unique in this cwd" — the mtime-guess class.
-        // It binds, but graded `reconciled` so the frontend QUARANTINES it.
+        // It binds, but graded `reconciled`, so restore opens it as a plain
+        // terminal (terminal-only) and never types a resume for it.
         // Grading it `observed` here would auto-resume a possibly-foreign
         // session on the weakest evidence in the ladder.
         let one = vec![cand("a", "C:/cfg", Some(500))];
@@ -2230,11 +1994,11 @@ mod tests {
         };
         store.record_open(phantom);
 
-        // One live PTY with no record — a shim-bypassed claude. Its child
-        // process start = 1000; a post-start transcript exists.
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        // One live PTY with no record — a shim-bypassed claude, anchored on
+        // its claude descendant (pid 4242, start = 1000); a post-start
+        // transcript exists.
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
 
         let mut by_wd = HashMap::new();
         by_wd.insert(
@@ -2285,9 +2049,8 @@ mod tests {
     fn run_reconcile_is_idempotent_on_second_pass() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2397,9 +2160,8 @@ mod tests {
             spawn_device_default: None,
         });
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2485,9 +2247,8 @@ mod tests {
             spawn_device_default: None,
         });
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2530,9 +2291,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        let live = vec![pty("live-term", Some(4242), "C:/repo")];
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.creation_times.insert(4242, 1_000);
+        let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
+        let snapshot = ProcessSnapshot::default();
         let mut by_wd = HashMap::new();
         by_wd.insert(
             "C:/repo".to_string(),
@@ -2555,264 +2315,103 @@ mod tests {
         );
     }
 
-    // ── Disk-only restore net (G3) — pure selection ─────────────────────────
-
-    fn recent(
-        id: &str,
-        cfg: &str,
-        wd: &str,
-        last_ms: i64,
-    ) -> crate::terminal::transcript::RecentTranscript {
-        crate::terminal::transcript::RecentTranscript {
-            session_id: id.to_string(),
-            config_dir: cfg.to_string(),
-            working_dir: wd.to_string(),
-            last_activity_ms: last_ms,
-        }
-    }
-
-    /// A registry-ABSENT, recently-active transcript is offered as a
-    /// quarantine-tier candidate under the ACCOUNT (config dir) that holds it;
-    /// a transcript OLDER than the window is excluded; an id ALREADY in the
-    /// registry is not duplicated.
+    /// A pane with a shell and NO claude (`ai_pid: None`) is never bound, even
+    /// when exactly one same-cwd transcript started after the shell did. The
+    /// shell-start fallback once turned that into a confirmed `observed` row
+    /// (2026-09-30: bare shell d8d6a412 bound to unrelated session 01bcee5d),
+    /// which a restore then auto-resumed into a fresh pane.
     #[test]
-    fn select_disk_only_window_dedup_and_account() {
-        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS; // large, avoids underflow
-        let registry_ids: HashSet<String> = ["in-registry".to_string()].into_iter().collect();
-        let recents = vec![
-            // Recent + registry-absent under account A → INCLUDED.
-            recent("fresh-a", "C:/cfg-A", "C:/repoA", now - 1_000),
-            // Recent but ALREADY in the registry restorable/known set → excluded.
-            recent("in-registry", "C:/cfg-A", "C:/repoA", now - 1_000),
-            // Older than the window → excluded (finished session).
-            recent(
-                "ancient",
-                "C:/cfg-B",
-                "C:/repoB",
-                now - DISK_ONLY_RESTORE_WINDOW_MS - 1,
-            ),
-            // Exactly at the window boundary is still IN-window → included.
-            recent(
-                "edge",
-                "C:/cfg-B",
-                "C:/repoB",
-                now - DISK_ONLY_RESTORE_WINDOW_MS,
-            ),
-        ];
+    fn run_reconcile_never_binds_a_shell_with_no_claude() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        let out = select_disk_only_candidates(&recents, &registry_ids, now);
-        let ids: HashSet<&str> = out.iter().map(|r| r.claude_session_id.as_str()).collect();
-        assert!(ids.contains("fresh-a"), "recent registry-absent included");
-        assert!(ids.contains("edge"), "boundary transcript included");
-        assert!(!ids.contains("in-registry"), "registry id not duplicated");
-        assert!(!ids.contains("ancient"), "older-than-window excluded");
-
-        // The included candidate is quarantine-tier under the correct account.
-        let a = out
-            .iter()
-            .find(|r| r.claude_session_id == "fresh-a")
-            .unwrap();
-        assert_eq!(a.origin.as_deref(), Some(ORIGIN_RECONCILED));
-        assert!(
-            a.confirmed_at.is_none(),
-            "disk-only candidate is unconfirmed"
+        // Shell pid 4242 started at 1000; no claude image resolved.
+        let live = vec![pty("shell-term", Some(4242), "C:/repo")];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("foreign-sess", "C:/cfg", Some(1_500))],
         );
-        assert_eq!(
-            a.config_dir.as_deref(),
-            Some("C:/cfg-A"),
-            "account derived from the transcript's config dir"
-        );
-        assert_eq!(a.working_dir.as_deref(), Some("C:/repoA"));
-        assert_eq!(a.zone_index, -1, "no recorded layout — default zone");
-        assert_eq!(a.page_id, "default");
-        assert!(a.terminal_id.is_empty(), "no live PTY hosts it");
-    }
-
-    /// The same session id under two config dirs is offered ONCE (first wins) —
-    /// a transcript copied between accounts is not duplicated in the restore
-    /// set.
-    #[test]
-    fn select_disk_only_dedups_same_id_across_accounts() {
-        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS;
-        let registry_ids: HashSet<String> = HashSet::new();
-        let recents = vec![
-            recent("dup", "C:/cfg-A", "C:/repo", now - 1_000),
-            recent("dup", "C:/cfg-B", "C:/repo", now - 2_000),
-        ];
-        let out = select_disk_only_candidates(&recents, &registry_ids, now);
-        assert_eq!(out.len(), 1, "same id across accounts offered once");
-        assert_eq!(
-            out[0].config_dir.as_deref(),
-            Some("C:/cfg-A"),
-            "first-seen account wins"
-        );
-    }
-
-    /// The machine-global disk-only net must be PRIMARY-ONLY (plan
-    /// `2026-08-10-temp-runner-session-restore-isolation`, Phase 2 / mechanism 1).
-    ///
-    /// The net (G3) exists to recover sessions that were live when THIS runner
-    /// crashed but that the registry never captured. A freshly spawned secondary
-    /// has, by construction, no crashed sessions of its own — so every candidate
-    /// it can produce belongs to another instance. Worse, its only filter is
-    /// `registry_ids`, and a fresh temp runner's registry is EMPTY, so NOTHING is
-    /// filtered: every in-window transcript on the machine is offered, each
-    /// materializing a PTY (`disk_only_record` leaves `terminal_id` empty, so the
-    /// frontend creates a fresh terminal per candidate). Measured 2026-08-08: 136
-    /// candidates / 283 live PTYs on one temp runner; re-measured 2026-08-10 in a
-    /// QUIET window: 37 candidates / 35 PTYs, the log line appearing 3× in ~3
-    /// minutes because the sweep re-runs on every frontend mount.
-    ///
-    /// The load-bearing assertion here is `assert!(!scanned)` on the secondary
-    /// arm: the SCAN ITSELF is the cost — it walks every account's transcript
-    /// tree synchronously on the IPC thread — so the guard must PRECEDE it, not
-    /// filter its output. That the returned vec is empty when `false` is
-    /// injected is true by construction and proves nothing on its own; it is
-    /// asserted only to name the user-visible consequence.
-    ///
-    /// The primary arm is a change-detector for the non-secondary path: it
-    /// pins that the guard did not narrow what a primary is offered.
-    ///
-    /// Pure: both the primary-ness verdict and the scan are injected, so no
-    /// tempdir, no disk, and no dependence on how much Claude activity this box
-    /// happened to see in the last 6 hours.
-    ///
-    /// **Which predicate production actually supplies is NOT covered here** —
-    /// this test injects a bool. That wiring is
-    /// [`production_wiring_uses_the_fail_closed_primary_predicate`], and without
-    /// it this test stays green while the guard is inert.
-    ///
-    /// Honest note on the plan's "must be RED first" gate: this test cannot
-    /// satisfy it literally. It names `disk_only_restore_candidates_with`, which
-    /// does not exist on the base, so against pre-change code it is a COMPILE
-    /// error — exactly what that gate excludes. It was confirmed red
-    /// behaviourally against an intermediate build carrying this signature with
-    /// the guard body omitted ("a secondary must be offered ZERO machine-global
-    /// candidates, got 3"), which is the closest a signature-changing refactor
-    /// can get. `production_wiring_uses_the_fail_closed_primary_predicate` below
-    /// has the same limitation for the same reason.
-    #[test]
-    fn disk_only_net_is_primary_only_and_skips_the_scan_entirely_on_a_secondary() {
-        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS;
-        // The fresh-temp-runner exclusion set: EMPTY, so it filters nothing.
-        let registry_ids: HashSet<String> = HashSet::new();
-        let corpus = || {
-            vec![
-                recent("foreign-1", "C:/claude/.claude-a", "D:/coord", now - 1_000),
-                recent("foreign-2", "C:/claude/.claude-b", "D:/web", now - 2_000),
-                recent("foreign-3", "C:/cfg-C", "D:/runner", now - 3_000),
-            ]
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["foreign-sess".to_string()].into_iter().collect(),
         };
 
-        // SECONDARY. THE assertion is `!scanned`: the guard must PRECEDE the
-        // scan, because the multi-config-dir walk is the cost that saturates the
-        // runner — filtering its output would leave the load in place.
-        let mut scanned = false;
-        let out = disk_only_restore_candidates_with(false, now, &registry_ids, |n| {
-            scanned = true;
-            corpus_at(&corpus(), n)
-        });
+        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
         assert!(
-            !scanned,
-            "the guard must PRECEDE the scan — the multi-config-dir walk is the cost, \
-             so filtering its output would not fix the saturation"
+            actions.iter().any(|a| matches!(
+                a,
+                ReconcileAction::LeaveAlone { terminal_id } if terminal_id == "shell-term"
+            )),
+            "a shell with no claude is left alone, got {actions:?}"
         );
-        // Consequence of the above, stated for the reader (not independent
-        // evidence — an injected `false` makes this true by construction).
-        assert!(out.is_empty(), "…so a secondary is offered nothing");
-
-        // PRIMARY: byte-identical to the pre-guard behaviour — the scan runs and
-        // every registry-absent in-window transcript is still offered. The
-        // primary is the one instance whose capture-miss recovery is real, and
-        // silently losing it is the one outcome that costs the operator sessions.
-        let mut scanned = false;
-        let out = disk_only_restore_candidates_with(true, now, &registry_ids, |n| {
-            scanned = true;
-            corpus_at(&corpus(), n)
-        });
-        assert!(scanned, "the primary still scans");
-        let ids: HashSet<&str> = out.iter().map(|r| r.claude_session_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["foreign-1", "foreign-2", "foreign-3"]
-                .into_iter()
-                .collect(),
-            "the primary keeps the full disk-only net"
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { .. })),
+            "no bind for a shell with no claude, got {actions:?}"
         );
-        // The account attribution survives the guard — a disk-only candidate is
-        // only resumable under the config dir that holds its transcript, and
-        // that is the property the primary's recovery actually depends on.
-        let by_id = |id: &str| -> Option<String> {
-            out.iter()
-                .find(|r| r.claude_session_id == id)
-                .and_then(|r| r.config_dir.clone())
-        };
-        assert_eq!(by_id("foreign-1").as_deref(), Some("C:/claude/.claude-a"));
-        assert_eq!(by_id("foreign-3").as_deref(), Some("C:/cfg-C"));
+        assert!(
+            store.get("foreign-sess").is_none(),
+            "no row written for the unrelated transcript"
+        );
+        assert!(
+            store.find_open_by_terminal("shell-term").is_none(),
+            "no row written for the shell pane"
+        );
     }
 
-    /// Finding 2 (code review 2026-08-10): the whole fix is the six-line adapter
-    /// [`disk_only_restore_candidates`], which supplies
-    /// `instance::owns_shared_root_state()` to
-    /// [`disk_only_restore_candidates_with`]. The test above injects that bool,
-    /// so nothing else in the suite pins WHICH predicate is really wired in — a
-    /// later refactor could swap in the fail-OPEN `!instance::is_secondary()`
-    /// (explicitly rejected by the plan), drop the `!`, or hardcode `true` while
-    /// debugging, and the suite would stay green while the next temp runner
-    /// spawned hundreds of PTYs. An inert guard reporting healthy.
-    ///
-    /// Cheap and disk-free precisely BECAUSE the fix works: the secondary arm
-    /// returns before any I/O, so this never touches the filesystem despite
-    /// calling the production entry point.
-    ///
-    /// **The load-bearing assertion is the [`SCAN_CALLS`] delta, NOT
-    /// `is_empty()`.** Asserting emptiness alone is VACUOUS on a clean CI
-    /// runner: all four `find_claude_config_dirs` sources are absent there, so a
-    /// build whose guard had been swapped for the fail-OPEN `!is_secondary()`
-    /// would scan, find nothing, return `[]`, and pass — catching the mutant
-    /// only on a dev box that happens to hold transcripts, i.e. the machine
-    /// where you would have noticed anyway. Counting real scan invocations is
-    /// red under that mutant everywhere. (`now_ms = 0` deliberately defeats the
-    /// window filter — `0.saturating_sub(mtime) > WINDOW` is false for any
-    /// positive mtime — so age can never be the reason the result is empty.)
-    ///
-    /// Sets ONLY `QONTINUI_INSTANCE_NAME` — `resolve_data_subdir` answers on its
-    /// first branch from the name alone, so this cannot flake on the
-    /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently. The
-    /// counter delta is likewise race-free: `disk_only_restore_candidates` has
-    /// exactly one production caller (`terminal_session_list_open`, a
-    /// `#[tauri::command]` no unit test invokes) and one test caller — this one,
-    /// which holds the shared env lock throughout.
+    /// The KEPT fallback: a claude image WAS found (`ai_pid: Some`) but its own
+    /// start time is unknown (`ai_start_unix: None`). The shell pid's creation
+    /// time then anchors the correlation, so a unique same-cwd transcript that
+    /// started after the shell binds `Observed` (auto-resume eligible). Removing
+    /// the fallback would leave the anchor at 0 and downgrade this real session
+    /// to `Reconciled`.
     #[test]
-    fn production_wiring_uses_the_fail_closed_primary_predicate() {
-        use std::sync::atomic::Ordering;
+    fn run_reconcile_claude_with_unknown_start_falls_back_to_shell_start() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        let _env = crate::test_env::env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
-        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
-
-        let before = SCAN_CALLS.load(Ordering::Relaxed);
-        let out = disk_only_restore_candidates(0, &HashSet::new());
-        assert_eq!(
-            SCAN_CALLS.load(Ordering::Relaxed),
-            before,
-            "the production adapter must gate on a predicate that reports FALSE for a named \
-             secondary, BEFORE the machine-global scan runs. A non-zero delta means the guard \
-             is inert (predicate inverted, hardcoded `true`, or swapped for the fail-OPEN \
-             `!is_secondary()`) and every temp runner is sweeping the whole box again."
+        // Shell pid 4242 started at 1000; claude 5151 found, start unknown.
+        let live = vec![LivePty {
+            ai_pid: Some(5151),
+            ai_start_unix: None,
+            ..pty("claude-term", Some(4242), "C:/repo")
+        }];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("real-sess", "C:/cfg", Some(1_500))],
         );
-        // Consequence of the above; on its own this is satisfiable by an empty
-        // machine, which is why it is not the gate.
-        assert!(out.is_empty(), "…so a named secondary is offered nothing");
-    }
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["real-sess".to_string()].into_iter().collect(),
+        };
 
-    /// Identity helper: the injected scan returns its corpus verbatim (the real
-    /// scan already window-filters, and `select_disk_only_candidates` re-applies
-    /// the window regardless).
-    fn corpus_at(
-        corpus: &[crate::terminal::transcript::RecentTranscript],
-        _now_ms: i64,
-    ) -> Vec<crate::terminal::transcript::RecentTranscript> {
-        corpus.to_vec()
+        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
+        assert!(
+            actions.contains(&ReconcileAction::Bind {
+                terminal_id: "claude-term".to_string(),
+                session_id: "real-sess".to_string(),
+                config_dir: "C:/cfg".to_string(),
+                origin: BindOrigin::Observed,
+                confirmed: true,
+            }),
+            "shell-start fallback anchors the bind ⇒ Observed, got {actions:?}"
+        );
+        assert_eq!(
+            store
+                .get("real-sess")
+                .expect("observed bind written")
+                .origin
+                .as_deref(),
+            Some(ORIGIN_OBSERVED)
+        );
     }
 }

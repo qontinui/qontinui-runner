@@ -1021,6 +1021,25 @@ Then:
    Stop-mode cancel is class C, and a 409 from the door is a successful guard,
    never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
+   **First, read what the implementer left you.** A diff shows what changed,
+   never what must NOT change. The implementing session's handoff record
+   (`handoff-arm/1` — plan
+   `2026-09-10-the-fixer-contract-authority-context-and-provenance-on-a-pr-you-did-not-author`
+   Phase 1) is five `Coord-Handoff-*` trailers in the PR body, keyed to the
+   head they describe; coord harvests them like `Coord-Reviewed-Head:` and
+   serves them on the `coord_pr_status` card as `handoff` (`state:
+   present|stale|absent` + `load_bearing[]`, `rejected[]`, `fragile[]`,
+   `deploy_order[]`). Read it through the card when a coord door is live, or
+   through the credential-free twin
+   `bash <workspace-root>/qontinui-claude-config/scripts/handoff-arm-check.sh <owner/repo#N>`
+   (exit 0 present, 1 stale — written for an earlier head, items still
+   shown — 3 **absent**, 2 PR unreadable, which is UNKNOWN and never
+   absent). **Absent is UNKNOWN, never "nothing load-bearing"**:
+   the implementer recorded nothing, so proceed with MORE caution, not less,
+   and say in your PR body which state you read. A `rejected[]` item is a
+   settled fork — do not re-litigate it (coord#1815's rescue re-opened one
+   `design-tradeoff-ranking#1` had already decided); a `deploy_order[]` item
+   is a landing constraint your new PR inherits (`Coord-Downstream-Of:`).
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —

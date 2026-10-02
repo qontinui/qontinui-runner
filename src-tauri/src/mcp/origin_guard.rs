@@ -567,9 +567,16 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/saved-api-requests/{id}"),
     ("PUT", "/saved-api-requests/{id}"),
     ("POST", "/saved-api-requests/{id}/duplicate"),
+    // the Execute page's Scheduled tab (qontinui-web #1586). Run-now
+    // (`POST /scheduler/tasks/{id}/run`) is a CREDENTIAL_DOORS entry and stays
+    // off this list.
+    ("GET", "/scheduler/tasks"),
     ("POST", "/scheduler/tasks"),
     ("DELETE", "/scheduler/tasks/{id}"),
     ("PUT", "/scheduler/tasks/{id}"),
+    ("GET", "/scheduler/tasks/{id}/history"),
+    ("PUT", "/scheduler/settings"),
+    ("GET", "/scheduler/status"),
     ("GET", "/settings/agentic"),
     ("PUT", "/settings/agentic"),
     ("GET", "/settings/ai"),
