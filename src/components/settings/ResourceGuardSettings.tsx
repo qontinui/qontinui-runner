@@ -574,7 +574,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         </div>
 
         <ThreadCeilingInput
-          which="warn"
+          tier="warn"
           label="Warn above (OS threads)"
           value={warnThreads}
           draft={warnThreadsDraft}
@@ -596,7 +596,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         />
 
         <ThreadCeilingInput
-          which="critical"
+          tier="critical"
           label="Block above (OS threads)"
           value={criticalThreads}
           draft={criticalThreadsDraft}
@@ -879,7 +879,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
 
 // ── One thread-ceiling input ────────────────────────────────────────────────
 interface ThreadCeilingInputProps {
-  which: "warn" | "critical";
+  tier: "warn" | "critical";
   label: string;
   /** The stored override, `null` = machine default. */
   value: number | null;
@@ -905,7 +905,7 @@ interface ThreadCeilingInputProps {
  * it, straight from the runner's report.
  */
 function ThreadCeilingInput({
-  which,
+  tier,
   label,
   value,
   draft,
@@ -916,8 +916,8 @@ function ThreadCeilingInput({
   disabled,
   help,
 }: ThreadCeilingInputProps) {
-  const id = `resource-guard-${which}-threads`;
-  const enforced = report ? report[which] : null;
+  const id = `resource-guard-${tier}-threads`;
+  const enforced = report ? report[tier] : null;
   return (
     <div className="space-y-1.5">
       <label className="text-xs font-medium" htmlFor={id}>
@@ -934,7 +934,7 @@ function ThreadCeilingInput({
         placeholder={
           // Only when the report IS the machine default may its number be
           // quoted as one; anything else would be re-deriving the fold here.
-          enforced !== null && report?.provenance[which] !== "local"
+          enforced !== null && report?.provenance[tier] !== "local"
             ? `machine default (${enforced})`
             : "machine default"
         }
@@ -969,15 +969,15 @@ function ThreadCeilingInput({
         className={`text-[10px] ${
           // Amber when the runner enforces something other than the stored
           // override (a fleet term, a clamp, the ladder).
-          report && !unsaved && value !== null && report.provenance[which] !== "local"
+          report && !unsaved && value !== null && report.provenance[tier] !== "local"
             ? getAccentColors("amber").text
             : "text-muted-foreground"
         }`}
       >
         {report ? (
           <>
-            Enforced: <strong>{report[which]} threads</strong> —{" "}
-            {threadCeilingSourceText(which, report)}.
+            Enforced: <strong>{report[tier]} threads</strong> —{" "}
+            {threadCeilingSourceText(tier, report)}.
             {unsaved ? " Save to see what your change enforces." : ""}
           </>
         ) : (
