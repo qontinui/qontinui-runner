@@ -44,12 +44,13 @@ pub struct PlannedActionResult {
     #[serde(default)]
     pub skipped_low_confidence: bool,
     pub duration_ms: u64,
-    /// The UI Bridge's post-action `elementState` object. The handler keeps it
-    /// only when it IS an object, so the schema's `Record<string, unknown>`
-    /// is a guarantee, not a hope.
+    /// The UI Bridge's post-action `elementState` object. Typed as a map so
+    /// the schema's `Record<string, unknown>` is enforced by the type: a
+    /// non-object value from the bridge (including `null`) is omitted rather
+    /// than forwarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
-    pub element_state: Option<serde_json::Value>,
+    pub element_state: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Aggregated result of executing a full action plan.

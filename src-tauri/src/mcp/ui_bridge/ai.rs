@@ -552,7 +552,10 @@ async fn ui_bridge_execute_action_plan_handler_dispatch(
                 // Strict: an absent `success` is INDETERMINATE, never a success.
                 let outcome = super::request::action_outcome(&data);
                 let action_success = outcome.succeeded();
-                let element_state = data.get("elementState").filter(|v| v.is_object()).cloned();
+                let element_state = data
+                    .get("elementState")
+                    .and_then(|v| v.as_object())
+                    .cloned();
                 let action_error = outcome.error_message();
 
                 if !action_success {

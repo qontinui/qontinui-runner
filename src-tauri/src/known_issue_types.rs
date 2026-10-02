@@ -27,10 +27,34 @@ use serde::{Deserialize, Serialize};
 /// (`detection_config`, `verification_step_template`, `step_template`). The
 /// Rust field stays `serde_json::Value`; the schema narrows it to an object —
 /// the shape the in-tree producers write and the hand-authored TS mirror always
-/// declared. That narrowing is a schema CLAIM, not something serde enforces: a
-/// caller of the `known_issues` commands can still store a non-object value,
-/// and it would read back as one.
+/// declared. Serde does not enforce that on the way in, so the write boundary
+/// does: [`CreateKnownIssueRequest::validate`] and
+/// [`UpdateKnownIssueRequest::validate`] refuse a non-object before it is
+/// stored. (`step_template` has no writer at all.) A row stored before that
+/// check existed is not rewritten.
 type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+/// Refuse a JSON-object field that holds anything but an object.
+fn ensure_object(field: &str, value: Option<&serde_json::Value>) -> Result<(), String> {
+    match value {
+        Some(v) if !v.is_object() => Err(format!(
+            "{field} must be a JSON object, got {}",
+            json_kind(v)
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
 
 /// Category of a known issue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -329,6 +353,17 @@ pub struct CreateKnownIssueRequest {
     pub verification_step_template: Option<serde_json::Value>,
 }
 
+impl CreateKnownIssueRequest {
+    /// Enforce the object shape the schema publishes for the JSON fields.
+    pub fn validate(&self) -> Result<(), String> {
+        ensure_object("detection_config", self.detection_config.as_ref())?;
+        ensure_object(
+            "verification_step_template",
+            self.verification_step_template.as_ref(),
+        )
+    }
+}
+
 /// Request to update an existing known issue.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -351,6 +386,17 @@ pub struct UpdateKnownIssueRequest {
     pub verification_hint: Option<String>,
     #[schemars(with = "Option<JsonObject>")]
     pub verification_step_template: Option<serde_json::Value>,
+}
+
+impl UpdateKnownIssueRequest {
+    /// Enforce the object shape the schema publishes for the JSON fields.
+    pub fn validate(&self) -> Result<(), String> {
+        ensure_object("detection_config", self.detection_config.as_ref())?;
+        ensure_object(
+            "verification_step_template",
+            self.verification_step_template.as_ref(),
+        )
+    }
 }
 
 /// Query parameters for listing known issues.
@@ -408,4 +454,44 @@ pub struct TemplateParameter {
     pub description: String,
     #[schemars(with = "crate::schema_export::Nullable<serde_json::Value>")]
     pub default: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn create(detection_config: serde_json::Value) -> CreateKnownIssueRequest {
+        serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "description": "d",
+            "category": "rendering",
+            "scope_type": "global",
+            "detection_method": "algorithmic",
+            "severity": "low",
+            "detection_config": detection_config,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn create_accepts_an_object_or_absent_config() {
+        assert!(create(serde_json::json!({"k": 1})).validate().is_ok());
+        assert!(create(serde_json::Value::Null).validate().is_ok());
+    }
+
+    #[test]
+    fn create_refuses_a_non_object_config() {
+        let err = create(serde_json::json!([1])).validate().unwrap_err();
+        assert_eq!(err, "detection_config must be a JSON object, got an array");
+    }
+
+    #[test]
+    fn update_refuses_a_non_object_step_template() {
+        let req: UpdateKnownIssueRequest =
+            serde_json::from_value(serde_json::json!({"verification_step_template": "x"})).unwrap();
+        assert_eq!(
+            req.validate().unwrap_err(),
+            "verification_step_template must be a JSON object, got a string"
+        );
+    }
 }

@@ -128,6 +128,7 @@ impl PgDb {
         &self,
         req: &CreateKnownIssueRequest,
     ) -> Result<KnownIssue, String> {
+        req.validate()?;
         let conn = self
             .pool
             .get()
@@ -232,6 +233,7 @@ impl PgDb {
         id: &str,
         req: &UpdateKnownIssueRequest,
     ) -> Result<KnownIssue, String> {
+        req.validate()?;
         let existing = self
             .get_known_issue(id)
             .await?
