@@ -687,7 +687,9 @@ function QuickSwitchDropdown({
                 className="w-1.5 h-1.5 rounded-full shrink-0"
                 style={{ backgroundColor: STATE_BORDER_COLORS[tState] }}
               />
-              <span className="text-[10px] text-[#c0caf5] truncate">{t.title}</span>
+              <span className="text-[10px] text-[#c0caf5] truncate">
+                <TabTitle tab={t} />
+              </span>
             </button>
           );
         })
