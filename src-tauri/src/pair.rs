@@ -4358,7 +4358,8 @@ pub fn converge_binding_store() -> BindingStoreMergeReport {
 ///
 /// Answers [`crate::auth::holds_credential_for`] over the tenant's own
 /// per-tenant slot and the LEGACY `access_token` slot. The legacy slot is read
-/// at most ONCE per predicate (lazily, on the first tenant asked about): the
+/// at most ONCE per predicate, and only when a DEFAULT tenant is asked about
+/// (`holds_credential_for` never consults it for a non-default tenant): the
 /// doctor builds one of these on every `/coord-mcp/doctor` probe, and the
 /// legacy read can reach the OS keychain.
 ///
