@@ -279,7 +279,7 @@ pub fn resolve_ref_listing_source(git: &dyn GitRefReader, plans_dir: &Path) -> S
 /// `None` when it is not under the root at all, which is a contradiction worth
 /// reporting rather than papering over with an empty path that would scan the
 /// whole repo.
-fn relative_dir(repo_root: &Path, plans_dir: &Path) -> Option<String> {
+pub(super) fn relative_dir(repo_root: &Path, plans_dir: &Path) -> Option<String> {
     // Canonicalized on BOTH sides before the strip. `rev-parse --show-toplevel`
     // returns a realpath with every symlink resolved, while the configured
     // plans dir need not be one — so on a box whose workspace root is reached
