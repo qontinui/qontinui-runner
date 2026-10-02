@@ -7366,12 +7366,9 @@ async fn run_condition_check_terminal(
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
     // `check-<condition name>` when coord supplies one, else the run-id label.
-    let spawn_name = payload
-        .condition_name
-        .as_deref()
-        .and_then(|n| {
-            crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
-        });
+    let spawn_name = payload.condition_name.as_deref().and_then(|n| {
+        crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
+    });
     let title = spawn_name
         .clone()
         .unwrap_or_else(|| format!("Condition check {run_id_short}"));
