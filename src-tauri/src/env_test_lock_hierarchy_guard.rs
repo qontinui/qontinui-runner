@@ -822,10 +822,12 @@ mod tests {
         D.lock().unwrap()
     }
 
-    fn ambient_first_child() -> (crate::test_env::IsolatedAmbient, std::sync::MutexGuard<'static, ()>) {
+    // Tuple elements drop in order, so the child guard comes FIRST: it is
+    // released while the ambient fixture still holds `env_lock`.
+    fn ambient_first_child() -> (std::sync::MutexGuard<'static, ()>, crate::test_env::IsolatedAmbient) {
         static A: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let amb = crate::test_env::isolated_ambient();
-        (amb, A.lock().unwrap())
+        (A.lock().unwrap(), amb)
     }
 
     // test-lock: standalone — module-private, its holders take no other lock

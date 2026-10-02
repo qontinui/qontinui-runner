@@ -3372,14 +3372,20 @@ mod tests {
     /// Thread A takes the pin then `env_lock`; thread B takes `env_lock` then
     /// the pin — `plan_library`'s and `terminal` / `agent_runtime`'s orders. On
     /// the pre-fix code (the pin a sibling of `env_lock`) both reach their
-    /// first lock, meet at the rendezvous and then wait on each other forever;
-    /// the outer `recv_timeout` turns that into a NAMED failure instead of a
-    /// hung `cargo test`. With the fix both first acquisitions are the same
-    /// `ENV_LOCK`, so B blocks on its first lock, A times out at the rendezvous
-    /// and finishes, and B then runs.
+    /// first lock, meet at the rendezvous and then wait on each other forever.
+    /// With the fix both first acquisitions are the same `ENV_LOCK`, so B
+    /// blocks on its first lock, A times out at the rendezvous and finishes,
+    /// and B then runs.
     ///
     /// The rendezvous is BOUNDED on purpose. A `std::sync::Barrier` would hang
     /// on the FIXED code too: B can never reach it while A holds `ENV_LOCK`.
+    ///
+    /// The tight DEADLOCK bound starts only once A HOLDS its first lock. Until
+    /// then A may simply be queueing behind other env-locked tests in a loaded
+    /// full-suite run — that wait is not a deadlock, so it gets a generous
+    /// hang-guard bound instead. After A holds its first lock, its remaining
+    /// work only nests on locks it already holds (fixed code) or blocks on B
+    /// forever (pre-fix code), so `DEADLOCK_BOUND` separates the two cleanly.
     ///
     /// MUTATION CHECK — run this test ALONE (`-- the_pin_and_env_lock_cannot_deadlock
     /// --exact`-style filter). On the pre-fix code the two deadlocked threads
@@ -3391,21 +3397,24 @@ mod tests {
         use std::time::Duration;
 
         const RENDEZVOUS: Duration = Duration::from_secs(2);
-        const OUTER: Duration = Duration::from_secs(10);
+        const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
+        const QUEUE_BOUND: Duration = Duration::from_secs(300);
 
         let (a_ready_tx, a_ready_rx) = mpsc::channel::<()>();
         let (b_ready_tx, b_ready_rx) = mpsc::channel::<()>();
-        let (done_tx, done_rx) = mpsc::channel::<&'static str>();
-        let done_a = done_tx.clone();
+        let (a_holds_tx, a_holds_rx) = mpsc::channel::<()>();
+        let (a_done_tx, a_done_rx) = mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
 
         let a = std::thread::spawn(move || {
             let pin = pin_plan_capture_level_for_test("off");
+            let _ = a_holds_tx.send(());
             let _ = a_ready_tx.send(());
             let _ = b_ready_rx.recv_timeout(RENDEZVOUS);
             let env = crate::test_env::env_lock();
             drop(env);
             drop(pin);
-            let _ = done_a.send("pin-then-env");
+            let _ = a_done_tx.send(());
         });
         let b = std::thread::spawn(move || {
             let env = crate::test_env::env_lock();
@@ -3414,25 +3423,27 @@ mod tests {
             let pin = pin_plan_capture_level_for_test("off");
             drop(pin);
             drop(env);
-            let _ = done_tx.send("env-then-pin");
+            let _ = b_done_tx.send(());
         });
 
-        let mut finished = Vec::new();
-        for _ in 0..2 {
-            match done_rx.recv_timeout(OUTER) {
-                Ok(who) => finished.push(who),
-                Err(_) => panic!(
-                    "DEADLOCK: the plan-capture pin and `env_lock` taken in opposite orders on two \
-                     threads did not both finish within {OUTER:?} (finished: {finished:?}). The pin \
-                     must acquire `crate::test_env::env_lock()` BEFORE its own mutex — see \
-                     `PlanCaptureLevelPin`."
-                ),
-            }
+        a_holds_rx.recv_timeout(QUEUE_BOUND).expect(
+            "thread A never acquired the plan-capture pin within the queueing bound: either \
+             another test held `env_lock` / the pin for minutes, or the pin deadlocks INSIDE \
+             its own acquisition (e.g. it takes `env_lock` AFTER its mutex instead of before)",
+        );
+        if a_done_rx.recv_timeout(DEADLOCK_BOUND).is_err() {
+            panic!(
+                "DEADLOCK: the plan-capture pin and `env_lock` taken in opposite orders on two \
+                 threads — thread A held its first lock and could not finish within \
+                 {DEADLOCK_BOUND:?}. The pin must acquire `crate::test_env::env_lock()` BEFORE \
+                 its own mutex — see `PlanCaptureLevelPin`."
+            );
         }
+        b_done_rx
+            .recv_timeout(QUEUE_BOUND)
+            .expect("thread B (env_lock then pin) did not finish once A released its locks");
         a.join().expect("pin-then-env thread");
         b.join().expect("env-then-pin thread");
-        finished.sort_unstable();
-        assert_eq!(finished, ["env-then-pin", "pin-then-env"]);
     }
 
     #[test]
