@@ -705,7 +705,10 @@ mod tests {
             s.name = Some("new".to_string());
             let argv = render_argv(&s, &tmpl(t), "claude");
             assert_eq!(value_after(&argv, "--name"), Some("new"), "{t}");
-            assert!(!argv.iter().any(|a| a.contains("old") || a == "-n"), "{t}: {argv:?}");
+            assert!(
+                !argv.iter().any(|a| a.contains("old") || a == "-n"),
+                "{t}: {argv:?}"
+            );
         }
     }
 
@@ -717,13 +720,22 @@ mod tests {
 
     #[test]
     fn sanitize_session_name_strips_collapses_and_caps() {
-        assert_eq!(sanitize_session_name("a\u{7}b\r\nc   d"), Some("a b c d".to_string()));
+        assert_eq!(
+            sanitize_session_name("a\u{7}b\r\nc   d"),
+            Some("a b c d".to_string())
+        );
         assert_eq!(sanitize_session_name("---x"), Some("x".to_string()));
         assert_eq!(sanitize_session_name("   "), None);
         let long = "x".repeat(100);
-        assert_eq!(sanitize_session_name(&long).unwrap().chars().count(), MAX_SESSION_NAME_CHARS);
+        assert_eq!(
+            sanitize_session_name(&long).unwrap().chars().count(),
+            MAX_SESSION_NAME_CHARS
+        );
         let multi = "é".repeat(100);
-        assert_eq!(sanitize_session_name(&multi).unwrap().chars().count(), MAX_SESSION_NAME_CHARS);
+        assert_eq!(
+            sanitize_session_name(&multi).unwrap().chars().count(),
+            MAX_SESSION_NAME_CHARS
+        );
     }
 
     #[test]

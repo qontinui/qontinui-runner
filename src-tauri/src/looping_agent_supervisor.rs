@@ -1114,10 +1114,8 @@ async fn spawn_looping_agent_terminal(
     // carrier the argv uses.
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     // One string for `--name`, the tab title and the trailer file.
-    let spawn_name = crate::claude_session::launch_spec::sanitize_session_name(&format!(
-        "loop-{}",
-        def.name
-    ));
+    let spawn_name =
+        crate::claude_session::launch_spec::sanitize_session_name(&format!("loop-{}", def.name));
     let tab_title = spawn_name.clone().unwrap_or_else(|| def.name.clone());
     let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
