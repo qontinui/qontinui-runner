@@ -323,7 +323,7 @@ pub(crate) struct SetTabReadback {
 /// as a JSON string). Every field is optional: an unparseable result, a
 /// missing key, or a non-string value reads as absent (and non-string chain
 /// entries are dropped). The eval result is text produced inside the webview,
-/// where page script can shadow globals such as `JSON`, so it is parsed as
+/// where page script runs alongside the read-back, so it is parsed as
 /// untrusted input: a malformed read-back costs the verification signal, never
 /// the tab switch that already happened.
 pub(crate) fn parse_set_tab_readback(result_str: &str) -> SetTabReadback {
@@ -2167,8 +2167,10 @@ pub async fn ui_bridge_page_set_tab_handler(
     // `await_promise` must be true: the expression is an async IIFE, and with
     // false the helper stringifies the pending Promise (`"{}"`), so every
     // read-back field would come back absent. The read-back is wrapped in
-    // try/catch so a throwing walk (e.g. page script shadowing `JSON`) costs
-    // only the signal, not a 500 for a tab switch that already happened.
+    // try/catch so a throwing walk (a DOM method throwing mid-read) costs only
+    // the signal, not a 500 for a tab switch that already happened. A page that
+    // breaks `JSON.stringify` itself still times out: the helper's own POST
+    // back needs it.
     match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), true).await {
         Ok(result_str) => {
             let readback = parse_set_tab_readback(&result_str);
