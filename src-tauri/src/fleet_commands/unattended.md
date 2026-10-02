@@ -71,8 +71,11 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
 
    Classify it by the SAME `origin/main` content check the table demands below,
    after a `fetch`: the stamped file's content hash must equal `origin/main`'s
-   blob at its path (`/implement-plan` Step 6 item 3's read-back, with its
-   non-empty guard). An existence check is not enough, because after a stranded
+   blob at its path. That read-back now lives in `scripts/land-plan-stamp.sh`,
+   which `/implement-plan` Step 6 item 3 calls: after a fresh fetch it hashes
+   the blob at the ref and exits 3 on a missing path or a different blob, so a
+   `LANDED` verdict line from it has passed the check — and a `PROPOSED` one has
+   NOT landed, it is on a fresh branch awaiting its PR. An existence check is not enough, because after a stranded
    stamp push an earlier, unstamped version is already at that path. **A plan that is committed and pushed is not thereby LANDED**: a bare
    `git push` lands it on whatever branch the plans checkout was on, and nothing
    opens a PR for that branch or merges it. Measured 2026-09-02 on
@@ -2112,10 +2115,39 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
-`--reason "unattended: 7 units, all landed"`. It runs the transport cascade and
-handles the id resolution.
+`--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —
+never past it. Part A's steps 0 / 0.5 / 1 / 1a (the subagent stop, the
+live-claims fence, the ownership check) run BEFORE any write, and a
+path-addressed door finishes exactly the id it is given, so a wrong id, or a
+session still holding claims, is still a wrong finish. `/finish-session` then
+runs the transport cascade, and its first rung (Part B Step 1) is the runner's
+path-addressed door: the target is the URL path, and it names no work unit.
 
-If you write it directly instead, **pass `claude_code_session_id` explicitly**,
+That rung is shown here for reference only, so the door is visible from this
+step. **Do not run it yourself** — `/finish-session` Part B Step 1 makes exactly
+this call, behind a `/health` probe, after Part A:
+
+```text
+POST http://127.0.0.1:9876/sessions/<your-own-harness-session-id>/finish
+     {"reason": "unattended: <N> units, all landed"}      # --undo: {"finished": false}
+```
+
+Its answer is read by `/finish-session` Part B Step 1's table, not by its
+status line, branching on `changed` first. `changed: "marker"` with
+`coord.queued: true`, read back `finishSynced: true` (after the table's
+wait-and-re-read when the first read-back shows the write re-queued), is done,
+and so is a `"none"` / `"reason_only"` with `finishSynced: true` (already
+finished and synced). A `404`, a `"marker"` with `coord.queued: false`, a
+`"none"` / `"reason_only"` with `finishSynced: false` and `coord.queued: false`,
+a `finishSynced` still false after that re-read, a body with no `coord` key, or any other status or an empty
+body means the coord half is still owed, and the cascade continues. `9876` is the primary runner's port; Part B Step 1 says when to use
+another.
+
+If you write the coord half directly with `coord_report_status` instead, make
+it progress-only (`session_status` plus the id, no `work_unit_id`,
+`correlation_topic` or `status_text`). If that is refused
+`missing required argument`, pass all three for what this session was actually
+working on, never a placeholder. And **pass `claude_code_session_id` explicitly**,
 and pass **your own** — not whatever `~/.qontinui/agent_session_id` happens to
 hold, which is box-global and has twice been measured pointing at a live peer.
 An unscoped call is refused outright (`harness_session_id_required`); there is no
@@ -2125,13 +2157,23 @@ their resume set.
 
 **When that scoped write is refused, read WHICH refusal you got.** Since
 `qontinui-coord#2052` there are two strings with two different remedies:
-`caller_owns_no_active_session` (absence — *"Register one with `POST /sessions`
-and re-report"*) and `session_not_owned_by_caller` (you own rows, this id
+`caller_owns_no_active_session` (absence — as served at `qontinui-coord`
+`07a192bae`: *"Register one YOURSELF: call `coord_bind_self_session` with that
+same `claude_code_session_id` and `create_if_absent: true`, then re-report"*,
+and it warns that hand-registering through `POST /sessions` takes device and
+tenant from the request body, so a guessed value makes a row your own reads
+never see) and `session_not_owned_by_caller` (you own rows, this id
 resolved to none — *"a row whose `claude_code_session_id` is still NULL is
-invisible to this resolver, and is repaired by
-`POST /coord/sessions/bind-harness-session`"*). The second no longer means "owns
-no row for this device"; that gloss predates `#2052`. Both are expanded, with the
-terminal state to report, in the two-failure split at the end of this step.
+invisible to this resolver, and is repaired by `coord_bind_self_session` (or its
+HTTP twin `POST /coord/sessions/bind-harness-session`)"*). The second no longer
+means "owns no row for this device"; that gloss predates `#2052`. Either way the
+next move is the same. For a runner-hosted session whose `/finish-session`
+run has NOT already taken the runner rung, take it (through `/finish-session`,
+not by hand), which does not consult this predicate. When that rung left the
+coord half owed, a runner-hosted session does NOT create a row — `/finish-session`
+Part A step 1b's runner-hosted arm is the terminal state. An operator-launched
+session **binds its own row, then re-issues the write** — the same step 1b. Both strings are expanded, with the remedy and
+the terminal state that remains, in the two-failure split at the end of this step.
 
 ### What this step is NOT
 
@@ -2156,7 +2198,11 @@ or, when Step 4.9 held it:
 
 > **Session left UNFINISHED** — Step 4.9 headline `<NOT SAFE | UNKNOWN>`: <the trees>.
 
-All three are complete outcomes. A session left unfinished because work genuinely
+All of these, and the terminal lines further down ("Session NOT finished — bind
+attempted and failed" and, runner-hosted, "Session coord half NOT written —
+runner-hosted, own row unbound"), are complete outcomes. When the runner rung
+marked the session but coord was not told, add *"resume set corrected locally;
+coord NOT told"* to whichever line you write. A session left unfinished because work genuinely
 remains is this step working, not failing.
 
 **Bookkeeping, so it never blocks.** This write is visibility, not correctness.
@@ -2166,13 +2212,23 @@ a session reported finished on the strength of an unverified write is exactly
 the false-completeness this whole command exists to prevent.
 
 ⚠️ **"Every rung probed and unavailable" is not one failure — say which of two
-you hit.** `/finish-session`'s cascade is **two** rungs, not three (the
-runner-local `POST /sessions/<id>/finish` was deleted 2026-09-05: it existed on
-no runner build, upstream included — plan
-`2026-09-03-a-finished-session-cannot-record-that-it-finished`). Both remaining
-rungs carry the SAME tool to the SAME server over different transports, so a
-cascade that ends without a write means one of two things, with different
-remedies and different write-ups:
+you hit.** `/finish-session`'s cascade is **three** rungs, runner-local first:
+`POST /sessions/<id>/finish` on the runner, then `coord_report_status` natively,
+then the same tool over the loopback proxy. The dated history: the runner route
+was absent from every build on 2026-09-05, so plan
+`2026-09-03-a-finished-session-cannot-record-that-it-finished` removed it from
+the commands. It landed on 2026-09-10 as `qontinui-runner` `44870ff25` (#1271).
+Plan
+`2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-is-disowned-by-both-closeout-commands`
+put it back first, and makes it coord-reaching and self-describing on a runner
+build carrying that plan's Phase 1. An older build answers with no `coord` key,
+and its coord half is UNKNOWN. The last two
+rungs carry the SAME tool to the SAME server over different transports. So once
+the runner rung is absent (`404`, not runner-hosted) or has left the coord half
+owed, a cascade that ends without a coord write means one of two things, with
+different remedies and different write-ups. When the runner rung answered
+`coord.queued: false`, say *"resume set corrected locally; coord NOT told"*
+beside whichever of the two it was:
 
 - **A transport floor** — no door answered. Run `/coord-revive`, re-issue over
   the door it reports LIVE, and treat a `"Command failed with no output"` write
@@ -2190,14 +2246,29 @@ remedies and different write-ups:
     active `coord.sessions` row at all, so nothing here is a permission problem.
     Coord's own hint: *"this is ABSENCE, not an authorization violation: there is
     no peer's row you reached for … The usual cause is a session that was not
-    runner-spawned, so coord was never told it exists. **Register one with
-    `POST /sessions` and re-report.** Do NOT retry without the argument."*
+    runner-spawned, so coord was never told it exists. **Register one YOURSELF:
+    call `coord_bind_self_session` with that same `claude_code_session_id` and
+    `create_if_absent: true`, then re-report.** … Do NOT retry without the
+    argument."* (as served at `qontinui-coord` `07a192bae`). Never hand-register
+    a row through `POST /sessions`: it takes device and tenant from the request
+    body, and a guessed value creates a row your own reads cannot see. On the
+    runner-hosted arm, `/finish-session` step 1b still does not create (it says
+    why); the remedy above is the operator-launched arm's.
   - **`session_not_owned_by_caller`** — you own rows; this id resolved to none of
-    them. Coord's own hint: *"If you DO own an active session, check whether its
-    row is simply UNBOUND before assuming you mistyped the id: a row whose
-    `claude_code_session_id` is still NULL is invisible to this resolver, and is
-    **repaired by `POST /coord/sessions/bind-harness-session`** — not by
-    re-sending a different UUID."*
+    them. Coord's own hint (served from `qontinui-coord` `59fcdb564` and still served
+at `07a192bae`, until qontinui-coord#2608 lands): *"If you
+    DO own an active session, check whether its row is simply UNBOUND before
+    assuming you mistyped the id: a row whose `claude_code_session_id` is still
+    NULL is invisible to this resolver, and is **repaired by
+    `coord_bind_self_session` (or its HTTP twin
+    `POST /coord/sessions/bind-harness-session`)** NAMING THAT ROW as
+    `coord_session_id` — not by re-sending a different UUID."* That same hint
+    goes on to argue against the create arm on the strength of
+    the device owning rows at all. The device's rows are not the question; an
+    unbound row belonging to THIS session is, and only a runner-hosted session
+    can have one. The discriminator is the `$QONTINUI_RUNNER_CONTEXT` branch
+    before the call and `unbound_sibling_rows` after it — `/finish-session`
+    Part A step 1b.
 
   ⚠️ **This string no longer means "owns no row for this device."** That was true
   before `#2052` (landed `3014d7c6`, 2026-09-09) split absence out, and it is the
@@ -2206,20 +2277,59 @@ remedies and different write-ups:
   `session_not_owned_by_caller` carries **no** diagnostic weight and the split
   above does not apply — check the serving build before reading it as "owns rows".
 
-**On the authorization verdict, record the honest terminal state — this is a
-CHECKED step, not prose.** When the refusal is `session_not_owned_by_caller` and
-the id you sent was your own `$CLAUDE_CODE_SESSION_ID`, the outcome line is:
+**On the authorization verdict, BIND FIRST — this is a CHECKED step, not
+prose.** When either refusal came back for your own `$CLAUDE_CODE_SESSION_ID`,
+first make sure the runner rung above was tried if you are runner-hosted. A
+`coord.queued: true` there, read back `finishSynced: true`, settles the coord
+half with no bind and no fork risk. Otherwise run `/finish-session` Part A
+step 1b before writing any outcome line. In one
+line: branch on `$QONTINUI_RUNNER_CONTEXT` (empty: call
+`coord_bind_self_session` with `create_if_absent: true`, read `unbound_sibling_rows`
+in the answer and name a non-zero value as a possible fork; non-empty: do NOT
+create — the runner binds its own row, as Step 4.9 says — and report the session
+not finished, runner-hosted, own row unbound). Never bind a row picked out of
+`coord_orient`'s `session_activity` — those rows carry no harness id, so a pick
+can bind a PEER. Read the binding back with `coord_orient`
+(`your_session.coord_session_id` non-null), re-run Step 4.9's
+`worktree-handoff.sh` for any tree it reported `coord_row_unbound` (and re-print
+the verdict with the re-run's `transcript:` line in place of the old one), then
+re-issue the finish. The full recipe — including the `coord-revive.sh call` fallback and its
+cwd trap — lives there, once; do not copy it here.
 
-> **Session NOT finished — owns rows, none bound.** `<session id>` on device
-> `<device id>`; coord answered `session_not_owned_by_caller`. The remedy
-> (`POST /coord/sessions/bind-harness-session`) needs the `coord_session_id`
-> this caller cannot learn. Dossier
+**The terminal state is what remains after that attempt**, and it has four
+shapes: the session is runner-hosted (no create, by rule), the bind itself was
+refused, no door carried it, or the bind answered and yet the read-back after
+it still does not resolve `your_session` (including a
+`subject_already_registered: true` whose row is not yours to write). Name that
+fourth shape "bind's read-back did not resolve" in the line below. The outcome line
+is then:
+
+> **Session NOT finished — bind attempted and failed.** `<session id>` on device
+> `<device id>`; the finish write was refused `<reason>`, and
+> `coord_bind_self_session` was then <refused `<its reason>` | not carried:
+> `<the door failure>` | answered, but its read-back did not resolve:
+> `<coord_orient's your_session.reason>`>. Dossier
 > `finish-session-no-safe-rung-for-unregistered-session`.
 
-Record it on that dossier as the next occurrence — a finding ON the dossier, not
-a fresh unattached one; this condition has recurred a dozen times across two
-devices and an unattached finding starts the count over. Quote the reason string,
-the serving build id, and the transport that carried the call.
+On the runner-hosted arm, where no bind is attempted, the line is instead:
+
+> **Session coord half NOT written — runner-hosted, own row unbound.** `<session
+> id>` on device `<device id>`; runner rung: `<Step 1's answer — coord.reason or
+> status; "resume set corrected locally; coord NOT told" when it marked>`; the
+> finish write was refused `<reason>`, and the runner's own row is not bound to
+> this harness id. No row was created (Step 4.9's rule).
+> Dossier `finish-session-no-safe-rung-for-unregistered-session`.
+
+A bind that succeeded on the operator-launched arm but reported a non-zero
+`unbound_sibling_rows` is not a terminal state — it is a finished session with a
+possible fork to name in the report beside it.
+
+Only then, record it on that dossier as the next occurrence — a finding ON the
+dossier, not a fresh unattached one; this condition has recurred across devices
+and an unattached finding starts the count over. Quote the finish write's reason
+string, the bind's reason or door failure, the serving build id, and the
+transport that carried each call. A dossier occurrence recorded **instead of**
+attempting the bind is the failure this step exists to stop.
 
 ⛔ **Do not reach for `~/.qontinui/agent_session_id` to make the write succeed.**
 It is box-global and has twice resolved to a LIVE peer; `/finish-session` step 1a
