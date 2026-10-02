@@ -195,6 +195,24 @@ export function detachedRemoteTabs<T extends { isAlive: boolean; remote?: Remote
 }
 
 /**
+ * Whether the tab a fleet-picker attach (or create) opened is STILL open on
+ * this page — the predicate behind "Attached — tab open on this page."
+ *
+ * The picker records the opened tab's id once, when the attach succeeds; that
+ * is a fact about the past. Rendering the notice off the id alone kept it on
+ * screen after the operator closed the tab. The claim is about the present, so
+ * it is read against the page's live tab list: gone, or ended (`!isAlive`, the
+ * tab that offers "Reattach"), and the notice goes.
+ */
+export function openedTabStillOpen<T extends { id: string; isAlive: boolean }>(
+  openedId: string | null | undefined,
+  tabs: readonly T[],
+): boolean {
+  if (!openedId) return false;
+  return tabs.some((t) => t.id === openedId && t.isAlive);
+}
+
+/**
  * Split a remote tab's title back into its session half, for a reattach that
  * should keep the same title. Falls back to the whole title when it was
  * renamed away from the `"<device>: <label>"` shape.

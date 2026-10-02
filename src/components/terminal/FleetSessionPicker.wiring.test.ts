@@ -566,3 +566,15 @@ describe("a walked list shows when each row was last observed", () => {
     expect(SOURCE).toContain("clearInterval(id)");
   });
 });
+
+describe("the 'tab open on this page' notices follow the live tab list", () => {
+  // The opened id is recorded once, on success. Gating the notice on it alone
+  // kept "Attached — tab open on this page." on screen after the tab closed.
+  it("gates both notices on openedTabStillOpen, never on the bare id", () => {
+    const code = codeOf(SOURCE);
+    expect(code).toMatch(/openedTabStillOpen\(row\?\.openedId, tabs\)/);
+    expect(code).toMatch(/openedTabStillOpen\(state\.openedId, tabs\)/);
+    expect(code).not.toMatch(/\{\s*row\?\.openedId\s*&&/);
+    expect(code).not.toMatch(/if \(state\.openedId\)/);
+  });
+});
