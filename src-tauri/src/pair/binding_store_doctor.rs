@@ -86,7 +86,7 @@ pub struct BindingStoreCheck {
     /// 3. `fail` — the canonical is ABSENT while a non-canonical copy carries a
     ///    tenant this process holds a credential for: a credential with no
     ///    binding store. Converge never synthesizes a canonical, so the remedy
-    ///    is the heal / a re-pair, not a restart.
+    ///    is a re-pair, not a restart.
     /// 4. `report` — the canonical is absent otherwise: no binding store, this
     ///    process is unpaired. Honest about an absent store; not a fault.
     /// 5. `ok` — no non-canonical copy is live (no override, or the bare
@@ -238,8 +238,9 @@ pub(crate) fn inspect_binding_store_paths(
                 "the canonical binding store {} is ABSENT, yet this process holds a credential \
                  for tenant(s) {:?} carried by another copy — a credential with no binding \
                  store, so this process reports itself unpaired while it is not. Converge \
-                 never synthesizes a canonical, so a restart will not clear this: run the \
-                 binding-store heal, or re-pair this runner.{}",
+                 never synthesizes a canonical, so a restart will not clear this: re-pair \
+                 this runner (an automatic vanished-store heal is proposed in \
+                 qontinui-runner#1889 and is not on this build).{}",
                 canonical.path,
                 sets.gap,
                 residue_suffix(&sets)
@@ -247,8 +248,9 @@ pub(crate) fn inspect_binding_store_paths(
             return check("fail", detail, sets);
         }
         let detail = format!(
-            "no binding store: the canonical {} is absent, so this process is unpaired \
-             (reported, not failed — pairing creates this file).{}",
+            "no binding store: the canonical {} is absent, so this process reports itself \
+             unpaired (reported, not failed — pairing creates this file; if this runner was \
+             paired, its store has vanished and a re-pair restores it).{}",
             canonical.path,
             residue_suffix(&sets)
         );
@@ -802,7 +804,7 @@ mod tests {
 
     /// A credential with no binding store is the one absent-canonical case
     /// that is a real fault. Converge never synthesizes a canonical, so the
-    /// remedy is the heal / a re-pair — not a restart. With nothing
+    /// remedy is a re-pair — not a restart. With nothing
     /// credentialed it is only an unpaired process: reported.
     #[test]
     fn an_absent_canonical_fails_only_when_a_foreign_tenant_is_credentialed() {
@@ -815,7 +817,11 @@ mod tests {
         let check = b.inspect(&second_answers(Some(true)));
         assert_eq!(check.verdict, "fail", "{}", check.detail);
         assert!(check.detail.contains("re-pair"), "{}", check.detail);
-        assert!(check.detail.contains("heal"), "{}", check.detail);
+        assert!(
+            !check.detail.contains("run the binding-store heal"),
+            "no such heal exists on this build; the remedy must not name one: {}",
+            check.detail
+        );
         assert!(
             !check.detail.contains("next start"),
             "converge cannot clear this, so it must not be named: {}",
@@ -962,6 +968,58 @@ mod tests {
     /// then read that steady state as `report`, not `fail`. Under the
     /// pairwise check this failed forever; it is the test that would have
     /// caught the regression.
+    /// A merge gap and an informational residue in the same pass: the verdict
+    /// is the strongest (`fail`) and the detail names BOTH arms.
+    #[test]
+    fn a_merge_gap_beside_withheld_residue_fails_and_names_both() {
+        let b = two_copies();
+        write(&b.canonical, &store(DEFAULT_TENANT, &[DEFAULT_TENANT]));
+        write(
+            &b.foreign,
+            &store(
+                DEFAULT_TENANT,
+                &[DEFAULT_TENANT, SECOND_TENANT, UNCREDENTIALED_TENANT],
+            ),
+        );
+        let pred = |t: &uuid::Uuid, _d: bool| Some(t.to_string() != UNCREDENTIALED_TENANT);
+        let check = b.inspect(&pred);
+        assert_eq!(check.verdict, "fail", "{}", check.detail);
+        assert!(check.detail.contains(SECOND_TENANT), "{}", check.detail);
+        assert_eq!(
+            check.withheld_no_credential,
+            vec![UNCREDENTIALED_TENANT.to_string()]
+        );
+        assert!(
+            check.detail.contains("withheld_no_credential"),
+            "the residue arm must be named beside the gap: {}",
+            check.detail
+        );
+    }
+
+    /// A `stray` copy is judged by the SAME rules as `foreign_canonical` —
+    /// only the label differs.
+    #[test]
+    fn a_stray_copy_follows_the_same_merge_gap_and_withheld_rules() {
+        let b = two_copies();
+        write(&b.canonical, &store(DEFAULT_TENANT, &[DEFAULT_TENANT]));
+        write(
+            &b.foreign,
+            &store(DEFAULT_TENANT, &[DEFAULT_TENANT, SECOND_TENANT]),
+        );
+        let paths = [b.canonical.clone(), b.foreign.clone()];
+
+        let gap = inspect_binding_store_paths(&paths, None, &second_answers(Some(true)));
+        assert_eq!(gap.copies[1].role, "stray");
+        assert_eq!(gap.verdict, "fail", "{}", gap.detail);
+
+        let withheld = inspect_binding_store_paths(&paths, None, &second_answers(Some(false)));
+        assert_eq!(withheld.verdict, "report", "{}", withheld.detail);
+        assert_eq!(
+            withheld.withheld_no_credential,
+            vec![SECOND_TENANT.to_string()]
+        );
+    }
+
     #[test]
     fn converge_then_inspect_an_override_home_with_a_withheld_tenant_is_not_a_fail() {
         let b = two_copies();
