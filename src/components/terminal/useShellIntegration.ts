@@ -258,7 +258,8 @@ export function useShellIntegration({
           "resume fallback timer",
         );
       }, 1500);
-      await openRecorded;
+      // Bounded: a hung IPC must not strand the caller's replacement unassigned.
+      await Promise.race([openRecorded, new Promise<void>((r) => setTimeout(r, 3000))]);
       return tabId;
     },
     [

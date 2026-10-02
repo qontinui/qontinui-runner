@@ -75,6 +75,10 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   );
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
+  // Zones with a restart in flight. A restart awaits a liveness read and a resume
+  // before the zone is reassigned; a second trigger (chip, hover action, shortcut,
+  // auto-restart) in that window would otherwise resume the same session id twice.
+  const restartingZonesRef = useRef<Set<number>>(new Set());
 
   /**
    * Replace the finished/errored pane in `zoneIdx` with a fresh terminal.
@@ -127,39 +131,48 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       if (state !== "completed" && state !== "error") {
         return { restarted: false, reason: "not-restartable", state };
       }
-      const label = labelsAndTags.zoneLabels[zoneIdx];
-      // Liveness is only consulted for a pane that hosted a Claude session.
-      const plan = planRestart(
-        oldTab,
-        oldTab?.claudeSessionId ? await fetchLiveClaudeSessionIds() : new Set(),
-      );
-      if (plan.kind === "blocked") {
-        return { restarted: false, reason: "resume-unsafe", state, detail: plan.detail };
+      if (restartingZonesRef.current.has(zoneIdx)) {
+        return { restarted: false, reason: "not-restartable", state: "restart-in-progress" };
       }
-      const tabId =
-        plan.kind === "resume"
-          ? await shellIntegration.handleResumeSession(plan.session)
-          : await createTerminal(
-              oldTab?.title ? `${oldTab.title} (2)` : undefined,
-              oldTab?.workingDir ?? undefined,
-            );
-      if (tabId) {
-        zoneLayout.assignTabToZone(zoneIdx, tabId);
-        zoneLayout.setFocusedZone(zoneIdx);
-        if (label) {
-          labelsAndTags.setZoneLabel(zoneIdx, label);
+      restartingZonesRef.current.add(zoneIdx);
+      try {
+        const label = labelsAndTags.zoneLabels[zoneIdx];
+        // Liveness is only consulted for a pane that hosted a Claude session.
+        const plan = planRestart(
+          oldTab,
+          oldTab?.claudeSessionId ? await fetchLiveClaudeSessionIds() : new Set(),
+        );
+        if (plan.kind === "blocked") {
+          console.warn(`[restart] zone ${zoneIdx + 1}: ${plan.detail}`);
+          return { restarted: false, reason: "resume-unsafe", state, detail: plan.detail };
         }
-        // Retire the pane we just replaced — after the zone points at the
-        // replacement, so the zone is never momentarily empty.
-        if (oldTabId) {
-          closeTerminal(oldTabId);
+        const tabId =
+          plan.kind === "resume"
+            ? await shellIntegration.handleResumeSession(plan.session)
+            : await createTerminal(
+                oldTab?.title ? `${oldTab.title} (2)` : undefined,
+                oldTab?.workingDir ?? undefined,
+              );
+        if (tabId) {
+          zoneLayout.assignTabToZone(zoneIdx, tabId);
+          zoneLayout.setFocusedZone(zoneIdx);
+          if (label) {
+            labelsAndTags.setZoneLabel(zoneIdx, label);
+          }
+          // Retire the pane we just replaced — after the zone points at the
+          // replacement, so the zone is never momentarily empty.
+          if (oldTabId) {
+            closeTerminal(oldTabId);
+          }
+          return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
         }
-        return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
+        // `createTerminal` returned nothing: the replacement never existed, so
+        // the old pane was deliberately NOT retired. Saying so is the whole
+        // point of this return type.
+        return { restarted: false, reason: "spawn-failed" };
+      } finally {
+        restartingZonesRef.current.delete(zoneIdx);
       }
-      // `createTerminal` returned nothing: the replacement never existed, so
-      // the old pane was deliberately NOT retired. Saying so is the whole
-      // point of this return type.
-      return { restarted: false, reason: "spawn-failed" };
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
