@@ -41,7 +41,6 @@ pub struct PlannedActionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
     pub error: Option<String>,
-    #[serde(default)]
     pub skipped_low_confidence: bool,
     pub duration_ms: u64,
     /// The UI Bridge's post-action `elementState` object. Typed as a map so
@@ -69,6 +68,58 @@ pub struct ActionPlanResponse {
     pub failed_count: usize,
     pub total_duration_ms: u64,
     /// Whether this plan was stored in the cache for future reuse
-    #[serde(default)]
     pub cached: bool,
+}
+
+/// The UI Bridge's post-action `elementState`, kept only when it is a JSON
+/// object (see [`PlannedActionResult::element_state`]).
+pub fn element_state_of(
+    data: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    data.get("elementState")
+        .and_then(|v| v.as_object())
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn element_state_keeps_only_an_object() {
+        let obj = serde_json::json!({"elementState": {"checked": true}});
+        assert_eq!(
+            element_state_of(&obj).map(serde_json::Value::Object),
+            Some(serde_json::json!({"checked": true}))
+        );
+        for v in [
+            serde_json::Value::Null,
+            serde_json::json!([1]),
+            serde_json::json!("s"),
+        ] {
+            assert_eq!(
+                element_state_of(&serde_json::json!({"elementState": v})),
+                None
+            );
+        }
+        assert_eq!(element_state_of(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn absent_element_state_is_omitted_from_the_wire() {
+        let r = PlannedActionResult {
+            index: 0,
+            success: true,
+            action: "click".into(),
+            resolved_element_id: None,
+            error: None,
+            skipped_low_confidence: false,
+            duration_ms: 1,
+            element_state: element_state_of(&serde_json::json!({"elementState": null})),
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"index":0,"success":true,"action":"click","skippedLowConfidence":false,"durationMs":1}"#
+        );
+    }
 }

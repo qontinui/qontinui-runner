@@ -468,6 +468,7 @@ mod execution_status_tests {
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"hook_started","task_run_id":"tr-1","timestamp":1,"hook_id":"h","hook_name":"n","trigger":"on_verification_fail"}"#
         );
+        assert_eq!(event.type_tag(), "hook_started");
     }
 
     // The five tests below pin each remaining variant to the exact bytes the

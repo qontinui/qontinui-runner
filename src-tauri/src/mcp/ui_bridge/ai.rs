@@ -520,10 +520,8 @@ pub async fn ui_bridge_execute_action_plan_handler(
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let element_state = data
-                    .get("elementState")
-                    .and_then(|v| v.as_object())
-                    .cloned();
+                let element_state =
+                    qontinui_runner_lib::ui_bridge_action_plan::element_state_of(&data);
                 let action_error = if action_success {
                     None
                 } else {

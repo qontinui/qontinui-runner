@@ -143,6 +143,7 @@ impl PgDb {
         let detection_config_json = serde_json::to_string(
             &req.detection_config
                 .clone()
+                .filter(|v| !v.is_null())
                 .unwrap_or(serde_json::json!({})),
         )
         .unwrap_or_else(|_| "{}".to_string());
@@ -155,6 +156,7 @@ impl PgDb {
         let verification_step_template_json = req
             .verification_step_template
             .as_ref()
+            .filter(|v| !v.is_null())
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
 
         let provenance = req
@@ -285,6 +287,7 @@ impl PgDb {
         let detection_config_json = req
             .detection_config
             .as_ref()
+            .filter(|v| !v.is_null())
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|| {
                 serde_json::to_string(&existing.detection_config)
@@ -329,6 +332,7 @@ impl PgDb {
         let verification_step_template_json = req
             .verification_step_template
             .as_ref()
+            .filter(|v| !v.is_null())
             .or(existing.verification_step_template.as_ref())
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
 
@@ -892,7 +896,11 @@ impl PgDb {
             scope_tags: serde_json::from_str(&scope_tags_json).unwrap_or_default(),
             detection_method: DetectionMethod::from_str(&row.get::<_, String>(7))
                 .unwrap_or(DetectionMethod::AiJudgment),
-            detection_config: serde_json::from_str(&detection_config_json)
+            // A row written before the object check existed may hold any
+            // JSON; serve only an object, so the published schema holds.
+            detection_config: serde_json::from_str::<serde_json::Value>(&detection_config_json)
+                .ok()
+                .filter(|v| v.is_object())
                 .unwrap_or(serde_json::json!({})),
             pattern_template_id: row.get(9),
             reproduction_context: row.get(10),
@@ -907,7 +915,8 @@ impl PgDb {
             source_task_run_id: row.get(17),
             verification_hint: row.get(18),
             verification_step_template: verification_step_json
-                .and_then(|s| serde_json::from_str(&s).ok()),
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .filter(|v| v.is_object()),
             times_detected: times_detected as u32,
             times_checked: times_checked as u32,
             last_detected_at,
