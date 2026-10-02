@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 55 | 68 | 55 | 0 | 0 | 0 |
+| `repo_layout` | 56 | 69 | 53 | 3 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 27 | 0 | 0 | 0 |
 | `supervisor_dependency` | 50 | 50 | 0 | 40 | 4 | 6 |
 | `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
@@ -16,13 +16,13 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 | `machine_path` | 22 | 22 | 0 | 20 | 2 | 0 |
 
-## `repo_layout` (55 rows)
+## `repo_layout` (56 rows)
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
 | `src/agent_runtime.rs` | `continuation_fallback_workdir` | `.ok_or_else(\|\| "no QONTINUI_ROOT or canonical checkout resolved".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | fallback_correct — <root>/qontinui-claude-config/.claude/agents is the operator checkout OVERLAID on the embedded fleet_agents floor, which is written first whether or not a root resolves. No root, or no agents dir under it, records an Unresolved agent_definitions ledger row (the quoted text is that row's reason) and the embedded defaults stand in. | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `r.join("qontinui-claude-config")` | 1 | fallback_correct — <root>/qontinui-claude-config/.claude/agents is the operator checkout OVERLAID on the embedded fleet_agents floor, which is written first whether or not a root resolves. No root, or no agents dir under it, records an Unresolved agent_definitions ledger row (the quoted text is that row's reason) and the embedded defaults stand in. | `agent_definitions` |
 | `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/agent_worktree/disk_survey.rs` | `survey` | `"the workspace root could not be resolved (set QONTINUI_ROOT, or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ai_router.rs` | `route_with_learning` | `has_ui_component: context.prompt.to_lowercase().contains("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
@@ -69,6 +69,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `$QONTINUI_ROOT to the directory holding the repo checkouts if the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/planning_bridge.rs` | `execute_htn_attempt` | `is already installed for this interpreter. Set $QONTINUI_ROOT to the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
+| `src/session_assets.rs` | `provision_session_assets_from_root` | `&r.join("qontinui-claude-config").join(".claude"),` | 1 | fallback_correct — Only when a root resolves: compares the session's <workdir>/.claude against <root>/qontinui-claude-config/.claude to detect a cwd whose .claude IS the canonical source (the workspace-root symlink), and then writes nothing and records CanonicalSource rows. With no root the check is skipped and the ordinary arm runs, so the embedded floors are provisioned without a checkout. | — (no CAPABILITY_SPECS row) |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |
 | `src/slash_commands.rs` | `find_commands_directory_reported` | `.join("qontinui-claude-config")` | 1 | unreviewed | `slash_commands` |
 | `src/ui_bridge_plugin.rs` | `init` | `Builder::new("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |

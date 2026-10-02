@@ -58,6 +58,7 @@ use std::path::Path;
 use include_dir::{include_dir, Dir};
 
 use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+use crate::provision_guard::TrackedPaths;
 
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
 /// `claude` expects under `.claude/agents/`.
@@ -71,7 +72,17 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 
 /// Write every embedded subagent definition into `dst_dir`, returning a
 /// [`ProvisionReport`] describing what landed. Creates `dst_dir` if absent;
-/// overwrites existing files (idempotent).
+/// overwrites existing files (idempotent) — EXCEPT a destination that already
+/// exists and that `tracked` says the enclosing git repository tracks, which is
+/// skipped and reported as [`SkipReason::GitTracked`] (see
+/// [`crate::provision_guard`]). The caller probes `tracked` once for `dst_dir`
+/// and shares it with the checkout overlay, which writes the same directory.
+///
+/// The guard matters because every session spawn path provisions agent
+/// definitions now, including cwds that are checkouts: `qontinui-claude-config`
+/// TRACKS every `.claude/agents/*.md`, and an unguarded floor write there would
+/// replace the canonical sources with this binary's older snapshot and leave
+/// the tree dirty.
 ///
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
@@ -84,7 +95,10 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// remove — `claude` cannot resolve the named subagent, the review never runs,
 /// and coord ages the PR out as `specialist_timeout` with no error at the point
 /// of cause — so "how many" was never the interesting half.
-pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<ProvisionReport> {
+pub(crate) fn provision_fleet_agents_into(
+    dst_dir: &Path,
+    tracked: &TrackedPaths,
+) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(dst_dir)?;
     let mut out = ProvisionReport::new(
         "fleet_agents",
@@ -100,10 +114,26 @@ pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<Pro
             continue;
         };
         let unit = name.to_string_lossy().into_owned();
+        let dst = dst_dir.join(name);
+        // Never through a symlink: a per-file link into a canonical checkout is
+        // invisible to `tracked`, which asks the SESSION repo.
+        if let Some(why) = crate::provision_guard::symlink_below(dst_dir, &dst) {
+            out.skip(unit, SkipReason::Symlinked(why));
+            continue;
+        }
+        if tracked.should_skip(&dst, Path::new(name)) {
+            tracing::info!(
+                "fleet_agents: skipping {} — it is tracked by the enclosing git \
+                 repository, and overwriting it would replace that repo's own content",
+                dst.display()
+            );
+            out.skip(unit, SkipReason::GitTracked);
+            continue;
+        }
         // Per-file rather than `?`: one unwritable definition must not cost the
         // session the other four, and it must be NAMED rather than aborting the
         // pass at whatever point it happened to reach.
-        match std::fs::write(dst_dir.join(name), file.contents()) {
+        match std::fs::write(&dst, file.contents()) {
             Ok(()) => out.record_written(),
             Err(e) => out.skip(unit, SkipReason::WriteFailed(e.to_string())),
         }
@@ -132,7 +162,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let report = provision_fleet_agents_into(&dst).expect("provision");
+        let report =
+            provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("provision");
         assert_eq!(
             report.written,
             embedded_agent_count(),
@@ -166,11 +197,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let first = provision_fleet_agents_into(&dst).expect("first");
+        let first = provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("first");
         let victim = dst.join("code-reviewer.md");
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
-        let second = provision_fleet_agents_into(&dst).expect("second");
+        let second = provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("second");
         assert_eq!(
             (first.written, first.skipped.len()),
             (second.written, second.skipped.len()),
@@ -180,6 +211,50 @@ mod tests {
             std::fs::read(&victim).expect("read restored"),
             b"CLOBBERED",
             "re-provisioning must overwrite a modified def, not leave it"
+        );
+    }
+
+    /// A destination TRACKED by the enclosing repository keeps the repo's bytes
+    /// and is reported skipped with its reason; an untracked sibling in the same
+    /// repo is still written. `qontinui-claude-config` tracks every
+    /// `.claude/agents/*.md`, so this is the shipped behaviour for a session
+    /// spawned there, not a corner case.
+    #[test]
+    fn a_git_tracked_agent_def_is_skipped_and_an_untracked_sibling_written() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dst = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        git_init(tmp.path());
+
+        let tracked = dst.join("code-reviewer.md");
+        std::fs::write(&tracked, b"# the repo's own reviewer\n").unwrap();
+        git_add(tmp.path(), &tracked);
+        // Present but deliberately NOT `git add`ed.
+        let untracked = dst.join("repo-auditor.md");
+        std::fs::write(&untracked, b"stale, untracked\n").unwrap();
+
+        let report =
+            provision_fleet_agents_into(&dst, &TrackedPaths::probe(&dst)).expect("provision");
+
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            b"# the repo's own reviewer\n",
+            "a tracked definition must be left byte-identical"
+        );
+        assert_eq!(report.skipped.len(), 1, "only the tracked file is skipped");
+        assert_eq!(report.skipped[0].unit, "code-reviewer.md");
+        assert_eq!(report.skipped[0].reason, SkipReason::GitTracked);
+        assert!(report.is_degraded(), "a skipped unit reads as degraded");
+        assert_eq!(report.written, embedded_agent_count() - 1);
+        assert_eq!(
+            std::fs::read(&untracked).unwrap(),
+            FLEET_AGENTS
+                .get_file("repo-auditor.md")
+                .expect("repo-auditor.md is bundled")
+                .contents(),
+            "an untracked sibling is overwritten with the embedded copy"
         );
     }
 

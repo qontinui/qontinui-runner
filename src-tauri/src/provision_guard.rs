@@ -1,7 +1,10 @@
-//! The one tracked-file guard both fleet provisioners consult before writing.
+//! The one tracked-file guard every session-asset provisioner consults before
+//! writing.
 //!
-//! [`crate::fleet_commands`] and [`crate::fleet_skills`] each write a bundled
-//! tree into a spawned session's `<cwd>/.claude/…`, unconditionally. That is
+//! [`crate::fleet_commands`], [`crate::fleet_skills`] and the subagent
+//! definitions ([`crate::fleet_agents`] plus the checkout overlay in
+//! `agent_runtime`) each write a bundled tree into a spawned session's
+//! `<cwd>/.claude/…`, unconditionally. That is
 //! correct for the case they were built for — a fresh agent worktree, where
 //! nothing tracks those paths and the alternative is a session with no fleet
 //! commands or skills at all.
@@ -201,6 +204,79 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
         return None;
     }
     std::fs::read(out_file.path()).ok()
+}
+
+/// `Some(why)` when `dst` resolves to `src` or to a path inside it, following
+/// symlinks — the destination IS the canonical source a provisioner would copy
+/// from (a workspace-root cwd whose `.claude` links into
+/// `qontinui-claude-config/.claude`), so writing there overwrites the source. Either side may not exist yet, so each is resolved through its
+/// nearest existing ancestor ([`canonicalize_through_ancestors`]). `None` —
+/// "not the same tree" — also when either side cannot be resolved at all,
+/// which on a real filesystem means neither exists and there is nothing of the
+/// source's to overwrite.
+pub(crate) fn destination_is_source(dst: &Path, src: &Path) -> Option<String> {
+    let dst_real = canonicalize_through_ancestors(dst)?;
+    let src_real = canonicalize_through_ancestors(src)?;
+    dst_real.starts_with(&src_real).then(|| {
+        format!(
+            "{} resolves to {}, which is the source {} it would be copied from",
+            dst.display(),
+            dst_real.display(),
+            src_real.display()
+        )
+    })
+}
+
+/// `std::fs::canonicalize` for a path that may not exist yet: canonicalize its
+/// nearest existing ancestor and re-append the missing tail. `None` when no
+/// ancestor resolves, or the tail holds a component with no file name (`..`).
+fn canonicalize_through_ancestors(path: &Path) -> Option<PathBuf> {
+    let mut tail = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return Some(tail.iter().rev().fold(real, |acc, part| acc.join(part)));
+        }
+        tail.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
+/// `Some(why)` when writing `path` would pass through a symlink below `base`:
+/// some EXISTING component of `path` strictly below `base` — `path` itself
+/// included — is a symlink, so the write would land somewhere other than its
+/// lexical destination. `base` itself is not examined. A component that does
+/// not exist ends the walk: nothing below it can be a symlink yet.
+///
+/// The rule every session-asset provisioner applies, independent of any
+/// workspace root: never write through a symlink. A per-file symlink into a
+/// canonical checkout is invisible to [`TrackedPaths`], which asks the SESSION
+/// repo, and `std::fs::copy` onto a file's own target truncates it.
+pub(crate) fn symlink_below(base: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(base).ok()?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)
+                    .map(|t| format!(" -> {}", t.display()))
+                    .unwrap_or_default();
+                return Some(format!("{}{target} is a symlink", current.display()));
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// [`symlink_below`] for a whole asset kind: `dir` is `<cwd>/.claude/<kind>`,
+/// and both `.claude` and `<kind>` are examined. `Some(why)` means the kind
+/// stands down — even `create_dir_all` would build inside the link's target.
+pub(crate) fn redirected_asset_dir(dir: &Path) -> Option<String> {
+    let cwd = dir.parent()?.parent()?;
+    symlink_below(cwd, dir)
 }
 
 #[cfg(test)]

@@ -1524,19 +1524,22 @@
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
-      "symbol": "provision_agent_definitions",
+      "symbol": "provision_agent_definitions_from_root",
       "excerpt": "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
       "count": 1,
-      "disposition": "unreviewed"
+      "disposition": "fallback_correct",
+      "capability": "agent_definitions",
+      "note": "<root>/qontinui-claude-config/.claude/agents is the operator checkout OVERLAID on the embedded fleet_agents floor, which is written first whether or not a root resolves. No root, or no agents dir under it, records an Unresolved agent_definitions ledger row (the quoted text is that row's reason) and the embedded defaults stand in."
     },
     {
       "class": "repo_layout",
       "file": "src/agent_runtime.rs",
       "symbol": "provision_agent_definitions_from_root",
-      "excerpt": ".join(\"qontinui-claude-config\")",
+      "excerpt": "r.join(\"qontinui-claude-config\")",
       "count": 1,
-      "disposition": "unreviewed",
-      "capability": "agent_definitions"
+      "disposition": "fallback_correct",
+      "capability": "agent_definitions",
+      "note": "<root>/qontinui-claude-config/.claude/agents is the operator checkout OVERLAID on the embedded fleet_agents floor, which is written first whether or not a root resolves. No root, or no agents dir under it, records an Unresolved agent_definitions ledger row (the quoted text is that row's reason) and the embedded defaults stand in."
     },
     {
       "class": "repo_layout",
@@ -1906,6 +1909,15 @@
       "excerpt": "if lower.contains(\"frontend\") || lower.contains(\"ui-bridge\") {",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "repo_layout",
+      "file": "src/session_assets.rs",
+      "symbol": "provision_session_assets_from_root",
+      "excerpt": "&r.join(\"qontinui-claude-config\").join(\".claude\"),",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Only when a root resolves: compares the session's <workdir>/.claude against <root>/qontinui-claude-config/.claude to detect a cwd whose .claude IS the canonical source (the workspace-root symlink), and then writes nothing and records CanonicalSource rows. With no root the check is skipped and the ordinary arm runs, so the embedded floors are provisioned without a checkout."
     },
     {
       "class": "repo_layout",
