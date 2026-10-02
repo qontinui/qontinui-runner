@@ -2037,13 +2037,26 @@ mod timeout_tests {
     #[cfg(unix)]
     const MIN_TICKS_IN_WINDOW: usize = 5;
 
+    /// The pid the start command recorded in `pidfile`.
+    ///
+    /// The shell's `> pidfile` redirect CREATES the file before `echo` writes
+    /// the pid into it, so "the file exists" (what the callers wait on) does
+    /// not mean "the pid is in it". Re-read until it parses rather than
+    /// panicking on the empty window (seen on CI: runner#1922, ubuntu).
     #[cfg(unix)]
     fn read_pid(pidfile: &std::path::Path) -> i32 {
-        std::fs::read_to_string(pidfile)
-            .expect("the start command must have recorded its server pid")
-            .trim()
-            .parse()
-            .expect("pidfile must hold a pid")
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let contents = std::fs::read_to_string(pidfile)
+                .expect("the start command must have recorded its server pid");
+            match contents.trim().parse() {
+                Ok(pid) => return pid,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("pidfile must hold a pid, got {contents:?}: {e}"),
+            }
+        }
     }
 
     /// A command whose whole purpose is to leave a server running, in the shape
