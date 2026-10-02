@@ -4379,7 +4379,14 @@ pub(crate) fn holds_credential_predicate(
         crate::auth::holds_credential_for(
             crate::auth::read_tenant_slot(mgr, tenant).state(),
             is_default,
-            *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state()),
+            // `holds_credential_for` consults the legacy slot only for the
+            // default tenant, so a non-default probe never pays the (possibly
+            // keychain-backed) read; `Absent` is never inspected on that arm.
+            if is_default {
+                *legacy.get_or_init(|| crate::auth::read_legacy_slot(mgr).state())
+            } else {
+                crate::auth::SlotState::Absent
+            },
         )
     }
 }
