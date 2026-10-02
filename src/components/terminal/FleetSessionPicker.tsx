@@ -37,6 +37,7 @@ import {
   attachErrorMessage,
   attachWaitingMessage,
   fleetSessionAttachId,
+  openedTabStillOpen,
   remoteSessionLabel,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
@@ -269,6 +270,7 @@ function RemoteCreateOutcome({
   state: DeviceCreateState | undefined;
   onRetry: () => void;
 }) {
+  const { tabs } = useTerminalSession();
   if (!state || state.pending) return null;
   if (state.refusal) {
     const r = state.refusal;
@@ -313,7 +315,7 @@ function RemoteCreateOutcome({
       </div>
     );
   }
-  if (state.openedId) {
+  if (openedTabStillOpen(state.openedId, tabs)) {
     return (
       <div
         data-ui-bridge-id={`terminal.fleet-device-create-open.${deviceId}`}
@@ -445,7 +447,7 @@ export function FleetSessionPicker() {
   );
   const conflict = fleetFilterConflict(server);
 
-  const { pageId, setActiveId } = useTerminalSession();
+  const { pageId, setActiveId, tabs } = useTerminalSession();
   const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
   /** The runner's own progress while it re-presents a grant the target has
    * not recorded yet — keyed by session id, empty when nothing is waiting. */
@@ -1135,7 +1137,9 @@ export function FleetSessionPicker() {
                           Attach failed: {row.error}
                         </div>
                       )}
-                      {row?.openedId && !row.error && !pending && (
+                      {/* Read against the live tab list, not the id alone:
+                        the id is set once on success, so it outlives the tab. */}
+                      {openedTabStillOpen(row?.openedId, tabs) && !row?.error && !pending && (
                         <div
                           data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
                           className="mt-0.5 text-[10px] text-[#9ece6a]"
