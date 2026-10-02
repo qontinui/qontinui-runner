@@ -452,6 +452,10 @@ pub const ACTIVE_SELECTION_ROUTES: &[(&str, &str)] = &[
 pub const FOREIGN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/health"),
     ("GET", "/livez"),
+    // The compiled-in product glossary (mcp::glossary). Public vocabulary: no
+    // secret, no caller-named path, no outbound request, no process — so any
+    // page, extension or agent may read it without a credential.
+    ("GET", "/glossary"),
     // useCommandRelay phone-home (packages/ui-bridge/src/react/useCommandRelay.ts)
     ("POST", "/ui-bridge/apps/register"),
     ("DELETE", "/ui-bridge/apps/register/{app_id}"),
