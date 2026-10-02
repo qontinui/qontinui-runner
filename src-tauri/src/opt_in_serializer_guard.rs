@@ -184,16 +184,64 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "a_stale_sidecar_reports_unknown_never_no_gaps",
             "an_unreadable_covered_side_is_unknown_not_a_gap",
             "the_sweep_hop_composes_the_gap_report",
+            "no_headless_pair_cli_seeds_a_bound_tenants_slot",
+            "a_sidecar_too_stale_to_act_on_reports_the_gap_but_asks_nobody",
+            "an_ask_made_with_no_listener_is_readable_by_pull_until_its_lapse_closes",
+            "an_open_ask_is_withdrawn_once_its_evidence_is_stale_or_contradicted",
+            "sign_out_forgets_the_asks_and_the_bound_set_they_came_from",
+            "asks_never_cross_an_account_switch",
+            "exactly_one_ask_per_tenant_per_lapse_across_passes_and_restarts",
+            "an_unknown_binding_gap_reading_asks_nobody_and_closes_nothing",
+            "a_corrupt_or_legacy_lapse_record_fails_soft",
+            "measured_gaps_is_the_one_gate_on_unknown",
         ],
         reason: "the lock serialises refresh_tenant_slots passes over the process-global posture cell, \
-         tenant_slot_health and the CLEARED_* counters; the five tests outside it \
+         tenant_slot_health and the CLEARED_* counters; the 15 tests outside it are pure over \
+         explicit inputs, or file-backed state addressed by an explicit path, and never call \
+         refresh_tenant_slots or read the snapshot. The first five \
          (a_bound_tenant_with_no_slot_is_a_gap, an_absent_sidecar_reports_unknown_never_no_gaps, \
          a_stale_sidecar_reports_unknown_never_no_gaps, an_unreadable_covered_side_is_unknown_not_a_gap, \
-         the_sweep_hop_composes_the_gap_report) are pure over explicit inputs — \
-         resolve_binding_gaps / binding_gaps_from on literal reads, and coord_bound_tenants_at on a \
-         uniquely named temp dir — and never call refresh_tenant_slots or read the snapshot. \
-         Enumerated after the 2026-09-21 rebase onto main, which added them; taking the lock in \
-         them is the trivial alternative and lives in that file, not this one",
+         the_sweep_hop_composes_the_gap_report) run resolve_binding_gaps / binding_gaps_from on \
+         literal reads and coord_bound_tenants_at on a uniquely named temp dir; enumerated after \
+         the 2026-09-21 rebase onto main, which added them. The ten binding-gap-ask tests added \
+         2026-10-02 are main's, and they are already in the shape this plan prescribes rather \
+         than in need of a lock: every state-touching call takes its path explicitly \
+         (ask_bound_tenant_gaps_at, forget_binding_gap_evidence_at, open_binding_gap_asks, \
+         load_gap_ask_state, save_gap_ask_state, coord_bound_tenants_at[_within]) and that path \
+         comes from the module's gap_state_path(), which keys every call on a fresh \
+         Uuid::now_v7() — so no two of them can meet. Of the remaining helpers \
+         resolve_binding_gaps, measured_gaps, binding_gap_ask_account and \
+         binding_gap_asks_permitted are pure, and \
+         no_headless_pair_cli_seeds_a_bound_tenants_slot reads this file's own source with \
+         include_str!. settle_binding_gap_actions is NOT pure, and this entry does not rest on \
+         pretending otherwise: on a GapAction::LapseClosed{slot_now_held:true} arm it calls \
+         reset_upstream_rejections_for, which mutates the process-global UPSTREAM_SIGNALS and, \
+         via clear_orphan_warning, ORPHAN_WARNED_KEYS — which is precisely why the sibling \
+         a_lapse_healed_by_a_new_slot_resets_that_tenants_rejection_streak takes this lock on \
+         its first line. The one allowlisted test that calls it, \
+         an_ask_made_with_no_listener_is_readable_by_pull_until_its_lapse_closes, is safe by its \
+         ARGUMENT DATA, and its own assertion is what pins that: it passes the opening pass's \
+         Notified actions and asserts the settle returns an EMPTY reset list, while \
+         reset.push(tenant) sits in the same `if let` body as the mutation — so an empty return \
+         is proof no mutation ran. Give that test a LapseClosed{slot_now_held:true} arm and this \
+         entry becomes wrong: take the lock there rather than reword this. Note too that \
+         health_lock() delegates to super::posture_test_lock(), THE crate-wide lock, so its \
+         blast radius is wider than the three cells named at the top of this reason. Verified \
+         2026-10-02 by enumerating every call in all ten bodies and in the five helpers they \
+         call; an independent review the same day caught the purity claim, because the author's \
+         grep set (refresh_tenant_slots / tenant_slot_health / CLEARED_* / the snapshot reader) \
+         covered only the cells named at the top of this reason. That file holds TWELVE statics: \
+         LOCK is the serialiser itself; COORD_CREDENTIAL_POSTURE, TENANT_SLOT_HEALTH, \
+         CLEARED_ON_EXPIRY_TOTAL and CLEARED_ON_REJECTION_TOTAL are the four this reason's \
+         opening sentence names; and SEVEN sit outside that scope entirely — \
+         DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL, WARNED_TENANT_MISMATCHES, UPSTREAM_SIGNALS, \
+         ORPHAN_WARNED_KEYS, BINDING_GAPS, POSTURE_TRANSITIONS and REFRESHER_STATE. The closure \
+         was re-run over all twelve and settle_binding_gap_actions is the only hit. Enumerate \
+         them rather than trusting this list: an incomplete set is how the first audit went \
+         wrong, and a correction that ships its own incomplete set repeats it (the independent \
+         review named eleven, omitting only the serialiser itself, and this sentence \
+         previously named five). Taking the lock in them is the trivial \
+         alternative and lives in that file, not this one",
     },
     AllowlistEntry {
         file: "mcp/session_message_poller.rs",
@@ -419,10 +467,17 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "allocated_worktree_unrecognised_freshness_reads_unknown",
             "payload_to_allocate_result_carries_freshness_onto_the_result",
             "credential_door_typed_404_in_code_field_never_falls_back",
+            "decide_spawn_on_409_rerouted_skips_with_target",
+            "decide_spawn_on_409_rerouted_without_target_still_skips",
         ],
         reason: "guards the continuation registry + admitted-launch cap (clear_continuation_registry); \
-         the 164 tests outside it never call evaluate_continuation_guard* or the registry \
-         accessors (grep-verified 2026-09-21, re-derived 2026-09-26) — command builders, payload shapes, env scrubs",
+         the 166 tests outside it never call evaluate_continuation_guard* or the registry \
+         accessors (grep-verified 2026-09-21, re-derived 2026-09-26 and 2026-10-02) — command \
+         builders, payload shapes, env scrubs. The two added 2026-10-02 are main's new rerouted \
+         arms (33844e8fb's sibling, plan 2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs \
+         Phase 3); like the six decide_spawn_on_409_* members already here (eight with these two) they call only \
+         decide_spawn(status, body), a pure (u16, &str) -> SpawnDecision parse that reaches no \
+         global at all",
     },
     AllowlistEntry {
         file: "ai_provider/oauth_refresh.rs",
@@ -472,9 +527,16 @@ const ALLOWLIST: &[AllowlistEntry] = &[
             "rung_rank_is_the_declared_ordering_with_the_non_answers_last",
             "the_roster_matches_the_resolvers_phase_2_actually_shipped",
             "manifest_json_is_wellformed_and_uses_wire_strings",
+            "a_live_probe_wins_the_row_and_the_recorded_reading_rides_in_its_note",
+            "the_session_cli_row_uses_the_existing_rung_vocabulary",
         ],
-        reason: "guards the process-wide provisioning store (reset_provision_store); the 29 tests \
-         outside it never touch the store — spec population, unit shapes, rendering",
+        reason: "guards the process-wide provisioning store (reset_provision_store); the 31 tests \
+         outside it never touch the store — spec population, unit shapes, rendering. The two \
+         added 2026-10-02 are main's: a_live_probe_wins_the_row_* drives only the pure fold \
+         with_recorded_reading over locally built CapabilityObservation values, and says so in \
+         its own doc comment (\"Tested on the pure fold rather than through the process-wide \
+         store\"); the_session_cli_row_* reads the static spec via capability(\"session_cli\") \
+         and Rung::describe()",
     },
     AllowlistEntry {
         file: "commands/transcript.rs",

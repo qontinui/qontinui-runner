@@ -359,9 +359,89 @@ mod tests {
     /// same rule as `wedge_diagnostics.rs`'s pins: a pin must never scan
     /// `#[cfg(test)]` code, or its negative assertions match their own string
     /// literals.
-    fn prod_part(src: &str) -> &str {
-        src.split_once("\n#[cfg(test)]\nmod ")
-            .map_or(src, |(before, _)| before)
+    /// The production half: every `#[cfg(test)] mod … { … }` block REMOVED,
+    /// wherever it sits in the file.
+    ///
+    /// This used to truncate at the FIRST such module and call the result a
+    /// prefix. That is only the production half while every test module sits
+    /// BELOW every pinned item, and nothing enforced that: main's
+    /// `33844e8fb` added `mod coord_mcp_doctor_scope_tests` above the
+    /// wrappers this pin inspects, so the "production half" ended before
+    /// them and the pin panicked that it could not find a signature that was
+    /// right there. Stripping instead of truncating removes the ordering
+    /// assumption. A module's end is the next line that is exactly `}` at
+    /// column 0, because every item nested inside a top-level module is
+    /// indented — which is also why this does not try to brace-match
+    /// (a `format!("{{{x}")` in test code is deliberately unbalanced).
+    ///
+    /// CONTRACT FOR THE NEXT PIN WRITTEN AGAINST THIS: it is safe only for an
+    /// assertion that fails on BOTH sides of a mis-slice — an exact count
+    /// (`assert_eq!(mentions, 2)`) or a `find` that panics by name. A leak
+    /// raises an exact count and an over-strip lowers it, so either direction
+    /// reds. A POSITIVE CONTAINMENT pin (`assert!(prod.contains(…))`) does not
+    /// have that property: a leak satisfies it silently, and the shapes this
+    /// heuristic cannot see — a `#[cfg(test)]` with another attribute stacked
+    /// before its `mod` (the form at `wedge_diagnostics.rs:1756`), a bodyless
+    /// `mod foo;`, or a column-0 `}` inside a fixture string — would then pass
+    /// vacuously instead of failing. If you need a containment pin here, give
+    /// this function the production-symbol anchor set that
+    /// `production_constructs_exactly_one_relay_binding` carries first.
+    fn prod_part(src: &str) -> String {
+        const OPEN: &str = "\n#[cfg(test)]\nmod ";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find(OPEN) {
+            // `str::get`, not `&rest[..]`: `clippy::string_slice` is deny-tier in
+            // this crate and only sites PREDATING that gate are grandfathered
+            // (`expect_ratchet.rs`), so a site landing now migrates instead. Each
+            // index is a char boundary by construction — `at` is where `find`
+            // matched, the byte there is the ASCII `\n` that opens `OPEN`, and
+            // `"\n}\n"` is three ASCII bytes — so the `expect`s are unreachable
+            // and say which invariant would have to break first.
+            out.push_str(rest.get(..at).expect("`find` returns a char boundary"));
+            out.push('\n');
+            let after = rest
+                .get(at + 1..)
+                .expect("the byte at the match is the ASCII newline opening OPEN");
+            match after.find("\n}\n") {
+                Some(end) => {
+                    rest = after
+                        .get(end + 3..)
+                        .expect("`\\n}\\n` is three ASCII bytes");
+                }
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The regression for the bug above: production code BELOW an early test
+    /// module must still be in the pin's reach, and the test module must not.
+    #[test]
+    fn a_test_module_above_the_production_code_is_stripped_not_truncated_at() {
+        const SRC: &str = "\nfn before() {}\n#[cfg(test)]\nmod early {\n    #[test]\n    fn t() {}\n}\nfn after() {}\n";
+        let prod = prod_part(SRC);
+        // Shadow the owned half with its own `&str`: every pin below was
+        // written against a borrowed slice, and the strip has to allocate.
+        let prod = prod.as_str();
+        assert!(
+            prod.contains("fn before()"),
+            "code above the module must survive"
+        );
+        assert!(
+            prod.contains("fn after()"),
+            "code BELOW an early test module must survive — truncating here is the \
+             defect this fixture pins"
+        );
+        assert!(
+            !prod.contains("mod early"),
+            "the test module itself must be stripped"
+        );
+        assert!(!prod.contains("fn t()"), "and its contents with it");
     }
 
     /// Strip whole-line comments, then all whitespace, so the pin matches
@@ -443,15 +523,24 @@ fn not_a_static() {}
                  silently stops guarding anything."
             )
         });
+        // `str::get`, not `&prod[..]`, for the same deny-tier reason as
+        // `prod_part` above: every index here is a `find` result, so each
+        // `expect` names an invariant that cannot break.
         let body_start = start
-            + prod[start..]
+            + prod
+                .get(start..)
+                .expect("a `find` result is a char boundary")
                 .find('{')
                 .expect("the wrapper must have a body");
         let body_end = body_start
-            + prod[body_start..]
+            + prod
+                .get(body_start..)
+                .expect("a `find` result is a char boundary")
                 .find("\n}\n")
                 .expect("the wrapper's body must be closed at column 0");
-        let raw = &prod[body_start..body_end];
+        let raw = prod
+            .get(body_start..body_end)
+            .expect("both ends are `find` results");
         let squeezed = squeezed_code(raw);
         // Both bounds, loose on top: a collapsed slice asserts nothing, and a
         // slice that ran away past several fns is a parse failure rather than
@@ -482,6 +571,9 @@ fn not_a_static() {}
     fn the_public_ring_api_only_delegates() {
         const SRC: &str = include_str!("outbound_trace.rs");
         let prod = prod_part(SRC);
+        // Shadow the owned half with its own `&str`: every pin below was
+        // written against a borrowed slice, and the strip has to allocate.
+        let prod = prod.as_str();
 
         for (signature, expected) in [
             ("pub fn current_seq() -> u64", "current_seq_in(&RING)"),
