@@ -270,9 +270,10 @@ pub struct SetTabResponse {
     pub tab: String,
     /// Value of the FIRST `[data-page-id]` in document order after the tab
     /// change — always the outermost page wrapper, never a sub-view (null if
-    /// no element with that attribute is present). Kept byte-identical to the
-    /// pre-`activePageId` behaviour so existing callers do not break; read
-    /// `active_page_id` when you need the innermost visible view.
+    /// no element with that attribute is present). The selector predates
+    /// `activePageId` and is unchanged; the value used to be always null
+    /// because the read-back Promise was never awaited. Read `active_page_id`
+    /// when you need the innermost visible view.
     pub page_id: Option<String>,
     /// `data-page-id` of the deepest VISIBLE `[data-page-id]` inside the page
     /// wrapper (the wrapper itself included) — the sub-view a nested page
@@ -293,6 +294,22 @@ pub struct SetTabResponse {
 /// defines `readSetTabPageIds(doc)`; its vitest lives in
 /// `src/components/app/__tests__/set-tab-readback.test.ts`.
 const SET_TAB_READBACK_JS: &str = include_str!("set_tab_readback.js");
+
+/// The set-tab eval expression: dispatch `ui-bridge-set-tab`, wait 100 ms,
+/// then return the [`SET_TAB_READBACK_JS`] read-back as a JSON string. Must be
+/// evaluated with `await_promise = true` — it is an async IIFE.
+fn set_tab_expression(tab: &str) -> String {
+    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
+            await new Promise(r => setTimeout(r, 100));
+            {}
+            try {{ return JSON.stringify(readSetTabPageIds(document)); }} catch (e) {{ return "{{}}"; }}
+        }})()"#,
+        escaped_tab, SET_TAB_READBACK_JS
+    )
+}
 
 /// The page-id fields read back from the webview after a set-tab dispatch.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2111,7 +2128,7 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 ///
 /// Dispatches `ui-bridge-set-tab`, waits 100 ms, then reads back three page-id
 /// signals via [`SET_TAB_READBACK_JS`]: `pageId` (the first `[data-page-id]`
-/// in document order — the outer wrapper, unchanged), `activePageId` (the
+/// in document order — the outer wrapper), `activePageId` (the
 /// deepest visible `[data-page-id]` inside that wrapper, i.e. the sub-view) and
 /// `pageIdChain` (outer → inner along that element's ancestors). See
 /// [`SetTabResponse`].
@@ -2145,20 +2162,13 @@ pub async fn ui_bridge_page_set_tab_handler(
 
     info!("UI Bridge API: page/set-tab → {}", tab);
 
-    let escaped_tab = serde_json::to_string(&tab).unwrap_or_else(|_| "\"\"".to_string());
-    let expression = format!(
-        r#"(async () => {{
-            window.dispatchEvent(new CustomEvent("ui-bridge-set-tab", {{ detail: {{ tab: {} }} }}));
-            await new Promise(r => setTimeout(r, 100));
-            {}
-            return JSON.stringify(readSetTabPageIds(document));
-        }})()"#,
-        escaped_tab, SET_TAB_READBACK_JS
-    );
+    let expression = set_tab_expression(&tab);
 
     // `await_promise` must be true: the expression is an async IIFE, and with
     // false the helper stringifies the pending Promise (`"{}"`), so every
-    // read-back field would come back absent.
+    // read-back field would come back absent. The read-back is wrapped in
+    // try/catch so a throwing walk (e.g. page script shadowing `JSON`) costs
+    // only the signal, not a 500 for a tab switch that already happened.
     match direct_webview_evaluate_with_result(&state, &expression, Some(5_000), true).await {
         Ok(result_str) => {
             let readback = parse_set_tab_readback(&result_str);
@@ -4042,6 +4052,18 @@ mod set_tab_readback_tests {
     #[test]
     fn readback_js_defines_the_function_the_expression_calls() {
         assert!(SET_TAB_READBACK_JS.contains("function readSetTabPageIds(doc)"));
+    }
+
+    #[test]
+    fn expression_embeds_the_walk_and_never_throws_on_readback() {
+        let expr = set_tab_expression("settings");
+        assert!(expr.starts_with("(async () => {"));
+        assert!(expr.contains(r#"detail: { tab: "settings" }"#));
+        assert!(expr.contains(SET_TAB_READBACK_JS));
+        assert!(expr.contains(
+            r#"try { return JSON.stringify(readSetTabPageIds(document)); } catch (e) { return "{}"; }"#
+        ));
+        assert!(expr.trim_end().ends_with("})()"));
     }
 
     #[test]
