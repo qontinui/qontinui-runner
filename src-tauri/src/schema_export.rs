@@ -37,12 +37,12 @@ pub fn export_all_schemas() -> Value {
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
         functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        mcp_config as qmc, memory as qmem, orchestration_config as qoc, priorities_profile as qpp,
-        process_management as qpm, projects as qprj, rag as qr, runner as qrn, scheduler as qs,
-        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
-        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
-        workflow_step as qws,
+        journey as qj, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        priorities_profile as qpp, process_management as qpm, projects as qprj, rag as qr,
+        runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
+        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
+        worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -864,6 +864,19 @@ pub fn export_all_schemas() -> Value {
     add!("HelperAnswerSchema", qht::HelperAnswerSchema);
     add!("HelperTaskSource", qht::HelperTaskSource);
 
+    // ── qontinui-types: journey (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 1). STRUCTS ONLY: every journey enum (`NavigationTriggerKind`,
+    // `ChokePoint`, `RunKind`, `EdgeOutcome`, `FrontierReason`, `LedgerState`)
+    // is `#[schemars(inline)]`, so each struct's schema carries its closed
+    // value sets inline and registering the enums would add unreferenced
+    // top-level names. (5) ──
+    add!("JourneyNode", qj::JourneyNode);
+    add!("JourneyTrigger", qj::JourneyTrigger);
+    add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
+    add!("FrontierEntry", qj::FrontierEntry);
+    add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
+
     Value::Object(m)
 }
 
@@ -928,10 +941,21 @@ mod tests {
         // Phase 2) = 553
         // + the 1 component_action target (UiBridgeComponentActionTarget —
         // plan 2026-09-25-builder-ui-bridge-steps-lose-action-and-url
-        // Phase 3) = 554.
-        // Independently corroborated by the codegen, which reports
-        // "Processing 554 top-level types" and emits 554 .d.ts files.
-        assert_eq!(obj.len(), 554, "Expected 554 schema entries");
+        // Phase 3) = 554
+        // + the 5 journey structs (JourneyNode, JourneyTrigger,
+        // JourneyEdgeObservation, FrontierEntry, JourneyLedgerHealth — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phase 1; the journey enums are schemars-inline) = 559.
+        assert_eq!(obj.len(), 559, "Expected 559 schema entries");
+        for journey in [
+            "JourneyNode",
+            "JourneyTrigger",
+            "JourneyEdgeObservation",
+            "FrontierEntry",
+            "JourneyLedgerHealth",
+        ] {
+            assert!(obj.contains_key(journey), "Missing {journey} schema");
+        }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

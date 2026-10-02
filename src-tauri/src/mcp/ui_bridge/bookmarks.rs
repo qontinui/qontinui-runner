@@ -85,7 +85,44 @@ pub async fn ui_bridge_execute_with_diff_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Execute with diff");
-    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", body).await)
+    let result =
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", body.clone()).await);
+    record_diff_result(&state, &body, &result);
+    result
+}
+
+/// Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-users-
+/// path-and-the-passage-of-time, D3) for the runner's execute-with-diff
+/// routes: the response's `beforeSnapshot` / `afterSnapshot` resolve both
+/// nodes, so the edge is written immediately. These routes drive the runner's
+/// OWN webview, so the app is the runner's.
+///
+/// A 4xx the runner answered itself acted on nothing and records nothing. An
+/// action counts as failed when the route failed OR the diff result's
+/// `actionSuccess` is present and not `true`.
+fn record_diff_result(
+    state: &Arc<ApiState>,
+    request_body: &serde_json::Value,
+    result: &Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>,
+) {
+    let Some(route_failed) = crate::journey::capture::control_action_verdict(result) else {
+        return;
+    };
+    let response = match result {
+        Ok(Json(body)) => body.data.clone().unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    };
+    let action_failed = response
+        .get("actionSuccess")
+        .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(true));
+    crate::journey::capture::record_diff(
+        state.app_state.pg_db.clone(),
+        crate::journey::cursor::CursorKey::new(crate::spec_api::storage::RUNNER_APP_ID, None),
+        request_body,
+        &response,
+        crate::journey::cursor::Provenance::default(),
+        route_failed || action_failed,
+    );
 }
 
 /// Composite endpoint: execute one or more actions with atomic change-buffer tracking.
@@ -100,11 +137,52 @@ pub async fn ui_bridge_with_diff_handler(
     // Detect batch vs single based on presence of "operations" array
     if body.get("operations").is_some() {
         info!("UI Bridge API: Batch execute with diff");
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_batch_with_diff", body).await)
+        let result = wrap_ipc_result(
+            ui_bridge_request_sync(&state, "execute_batch_with_diff", body.clone()).await,
+        );
+        // Each operation is its own action (its own pending edge), unlike
+        // `/control/batch-actions`, which is one trigger. A 2xx records each
+        // operation with its own result's outcome hint; a 5xx records every
+        // operation as an `error` edge like every other route (m4); a 4xx the
+        // runner answered itself acted on nothing.
+        let operations = body
+            .get("operations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        match &result {
+            Ok(Json(resp)) => {
+                let results = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("results"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for (op, op_result) in operations.iter().zip(results.iter()) {
+                    let op_ok: Result<
+                        Json<ApiResponse<serde_json::Value>>,
+                        (StatusCode, Json<ApiResponse<()>>),
+                    > = Ok(Json(ApiResponse::success(op_result.clone())));
+                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &op_ok);
+                }
+            }
+            Err((status, _)) if status.is_server_error() => {
+                for op in &operations {
+                    record_diff_result(&state, &with_diff_single_payload(op.clone()), &result);
+                }
+            }
+            Err(_) => {}
+        }
+        result
     } else {
         info!("UI Bridge API: Single execute with diff");
         let payload = with_diff_single_payload(body);
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_with_diff", payload).await)
+        let result = wrap_ipc_result(
+            ui_bridge_request_sync(&state, "execute_with_diff", payload.clone()).await,
+        );
+        record_diff_result(&state, &payload, &result);
+        result
     }
 }
 

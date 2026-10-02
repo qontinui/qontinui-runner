@@ -171,6 +171,7 @@ mod instance;
 mod instance_health;
 mod instance_manager;
 mod iteration_bundle;
+mod journey;
 mod knowledge_acquisition;
 mod known_issues;
 mod launch_env;
@@ -6267,6 +6268,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 tauri::async_runtime::spawn(async move {
                     process_capture::cleanup::run_process_log_cleanup_loop(pg_for_logs).await;
+                });
+            }
+
+            // Spawn the journey edge-ledger retention loop (plan
+            // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+            // Phase 0 decision 2): the runner writes journey edges into its OWN
+            // database, which qontinui-web's retention job cannot reach, so the
+            // 90-day prune runs here — once shortly after startup, then hourly.
+            // Same shape as the retention loops beside it.
+            {
+                let pg_for_journey = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::journey::retention::run_journey_edge_retention_loop(pg_for_journey)
+                        .await;
                 });
             }
 

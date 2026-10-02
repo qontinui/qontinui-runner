@@ -1383,6 +1383,52 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
     }
 }
 
+/// The active SDK connection's `(app_id, version)`, if one is connected —
+/// the app `dispatch_active` will route to. Used by the journey ledger to
+/// attribute an action or snapshot to the app it actually reached.
+async fn active_app_identity(state: &Arc<ApiState>) -> Option<(String, Option<String>)> {
+    let guard = state.sdk_connection.lock().await;
+    guard
+        .active_connection()
+        .map(|c| (c.app_info.app_id.clone(), c.app_info.version.clone()))
+}
+
+/// The version a registered app reported, when it is the active connection.
+/// `None` = not reported (plan U4).
+async fn app_version_for(state: &Arc<ApiState>, app_id: &str) -> Option<String> {
+    let guard = state.sdk_connection.lock().await;
+    guard
+        .connections
+        .values()
+        .find(|c| c.app_info.app_id == app_id)
+        .and_then(|c| c.app_info.version.clone())
+}
+
+/// Journey ledger (D3): a successful, UNFILTERED snapshot of `app_id` (in
+/// `scope`, the relay tab it was pinned to) closes that cursor's pending
+/// edge. A filtered snapshot (`withDisabledOnly`, `recency`, …) is not the
+/// page's configuration, so it records nothing. The body is shared with the
+/// response (`Arc`), never deep-copied; the worker reads through the SDK's
+/// `{success, data}` envelope itself.
+fn record_journey_snapshot(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    scope: Option<&str>,
+    app_version: Option<String>,
+    body: &Arc<serde_json::Value>,
+    filtered: bool,
+) {
+    if filtered || body.get("success") == Some(&serde_json::Value::Bool(false)) {
+        return;
+    }
+    crate::journey::capture::record_snapshot(
+        state.app_state.pg_db.clone(),
+        crate::journey::cursor::CursorKey::new(app_id, scope),
+        app_version,
+        Arc::clone(body),
+    );
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
@@ -1415,6 +1461,11 @@ async fn handle_element_action(
         None => serde_json::json!({ "id": id, "request": body.clone() }),
     };
     let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
+    // The app this action lands on, for the journey ledger: the active SDK
+    // connection (read here, before dispatch, exactly as dispatch reads it),
+    // or the runner's own webview when the IPC fallback below runs instead.
+    let active_app = active_app_identity(&state).await;
+    let mut acted_via_ipc = false;
     let result = match dispatch_app_request_typed(
         &state,
         "executeElementAction",
@@ -1440,9 +1491,14 @@ async fn handle_element_action(
                     .get("error")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                // Recorded as a FAILED action_executed event below.
+                // Recorded as a FAILED action_executed event below. The
+                // journey ledger decides on the refusal's `failure_origin`
+                // (N3): a TRANSPORT refusal reached no UI and records nothing
+                // (the control twin's 4xx rule); an APP-origin failure
+                // reached the app and is an `error` edge.
                 (Json(refusal), false, err)
             } else {
+                acted_via_ipc = true;
                 // Fall back to IPC — wrap action in an object to match the format
                 // expected by the TypeScript handler (action.action, action.params, etc.)
                 let params = body
@@ -1492,6 +1548,37 @@ async fn handle_element_action(
             }
         }
     };
+
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3): open a pending edge for the app
+    // acted on. Only the action NAME and the element id are read — never the
+    // body's `params`, which carries typed text.
+    // The IPC fallback acted on the runner's own webview (its main window),
+    // so the relay tab scope does not apply there.
+    let (journey_app, app_version, scope) = match (acted_via_ipc, active_app) {
+        (false, Some((app_id, version))) => (app_id, version, tab_id),
+        _ => (
+            crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+            None,
+            None,
+        ),
+    };
+    if !crate::journey::capture::sdk_refusal(&result.0) {
+        crate::journey::capture::record_action(
+            state.app_state.pg_db.clone(),
+            crate::journey::cursor::CursorKey::new(journey_app, scope),
+            crate::journey::cursor::ActionSpec::element(
+                &id,
+                &action_name,
+                qontinui_types::journey::ChokePoint::SdkElementAction,
+            ),
+            crate::journey::cursor::Provenance {
+                app_version,
+                run_id: crate::journey::capture::run_id_from_task_run(query.task_run_id),
+            },
+            !result.1,
+        );
+    }
 
     // Persist the action event when task_run_id is provided (fire-and-forget)
     if let Some(tr_id) = query.task_run_id {
@@ -1560,6 +1647,9 @@ async fn handle_snapshot(
     };
     let want_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
         || query.get("with_disabled_only").is_some_and(truthy);
+    // A filtered snapshot is not the page's configuration: the journey ledger
+    // records only unfiltered ones (M2).
+    let filtered = crate::journey::capture::snapshot_query_is_filtered(&query);
     // Per-tab routing (Item #4): pin the snapshot to a specific connected tab
     // when `?tabId=` (or `?targetTabId=`) is supplied. Lets a caller snapshot
     // tab A while tab B is the relay's primary, instead of always getting the
@@ -1612,7 +1702,12 @@ async fn handle_snapshot(
         )
         .await
         {
-            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+            Ok(data) => {
+                let version = app_version_for(&state, app_id).await;
+                let data = Arc::new(data);
+                record_journey_snapshot(&state, app_id, tab_id, version, &data, filtered);
+                (StatusCode::OK, Json(data)).into_response()
+            }
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "success": false, "error": e })),
@@ -1621,6 +1716,7 @@ async fn handle_snapshot(
         };
     }
 
+    let active_app = active_app_identity(&state).await;
     match dispatch_app_request(
         &state,
         "getControlSnapshot",
@@ -1631,16 +1727,31 @@ async fn handle_snapshot(
     )
     .await
     {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Ok(data) => {
+            let data = Arc::new(data);
+            if let Some((app_id, version)) = active_app {
+                record_journey_snapshot(&state, &app_id, tab_id, version, &data, filtered);
+            }
+            (StatusCode::OK, Json(data)).into_response()
+        }
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via control endpoint
             debug!("SDK snapshot unavailable, falling back to control endpoint");
             match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
-                Ok(data) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "success": true, "data": data })),
-                )
-                    .into_response(),
+                Ok(data) => {
+                    let body = Arc::new(serde_json::json!({ "success": true, "data": data }));
+                    // The runner's own webview: its cursor is the main window.
+                    // The fallback ignores the SDK filters, so it is unfiltered.
+                    record_journey_snapshot(
+                        &state,
+                        crate::spec_api::storage::RUNNER_APP_ID,
+                        None,
+                        None,
+                        &body,
+                        false,
+                    );
+                    (StatusCode::OK, Json(body)).into_response()
+                }
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({ "success": false, "error": e })),
@@ -1948,8 +2059,31 @@ async fn handle_ai_search(
     }
 }
 
-/// POST /ui-bridge/sdk/ai/execute — AI-powered action execution
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/ai/execute` is ONE `batch_action` (`ai_execute`); the instruction is never recorded.
 async fn handle_ai_execute(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::batch_kind("ai_execute", None);
+    let response = handle_ai_execute_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/ai/execute — AI-powered action execution
+async fn handle_ai_execute_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -2105,8 +2239,38 @@ async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Va
     }
 }
 
-/// POST /ui-bridge/sdk/fill — Smart form fill
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/fill` is an `element_action` (`fill`) on the first field when it names one, else untargeted; values are never read.
 async fn handle_fill_form(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = match crate::journey::cursor::form_fields(&body).1 {
+        Some(id) => crate::journey::cursor::ActionSpec::element(
+            &id,
+            "fill",
+            qontinui_types::journey::ChokePoint::ElementAction,
+        ),
+        None => crate::journey::cursor::ActionSpec::untargeted_element("fill"),
+    };
+    let response = handle_fill_form_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/fill — Smart form fill
+async fn handle_fill_form_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -2596,8 +2760,34 @@ async fn handle_tabs(
     }
 }
 
-/// POST /ui-bridge/sdk/page/refresh — Refresh the page
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/refresh` is a `navigation` edge: a reload is an `initial` load.
 async fn handle_page_refresh(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope =
+        crate::journey::capture::sdk_request_scope(&journey_query, body.as_ref().map(|b| &b.0));
+    let response = handle_page_refresh_dispatch(State(Arc::clone(&state)), body).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        crate::journey::cursor::ActionSpec::navigation(
+            "refresh",
+            qontinui_types::journey::NavigationTriggerKind::Initial,
+        ),
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/refresh — Refresh the page
+async fn handle_page_refresh_dispatch(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
@@ -2636,8 +2826,34 @@ async fn handle_page_refresh(
     }
 }
 
-/// POST /ui-bridge/sdk/page/navigate — Navigate to a URL
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/navigate` is a `navigation` edge (`push`, or `replace` when the request says so); the URL is never recorded.
 async fn handle_page_navigate(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        "navigate",
+        crate::journey::cursor::push_or_replace(&body),
+    );
+    let response = handle_page_navigate_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/navigate — Navigate to a URL
+async fn handle_page_navigate_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -2708,6 +2924,10 @@ async fn handle_page_navigate(
                         return Json(serde_json::json!({
                             "success": false,
                             "error": message,
+                            // Rejected by the runner before any UI was
+                            // touched: the journey ledger records nothing
+                            // (the control routes' 4xx rule, e1).
+                            "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
                             "error_detail": {
                                 "code": "INVALID_REQUEST",
                                 "message": message,
@@ -2731,8 +2951,34 @@ async fn handle_page_navigate(
     }
 }
 
-/// POST /ui-bridge/sdk/page/back — Go back in history
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/back` is a `navigation` edge triggered by history `pop`.
 async fn handle_page_go_back(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope =
+        crate::journey::capture::sdk_request_scope(&journey_query, body.as_ref().map(|b| &b.0));
+    let response = handle_page_go_back_dispatch(State(Arc::clone(&state)), body).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        crate::journey::cursor::ActionSpec::navigation(
+            "back",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/back — Go back in history
+async fn handle_page_go_back_dispatch(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
@@ -2754,8 +3000,34 @@ async fn handle_page_go_back(
     }
 }
 
-/// POST /ui-bridge/sdk/page/forward — Go forward in history
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/forward` is a `navigation` edge triggered by history `pop`.
 async fn handle_page_go_forward(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope =
+        crate::journey::capture::sdk_request_scope(&journey_query, body.as_ref().map(|b| &b.0));
+    let response = handle_page_go_forward_dispatch(State(Arc::clone(&state)), body).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        crate::journey::cursor::ActionSpec::navigation(
+            "forward",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/forward — Go forward in history
+async fn handle_page_go_forward_dispatch(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Json<serde_json::Value> {
@@ -2777,8 +3049,31 @@ async fn handle_page_go_forward(
     }
 }
 
-/// POST /ui-bridge/sdk/control/page/scroll — Scroll the page or a target element
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/control/page/scroll` is an `element_action` with no element id.
 async fn handle_page_scroll(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("scroll");
+    let response = handle_page_scroll_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/control/page/scroll — Scroll the page or a target element
+async fn handle_page_scroll_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -3902,19 +4197,41 @@ async fn handle_ct_execute_with_diff(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match dispatch_app_request(
+    let active_app = active_app_identity(&state).await;
+    let response = match dispatch_app_request(
         &state,
         "executeWithDiff",
         body.clone(),
         Method::POST,
         "/ai/execute-with-diff",
-        Some(body),
+        Some(body.clone()),
     )
     .await
     {
-        Ok(data) => Json(guard_execute_with_diff(data)),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(data) => guard_execute_with_diff(data),
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    // Journey ledger choke point (plan 2026-09-20-ui-bridge-represents-the-
+    // users-path-and-the-passage-of-time, D3); `sdk_action_target` decides
+    // where it landed (a refusal: nowhere; no SDK app: nowhere — this route has no IPC
+    // fallback, C1).
+    if let Some((key, app_version)) =
+        crate::journey::capture::sdk_action_target(active_app, None, false, &response)
+    {
+        let failed = response.get("success") == Some(&serde_json::Value::Bool(false));
+        crate::journey::capture::record_diff(
+            state.app_state.pg_db.clone(),
+            key,
+            &body,
+            &response,
+            crate::journey::cursor::Provenance {
+                app_version,
+                run_id: None,
+            },
+            failed,
+        );
     }
+    Json(response)
 }
 
 /// Read an `execute_with_diff` result's `actionSuccess`, at the top level (the
@@ -4215,8 +4532,29 @@ async fn handle_undo_state(State(state): State<Arc<ApiState>>) -> Json<serde_jso
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/undo` is an `element_action` with no element id.
+async fn handle_undo(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, None);
+    let response = handle_undo_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        crate::journey::cursor::ActionSpec::untargeted_element("undo"),
+    );
+    response
+}
+
 /// POST /ui-bridge/sdk/undo — Execute undo
-async fn handle_undo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+async fn handle_undo_dispatch(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match dispatch_app_request(
         &state,
@@ -4233,8 +4571,29 @@ async fn handle_undo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Val
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/redo` is an `element_action` with no element id.
+async fn handle_redo(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, None);
+    let response = handle_redo_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        crate::journey::cursor::ActionSpec::untargeted_element("redo"),
+    );
+    response
+}
+
 /// POST /ui-bridge/sdk/redo — Execute redo
-async fn handle_redo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+async fn handle_redo_dispatch(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match dispatch_app_request(
         &state,
@@ -4408,7 +4767,7 @@ async fn handle_component_action(
     // Per-app-id dispatch: skip the active-SDK-connection probe and route
     // straight to the named registered app.
     if let Some(app_id) = query.get("app_id").map(|s| s.as_str()) {
-        return match dispatch_app_request_by_id(
+        let response = match dispatch_app_request_by_id(
             &state,
             app_id,
             "executeComponentAction",
@@ -4419,12 +4778,22 @@ async fn handle_component_action(
         )
         .await
         {
-            Ok(data) => Json(data),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            Ok(data) => data,
+            Err(e) => serde_json::json!({ "success": false, "error": e }),
         };
+        let version = app_version_for(&state, app_id).await;
+        record_sdk_component_action(
+            &state,
+            Some((app_id.to_string(), version)),
+            &id,
+            &action_id,
+            &response,
+        );
+        return Json(response);
     }
 
-    match dispatch_app_request(
+    let active_app = active_app_identity(&state).await;
+    let response = match dispatch_app_request(
         &state,
         "executeComponentAction",
         ws_payload,
@@ -4434,9 +4803,85 @@ async fn handle_component_action(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    // With no active SDK app the dispatch reached nothing (this route has no
+    // IPC fallback), so `sdk_action_target` records no edge (C1).
+    record_sdk_component_action(&state, active_app, &id, &action_id, &response);
+    Json(response)
+}
+
+/// Whether an SDK route's JSON answer is an explicit failure.
+fn sdk_response_failed(response: &serde_json::Value) -> bool {
+    response.get("success") == Some(&serde_json::Value::Bool(false))
+}
+
+/// Journey ledger choke point for the SDK component action (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, D3).
+///
+/// Recorded as `ChokePoint::ComponentAction`, the same kind as the control
+/// route `/control/component/{id}/action/{action_id}`: `ChokePoint` names the
+/// ACTION KIND, not the transport, so whether a component action arrived over
+/// the SDK route or the control route is NOT recorded in the ledger. Same
+/// pending-edge rule as its control twin (no snapshot in hand).
+fn record_sdk_component_action(
+    state: &Arc<ApiState>,
+    target_app: Option<(String, Option<String>)>,
+    component_id: &str,
+    action_id: &str,
+    response: &serde_json::Value,
+) {
+    let Some((key, app_version)) =
+        crate::journey::capture::sdk_action_target(target_app, None, false, response)
+    else {
+        return;
+    };
+    crate::journey::capture::record_action(
+        state.app_state.pg_db.clone(),
+        key,
+        crate::journey::cursor::ActionSpec::component(component_id, action_id),
+        crate::journey::cursor::Provenance {
+            app_version,
+            run_id: None,
+        },
+        sdk_response_failed(response),
+    );
+}
+
+/// Journey ledger choke point for the two SDK batch routes (D3).
+///
+/// Recorded as `ChokePoint::BatchAction`, the same kind as the control route
+/// `/control/batch-actions`: `ChokePoint` names the ACTION KIND, not the
+/// transport, so whether a batch arrived over an SDK route or the control
+/// route is NOT recorded in the ledger. Same rule as the control twin: the
+/// batch is ONE trigger (`batch:<n>` on its first target) opening one pending
+/// edge. `action_steps` are the steps that act on an element; an empty batch
+/// acted on nothing and records nothing; `sdk_action_target` decides where
+/// the rest landed (a refusal or no SDK app: nowhere — this route has no
+/// IPC fallback, C1).
+fn record_sdk_batch(
+    state: &Arc<ApiState>,
+    active_app: Option<(String, Option<String>)>,
+    action_steps: &[serde_json::Value],
+    response: &serde_json::Value,
+) {
+    let (Some((key, app_version)), Some(action)) = (
+        crate::journey::capture::sdk_action_target(active_app, None, false, response),
+        crate::journey::cursor::ActionSpec::batch(action_steps),
+    ) else {
+        return;
+    };
+    crate::journey::capture::record_action(
+        state.app_state.pg_db.clone(),
+        key,
+        action,
+        crate::journey::cursor::Provenance {
+            app_version,
+            run_id: None,
+        },
+        sdk_response_failed(response),
+    );
 }
 
 /// GET /ui-bridge/sdk/control/element/:id/state-generic — Get generic element state
@@ -4532,8 +4977,15 @@ async fn handle_execute_batch_action(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    // `BatchActionRequest.steps[]` — every step acts on an element.
+    let steps = body
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    let response = match dispatch_app_request(
         &state,
         "executeBatchAction",
         serde_json::json!({ "request": body.clone() }),
@@ -4543,9 +4995,23 @@ async fn handle_execute_batch_action(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    record_sdk_batch(&state, active_app, &steps, &response);
+    Json(response)
+}
+
+/// The steps of a `ControlBatchRequest` that act on an element
+/// (`type: "action"`); `wait` and `snapshot` steps act on nothing.
+fn control_batch_action_steps(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body.get("actions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|step| step.get("type").and_then(|t| t.as_str()) == Some("action"))
+        .cloned()
+        .collect()
 }
 
 /// POST /ui-bridge/sdk/control/batch — Execute a batched control request
@@ -4553,8 +5019,10 @@ async fn handle_control_batch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    let steps = control_batch_action_steps(&body);
+    let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    let response = match dispatch_app_request(
         &state,
         "controlBatch",
         body.clone(),
@@ -4564,9 +5032,11 @@ async fn handle_control_batch(
     )
     .await
     {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
+    };
+    record_sdk_batch(&state, active_app, &steps, &response);
+    Json(response)
 }
 
 // =============================================================================
@@ -4594,8 +5064,33 @@ async fn handle_workflows(State(state): State<Arc<ApiState>>) -> Json<serde_json
     }
 }
 
-/// POST /ui-bridge/sdk/workflow/:id/run — Run a workflow
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/workflow/{id}/run` is ONE `batch_action` (`workflow:<id>`).
 async fn handle_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope =
+        crate::journey::capture::sdk_request_scope(&journey_query, body.as_ref().map(|b| &b.0));
+    let action = crate::journey::cursor::ActionSpec::batch_kind(&format!("workflow:{id}"), None);
+    let response = handle_workflow_run_dispatch(State(Arc::clone(&state)), Path(id), body).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/workflow/:id/run — Run a workflow
+async fn handle_workflow_run_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     body: Option<Json<serde_json::Value>>,
@@ -4863,8 +5358,31 @@ async fn handle_find_path(
     }
 }
 
-/// POST /ui-bridge/sdk/states/navigate — Navigate to a state
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/states/navigate` is ONE `batch_action` (`states_navigate`).
 async fn handle_navigate_to(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::batch_kind("states_navigate", None);
+    let response = handle_navigate_to_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/states/navigate — Navigate to a state
+async fn handle_navigate_to_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -5052,8 +5570,31 @@ async fn handle_can_execute_transition(
     }
 }
 
-/// POST /ui-bridge/sdk/transition/:id/execute — Execute a transition
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/transition/{id}/execute` is ONE `batch_action` (`transition:<id>`).
 async fn handle_execute_transition(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, None);
+    let action = crate::journey::cursor::ActionSpec::batch_kind(&format!("transition:{id}"), None);
+    let response = handle_execute_transition_dispatch(State(Arc::clone(&state)), Path(id)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/transition/:id/execute — Execute a transition
+async fn handle_execute_transition_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
@@ -5095,8 +5636,41 @@ async fn handle_list_intents(State(state): State<Arc<ApiState>>) -> Json<serde_j
     }
 }
 
-/// POST /ui-bridge/sdk/ai/intents/execute — Execute an intent
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/ai/intents/execute` is ONE `batch_action` (`intent:<id>`).
 async fn handle_execute_intent(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::batch_kind(
+        &format!(
+            "intent:{}",
+            body.get("intentId")
+                .or_else(|| body.get("id"))
+                .or_else(|| body.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        ),
+        None,
+    );
+    let response = handle_execute_intent_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/ai/intents/execute — Execute an intent
+async fn handle_execute_intent_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -5155,8 +5729,32 @@ async fn handle_register_intent(
     }
 }
 
-/// POST /ui-bridge/sdk/ai/intents/execute-from-query — Execute intent from natural language
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/ai/intents/execute-from-query` is ONE `batch_action` (`intent_query`); the query is never recorded.
 async fn handle_execute_intent_from_query(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::batch_kind("intent_query", None);
+    let response =
+        handle_execute_intent_from_query_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/ai/intents/execute-from-query — Execute intent from natural language
+async fn handle_execute_intent_from_query_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -5200,8 +5798,31 @@ async fn handle_delete_intent(
 // Recovery Handler
 // =============================================================================
 
-/// POST /ui-bridge/sdk/ai/recovery/attempt — Attempt error recovery
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/ai/recovery/attempt` re-attempts a failed action: ONE `batch_action`
+/// (`recovery_attempt`), like its control twin.
 async fn handle_recovery_attempt(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let response = handle_recovery_attempt_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        false,
+        &response.0,
+        crate::journey::cursor::ActionSpec::batch_kind("recovery_attempt", None),
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/ai/recovery/attempt — Attempt error recovery
+async fn handle_recovery_attempt_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -6430,8 +7051,31 @@ async fn handle_page_evaluate(
 // App-Agnostic Convenience Endpoints
 // =============================================================================
 
-/// POST /ui-bridge/sdk/page/click-by-text — Click an element by visible text
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/click-by-text` is an `element_action` with no element id.
 async fn handle_click_by_text(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_text");
+    let response = handle_click_by_text_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/click-by-text — Click an element by visible text
+async fn handle_click_by_text_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -6463,8 +7107,31 @@ async fn handle_click_by_text(
     }
 }
 
-/// POST /ui-bridge/sdk/page/click-by-selector — Click an element by CSS selector
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/click-by-selector` is an `element_action` with no element id.
 async fn handle_click_by_selector(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("click_by_selector");
+    let response = handle_click_by_selector_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/click-by-selector — Click an element by CSS selector
+async fn handle_click_by_selector_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -6496,8 +7163,31 @@ async fn handle_click_by_selector(
     }
 }
 
-/// POST /ui-bridge/sdk/page/type-into — Type text into an input field
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/type-into` is an `element_action`; the text is never read.
 async fn handle_type_into(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("type_into");
+    let response = handle_type_into_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/type-into — Type text into an input field
+async fn handle_type_into_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -6562,6 +7252,29 @@ async fn handle_read_value(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/send-keys` is an `element_action`; the keys are never read.
+async fn handle_send_keys_to_page(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("send_keys");
+    let response = handle_send_keys_to_page_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
 /// POST /ui-bridge/sdk/page/send-keys — Dispatch a key sequence at the DOCUMENT
 /// level (not scoped to an element).
 ///
@@ -6575,7 +7288,7 @@ async fn handle_read_value(
 /// the by-name rejection of an unknown `target` belong to whichever side
 /// executes the dispatch, and duplicating them here would be a fourth copy of
 /// the key vocabulary that could drift.
-async fn handle_send_keys_to_page(
+async fn handle_send_keys_to_page_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -6606,7 +7319,7 @@ async fn handle_send_keys_to_page(
             // message type the webview relay actually handles. Re-emitting a
             // `send_keys_to_page` message here would be silently dropped.
             // Same delegation pattern as `handle_list_windows` above.
-            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler(
+            match crate::mcp::ui_bridge::keyboard::ui_bridge_send_keys_to_page_handler_dispatch(
                 State(state.clone()),
                 Json(body),
             )
@@ -6615,8 +7328,13 @@ async fn handle_send_keys_to_page(
                 Ok(Json(resp)) => Json(serde_json::to_value(resp).unwrap_or_else(
                     |e| serde_json::json!({ "success": false, "error": e.to_string() }),
                 )),
-                Err((_status, Json(err))) => Json(serde_json::to_value(err).unwrap_or_else(
-                    |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                // A 4xx is the runner rejecting the request before any key
+                // was sent: tagged so the journey ledger records nothing (e1).
+                Err((status, Json(err))) => Json(crate::journey::capture::tag_runner_rejection(
+                    serde_json::to_value(err).unwrap_or_else(
+                        |e| serde_json::json!({ "success": false, "error": e.to_string() }),
+                    ),
+                    status,
                 )),
             }
         }
@@ -6700,8 +7418,34 @@ async fn handle_page_routes(State(state): State<Arc<ApiState>>) -> Json<serde_js
     }
 }
 
-/// POST /ui-bridge/sdk/page/navigate-to — Navigate using the navigation adapter
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/sdk/page/navigate-to` is a `navigation` edge (`push` / `replace`); the route is never recorded.
 async fn handle_navigate_by_adapter(
+    State(state): State<Arc<ApiState>>,
+    Query(journey_query): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active_app = active_app_identity(&state).await;
+    let scope = crate::journey::capture::sdk_request_scope(&journey_query, Some(&body));
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        "navigate_to",
+        crate::journey::cursor::push_or_replace(&body),
+    );
+    let response = handle_navigate_by_adapter_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_sdk_result(
+        &state,
+        active_app,
+        scope.as_deref(),
+        true,
+        &response.0,
+        action,
+    );
+    response
+}
+
+/// POST /ui-bridge/sdk/page/navigate-to — Navigate using the navigation adapter
+async fn handle_navigate_by_adapter_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -7479,7 +8223,14 @@ mod tests {
             "handle_find_by_text",
             "handle_navigate_by_adapter",
         ] {
-            let needle = format!("\nasync fn {handler}(");
+            // A handler the journey ledger wraps keeps its original body in
+            // `<handler>_dispatch`; the wrapper itself only records.
+            let wrapped = format!("\nasync fn {handler}_dispatch(");
+            let needle = if src.contains(wrapped.as_str()) {
+                wrapped
+            } else {
+                format!("\nasync fn {handler}(")
+            };
             let body = src
                 .split(needle.as_str())
                 .nth(1)
@@ -7502,7 +8253,7 @@ mod tests {
             // canonical `/control/page/send-keys` handler instead.
             let fallback = body
                 .find("ui_bridge_request_sync(")
-                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler("))
+                .or_else(|| body.find("ui_bridge_send_keys_to_page_handler_dispatch("))
                 .unwrap_or_else(|| panic!("{handler} has no IPC fallback any more"));
             assert!(
                 gate < fallback,
@@ -7561,7 +8312,8 @@ mod tests {
             .iter()
             .any(|d| chunk.contains(d));
             let falls_back = chunk.contains("ui_bridge_request_sync(")
-                || (chunk.contains("crate::mcp::ui_bridge::") && chunk.contains("_handler("));
+                || (chunk.contains("crate::mcp::ui_bridge::")
+                    && (chunk.contains("_handler(") || chunk.contains("_handler_dispatch(")));
             if !(dispatches && falls_back) {
                 continue;
             }
@@ -7667,7 +8419,10 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nasync fn ").next())
             .expect("handle_ct_execute_with_diff present");
-        assert!(body.contains("Ok(data) => Json(guard_execute_with_diff(data)),"));
+        // The journey choke point reads the guarded value before replying,
+        // so the Ok arm binds it and the handler returns that same value.
+        assert!(body.contains("Ok(data) => guard_execute_with_diff(data),"));
+        assert!(body.contains("\n    Json(response)\n}"));
     }
 
     #[test]
