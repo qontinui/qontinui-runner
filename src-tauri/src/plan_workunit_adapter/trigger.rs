@@ -262,10 +262,13 @@ pub fn adapter_metrics() -> &'static AdapterMetrics {
 // having succeeded, because by its own lights it did. This block computes the
 // missing number once per cycle and publishes it beside the other gauges.
 //
-// It measures and it says. It does NOT change the scan source and it does NOT
-// fetch: the reading is explicitly "as of this clone's last fetch", which is
-// what makes landing the detector a behaviour-free change. Moving the scan onto
-// a ref is Phase 2, deferred while four open PRs rewrite this seam.
+// It measures and it says. It does not change the scan source. It landed as a
+// fetch-free detector ("as of this clone's last fetch"); since the scan moved
+// onto a ref (Phase 2) and the cycle took one ref pin, the reading resolves the
+// default ref through that pin (plan
+// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`): on a writing
+// cycle it is as of the cycle's own fetch, on a withheld cycle or a failed
+// fetch it is as of the clone's last fetch — see `ScanDivergence::ref_sha`.
 // ---------------------------------------------------------------------------
 
 /// Why a [`ScanDivergence`] reading says what it says.
@@ -857,13 +860,31 @@ fn measure_unstamped(
     // Resolved through the cycle's pin when there is one — see
     // [`measure_scan_divergence_pinned`] for the three answers. The clock is
     // read only once this resolution (and, on a writing pin, its fetch) is done.
-    let resolved = match pin.map(|p| p.resolve_ref(git, &root, &default_ref)) {
-        Some(Ok(Some(sha))) => Ok(sha),
-        Some(Ok(None)) => {
-            Err("the cycle fetched it, but it would not resolve to an object id".to_string())
-        }
+    //
+    // The pin is consulted only when the plans dir is LISTABLE at the ref —
+    // the same predicate the scan's own `resolve_source` checks before it
+    // fetches. A plans dir the ref can never list (outside its work-tree
+    // root, say) is `Unavailable` to the scan without a fetch, so the probe
+    // must not be the thing that fetches for it every cycle; it reads the
+    // as-found ref instead, and no census travels to disagree with it.
+    let pin = pin.filter(|_| {
+        matches!(
+            super::ref_scan::resolve_ref_listing_source(git, dir),
+            super::ref_scan::ScanSource::Ref { .. }
+        )
+    });
+    let resolved = match pin.map(|p| (p.is_fetching(), p.resolve_ref(git, &root, &default_ref))) {
+        Some((_, Ok(Some(sha)))) => Ok(sha),
+        Some((fetching, Ok(None))) => Err(format!(
+            "the cycle's ref pin ({}) found it, but it would not resolve to an object id",
+            if fetching {
+                "after fetching"
+            } else {
+                "without fetching"
+            }
+        )),
         // The pin's fetch failed (or there is no pin): the as-found ref.
-        Some(Err(_)) | None => git.rev_parse(&root, &default_ref),
+        Some((_, Err(_))) | None => git.rev_parse(&root, &default_ref),
     };
     let now_unix = clock();
     let ref_sha = match resolved {
@@ -958,7 +979,8 @@ fn measure_unstamped(
         }
         Err(e) => ScanDivergence {
             detail: Some(format!(
-                "cannot count `{default_ref}`...`HEAD` in `{root_str}`: {e}"
+                "cannot count `{default_ref}` (resolved to the cycle's sha)...`HEAD` in \
+                 `{root_str}`: {e}"
             )),
             ..base
         },
@@ -2232,6 +2254,10 @@ pub fn ref_census_only(
     pin: &CycleRefPin,
 ) -> Result<Option<super::body_push::PlanSlugCensus>, String> {
     use super::ref_scan::{list_ref_plan_names_at, resolve_ref_listing_source, ScanSource};
+    debug_assert!(
+        !pin.is_fetching(),
+        "the census-only listing never fetches, so it reads through a listing-only pin"
+    );
     match resolve_ref_listing_source(git, dir) {
         // Not in a repo: the same `None` the WorkTree arm of
         // `read_plans_for_cycle` reports. There is no ref, so there is no ref
@@ -10131,12 +10157,6 @@ Body.
             vec!["a".repeat(40)],
             "behind/ahead were counted against the object id the reading reports"
         );
-        // The pin is the one the cycle's census then reads through: no second
-        // resolution is possible.
-        assert_eq!(
-            pin.resolve_ref(&git, Path::new("/repo"), "origin/main"),
-            Ok(Some("a".repeat(40)))
-        );
     }
 
     /// **T4 — a failed fetch still yields an honest as-found reading.** The
@@ -10257,6 +10277,25 @@ Body.
         );
         // Refreshed at NOW - 60 by the canned stamp, read at NOW + 90.
         assert_eq!(d.ref_age_secs, Some(150));
+    }
+
+    /// The probe never makes a writing pin fetch for a plans dir the ref can
+    /// never list (here: one outside its work-tree root). The scan reports that
+    /// dir `Unavailable` WITHOUT fetching; a probe that fetched anyway would
+    /// cost a network round-trip every cycle on a standing misconfiguration.
+    ///
+    /// Neuter check: drop the listability filter on `pin` in
+    /// `measure_unstamped` — the probe then fetches through the pin, and this
+    /// fails on the count.
+    #[test]
+    fn the_probe_does_not_fetch_for_a_plans_dir_the_ref_cannot_list() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let git = MovingRef::at(root.path());
+        let pin = CycleRefPin::default();
+        let d = measure_scan_divergence_pinned(Some(elsewhere.path()), &git, Some(&pin), &|| NOW);
+        assert_eq!(d.state, ScanDivergenceState::Measured, "{d:?}");
+        assert_eq!(git.fetches(), 0, "no fetch for an unlistable plans dir");
     }
 
     /// A listing-only pin resolves once and never fetches; a default pin
