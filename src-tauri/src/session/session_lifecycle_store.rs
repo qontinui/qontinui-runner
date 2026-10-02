@@ -2626,14 +2626,40 @@ impl SessionLifecycleStore {
 
     /// Clone of EVERY record — OPEN and CLOSED alike (closed rows are retained
     /// until the 24 h prune). Unlike [`open_records`](Self::open_records) this
-    /// applies no state filter. Used by the DISPLAY-only "previous sessions"
-    /// listing ([`crate::session::past_sessions`]), which merges these with the
-    /// snapshot-history reader; it is NOT a restore surface.
+    /// applies no state filter, and it is NOT a restore surface (that is
+    /// [`restorable_records`](Self::restorable_records)). Its readers are
+    /// reporting and census surfaces — among them the "previous sessions"
+    /// listing ([`crate::session::past_sessions`]), the session ledger, the
+    /// restore census, the restore-health projection and the `/coord-mcp`
+    /// workdir census — none of which resurrects a row from it.
+    ///
+    /// It clones the whole set under the lock, closed rows included, so a hot
+    /// path that needs only some of them should use
+    /// [`records_where`](Self::records_where) instead; the `/coord-mcp`
+    /// caller-session resolver does exactly that.
     pub fn all_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
             Ok(m) => m.values().cloned().collect(),
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Clone of the records `keep` accepts, filtered UNDER the lock so a
+    /// rejected record is never cloned. A snapshot exactly like
+    /// [`all_records`](Self::all_records) restricted to `keep` — the cheap
+    /// form for a per-request caller that needs the open set plus a narrow
+    /// slice of the closed history rather than all 24 h of it.
+    pub fn records_where(
+        &self,
+        keep: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Vec<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m.values().filter(|r| keep(r)).cloned().collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on records_where");
                 Vec::new()
             }
         }
@@ -6155,6 +6181,34 @@ mod tests {
             closed.finished_at.is_none(),
             "a crashed/exited session is CLOSED, not FINISHED"
         );
+    }
+
+    /// `records_where` is `all_records` filtered under the lock: it returns
+    /// exactly the records the predicate accepts, closed ones included when
+    /// accepted, and none it rejects.
+    #[test]
+    fn records_where_returns_exactly_the_accepted_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("live"));
+        store.record_open(rec("gone"));
+        store.record_open(rec("kept-closed"));
+        store.record_close("gone", "pty-exit");
+        store.record_close("kept-closed", "pty-exit");
+
+        let mut ids: Vec<String> = store
+            .records_where(|r| r.state == "open" || r.claude_session_id == "kept-closed")
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["kept-closed".to_string(), "live".to_string()]);
+        assert_eq!(
+            store.records_where(|_| true).len(),
+            store.all_records().len()
+        );
+        assert!(store.records_where(|_| false).is_empty());
     }
 
     /// Re-finishing must be idempotent: a repeat call must not move the
