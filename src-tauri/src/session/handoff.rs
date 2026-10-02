@@ -764,6 +764,13 @@ async fn handle_push_frame(
     sources: &MaterializedSources,
     text: &str,
 ) {
+    // The MESSAGE-WAKE arm — fifth suffix on the same socket
+    // (`.message_enqueued`), same disambiguation. Rings the session-message
+    // poller's doorbell; materializes and records nothing (the payload is ids
+    // only — the body stays behind the poller's authorized pending read). It
+    // is synchronous and runs FIRST so a doorbell never waits behind a
+    // respawn materialization awaited below.
+    super::message_wake::handle_push_frame(device_id, text);
     // The RESPAWN arm shares this one socket (coord publishes respawns on the
     // same `qontinui.sessions.<tenant>.<device>.<kind>` family). The two arms
     // are disambiguated ONLY by the channel's trailing segment — this parser
@@ -781,11 +788,6 @@ async fn handle_push_frame(
     // grant arms are disjoint in both directions (asserted in `create`'s
     // tests), so an attach grant can never land in the create table.
     super::create::handle_push_frame(device_id, text);
-    // The MESSAGE-WAKE arm — fifth suffix on the same socket
-    // (`.message_enqueued`), same disambiguation. Rings the session-message
-    // poller's doorbell; materializes and records nothing (the payload is ids
-    // only — the body stays behind the poller's authorized pending read).
-    super::message_wake::handle_push_frame(device_id, text);
 
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;
@@ -2226,5 +2228,72 @@ mod tests {
         assert!(!super::resumed_after_drain(true, true));
         assert!(!super::resumed_after_drain(true, false));
         assert!(!super::resumed_after_drain(false, false));
+    }
+
+    /// The `/ws` dispatcher this module owns routes a `.message_enqueued`
+    /// frame for this device into the message-wake arm (deleting that wiring
+    /// turns this red), and the other arms ignore it — nothing materializes,
+    /// so the registry and store here are never touched.
+    #[tokio::test]
+    async fn push_dispatch_routes_message_enqueued_to_the_wake_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            super::super::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap(),
+        );
+        let external = || {
+            Arc::new(super::super::transport::ExternalTransport)
+                as super::super::transport::DynTransport
+        };
+        let registry = SessionRegistry::new(
+            Uuid::new_v4(),
+            super::super::SessionTransports {
+                pty: external(),
+                claude_cli: external(),
+                workflow: external(),
+            },
+            super::super::coord_sync::CoordSync::new(outbox),
+        );
+        let lifecycle_store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let http = reqwest::Client::new();
+        let sources = MaterializedSources::default();
+        let device = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let message_id = Uuid::new_v4().to_string();
+        let frame = json!({
+            "channel": format!("qontinui.sessions.{tenant}.{device}.message_enqueued"),
+            "payload": json!({
+                "message_id": message_id,
+                "to_session": Uuid::new_v4().to_string(),
+                "priority": "normal",
+            })
+            .to_string(),
+        })
+        .to_string();
+
+        handle_push_frame(
+            &registry,
+            &lifecycle_store,
+            &http,
+            "http://127.0.0.1:9",
+            device,
+            &sources,
+            &frame,
+        )
+        .await;
+
+        let rung = super::super::message_wake::rung_ids()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert!(
+            rung.contains(&message_id),
+            "the dispatcher must ring the message-wake doorbell for this device's frame"
+        );
+        assert!(
+            registry.snapshot().is_empty(),
+            "a doorbell materializes nothing"
+        );
     }
 }

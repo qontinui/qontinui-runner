@@ -73,8 +73,22 @@ pub(super) fn parse_message_push(text: &str, device_id: Uuid) -> Option<MessageE
     let envelope: serde_json::Value = serde_json::from_str(text).ok()?;
     let channel = envelope.get("channel").and_then(|c| c.as_str())?;
 
-    let suffix = format!(".{device_id}.{SUFFIX}");
-    if !channel.starts_with("qontinui.sessions.") || !channel.ends_with(&suffix) {
+    // `machine_subject_raw` is exactly
+    // `qontinui.sessions.<tenant>.<machine>.<kind>` — five segments, as
+    // `create::parse_create_push` requires. Matching every segment (not only
+    // the two ends) means a channel with an extra segment spliced in, or an
+    // empty tenant, does not pass on its endpoints alone.
+    let device = device_id.to_string();
+    let segments: Vec<&str> = channel.split('.').collect();
+    let [root, family, tenant, machine, kind] = segments.as_slice() else {
+        return None;
+    };
+    if *root != "qontinui"
+        || *family != "sessions"
+        || tenant.is_empty()
+        || *machine != device
+        || *kind != SUFFIX
+    {
         return None;
     }
 
@@ -87,8 +101,18 @@ pub(super) fn parse_message_push(text: &str, device_id: Uuid) -> Option<MessageE
     serde_json::from_value(payload_val).ok()
 }
 
-/// Ring the doorbell for one parsed directive.
-fn ring(enqueued: &MessageEnqueued) {
+/// Message ids this process rang for, newest last — test-only evidence that a
+/// frame reached the ring through whichever dispatcher carried it. Keyed by
+/// id so concurrent tests sharing the global doorbell never read each
+/// other's rings.
+#[cfg(test)]
+pub(crate) fn rung_ids() -> &'static std::sync::Mutex<Vec<String>> {
+    static RUNG: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+    RUNG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Ring `wake` for one parsed directive.
+fn ring(wake: &Notify, enqueued: &MessageEnqueued) {
     tracing::debug!(
         message_id = %enqueued.message_id,
         to_session = ?enqueued.to_session,
@@ -96,14 +120,25 @@ fn ring(enqueued: &MessageEnqueued) {
         blocking = enqueued.is_blocking(),
         "session messages: message_enqueued push received; waking the poller"
     );
-    wake().notify_one();
+    #[cfg(test)]
+    rung_ids()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(enqueued.message_id.clone());
+    wake.notify_one();
 }
 
 /// Handle one inbound `/ws` frame on the message-wake arm. Not a
 /// `message_enqueued` directive for this device → ignored silently.
 pub(super) fn handle_push_frame(device_id: Uuid, text: &str) {
+    handle_push_frame_on(wake(), device_id, text);
+}
+
+/// [`handle_push_frame`] against an explicit doorbell, so the ring is
+/// observable in a test without racing other users of the global one.
+fn handle_push_frame_on(wake: &Notify, device_id: Uuid, text: &str) {
     if let Some(enqueued) = parse_message_push(text, device_id) {
-        ring(&enqueued);
+        ring(wake, &enqueued);
     }
 }
 
@@ -150,6 +185,10 @@ mod tests {
             format!("qontinui.sessions.{tenant}.{device}.handoff_request"),
             format!("qontinui.sessions.{tenant}.{device}.message_enqueued_v2"),
             format!("qontinui.other.{tenant}.{device}.message_enqueued"),
+            format!("qontinui.sessions.a.b.{device}.message_enqueued"),
+            format!("qontinui.sessions..{device}.message_enqueued"),
+            format!("xqontinui.sessions.{tenant}.{device}.message_enqueued"),
+            format!("qontinui.sessions.{tenant}.x{device}.message_enqueued"),
         ] {
             let env = json!({"channel": wrong, "payload": body().to_string()});
             assert!(
@@ -201,25 +240,23 @@ mod tests {
         assert!(!mk("").is_blocking());
     }
 
-    /// A frame for this device leaves a permit on the global doorbell, so a
-    /// waiter that arrives AFTER the push still wakes at once; a frame for
-    /// another device rings nothing.
+    /// A frame for this device leaves a permit on the doorbell, so a waiter
+    /// that arrives AFTER the push still wakes at once; a frame for another
+    /// device rings nothing.
     #[tokio::test]
-    async fn handle_push_frame_rings_the_global_wake() {
+    async fn handle_push_frame_rings_the_doorbell() {
         let device = Uuid::from_u128(10);
         let other = Uuid::from_u128(11);
         let tenant = Uuid::from_u128(30);
-
-        // Drain any permit a sibling test left behind.
-        let _ = tokio::time::timeout(Duration::from_millis(10), wake().notified()).await;
+        let wake = Notify::new();
 
         let foreign = json!({
             "channel": format!("qontinui.sessions.{tenant}.{other}.message_enqueued"),
             "payload": body().to_string(),
         });
-        handle_push_frame(device, &foreign.to_string());
+        handle_push_frame_on(&wake, device, &foreign.to_string());
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), wake().notified())
+            tokio::time::timeout(Duration::from_millis(50), wake.notified())
                 .await
                 .is_err(),
             "another device's frame must not ring"
@@ -229,9 +266,9 @@ mod tests {
             "channel": format!("qontinui.sessions.{tenant}.{device}.message_enqueued"),
             "payload": body().to_string(),
         });
-        handle_push_frame(device, &mine.to_string());
+        handle_push_frame_on(&wake, device, &mine.to_string());
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), wake().notified())
+            tokio::time::timeout(Duration::from_secs(1), wake.notified())
                 .await
                 .is_ok(),
             "this device's frame must ring"
