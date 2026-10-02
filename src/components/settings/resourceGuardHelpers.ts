@@ -251,7 +251,8 @@ export type ThreadCeilingSource =
   | "fleet"
   | "clamp_min"
   | "clamp_max"
-  | "ladder";
+  | "ladder"
+  | "census_misread";
 
 interface ThreadCeilingPair {
   warn: number;
@@ -290,13 +291,19 @@ export interface ThreadCeilingsReport {
         perSessionThreadsUsed: number;
       })
     | null;
-  scaledUnknown: "cores_unknown" | "mem_total_unknown" | "session_threads_unknown" | null;
+  scaledUnknown:
+    | "cores_unknown"
+    | "mem_total_unknown"
+    | "session_threads_unknown"
+    | "session_census_misread"
+    | null;
   inputs: {
     cores: number | null;
     memTotalBytes: number | null;
     baseline: number | null;
     perSessionThreads: number | null;
     sessionThreadsNow: number | null;
+    sessionCensusMisread: boolean;
   };
   ladderCoerced: boolean;
 }
@@ -332,6 +339,8 @@ export function threadCeilingSourceText(
       return `cut to the ${report.absMax}-thread bound`;
     case "ladder":
       return "raised to the warn ceiling — the lighter verdict has to fire first";
+    case "census_misread":
+      return "the built-in floor — the thread census disagreed with the live session count, so this machine's sized default is unknown right now";
   }
 }
 
