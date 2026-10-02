@@ -602,6 +602,7 @@ mod tests {
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,
+            activated_by: None,
         };
         mgr.connections.insert(url.to_string(), conn);
         mgr.active_url = Some(url.to_string());

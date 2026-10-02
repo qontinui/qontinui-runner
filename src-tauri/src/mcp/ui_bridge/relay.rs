@@ -52,7 +52,8 @@ use axum::Extension;
 
 use crate::mcp::origin_guard::RequesterPrincipal;
 use crate::mcp::relay_binding::{
-    BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R1, RULE_R5, RULE_R9_UNKEYED,
+    BindingMode, Principal, Refusal, RelayBinding, RelayState, BINDING_TOMBSTONE_MS, RULE_R1,
+    RULE_R5, RULE_R8, RULE_R9_UNKEYED,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -127,13 +128,21 @@ pub struct CommandResult {
     pub error: Option<String>,
 }
 
+/// One tab an untargeted dispatch could have meant, with the origin its
+/// attach was verified at (`None` for operator trust and a keyed tab).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabCandidate {
+    pub id: String,
+    pub verified_origin: Option<String>,
+}
+
 /// Why a dispatch could not produce a tab result.
 #[derive(Debug)]
 pub enum DispatchError {
     /// No tab currently holds a live SSE listener.
     NoTabConnected,
     /// No `tabId` was supplied and more than one tab is connected.
-    AmbiguousTab(Vec<String>),
+    AmbiguousTab(Vec<TabCandidate>),
     /// The named tab is unknown or has no live SSE listener.
     TabNotFound(String),
     /// The tab's listener channel closed before a result arrived.
@@ -481,6 +490,7 @@ impl RelayRegistry {
     /// Returns `(tab_id, command_id, result)` on success.
     pub async fn dispatch(
         &self,
+        binding: &RelayBinding,
         tab_id: Option<&str>,
         action: &str,
         payload: serde_json::Value,
@@ -505,20 +515,75 @@ impl RelayRegistry {
                     id.to_string()
                 }
                 None => {
+                    let now = now_ms();
                     let connected: Vec<&String> = inner
                         .tabs
                         .iter()
                         .filter(|(_, t)| t.listener.is_some())
                         .map(|(id, _)| id)
                         .collect();
-                    match connected.len() {
-                        0 => return Err(DispatchError::NoTabConnected),
-                        1 => connected[0].clone(),
-                        _ => {
-                            let mut ids: Vec<String> = connected.into_iter().cloned().collect();
-                            ids.sort();
-                            return Err(DispatchError::AmbiguousTab(ids));
+                    if connected.is_empty() {
+                        return Err(DispatchError::NoTabConnected);
+                    }
+                    // R8: an untargeted dispatch may resolve only when exactly
+                    // one tab is connected AND no tab under a different
+                    // principal is, or was within the reservation window,
+                    // connected. Otherwise a fresh foreign tab attaching while
+                    // the real one reconnects would capture the command.
+                    let sole = (connected.len() == 1).then(|| connected[0].clone());
+                    let rival = sole.as_ref().is_some_and(|id| {
+                        let mine = inner.tabs.get(id).and_then(|t| t.principal.as_ref());
+                        inner.tabs.iter().any(|(other, t)| {
+                            other != id
+                                && now.saturating_sub(t.last_seen_ms) < BINDING_TOMBSTONE_MS as u64
+                                && !matches!((mine, t.principal.as_ref()),
+                                    (Some(a), Some(b)) if a.same(b))
+                        })
+                    });
+                    if sole.is_some() && !rival {
+                        sole.expect("checked is_some")
+                    } else {
+                        let mut candidates: Vec<TabCandidate> = inner
+                            .tabs
+                            .iter()
+                            .filter(|(_, t)| {
+                                t.listener.is_some()
+                                    || now.saturating_sub(t.last_seen_ms)
+                                        < BINDING_TOMBSTONE_MS as u64
+                            })
+                            .map(|(id, t)| TabCandidate {
+                                id: id.clone(),
+                                verified_origin: t
+                                    .principal
+                                    .as_ref()
+                                    .and_then(|p| p.verified_origin()),
+                            })
+                            .collect();
+                        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+                        let ambiguous_by_count = connected.len() > 1;
+                        if ambiguous_by_count {
+                            // Two connected tabs were ambiguous before R8 and
+                            // stay so in every mode.
+                            return Err(DispatchError::AmbiguousTab(candidates));
                         }
+                        // Sole connected tab, rival tab seen recently: R8's
+                        // new refusal, metered through the kill switch.
+                        let principal = inner
+                            .tabs
+                            .get(connected[0])
+                            .and_then(|t| t.principal.clone())
+                            .unwrap_or(Principal::Opaque {
+                                class: crate::mcp::origin_guard::OriginClass::Foreign,
+                            });
+                        binding
+                            .meter(
+                                binding.config.active_binding,
+                                &principal,
+                                "POST /ui-bridge/relay/dispatch",
+                                Refusal::active_held(RULE_R8),
+                            )
+                            .map_err(|_| DispatchError::AmbiguousTab(candidates))?;
+                        connected[0].clone()
                     }
                 }
             };
@@ -867,6 +932,7 @@ pub async fn ui_bridge_relay_dispatch_handler(
     match state
         .ui_bridge_relay
         .dispatch(
+            &state.binding,
             request.tab_id.as_deref(),
             &request.action,
             request.payload,
@@ -904,14 +970,26 @@ pub async fn ui_bridge_relay_dispatch_handler(
         Err(DispatchError::AmbiguousTab(ids)) => {
             let mut err = api_error(format!(
                 "multiple relay tabs are connected ({}) — supply tabId to pin the target",
-                ids.join(", ")
+                ids.iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             err.code = Some("AMBIGUOUS_TAB".to_string());
             err.suggestions = Some(
                 ids.iter()
-                    .map(|id| format!("retry with {{\"tabId\": \"{id}\"}}"))
+                    .map(|c| format!("retry with {{\"tabId\": \"{}\"}}", c.id))
                     .collect(),
             );
+            err.hint = Some(serde_json::json!({
+                "candidates": ids
+                    .iter()
+                    .map(|c| serde_json::json!({
+                        "tabId": c.id,
+                        "verifiedOrigin": c.verified_origin,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
             Err((StatusCode::CONFLICT, Json(err)))
         }
         Err(DispatchError::TabNotFound(id)) => {
@@ -1104,6 +1182,7 @@ mod tests {
 
         let (tab_id, command_id, result) = registry
             .dispatch(
+                &b(),
                 Some("tab-a"),
                 "discover",
                 serde_json::json!({ "query": "smoke" }),
@@ -1147,6 +1226,7 @@ mod tests {
 
         let (tab_id, _, _) = registry
             .dispatch(
+                &b(),
                 None,
                 "ping",
                 serde_json::Value::Null,
@@ -1166,6 +1246,7 @@ mod tests {
             .unwrap();
         let err = registry
             .dispatch(
+                &b(),
                 None,
                 "ping",
                 serde_json::Value::Null,
@@ -1183,6 +1264,7 @@ mod tests {
         let (_c2, _rx2) = registry.connect_stream(&b(), &op(), "tab-b").unwrap();
         let err = registry
             .dispatch(
+                &b(),
                 None,
                 "ping",
                 serde_json::Value::Null,
@@ -1192,7 +1274,8 @@ mod tests {
             .expect_err("ambiguous");
         match err {
             DispatchError::AmbiguousTab(ids) => {
-                assert_eq!(ids, vec!["tab-a".to_string(), "tab-b".to_string()]);
+                let ids: Vec<&str> = ids.iter().map(|c| c.id.as_str()).collect();
+                assert_eq!(ids, vec!["tab-a", "tab-b"]);
             }
             other => panic!("expected AmbiguousTab, got {other:?}"),
         }
@@ -1203,6 +1286,7 @@ mod tests {
         let registry = RelayRegistry::new();
         let err = registry
             .dispatch(
+                &b(),
                 Some("tab-missing"),
                 "ping",
                 serde_json::Value::Null,
@@ -1219,6 +1303,7 @@ mod tests {
             .unwrap();
         let err = registry
             .dispatch(
+                &b(),
                 Some("tab-idle"),
                 "ping",
                 serde_json::Value::Null,
@@ -1235,6 +1320,7 @@ mod tests {
         let (_conn_id, mut rx) = registry.connect_stream(&b(), &op(), "tab-a").unwrap();
         let err = registry
             .dispatch(
+                &b(),
                 Some("tab-a"),
                 "ping",
                 serde_json::Value::Null,
@@ -1273,6 +1359,7 @@ mod tests {
         drop(rx); // client vanished without the guard firing yet
         let err = registry
             .dispatch(
+                &b(),
                 Some("tab-a"),
                 "ping",
                 serde_json::Value::Null,
@@ -1317,6 +1404,7 @@ mod tests {
         };
         registry
             .dispatch(
+                &b(),
                 Some("tab-a"),
                 "ping",
                 serde_json::Value::Null,

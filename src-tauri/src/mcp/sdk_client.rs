@@ -59,6 +59,11 @@ pub struct SdkConnection {
     pub transport_kind: Option<crate::mcp::transport::TransportKind>,
     /// Physical device ID if connected via physical device registry
     pub physical_device_id: Option<String>,
+    /// WHO made this connection the active one (R6). `None` is operator trust:
+    /// the HTTP `connect`/`switch` routes, which R7 keeps from Foreign and
+    /// Extension origins. A WS registration records its browser principal here
+    /// so a later foreign registration can be compared against it.
+    pub activated_by: Option<crate::mcp::relay_binding::Principal>,
 }
 
 /// Manages multiple simultaneous SDK connections with one active connection
@@ -178,6 +183,10 @@ pub(crate) struct ConnectionInfo {
     app: SdkAppInfo,
     connected_at: i64,
     is_active: bool,
+    /// The origin the activating WS registration was verified at; `None` for
+    /// operator trust and keyed/opaque principals.
+    verified_origin: Option<String>,
+    principal_class: &'static str,
 }
 
 /// Request body for switching active connection
@@ -819,6 +828,7 @@ pub async fn connect_sdk_app(
             connected_at,
             transport_kind: None,
             physical_device_id: None,
+            activated_by: None,
         },
     );
     manager.active_url = Some(url.to_string());
@@ -970,6 +980,11 @@ async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<S
             app: conn.app_info.clone(),
             connected_at: conn.connected_at,
             is_active: manager.active_url.as_deref() == Some(url.as_str()),
+            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
+            principal_class: conn
+                .activated_by
+                .as_ref()
+                .map_or("operator_trust", |p| p.class_str()),
         })
         .collect();
 
@@ -2861,6 +2876,11 @@ pub(crate) async fn handle_connections(
             app: conn.app_info.clone(),
             connected_at: conn.connected_at,
             is_active: manager.active_url.as_deref() == Some(url.as_str()),
+            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
+            principal_class: conn
+                .activated_by
+                .as_ref()
+                .map_or("operator_trust", |p| p.class_str()),
         })
         .collect();
 

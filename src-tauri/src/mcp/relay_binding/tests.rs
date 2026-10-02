@@ -599,7 +599,6 @@ async fn hijack_live_ws_connection_refused() {
 
 /// Vector 2 (R6, enforce).
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn new_app_id_does_not_steal_active_connection() {
     let s = spawn(enforce_all()).await;
     let (_good, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -1648,7 +1647,6 @@ async fn an_oversized_app_id_is_refused_at_the_register_door() {
 
 /// R7.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn sdk_switch_refused_to_foreign() {
     // R7 holds in EVERY route policy, so exercise the default
     // (`enforce-doors`, which only shadows this route today) and `off`, where
@@ -1791,7 +1789,6 @@ async fn operator_trust_cannot_post_tab_result() {
 
 /// Vector 6 (R8, enforce).
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn untargeted_dispatch_not_captured_during_reconnect() {
     let s = spawn(enforce_all()).await;
     let t1 = s.attach("t1", browser(INJECT)).await.expect("attach t1");

@@ -75,6 +75,13 @@ pub const RULE_R2: &str = "R2";
 pub const RULE_R3: &str = "R3";
 pub const RULE_R4: &str = "R4";
 pub const RULE_R5: &str = "R5";
+/// A browser-principal WS registration taking the ACTIVE SDK connection from a
+/// live one it does not own. Rides `active_binding`.
+pub const RULE_R6: &str = "R6";
+/// An untargeted `relay/dispatch` resolving while a tab under a different
+/// principal is, or was within [`BINDING_TOMBSTONE_MS`], connected. Rides
+/// `active_binding`.
+pub const RULE_R8: &str = "R8";
 /// R9's unkeyed cross-origin tab re-attach: an unkeyed browser taking over an
 /// ENDED tab id from a different origin. Rides `active_binding`.
 pub const RULE_R9_UNKEYED: &str = "R9-unkeyed";
@@ -126,6 +133,17 @@ impl Refusal {
             code: CODE_REGISTRATION_HELD,
             rule,
             message: "This appId is held by a different principal; only its holder or an operator-trust caller may claim or release it",
+        }
+    }
+
+    /// R6 / R8: a verdict about which connection or tab traffic reaches, not
+    /// about an id. Used for metering only — the registration itself is
+    /// admitted — and it carries no holder detail, like every refusal here.
+    pub const fn active_held(rule: &'static str) -> Self {
+        Self {
+            code: CODE_REGISTRATION_HELD,
+            rule,
+            message: "The active connection is held by a different principal; a foreign registration does not take it",
         }
     }
 

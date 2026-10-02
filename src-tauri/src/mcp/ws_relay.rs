@@ -44,7 +44,7 @@ use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
 use super::origin_guard::{NormOrigin, RequesterPrincipal};
-use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState};
+use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R6};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
 
@@ -61,9 +61,20 @@ fn ws_synthetic_url(app_id: &str) -> String {
 /// can resolve `app_id` from `active_connection()`. Returns the previous
 /// `active_url` so the disconnect path can restore it if our entry is still
 /// the active one.
+///
+/// **R6.** The entry is always inserted (targeted dispatch by `app_id` needs
+/// it), but it becomes the ACTIVE connection only when the registrant may take
+/// it: operator trust always may (today's "newest becomes active"); a browser
+/// principal only when no LIVE active connection exists, or when the active one
+/// is its own appId under the same principal (a reconnect). Under `shadow` the
+/// takeover proceeds and is counted; under `enforce` the active connection
+/// stays where it was.
 async fn install_ws_sdk_connection(
     sdk_connection: &Arc<Mutex<SdkConnectionManager>>,
+    ws_manager: &WsConnectionManager,
+    binding: &RelayBinding,
     register: &RegisterFrame,
+    principal: &Principal,
 ) -> (String, Option<String>) {
     let synthetic_url = ws_synthetic_url(&register.app_id);
     let app_info = SdkAppInfo {
@@ -83,13 +94,59 @@ async fn install_ws_sdk_connection(
         connected_at: chrono::Utc::now().timestamp_millis(),
         transport_kind: None,
         physical_device_id: None,
+        activated_by: (!principal.is_operator_trust()).then(|| principal.clone()),
     };
+    // The liveness of the CURRENT active connection is read before the manager
+    // lock is taken, so the two locks are never held together. A `ws-app://`
+    // active is live only while its socket is registered; any other transport
+    // counts as live unless its cached responsiveness says otherwise.
+    let active_app_before = {
+        let guard = sdk_connection.lock().await;
+        guard
+            .active_connection()
+            .map(|c| (c.app_info.app_id.clone(), c.app_url.clone()))
+    };
+    let active_ws_live = match &active_app_before {
+        Some((app_id, url)) if url.starts_with("ws-app://") => {
+            Some(ws_manager.conn_for_app(app_id).await.is_some())
+        }
+        _ => None,
+    };
+
     let mut guard = sdk_connection.lock().await;
     let prior_active = guard.active_url.clone();
+    let takes_active =
+        if principal.is_operator_trust() || binding.config.binding == BindingMode::Off {
+            true
+        } else {
+            let allowed = match guard.active_connection() {
+                None => true,
+                Some(active) => {
+                    let live = active_ws_live.unwrap_or(guard.active_responsive != Some(false));
+                    let own_reconnect = active.app_info.app_id == register.app_id
+                        && active
+                            .activated_by
+                            .as_ref()
+                            .is_some_and(|holder| principal.same(holder));
+                    !live || own_reconnect
+                }
+            };
+            allowed
+                || binding
+                    .meter(
+                        binding.config.active_binding,
+                        principal,
+                        WS_ROUTE,
+                        Refusal::active_held(RULE_R6),
+                    )
+                    .is_ok()
+        };
     guard.connections.insert(synthetic_url.clone(), conn);
-    guard.active_url = Some(synthetic_url.clone());
-    guard.active_responsive = Some(true);
-    guard.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+    if takes_active {
+        guard.active_url = Some(synthetic_url.clone());
+        guard.active_responsive = Some(true);
+        guard.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+    }
     (synthetic_url, prior_active)
 }
 
@@ -515,8 +572,14 @@ async fn drive_connection(
     //     Without this, WS-only wrappers can never be reached via the
     //     /ui-bridge/sdk/control/* HTTP routes — those handlers gate on
     //     `state.sdk_connection.active_connection()`.
-    let (synthetic_url, prior_active) =
-        install_ws_sdk_connection(&state.sdk_connection, &register).await;
+    let (synthetic_url, prior_active) = install_ws_sdk_connection(
+        &state.sdk_connection,
+        &ws_manager,
+        &binding,
+        &register,
+        &principal,
+    )
+    .await;
 
     info!(
         "[ws-relay] app '{}' connected (conn_id={}, framework={:?})",
@@ -906,11 +969,28 @@ mod tests {
         }
     }
 
+    /// Operator-trust install under the default config: today's behaviour.
+    async fn install_for_test(
+        mgr: &Arc<Mutex<SdkConnectionManager>>,
+        reg: &RegisterFrame,
+    ) -> (String, Option<String>) {
+        install_ws_sdk_connection(
+            mgr,
+            &WsConnectionManager::new(),
+            &RelayBinding::default(),
+            reg,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn install_ws_sdk_connection_sets_active() {
         let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
         let reg = sample_register("wapp");
-        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        let (synthetic, prior) = install_for_test(&mgr, &reg).await;
         assert_eq!(synthetic, "ws-app://wapp");
         assert!(prior.is_none());
         let guard = mgr.lock().await;
@@ -923,7 +1003,7 @@ mod tests {
     async fn uninstall_restores_prior_active_when_still_ours() {
         let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
         let reg = sample_register("wapp");
-        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        let (synthetic, prior) = install_for_test(&mgr, &reg).await;
         uninstall_ws_sdk_connection(&mgr, &synthetic, prior).await;
         let guard = mgr.lock().await;
         assert!(guard.active_url.is_none());
@@ -934,7 +1014,7 @@ mod tests {
     async fn uninstall_leaves_active_alone_when_changed() {
         let mgr = Arc::new(Mutex::new(SdkConnectionManager::new()));
         let reg = sample_register("wapp");
-        let (synthetic, prior) = install_ws_sdk_connection(&mgr, &reg).await;
+        let (synthetic, prior) = install_for_test(&mgr, &reg).await;
         // Simulate something else stealing active_url between install and uninstall.
         {
             let mut guard = mgr.lock().await;
