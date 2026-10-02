@@ -17,11 +17,20 @@
 //! Several fields are free `String`s on the wire and stay that way — they are
 //! deserialized leniently from prompt-template frontmatter, user rows and
 //! community payloads, and tightening them would newly reject input that parses
-//! today. Their CLOSED vocabulary (what this program produces and what the
-//! frontend renders) is declared once below as a schema-only enum and attached
-//! with `#[schemars(with = ...)]`, so the generated bindings carry the literal
-//! union without the serde behaviour changing. These enums are never
-//! constructed; they exist for `JsonSchema` alone.
+//! today. Their KNOWN vocabulary (what this program's producers emit and what
+//! the frontend renders) is declared once below as a schema-only enum. These
+//! enums are never constructed; they exist for `JsonSchema` alone, and each is
+//! attached in one of two ways:
+//!
+//! - **Closed** (`#[schemars(with = "V")]`) where the runtime value really is
+//!   confined to `V`: parameter `type`, `approval_status`, manifest
+//!   `content_type`.
+//! - **Open** (`#[schemars(with = "OpenVocab<V>")]`, schema `V | string`) where
+//!   a foreign value reaches the wire today: `category`, `allowed_phases` and
+//!   `source` are read back from user rows and imported or community payloads
+//!   written by other program versions (`SkillSource::Other` exists precisely
+//!   to round-trip such a `source`, and the approval panel already filters on
+//!   `source === "auto"`, which no closed vocabulary here names).
 //!
 //! Likewise every `Option` field that is skipped when `None` is schema'd as its
 //! inner type, so the binding reads `?: T` (absent, never `null` — what the
@@ -101,12 +110,14 @@ pub enum SkillSourceSchema {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillParameterOption {
     pub label: String,
     pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillAuthor {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +161,7 @@ pub fn humanize_param_name(name: &str) -> String {
 /// (and so `qontinui-schemas/ts/src/generated/SkillParameter.d.ts`) marks them
 /// required.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillParameter {
     pub name: String,
     #[serde(rename = "type")]
@@ -244,6 +256,7 @@ impl<'de> Deserialize<'de> for SkillParameter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "SkillParameterDependency")]
 pub struct ParameterDependency {
     pub param: String,
@@ -251,6 +264,7 @@ pub struct ParameterDependency {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillRef {
     pub skill_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +273,7 @@ pub struct SkillRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(tag = "kind")]
 pub enum SkillTemplate {
     #[serde(rename = "single_step")]
@@ -288,6 +303,7 @@ pub enum SkillTemplate {
 /// Determines when a playbook should be automatically included in AI prompts
 /// based on the current automation context (app name, URL pattern, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "SkillPlaybookTrigger")]
 pub struct PlaybookTrigger {
     /// Type of trigger: "app_name", "url_pattern", "tag".
@@ -391,22 +407,23 @@ impl<'de> Deserialize<'de> for SkillSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillDefinition {
     pub id: String,
     pub name: String,
     pub slug: String,
     pub description: String,
-    #[schemars(with = "SkillCategory")]
+    #[schemars(with = "crate::schema_export::OpenVocab<SkillCategory>")]
     pub category: String,
     pub tags: Vec<String>,
     pub icon: String,
     pub color: String,
-    #[schemars(with = "Vec<SkillAllowedPhase>")]
+    #[schemars(with = "Vec<crate::schema_export::OpenVocab<SkillAllowedPhase>>")]
     pub allowed_phases: Vec<String>,
     pub parameters: Vec<SkillParameter>,
     pub template: SkillTemplate,
     /// Provenance. Typed rather than free text — see [`SkillSource`].
-    #[schemars(with = "SkillSourceSchema")]
+    #[schemars(with = "crate::schema_export::OpenVocab<SkillSourceSchema>")]
     pub source: SkillSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
@@ -433,6 +450,7 @@ pub struct SkillDefinition {
 
 /// Tracks that a step was created from a skill
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillOrigin {
     pub skill_id: String,
     pub skill_slug: String,
@@ -444,6 +462,7 @@ pub struct SkillOrigin {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillExportManifest {
     pub version: String,
     pub exported_at: String,
@@ -457,12 +476,14 @@ pub struct SkillExportManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillExport {
     pub manifest: SkillExportManifest,
     pub skills: Vec<SkillDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SkillImportResult {
     pub imported: usize,
     pub skipped: usize,

@@ -228,6 +228,7 @@ impl HookTrigger {
 
 /// Routing decision payload.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawRoutingDecisionPayload")]
 pub struct RoutingDecisionPayload {
     /// The assessed complexity level
@@ -251,6 +252,7 @@ pub struct RoutingDecisionPayload {
 
 /// One retry attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawRetryAttemptPayload")]
 pub struct RetryAttemptPayload {
     pub attempt_number: u32,
@@ -262,6 +264,7 @@ pub struct RetryAttemptPayload {
 
 /// Accumulated retry state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawRetryStatePayload")]
 pub struct RetryStatePayload {
     pub attempt: u32,
@@ -275,6 +278,7 @@ pub struct RetryStatePayload {
 
 /// Token count by memory category.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawTokenCountPayload")]
 pub struct TokenCountPayload {
     pub total: usize,
@@ -288,6 +292,7 @@ pub struct TokenCountPayload {
 
 /// Result of one memory-compression pass.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawCompressionResultPayload")]
 pub struct CompressionResultPayload {
     pub original_tokens: usize,
@@ -300,6 +305,7 @@ pub struct CompressionResultPayload {
 
 /// Result of one lifecycle-hook execution.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[schemars(title = "RawHookExecutionPayload")]
 pub struct HookExecutionPayload {
     pub hook_id: String,
@@ -316,6 +322,7 @@ pub struct HookExecutionPayload {
 
 /// `routing_decision` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RoutingDecisionEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -325,6 +332,7 @@ pub struct RoutingDecisionEvent {
 
 /// `retry_attempt` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RetryAttemptEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -338,6 +346,7 @@ pub struct RetryAttemptEvent {
 
 /// `compression` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct CompressionEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -348,6 +357,7 @@ pub struct CompressionEvent {
 
 /// `token_count_update` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TokenCountUpdateEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -359,6 +369,7 @@ pub struct TokenCountUpdateEvent {
 
 /// `hook_execution` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct HookExecutionEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -368,6 +379,7 @@ pub struct HookExecutionEvent {
 
 /// `hook_started` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct HookStartedEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -379,6 +391,7 @@ pub struct HookStartedEvent {
 
 /// `status_change` event body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct StatusChangeEvent {
     pub task_run_id: String,
     /// Unix timestamp in milliseconds
@@ -391,6 +404,7 @@ pub struct StatusChangeEvent {
 
 /// One event on the `execution-status` Tauri channel, tagged by `type`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[schemars(title = "RawExecutionStatusEvent")]
 pub enum ExecutionStatusEvent {
@@ -453,6 +467,160 @@ mod execution_status_tests {
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"hook_started","task_run_id":"tr-1","timestamp":1,"hook_id":"h","hook_name":"n","trigger":"on_verification_fail"}"#
         );
+    }
+
+    // The five tests below pin each remaining variant to the exact bytes the
+    // pre-enum emitter produced: `type`, `task_run_id`, `timestamp` first (the
+    // flattened `EventBase`), then the variant's own fields in declaration
+    // order, with `None` serialized as `null` and the former hand-mapped
+    // `complexity` / `trigger` strings unchanged.
+
+    #[test]
+    fn routing_decision_wire_shape_is_unchanged() {
+        let event = ExecutionStatusEvent::RoutingDecision(RoutingDecisionEvent {
+            task_run_id: "tr-1".into(),
+            timestamp: 7,
+            decision: RoutingDecisionPayload {
+                complexity: TaskComplexity::Medium,
+                confidence: 0.5,
+                factors: vec!["f".into()],
+                selected_model: "m".into(),
+                prompt_preview: Some("p".into()),
+                file_count: None,
+                criteria_count: Some(2),
+            },
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"routing_decision","task_run_id":"tr-1","timestamp":7,"decision":{"complexity":"medium","confidence":0.5,"factors":["f"],"selected_model":"m","prompt_preview":"p","file_count":null,"criteria_count":2}}"#
+        );
+        assert_eq!(event.type_tag(), "routing_decision");
+    }
+
+    #[test]
+    fn retry_attempt_wire_shape_is_unchanged() {
+        let attempt = RetryAttemptPayload {
+            attempt_number: 1,
+            error: "e".into(),
+            attempt_timestamp: "t".into(),
+            delay_ms: 10,
+            feedback_injected: true,
+        };
+        let event = ExecutionStatusEvent::RetryAttempt(RetryAttemptEvent {
+            task_run_id: "tr-1".into(),
+            timestamp: 8,
+            attempt: attempt.clone(),
+            state: RetryStatePayload {
+                attempt: 1,
+                last_error: None,
+                last_attempt_at: Some("t".into()),
+                total_delay_ms: 10,
+                error_history: vec![attempt],
+            },
+            exhausted: false,
+            next_retry_delay_ms: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            concat!(
+                r#"{"type":"retry_attempt","task_run_id":"tr-1","timestamp":8,"#,
+                r#""attempt":{"attempt_number":1,"error":"e","attempt_timestamp":"t","delay_ms":10,"feedback_injected":true},"#,
+                r#""state":{"attempt":1,"last_error":null,"last_attempt_at":"t","total_delay_ms":10,"#,
+                r#""error_history":[{"attempt_number":1,"error":"e","attempt_timestamp":"t","delay_ms":10,"feedback_injected":true}]},"#,
+                r#""exhausted":false,"next_retry_delay_ms":null}"#
+            )
+        );
+        assert_eq!(event.type_tag(), "retry_attempt");
+    }
+
+    fn token_count() -> TokenCountPayload {
+        TokenCountPayload {
+            total: 1,
+            findings: 2,
+            observations: 3,
+            feedback: 4,
+            solutions: 5,
+            other: 6,
+            entry_count: 7,
+        }
+    }
+
+    const TOKEN_COUNT_JSON: &str = r#"{"total":1,"findings":2,"observations":3,"feedback":4,"solutions":5,"other":6,"entry_count":7}"#;
+
+    #[test]
+    fn compression_wire_shape_is_unchanged() {
+        let event = ExecutionStatusEvent::Compression(CompressionEvent {
+            task_run_id: "tr-1".into(),
+            timestamp: 9,
+            result: CompressionResultPayload {
+                original_tokens: 100,
+                compressed_tokens: 40,
+                items_summarized: 3,
+                summary_entries_created: 1,
+                compressed_categories: vec!["findings".into()],
+                timestamp: "t".into(),
+            },
+            current_token_count: token_count(),
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            format!(
+                concat!(
+                    r#"{{"type":"compression","task_run_id":"tr-1","timestamp":9,"#,
+                    r#""result":{{"original_tokens":100,"compressed_tokens":40,"items_summarized":3,"#,
+                    r#""summary_entries_created":1,"compressed_categories":["findings"],"timestamp":"t"}},"#,
+                    r#""current_token_count":{}}}"#
+                ),
+                TOKEN_COUNT_JSON
+            )
+        );
+        assert_eq!(event.type_tag(), "compression");
+    }
+
+    #[test]
+    fn token_count_update_wire_shape_is_unchanged() {
+        let event = ExecutionStatusEvent::TokenCountUpdate(TokenCountUpdateEvent {
+            task_run_id: "tr-1".into(),
+            timestamp: 10,
+            token_count: token_count(),
+            threshold_percentage: 0.25,
+            compression_imminent: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            format!(
+                r#"{{"type":"token_count_update","task_run_id":"tr-1","timestamp":10,"token_count":{},"threshold_percentage":0.25,"compression_imminent":true}}"#,
+                TOKEN_COUNT_JSON
+            )
+        );
+        assert_eq!(event.type_tag(), "token_count_update");
+    }
+
+    #[test]
+    fn hook_execution_wire_shape_is_unchanged() {
+        let event = ExecutionStatusEvent::HookExecution(HookExecutionEvent {
+            task_run_id: "tr-1".into(),
+            timestamp: 11,
+            result: HookExecutionPayload {
+                hook_id: "h".into(),
+                hook_name: "n".into(),
+                trigger: HookTrigger::PreIteration,
+                success: false,
+                output: None,
+                error: Some("boom".into()),
+                duration_ms: 12,
+                timestamp: "t".into(),
+            },
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            concat!(
+                r#"{"type":"hook_execution","task_run_id":"tr-1","timestamp":11,"#,
+                r#""result":{"hook_id":"h","hook_name":"n","trigger":"pre_iteration","success":false,"#,
+                r#""output":null,"error":"boom","duration_ms":12,"timestamp":"t"}}"#
+            )
+        );
+        assert_eq!(event.type_tag(), "hook_execution");
     }
 
     #[test]

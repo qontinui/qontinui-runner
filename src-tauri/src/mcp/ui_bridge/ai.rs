@@ -520,7 +520,7 @@ pub async fn ui_bridge_execute_action_plan_handler(
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let element_state = data.get("elementState").cloned();
+                let element_state = data.get("elementState").filter(|v| v.is_object()).cloned();
                 let action_error = if action_success {
                     None
                 } else {

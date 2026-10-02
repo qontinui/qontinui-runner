@@ -25,10 +25,15 @@ use serde::Serialize;
 
 /// Result of a single planned action execution.
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedActionResult {
     pub index: usize,
     pub success: bool,
+    /// The request's `action` echoed back. The request accepts any string and
+    /// the runner forwards an unrecognised one to the UI Bridge rather than
+    /// rejecting it, so this is open — not the request-side
+    /// `PlannedActionType` union.
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
@@ -39,12 +44,17 @@ pub struct PlannedActionResult {
     #[serde(default)]
     pub skipped_low_confidence: bool,
     pub duration_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The UI Bridge's post-action `elementState` object. The handler keeps it
+    /// only when it IS an object, so the schema's `Record<string, unknown>`
+    /// is a guarantee, not a hope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     pub element_state: Option<serde_json::Value>,
 }
 
 /// Aggregated result of executing a full action plan.
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 #[schemars(title = "ActionPlanResult")]
 pub struct ActionPlanResponse {
