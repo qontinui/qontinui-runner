@@ -25326,6 +25326,12 @@ mod terminal_env_reference_tests {
                 "every header value carries the reference WITH the default: {v}"
             );
         }
+        // The transport-rung headers stay literal constants: only the
+        // credential headers are ever env-referenced.
+        use crate::session::coord_transport_rung as rung;
+        let headers = &device["mcpServers"]["coord-mcp"]["headers"];
+        assert_eq!(headers[rung::TRANSPORT_HEADER], rung::TRANSPORT_NATIVE_MCP);
+        assert_eq!(headers[rung::REPORTER_HEADER], rung::REPORTER_MCP_CLIENT);
 
         // The agent document: literal, marked, and never env-referenced.
         let agent_wd = workdir(&amb, "agent");
