@@ -1297,9 +1297,11 @@ mod tests {
             reason: None,
             finished: Some(false),
         };
+        let again = apply_finish(&store, "s", unmark_again).unwrap();
+        assert_eq!(again["changed"], "none");
         assert_eq!(
-            apply_finish(&store, "s", unmark_again).unwrap()["changed"],
-            "none"
+            again["coord"]["reason"], "not_requeued",
+            "a no-op unmark owes coord nothing: {again}"
         );
 
         let (status, _) = apply_finish(&store, "ghost", finish_req(None))

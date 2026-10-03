@@ -986,12 +986,11 @@ pub struct SessionLifecycleStore {
     /// map lock, and never taken by the observer or anything it calls, so it
     /// adds no lock cycle.
     ///
-    /// Residual: the registrar's late-delivery paths
-    /// (`AiCoordRegistrar::register_inner`'s re-offer and
-    /// `deliver_owed_finish`) read a record and enqueue outside this lock, so
-    /// one of them racing an unmark can still land its `Finished` after the
-    /// unmark's `working`. Both fire only on a coord (re-)registration, not on
-    /// an operator call.
+    /// The registrar's late-delivery paths (`AiCoordRegistrar::register_inner`'s
+    /// re-offer and `deliver_owed_finish`) read and enqueue through
+    /// [`SessionLifecycleStore::with_unsynced_finished_records`], which holds
+    /// this same lock, so a late delivery cannot land its `Finished` after a
+    /// concurrent unmark's `working` either.
     finish_forward: Mutex<()>,
 }
 
@@ -2228,9 +2227,14 @@ impl SessionLifecycleStore {
             .get_mut(claude_session_id)
             .ok_or(SetFinishedError::UnknownSession)?;
 
+        // A blank reason is no reason, and a reason equal to the stored one
+        // rewrites nothing — both are no-ops, never a `reason_only` change.
+        let reason = non_empty(reason);
         // Idempotent: re-finishing an already-finished session must not move
         // its timestamp, or every repeat call would look like fresh work.
-        if finished == rec.finished_at.is_some() && (!finished || reason.is_none()) {
+        if finished == rec.finished_at.is_some()
+            && (!finished || reason.is_none() || reason == rec.finish_reason)
+        {
             let current = rec.clone();
             // Release the map lock BEFORE the observer runs (it may read the
             // store, and it enqueues to the outbox). `finish_forward` stays
@@ -2264,7 +2268,7 @@ impl SessionLifecycleStore {
                 // a write, and the boot reconcile must not revert it meanwhile.
                 rec.finish_synced = false;
             }
-            if let Some(r) = non_empty(reason) {
+            if let Some(r) = reason {
                 rec.finish_reason = Some(r);
             }
         } else {
@@ -2982,6 +2986,24 @@ impl SessionLifecycleStore {
                 Vec::new()
             }
         }
+    }
+
+    /// Run `f` over [`Self::unsynced_finished_records`] with `finish_forward`
+    /// held for the read AND whatever `f` enqueues — the serialized door for
+    /// the registrar's late-delivery paths. Without it a delivery could read a
+    /// still-finished record, lose the race to an unmark, and enqueue its
+    /// `Finished` after the unmark's `working`, leaving coord `finished` for a
+    /// session the operator unmarked, with nothing left to retry. `f` must not
+    /// call [`Self::set_finished`] (the lock is not re-entrant).
+    pub fn with_unsynced_finished_records<R>(
+        &self,
+        f: impl FnOnce(Vec<TerminalSessionRecord>) -> R,
+    ) -> R {
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(self.unsynced_finished_records())
     }
 
     /// Clone of every record carrying a finished marker coord has not ACKed
@@ -6734,6 +6756,59 @@ mod tests {
             store.finish_forward.try_lock().is_ok(),
             "and released when set_finished returns"
         );
+    }
+
+    /// Review (adoption) M2: the late-delivery door reads AND runs its
+    /// enqueue with `finish_forward` held, so it serializes against an unmark
+    /// exactly as `set_finished`'s own forwards do.
+    #[test]
+    fn late_delivery_door_holds_the_forward_serializer() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+        let _ = store.set_finished("s", true, None);
+        let (ids, held) = store.with_unsynced_finished_records(|recs| {
+            (
+                recs.into_iter()
+                    .map(|r| r.claude_session_id)
+                    .collect::<Vec<_>>(),
+                store.finish_forward.try_lock().is_err(),
+            )
+        });
+        assert_eq!(ids, vec!["s".to_string()], "the unsynced mark is offered");
+        assert!(held, "the serializer is held while the delivery runs");
+        assert!(
+            store.finish_forward.try_lock().is_ok(),
+            "and released when the door returns"
+        );
+    }
+
+    /// Review (adoption) L1: a blank reason, or the reason already stored, on
+    /// an already-finished mark rewrites nothing, so it is `changed: none`.
+    #[test]
+    fn a_blank_or_unchanged_reason_is_not_a_reason_only_rewrite() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+        store
+            .set_finished("s", true, Some("done".into()))
+            .expect("fresh mark");
+        for r in ["", "   ", "done"] {
+            let out = store
+                .set_finished("s", true, Some(r.to_string()))
+                .expect("known id");
+            assert_eq!(
+                out.changed,
+                FinishChange::None,
+                "reason {r:?} rewrote nothing"
+            );
+            assert_eq!(out.record.finish_reason.as_deref(), Some("done"));
+        }
+        let out = store
+            .set_finished("s", true, Some("other".into()))
+            .expect("known id");
+        assert_eq!(out.changed, FinishChange::ReasonOnly);
+        assert_eq!(out.record.finish_reason.as_deref(), Some("other"));
     }
 
     /// The finish observer is the producer seam for coord's `Finished` outbox
