@@ -122,6 +122,20 @@ fn structured_record(
     }
 }
 
+/// The directory a structured launch runs in: the one the caller asked for
+/// (the focused terminal's cwd), else the user's home directory. Never `None`
+/// while a home resolves — `open_ai_session`'s own fallback is the RUNNER
+/// process's cwd, which is wherever the runner happened to be started and
+/// nothing the operator chose. Pure.
+fn structured_working_dir(
+    requested: Option<String>,
+    home: Option<std::path::PathBuf>,
+) -> Option<String> {
+    requested
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| home.map(|h| h.to_string_lossy().into_owned()))
+}
+
 /// Launch a structured session of `provider` from the Terminal page, in
 /// [`PermissionMode::Prompt`], and record it on `page_id`/`zone_index`. The
 /// response's `record` is the lifecycle row (camelCase, the shape
@@ -150,7 +164,7 @@ pub async fn create_structured_session(
             })
         }
     };
-    let working_dir = working_dir.filter(|d| !d.trim().is_empty());
+    let working_dir = structured_working_dir(working_dir, dirs::home_dir());
     if let Some(dir) = &working_dir {
         if !std::path::Path::new(dir).is_dir() {
             return Ok(CommandResponse {
@@ -309,6 +323,26 @@ pub fn session_pending_permissions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structured launch with no chosen directory starts in the home dir —
+    /// never the runner process's cwd.
+    #[test]
+    fn a_structured_launch_without_a_cwd_starts_at_home() {
+        let home = Some(std::path::PathBuf::from("/home/op"));
+        assert_eq!(
+            structured_working_dir(None, home.clone()).as_deref(),
+            Some("/home/op")
+        );
+        assert_eq!(
+            structured_working_dir(Some("  ".into()), home.clone()).as_deref(),
+            Some("/home/op")
+        );
+        assert_eq!(
+            structured_working_dir(Some("/w/repo".into()), home).as_deref(),
+            Some("/w/repo")
+        );
+        assert_eq!(structured_working_dir(None, None), None);
+    }
 
     #[test]
     fn only_claude_stream_json_gets_a_structured_launch() {
