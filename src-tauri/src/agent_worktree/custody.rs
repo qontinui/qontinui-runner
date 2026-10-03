@@ -1235,6 +1235,24 @@ pub mod coord {
             self.rows.is_empty()
         }
 
+        /// Every ledger worktree path allocated to `session_id` — a
+        /// `coord.sessions.id`, which is what this route keys its sessions on
+        /// (NOT a Claude session id). Paths are returned verbatim, so a
+        /// RELATIVE ledger path is the caller's to resolve against the
+        /// workspace root. Deduplicated, in ledger order.
+        pub fn worktree_paths_for_session(&self, session_id: &str) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for (sid, _, row, _) in &self.rows {
+                if sid.eq_ignore_ascii_case(session_id)
+                    && !row.worktree_path.is_empty()
+                    && !out.contains(&row.worktree_path)
+                {
+                    out.push(row.worktree_path.clone());
+                }
+            }
+            out
+        }
+
         /// Look one worktree up. `census_path` is absolute; coord's ledger path
         /// may be RELATIVE — see [`worktree_path_matches`]. `repo`/`branch` are
         /// the fallback join for source 3, and spell BOTH repo arms.
@@ -1450,6 +1468,28 @@ pub mod coord {
                 .owner_for("D:/x", "qontinui-runner", Some("b"))
                 .is_none());
             assert!(idx.reachable, "an EMPTY answer is still an answer");
+        }
+
+        #[test]
+        fn worktree_paths_for_session_lists_only_that_sessions_rows() {
+            let idx = index(
+                r#"{"sessions":[
+                    {"sessionId":"AAAA-1","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-schemas","repo":"qontinui-schemas"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"}]},
+                    {"sessionId":"bbbb-2","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/b/qontinui-web","repo":"qontinui-web"}]}]}"#,
+            );
+            assert_eq!(
+                idx.worktree_paths_for_session("aaaa-1"),
+                vec![
+                    "agent-worktrees/a/qontinui-runner".to_string(),
+                    "agent-worktrees/a/qontinui-schemas".to_string()
+                ],
+                "case-insensitive on the uuid, deduplicated, in ledger order"
+            );
+            assert!(idx.worktree_paths_for_session("cccc-3").is_empty());
         }
     }
 }

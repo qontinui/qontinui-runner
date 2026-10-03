@@ -10,11 +10,11 @@
 //!
 //! Two callers read the verdict, and they are not the same:
 //! `GET /restart-readiness` REPORTS it, whatever the drain state; the Phase 4
-//! wind-down executor (`session::wind_down_executor`) ACTS on it, and only
-//! while coord holds this device drained. Since that phase landed, an
-//! [`Eligibility::Eligible`] on a drained runner is a session that will be
-//! graceful-`/exit`ed — so read the rules below as the authorisation they are,
-//! not as a report.
+//! wind-down executor (`session::wind_down_executor`) ACTS on it. Its drain
+//! arm closes any `Eligible` session while coord holds this device drained;
+//! its `finished_close` arm closes an `Eligible` TERMINAL session on any tick,
+//! drained or not, once [`custody_gate`] also answers `Clean`. So read the
+//! rules below as the authorisation they are, not as a report.
 //!
 //! ## The rules (D4, D6)
 //!
@@ -45,6 +45,21 @@
 //!    declaration was made; before that, [`Eligibility::NotYet`] with the
 //!    instant it would become eligible. When coord serves no transition time
 //!    the declaration does not bound the window.
+//!
+//! ## The custody gate is a SECOND verdict, not a sixth input
+//!
+//! Since plan `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`
+//! the executor has a second arm, `finished_close`, that closes finished
+//! terminal sessions on every tick, drained or not. Outside a drain a session
+//! may have declared itself finished while still holding uncommitted or
+//! unpushed work, so that arm additionally requires [`custody_gate`] to answer
+//! [`CustodyVerdict::Clean`] for every worktree the session touched (D2).
+//!
+//! It is deliberately NOT folded into [`eligibility`] (D2a): `GET
+//! /restart-readiness` evaluates `eligibility` for every session on every Stop
+//! turn under a 2 s client timeout, and the custody inputs need git probes.
+//! The executor gathers them only for sessions `eligibility` already rated
+//! `Eligible`, and the drain arm's verdict stays exactly what it was.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -205,8 +220,10 @@ impl UnknownReason {
     }
 }
 
-/// The verdict. Only [`Eligibility::Eligible`] authorises a close, and since
-/// Phase 4 the wind-down executor acts on exactly that — while drained.
+/// The verdict. Only [`Eligibility::Eligible`] authorises a close: the
+/// executor's drain arm acts on exactly that while drained, and its
+/// `finished_close` arm acts on it for terminal sessions whose custody is
+/// also [`CustodyVerdict::Clean`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eligibility {
     /// Every condition has held since `since_ms`, for at least the grace
@@ -332,6 +349,11 @@ pub struct WindDownView {
     /// Why, for `ineligible` and `unknown`.
     pub reason: Option<&'static str>,
     pub kind: SessionKind,
+    /// The `finished_close` arm's custody verdict for this session, from the
+    /// arm's most recent pass — present ONLY when that arm ran on it. Absent
+    /// is "the arm did not judge this session", never "clean".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody: Option<CustodyView>,
 }
 
 impl WindDownView {
@@ -348,11 +370,300 @@ impl WindDownView {
             until,
             reason,
             kind,
+            custody: None,
         }
     }
 
     pub fn is_eligible(&self) -> bool {
         self.eligibility == "eligible"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The custody gate (plan
+// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+// D2a and D2c)
+// ---------------------------------------------------------------------------
+
+/// The custody-slot `wip_state` values that mean the session's own record says
+/// its work was NOT left clean: snapshotted (`captured`), not snapshotted yet
+/// (`deferred`), a snapshot attempt that failed (`stash_create_failed`), or a
+/// record the hook could not make consistent (`inconsistent`). A cross-check
+/// only — the git probes are the source.
+pub const DIRTY_WIP_STATES: [&str; 4] = [
+    "captured",
+    "deferred",
+    "stash_create_failed",
+    "inconsistent",
+];
+
+/// What probing ONE worktree found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberState {
+    /// `.git` is a directory: a primary checkout, whose working tree mixes
+    /// peers' state, so its cleanliness is not this session's to judge.
+    PrimaryCheckout,
+    /// A linked worktree whose probes all answered.
+    Probed {
+        /// `git status --porcelain` printed anything, untracked files included.
+        dirty: bool,
+        /// Commits on `HEAD` that `@{upstream}` does not have. `None` when the
+        /// branch has no upstream (or `HEAD` is detached), so "pushed" cannot
+        /// be established.
+        ahead: Option<u64>,
+    },
+    /// A probe could not be completed — it failed, timed out, or the path is
+    /// not a worktree at all.
+    ProbeFailed(String),
+}
+
+/// One worktree the session touched, as probed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyMember {
+    pub path: String,
+    pub state: MemberState,
+    /// `wip_state` of THIS session's own custody slot in that worktree
+    /// (`qontinui-custody.d/<id>.json` with a matching `session_id` — never
+    /// the mirror, which may name a peer). `None` when no such slot exists.
+    pub slot_wip_state: Option<String>,
+}
+
+/// Everything [`custody_gate`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyInputs {
+    /// The session's directory (its lifecycle record's `working_dir`, else
+    /// the process cwd). `None` when neither is known.
+    pub session_dir: Option<String>,
+    /// Whether the worktrees attributed to the session could be read. `Err`
+    /// carries why not.
+    pub ownership: Result<(), String>,
+    /// Every distinct worktree in the session's set: the repo holding its
+    /// directory (absent when the directory is in no repo, e.g. the workspace
+    /// root), its coord-attributed worktrees, and its isolated-edit context's
+    /// materialized worktrees.
+    pub members: Vec<CustodyMember>,
+}
+
+/// Why custody rules a session out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyDirty {
+    /// A member is a primary checkout.
+    SharedCheckout { path: String },
+    /// A member has uncommitted changes or untracked files.
+    Uncommitted { path: String },
+    /// A member has commits its upstream does not.
+    Unpushed { path: String, ahead: u64 },
+    /// The session's own custody slot says its work was not left clean.
+    WipSlot { path: String, wip_state: String },
+}
+
+/// Which custody input could not be determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyUnknown {
+    /// No directory is known for the session.
+    NoSessionDir,
+    /// The attributed-worktree read failed.
+    OwnershipUnreadable { detail: String },
+    /// A member's branch has no upstream, so "pushed" cannot be established.
+    NoUpstream { path: String },
+    /// A member's probe failed or timed out.
+    ProbeFailed { path: String, detail: String },
+}
+
+/// The custody verdict. Only [`CustodyVerdict::Clean`] lets the
+/// `finished_close` arm close a session; `Dirty` and `Unknown` never do —
+/// served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyVerdict {
+    Clean,
+    Dirty(CustodyDirty),
+    Unknown(CustodyUnknown),
+}
+
+impl CustodyDirty {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SharedCheckout { .. } => "shared_checkout",
+            Self::Uncommitted { .. } => "uncommitted",
+            Self::Unpushed { .. } => "unpushed",
+            Self::WipSlot { .. } => "wip_slot",
+        }
+    }
+
+    /// One human-readable line naming the worktree and what was found.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::SharedCheckout { path } => format!("{path} is a primary checkout"),
+            Self::Uncommitted { path } => {
+                format!("{path} has uncommitted changes or untracked files")
+            }
+            Self::Unpushed { path, ahead } => {
+                format!("{path} is {ahead} commit(s) ahead of its upstream")
+            }
+            Self::WipSlot { path, wip_state } => {
+                format!("this session's custody slot in {path} reads wip_state={wip_state}")
+            }
+        }
+    }
+}
+
+impl CustodyUnknown {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoSessionDir => "no_session_dir",
+            Self::OwnershipUnreadable { .. } => "ownership_unreadable",
+            Self::NoUpstream { .. } => "no_upstream",
+            Self::ProbeFailed { .. } => "probe_failed",
+        }
+    }
+
+    /// One human-readable line naming what could not be read.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NoSessionDir => {
+                "neither the lifecycle record nor the process names a directory".to_string()
+            }
+            Self::OwnershipUnreadable { detail } => {
+                format!("the session's attributed worktrees could not be read: {detail}")
+            }
+            Self::NoUpstream { path } => format!("{path} has no upstream to compare against"),
+            Self::ProbeFailed { path, detail } => format!("{path}: {detail}"),
+        }
+    }
+}
+
+impl CustodyVerdict {
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean)
+    }
+
+    /// The wire word: `clean` | `dirty` | `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Dirty(_) => "dirty",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The reason code, for `dirty` and `unknown`.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Clean => None,
+            Self::Dirty(d) => Some(d.as_str()),
+            Self::Unknown(u) => Some(u.as_str()),
+        }
+    }
+
+    /// The human-readable detail, for `dirty` and `unknown`.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Clean => None,
+            Self::Dirty(d) => Some(d.detail()),
+            Self::Unknown(u) => Some(u.detail()),
+        }
+    }
+}
+
+/// Decide custody. Pure.
+///
+/// Evaluated in this fixed order:
+///
+/// 1. **No session directory → `Unknown`.** Without it the session's own
+///    repo cannot even be named.
+/// 2. **An unreadable ownership read → `Unknown`.** The attributed worktrees
+///    are the part of the set the directory cannot reveal.
+/// 3. **Any member that is definitely not clean → `Dirty`**, in member
+///    order: a primary checkout, then uncommitted changes, the session's own
+///    custody slot, and unpushed commits. Dirty outranks a sibling's unknown
+///    because it is the more useful thing to report, and neither closes.
+/// 4. **Any member that could not be judged → `Unknown`**: a failed probe or
+///    a branch with no upstream.
+/// 5. Otherwise **`Clean`** — including a session with NO members at all,
+///    which is a session sitting outside any repo (the workspace root) that
+///    no worktree is attributed to.
+pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
+    if inputs.session_dir.is_none() {
+        return CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir);
+    }
+    if let Err(detail) = &inputs.ownership {
+        return CustodyVerdict::Unknown(CustodyUnknown::OwnershipUnreadable {
+            detail: detail.clone(),
+        });
+    }
+    for member in &inputs.members {
+        let path = member.path.clone();
+        match &member.state {
+            MemberState::PrimaryCheckout => {
+                return CustodyVerdict::Dirty(CustodyDirty::SharedCheckout { path })
+            }
+            MemberState::Probed { dirty: true, .. } => {
+                return CustodyVerdict::Dirty(CustodyDirty::Uncommitted { path })
+            }
+            MemberState::Probed { .. } | MemberState::ProbeFailed(_) => {}
+        }
+        if let Some(state) = member
+            .slot_wip_state
+            .as_deref()
+            .filter(|s| DIRTY_WIP_STATES.contains(s))
+        {
+            return CustodyVerdict::Dirty(CustodyDirty::WipSlot {
+                path,
+                wip_state: state.to_string(),
+            });
+        }
+        if let MemberState::Probed {
+            ahead: Some(ahead), ..
+        } = member.state
+        {
+            if ahead > 0 {
+                return CustodyVerdict::Dirty(CustodyDirty::Unpushed { path, ahead });
+            }
+        }
+    }
+    for member in &inputs.members {
+        match &member.state {
+            MemberState::ProbeFailed(detail) => {
+                return CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
+                    path: member.path.clone(),
+                    detail: detail.clone(),
+                })
+            }
+            MemberState::Probed { ahead: None, .. } => {
+                return CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+                    path: member.path.clone(),
+                })
+            }
+            MemberState::Probed { .. } | MemberState::PrimaryCheckout => {}
+        }
+    }
+    CustodyVerdict::Clean
+}
+
+/// The `windDown.custody` block `GET /restart-readiness` attaches when the
+/// `finished_close` arm judged a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustodyView {
+    /// `clean` | `dirty` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `dirty` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found, naming the worktree.
+    pub detail: Option<String>,
+    /// When the arm judged it (unix millis).
+    pub judged_at: i64,
+}
+
+impl CustodyView {
+    pub fn from_verdict(verdict: &CustodyVerdict, judged_at_ms: i64) -> Self {
+        Self {
+            verdict: verdict.as_str(),
+            reason: verdict.reason(),
+            detail: verdict.detail(),
+            judged_at: judged_at_ms,
+        }
     }
 }
 
@@ -841,6 +1152,228 @@ mod tests {
                 "reason": null, "kind": "looping"
             })
         );
+    }
+
+    // ---- the custody gate (D2) ---------------------------------------------
+
+    fn clean_member(path: &str) -> CustodyMember {
+        CustodyMember {
+            path: path.to_string(),
+            state: MemberState::Probed {
+                dirty: false,
+                ahead: Some(0),
+            },
+            slot_wip_state: Some("clean".to_string()),
+        }
+    }
+
+    fn custody(members: Vec<CustodyMember>) -> CustodyInputs {
+        CustodyInputs {
+            session_dir: Some("/ws/agent-worktrees/a/repo".to_string()),
+            ownership: Ok(()),
+            members,
+        }
+    }
+
+    #[test]
+    fn a_clean_pushed_worktree_is_clean() {
+        let v = custody_gate(&custody(vec![clean_member("/ws/a")]));
+        assert_eq!(v, CustodyVerdict::Clean);
+        assert!(v.is_clean());
+        assert_eq!((v.as_str(), v.reason()), ("clean", None));
+    }
+
+    #[test]
+    fn an_untracked_or_uncommitted_change_is_dirty() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::Probed {
+            dirty: true,
+            ahead: Some(0),
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![m])),
+            CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                path: "/ws/a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_unpushed_commit_is_dirty() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::Probed {
+            dirty: false,
+            ahead: Some(2),
+        };
+        let v = custody_gate(&custody(vec![m]));
+        assert_eq!(
+            v,
+            CustodyVerdict::Dirty(CustodyDirty::Unpushed {
+                path: "/ws/a".to_string(),
+                ahead: 2
+            })
+        );
+        assert_eq!(v.reason(), Some("unpushed"));
+    }
+
+    #[test]
+    fn no_upstream_is_unknown_never_clean() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::Probed {
+            dirty: false,
+            ahead: None,
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![m])),
+            CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+                path: "/ws/a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_is_unknown() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::ProbeFailed("git status timed out".to_string());
+        let v = custody_gate(&custody(vec![m]));
+        assert_eq!(v.as_str(), "unknown");
+        assert_eq!(v.reason(), Some("probe_failed"));
+    }
+
+    #[test]
+    fn a_failed_ownership_read_is_unknown_even_with_a_clean_directory() {
+        let mut i = custody(vec![clean_member("/ws/a")]);
+        i.ownership = Err("coord returned 503".to_string());
+        assert_eq!(
+            custody_gate(&i),
+            CustodyVerdict::Unknown(CustodyUnknown::OwnershipUnreadable {
+                detail: "coord returned 503".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn no_known_directory_is_unknown() {
+        let mut i = custody(vec![]);
+        i.session_dir = None;
+        assert_eq!(
+            custody_gate(&i),
+            CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir)
+        );
+    }
+
+    #[test]
+    fn a_primary_checkout_is_dirty_whatever_its_status() {
+        let m = CustodyMember {
+            path: "/ws/qontinui-runner".to_string(),
+            state: MemberState::PrimaryCheckout,
+            slot_wip_state: None,
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![m])),
+            CustodyVerdict::Dirty(CustodyDirty::SharedCheckout {
+                path: "/ws/qontinui-runner".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_captured_deferred_or_failed_custody_slot_is_dirty() {
+        for state in DIRTY_WIP_STATES {
+            let mut m = clean_member("/ws/a");
+            m.slot_wip_state = Some(state.to_string());
+            assert_eq!(
+                custody_gate(&custody(vec![m])),
+                CustodyVerdict::Dirty(CustodyDirty::WipSlot {
+                    path: "/ws/a".to_string(),
+                    wip_state: state.to_string()
+                }),
+                "{state}"
+            );
+        }
+        // `clean`, `unchanged` and an absent slot are not refusals on their
+        // own — the git probes are the source.
+        for state in [Some("clean"), Some("unchanged"), None] {
+            let mut m = clean_member("/ws/a");
+            m.slot_wip_state = state.map(str::to_string);
+            assert!(custody_gate(&custody(vec![m])).is_clean(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_root_session_is_judged_by_its_attributed_worktrees_alone() {
+        // No member for the directory itself: it is in no repo.
+        let none = custody(vec![]);
+        assert!(custody_gate(&none).is_clean(), "nothing attributed → clean");
+
+        let mut dirty = clean_member("/ws/agent-worktrees/x/repo");
+        dirty.state = MemberState::Probed {
+            dirty: true,
+            ahead: Some(0),
+        };
+        assert_eq!(custody_gate(&custody(vec![dirty])).as_str(), "dirty");
+    }
+
+    #[test]
+    fn one_dirty_sibling_rules_out_a_multi_worktree_session() {
+        let mut sibling = clean_member("/ws/b");
+        sibling.state = MemberState::Probed {
+            dirty: false,
+            ahead: Some(1),
+        };
+        let v = custody_gate(&custody(vec![
+            clean_member("/ws/a"),
+            sibling,
+            clean_member("/ws/c"),
+        ]));
+        assert_eq!(
+            v,
+            CustodyVerdict::Dirty(CustodyDirty::Unpushed {
+                path: "/ws/b".to_string(),
+                ahead: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_dirty_member_is_reported_ahead_of_a_siblings_unknown() {
+        let mut unknown = clean_member("/ws/a");
+        unknown.state = MemberState::ProbeFailed("timed out".to_string());
+        let mut dirty = clean_member("/ws/b");
+        dirty.state = MemberState::Probed {
+            dirty: true,
+            ahead: Some(0),
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![unknown, dirty])).as_str(),
+            "dirty"
+        );
+    }
+
+    #[test]
+    fn the_custody_view_carries_the_verdict_and_is_omitted_when_absent() {
+        let v = CustodyView::from_verdict(
+            &CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+                path: "/ws/a".to_string(),
+            }),
+            42,
+        );
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({
+                "verdict": "unknown", "reason": "no_upstream",
+                "detail": "/ws/a has no upstream to compare against", "judgedAt": 42
+            })
+        );
+        // A view the arm never judged serialises with no `custody` key at all.
+        let plain = WindDownView::from_verdict(
+            &Eligibility::Eligible { since_ms: 1 },
+            SessionKind::Terminal,
+        );
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("custody")
+            .is_none());
     }
 
     // ---- GridIdleTracker ---------------------------------------------------

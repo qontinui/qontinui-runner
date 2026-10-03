@@ -4118,6 +4118,24 @@ impl TerminalSession {
             .and_then(|mut slot| slot.take())
     }
 
+    /// Every worktree the parked `IsolatedEditContext` materialized, or empty
+    /// when none is parked. Read by the wind-down executor's custody gate,
+    /// which must judge every worktree this session could have edited.
+    pub fn isolated_edit_worktree_paths(&self) -> Vec<std::path::PathBuf> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref().map(|ctx| {
+                    ctx.worktrees
+                        .iter()
+                        .map(|w| w.worktree_path.clone())
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
     /// Every owner-token session id a worktree claim held BY this terminal can
     /// carry: its coord session id, and the discriminator its parked
     /// `IsolatedEditContext` acquired its claims under (a gate continuation's is

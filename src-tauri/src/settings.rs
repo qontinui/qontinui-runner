@@ -3221,6 +3221,60 @@ pub struct RemoteCreateSettings {
     pub allowed_intent_repos: Vec<String>,
 }
 
+/// Settings → General → Sessions → "Close finished sessions after grace" (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+/// D3) — the product off-switch for the wind-down executor's `finished_close`
+/// arm, which graceful-`/exit`s a finished, idle, custody-clean terminal
+/// session after grace without waiting for a drain.
+///
+/// Default **`On`** (served policy `engineering-priorities`
+/// `capability-ships-enabled`). Because the arm acts on the user's behalf —
+/// it closes their windows — the off-switch lives in the product, not only in
+/// the environment. `QONTINUI_FINISHED_SESSION_CLOSE=0` in the runner's spawn
+/// environment is a machine kill switch that wins over this value, and
+/// `QONTINUI_WIND_DOWN_EXECUTOR=0` still disables the whole executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishedSessionClose {
+    /// Close finished sessions after grace. The default.
+    #[default]
+    On,
+    /// Judge every candidate exactly as `On` would, log "would close", and
+    /// close nothing.
+    Shadow,
+    /// The arm does not run.
+    Off,
+}
+
+impl FinishedSessionClose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishedSessionClose::On => "on",
+            FinishedSessionClose::Shadow => "shadow",
+            FinishedSessionClose::Off => "off",
+        }
+    }
+
+    /// Parse the wire spelling; `None` for anything else (never a default —
+    /// a typo must not silently turn the arm on or off).
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "on" => Some(FinishedSessionClose::On),
+            "shadow" => Some(FinishedSessionClose::Shadow),
+            "off" => Some(FinishedSessionClose::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Session-lifecycle settings block. A missing `sessions` key — every
+/// `settings.json` written before this block — loads the defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionsSettings {
+    #[serde(default)]
+    pub finished_session_close: FinishedSessionClose,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3480,6 +3534,11 @@ pub struct Settings {
     /// where it may land). See [`RemoteCreateSettings`]; default-off.
     #[serde(default)]
     pub remote_create: RemoteCreateSettings,
+    /// Session-lifecycle preferences (the `finished_close` arm's switch). See
+    /// [`SessionsSettings`]. Re-read by the wind-down executor on every tick,
+    /// so a change is live with no runner restart.
+    #[serde(default)]
+    pub sessions: SessionsSettings,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -6133,6 +6192,25 @@ pub fn get_remote_create_settings() -> RemoteCreateSettings {
 /// Persist the remote-create preference.
 pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
+}
+
+/// The `finished_close` arm's switch as SAVED — not the effective mode, which
+/// the machine kill switch can override (see
+/// `session::finished_close::effective_mode`).
+///
+/// Read through [`read_settings_from_disk`], not [`load_settings`]: the
+/// wind-down executor calls this on every tick, and that door serves a cached
+/// parse and never writes the operator's file as a side effect of reading it.
+pub fn get_finished_session_close() -> FinishedSessionClose {
+    read_settings_from_disk()
+        .settings
+        .sessions
+        .finished_session_close
+}
+
+/// Persist the `finished_close` arm's switch.
+pub fn save_finished_session_close(mode: FinishedSessionClose) -> Result<(), String> {
+    update_settings(|settings| settings.sessions.finished_session_close = mode)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

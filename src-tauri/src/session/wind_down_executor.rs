@@ -1,13 +1,37 @@
-//! Wind-down EXECUTOR — the tick that actually closes a drained runner's
-//! finished, idle sessions (plan `2026-09-13-drained-runner-never-reaches-idle`,
-//! Phase 4; design decisions D4, D5, D6).
+//! Wind-down EXECUTOR — the tick that actually closes finished, idle
+//! sessions: a drained runner's (plan `2026-09-13-drained-runner-never-reaches-idle`,
+//! Phase 4; design decisions D4, D5, D6), and — through the `finished_close`
+//! arm — any runner's finished terminal sessions, with no drain at all (plan
+//! `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`).
 //!
 //! Phase 1 built the two halves and wired neither: the pure verdict
 //! ([`qontinui_runner_lib::wind_down::eligibility`]) and the closing primitive
 //! (`TerminalManager::graceful_exit`). This module is what joins them, and it
-//! is the ONLY place in the runner that closes a session because of a drain.
+//! is the ONLY place in the runner that closes a session for wind-down.
 //!
-//! ## What one tick does
+//! ## Two arms, one tick, one budget
+//!
+//! [`decide_tick`] picks exactly ONE action per tick, so the two arms never
+//! run in the same tick and together they never close more than
+//! [`MAX_CLOSES_PER_TICK`] sessions in one. They also share the
+//! [`ClockJumpGuard`] quarantine and the one `graceful_exit` call below.
+//!
+//! * **The drain arm** ([`TickAction::WindDown`]) — while drained, described
+//!   in the next section, unchanged by the second arm.
+//! * **The `finished_close` arm** ([`TickAction::FinishedClose`]) — on every
+//!   tick that is not a drain and owes no undrain (`Clear` or `NotEnrolled`;
+//!   `Unknown` is still `Nothing`). It considers `Eligible` TERMINAL sessions
+//!   only — looping agents and stewards stay drain-only — and closes one only
+//!   when `wind_down::custody_gate` also answers `Clean` for every worktree the
+//!   session touched, read fresh by git probes (`wind_down_observer::
+//!   gather_custody`). Its switch, cadence and candidate filter live in
+//!   [`crate::session::finished_close`]: Settings `on` / `shadow` / `off`,
+//!   overridden off by `QONTINUI_FINISHED_SESSION_CLOSE=0`, and a census at
+//!   most every `max(TICK, grace / 4)` — none at all while the lifecycle store
+//!   holds no open terminal record. Each close's outcome is recorded with
+//!   `wind_down_arm: finished_close`.
+//!
+//! ## What the drain arm does
 //!
 //! Every [`TICK`], and **only while [`CoordDrainState::Drained`]**:
 //!
@@ -116,15 +140,18 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use crate::coord_drain_state::CoordDrainState;
+use crate::session::finished_close::{self, PassPlan, SkipReason};
 use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, WIND_DOWN_CLOSED, WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN,
-    WIND_DOWN_EXIT_STUCK, WIND_DOWN_NOT_ATTEMPTED,
+    SessionLifecycleStore, WIND_DOWN_ARM_DRAIN, WIND_DOWN_ARM_FINISHED_CLOSE, WIND_DOWN_CLOSED,
+    WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN, WIND_DOWN_EXIT_STUCK,
+    WIND_DOWN_NOT_ATTEMPTED,
 };
-use crate::session::tracking_health::LiveClaudeProcess;
-use crate::session::wind_down_observer;
+use crate::session::tracking_health::{LiveClaudeProcess, TrackingHealthPass};
+use crate::session::wind_down_observer::{self, GitCustodyProbe, OwnershipRead};
+use crate::settings::FinishedSessionClose;
 use crate::terminal::graceful_exit::GracefulExitOutcome;
 use crate::terminal::TerminalManager;
-use qontinui_runner_lib::wind_down::{self, SessionKind};
+use qontinui_runner_lib::wind_down::{self, CustodyVerdict, SessionKind};
 
 /// How often the executor looks (plan Phase 4).
 pub const TICK: Duration = Duration::from_secs(30);
@@ -162,12 +189,16 @@ pub fn enabled() -> bool {
 /// What one tick should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickAction {
-    /// Drained: look for eligible sessions and close them.
+    /// Drained: look for eligible sessions and close them (the drain arm).
     WindDown,
     /// Autonomous spawns are allowed again after a drain: restart what the
     /// drain stopped.
     Undrain,
-    /// Do nothing at all — including while `Unknown`.
+    /// Not drained, nothing owed: the `finished_close` arm may close finished,
+    /// custody-clean terminal sessions (its own switch and cadence decide
+    /// whether it actually looks — see [`finished_close::plan_pass`]).
+    FinishedClose,
+    /// Do nothing at all — the action for `Unknown`.
     Nothing,
 }
 
@@ -181,7 +212,10 @@ pub enum TickAction {
 ///
 /// `NotEnrolled` sits with `Clear`: both ALLOW autonomous spawns, so if this
 /// runner was wound down and is now un-drained by either route, what the drain
-/// stopped is owed a restart. `Unknown` is neither, and does nothing.
+/// stopped is owed a restart — and once nothing is owed, both are ticks the
+/// `finished_close` arm may use. An owed undrain goes first; the arm waits a
+/// tick. `Unknown` is neither a drain nor an undrain, and does nothing: an
+/// unreadable state is not evidence for any action, including the arm's.
 pub fn decide_tick(state: &CoordDrainState, owes_undrain: bool, now: DateTime<Utc>) -> TickAction {
     let allows = match state {
         CoordDrainState::Clear | CoordDrainState::NotEnrolled { .. } => true,
@@ -193,7 +227,7 @@ pub fn decide_tick(state: &CoordDrainState, owes_undrain: bool, now: DateTime<Ut
     match (allows, owes_undrain) {
         (false, _) => TickAction::WindDown,
         (true, true) => TickAction::Undrain,
-        (true, false) => TickAction::Nothing,
+        (true, false) => TickAction::FinishedClose,
     }
 }
 
@@ -381,8 +415,14 @@ impl StoppedByDrain {
 /// next runner restart.
 pub fn start() {
     if !enabled() {
-        info!("wind_down_executor: disabled by {ENABLE_ENV}=0 — a drained runner will not wind down on this machine");
+        info!("wind_down_executor: disabled by {ENABLE_ENV}=0 — a drained runner will not wind down, and no finished session is closed, on this machine");
         return;
+    }
+    if finished_close::kill_switch_engaged() {
+        info!(
+            "wind_down_executor: the finished_close arm is disabled by {}=0 — finished sessions close only under a drain on this machine",
+            finished_close::KILL_ENV
+        );
     }
     tauri::async_runtime::spawn(async move {
         crate::mcp::task_supervisor::spawn_supervised_forever(
@@ -422,6 +462,10 @@ struct ExecutorState {
     /// blocking filesystem call on a runtime worker for an answer that cannot
     /// change after the first look.
     inherited_checked: bool,
+    /// When the `finished_close` arm last ran a census — the cadence input to
+    /// [`finished_close::plan_pass`]. In-memory on purpose: a respawned loop
+    /// simply looks on its first eligible tick.
+    finished_close_last_census: Option<Instant>,
 }
 
 async fn tick_once(state: &mut ExecutorState) {
@@ -474,6 +518,38 @@ async fn tick_once(state: &mut ExecutorState) {
 
     match decide_tick(&drain, state.was_drained, Utc::now()) {
         TickAction::Nothing => {}
+        TickAction::FinishedClose => {
+            use tauri::Manager;
+            let mode = finished_close::current_mode();
+            let open_terminal_records = app
+                .try_state::<Arc<SessionLifecycleStore>>()
+                .map_or(0, |store| store.open_records().len());
+            let now = Instant::now();
+            match finished_close::plan_pass(
+                mode,
+                clock,
+                state.finished_close_last_census,
+                now,
+                grace,
+                open_terminal_records,
+            ) {
+                PassPlan::Census { shadow } => {
+                    state.finished_close_last_census = Some(now);
+                    finished_close_once(&app, grace, shadow).await;
+                }
+                PassPlan::Skip(SkipReason::Off) => {
+                    // A switched-off arm judges nothing, so it must not keep
+                    // serving the verdicts it reached while it was on.
+                    finished_close::publish_custody(&[], Utc::now().timestamp_millis());
+                }
+                PassPlan::Skip(reason) => {
+                    debug!(
+                        ?reason,
+                        "wind_down_executor: finished_close skipped this tick"
+                    );
+                }
+            }
+        }
         TickAction::Undrain => {
             // `undrain` reports what it could not restart, so a kind the drain
             // re-armed under is still owed and is retried on a later undrain.
@@ -725,8 +801,177 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         manager,
         store,
         fresh: &fresh,
+        pass,
+        workspace_root: None,
     };
-    close_batch(candidates, &effects).await;
+    close_batch(CloseArm::Drain, candidates, &effects).await;
+}
+
+/// The custody verdict for one candidate of the `finished_close` arm: its
+/// context from `pass` and the live pane, its attributed worktrees from
+/// `ownership`, every member probed fresh by git (D2b, D2c).
+async fn custody_verdict(
+    app: &tauri::AppHandle,
+    pass: &TrackingHealthPass,
+    ownership: &OwnershipRead,
+    workspace_root: Option<&std::path::Path>,
+    session_id: &str,
+    terminal_id: &str,
+) -> CustodyVerdict {
+    let context = wind_down_observer::custody_context(app, pass, session_id, terminal_id);
+    let attributed = wind_down_observer::attributed_worktrees(
+        ownership,
+        context.coord_session_id.as_deref(),
+        workspace_root,
+    );
+    let inputs = wind_down_observer::gather_custody(
+        &GitCustodyProbe::default(),
+        &context,
+        attributed,
+        session_id,
+    )
+    .await;
+    let verdict = wind_down::custody_gate(&inputs);
+    debug!(
+        session_id = %session_id,
+        terminal_id = %terminal_id,
+        session_dir = inputs.session_dir.as_deref().unwrap_or("-"),
+        members = inputs.members.len(),
+        custody = %finished_close::describe(&verdict),
+        "wind_down_executor: finished_close custody judged"
+    );
+    verdict
+}
+
+/// One `finished_close` pass (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`):
+/// observe, gate every `Eligible` terminal session on custody, then hand the
+/// clean ones to the SAME [`close_batch`] the drain arm uses.
+///
+/// The ownership read is made once here and shared by every candidate; the
+/// custody probes run only on candidates `eligibility` already rated
+/// `Eligible`. Every verdict reached is published for `GET /restart-readiness`
+/// (`windDown.custody`), replacing the previous pass's.
+async fn finished_close_once(app: &tauri::AppHandle, grace: Duration, shadow: bool) {
+    use tauri::Manager;
+
+    let fresh = wind_down_observer::fresh_pass(app, grace).await;
+    let Some(pass) = fresh.pass.as_ref() else {
+        debug!(
+            unknowns = ?fresh.unknowns,
+            "wind_down_executor: finished_close has no census this tick — nothing closed"
+        );
+        return;
+    };
+    let candidates = finished_close::select_finished_close_candidates(
+        &pass.report.terminal_hosted,
+        &fresh.observed,
+    );
+    if candidates.is_empty() {
+        finished_close::publish_custody(&[], Utc::now().timestamp_millis());
+        return;
+    }
+    let Some(manager) = app
+        .try_state::<Arc<TerminalManager>>()
+        .map(|s| s.inner().clone())
+    else {
+        return;
+    };
+    let store = app
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+
+    let ownership = wind_down_observer::fetch_ownership().await;
+    let workspace_root = crate::workspace_paths::workspace_root_readonly();
+    let mut verdicts: Vec<(String, CustodyVerdict)> = Vec::new();
+    let mut clean: Vec<(String, String)> = Vec::new();
+    for (session_id, terminal_id) in candidates {
+        let verdict = custody_verdict(
+            app,
+            pass,
+            &ownership,
+            workspace_root.as_deref(),
+            &session_id,
+            &terminal_id,
+        )
+        .await;
+        if verdict.is_clean() {
+            clean.push((session_id.clone(), terminal_id));
+        } else {
+            info!(
+                session_id = %session_id,
+                terminal_id = %terminal_id,
+                custody = %finished_close::describe(&verdict),
+                "wind_down_executor: finished and idle past grace, but custody is not clean — not closed"
+            );
+        }
+        verdicts.push((session_id, verdict));
+    }
+    finished_close::publish_custody(&verdicts, Utc::now().timestamp_millis());
+
+    if clean.is_empty() {
+        return;
+    }
+    info!(
+        clean = clean.len(),
+        budget = MAX_CLOSES_PER_TICK,
+        shadow,
+        "wind_down_executor: finished_close — closing finished, custody-clean sessions"
+    );
+    let effects = LiveCloseEffects {
+        app,
+        grace,
+        manager,
+        store,
+        fresh: &fresh,
+        pass,
+        workspace_root,
+    };
+    close_batch(CloseArm::FinishedClose, clean, &effects).await;
+}
+
+/// Which arm a [`close_batch`] runs for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseArm {
+    /// The drain arm: closes while coord holds this device drained.
+    Drain,
+    /// The `finished_close` arm: closes finished, custody-clean terminal
+    /// sessions with no drain.
+    FinishedClose,
+}
+
+impl CloseArm {
+    /// The word recorded as the lifecycle record's `wind_down_arm`.
+    pub fn word(self) -> &'static str {
+        match self {
+            CloseArm::Drain => WIND_DOWN_ARM_DRAIN,
+            CloseArm::FinishedClose => WIND_DOWN_ARM_FINISHED_CLOSE,
+        }
+    }
+}
+
+/// Whether the arm still admits closes, re-read before EACH candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Close the candidate.
+    Close,
+    /// Judge the candidate in full but only log that it would be closed —
+    /// the `finished_close` arm's `shadow` mode.
+    Shadow,
+    /// The arm no longer applies: the drain lifted, or the `finished_close`
+    /// switch went off or the clock became untrustworthy. Abandon the batch.
+    Withdrawn,
+}
+
+/// PURE: the `finished_close` arm's admission from its switch and the clock.
+/// An untrustworthy clock withdraws even a shadow pass: its idle windows are
+/// exactly what the quarantine says not to believe.
+pub fn finished_close_admission(mode: FinishedSessionClose, clock_trustworthy: bool) -> Admission {
+    match (mode, clock_trustworthy) {
+        (FinishedSessionClose::Off, _) | (_, false) => Admission::Withdrawn,
+        (FinishedSessionClose::Shadow, true) => Admission::Shadow,
+        (FinishedSessionClose::On, true) => Admission::Close,
+    }
 }
 
 /// What one candidate's turn came to. Returned rather than only logged so a
@@ -744,27 +989,41 @@ pub(crate) enum CandidateOutcome {
     ExitNotStarted,
     /// Re-observation no longer admitted it (B1). Nothing was typed at it.
     NoLongerEligible,
-    /// The drain lifted before its turn. This candidate and every later one
-    /// were abandoned, so this is always the LAST element.
-    DrainLifted,
+    /// `finished_close` only: the custody re-check no longer answered
+    /// `Clean`. Nothing was typed at it.
+    CustodyNotClean,
+    /// `finished_close` in `shadow`: every check passed and the close was
+    /// logged, not made. Nothing was typed at it.
+    Shadowed,
+    /// The arm withdrew before its turn — the drain lifted, or the
+    /// `finished_close` switch went off or the clock stepped. This candidate
+    /// and every later one were abandoned, so this is always the LAST element.
+    ArmWithdrawn,
 }
 
 /// Everything [`close_batch`] does to the world, behind a trait.
 ///
-/// The two per-candidate preconditions are **sequencing**, not computation, and
+/// The per-candidate preconditions are **sequencing**, not computation, and
 /// sequencing is exactly what the pure helpers around it cannot pin: with
 /// `recheck_is_owed` and `recheck_admits` tested in isolation, deleting the
 /// block that CALLS them stayed green across the whole suite. Injecting the
-/// three effects is what makes "index 0 is not re-checked, index 1 is, and a
+/// effects is what makes "index 0 is not re-checked, index 1 is, and a
 /// `NotYet` answer skips the close" an assertion instead of a comment.
 #[async_trait::async_trait]
 pub(crate) trait CloseEffects {
-    /// (a) Is the device still drained?
-    fn still_drained(&self) -> bool;
+    /// (a) Does `arm` still admit closes? For the drain arm: is the device
+    /// still drained. For `finished_close`: is its switch still not `off`,
+    /// and is the clock still trustworthy.
+    fn arm_still_admitted(&self, arm: CloseArm) -> Admission;
     /// (b) Re-observe ONE candidate. `None` when the session or its pane is
     /// gone, or could not be observed — both fail closed.
     async fn recheck(&self, session_id: &str, terminal_id: &str)
         -> Option<wind_down::WindDownView>;
+    /// (c) `finished_close` only: re-judge ONE candidate's custody, fresh.
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict;
+    /// `finished_close` in `shadow`: log that this candidate WOULD be closed,
+    /// with the inputs it was judged on.
+    fn would_close(&self, session_id: &str, terminal_id: &str);
     /// Ask the pane to leave. `Err` when the exit could not START at all.
     ///
     /// Deliberately NOT named `close`: the kill-path tripwire forbids the bare
@@ -782,8 +1041,9 @@ pub(crate) trait CloseEffects {
     /// steward registry, so a test double supplies them.
     fn session_kind(&self, terminal_id: &str) -> SessionKind;
     fn steward_kind(&self, terminal_id: &str) -> Option<String>;
-    /// Stamp the outcome on the session's lifecycle record.
-    fn record_outcome(&self, session_id: &str, outcome: &GracefulExitOutcome);
+    /// Stamp the outcome, and the arm that produced it, on the session's
+    /// lifecycle record.
+    fn record_outcome(&self, arm: CloseArm, session_id: &str, outcome: &GracefulExitOutcome);
     /// Latch [`crate::mcp::steward::StewardMeta::claude_seen`] — B4-1's
     /// backend-owned writer.
     fn record_claude_seen(&self, terminal_id: &str);
@@ -791,16 +1051,17 @@ pub(crate) trait CloseEffects {
     async fn record_stopped_by_drain(&self, kind: &str);
 }
 
-/// Close up to [`MAX_CLOSES_PER_TICK`] candidates, re-establishing BOTH
-/// preconditions before each one.
+/// Close up to [`MAX_CLOSES_PER_TICK`] candidates for `arm`, re-establishing
+/// EVERY precondition before each one.
 ///
 /// A batch is up to `MAX_CLOSES_PER_TICK` closes, each of which can wait a full
 /// [`EXIT_DEADLINE`], so the last one can start minutes after the pass that
-/// authorised it. Both things that authorise a close can have changed in those
-/// minutes, and both are re-read:
+/// authorised it. Everything that authorises a close can have changed in those
+/// minutes, and all of it is re-read:
 ///
-/// * **The DRAIN.** "Only while `Drained`" would otherwise be false for every
-///   close after the first.
+/// * **The ARM.** "Only while `Drained`" would otherwise be false for every
+///   close after the first — and for `finished_close`, so would "only while the
+///   switch is on and the clock is trustworthy".
 /// * **The ELIGIBILITY of THIS session.** The scenario: four sessions are
 ///   eligible, D is last; while A, B and C are being closed the operator
 ///   returns to D, types a prompt, `claude` works for 90 s, answers, and D is
@@ -819,7 +1080,16 @@ pub(crate) trait CloseEffects {
 ///   Skipped for the FIRST candidate alone, whose verdict is the pass that just
 ///   ran, milliseconds old, with nothing having elapsed since. Every later one
 ///   pays a re-check.
+/// * **CUSTODY, for `finished_close`.** The same minutes are long enough for a
+///   session's operator to come back and commit, or to leave a file behind;
+///   a later candidate's custody is therefore re-judged fresh too, under the
+///   same first-candidate exemption — its verdict is the one the pass reached
+///   milliseconds ago.
+///
+/// In `shadow`, every one of those checks still runs, and the close is logged
+/// instead of made.
 pub(crate) async fn close_batch<E: CloseEffects + Sync>(
+    arm: CloseArm,
     candidates: Vec<(String, String)>,
     effects: &E,
 ) -> Vec<CandidateOutcome> {
@@ -827,9 +1097,13 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     for (index, (session_id, terminal_id)) in
         candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
     {
-        if !effects.still_drained() {
-            info!("wind_down_executor: the drain lifted mid-batch — stopping this pass");
-            outcomes.push(CandidateOutcome::DrainLifted);
+        let admission = effects.arm_still_admitted(arm);
+        if admission == Admission::Withdrawn {
+            info!(
+                arm = arm.word(),
+                "wind_down_executor: the arm no longer applies mid-batch — stopping this pass"
+            );
+            outcomes.push(CandidateOutcome::ArmWithdrawn);
             return outcomes;
         }
         let rechecked = if recheck_is_owed(index) {
@@ -848,6 +1122,24 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             outcomes.push(CandidateOutcome::NoLongerEligible);
             continue;
         }
+        if arm == CloseArm::FinishedClose && recheck_is_owed(index) {
+            let custody = effects.recheck_custody(&session_id, &terminal_id).await;
+            if !custody.is_clean() {
+                info!(
+                    session_id = %session_id,
+                    terminal_id = %terminal_id,
+                    custody = %finished_close::describe(&custody),
+                    "wind_down_executor: custody no longer clean when its turn came — not closed"
+                );
+                outcomes.push(CandidateOutcome::CustodyNotClean);
+                continue;
+            }
+        }
+        if admission == Admission::Shadow {
+            effects.would_close(&session_id, &terminal_id);
+            outcomes.push(CandidateOutcome::Shadowed);
+            continue;
+        }
         let outcome = match effects.wind_down_one(&session_id, &terminal_id).await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -856,7 +1148,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
                 continue;
             }
         };
-        effects.record_outcome(&session_id, &outcome);
+        effects.record_outcome(arm, &session_id, &outcome);
 
         // B4-1: POSITIVE PROOF that a `claude` lived in this pane, taken at the
         // exact moment the husk is created. Six of the eight outcomes carry the
@@ -880,7 +1172,10 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         // `terminal_hosted` again. Over-recording is cheap — the set is
         // idempotent and `restart_after_drain` answers a benign 409 with
         // `NotNeeded` — and under-recording is permanent.
-        if effects.session_kind(&terminal_id) == SessionKind::Steward && claude_left(&outcome) {
+        if arm == CloseArm::Drain
+            && effects.session_kind(&terminal_id) == SessionKind::Steward
+            && claude_left(&outcome)
+        {
             if let Some(kind) = effects.steward_kind(&terminal_id) {
                 effects.record_stopped_by_drain(&kind).await;
             }
@@ -890,20 +1185,66 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     outcomes
 }
 
-/// The shipped [`CloseEffects`] — the real drain state, the real observer, and
-/// `TerminalManager::graceful_exit`.
+/// The shipped [`CloseEffects`] — the real drain state and switch, the real
+/// observer, the real custody probes, and `TerminalManager::graceful_exit`.
 struct LiveCloseEffects<'a> {
     app: &'a tauri::AppHandle,
     grace: Duration,
     manager: Arc<TerminalManager>,
     store: Option<Arc<SessionLifecycleStore>>,
     fresh: &'a wind_down_observer::FreshPass,
+    /// `fresh`'s census — a batch is only ever started on a pass that has one.
+    pass: &'a TrackingHealthPass,
+    /// The workspace root a relative coord ledger path is anchored on —
+    /// `finished_close` only; the drain arm never re-judges custody.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 #[async_trait::async_trait]
 impl CloseEffects for LiveCloseEffects<'_> {
-    fn still_drained(&self) -> bool {
-        decide_tick(&crate::coord_drain_state::current(), false, Utc::now()) == TickAction::WindDown
+    fn arm_still_admitted(&self, arm: CloseArm) -> Admission {
+        match arm {
+            CloseArm::Drain => {
+                if decide_tick(&crate::coord_drain_state::current(), false, Utc::now())
+                    == TickAction::WindDown
+                {
+                    Admission::Close
+                } else {
+                    Admission::Withdrawn
+                }
+            }
+            CloseArm::FinishedClose => finished_close_admission(
+                finished_close::current_mode(),
+                check_clock(self.grace).trustworthy(),
+            ),
+        }
+    }
+
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict {
+        let ownership = wind_down_observer::fetch_ownership().await;
+        custody_verdict(
+            self.app,
+            self.pass,
+            &ownership,
+            self.workspace_root.as_deref(),
+            session_id,
+            terminal_id,
+        )
+        .await
+    }
+
+    fn would_close(&self, session_id: &str, terminal_id: &str) {
+        let observation = self.fresh.observed.observation_for(terminal_id);
+        info!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            sideband = ?observation.sideband,
+            grid = ?observation.grid,
+            judged_at_ms = self.fresh.observed.now_ms,
+            grace_s = self.grace.as_secs(),
+            custody = "clean",
+            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, custody clean); closing nothing"
+        );
     }
 
     async fn recheck(
@@ -922,14 +1263,10 @@ impl CloseEffects for LiveCloseEffects<'_> {
         let kind = self.fresh.observed.kind_for(terminal_id);
         let observation = self.fresh.observed.observation_for(terminal_id);
         let origin = self
-            .fresh
             .pass
-            .as_ref()
-            .and_then(|pass| {
-                pass.open_records
-                    .iter()
-                    .find(|r| r.claude_session_id == session_id)
-            })
+            .open_records
+            .iter()
+            .find(|r| r.claude_session_id == session_id)
             .and_then(|r| r.origin.clone());
         info!(
             session_id = %session_id,
@@ -965,11 +1302,14 @@ impl CloseEffects for LiveCloseEffects<'_> {
         crate::mcp::steward::steward_kind_for_terminal(terminal_id)
     }
 
-    fn record_outcome(&self, session_id: &str, outcome: &GracefulExitOutcome) {
+    fn record_outcome(&self, arm: CloseArm, session_id: &str, outcome: &GracefulExitOutcome) {
         match (outcome_word(outcome), &self.store) {
-            (Some(word), Some(store)) => {
-                store.set_wind_down_outcome(session_id, word, Utc::now().timestamp_millis())
-            }
+            (Some(word), Some(store)) => store.set_wind_down_outcome(
+                session_id,
+                word,
+                arm.word(),
+                Utc::now().timestamp_millis(),
+            ),
             _ => {
                 debug!(session_id = %session_id, ?outcome, "wind_down_executor: nothing recorded for this outcome")
             }
@@ -1186,7 +1526,7 @@ mod tests {
             (drained(), TickAction::WindDown),
             (unknown(), TickAction::Nothing),
             (CoordDrainState::Clear, TickAction::Undrain),
-            (CoordDrainState::Clear, TickAction::Nothing),
+            (CoordDrainState::Clear, TickAction::FinishedClose),
         ] {
             let action = decide_tick(&state, was_drained, now);
             assert_eq!(
@@ -1196,7 +1536,7 @@ mod tests {
             match action {
                 TickAction::WindDown => was_drained = true,
                 TickAction::Undrain => was_drained = false,
-                TickAction::Nothing => {}
+                TickAction::FinishedClose | TickAction::Nothing => {}
             }
         }
     }
@@ -1213,7 +1553,7 @@ mod tests {
             reason: None,
         };
         assert_eq!(decide_tick(&expired, true, now), TickAction::Undrain);
-        assert_eq!(decide_tick(&expired, false, now), TickAction::Nothing);
+        assert_eq!(decide_tick(&expired, false, now), TickAction::FinishedClose);
         assert_eq!(decide_tick(&live, false, now), TickAction::WindDown);
         // ...and the spawn gate agrees about the same two states.
         assert!(crate::coord_drain_state::gate_for_at(
@@ -1237,7 +1577,10 @@ mod tests {
             why: "no machine.json",
         };
         assert_eq!(decide_tick(&not_enrolled, true, now), TickAction::Undrain);
-        assert_eq!(decide_tick(&not_enrolled, false, now), TickAction::Nothing);
+        assert_eq!(
+            decide_tick(&not_enrolled, false, now),
+            TickAction::FinishedClose
+        );
     }
 
     // ── Hazard 1: the wall-clock guard ───────────────────────────────────
@@ -1455,6 +1798,7 @@ mod tests {
                 until: None,
                 reason: None,
                 kind: SessionKind::Terminal,
+                custody: None,
             }),
         }
     }
@@ -1503,6 +1847,7 @@ mod tests {
             until: None,
             reason: None,
             kind: SessionKind::Terminal,
+            custody: None,
         };
         let not_yet = wind_down::WindDownView {
             eligibility: "not_yet",
@@ -1510,6 +1855,7 @@ mod tests {
             until: Some(2),
             reason: None,
             kind: SessionKind::Terminal,
+            custody: None,
         };
 
         // Index 0 owes nothing: its verdict is the pass that just ran.
@@ -1562,29 +1908,32 @@ mod tests {
 
     /// A [`CloseEffects`] that records every call and answers from a script.
     struct RecordingEffects {
-        /// `still_drained` answers by index of call: `drained[n]`, then the
-        /// last value forever.
-        drained: Vec<bool>,
+        /// `arm_still_admitted` answers by index of call: `admissions[n]`,
+        /// then the last value forever.
+        admissions: Vec<Admission>,
         /// What `recheck` answers, by terminal id. Absent = `None` (gone).
         verdicts: HashMap<String, wind_down::WindDownView>,
+        /// What `recheck_custody` answers, by terminal id. Absent = `Clean`.
+        custody: HashMap<String, CustodyVerdict>,
         /// What `wind_down_one` answers, by terminal id. Absent = `Exited`
         /// with one pid — the ordinary case.
         outcomes: HashMap<String, Result<GracefulExitOutcome, String>>,
         /// Which terminals hold a steward, and of which kind.
         stewards: HashMap<String, String>,
         calls: std::sync::Mutex<Vec<String>>,
-        drained_calls: std::sync::atomic::AtomicUsize,
+        admission_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingEffects {
         fn new() -> Self {
             Self {
-                drained: vec![true],
+                admissions: vec![Admission::Close],
                 verdicts: HashMap::new(),
+                custody: HashMap::new(),
                 outcomes: HashMap::new(),
                 stewards: HashMap::new(),
                 calls: std::sync::Mutex::new(Vec::new()),
-                drained_calls: std::sync::atomic::AtomicUsize::new(0),
+                admission_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
         fn eligible(mut self, terminal_id: &str) -> Self {
@@ -1598,7 +1947,24 @@ mod tests {
             self
         }
         fn drained(mut self, script: &[bool]) -> Self {
-            self.drained = script.to_vec();
+            self.admissions = script
+                .iter()
+                .map(|&on| {
+                    if on {
+                        Admission::Close
+                    } else {
+                        Admission::Withdrawn
+                    }
+                })
+                .collect();
+            self
+        }
+        fn admissions(mut self, script: &[Admission]) -> Self {
+            self.admissions = script.to_vec();
+            self
+        }
+        fn custody(mut self, terminal_id: &str, verdict: CustodyVerdict) -> Self {
+            self.custody.insert(terminal_id.to_string(), verdict);
             self
         }
         fn steward(mut self, terminal_id: &str, kind: &str) -> Self {
@@ -1630,6 +1996,7 @@ mod tests {
             until: None,
             reason: None,
             kind: SessionKind::Terminal,
+            custody: None,
         }
     }
 
@@ -1642,11 +2009,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CloseEffects for RecordingEffects {
-        fn still_drained(&self) -> bool {
+        fn arm_still_admitted(&self, arm: CloseArm) -> Admission {
+            self.log(format!("admitted?:{}", arm.word()));
             let n = self
-                .drained_calls
+                .admission_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *self.drained.get(n).unwrap_or(self.drained.last().unwrap())
+            *self
+                .admissions
+                .get(n)
+                .unwrap_or(self.admissions.last().unwrap())
+        }
+        async fn recheck_custody(&self, _session_id: &str, terminal_id: &str) -> CustodyVerdict {
+            self.log(format!("custody:{terminal_id}"));
+            self.custody
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or(CustodyVerdict::Clean)
+        }
+        fn would_close(&self, _session_id: &str, terminal_id: &str) {
+            self.log(format!("would_close:{terminal_id}"));
         }
         async fn recheck(
             &self,
@@ -1678,8 +2059,8 @@ mod tests {
         fn steward_kind(&self, terminal_id: &str) -> Option<String> {
             self.stewards.get(terminal_id).cloned()
         }
-        fn record_outcome(&self, session_id: &str, _outcome: &GracefulExitOutcome) {
-            self.log(format!("record_outcome:{session_id}"));
+        fn record_outcome(&self, arm: CloseArm, session_id: &str, _outcome: &GracefulExitOutcome) {
+            self.log(format!("record_outcome:{session_id}:{}", arm.word()));
         }
         fn record_claude_seen(&self, terminal_id: &str) {
             self.log(format!("claude_seen:{terminal_id}"));
@@ -1704,7 +2085,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_candidate_is_closed_unrechecked_and_the_rest_are_rechecked_first() {
         let effects = RecordingEffects::new().eligible("t2").eligible("t3");
-        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2", "t3"]), &effects).await;
 
         let order: Vec<String> = effects
             .calls()
@@ -1732,7 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_whose_grace_clock_restarted_is_skipped_not_closed() {
         let effects = RecordingEffects::new().not_yet("t2").eligible("t3");
-        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2", "t3"]), &effects).await;
 
         assert!(
             !effects.calls().contains(&"exit:t2".to_string()),
@@ -1753,7 +2134,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_the_recheck_cannot_find_is_not_closed() {
         let effects = RecordingEffects::new();
-        let outcomes = close_batch(batch(&["t1", "t2"]), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
 
         assert!(!effects.calls().contains(&"exit:t2".to_string()));
         assert_eq!(
@@ -1774,7 +2155,7 @@ mod tests {
             .drained(&[true, false])
             .eligible("t2")
             .eligible("t3");
-        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2", "t3"]), &effects).await;
 
         assert!(
             !effects.calls().iter().any(|c| c.ends_with(":t2")),
@@ -1782,7 +2163,7 @@ mod tests {
         );
         assert_eq!(
             outcomes,
-            vec![CandidateOutcome::Attempted, CandidateOutcome::DrainLifted]
+            vec![CandidateOutcome::Attempted, CandidateOutcome::ArmWithdrawn]
         );
     }
 
@@ -1797,7 +2178,7 @@ mod tests {
             effects = effects.eligible(id);
         }
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let outcomes = close_batch(batch(&refs), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&refs), &effects).await;
 
         assert_eq!(outcomes.len(), MAX_CLOSES_PER_TICK);
         assert_eq!(
@@ -1821,7 +2202,7 @@ mod tests {
         let effects = RecordingEffects::new()
             .steward("t1", "merge-train")
             .eligible("t2");
-        close_batch(batch(&["t1", "t2"]), &effects).await;
+        close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
 
         let calls = effects.calls();
         assert!(
@@ -1851,7 +2232,7 @@ mod tests {
                 reason: "pane not provably clear".to_string(),
             },
         );
-        close_batch(batch(&["t1"]), &effects).await;
+        close_batch(CloseArm::Drain, batch(&["t1"]), &effects).await;
 
         assert!(effects
             .calls()
@@ -1868,7 +2249,7 @@ mod tests {
     #[tokio::test]
     async fn an_exit_that_saw_a_claude_latches_it_on_the_steward_registry() {
         let effects = RecordingEffects::new().steward("t1", "merge-train");
-        close_batch(batch(&["t1"]), &effects).await;
+        close_batch(CloseArm::Drain, batch(&["t1"]), &effects).await;
 
         assert!(
             effects.calls().contains(&"claude_seen:t1".to_string()),
@@ -1884,7 +2265,7 @@ mod tests {
         let effects = RecordingEffects::new()
             .steward("t1", "merge-train")
             .outcome("t1", GracefulExitOutcome::NoLiveClaude);
-        close_batch(batch(&["t1"]), &effects).await;
+        close_batch(CloseArm::Drain, batch(&["t1"]), &effects).await;
 
         let calls = effects.calls();
         assert!(
@@ -1902,7 +2283,7 @@ mod tests {
     #[tokio::test]
     async fn an_exit_that_could_not_start_is_not_reported_as_attempted() {
         let effects = RecordingEffects::new().exit_fails("t1").eligible("t2");
-        let outcomes = close_batch(batch(&["t1", "t2"]), &effects).await;
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
 
         assert_eq!(
             outcomes,
@@ -1913,7 +2294,7 @@ mod tests {
         );
         let calls = effects.calls();
         assert!(
-            !calls.contains(&"record_outcome:s-t1".to_string()),
+            !calls.iter().any(|c| c.starts_with("record_outcome:s-t1")),
             "nothing happened to that session, so nothing is stamped on it: {calls:?}"
         );
         assert!(
@@ -2122,7 +2503,7 @@ mod tests {
         let store =
             SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
         // An absent record is a no-op, not an error and not a new row.
-        store.set_wind_down_outcome("missing", WIND_DOWN_CLOSED, 10);
+        store.set_wind_down_outcome("missing", WIND_DOWN_CLOSED, WIND_DOWN_ARM_DRAIN, 10);
         assert!(store.get("missing").is_none());
 
         store.record_open(
@@ -2156,6 +2537,7 @@ mod tests {
                 finished_at: None,
                 wind_down_outcome: None,
                 wind_down_at: None,
+                wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
@@ -2163,20 +2545,26 @@ mod tests {
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());
 
-        store.set_wind_down_outcome("s1", WIND_DOWN_EXIT_STUCK, 111);
+        store.set_wind_down_outcome("s1", WIND_DOWN_EXIT_STUCK, WIND_DOWN_ARM_DRAIN, 111);
         let after = store.get("s1").unwrap();
         assert_eq!(
             after.wind_down_outcome.as_deref(),
             Some(WIND_DOWN_EXIT_STUCK)
         );
         assert_eq!(after.wind_down_at, Some(111));
+        assert_eq!(after.wind_down_arm.as_deref(), Some(WIND_DOWN_ARM_DRAIN));
         // Orthogonal to `state`: an exit-stuck session is still open.
         assert_eq!(after.state, "open");
 
-        store.set_wind_down_outcome("s1", WIND_DOWN_CLOSED, 222);
+        store.set_wind_down_outcome("s1", WIND_DOWN_CLOSED, WIND_DOWN_ARM_FINISHED_CLOSE, 222);
         let later = store.get("s1").unwrap();
         assert_eq!(later.wind_down_outcome.as_deref(), Some(WIND_DOWN_CLOSED));
         assert_eq!(later.wind_down_at, Some(222));
+        assert_eq!(
+            later.wind_down_arm.as_deref(),
+            Some(WIND_DOWN_ARM_FINISHED_CLOSE),
+            "the arm is written with the outcome, so the two always describe the same act"
+        );
     }
 
     // ── Invariants 2 and 3, over the pure verdict this executor acts on ──
@@ -2281,6 +2669,353 @@ mod tests {
             assert!(
                 closable(&inputs, GRACE_MS),
                 "{kind:?} never finishes by design and must still wind down"
+            );
+        }
+    }
+
+    // ── The `finished_close` arm (plan
+    //    2026-10-03-finished-runner-sessions-close-their-window-without-a-drain) ──
+
+    use crate::session::finished_close::{
+        plan_pass, select_finished_close_candidates, PassPlan as FcPlan,
+    };
+    use qontinui_runner_lib::wind_down::{CustodyDirty, CustodyUnknown};
+
+    /// A finished, idle terminal session's inputs, idle since t=0.
+    fn finished_idle() -> EligibilityInputs {
+        EligibilityInputs {
+            kind: SessionKind::Terminal,
+            work_status: WorkStatus::Finished,
+            sideband: Sideband::NeverReported,
+            grid: GridIdle::Idle { since_ms: 0 },
+            has_live_children: Some(false),
+            finished_at_ms: None,
+            grace: GRACE,
+        }
+    }
+
+    /// One top-level process carrying the verdict `inputs` reach at `now_ms`.
+    fn judged(session_id: &str, inputs: &EligibilityInputs, now_ms: i64) -> LiveClaudeProcess {
+        let mut proc = candidate_proc(1, Some(session_id), None, false);
+        proc.wind_down = Some(wind_down::WindDownView::from_verdict(
+            &eligibility(inputs, now_ms),
+            inputs.kind,
+        ));
+        proc
+    }
+
+    /// THE property: an eligible, finished, idle, custody-clean terminal
+    /// session is closed — with no drain anywhere — and the record names the
+    /// arm that closed it.
+    #[tokio::test]
+    async fn an_eligible_custody_clean_terminal_session_is_closed_with_no_drain() {
+        let now = Utc::now();
+        // Not drained, nothing owed: the tick is the finished_close arm's.
+        assert_eq!(
+            decide_tick(&CoordDrainState::Clear, false, now),
+            TickAction::FinishedClose
+        );
+        assert_eq!(
+            plan_pass(
+                FinishedSessionClose::On,
+                ClockVerdict::Trustworthy,
+                None,
+                Instant::now(),
+                GRACE,
+                1
+            ),
+            FcPlan::Census { shadow: false }
+        );
+        let processes = vec![judged("s-t1", &finished_idle(), GRACE_MS)];
+        let candidates =
+            select_finished_close_candidates(&processes, &observed_with(&[("s-t1", "t1")]));
+        assert_eq!(candidates, vec![("s-t1".to_string(), "t1".to_string())]);
+
+        let effects = RecordingEffects::new();
+        let outcomes = close_batch(CloseArm::FinishedClose, candidates, &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        let calls = effects.calls();
+        assert!(calls.contains(&"exit:t1".to_string()), "{calls:?}");
+        assert!(
+            calls.contains(&"record_outcome:s-t1:finished_close".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    /// Every single failing ELIGIBILITY input keeps a session out of the arm
+    /// entirely. (The custody inputs — untracked, unpushed, no upstream, a
+    /// failed ownership read, no directory, a primary checkout, a captured or
+    /// deferred slot — are pinned one each against `custody_gate` itself in
+    /// `wind_down`'s tests, and through the gather in `wind_down_observer`'s.)
+    #[test]
+    fn each_single_failing_eligibility_input_is_never_a_finished_close_candidate() {
+        let past_grace = GRACE_MS;
+        let cases: Vec<(&str, EligibilityInputs, i64)> = vec![
+            (
+                "not finished",
+                EligibilityInputs {
+                    work_status: WorkStatus::NotFinished,
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "working",
+                EligibilityInputs {
+                    sideband: Sideband::Reported {
+                        state: SidebandState::Working,
+                        set_at_ms: 0,
+                    },
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "busy grid",
+                EligibilityInputs {
+                    grid: GridIdle::Busy,
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            (
+                "live children",
+                EligibilityInputs {
+                    has_live_children: Some(true),
+                    ..finished_idle()
+                },
+                past_grace,
+            ),
+            ("inside grace", finished_idle(), GRACE_MS - 1),
+        ];
+        let observed = observed_with(&[("s", "t1")]);
+        for (name, inputs, now_ms) in cases {
+            let processes = vec![judged("s", &inputs, now_ms)];
+            assert!(
+                select_finished_close_candidates(&processes, &observed).is_empty(),
+                "{name}: must never be a finished_close candidate"
+            );
+        }
+        // ...and the base case is one, so the table is not vacuous.
+        let processes = vec![judged("s", &finished_idle(), GRACE_MS)];
+        assert_eq!(
+            select_finished_close_candidates(&processes, &observed).len(),
+            1
+        );
+    }
+
+    /// D1: looping agents and stewards are never closed without a drain —
+    /// even with an `Eligible` verdict the drain arm WOULD act on.
+    #[test]
+    fn looping_agents_and_stewards_are_never_finished_close_candidates() {
+        let mut observed = observed_with(&[("s-loop", "t-loop"), ("s-stew", "t-stew")]);
+        observed.looping_terminal_ids.insert("t-loop".to_string());
+        observed.steward_terminal_ids.insert("t-stew".to_string());
+        let processes = vec![
+            candidate_proc(1, Some("s-loop"), Some("eligible"), false),
+            candidate_proc(2, Some("s-stew"), Some("eligible"), false),
+        ];
+        assert_eq!(
+            select_candidates(&processes, &observed).len(),
+            2,
+            "the drain arm would close both"
+        );
+        assert!(select_finished_close_candidates(&processes, &observed).is_empty());
+    }
+
+    /// The recheck re-applies custody for `finished_close`: a later candidate
+    /// whose custody went dirty (or unreadable) while earlier ones were being
+    /// closed is skipped, not closed — and index 0, judged milliseconds ago,
+    /// is exempt exactly as it is from the eligibility re-check.
+    #[tokio::test]
+    async fn a_later_candidate_whose_custody_is_no_longer_clean_is_not_closed() {
+        let effects = RecordingEffects::new()
+            .eligible("t2")
+            .eligible("t3")
+            .eligible("t4")
+            .custody(
+                "t2",
+                CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                    path: "/ws/a".to_string(),
+                }),
+            )
+            .custody(
+                "t3",
+                CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+                    path: "/ws/b".to_string(),
+                }),
+            );
+        let outcomes = close_batch(
+            CloseArm::FinishedClose,
+            batch(&["t1", "t2", "t3", "t4"]),
+            &effects,
+        )
+        .await;
+        let order: Vec<String> = effects
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                c.starts_with("recheck:") || c.starts_with("custody:") || c.starts_with("exit:")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "exit:t1",
+                "recheck:t2",
+                "custody:t2",
+                "recheck:t3",
+                "custody:t3",
+                "recheck:t4",
+                "custody:t4",
+                "exit:t4",
+            ]
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                CandidateOutcome::Attempted,
+                CandidateOutcome::CustodyNotClean,
+                CandidateOutcome::CustodyNotClean,
+                CandidateOutcome::Attempted,
+            ]
+        );
+    }
+
+    /// The drain arm's behaviour is unchanged: it never consults custody.
+    #[tokio::test]
+    async fn the_drain_arm_never_rechecks_custody() {
+        let effects = RecordingEffects::new().eligible("t2").custody(
+            "t2",
+            CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                path: "/ws/a".to_string(),
+            }),
+        );
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted; 2]);
+        assert!(!effects.calls().iter().any(|c| c.starts_with("custody:")));
+    }
+
+    /// `shadow` closes NOTHING and logs a "would close" per candidate — after
+    /// every check a real close would have made.
+    #[tokio::test]
+    async fn shadow_closes_nothing_and_logs_would_close() {
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Shadow])
+            .eligible("t2");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Shadowed; 2]);
+        let calls = effects.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("exit:")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("record_outcome:")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"would_close:t1".to_string()));
+        assert!(
+            calls.contains(&"custody:t2".to_string()),
+            "a shadow pass still re-judges custody, so its log is honest: {calls:?}"
+        );
+        assert!(calls.contains(&"would_close:t2".to_string()));
+    }
+
+    /// `off`, the env kill switch, and a stepped clock all withdraw the arm —
+    /// before the first close, or mid-batch.
+    #[tokio::test]
+    async fn off_the_kill_switch_and_an_untrusted_clock_withdraw_the_arm() {
+        use crate::session::finished_close::effective_mode;
+        assert_eq!(
+            finished_close_admission(FinishedSessionClose::Off, true),
+            Admission::Withdrawn
+        );
+        assert_eq!(
+            finished_close_admission(effective_mode(FinishedSessionClose::On, Some("0")), true),
+            Admission::Withdrawn
+        );
+        assert_eq!(
+            finished_close_admission(FinishedSessionClose::On, false),
+            Admission::Withdrawn
+        );
+        assert_eq!(
+            finished_close_admission(FinishedSessionClose::Shadow, false),
+            Admission::Withdrawn
+        );
+        assert_eq!(
+            finished_close_admission(FinishedSessionClose::Shadow, true),
+            Admission::Shadow
+        );
+        assert_eq!(
+            finished_close_admission(FinishedSessionClose::On, true),
+            Admission::Close
+        );
+
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Close, Admission::Withdrawn])
+            .eligible("t2");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Attempted, CandidateOutcome::ArmWithdrawn]
+        );
+        assert!(!effects.calls().contains(&"exit:t2".to_string()));
+    }
+
+    /// The two arms share ONE budget: a tick takes exactly one action, so it
+    /// runs at most one arm, and whichever arm it runs is capped at
+    /// `MAX_CLOSES_PER_TICK`.
+    #[tokio::test]
+    async fn the_budget_is_shared_between_the_two_arms() {
+        let now = Utc::now();
+        for state in [drained(), CoordDrainState::Clear, unknown()] {
+            for owes in [false, true] {
+                let action = decide_tick(&state, owes, now);
+                let arms = [TickAction::WindDown, TickAction::FinishedClose]
+                    .iter()
+                    .filter(|a| **a == action)
+                    .count();
+                assert!(arms <= 1, "{state:?}/{owes}: one tick, at most one arm");
+            }
+        }
+        let ids: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for arm in [CloseArm::Drain, CloseArm::FinishedClose] {
+            let mut effects = RecordingEffects::new();
+            for id in &ids {
+                effects = effects.eligible(id);
+            }
+            close_batch(arm, batch(&refs), &effects).await;
+            assert_eq!(
+                effects
+                    .calls()
+                    .iter()
+                    .filter(|c| c.starts_with("exit:"))
+                    .count(),
+                MAX_CLOSES_PER_TICK,
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// A steward a `finished_close` batch somehow reached is NOT recorded as
+    /// owed a restart: that set is the drain's, and only the drain arm writes
+    /// it.
+    #[tokio::test]
+    async fn only_the_drain_arm_records_stopped_by_drain() {
+        let effects = RecordingEffects::new().steward("t1", "merge-train");
+        close_batch(CloseArm::FinishedClose, batch(&["t1"]), &effects).await;
+        assert!(!effects
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("stopped_by_drain:")));
+    }
+
+    /// `Unknown` is still nothing for BOTH arms.
+    #[test]
+    fn unknown_is_not_a_finished_close_tick() {
+        for owes in [false, true] {
+            assert_eq!(
+                decide_tick(&unknown(), owes, Utc::now()),
+                TickAction::Nothing
             );
         }
     }
