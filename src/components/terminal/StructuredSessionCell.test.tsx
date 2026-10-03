@@ -32,6 +32,7 @@ import {
   PermissionCard,
   addPermissionRequest,
   formatToolInput,
+  interruptFailureText,
   kindCopy,
   removePermissionRequest,
   resolvedLabel,
@@ -676,6 +677,18 @@ describe("ConversationView", () => {
       <ConversationView {...base} messages={[]} readStatus="ok" lastReadError={null} />,
     );
     expect(ok).toContain("No transcript yet");
+    expect(ok).toContain("worker");
+    const structured = renderToStaticMarkup(
+      <ConversationView
+        {...base}
+        messages={[]}
+        readStatus="ok"
+        lastReadError={null}
+        kind="structured"
+      />,
+    );
+    expect(structured).toContain("No transcript yet");
+    expect(structured).not.toContain("worker");
   });
 
   it("renders the in-flight tail through StreamingMessageView while processing", () => {
@@ -809,12 +822,32 @@ describe("permission card (Phase 9)", () => {
     expect(resolvedLabel({ ...base, outcome: "denied", interrupt: true })).toContain("interrupted");
     expect(resolvedLabel({ ...base, outcome: "allowed" })).toBe("Allowed Bash.");
     expect(resolvedLabel({ ...base, outcome: "session_ended" })).toContain("ended");
+    expect(resolvedLabel({ ...base, outcome: "superseded" })).toContain("replaced");
   });
 
   it("labels the cell by what it hosts", () => {
     expect(kindCopy("worker").label).toBe("Worker");
     expect(kindCopy("structured").label).toBe("Structured");
     expect(kindCopy("structured").steerNow).not.toContain("worker");
+    expect(kindCopy("structured").emptyTranscript).not.toContain("worker");
+  });
+
+  it("surfaces an interrupt that could not be sent after a deny", () => {
+    const resolved = {
+      sessionId: "s",
+      requestId: "r",
+      toolName: "Bash",
+      outcome: "denied" as const,
+      interrupt: true,
+    };
+    expect(interruptFailureText({ resolved, interruptError: "stdin closed" })).toContain(
+      "stdin closed",
+    );
+    expect(interruptFailureText({ resolved, interruptError: null })).toBeNull();
+    expect(interruptFailureText(null)).toBeNull();
+    const source = readFileSync(resolve(__dirname, "./StructuredSessionCell.tsx"), "utf8");
+    expect(source).toContain("setInterruptWarning(interruptFailureText(outcome))");
+    expect(source).toContain("data-permission-interrupt-failed");
   });
 
   it("marks a structured launch's record as prompting, and a worker's as not", () => {
