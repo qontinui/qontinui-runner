@@ -505,7 +505,7 @@ do_check() {
     n=${#TASKS[@]}
     if [ "$n" -eq 0 ]; then
         say "ABSENT -- no runner scheduler task named $TASK_NAME at $BASE ($ALL_COUNT task(s) with other names)"
-        [ "$LIST_EMPTY" = 1 ] && printf '  note: the list was EMPTY, and the runner answers an empty list when its own database read fails too (mcp/scheduler.rs list_scheduled_tasks), so this is as good as that read\n'
+        [ "$LIST_EMPTY" = 1 ] && printf '  note: the list was EMPTY, and a runner built before qontinui-runner#1865 answers an empty list when its own database read fails too (mcp/scheduler.rs list_scheduled_tasks; #1865 makes it a 500), so on such a runner this is as good as that read\n'
         printf '  fix: %s\n' "$FIX_HINT"
         exit 1
     fi
