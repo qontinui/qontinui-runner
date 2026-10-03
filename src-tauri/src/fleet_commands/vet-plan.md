@@ -244,7 +244,7 @@ so the next author does not reintroduce them:
   **plus an optional `independence` declaration**, and does an
   `owner == attester` compare **when no declaration is sent** — on the DEVICE
   half of each key since qontinui-coord#2561 (`parse_actor_key`, landed
-  2026-09-26, after the correction above), so a same-device agent JWT, however
+  2026-09-28, after the correction above), so a same-device agent JWT, however
   freshly allocated, is the same actor;
   `non_author_allows_identities` is called only from `gates.rs`.
 - It said *"a subagent never qualifies"*. The operator ruled the opposite on
@@ -3192,7 +3192,7 @@ around it:
   WORK-UNIT attestation this step performs goes through
   `work_unit_registry::authorize_target_transition`, which compares the DEVICE
   half of the owner and attester keys (`parse_actor_key`, since
-  qontinui-coord#2561, 2026-09-26) **only when no `independence` declaration is
+  qontinui-coord#2561, 2026-09-28) **only when no `independence` declaration is
   sent**. It shares the ladder's device floor and, like it, never admits on a
   differing agent id (it ignores the agent half entirely); it deliberately has
   no session rung — its doc comment says so. Do not read the tier analysis as
