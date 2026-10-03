@@ -736,6 +736,7 @@ pub async fn dispatch_subtask(
                 closed_at: None,
                 close_reason: None,
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                lane: crate::session::session_lifecycle_store::SessionLane::Structured,
                 // Authoritative: the CLI session id was pre-pinned to
                 // task_run_id via `CliSessionContext { is_resume: false }` above
                 // (`--session-id`).

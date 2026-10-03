@@ -23,6 +23,7 @@ import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
 import { describeThrown } from "@/lib/utils";
+import { providerLabel } from "./providerAdapter";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -470,6 +471,7 @@ function SessionCardInner({
         data-session-title={cardName}
         data-session-status={session.liveStatus}
         data-session-account={session.accountLabel}
+        data-session-provider={session.provider}
         // `accessibleName` and `ai/find` resolve on this. `title` carries the
         // rich multi-line tooltip, which makes a poor name, so the headline is
         // stated separately here; the tooltip is unchanged visually.
@@ -498,6 +500,12 @@ function SessionCardInner({
             title={statusInfo.label}
           />
           <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
+          <span
+            className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#7aa2f7]/10 text-[#7aa2f7]"
+            data-testid={`session-card-provider-${session.sessionId}`}
+          >
+            {providerLabel(session.provider)}
+          </span>
           {accountBadge && (
             <span
               className={`px-1 py-0 rounded text-[9px] font-medium shrink-0 ${accountBadge.bg} ${accountBadge.text}`}

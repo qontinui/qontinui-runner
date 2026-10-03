@@ -646,7 +646,8 @@ pub async fn transcript_list_sessions(
         vec![project]
     };
 
-    let config_dirs = transcript::find_claude_config_dirs();
+    let config_dirs =
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     // DEBUG, not INFO. This line counts *invocations of this command*, not
     // filesystem scans: `collect_all_sessions_cached` coalesces concurrent
     // callers onto one walk (shipped in c7c789571), so N of these lines can
@@ -708,7 +709,7 @@ pub async fn transcript_read_session(
     let config_dirs = if let Some(dir) = config_dir {
         vec![std::path::PathBuf::from(dir)]
     } else {
-        transcript::find_claude_config_dirs()
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)
     };
 
     for dir in &config_dirs {
@@ -759,7 +760,7 @@ pub async fn transcript_read_user_prompts(
     let config_dirs = if let Some(dir) = config_dir {
         vec![std::path::PathBuf::from(dir)]
     } else {
-        transcript::find_claude_config_dirs()
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)
     };
 
     // Reading and parsing a transcript is blocking file I/O — on the largest
@@ -826,7 +827,7 @@ pub async fn transcript_get_latest(
     let config_dirs: Vec<std::path::PathBuf> = if let Some(dir) = config_dir {
         vec![std::path::PathBuf::from(dir)]
     } else {
-        transcript::find_claude_config_dirs()
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)
     };
 
     // Convert the epoch-millis threshold to a UTC timestamp for the backend
@@ -861,7 +862,8 @@ pub async fn transcript_session_digests(
     max_sessions: Option<usize>,
 ) -> Result<CommandResponse, String> {
     let project_paths = collect_workspace_project_paths();
-    let config_dirs = transcript::find_claude_config_dirs();
+    let config_dirs =
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     if config_dirs.is_empty() {
         return Ok(CommandResponse {
             success: true,

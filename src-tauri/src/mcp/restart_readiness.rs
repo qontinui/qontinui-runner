@@ -1235,7 +1235,7 @@ pub async fn restart_readiness_handler(
             gather_activity_evidence(
                 &p.report,
                 &observed,
-                crate::terminal::transcript::find_claude_config_dirs(),
+                crate::terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE),
                 claude_activity::proc_start_ticks,
                 RECORD_READ_TIMEOUT,
                 &RECORD_READ_IN_FLIGHT,
@@ -1349,6 +1349,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: "claude".to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,

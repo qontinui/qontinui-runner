@@ -20,7 +20,7 @@
 //!
 //! Interactive panes are ALREADY registered with coord.
 //! `AiCoordRegistrar::register_sniffed_session` — called from
-//! `terminal::claude_resume_sniff` when the operator's `claude --resume <id>`
+//! `terminal::typed_resume_sniff` when the operator's `claude --resume <id>`
 //! line is sniffed off the PTY — writes a `session_kind="terminal_claude"` row
 //! with no `task_run_id`, anchored on `claude_code_session_id`. And
 //! `AiCoordRegistrar::session_id_for` is keyed on `claude_session_id` for BOTH
@@ -1630,7 +1630,7 @@ mod tests {
         )
     }
 
-    /// Register an interactive pane exactly as `claude_resume_sniff` does.
+    /// Register an interactive pane exactly as `typed_resume_sniff` does.
     /// `register_sniffed_session` is gated on the process-global
     /// `QONTINUI_SESSION_AUTOMATION_REGISTER` env var that the coord_register
     /// suite toggles under its own lock, so retry briefly rather than flake.

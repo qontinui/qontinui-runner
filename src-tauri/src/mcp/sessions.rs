@@ -650,7 +650,8 @@ async fn get_transcript(
         .map(|(root, _, _)| root.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config_dirs = transcript::find_claude_config_dirs();
+    let config_dirs =
+        transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     for dir in &config_dirs {
         if let Ok(messages) = transcript::read_session(dir, &project, &id) {
             let json_messages: Vec<serde_json::Value> = messages

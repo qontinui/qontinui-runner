@@ -469,7 +469,7 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .names
         .keys()
         .copied()
-        .filter(|p| pt::is_countable_claude(*p, &snap))
+        .filter(|p| pt::is_countable_ai_cli(*p, &snap))
         .collect();
     let cmdlines = pt::command_lines_for_pids(&pids).await;
     let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
@@ -488,7 +488,7 @@ async fn read_claude_procs(
     use crate::process_capture::process_tree as pt;
     let root = tm.get(terminal_id)?.child_pid()?;
     let snap = pt::snapshot_process_table_public().await;
-    let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
+    let pids = pt::ai_cli_pids_in_inclusive_subtree(root, &snap);
     let cmdlines = pt::command_lines_for_pids(&pids).await;
     let cwds = pt::working_directories_for_pids(&pids).await;
     Some(
@@ -810,6 +810,7 @@ mod tests {
             closed_at: Some(5),
             close_reason: None,
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            lane: super::super::session_lifecycle_store::SessionLane::Pty,
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,

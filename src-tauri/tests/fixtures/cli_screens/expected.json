@@ -10,6 +10,7 @@
     { "provider": "claude", "file": "claude/v2_first_paint.txt", "resume": "verified", "usageLimit": false },
     { "provider": "claude", "file": "claude/v2_logo.txt", "resume": "verified", "usageLimit": false },
     { "provider": "claude", "file": "claude/two_line_shell_prompt.txt", "resume": "none", "usageLimit": false },
-    { "provider": "claude", "file": "claude/cli_error.txt", "resume": "none", "usageLimit": false }
+    { "provider": "claude", "file": "claude/cli_error.txt", "resume": "none", "usageLimit": false },
+    { "provider": "codex", "file": "codex/plain_shell.txt", "resume": "none", "usageLimit": false }
   ]
 }
