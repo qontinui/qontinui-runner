@@ -30,17 +30,23 @@ HOSTED; nothing here can override them toward self-hosted.
      the pool host. What this rule buys is that an UNMODIFIED workflow never sends fork code
      to the pool by accident. A run whose head repo is not this repo routes self-hosted only
      when this script READ the policy as `all_external_contributors`; that read needs
-     repository-administration permission, which the GITHUB_TOKEN never holds, so in
+     repository-administration permission, which the GITHUB_TOKEN is not expected to hold
+     (it has no administration scope; not measured from inside a run), so in
      practice forks stay hosted. If the policy IS readable (a future token) and reads
      anything weaker, every run routes hosted. With the GITHUB_TOKEN that branch is
      unreachable in production; the tests exercise it.
+
+  2b. BOT-AUTHORED PRs STAY HOSTED. A same-repo PR opened by a bot account (a Dependabot
+     security update can appear without any dependabot.yml) runs new upstream build code
+     with no human in the loop.
 
   3. A STALLED OR SATURATED POOL FALLS BACK. In `auto`, a matching self-hosted job in
      this repo queued >= RUNNER_PUBLIC_POOL_STALL_MINUTES (default 10), or >=
      RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH (default 3) of them queued, routes hosted. Any
      read error, timeout or script fault is UNKNOWN and routes hosted. `self-hosted`
      skips this check (it is the trial/forcing lever) but never rules 1 and 2.
-     KNOWN LIMIT: a dead pool with NOTHING queued reads healthy, so the first job routed
+     KNOWN LIMIT: health reads only THIS repo's jobs, so load from another repo's listener
+     on the same host (qontinui-web's) is invisible. A dead pool with NOTHING queued reads healthy, so the first job routed
      to it waits (GitHub's queue limit, not timeout-minutes, bounds it) until a later
      run sees it stalled. Only the 10 oldest in-flight runs are inspected; the reason
      line says when more were skipped. Recovery for a stranded run: set the variable to
@@ -166,6 +172,7 @@ def decide(
     lane_raw: str | None,
     lane_source: str,
     same_repo: bool,
+    bot_author: bool,
     policy: str | None,
     policy_error: str | None,
     pool: PoolObservation | None,
@@ -194,6 +201,12 @@ def decide(
         hosted.reason = (
             f"fork-PR approval policy reads {policy!r}, weaker than {REQUIRED_APPROVAL_POLICY!r}: "
             "public-pool routing refused for every run (fail closed)"
+        )
+        return hosted
+    if bot_author:
+        hosted.reason = (
+            "PR opened by a bot account (e.g. a Dependabot security update on a same-repo branch): "
+            "it runs new upstream build code with no approval gate; hosted"
         )
         return hosted
     if not same_repo:
@@ -375,6 +388,7 @@ def main() -> int:
             lane_raw=lanes[os_key],
             lane_source=sources[os_key],
             same_repo=same_repo,
+            bot_author=os.environ.get("PR_USER_TYPE", "").strip().lower() == "bot",
             policy=policy,
             policy_error=policy_error,
             pool=pool[os_key] if pool else None,

@@ -220,6 +220,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_USER_TYPE: ${{ github.event.pull_request.user.type }}
           RUNNER_LINUX_LANE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_linux_lane != 'variable') && inputs.force_linux_lane || vars.RUNNER_LINUX_LANE }}
           RUNNER_LINUX_LANE_SOURCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_linux_lane != 'variable') && 'workflow_dispatch input force_linux_lane' || 'repo variable RUNNER_LINUX_LANE' }}
           RUNNER_WINDOWS_LANE: ${{ vars.RUNNER_WINDOWS_LANE }}
@@ -311,6 +312,7 @@ jobs:
         with:
           siblings: qontinui-schemas qontinui-web ui-bridge
           check-build-deps: 'true'
+          target-key: pr-${{ github.event.pull_request.number || format('run-{0}', github.run_id) }}
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -1668,6 +1670,7 @@ jobs:
         uses: ./.github/actions/public-pool-prepare
         with:
           siblings: qontinui-schemas
+          target-key: pr-${{ github.event.pull_request.number || format('run-{0}', github.run_id) }}
 
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
@@ -1738,15 +1741,22 @@ jobs:
 
   frontend-tests:
     name: Frontend unit tests (vitest)
-    # May run on the public pool -- see the `route` job. Node/pnpm only: no
-    # siblings, no sudo, nothing persistent to prepare.
+    # May run on the public pool -- see the `route` job. Node/pnpm only, but it
+    # still gets a per-job HOME (pnpm store, ~/.cache, lifecycle scripts) from
+    # public-pool-prepare, like every routed job.
     needs: route
     if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_lane == 'self-hosted' && '["self-hosted","Linux","public-pool"]' || '"ubuntu-latest"') }}
+    env:
+      SELF_HOSTED_LANE: ${{ needs.route.outputs.linux_lane == 'self-hosted' }}
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: "Public-pool lane: prepare persistent host"
+        if: env.SELF_HOSTED_LANE == 'true'
+        uses: ./.github/actions/public-pool-prepare
 
       # Mirror the matrix job's frontend setup EXACTLY: pnpm 10.33.2, node 20,
       # pnpm cache keyed on the root lockfile, frozen-lockfile install.

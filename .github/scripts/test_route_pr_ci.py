@@ -41,6 +41,7 @@ def call(os_key="linux", **kw):
         lane_raw="auto",
         lane_source="test",
         same_repo=True,
+        bot_author=False,
         policy=None,
         policy_error="GET -> HTTP 403",
         pool=r.PoolObservation(),
@@ -83,6 +84,10 @@ class DecideTests(unittest.TestCase):
             d = call(same_repo=False, lane_raw=lane)
             self.assertEqual(d.lane, "hosted", lane)
             self.assertIn("fork PR", d.reason)
+
+    def test_bot_authored_pr_is_hosted_even_when_forced(self):
+        for lane in ("auto", "self-hosted"):
+            self.assertEqual(call(lane_raw=lane, bot_author=True).lane, "hosted", lane)
 
     def test_fork_pr_with_proven_policy_may_route(self):
         d = call(same_repo=False, policy="all_external_contributors", policy_error=None)
@@ -250,17 +255,24 @@ class TreePins(unittest.TestCase):
                                   f"{key}: step {step.get('name') or uses} is not skipped on the pool")
 
     def test_routed_jobs_deliver_no_secret_to_the_pool(self):
-        # A step that names `secrets.` must either be skipped on the pool or blank the
-        # secret there in its own expression. (Workflow-level GITHUB_TOKEN is the
-        # run-scoped token and is out of scope.)
+        # Every `secrets.` occurrence anywhere in a routed job (job env, step env,
+        # with:, run:) must sit in an expression that blanks it on the pool, or in a
+        # step skipped on the pool. `secrets: inherit` is refused outright.
+        expr = re.compile(r"\$\{\{(.*?)\}\}", re.S)
         for key, job in self.routed_jobs().items():
+            self.assertNotIn("secrets", job, f"{key}: reusable-workflow secrets on a routed job")
+            for env_key, value in (job.get("env") or {}).items():
+                self.assertNotIn("secrets.", str(value), f"{key}: job-level env {env_key} carries a secret")
             for step in job.get("steps", []):
-                for env_key, value in (step.get("env") or {}).items():
-                    v = self.squash(value)
-                    if "secrets." not in v:
-                        continue
-                    guarded = self.GUARD in self.squash(step.get("if", "")) or (self.GUARD in v and "|| ''" in v)
-                    self.assertTrue(guarded, f"{key}: step {step.get('name')} delivers {env_key} to the pool")
+                if self.GUARD in self.squash(step.get("if", "")):
+                    continue
+                text = yaml.safe_dump({k: v for k, v in step.items() if k != "if"})
+                for m in expr.finditer(text):
+                    e = self.squash(m.group(1))
+                    if "secrets." in e:
+                        self.assertTrue(self.GUARD in e and "|| ''" in e,
+                                        f"{key}: step {step.get('name')} delivers a secret to the pool: {e}")
+                self.assertNotIn("secrets.", expr.sub("", text), f"{key}: step {step.get('name')} names a secret outside an expression")
 
     def test_routed_runs_on_are_pinned(self):
         pool = "'[\"self-hosted\",\"Linux\",\"public-pool\"]'"
@@ -273,9 +285,16 @@ class TreePins(unittest.TestCase):
         self.assertEqual(set(jobs), set(want))
         for key, expected in want.items():
             self.assertEqual(self.squash(jobs[key]["runs-on"]), expected, key)
-            if key != "frontend-tests":
-                env = self.squash(jobs[key]["env"]["SELF_HOSTED_LANE"])
-                self.assertIn("needs.route.outputs.linux_lane == 'self-hosted'", env, key)
+            env = self.squash(jobs[key]["env"]["SELF_HOSTED_LANE"])
+            self.assertIn("needs.route.outputs.linux_lane == 'self-hosted'", env, key)
+
+    def test_every_routed_job_prepares_first(self):
+        for key, job in self.routed_jobs().items():
+            steps = job.get("steps", [])
+            self.assertTrue(str(steps[0].get("uses", "")).startswith("actions/checkout@"), key)
+            self.assertIn("public-pool-prepare", str(steps[1].get("uses", "")), f"{key}: step 2 must be public-pool-prepare")
+            self.assertEqual(steps[1].get("if"), "env.SELF_HOSTED_LANE == 'true'", key)
+            self.assertEqual(sum("public-pool-prepare" in str(st.get("uses", "")) for st in steps), 1, key)
 
     def test_prepare_step_clears_exactly_the_checked_out_siblings(self):
         for key, job in self.routed_jobs().items():

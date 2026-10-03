@@ -20,10 +20,13 @@
 #      (dpkg-query) and fails naming what is missing, rather than letting a
 #      cargo build fail an hour later on a missing pkg-config file.
 #
-#   3. A PERSISTENT TARGET DIR replaces rust-cache. `actions/checkout` cleans the
-#      workspace (`git clean -ffdx`), so `./target` would be cold every run. The
-#      target dir is pointed OUTSIDE the workspace, at a per-host cache under the
-#      runner account's home, and wiped when it grows past `max-target-gb`.
+#   3. A PERSISTENT TARGET DIR PER PR replaces rust-cache. `actions/checkout`
+#      cleans the workspace (`git clean -ffdx`), so `./target` would be cold every
+#      run. The target dir lives OUTSIDE the workspace, keyed by `target-key` (the
+#      PR number): repeat pushes to one PR build incrementally, but one PR's
+#      artifacts are never loaded by another PR's build. Keys untouched for 3 days
+#      are pruned, and the oldest keys go first when the total passes
+#      `max-target-gb`.
 #
 #   4. A PER-JOB HOME. More than one runner listener can run as `runner-public`
 #      (qontinui-web's does today), so `$HOME` is shared between concurrent jobs.
@@ -53,9 +56,13 @@ inputs:
     required: false
     default: 'false'
   max-target-gb:
-    description: Wipe the persistent target dir when it is larger than this many GiB.
+    description: Prune the oldest per-PR target dirs while their total exceeds this many GiB.
     required: false
     default: '200'
+  target-key:
+    description: Per-PR key for the persistent target dir (e.g. pr-1234); [A-Za-z0-9._-] only.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
@@ -64,6 +71,7 @@ runs:
         SIBLINGS: ${{ inputs.siblings }}
         CHECK_BUILD_DEPS: ${{ inputs.check-build-deps }}
         MAX_TARGET_GB: ${{ inputs.max-target-gb }}
+        TARGET_KEY: ${{ inputs.target-key }}
       run: |
         set -euo pipefail
         set -f   # no glob expansion of the sibling list
@@ -94,7 +102,7 @@ runs:
           missing=()
           for pkg in libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev \
                      libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev \
-                     libatspi2.0-dev at-spi2-core; do
+                     libatspi2.0-dev at-spi2-core python3-yaml; do
             if ! dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"; then
               missing+=("${pkg}")
             fi
@@ -106,27 +114,43 @@ runs:
           echo "build deps present"
         fi
 
-        # 3. Persistent target dir outside the cleaned workspace (real home).
+        # 3. Persistent per-PR target dir outside the cleaned workspace (real home).
         real_home="${HOME}"
-        target="${real_home}/.cache/qontinui-runner-ci/target"
-        mkdir -p "${target}"
-        size_gb="$(du -s --block-size=1G "${target}" 2>/dev/null | awk 'NR==1{print $1}')"
-        size_gb="${size_gb:-0}"
-        case "${size_gb}" in *[!0-9]*|'') size_gb=0 ;; esac
-        if [ "${size_gb}" -gt "${MAX_TARGET_GB}" ]; then
-          echo "persistent target ${target} is ${size_gb} GiB > ${MAX_TARGET_GB}; wiping"
-          rm -rf -- "${target:?}"
-          mkdir -p "${target}"
+        root="${real_home}/.cache/qontinui-runner-ci/targets"
+        mkdir -p "${root}"
+        # Prune keys untouched for 3 days, then the oldest while over the cap.
+        find "${root}" -mindepth 1 -maxdepth 1 -type d -mtime +3 -print0 2>/dev/null \
+          | xargs -0 -r rm -rf --
+        total_gb() { du -s --block-size=1G "${root}" 2>/dev/null | awk 'NR==1{print $1+0}'; }
+        while [ "$(total_gb)" -gt "${MAX_TARGET_GB}" ]; do
+          oldest="$(ls -1tr "${root}" 2>/dev/null | head -1 || true)"
+          [ -n "${oldest}" ] || break
+          echo "target cache over ${MAX_TARGET_GB} GiB; removing ${oldest}"
+          rm -rf -- "${root:?}/${oldest}"
+        done
+        if [ -n "${TARGET_KEY}" ] && [[ "${TARGET_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          key="${TARGET_KEY}"
+        else
+          key="run-${GITHUB_RUN_ID:?}"
         fi
+        target="${root}/${key}"
+        mkdir -p "${target}"
+        touch "${target}"
 
-        # 4. Per-job HOME, toolchain homes pinned to the real one first.
+        # 4. Per-job HOME, XDG dirs and CARGO_HOME; RUSTUP_HOME pinned to the real
+        #    home so the installed toolchain is found (a host prerequisite makes it
+        #    operator-owned and read-only -- plan Phase 2 precondition (d)).
         job_home="${RUNNER_TEMP:?}/home"
         rm -rf -- "${job_home:?}"
-        mkdir -p "${job_home}"
+        mkdir -p "${job_home}/.config" "${job_home}/.cache" "${job_home}/.local/share" "${job_home}/.local/state" "${job_home}/.cargo"
         {
           echo "CARGO_TARGET_DIR=${target}"
-          echo "CARGO_HOME=${CARGO_HOME:-${real_home}/.cargo}"
+          echo "CARGO_HOME=${job_home}/.cargo"
           echo "RUSTUP_HOME=${RUSTUP_HOME:-${real_home}/.rustup}"
+          echo "XDG_CONFIG_HOME=${job_home}/.config"
+          echo "XDG_CACHE_HOME=${job_home}/.cache"
+          echo "XDG_DATA_HOME=${job_home}/.local/share"
+          echo "XDG_STATE_HOME=${job_home}/.local/state"
           echo "HOME=${job_home}"
         } >> "${GITHUB_ENV}"
-        echo "CARGO_TARGET_DIR=${target} (${size_gb} GiB); HOME=${job_home}; CARGO_HOME/RUSTUP_HOME pinned under ${real_home}"
+        echo "CARGO_TARGET_DIR=${target}; HOME=${job_home} (CARGO_HOME + XDG dirs per job); RUSTUP_HOME=${RUSTUP_HOME:-${real_home}/.rustup}"
