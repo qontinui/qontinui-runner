@@ -965,6 +965,31 @@ pub(crate) fn claude_bin_path() -> String {
     std::env::var("QONTINUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// `resolved` when it is launchable, else the bare [`claude_bin_path`].
+///
+/// [`resolve_claude_bin`] accepts any regular file on unix and does not check
+/// the execute bit. A bare name goes through `execvp`, which skips a
+/// non-executable PATH entry and keeps searching. Pinning an absolute path to
+/// such a file would trade that for an `EACCES` on every attempt. On
+/// Windows, and for anything that is not an absolute path, `resolved` is
+/// returned as is.
+fn launchable_or_bare(resolved: String) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Path::new(&resolved);
+        if p.is_absolute() {
+            let executable = std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !executable {
+                return claude_bin_path();
+            }
+        }
+    }
+    resolved
+}
+
 /// Resolve `claude` to an absolute, directly-launchable executable path for
 /// PTY-spawned continuation terminals (condition-check, gate-continuation).
 ///
@@ -9391,7 +9416,13 @@ pub(crate) async fn spawn_claude_child(
     // signal delivery.
     own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
-    let bin = claude_bin_path();
+    // Resolved to an absolute path through the same PATH walk the PTY seams
+    // use, so a failure names the real file. Falls back to the bare name when
+    // nothing resolves; the spawn below retries either way (plan
+    // `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
+    let bin = spawn_blocking_tracked(|| launchable_or_bare(resolve_claude_bin()))
+        .await
+        .unwrap_or_else(|_| claude_bin_path());
 
     // ONE account resolution, feeding all three consumers below: the
     // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
@@ -9520,9 +9551,14 @@ pub(crate) async fn spawn_claude_child(
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn `{bin}` in {workdir}: {e}"))?;
+    // A transient launch failure (the CLI mid-reinstall by its own npm
+    // auto-updater) is retried with a bounded back-off before it is reported.
+    // Every headless caller gets that here: the scheduler, the agent loop and
+    // the headless continuation.
+    let mut child =
+        crate::claude_cli_spawn::spawn_tokio_with_retry(&mut cmd, Some(Path::new(workdir)))
+            .await
+            .map_err(|f| anyhow::anyhow!("{}", f.describe(&bin, workdir)))?;
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
         tokio::spawn(async move {
@@ -12858,6 +12894,76 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// The spawn seam resolves `claude` to the absolute file a PATH walk finds
+    /// (plan `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_claude_bin_finds_the_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Restored on drop, so a panicking assertion cannot leave the
+        // process PATH changed for the rest of the test binary.
+        struct Restore(Option<String>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
+                    None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+                }
+                match self.1.take() {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+        let prev_path = std::env::var_os("PATH");
+        let _restore = Restore(std::env::var("QONTINUI_CLAUDE_BIN").ok(), prev_path.clone());
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        // PREPEND, never replace: parallel tests outside the env lock still
+        // spawn `git`/`sh` by bare name and must keep finding them.
+        let mut dirs = vec![empty.clone(), bin_dir.clone()];
+        if let Some(p) = &prev_path {
+            dirs.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let found = resolve_claude_bin();
+        assert_eq!(found, bin.to_string_lossy());
+    }
+
+    /// A resolved path to a NON-executable file is not pinned: the bare name
+    /// lets `execvp` skip it and keep searching PATH.
+    #[cfg(unix)]
+    #[test]
+    fn launchable_or_bare_falls_back_for_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let prev_bin = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("claude");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let non_exec = launchable_or_bare(f.to_string_lossy().into_owned());
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exec = launchable_or_bare(f.to_string_lossy().into_owned());
+        let missing = launchable_or_bare(tmp.path().join("gone").to_string_lossy().into_owned());
+        if let Some(v) = prev_bin {
+            std::env::set_var("QONTINUI_CLAUDE_BIN", v);
+        }
+        assert_eq!(non_exec, "claude");
+        assert_eq!(exec, f.to_string_lossy());
+        assert_eq!(missing, "claude");
     }
 
     #[test]
