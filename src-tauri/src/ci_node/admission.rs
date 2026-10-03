@@ -1,5 +1,5 @@
 //! Admission control for CI dispatches — defer-not-reject (the
-//! `ContinuationGuard::AtCap` idiom from `agent_runtime`):
+//! load-deferral idiom `agent_runtime`'s continuation guard uses):
 //!
 //! - HARD reject (POST `cancelled` + reason): ci_node disabled, repo not in
 //!   the local allowlist, unsafe identifiers, missing repo checkout, disk

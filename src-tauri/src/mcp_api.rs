@@ -1600,6 +1600,13 @@ async fn health(
         // `silent-empty-is-unknown`. It is what separates "441 threads of
         // load" from "441 threads, 325 of them an idle tokio blocking pool".
         "threadCensus": crate::health_monitor::thread_name_census_json(),
+        // Plan 2026-10-03-retire-the-continuation-session-cap-and-let-the-
+        // queue-pre-check-read-both-resource-lanes, Phase 3: what unattended
+        // admission (gate continuations, coord launches) would decide RIGHT
+        // NOW — the memory and thread lanes' readings, limits and verdicts, and
+        // the deferral stamp the pre-check would write. Read through the same
+        // `resource_guard::lane_verdicts` the gate uses. There is no count cap.
+        "spawnAdmission": crate::agent_runtime::spawn_admission_health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was
