@@ -334,8 +334,25 @@ mod tests {
     fn test_malformed_json_rejection() {
         assert!(decode_message("not json at all").is_err());
         assert!(decode_message("{invalid json}").is_err());
-        assert!(decode_message(r#"{"type":"unknown_type"}"#).is_err());
         assert!(decode_message(r#"{"no_type_field": true}"#).is_err());
+        assert!(decode_message(r#"{"type": 7}"#).is_err());
+    }
+
+    /// An unlisted frame type is tolerated: it decodes as `Other`, keeping its
+    /// type, instead of failing and being dropped (plan Phase 8).
+    #[test]
+    fn test_unknown_frame_type_is_other_not_an_error() {
+        let msg = decode_message(r#"{"type":"unknown_type","x":1}"#).unwrap();
+        match &msg {
+            ClaudeOutputMessage::Other(f) => {
+                assert_eq!(f.frame_type, "unknown_type");
+                assert_eq!(f.raw["x"], 1);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        assert_eq!(msg.frame_type(), "unknown_type");
+        assert!(!msg.is_result());
+        assert!(msg.extract_text().is_none());
     }
 
     /// Verify that result messages without content still parse.
