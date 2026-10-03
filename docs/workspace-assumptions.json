@@ -661,6 +661,15 @@
     {
       "class": "os_bound_tooling",
       "file": "src/install_effects_producer/intercept/shim_materializer.rs",
+      "symbol": "identity_cmd_template",
+      "excerpt": "cfg(windows)-only fn `identity_cmd_template` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows `.cmd` flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/install_effects_producer/intercept/shim_materializer.rs",
       "symbol": "locate_stub_exe",
       "excerpt": "cfg(windows)-only fn `locate_stub_exe` has no cfg(not(windows)) sibling in this file",
       "count": 1,

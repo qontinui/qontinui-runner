@@ -582,3 +582,17 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+# os_bound_tooling — reviewed individually as they are added (plan
+# 2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy
+# Phase 6 split the identity shim's templates per CLI profile).
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/install_effects_producer/intercept/shim_materializer.rs"
+symbol = "identity_cmd_template"
+disposition = "fallback_correct"
+note = "The Windows `.cmd` flavour of the identity shim, called only from the cfg(windows) block of write_identity_shims_for. Every OS gets the extensionless bash shim from identity_bash_template, so a non-Windows sibling would have nothing to render."
+reviewed = [
+    "cfg(windows)-only fn `identity_cmd_template` has no cfg(not(windows)) sibling in this file",
+]
