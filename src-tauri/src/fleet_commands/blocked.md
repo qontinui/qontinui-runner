@@ -106,6 +106,14 @@ Every gate needs an anchor — one of two shapes:
   alembic-head claim goes terminal" → `claim_kind`+`resource_key` with a
   `claim_terminal` predicate.
 
+  **Never anchor a "watch / babysit this OPEN PR" continuation on
+  `claim:pr:<owner>/<repo>#<n>`**: coord's auto-PR hook registers (on PR open,
+  when enabled) its own open `pr_merged` gate on that exact anchor, so your
+  cleared continuation is held until the PR lands while `will_dispatch` still
+  reads `true`. Use a work-unit
+  anchor or a non-`pr` `claim_kind` (e.g. `babysit`). Canonical:
+  `_gate-registration` → "Anchor derivation (zero user input)".
+
 `$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`. Tenant always derives
 server-side from the session JWT — **never pass a tenant argument.**
 
@@ -265,7 +273,10 @@ JWT all work), first reachable transport wins:
    clearance_audience?, gate_class?}`. Reach it over the held device JWT; the runner's
    proxy-nonce write forwarder (`POST {runner}/coord-mcp/work-units/…`, header
    `X-Coord-Mcp-Proxy-Key` — or `Authorization: Bearer <nonce>` on newer configs —
-   read from a live `.mcp.json`; the forwarder injects a
+   read from a live `.mcp.json`, and expanded from your own environment when it
+   is an env reference like `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` (the variable
+   when set and non-empty, else the default; allowlisted names only: `mcp_expand_env_ref`,
+   `scripts/lib/mcp-env-ref.sh` - never sent literally); the forwarder injects a
    fresh device JWT per request); or the acting-user-service token
    (`bash …/scripts/coord-acting-bearer.sh` — sourced from **`$COORD_AGENT_JWT`
    ONLY**: no `.mcp.json` carries a bearer anymore, every config is

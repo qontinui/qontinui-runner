@@ -448,6 +448,30 @@ Do all four (they're fast and independent):
    releases you from this check only; Step 0.5 still applies its own disposition
    and can still stop the run.
 
+   **A VETTED plan can be HELD — then STOP, before the reserve.** When the
+   stamp defers ALL remaining phases behind one or more cited gates ("do not
+   implement until gate `<id>` clears" — `/vet-plan` §5.4 step 6's hold-gate
+   skip), read each cited gate on this plan's work unit
+   (`GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>`, or
+   `coord_gate_inspect` by id for a claim-anchored one). Arms, in order:
+   - **Any cited gate is OPEN — armed or not** → the plan is **held**. Do not
+     stamp IN PROGRESS, do not launch a phase agent, and do NOT cancel, mute or withdraw
+     any gate — the hold gate is the plan's real net. Report the hold (each
+     `gate_id`, verdict, `armed`/`will_dispatch`) and go straight to Step 7.
+     An open gate that is NOT armed is still a hold: nothing will dispatch when
+     it clears, so say so in the report — that is a missing trigger to fix, not
+     permission to implement.
+   - **Any cited gate is not found, unreadable, failed, misconfigured, muted or
+     withdrawn** → UNKNOWN, not permission. Surface it with `AskUserQuestion`
+     (header `Hold gate`, options **Abort** / **Proceed anyway**) rather than
+     implementing forbidden work by default.
+   - **EVERY cited gate has cleared** → the hold is lifted, but a clear is not
+     automatically an implementation order. If a cleared gate's continuation
+     targets `/vet-imp` (or `/vet-plan`) on this plan and has not been consumed
+     with `work_completed`, the trigger owes a re-measure and re-vet FIRST —
+     stop, report it, and let that dispatched run decide. Otherwise proceed;
+     the plan's own DEFER/PROCEED text still governs what you implement.
+
    This check is also `/implement-plan`'s **capture step**. While you are here —
    read-only, and before the reserve — record the status block verbatim (token,
    date, session marker) and run the delivery arm table. Step 0.5 consumes what
@@ -1052,11 +1076,25 @@ Edit the plan .md to update its status block to:
 ```
 
 Rules:
-- If the existing block is `Status: VETTED <date>`, replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`).
+- If the existing block is `Status: VETTED <date>` (and Step 0.45 check 1 did not find it HELD), replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`). `VETTED (self) <date>` is the same state. `/vet-plan` writes it when it could not spawn its fresh-context reviewer. Keep the qualifier in the body (`Started from VETTED (self) 2026-05-02.`): dropping it turns a self-vet back into a stamp that cannot be told apart from an independent one.
+- **Carry the vet's independence record forward, verbatim: every line from `> Vetted-by:` through `> Independence:`, inclusive, as the last lines of the new block.** `/vet-plan` §5 writes it under the VETTED headline. `Vetted-by:` is a paragraph wrapped over several lines carrying `Plan:`, `Read:`, `Checks:` and `Served policy`, so copy the whole range, not the one line that starts `Vetted-by:`. It is what a later attestation re-send rebuilds its `independence` declaration from (`/vet-plan` §5.4, the REFUSED arm), and a replace that drops it destroys the only durable copy outside git history. Step 6 carries it again into the SHIPPED block (single-stamp invariant item 4). It carries no `Depends-On:` or `**Area:` (`/vet-plan` §5 forbids both), so the plan adapter parses nothing new out of it.
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
 - If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
 - If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: arm 1 — `shipped: true` ∧ `evidence_complete: true` ∧ the three phase-corroboration conjuncts `/vet-plan` §0.25 arm 1 states (`phases_remaining` the LITERAL `[]`, never `null`; that `[]` corroborated by a non-empty `phases_declared_indices` wholly inside `phases_delivered`; no `NO PHASE ATTRIBUTION` gap) — means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`. **Do not stop on `shipped` ∧ `evidence_complete` alone**: that pair is reachable on a unit with phases outstanding (plan `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`), and a response short of the phase conjuncts falls to arm 6 — fall through to the stamp arms; **the two UNKNOWN arms that a degraded read makes look clean are 2 and 3, and neither is an error shape** — `evidence_complete: false` is **arm 2 regardless of `shipped`** (the two derive independently — `shipped` from the landed citations and the phase-coverage gate, `evidence_complete = evidence_gaps.is_empty()` computed before the phase gaps are appended — so `shipped: true` ∧ `evidence_complete: false` is reachable, and keying arm 2 on `shipped: false` lets it fall through to the permissive arm), and a top-level `merged_degraded_reason` sitting BESIDE `delivery` is **arm 3**, evaluated ahead of every arm but 4 and **UNKNOWN whatever `delivery` says** — while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. Both answer `200` with a parseable `delivery` and no `citations_error`, so neither is caught by arm 6; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
+
+**Land the IN PROGRESS stamp with the helper — never by pushing "the branch".**
+When the plans directory is inside a git repo, publish the stamped file with
+`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: stamp <plan-stem> IN PROGRESS"`.
+It lands the one blob directly on the plans repo's default branch when that
+branch's ruleset requires no PR, and otherwise cuts a FRESH branch and opens a
+NEW PR; it never pushes to an existing branch, so the stamp cannot ride a branch
+whose first PR coord already landed (plan
+`2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the stamp is published.
+**A non-zero exit means the stamp is NOT published**: say so, with the failure
+the helper names, rather than reporting the plan IN PROGRESS on `origin`.
 
 > **Why the delivery read and not just the token list.** The stamp is an
 > authoring-surface artifact that lags by construction: a session that correctly
@@ -1285,7 +1323,17 @@ interim until plan
 this plan-stem, then `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` and look
 at each row's `verdict` / `continuation_spawn` / `continuation_dispatched_at` /
 `continuation_consumed_at` / `continuation_cancelled_at` fields. The row to act on
-is whichever one carries a `continuation_spawn`. (`/coord/agent-gates`
+is the **net** — the armed `time_elapsed` row under `phase_name`
+`vet→implement safety net` (or a non-canonical name). Never act on any other
+armed row: A gate that holds a vetted plan behind a live
+trigger (`/vet-plan` §5.4 step 6's hold-gate skip) carries an armed
+continuation BY DESIGN — it is that plan's real net, keyed on the real trigger.
+Retire only the `vet→implement safety net` row (an armed `time_elapsed` gate,
+under that `phase_name` or a non-canonical one) and any gate you are yourself
+re-registering; cancelling, muting or withdrawing a hold gate strands the plan with no
+trigger at all.
+A run that reached this step is not implementing a held plan (Step 0.45 check
+1 stopped it), so there is normally no hold gate on the unit anyway. (`/coord/agent-gates`
 is the **device-authed** read door — the operator `GET /coord/gates` is
 `TenantId`-only and 403s this session's device JWT. **Every write here is
 device-authed too**: the withdraw (`coord_withdraw_gate`, or the bare
@@ -1299,7 +1347,7 @@ that was false, and it is what let gate `7902e457` spawn a redundant terminal on
 
 | Row state | What it means | What to do |
 |---|---|---|
-| `verdict: open` ∧ `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED. This is the EXPECTED state at this stamp**, and what the 30-minute `time_elapsed` net exists to produce. | **Withdraw.** `coord_withdraw_gate` `{gate_id, reason}`, or `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}`. A withdrawn gate never clears, so it never dispatches. (The optional pre-dispatch cancel may go first.) |
+| `verdict: open` ∧ `continuation_spawn != null` ∧ `dispatched_at == null` ∧ **the net row, not a hold gate** | **PRE-DISPATCH — the net is ARMED. This is the EXPECTED state at this stamp**, and what the 30-minute `time_elapsed` net exists to produce. | **Withdraw.** `coord_withdraw_gate` `{gate_id, reason}`, or `POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` `{reason}`. A withdrawn gate never clears, so it never dispatches. (The optional pre-dispatch cancel may go first.) |
 | `verdict: open` ∧ `dispatched_at != null` ∧ `consumed_at == null` ∧ `cancelled_at == null` | Dispatched, not yet consumed — a net older than its 30-minute window, or a gate registered by a coord that predates the split. **Read `continuation_deferred_count` on this row**: `> 0` means a deferral bought you hours; `0` means this window is measured in *seconds* and you are unlikely to still be in it. | **Withdraw — the same call.** `withdraw_gate_core` cancels a dispatched-but-unconsumed continuation itself; read the row back for `continuation_cancelled_at`. If the MCP tool is not visible that is masking, not absence, so fall through to the HTTP twin rather than concluding the path is closed. |
 | `dispatched_at != null` ∧ `consumed_at != null` | The rescue spawn already fired. The honest fallback arm — reachable on gates registered by an older coord, where the continuation rode the born-cleared `unit_ready` gate. | **Do not** claim a clean takeover (see the responses below). If the verdict is still `open`, **still withdraw** — it leaves the consumed continuation alone and takes the row out of the open set. |
 | no row carries a `continuation_spawn` | Genuinely nothing pending — e.g. a standalone `/implement-plan` whose gates were registered continuation-less. | Say so and proceed. **Do not withdraw or mute anything.** |
@@ -1389,7 +1437,13 @@ and the body. Before writing your stamp:
 4. If folding in history is useful (`Started from VETTED 2026-05-02`),
    put it in **one trailing line inside your new block**, prefixed
    `History:`, `Started from:`, or `Previously:`. Never as a sibling
-   blockquote.
+   blockquote. The one exception: when the block you are replacing carries
+   `/vet-plan`'s independence record (every line from `> Vetted-by:` through
+   `> Independence:`), carry that range verbatim after the trailing line.
+   This applies at Step 0.5 (VETTED → IN PROGRESS) and at Step 6
+   (IN PROGRESS → SHIPPED). It is the durable home a later attestation
+   re-send rebuilds from (`/vet-plan` §5.4), and it outlives the
+   implementation.
 
 This stamp is mandatory before Step 1. It makes concurrent agents see
 "another session is implementing this" via a quick `head -5 plan.md`
@@ -1545,7 +1599,7 @@ second retirement of the same gate.
 pre-dispatch cancel before it and the same `NotRegistrant` fallback. Since
 2026-08-30 the continuation rides a separate `time_elapsed` net gate under
 `phase_name` `"vet→implement safety net"`, not the `unit_ready` record gate, so
-the row you act on is whichever one carries a `continuation_spawn` — and it is
+the row you act on is that net row (never a hold gate — see Step 0.5) — and it is
 normally still **pre-dispatch**, where a withdrawn gate simply never clears and so
 never dispatches. The withdraw is also what stops the retired net blocking
 `unit_ready` as an open sibling, and — unlike the mute this step used to teach —
@@ -1567,7 +1621,8 @@ once per run, not per phase):
    `/register-gate`, …) *are* device-authed — only the `GET`s moved to the
    `agent-` twins.
 2. Query the work unit's gates for a live continuation:
-   `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` → rows carrying a
+   `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` → **net** rows (the
+   armed `time_elapsed` safety net; never a hold gate, per Step 0.5) carrying a
    `continuation_spawn` with `continuation_consumed_at == null ∧
    continuation_cancelled_at == null`. **Do not filter on
    `continuation_dispatched_at != null`** — that filter drops the pre-dispatch
@@ -1614,7 +1669,8 @@ once per run, not per phase):
    open set until plan
    `2026-09-27-agent-gate-cleanup-verbs-cover-every-gate-an-agent-finds` ships
    `coord_retire_gate` (`continuation_retired_and_muted`). Act on the gate that
-   carried the continuation, **never on `unit_ready`**: withdrawing (or muting)
+   carried the continuation (the net — never a hold gate, see Step 0.5),
+   **never on `unit_ready`**: withdrawing (or muting)
    the last counted gate on a unit leaves `all_unit_gates_cleared` with
    `total = 0`, which is vacuously not ready.
 
@@ -1679,7 +1735,9 @@ Handle the selection:
     `2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning` and the legacy
     name stays accepted): `curl GET <proxy_base>/claims/by-resource?kind=phase&key=<rk>`
     with whichever of those two headers the config carries (the runner injects a
-    live device JWT).
+    live device JWT). A value written as `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` is
+    an env reference: expand it from your own environment first
+    (`mcp_expand_env_ref`, `scripts/lib/mcp-env-ref.sh`), never send it literally.
 
     **Static-bearer detection:** an `Authorization` header alone no longer
     proves the static-bearer shape — a proxy nonce now travels there too. The
@@ -3233,6 +3291,51 @@ body carries NO arming lines and says `arming UNKNOWN: <detail>` (or `arming
 ABSENT`) in prose instead — an absent line reads as absent, which is honest; a
 hand-typed one reads as observed, which is not.
 
+**A fifth block, in the same body: the HANDOFF RECORD (`Coord-Handoff-*`).**
+*(Plan `2026-09-10-the-fixer-contract-authority-context-and-provenance-on-a-pr-you-did-not-author`
+Phase 1; the same shape as `Coord-Reviewed-Head:` by the same decision record.)*
+You are the only party who knows what in this diff must NOT be silently
+changed. A session that inherits this PR — a coord-dispatched fixer, a
+route-around adopter — sees the diff and nothing else, and coord#1815's rescue
+shows what that costs: it re-litigated a fork the author had settled and nearly
+removed the measurement the PR existed to make. So, **after the last push you
+intend to make and before `gh pr create`**, render the record and put it in the
+body:
+
+```bash
+# WORKTREE = the worktree whose HEAD the PR will carry; PR_BODY = the body file
+# you will hand to `gh pr create --body-file`.
+cat <<'ITEMS' | bash <workspace-root>/qontinui-claude-config/scripts/handoff-arm-record.sh --repo-dir "$WORKTREE" --append-to "$PR_BODY"
+# Replace every <...> line below with real items (or delete the section). A
+# `# ` line is a comment; `#328 before x#9` is an item -- PR numbers count.
+[load-bearing]
+<what must not be silently changed, and WHY — one line each>
+[rejected]
+<alternative considered, and the reason it lost — so nobody re-litigates it>
+[fragile]
+<a seam known to break under replay / rebase>
+[deploy-order]
+<repo#N before repo#M>
+ITEMS
+```
+
+It writes `Coord-Handoff-Head: <full 40-hex HEAD>` plus one
+`Coord-Handoff-Load-Bearing:` / `-Rejected:` / `-Fragile:` / `-Deploy-Order:`
+line per item. ~20 lines of *what must not change*, never a transcript; an
+empty section is written as nothing, and a record with no items is refused
+(an empty record is indistinguishable from an absent one, and absent reads as
+UNKNOWN). coord harvests the lines into `coord.pr_labels` on the webhook and
+serves them on `coord_pr_status` as `handoff.state: present|stale|absent`
+against the PR's CURRENT head — so **a later push makes the record `stale`**;
+re-run the command for the new head (it replaces every earlier record in the
+body, whatever head it named, because coord pools items across recorded heads
+and a retracted item would otherwise linger) and push the edited body with `gh pr edit <n> --body-file
+"$PR_BODY"` — coord harvests it on the `edited` webhook. It gates nothing and
+prompts nobody; it is read by whoever
+inherits the PR. Adopters read it through
+`scripts/handoff-arm-check.sh <owner/repo#N>` or the card
+(`/babysit-prs` Step 6 → "Adopting a foreign branch").
+
 **Re-review rule — every push that moves the head needs a new line.** The gate
 compares against the CURRENT head, so the moment you push again the recorded sha
 stops matching and the PR reads `not-reviewed` until the new head is reviewed.
@@ -3263,6 +3366,9 @@ then EDIT the PR body to add a second `Coord-Reviewed-Head:` line for it:
 gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"
 gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep 'Coord-Reviewed-Head'   # read it back
 ```
+
+`<file>` lives in a private `mktemp -d` dir, never a fixed name in the shared scratchpad
+(`knowledge-base/qontinui-specific/common-pitfalls.md` §17).
 
 Not `gh pr edit --body-file`: on this fleet's gh 2.46.0 it exits 1 on the retired
 `repository.pullRequest.projectCards` GraphQL prefetch **before** writing, and
@@ -3300,7 +3406,8 @@ is reached from here:
   a JSON body with `repo` (`owner/name`), `head` and `title` required, and
   `base`, `body` and `draft` optional. `qontinui-pr create --title <t> --body-file <f>`
   is its client and finds the nonce and the port in the session `.mcp.json`
-  itself. To call the door directly, take the nonce header and the port from
+  itself. Write `<f>` in a private `mktemp -d` dir, never as a fixed name in
+  the scratchpad every subagent shares (`knowledge-base/qontinui-specific/common-pitfalls.md` §17). To call the door directly, take the nonce header and the port from
   that file's coord-mcp entry (the port is 9876 only on the primary runner),
   stage the header in a private file and pass `curl -H @file` — never on argv,
   where every peer session on the box can read it;
@@ -3605,7 +3712,7 @@ surface (`coord_pr_status` / `/pr-status` skill), which distinguishes a
 genuinely satisfied required-check state from one that has simply never been
 established — a clean `gh pr checks` read is not proof of the latter.
 
-1. **Stamp a status block at the top of the plan .md** (just below the H1 title) summarizing what shipped — applying the single-stamp invariant from Step 0.5 (delete the existing IN PROGRESS block, write SHIPPED in its place):
+1. **Stamp a status block at the top of the plan .md** (just below the H1 title) summarizing what shipped — applying the single-stamp invariant from Step 0.5 (delete the existing IN PROGRESS block, write SHIPPED in its place, carrying its `Vetted-by:` … `Independence:` range forward per item 4):
    ```markdown
    > **Status: SHIPPED <YYYY-MM-DD>.** <one-paragraph summary of what's
    > live and where to find it — repo + key commit SHAs at minimum>.
@@ -3661,49 +3768,41 @@ established — a clean `gh pr checks` read is not proof of the latter.
    from unlanded remote branches, the oldest ~4 months stale, plus 383 more whose
    newest version sits on a branch while `origin/main` carries an older one.**
 
+   Land it with the shared helper — one implementation, not a recipe each
+   command re-types:
+
    ```bash
    PLAN_PATH="<plan path>"               # absolute path to the stamped .md
    PLAN_DIR="$(dirname "$PLAN_PATH")"
    if git -C "$PLAN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
      TOP="$(git -C "$PLAN_DIR" rev-parse --show-toplevel)"
-     REL="${PLAN_PATH#"$TOP"/}"          # repo-relative; repeat per path
-     MSG="docs(plans): mark <plan> SHIPPED — <summary>"
-
-     # Land on main from a THROWAWAY worktree: never commit onto, rebase, or push
-     # the branch this checkout is on — it is routinely a peer's
-     # [policy: shared-checkout-route-around].
-     git -C "$PLAN_DIR" fetch origin
-     LAND="$(mktemp -d)"
-     git -C "$PLAN_DIR" worktree add --detach "$LAND" origin/main
-     mkdir -p "$LAND/$(dirname "$REL")"
-     cp "$TOP/$REL" "$LAND/$REL"         # repeat per path (add the 00-index.md flip)
-     git -C "$LAND" add -- "$REL"
-     # An identical file already on main stages nothing — that is SUCCESS
-     # (the read-back below will pass), not a failure to abort on.
-     git -C "$LAND" diff --cached --quiet || git -C "$LAND" commit -m "$MSG"
-     # Plain push, never --force. On non-fast-forward a peer landed first:
-     # re-fetch, recreate the worktree off the new origin/main, re-apply, retry.
-     git -C "$LAND" push origin HEAD:main
-     git -C "$PLAN_DIR" worktree remove --force "$LAND"
-
-     # MANDATORY read-back — the ONLY thing that establishes durability. Compare
-     # CONTENT, not existence: after a stranded push an earlier, unstamped version
-     # of the plan is already at this path, and an existence check passes on it.
-     git -C "$PLAN_DIR" fetch origin
-     # Guard the empty case: a missing path AND an unreadable local file would
-     # otherwise compare "" = "" and read as LANDED.
-     LANDED_BLOB="$(git -C "$PLAN_DIR" rev-parse -q --verify "origin/main:$REL")"
-     [ -n "$LANDED_BLOB" ] && \
-       [ "$LANDED_BLOB" = "$(git -C "$PLAN_DIR" hash-object "$TOP/$REL")" ] \
-       && echo "LANDED: $REL on origin/main matches the stamped file" \
-       || echo "NOT LANDED: $REL on origin/main is absent or not the stamped version — do not report SHIPPED"
+     REL="${PLAN_PATH#"$TOP"/}"          # repo-relative
+     bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+       "$TOP" "$REL" "$PLAN_PATH" "docs(plans): mark <plan> SHIPPED — <summary>"
+     # Suite dir: run it again for the flipped 00-index.md — one blob per call.
    fi
    ```
 
+   What the helper does, so its verdict can be read rather than trusted blind:
+   it fetches the plans repo's default branch with an explicit refspec, probes
+   that branch's ruleset, and — when no rule requires a PR — builds the commit
+   by plumbing on a separate index against a base resolved ONCE, so it never
+   commits onto, rebases, or pushes the branch this checkout is on (routinely a
+   peer's [policy: shared-checkout-route-around]). It pushes that commit to the
+   default branch without force, rebuilding on a non-fast-forward. Then it reads
+   the path back off the freshly fetched default branch and compares CONTENT,
+   not existence — after a stranded push an earlier, unstamped version of the
+   plan is already at this path, and an existence check passes on it. An
+   identical blob already there is success, not an error. It prints exactly one
+   line: `LANDED <commit|unchanged> <blob>` on the direct arm, or
+   `PROPOSED <pr-url|branch> <branch>` on the PR arm. Any non-zero exit
+   (3 read-back failed, 4 push failed after retries, 5 refused, 6 fetch failed,
+   2 usage) means the stamp is **not** published.
+
    **The read-back is not optional and its failure is not cosmetic.** Until
-   the read-back matches on `origin/main`, the plan is in exactly the state
+   the helper prints its verdict line, the plan is in exactly the state
    this step exists to prevent, and the run has not shipped its record. Report
-   the failure rather than the stamp
+   the failure rather than the stamp, and do not report SHIPPED
    [policy: unknown-must-not-render-as-a-default].
 
    This is standing authority, not an escalation: `git-operations`
@@ -3711,53 +3810,39 @@ established — a clean `gh pr checks` read is not proof of the latter.
    `qontinui-dev-notes` or a `plans/` dir for a session-owned closeout, and its
    *"verify branch == origin after"* bound is what the read-back discharges.
    `merge-authority` is not in tension — coord is sole merge authority for
-   `qontinui/*` **application** repos, and a notes/plans repo is neither. If the
-   plans repo IS one coord lands, open a PR for the plan branch instead
-   ([policy: pr-create-preference-order]), through Step 4.5b — the served door
-   order, then the read-back its number comes from — and let coord land it; the
+   `qontinui/*` **application** repos. Whether a given plans repo needs a PR is
+   not asserted here: the helper's ruleset probe decides it per repo, and an
+   unreadable probe takes the PR arm. On that arm coord lands the PR; the
    content read-back above is still what closes the step.
 
    If the `rev-parse --is-inside-work-tree` check fails, the plan directory is a plain folder: the
    stamped file on disk **is** the record, there is nothing to commit, push or
    read back, and you must not create a repo to hold it.
 
-   **FALLBACK ARM — when the direct land above is not available, a pushed branch
-   is NOT the closeout: assert a PR carries the push (`coord-ff-lands.md`), re-checked before and after EACH push.** The
-   land-on-`main` recipe is the primary route and `git-operations` `closeout-push`
-   is its authority for a notes/plans repo. Where the plan repo IS one coord
-   lands, that route is closed to you and a pull request is the only way the stamp
-   reaches `main` — and a branch pushed with no PR never gets there: the stamped
-   plan is published and permanently invisible to every `origin/main` reader.
-   Measured 2026-09-02, **9** plan stems were pushed to `origin` and never
-   proposed at all — no PR in any state, on any branch carrying the stem —
-   including one this very closeout had pushed the day before. (A further 23 were
-   on a pushed branch and on no `origin/main` while HAVING a PR: merge-train
-   business while those PRs are OPEN.) **Once per chain is not enough.** coord
-   can land the plan PR mid-chain and leave it CLOSED, MERGED or even OPEN, and
-   every later push to that same branch is then stranded again. So before each
-   push, and again after it, apply
-   `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-   whose PR may already have landed" to the branch you are about to push:
-   ```bash
-   BRANCH="<the branch you are about to push; after a fresh-branch cut, the NEW branch>"
-   gh pr list --repo <owner/repo> --head "$BRANCH" --state all \
-     --json number,state,headRefOid,url \
-     --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
-   ```
-   `--state all`, not `--state open`: an empty open-only answer cannot tell
-   "never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
-   proposed, so it is not Step 0's pushed-but-unproposed class, but it carries
-   nothing pushed after its close.
-
-   When the section says no PR carries the push and commits remain unlanded,
-   take its fresh-branch path. Open the new PR through **Step 4.5b** — the
-   served door order, then the read-back its number comes from — carrying the
-   line-anchored `Plan: <stem>` marker Step 4.5 specifies. **Never `gh pr merge`, never `--admin`**: coord is the sole
-   merge authority and that spelling is denied to agents fleet-wide. If the plan
-   branch is the same branch as the implementation PR, that PR satisfies the
-   assertion only while the same section says it carries the push; say so rather
-   than opening a second one. The content read-back above also catches a
-   stranded stamp push directly, whatever state the PR reads. Runbook:
+   **FALLBACK ARM — the helper's PR arm handles it.** When the plans repo's
+   default branch requires a PR, or the probe cannot tell, the helper cuts a
+   FRESH branch from the current default branch, pushes only this stamp's delta,
+   and opens a NEW PR with `gh pr create` (the only opener it runs), with the
+   line-anchored `Plan: <stem>` marker Step 4.5 specifies. A caller holding
+   coord's MCP door that wants `coord_create_pr` runs the helper with
+   `LAND_PLAN_STAMP_NO_PR=1` — it then pushes and reads back the branch, prints
+   it, and opens nothing — and opens the PR itself through **Step 4.5b** — the
+   served door order, then the read-back its number comes from. It never pushes to
+   an existing branch, so a stamp cannot ride a branch whose PR coord already
+   landed and strand there (plan
+   `2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+   On `PROPOSED`, confirm the PR the line names with
+   `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid,url`,
+   taking its number only from a row whose `headRefOid` is the head the helper
+   pushed (read it with `git -C <plans-repo-root> rev-parse origin/<branch>`, the ref the helper's own fetch leaves; its `PROPOSED` line names the branch, not the sha). `--state all`, not `--state open`: an empty open-only answer cannot
+   tell "never proposed" from "closed under you".
+   **Never `gh pr merge`, never `--admin`**: coord is the sole merge authority
+   and that spelling is denied to agents fleet-wide. Any NON-stamp push to an
+   existing branch — the implementation PR's own branch included — is still
+   governed by `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing
+   to a branch whose PR may already have landed", re-checked before and after
+   EACH push: coord can land a PR mid-chain and leave it CLOSED, MERGED or even
+   OPEN. Runbook:
    `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
    **Do NOT POST a `shipped` work-unit transition:**
@@ -4195,9 +4280,11 @@ record gate, not `unit_ready` itself — may have a queued runner-terminal spawn
 you **re-register** a gate for the same plan/anchor, or this run **directly takes
 over** the work that continuation was queued for (the active takeover wiring lives
 in Step 0.6), retire it so the runner does not spawn a redundant terminal: find it
-via `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` (rows carrying a
+via `GET $COORD_HTTP_URL/coord/agent-gates?work_unit_id=<id>` (the net row, or the
+gate you are re-registering, carrying a
 `continuation_spawn` with `continuation_consumed_at == null ∧
-continuation_cancelled_at == null` — **pre-dispatch rows included**), then
+continuation_cancelled_at == null` — **pre-dispatch rows included**; never a hold
+gate), then
 **withdraw it**: `coord_withdraw_gate` `{gate_id, reason}`, or its HTTP twin, the
 bare device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/withdraw` `{reason}`
 (no `/agent/` infix exists for withdraw). One call sets the terminal, non-clear,
@@ -4223,7 +4310,9 @@ and withdraw regardless. Narrate the retired `gate_id`. (canonical spec:
 ### Step 7: Run `/unattended` (mandatory, last action)
 
 Once every other step is done — Steps 1–6 landed, and Step 6.5's
-gate/attest handling is resolved for any deferred or blocked phase — invoke
+gate/attest handling is resolved for any deferred or blocked phase; or Step
+0.45 check 1 stopped on a HELD plan, which owes nothing from Steps 0.48–6.5 —
+  invoke
 the **`/unattended`** skill as the final action of this session, before
 ending it. Not conditional on how the plan went: run it after a clean finish
 exactly as after a partial one, and unconditionally on whether Step 6.5 found

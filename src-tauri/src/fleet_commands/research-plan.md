@@ -41,10 +41,11 @@ scratch.
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
->   never a requirement — no tenant needs a git repo to author, vet or ship a
->   plan. Which directory THIS fleet writes new plans to is a local operating
->   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **A git repo holding the plans directory is an OPTIONAL export target as a
+>   product matter**, never a requirement — no tenant needs a git repo to
+>   author, vet or ship a plan. Which directory a deployment writes new plans
+>   to is that deployment's own operating rule (its `CLAUDE.md`, where it has
+>   one), not a product one.
 > * **Read the corpus through these doors, in this order** *(plan
 >   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
 >   1. **The runner door — no credential.**
@@ -54,13 +55,28 @@ scratch.
 >      JWT; the caller presents nothing. A non-2xx names the host the runner
 >      dialled — that is the runner's configured web base, and the answer is an
 >      observation about that base, never about the corpus.
->   2. **The git doors — no credential, no service.**
->      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
->      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
->      enumerate. Authoring layer only (a plan authored through the web UI is
+>   2. **The git doors — no credential, no service; only where the plans
+>      directory is a git checkout.** Resolve the repo that holds it and the
+>      directory's path inside that repo:
+>      `REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)` and
+>      `DIR=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix)` (ends in
+>      `/`; empty when the plans directory is the repo root). When
+>      `$QONTINUI_PLANS_DIR` is unset or EMPTY, do not run them at all —
+>      `git -C ""` succeeds against whatever repo the shell stands in, so its
+>      answer is not the plans repo. Unset, empty, or either command exiting
+>      non-zero: there is no git door on this machine — that is an absent
+>      door, not a miss. So is a plans directory git does not TRACK in
+>      that repo (one sitting gitignored, or untracked, inside an unrelated
+>      work tree): after the fetch below, an EMPTY
+>      `ls-tree --name-only origin/main "${DIR:-.}"` is an absent door,
+>      never a miss.
+>      Otherwise `git -C "$REPO" show "origin/main:${DIR}<stem>.md"` for a
+>      body, `git -C "$REPO" ls-tree --name-only origin/main "${DIR:-.}"` to
+>      enumerate (substitute the remote's default branch throughout if it is
+>      not `main`). Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
 >      so fetch first:
->      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      `git -C "$REPO" fetch origin +refs/heads/main:refs/remotes/origin/main`,
 >      exit code read unpiped (a bare `fetch origin main` in a clone whose
 >      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
 >      When that fetch was skipped or exited non-zero, a git-door MISS is
@@ -70,8 +86,8 @@ scratch.
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
 >      claim the route requires; the agent token `/agents/allocate` mints does
->      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
->      door; whatever it answers is an observation about that process.
+>      not. A per-box dev backend on loopback is not a discovery door;
+>      whatever it answers is an observation about that process.
 >
 >   On every list result **check that the returned `slug` equals the stem** — a
 >   backend predating the `slug` filter ignores the parameter and returns an
@@ -96,8 +112,9 @@ scratch.
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
->   the key `<repo>/plans`.
+>   so a hit on `origin/main:${DIR}<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>${DIR:+/${DIR%/}}` — the bare `<repo>` when the plans
+>   directory is the repo root.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
 >     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
 >     and even then it speaks for the authoring layer only.
@@ -105,7 +122,7 @@ scratch.
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
 >     then always `false`); (b) after a `git fetch`,
->     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     `git -C "$REPO" cat-file -e "<ref_sha>:${DIR}<stem>.md"` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
 >     `least_behind_device_ids` (they share it); that row's own `state` may
@@ -140,10 +157,10 @@ scratch.
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
 >     the runner's write door, `qontinui-pr plan-library-backfill`, a
 >     secondary or temp runner instance, a runner build predating the report.
-> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
->   PowerShell interpreter (`pwsh` on Linux via
->   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
->   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+> * **The cache is one line.** A local plan cache exists only where your
+>   deployment provides one; where its renderer cannot run on this machine it
+>   is INOPERATIVE, not a degraded arm. When you read
+>   `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
 >   say so and quote its `Rendered:` stamp with the `api_base` beside it and
 >   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
@@ -384,24 +401,27 @@ waste yours.
   (`git -C <dir> rev-parse --show-toplevel`) rather than assuming it, since pointing
   `$QONTINUI_PLANS_DIR` at the `plans/` directory of a git repository is a
   supported configuration.
-- **Then assert a PR carries that branch's push — the push is not the
-  publication.** On a coord-merge-authority repo a pushed branch with no pull
-  request never reaches `main`, so the prompt is on `origin` and invisible to
-  every `origin/main` reader (9 plan stems were pushed and never proposed on
-  2026-09-02). Read `gh pr list --repo <owner/repo> --head <branch> --state all
-  --json number,state,headRefOid` and apply
-  `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-  whose PR may already have landed". Use `--state all` because an empty
-  open-only answer cannot tell never-proposed from closed-under-you, and a
-  CLOSED or MERGED PR carries nothing pushed after its close. When commits
-  remain unlanded, take its fresh-branch path and open the new PR,
-  `coord_create_pr` first, then `gh pr create`; **never `gh pr merge`, never
-  `--admin`**. Open it in `/implement-plan` Step 4.5b's served door order (the
-  runner's loopback door sits between the coord door and the `gh` fallback),
-  then READ it back — `gh pr list --repo <owner/repo> --head <branch>
-  --state all --json number,url,state,headRefOid` — and take the PR number only
-  from a row whose `headRefOid` is the head you pushed, never from the create
-  call's exit status or output. Runbook:
+- **Then land it with the helper — the push is not the publication.** A
+  branch pushed with no pull request, onto a repo that needs one, never reaches
+  `main`, so the prompt is on `origin` and invisible to every `origin/main`
+  reader (9 plan stems were pushed and never proposed on 2026-09-02). Publish
+  the file with
+  `bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative path>" "<local file>" "<commit subject>"`;
+  its ruleset probe of the default branch decides whether a PR is needed — no
+  command asserts that in prose. It prints `LANDED <commit|unchanged> <blob>`
+  on the direct arm, or cuts a fresh branch, opens a new PR with `gh pr create`
+  (the only opener it runs; **never `gh pr merge`, never `--admin`**) and
+  prints `PROPOSED <pr-url|branch> <branch>`. A caller holding coord's MCP door
+  that wants `coord_create_pr` sets `LAND_PLAN_STAMP_NO_PR=1` — the helper then
+  pushes and reads back the branch, prints it, and opens nothing — and opens the
+  PR itself in `/implement-plan` Step 4.5b's served door order (the runner's
+  loopback door sits between the coord door and the `gh` fallback). It never
+  pushes to an existing branch. A non-zero exit means the prompt is NOT
+  published — report it. On `PROPOSED`, READ the PR back — `gh pr list --repo
+  <owner/repo> --head <branch> --state all --json number,url,state,headRefOid`
+  for the branch the line names — and take the PR number only from a row whose
+  `headRefOid` is the head the helper pushed (read it with `git -C <plans-repo-root> rev-parse origin/<branch>`, the ref the helper's own fetch leaves; its `PROPOSED` line names the branch, not the sha), never from the create call's exit
+  status or output. Runbook:
   `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 - Also print the full prompt content in your response, so the operator can
   copy-paste it without opening the file.

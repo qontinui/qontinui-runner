@@ -213,42 +213,59 @@ the most-recently-modified fallback above, confirmed with the user). Hold this
 resolved absolute path; both downstream skills receive the **same** path so the
 vet stamp and the implement run can never drift onto different files.
 
-If that file is still untracked in git, commit and push it — stamped `DRAFT`,
-from a worktree, never the primary/shared checkout — before Step 2. `/vet-plan`
+If that file is still untracked in git, publish it — stamped `DRAFT` — before
+Step 2, with the shared helper (below), never by committing in the
+primary/shared checkout. `/vet-plan`
 documents the same precondition: `VETTED` is an attested status a non-owner
 session must be able to read, so vetting a file no peer can see defeats the
-attestation. **That commit-and-push is a mutation, so it happens AFTER Step 1.1's
+attestation. **That publication is a mutation, so it happens AFTER Step 1.1's
 reserve, not here** — resolve the path in this step, reserve in Step 1.1, then
-push.
+publish.
 
-⚠️ **"From a worktree" decides WHERE YOU COMMIT; it does not decide where the
-plan LANDS, and only the second one satisfies the reason above.** A worktree
-sits on its own branch, so a bare `git push` there puts the plan on that branch
-and nowhere else — still a file no peer can see, which is precisely the failure
-this precondition exists to prevent. Land it on `origin/main` and **read it
-back** before treating the precondition as met. The read-back is a content
-comparison: the file's hash must equal `origin/main`'s blob at its path, as in
-`/implement-plan` Step 6 item 3's read-back with its non-empty guard. Existence
-alone passes on an earlier version already at that path. Use the same
-throwaway-worktree recipe
-`/implement-plan` Step 6 item 3 spells out, which also carries the
-`closeout-push` authority and the non-fast-forward retry. A plan that fails the
-read-back is not vettable yet — say so rather than proceeding to Step 2.
+⚠️ **Where you commit does not decide where the plan LANDS, and only the second
+one satisfies the reason above.** A worktree sits on its own branch, so a bare
+`git push` there puts the plan on that branch and nowhere else — still a file
+no peer can see, which is precisely the failure this precondition exists to
+prevent. Publish it with:
 
-**Where the plan repo is itself coord-merge-authority, the direct land is not
-available and a PR is the only route — then the assertion is that a PR
-carries each push, re-checked before and after it** (per the
-`coord-ff-lands.md` section named below). A pushed branch with no pull request
-never reaches `main`, so the plan is on `origin` and still invisible to every
-`origin/main` reader. Measured 2026-09-02, **9** plan stems were pushed to
-`origin` and never proposed at all — no PR in any state, on any branch carrying
-the stem. A PR that existed at Step 1 is not enough either: coord can land it
-mid-chain and leave it CLOSED, MERGED or even OPEN, stranding every later push
-to the same branch. So before each push, and again after it, apply
-`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
-whose PR may already have landed", reading the PR with
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
+  "docs: add <plan-stem> (DRAFT)"
+```
+
+The helper is the one implementation of what this step used to spell out by
+hand: it fetches the default branch with an explicit refspec, builds the commit
+by plumbing on a separate index against a base resolved once (so the shared
+tree, index and worktree list are never touched), pushes without force with a
+non-fast-forward retry, and **reads the file back** — a content comparison of
+the file's hash against the default branch's blob at its path, with the
+non-empty guard, because existence alone passes on an earlier version already
+at that path. Its single stdout line — `LANDED <commit|unchanged> <blob>` or
+`PROPOSED <pr-url|branch> <branch>` — is the evidence the plan is published.
+`/implement-plan` Step 6 item 3 carries the `closeout-push` authority for it. A
+non-zero exit means the plan is NOT published and not vettable yet — say so
+rather than proceeding to Step 2.
+
+**Whether the plans repo needs a PR is decided by the helper's ruleset probe,
+not by this command.** With no PR-requiring rule on the default branch it lands
+directly; with one, or when the probe cannot tell, it cuts a FRESH branch, opens
+a NEW PR with `gh pr create` (the only opener it runs; a line-anchored
+`Plan: <stem>` marker ends the body) and prints `PROPOSED`. To open it with
+`coord_create_pr` instead, run the helper with `LAND_PLAN_STAMP_NO_PR=1` — it
+pushes and reads back the branch, prints it, and opens nothing — then open the
+PR with `coord_create_pr`, falling back to `gh pr create`. It never pushes to an existing
+branch, so a later stamp cannot ride a branch whose PR coord already landed
+(plan `2026-09-10-stamp-pushes-reuse-a-landed-branch-and-strand-the-first-pr-unobserved`).
+A pushed branch with no pull request never reaches `main`: measured
+2026-09-02, **9** plan stems were pushed to `origin` and never proposed at all —
+no PR in any state, on any branch carrying the stem. So on the `PROPOSED` arm,
+read the PR back with
 `gh pr list --repo <owner/repo> --head <branch> --state all --json number,state,headRefOid`.
-When it says no PR carries the push and commits remain unlanded, take its
+Every NON-stamp push to an existing branch — the implementation PRs this chain
+opens — stays governed by `knowledge-base/qontinui-specific/coord-ff-lands.md` →
+"Pushing to a branch whose PR may already have landed": before each such push,
+and again after it, and when it says no PR carries the push, take its
 fresh-branch path and open the new PR — **`coord_create_pr` first, then
 `gh pr create`** — with a line-anchored `Plan: <stem>` marker in the body,
 carrying the DELIVERY SCOPE for the phases this PR actually implements
@@ -756,7 +773,8 @@ Args: <resolved plan path>
 Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
 `Status: VETTED <date>` (and, under this chain, registers the `time_elapsed`
-safety-net gate — **not** a `unit_ready` record gate; see the table below). Do
+safety-net gate — **not** a `unit_ready` record gate; see the table below —
+unless it took its §5.4 step 6 **hold-gate skip**, which registers neither). Do
 not short-circuit any of it.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
@@ -775,13 +793,15 @@ point, so do not reintroduce it as a "quick summary of the vet" either.
 about the MIDPOINT, not a cap on output.)
 
 **`/vet-plan` registers exactly ONE gate for a `/vet-imp` run — the net
-(changed 2026-09-04).** If this chain drops after vetting, coord dispatches a
+(changed 2026-09-04) — or NONE when it takes its §5.4 step 6 hold-gate skip**
+(the plan is held behind a live trigger gate that already dispatches back to
+it; see Step 3's VETTED-HELD arm). If this chain drops after vetting, coord dispatches a
 fresh visible session to implement the plan instead of leaving it stranded.
 
 | Gate | `phase_name` | Predicate | Continuation | Registered under `/vet-imp`? |
 |---|---|---|---|---|
 | **Record** | the plan title, or `"vet→implement handoff"` | `unit_ready` `{work_unit_id, ready_status}` | **NEVER** — unconditional | **NO — standalone `/vet-plan` only** |
-| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always** |
+| **Net** | `"vet→implement safety net"` | `time_elapsed` `{duration_secs: 1800}` | the dispatching `continuation_spawn`, **carrying a brief** | **YES — always**, except under `/vet-plan` §5.4 step 6's hold-gate skip |
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
@@ -893,7 +913,10 @@ rescued by coord still burns a session and delays the work.
 ### Step 3 — Gate: confirm the plan is actually VETTED
 
 After `/vet-plan` returns, re-read the top of the plan file and confirm its
-status block now reads `Status: VETTED`. This gate exists because the two
+status block now reads `Status: VETTED`. `Status: VETTED (self)` passes this
+gate too: it is `/vet-plan`'s stamp for a vet whose fresh-context reviewer
+could not be spawned. It is still VETTED, only without independence, so proceed
+and carry the qualifier forward. This gate exists because the two
 states that legitimately stop the lifecycle must stop it here too:
 
 - **`/vet-plan` aborted** because the existing block was `SHIPPED` /
@@ -1172,13 +1195,26 @@ states that legitimately stop the lifecycle must stop it here too:
 
 - **The stamp is missing** for any other reason. Do not implement an unvetted
   plan; report what `/vet-plan` actually produced and stop.
+- **The plan is VETTED but HELD — `/vet-plan` took §5.4 step 6's hold-gate
+  skip.** The fresh stamp defers every remaining phase behind a named gate that
+  is open and armed to come back to this plan. There is nothing to implement,
+  and the plan's own text forbids implementing it. So do **not** invoke
+  `/implement-plan`: go to Step 5 and report the chain as **VETTED-HELD**,
+  quoting the hold `gate_id`, its verdict and `will_dispatch` as `/vet-plan`
+  read them. This is the one VETTED outcome that ends the chain here, and it is
+  a stand-down, not a stall. Only the hold-gate skip `/vet-plan` actually
+  reported qualifies — never your own reading that the work "looks deferred".
+  The Backstop hook below may block once because the stamp still reads
+  `VETTED`; answer it with this reason in one line.
 
-If the status block reads `VETTED`, proceed to Step 4. A defect count > 0 in the
+If the status block reads `VETTED` and the plan is not held (above), proceed to
+Step 4. A defect count > 0 in the
 VETTED summary is **not** a blocker — `/vet-plan` auto-fixes what it can and only
 surfaces genuine product/scope calls; those are reported, not gating.
 
 **Confirming VETTED and invoking `/implement-plan` happen in the SAME assistant
-turn, with the Skill call last.** Do not confirm the gate in one turn and plan to
+turn, with the Skill call last** — for every VETTED outcome except the
+VETTED-HELD arm above, which goes to Step 5 in that same turn instead. Do not confirm the gate in one turn and plan to
 invoke in the next — there is no next turn; the turn ends and the chain is dead.
 If you have just written the words that confirm the stamp, the very next thing
 you emit is the Step 4 Skill call, not a summary and not a hand-off sentence.
@@ -1350,7 +1386,14 @@ it was reporting. **INCOMPLETE *and* released** is the correct end state.
 
 Then give one short summary tying the two halves together: what the plan was
 about, the vet outcome (defects found / auto-fixed / surfaced), and the
-implement outcome (phases shipped, commit SHAs, anything deferred to a gate).
+implement outcome (phases shipped, commit SHAs, anything deferred to a gate)
+— or, for a VETTED-HELD plan, the hold instead: each hold `gate_id`, its
+verdict and `will_dispatch` as `/vet-plan` read them, and that
+`/implement-plan` was deliberately not run. When `/implement-plan` itself
+stopped at its Step 0.45 held check (a cited hold gate still open but not
+usable as a trigger — unarmed, armed toward another target, or claim-anchored —
+so `/vet-plan` took no skip), say that instead, with the same gate
+fields — and name the unarmed gate as a missing trigger.
 **Fold in the vet report you collected at Step 2** — it was never emitted, so
 this is its only appearance; dropping it loses the vet outcome entirely. For the
 implement half, defer to `/implement-plan`'s own report rather than repeating it
@@ -1427,7 +1470,9 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   stamps VETTED, writes the sentence, and ends the turn without ever calling the
   Skill tool (diagnosed 2026-07-28, reproduced live in the diagnosing session).
   **The Step 3 VETTED confirmation and the Step 4 `Skill: implement-plan` call
-  MUST occur in the SAME assistant turn, with the Skill call LAST.** If you find
+  MUST occur in the SAME assistant turn, with the Skill call LAST** — except on
+  Step 3's VETTED-HELD arm, where there is no Step 4 and Step 5 follows in the
+  same turn. If you find
   yourself about to write that sentence — **call the tool instead.** The tool
   call IS the sentence.
 - **No finished-looking report before implementation completes.** `/vet-plan`'s
@@ -1439,11 +1484,13 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   the `Skill: implement-plan` call.
 - **The VETTED gate is mandatory.** Never run `/implement-plan` from this
   command unless Step 3 confirms a fresh `Status: VETTED` block. A vet abort
-  (closed plan, or wrong architectural direction) stops the chain.
+  (closed plan, or wrong architectural direction) stops the chain, and so
+  does a VETTED-HELD plan (Step 3), which ends at Step 5 with nothing to implement.
 - **One session, no stop between halves.** Like `/implement-plan` itself, the
   vet → implement chain runs end-to-end without handing back to the operator
   between the two — except for the escalations the underlying skills already
-  define (operator-resource needs, oversize-plan handoff, a vet abort).
+  define (operator-resource needs, oversize-plan handoff, a vet abort) and a
+  VETTED-HELD plan, which ends at Step 5 without handing back.
 
 ## Backstop
 
@@ -1459,5 +1506,7 @@ It fires **at most once per session** (latched by
 and **fails open on everything else**, so it can nag but never trap. Treat it as
 the last line of defence: the rules above are what should prevent the stall, and
 a hook block means they were ignored. If the block is genuinely wrong (the vet
-aborted, or the operator stopped the run), state that reason in one line and
+aborted, the operator stopped the run, Step 3's VETTED-HELD arm ended the
+chain because the plan is held behind a live trigger gate, or `/implement-plan`
+Step 0.45 stopped on a held plan), state that reason in one line and
 stop — it will not ask twice.
