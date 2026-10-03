@@ -2086,15 +2086,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_shim_json_escape_yields_valid_json_for_any_cwd() {
-        let start = READ_BACK_SHIM_BASH
-            .find("json_escape() {")
+        let (_, from_fn) = READ_BACK_SHIM_BASH
+            .split_once("json_escape() {")
             .expect("json_escape defined");
-        let end = start
-            + READ_BACK_SHIM_BASH[start..]
-                .find("\n}\n")
-                .expect("json_escape closes")
-            + 3;
-        let func = &READ_BACK_SHIM_BASH[start..end];
+        let (body, _) = from_fn.split_once("\n}\n").expect("json_escape closes");
+        let func = format!("json_escape() {{{body}\n}}\n");
         let input = "C:\\it's \"q\"\nline\ttab\r\u{1}end&";
         let out = std::process::Command::new("bash")
             .arg("-c")
