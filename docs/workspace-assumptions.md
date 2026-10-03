@@ -15,7 +15,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `plans_dir` | 32 | 33 | 32 | 0 | 0 | 0 |
+| `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
 | `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
 
 ## `repo_layout` (74 rows)
@@ -205,7 +205,7 @@ _No hits._
 
 _No hits._
 
-## `plans_dir` (32 rows)
+## `plans_dir` (34 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -238,7 +238,9 @@ _No hits._
 | `src/plan_workunit_adapter/trigger.rs` | `LoopState::apply_resolution` | `setting = "paths.plans_dir",` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `ResolvedDirs::resolve` | `plans: resolve_plans_dir(inputs.plans_dir, &no_tenant_overrides, None),` | 1 | unreviewed |
 | `src/plan_workunit_adapter/trigger.rs` | `record_scan_divergence` | `plans_dir = ?divergence.plans_dir,` | 2 | unreviewed |
-| `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `"plans_dir_migration: recorded paths.plans_dir = {value:?} from the retired env \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `"plans_dir_migration: kept existing setting: paths.plans_dir is already set, \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `"plans_dir_migration: seeded from {var}: recorded paths.plans_dir = {value:?}. \` | 1 | unreviewed |
+| `src/plans_dir_migration.rs` | `outcome_message` | `{PLANS_DIR_ENV}{ignored}). paths.plans_dir stays unset, so the \` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
