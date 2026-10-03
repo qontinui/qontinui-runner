@@ -773,6 +773,31 @@ impl SchedulerService {
                     .await;
                 return;
             }
+            ScheduledTaskType::Script {
+                command,
+                working_directory,
+                timeout_seconds,
+            } => {
+                // Plan `2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-latency`
+                // Phase 4: run the command in-binary; success is its exit code.
+                let spec = crate::scheduler_script::ScriptSpec {
+                    task_name: task_name.clone(),
+                    execution_id: String::new(), // stamped by launch_and_await_script
+                    command: command.clone(),
+                    working_directory: working_directory.clone(),
+                    timeout: crate::scheduler_script::effective_timeout(*timeout_seconds),
+                };
+                self.clone()
+                    .launch_and_await_script(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        catch_up,
+                        spec,
+                    )
+                    .await;
+                return;
+            }
             _ => {}
         }
 
@@ -811,7 +836,8 @@ impl SchedulerService {
             // and return early; the compiler still needs them in this match.
             ScheduledTaskType::Prompt { .. }
             | ScheduledTaskType::AutoFix { .. }
-            | ScheduledTaskType::RemoteAgent { .. } => unreachable!(
+            | ScheduledTaskType::RemoteAgent { .. }
+            | ScheduledTaskType::Script { .. } => unreachable!(
                 "Async task types must be handled by the launch_and_poll dispatch above"
             ),
         };
@@ -1200,12 +1226,70 @@ impl SchedulerService {
             .as_ref()
             .map(|s| crate::mcp::types::runner_api_port(s));
 
-        match crate::scheduler_remote_agent::launch(spec, bound_port).await {
+        let launched = crate::scheduler_remote_agent::launch(spec, bound_port).await;
+        self.settle_launched_child(
+            "RemoteAgent",
+            task_id,
+            task_name,
+            auto_fix_on_failure,
+            record,
+            launched,
+        )
+        .await;
+    }
+
+    /// Launch a `Script` task (a shell command, no Claude session) and AWAIT
+    /// it. Phase 4 of plan
+    /// `2026-09-28-ccfg-bundle-parity-bound-outruns-runner-train-latency`:
+    /// success is the command's exit code (0), a timeout is a failure, and the
+    /// recording path is the same one `RemoteAgent` uses.
+    async fn launch_and_await_script(
+        self: Arc<Self>,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        catch_up: Option<CatchUpContext>,
+        mut spec: crate::scheduler_script::ScriptSpec,
+    ) {
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        if let Some(ref ctx) = catch_up {
+            ctx.apply(&mut record);
+        }
+        spec.execution_id = record.execution_id.clone();
+        let launched = crate::scheduler_script::launch(spec).await;
+        self.settle_launched_child(
+            "Script",
+            task_id,
+            task_name,
+            auto_fix_on_failure,
+            record,
+            launched,
+        )
+        .await;
+    }
+
+    /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`):
+    /// record the `Running` row the moment the child exists, clear the
+    /// launch-failure streak, and settle the row from the child's outcome via
+    /// [`Self::finalize_async_execution`]. A launch `Err` is a LaunchFailed.
+    async fn settle_launched_child(
+        self: Arc<Self>,
+        kind: &'static str,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        mut record: TaskExecutionRecord,
+        launched: Result<crate::scheduler_remote_agent::RemoteAgentLaunch, String>,
+    ) {
+        let execution_id = record.execution_id.clone();
+        match launched {
             Ok(launch) => {
-                record.session_id = Some(launch.session_id.clone());
+                if !launch.session_id.is_empty() {
+                    record.session_id = Some(launch.session_id.clone());
+                }
                 info!(
-                    "Scheduler: launched RemoteAgent task '{}' in-binary (session_id={}, cwd={}, log={:?})",
-                    task_name, launch.session_id, launch.workdir, launch.log_path
+                    "Scheduler: launched {} task '{}' in-binary (session_id={:?}, cwd={}, log={:?})",
+                    kind, task_name, launch.session_id, launch.workdir, launch.log_path
                 );
 
                 if let Ok(pg) = self.pg() {
@@ -1229,7 +1313,8 @@ impl SchedulerService {
                     let started = tokio::time::Instant::now();
                     let outcome = completion.await;
                     info!(
-                        "Scheduler: RemoteAgent task '{}' child ended (success={}, exit_code={:?}, timed_out={}, took {:?})",
+                        "Scheduler: {} task '{}' child ended (success={}, exit_code={:?}, timed_out={}, took {:?})",
+                        kind,
                         task_name,
                         outcome.success,
                         outcome.exit_code,
@@ -2692,7 +2777,8 @@ fn task_spawns_ai_session(task: &ScheduledTaskType) -> bool {
         | ScheduledTaskType::AutoFix { .. }
         | ScheduledTaskType::RemoteAgent { .. }
         | ScheduledTaskType::Watcher { .. } => true,
-        ScheduledTaskType::BackgroundCapture { .. } => false,
+        // A Script runs a shell command in-binary; it spawns no AI session.
+        ScheduledTaskType::BackgroundCapture { .. } | ScheduledTaskType::Script { .. } => false,
     }
 }
 
@@ -3010,6 +3096,11 @@ mod tests {
                 monitor_index: None,
                 workflow_id: None,
             },
+            ScheduledTaskType::Script {
+                command: "bash x.sh".into(),
+                working_directory: None,
+                timeout_seconds: None,
+            },
             ScheduledTaskType::BackgroundCapture {
                 monitor_index: None,
                 capture_interval_secs: 60,
@@ -3025,7 +3116,7 @@ mod tests {
             &crate::coord_drain_state::DrainGate::Allow,
             task_spawns_ai_session,
         );
-        assert_eq!((runnable.len(), held.len()), (6, 0));
+        assert_eq!((runnable.len(), held.len()), (7, 0));
         let (runnable, held) = partition_for_drain(
             items,
             &crate::coord_drain_state::DrainGate::Defer {
@@ -3034,7 +3125,7 @@ mod tests {
             },
             task_spawns_ai_session,
         );
-        assert_eq!((runnable.len(), held.len()), (2, 4));
+        assert_eq!((runnable.len(), held.len()), (3, 4));
         assert!(!runnable.iter().any(task_spawns_ai_session));
     }
 

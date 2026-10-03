@@ -236,6 +236,7 @@ mod scenarios;
 mod scheduler;
 mod scheduler_probe;
 mod scheduler_remote_agent;
+mod scheduler_script;
 mod scheduler_service;
 mod schema_registry;
 mod screen;
