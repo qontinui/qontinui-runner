@@ -200,6 +200,74 @@ impl UIBridgeDiscoveryRequest {
             force: self.force.or_else(|| nested.and_then(|o| o.force)),
         }
     }
+
+    /// Build the `discover` IPC hop's `options` object and `force` flag from
+    /// the raw HTTP body.
+    ///
+    /// The body is forwarded WHOLE, the way `ui_bridge_find_handler` forwards
+    /// `find`'s: the SDK's `FindRequest` is the contract for both routes, so a
+    /// filter this struct does not name (`includeMedia`, `includeContent`,
+    /// `contentOnly`, `text`, `role`, `label`, `testId`, …) is carried through
+    /// by identity rather than dropped. Narrowing the payload to the six typed
+    /// keys is what made `discover` unable to see registered media at all.
+    ///
+    /// The keys this struct DOES name keep the grammar [`Self::resolve`] gives
+    /// them — top-level beats `options`, snake_case folds to camelCase — and an
+    /// unset one is OMITTED rather than sent as `null`. That omission is
+    /// load-bearing: the frontend seeds `includeHidden: true` beneath the
+    /// caller's filters, and an explicit `null` would override the seed with a
+    /// value the SDK reads as false. Untyped keys follow the same precedence:
+    /// nested first, then top-level over it. `force` is a meta-flag about
+    /// registry state, so it travels beside `options`, never inside it.
+    pub(crate) fn discover_ipc_request(
+        body: &serde_json::Value,
+    ) -> Result<(serde_json::Map<String, serde_json::Value>, bool), serde_json::Error> {
+        /// Keys resolved through the typed struct (both spellings), plus the
+        /// `options` wrapper itself. Everything else is forwarded verbatim.
+        const TYPED_KEYS: &[&str] = &[
+            "root",
+            "interactiveOnly",
+            "interactive_only",
+            "includeHidden",
+            "include_hidden",
+            "limit",
+            "types",
+            "selector",
+            "force",
+            "options",
+        ];
+
+        let typed: Self = serde_json::from_value(body.clone())?;
+        let resolved = typed.resolve();
+
+        let mut options = serde_json::Map::new();
+        let untyped = |map: &serde_json::Map<String, serde_json::Value>| {
+            map.iter()
+                .filter(|(k, _)| !TYPED_KEYS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        };
+        if let Some(serde_json::Value::Object(nested)) = body.get("options") {
+            options.extend(untyped(nested));
+        }
+        if let serde_json::Value::Object(top) = body {
+            options.extend(untyped(top));
+        }
+
+        let mut put = |key: &str, value: Option<serde_json::Value>| {
+            if let Some(v) = value {
+                options.insert(key.to_string(), v);
+            }
+        };
+        put("root", resolved.root.map(Into::into));
+        put("interactiveOnly", resolved.interactive_only.map(Into::into));
+        put("includeHidden", resolved.include_hidden.map(Into::into));
+        put("limit", resolved.limit.map(Into::into));
+        put("types", resolved.types.map(Into::into));
+        put("selector", resolved.selector.map(Into::into));
+
+        Ok((options, resolved.force.unwrap_or(false)))
+    }
 }
 
 /// Request to start UI Bridge exploration
@@ -1078,6 +1146,78 @@ mod discovery_options_grammar_tests {
         assert_eq!(o.selector.as_deref(), Some(".btn"));
         assert_eq!(o.types, Some(vec!["button".to_string()]));
         assert_eq!(o.force, Some(true));
+    }
+
+    fn ipc(body: serde_json::Value) -> (serde_json::Map<String, serde_json::Value>, bool) {
+        UIBridgeDiscoveryRequest::discover_ipc_request(&body).expect("body should deserialize")
+    }
+
+    /// Plan 2026-09-20-fleet-tab-attach-loses-the-grant-push-race item 8: the
+    /// handler narrowed the payload to six keys, so `includeMedia` /
+    /// `includeContent` / `text` / `testId` never reached the SDK. Every
+    /// `FindRequest` filter must now travel, from either spelling.
+    #[test]
+    fn untyped_filters_are_forwarded_whole() {
+        let (opts, force) = ipc(serde_json::json!({
+            "interactive_only": false,
+            "includeMedia": true,
+            "includeContent": true,
+            "options": { "testId": "save", "role": "button" },
+        }));
+        assert_eq!(opts["includeMedia"], true);
+        assert_eq!(opts["includeContent"], true);
+        assert_eq!(opts["testId"], "save");
+        assert_eq!(opts["role"], "button");
+        assert_eq!(
+            opts["interactiveOnly"], false,
+            "snake_case folds to camelCase"
+        );
+        assert!(!opts.contains_key("interactive_only"));
+        assert!(
+            !opts.contains_key("options"),
+            "the wrapper must not nest itself"
+        );
+        assert!(!force);
+    }
+
+    /// An unset typed filter is OMITTED, never `null`: the frontend seeds
+    /// `includeHidden: true` beneath the caller's filters, and a forwarded
+    /// `null` overrode that seed with a value the SDK reads as false.
+    #[test]
+    fn unset_typed_filters_are_omitted_not_null() {
+        let (opts, force) = ipc(serde_json::json!({ "force": true }));
+        assert!(opts.is_empty(), "expected no keys, got {opts:?}");
+        assert!(force);
+        assert!(!opts.contains_key("force"), "force travels beside options");
+    }
+
+    /// An explicit `includeHidden: false` still reaches the SDK, so a caller
+    /// can opt into the visibility filter.
+    #[test]
+    fn explicit_include_hidden_false_is_forwarded() {
+        let (opts, _) = ipc(serde_json::json!({ "include_hidden": false }));
+        assert_eq!(opts["includeHidden"], false);
+    }
+
+    /// Precedence for untyped keys matches `resolve`: top-level beats nested.
+    #[test]
+    fn top_level_untyped_key_wins_over_nested() {
+        let (opts, _) = ipc(serde_json::json!({
+            "text": "top",
+            "options": { "text": "nested", "limit": 3 },
+        }));
+        assert_eq!(opts["text"], "top");
+        assert_eq!(opts["limit"], 3);
+    }
+
+    #[test]
+    fn a_mistyped_typed_filter_is_rejected() {
+        assert!(
+            UIBridgeDiscoveryRequest::discover_ipc_request(&serde_json::json!({
+                "limit": "five"
+            }))
+            .is_err()
+        );
     }
 }
 
