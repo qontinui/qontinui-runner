@@ -272,13 +272,77 @@ const CONTINUE_NUDGE: &str = "This session was automatically migrated to a fresh
 after the previous account hit a usage limit. Continue the task you were working on from where \
 it left off; if you were idle awaiting operator input, say so and wait.";
 
-/// How the nudge watcher decides the resumed CLI is ready for input: the Ink
-/// footer hint that is painted exactly when the input box is idle. Matched
-/// against the normalized (lowercased, whitespace-collapsed) grid.
-const READY_MARKER: &str = "? for shortcuts";
+/// How the watcher decides the resumed CLI is ready for input:
+/// [`crate::terminal::graceful_exit::input_prompt_ready`], the predicate the
+/// session message poller already pastes through (`❯` on the cursor row, an
+/// idle screen, an empty input line, no dialog), read on two consecutive
+/// identical screens ([`ReadyDebounce`]).
+///
+/// It used to be the Ink footer hint `? for shortcuts`, which Claude Code
+/// paints only in the DEFAULT permission mode. The sessions this watcher
+/// serves are resumed with `--permission-mode bypassPermissions` unless a
+/// launch template overrides it, and in that mode the footer slot reads
+/// `⏵⏵ bypass permissions on (shift+tab to cycle)` instead. The runner logs on
+/// merytshost read 24 `never painted its idle prompt` give-ups and zero
+/// submissions over 2026-09-23..2026-10-02, so neither the migration nudge nor
+/// coord's respawn `initial_prompt` was delivered. The hint is not kept as a
+/// fallback: it was matched against the whole screen, transcript included, so
+/// it would have overridden every refusal (a draft, a dialog) the shared
+/// predicate makes, and a default-mode v2 pane draws `❯` as well.
+///
 /// Painted while Claude is mid-turn — if visible, the session already picked
 /// itself up (or the operator beat us to it) and no nudge is needed.
 const BUSY_MARKER: &str = "esc to interrupt";
+
+/// What one grid read tells the idle watcher.
+#[derive(Debug, PartialEq, Eq)]
+enum IdlePromptProbe {
+    /// Claude is mid-turn: the session picked itself up, no prompt is needed.
+    Busy,
+    /// The input box is idle and empty: submit now.
+    Ready,
+    /// Neither yet (still repainting, a dialog, a draft): read again. Carries
+    /// why the shared predicate refused, for the give-up log line.
+    NotYet(String),
+}
+
+/// Classify one rendered screen. Busy wins over ready, as before: a pane
+/// showing `esc to interrupt` never receives the prompt.
+fn probe_idle_prompt(screen: &crate::terminal::graceful_exit::ScreenText) -> IdlePromptProbe {
+    let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
+    if normalized.contains(BUSY_MARKER) {
+        return IdlePromptProbe::Busy;
+    }
+    match crate::terminal::graceful_exit::input_prompt_ready(screen) {
+        Ok(()) => IdlePromptProbe::Ready,
+        Err(why) => IdlePromptProbe::NotYet(why),
+    }
+}
+
+/// Holds a `Ready` read until the NEXT read shows the identical screen. A
+/// resuming v2 pane can paint an idle `❯` for a moment while its start-up
+/// hooks and MCP servers are still loading; one read would submit into a pane
+/// that is still settling. The session message poller debounces the same way
+/// (`looks_idle_quiescent`).
+#[derive(Default)]
+struct ReadyDebounce {
+    last_ready: Option<crate::terminal::graceful_exit::ScreenText>,
+}
+
+impl ReadyDebounce {
+    /// `true` when `screen` read `Ready` and is identical to the previous
+    /// read, which also read `Ready`.
+    fn settled(&mut self, screen: crate::terminal::graceful_exit::ScreenText) -> bool {
+        let settled = self.last_ready.as_ref() == Some(&screen);
+        self.last_ready = Some(screen);
+        settled
+    }
+
+    /// A read that was not `Ready` restarts the debounce.
+    fn reset(&mut self) {
+        self.last_ready = None;
+    }
+}
 
 /// Watch the freshly-respawned terminal until the resumed CLI paints its idle
 /// prompt, then submit [`CONTINUE_NUDGE`]. Detached and strictly best-effort:
@@ -304,6 +368,7 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
     use tauri::Manager;
     tauri::async_runtime::spawn(async move {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut debounce = ReadyDebounce::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let Some(app) = crate::tauri_app_handle::current() else {
@@ -320,39 +385,44 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
                 );
                 return;
             };
-            let text = {
-                let grid = session.grid();
-                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-                guard.text_snapshot().text
-            };
-            let normalized = super::output_scan::normalize(&text);
-            if normalized.contains(BUSY_MARKER) {
-                info!(
-                    terminal_id,
-                    label, "prompt-when-idle: session already working — no prompt needed"
-                );
-                return;
-            }
-            if normalized.contains(READY_MARKER) {
-                // Composes both sides of the 2026-08-29 rebase: OUR generalized
-                // `prompt`/`label` seam (one impl for the migration nudge and the
-                // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-                // returning `()` in fee48d4c, which now reports the neutralized body.
-                match session.submit_prompt(
-                    &prompt,
-                    crate::terminal::session::PtyWriteCaller::AccountMigration,
-                ) {
-                    Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                    Err(e) => {
-                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
-                    }
+            let screen = session.grid_screen();
+            let refusal = match probe_idle_prompt(&screen) {
+                IdlePromptProbe::Busy => {
+                    info!(
+                        terminal_id,
+                        label, "prompt-when-idle: session already working — no prompt needed"
+                    );
+                    return;
                 }
-                return;
-            }
+                IdlePromptProbe::NotYet(why) => {
+                    debounce.reset();
+                    why
+                }
+                IdlePromptProbe::Ready if !debounce.settled(screen) => {
+                    "idle prompt seen once; waiting for an identical second read".to_string()
+                }
+                IdlePromptProbe::Ready => {
+                    // Composes both sides of the 2026-08-29 rebase: OUR generalized
+                    // `prompt`/`label` seam (one impl for the migration nudge and the
+                    // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
+                    // returning `()` in fee48d4c, which now reports the neutralized body.
+                    match session.submit_prompt(
+                        &prompt,
+                        crate::terminal::session::PtyWriteCaller::AccountMigration,
+                    ) {
+                        Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
+                        Err(e) => {
+                            warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                        }
+                    }
+                    return;
+                }
+            };
             if std::time::Instant::now() >= deadline {
                 warn!(
                     terminal_id,
                     label,
+                    last_refusal = %refusal,
                     "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
                 );
                 return;
@@ -908,6 +978,134 @@ fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- idle-prompt watcher -------------------------------------------------
+
+    fn v2_screen(
+        rows: &[&str],
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> crate::terminal::graceful_exit::ScreenText {
+        crate::terminal::graceful_exit::ScreenText {
+            lines: rows.iter().map(|r| r.to_string()).collect(),
+            cursor_row,
+            cursor_col,
+        }
+    }
+
+    /// The screen every resumed session actually paints: bypass mode, so the
+    /// footer carries no `? for shortcuts`. The old literal check never matched
+    /// it, and the watcher gave up on every migration nudge and respawn prompt.
+    #[test]
+    fn an_idle_bypass_mode_prompt_is_ready_without_the_shortcuts_hint() {
+        let rule = "─".repeat(75);
+        let s = v2_screen(
+            &[
+                "● Done — the branch is pushed.",
+                &rule,
+                "❯\u{a0}Try \"write a test for <filepath>\"",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            ],
+            2,
+            2,
+        );
+        assert!(
+            !super::super::output_scan::normalize(&s.lines.join("\n")).contains("? for shortcuts")
+        );
+        assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Ready);
+    }
+
+    #[test]
+    fn a_working_pane_is_busy_even_with_a_prompt_on_screen() {
+        let rule = "─".repeat(75);
+        let s = v2_screen(
+            &[
+                "✻ Compiling… (esc to interrupt)",
+                &rule,
+                "❯\u{a0}",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            2,
+            2,
+        );
+        assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Busy);
+    }
+
+    /// An operator draft on the input line must never receive the prompt
+    /// appended to it.
+    #[test]
+    fn an_unsent_draft_is_not_ready() {
+        let rule = "─".repeat(75);
+        let s = v2_screen(
+            &[
+                &rule,
+                "❯\u{a0}half typed",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            1,
+            12,
+        );
+        assert!(matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)));
+    }
+
+    #[test]
+    fn a_pane_with_no_prompt_drawn_yet_is_not_ready() {
+        let s = v2_screen(
+            &[
+                "$ claude --permission-mode bypassPermissions --resume abc",
+                "",
+            ],
+            1,
+            0,
+        );
+        assert!(matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)));
+    }
+
+    /// The old literal readiness check read the whole screen, so a transcript
+    /// row quoting the default-mode hint must not admit an operator's draft.
+    #[test]
+    fn a_quoted_shortcuts_hint_does_not_admit_a_draft() {
+        let rule = "─".repeat(75);
+        let s = v2_screen(
+            &[
+                "● The footer used to read `? for shortcuts`.",
+                &rule,
+                "❯\u{a0}half typed",
+                &rule,
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            2,
+            12,
+        );
+        assert!(matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)));
+    }
+
+    #[test]
+    fn ready_is_submitted_only_on_a_second_identical_read() {
+        let first = v2_screen(&["❯\u{a0}"], 0, 2);
+        let mut changed = first.clone();
+        changed
+            .lines
+            .insert(0, "  ⎿ SessionStart hook loading".to_string());
+        let mut d = ReadyDebounce::default();
+        assert!(!d.settled(first.clone()), "one read is never enough");
+        assert!(
+            !d.settled(changed.clone()),
+            "the screen moved between reads"
+        );
+        assert!(
+            d.settled(changed.clone()),
+            "two identical idle reads settle"
+        );
+        d.reset();
+        assert!(
+            !d.settled(changed),
+            "a refusal in between restarts the count"
+        );
+    }
 
     /// The `--resume` respawn carries the hook carrier and, with a cached body,
     /// the body-only file — and never the inline flag, since it has no briefing.
