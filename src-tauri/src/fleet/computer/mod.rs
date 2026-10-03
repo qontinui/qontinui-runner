@@ -44,6 +44,7 @@
 
 pub(crate) mod access;
 pub(crate) mod events;
+pub(crate) mod gpu;
 pub(crate) mod identity;
 pub(crate) mod services;
 pub(crate) mod wsl_guest;
@@ -83,8 +84,9 @@ pub(crate) struct ComputerReport {
     pub(crate) memory_total_bytes: Option<u64>,
     pub(crate) swap_total_bytes: Option<u64>,
     pub(crate) disk_total_bytes: Option<u64>,
-    /// Not measured by any runner probe yet — `null` = UNKNOWN, not "none".
-    pub(crate) gpus: Option<serde_json::Value>,
+    /// `[]` = measured, no GPU; `null` = UNKNOWN (see [`gpu`] for when each
+    /// is claimed and which vendors are measured).
+    pub(crate) gpus: Option<Vec<gpu::Gpu>>,
     pub(crate) boot_id: Option<String>,
     pub(crate) booted_at: Option<String>,
     pub(crate) access: Option<Access>,
@@ -163,7 +165,13 @@ pub(crate) fn host_report(
         memory_total_bytes: facts.memory_total_bytes,
         swap_total_bytes: facts.swap_total_bytes,
         disk_total_bytes: facts.disk_total_bytes,
-        gpus: None,
+        // A runner INSIDE a WSL guest leaves the guest's GPUs to the Windows
+        // host lane (`gpu::guest_gpus`), so each row has one writer.
+        gpus: if kind == "wsl_guest" {
+            None
+        } else {
+            facts.gpus.clone()
+        },
         boot_id,
         booted_at: facts.booted_at.clone(),
         access,
@@ -204,6 +212,9 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             memory_total_bytes: g.memory_total_bytes,
             swap_total_bytes: g.swap_total_bytes,
             disk_total_bytes: g.disk_total_bytes,
+            // The guest's GPU set is the HOST's measurement, applied by the
+            // caller through `gpu::guest_gpus` — the guest probe forks no
+            // `nvidia-smi` of its own.
             gpus: None,
             boot_id: g.boot_id.clone(),
             booted_at: g.booted_at.clone(),
@@ -490,6 +501,9 @@ pub(crate) fn quarantine(
 /// (`MAX_UNIT_LEN`).
 pub(crate) const MAX_TEXT_LEN: usize = 512;
 pub(crate) const MAX_UNIT_LEN: usize = 256;
+/// coord's serialized-size bound on each free-form JSON member (`gpus`,
+/// `access`, event `detail`) — `computers.rs` `MAX_JSON_BYTES`.
+pub(crate) const MAX_JSON_BYTES: usize = 16 * 1024;
 
 fn too_long(v: &Option<String>) -> bool {
     v.as_ref().is_some_and(|s| s.chars().count() > MAX_TEXT_LEN)
@@ -514,6 +528,14 @@ pub(crate) fn presanitize(c: &mut ComputerReport) {
             *f = None;
         }
     }
+    // `gpu` already bounds a reading well inside this; the check is here so
+    // the rule lives beside coord's other bounds, not only in the producer.
+    if c.gpus
+        .as_ref()
+        .is_some_and(|g| serde_json::to_vec(g).map_or(true, |b| b.len() > MAX_JSON_BYTES))
+    {
+        c.gpus = None;
+    }
     if let Some(rows) = c.services.as_mut() {
         rows.retain(|r| r.unit.chars().count() <= MAX_UNIT_LEN);
         for r in rows.iter_mut() {
@@ -536,7 +558,7 @@ pub(crate) fn presanitize(c: &mut ComputerReport) {
 
 /// The fallback after a 422 that named no event: the same report with the
 /// fields a computer-level refusal can sit in nulled — `services`, `hostname`,
-/// `access` and the free-text facts — keeping identity, boot facts and
+/// `access`, `gpus` and the free-text facts — keeping identity, boot facts and
 /// events. If coord refuses THIS too, the queue is quarantined. PURE.
 pub(crate) fn stripped(c: &ComputerReport) -> ComputerReport {
     let mut c = c.clone();
@@ -544,6 +566,8 @@ pub(crate) fn stripped(c: &ComputerReport) -> ComputerReport {
     c.services_complete_kinds = Vec::new();
     c.hostname = None;
     c.access = None;
+    // `null` is UNKNOWN and coord COALESCEs it, so this costs no stored value.
+    c.gpus = None;
     c.os = None;
     c.os_version = None;
     c.kernel = None;
@@ -828,7 +852,9 @@ impl Reporter {
             });
             if full || guest_pending {
                 for g in wsl_guest::probe::collect().await {
-                    observed.push(guest_observed(&g, &host_id));
+                    let mut o = guest_observed(&g, &host_id);
+                    o.base.gpus = gpu::guest_gpus(g.gpu_paravirt, facts.gpus.as_deref());
+                    observed.push(o);
                 }
             }
         }
@@ -1145,6 +1171,7 @@ mod tests {
             swap_total_bytes: Some(34_359_738_368),
             disk_total_bytes: Some(1_000_204_886_016),
             booted_at: Some("2026-09-21T14:13:20Z".into()),
+            gpus: None,
         }
     }
 
@@ -1738,6 +1765,82 @@ mod tests {
     }
 
     #[test]
+    fn gpus_come_from_the_facts_except_inside_a_wsl_guest() {
+        let g = vec![gpu::Gpu {
+            vendor: "nvidia".into(),
+            model: Some("Example GPU".into()),
+            vram_bytes: Some(8 << 30),
+            driver: Some("999.10".into()),
+            compute_capability: Some("8.6".into()),
+        }];
+        let f = StaticFacts {
+            gpus: Some(g.clone()),
+            ..facts()
+        };
+        assert_eq!(
+            host_report(HOST_ID.into(), "host", &f, None, None).gpus,
+            Some(g.clone())
+        );
+        assert_eq!(
+            host_report(HOST_ID.into(), "wsl_guest", &f, None, None).gpus,
+            None
+        );
+
+        // A host-probed guest takes the host's reading through `/dev/dxg`.
+        let mut probe = wsl_guest::parse_guest_probe(wsl_guest::tests::GUEST_OUTPUT).unwrap();
+        let mut o = guest_observed(&probe, HOST_ID);
+        o.base.gpus = gpu::guest_gpus(probe.gpu_paravirt, f.gpus.as_deref());
+        assert_eq!(o.base.gpus, Some(g.clone()));
+        probe.gpu_paravirt = Some(false);
+        assert_eq!(
+            gpu::guest_gpus(probe.gpu_paravirt, f.gpus.as_deref()),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn an_oversize_gpus_is_nulled_and_a_stripped_report_carries_none() {
+        let huge = gpu::Gpu {
+            vendor: "nvidia".into(),
+            model: Some("m".repeat(MAX_JSON_BYTES)),
+            vram_bytes: None,
+            driver: None,
+            compute_capability: None,
+        };
+        let mut c = host_report(HOST_ID.into(), "host", &facts(), None, None);
+        c.gpus = Some(vec![huge]);
+        presanitize(&mut c);
+        assert_eq!(c.gpus, None);
+
+        // coord refuses only `n > MAX_JSON_BYTES`: exactly the bound passes,
+        // one byte over is nulled.
+        let sized = |n: usize| {
+            let mut g = gpu::Gpu {
+                vendor: "nvidia".into(),
+                model: Some(String::new()),
+                vram_bytes: None,
+                driver: None,
+                compute_capability: None,
+            };
+            let base = serde_json::to_vec(&vec![g.clone()]).unwrap().len();
+            g.model = Some("m".repeat(n - base));
+            assert_eq!(serde_json::to_vec(&vec![g.clone()]).unwrap().len(), n);
+            let mut c = host_report(HOST_ID.into(), "host", &facts(), None, None);
+            c.gpus = Some(vec![g]);
+            presanitize(&mut c);
+            c.gpus.is_some()
+        };
+        assert!(sized(MAX_JSON_BYTES));
+        assert!(!sized(MAX_JSON_BYTES + 1));
+
+        let mut c = host_report(HOST_ID.into(), "host", &facts(), None, None);
+        c.gpus = Some(vec![]);
+        presanitize(&mut c);
+        assert_eq!(c.gpus, Some(vec![]), "a bounded reading survives");
+        assert_eq!(stripped(&c).gpus, None);
+    }
+
+    #[test]
     fn not_opted_in_sends_an_empty_access_object() {
         let c = host_report(
             HOST_ID.into(),
@@ -1805,6 +1908,7 @@ mod tests {
             ("wsl_guest.rs", include_str!("wsl_guest.rs")),
             ("access.rs", include_str!("access.rs")),
             ("identity.rs", include_str!("identity.rs")),
+            ("gpu.rs", include_str!("gpu.rs")),
         ] {
             let prod = src
                 .split_once("\n#[cfg(test)]")

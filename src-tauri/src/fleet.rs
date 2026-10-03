@@ -1765,9 +1765,19 @@ fn slow_host_probes() -> SlowHostProbes {
 /// [`heartbeat_capabilities`] only, so a caller asking for host facts (tests
 /// among them) can never start a live `gh` / `aws` probe.
 ///
-/// The image probe is an HTTP request on a cache miss, so this function
-/// BLOCKS: the heartbeat assembles its capability base
-/// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
+/// Plus `gpu:cuda` / `gpu:vram:<GiB>` when a CUDA-capable NVIDIA GPU is
+/// measured (plan `2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity-and-coord-has-no-resource-model`,
+/// amendment 2026-10-01 item 4), from the same cached reading the computer
+/// reporter publishes as `coord.computers.gpus`. While that reading is
+/// UNKNOWN the tokens keep the last known one for one more reading period
+/// (so a single slow `nvidia-smi` does not withdraw `gpu:cuda`), but never
+/// while an `nvidia-smi` is wedged; with nothing known, nothing is
+/// advertised.
+///
+/// The image probe is an HTTP request and the GPU probe a bounded
+/// `nvidia-smi` run on a cache miss, so this function BLOCKS: the heartbeat
+/// assembles its capability base ([`heartbeat_device_capabilities`], which
+/// reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
     let mut caps = assemble_host_capabilities(
         current_os_label(),
@@ -1776,6 +1786,9 @@ fn host_capabilities() -> Vec<String> {
         host_mem_total_bytes(),
     );
     caps.extend(imagegen_probe::capability_tokens());
+    caps.extend(computer::gpu::capability_tokens(
+        computer::gpu::host_gpus_for_capabilities().as_deref(),
+    ));
     caps
 }
 
@@ -3516,11 +3529,12 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
     // The host probes block (a `docker version` fork, and on a cache miss a
-    // bounded `GET /v1/models` of the image upstream), so the capability base
-    // is assembled on the blocking pool rather than on this async task's
-    // worker. A join failure (a panicking probe) still advertises the CI tokens,
-    // the OS fact (the one host token that needs no probe) and the credential
-    // family from its non-blocking cache: `heartbeat_join_failure_capabilities`.
+    // bounded `GET /v1/models` of the image upstream or a bounded `nvidia-smi`
+    // run), so the capability base is assembled on the blocking pool rather
+    // than on this async task's worker. A join failure (a panicking probe)
+    // still advertises the CI tokens, the OS fact (the one host token that
+    // needs no probe) and the credential family from its non-blocking cache:
+    // `heartbeat_join_failure_capabilities`.
     let (ci_enabled, repo_allowlist) = (ci.enabled, ci.repo_allowlist.clone());
     let mut capabilities =
         spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
@@ -9733,8 +9747,14 @@ mod tests {",
                 && heartbeat.iter().any(|c| c == CRED_GH_CAPABILITY),
             "anti-vacuity: heartbeat_capabilities must carry the seeded cred family, got {heartbeat:?}"
         );
-        let first = host_capabilities();
-        let second = host_capabilities();
+        // `gpu:*` tokens are excluded: the GPU reading is a shared,
+        // single-flight cache another test may be filling concurrently, so
+        // two calls can legitimately straddle its first measurement.
+        let non_gpu = |v: Vec<String>| -> Vec<String> {
+            v.into_iter().filter(|c| !c.starts_with("gpu:")).collect()
+        };
+        let first = non_gpu(host_capabilities());
+        let second = non_gpu(host_capabilities());
         assert!(
             !first
                 .iter()
@@ -9821,6 +9841,8 @@ mod tests {",
             "heartbeat_capabilities",
             "host_capabilities",
             "capability_tokens",
+            "host_gpus_for_capabilities",
+            "host_gpus_cached",
             "slow_host_probes",
             "claude_code_probe",
         ] {
@@ -10826,10 +10848,11 @@ Add-Content -LiteralPath $Out -Value $lines
 
     /// The heartbeat runs the host probes on the blocking pool, never inline
     /// on its async worker: `host_capabilities` blocks on a cache miss (a
-    /// `docker version` fork, the image probe's HTTP request), and the
-    /// heartbeat reaches it through `heartbeat_device_capabilities`. A source
-    /// contract, because a blocking call inline in an async fn compiles and
-    /// passes every behavioural test while it stalls a runtime worker.
+    /// `docker version` fork, the image probe's HTTP request, a bounded
+    /// `nvidia-smi` run), and the heartbeat reaches it through
+    /// `heartbeat_device_capabilities`. A source contract, because a blocking
+    /// call inline in an async fn compiles and passes every behavioural test
+    /// while it stalls a runtime worker.
     ///
     /// Only the PRODUCTION half of the file is scanned (cut at the test module
     /// header, via `prod_part`), so the string literals in this test can never
@@ -10839,8 +10862,9 @@ Add-Content -LiteralPath $Out -Value $lines
     /// `spawn_blocking_tracked(move || heartbeat_device_capabilities(..))`.
     /// With that call cut out, the rest must not call
     /// `heartbeat_device_capabilities`, `heartbeat_capabilities`,
-    /// `host_capabilities`, or the two blocking probes those wrap,
-    /// `slow_host_probes` and the image probe's `capability_tokens`. A name
+    /// `host_capabilities`, or the blocking probes those wrap,
+    /// `slow_host_probes`, the image probe's `capability_tokens` and the GPU
+    /// probe's `host_gpus_for_capabilities` / `host_gpus_cached`. A name
     /// counts as a call only where it is not the tail of a longer identifier
     /// ([`calls_fn`]), so the heartbeat's own `skill_capability_tokens(...)`
     /// is not mistaken for the image probe, while `imagegen_probe::capability_tokens(`
@@ -10875,6 +10899,8 @@ Add-Content -LiteralPath $Out -Value $lines
             "heartbeat_capabilities",
             "host_capabilities",
             "capability_tokens",
+            "host_gpus_for_capabilities",
+            "host_gpus_cached",
             "slow_host_probes",
             "claude_code_probe",
         ] {
