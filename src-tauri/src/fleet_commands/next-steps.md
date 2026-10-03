@@ -103,8 +103,11 @@ gate; just list it.
   alert (`misconfigured` pages critical immediately; `failed` pages warning
   after a 15-min grace), and a gate rotting open past ~7 days surfaces via the
   gate doctor / info-level non-paging alerts. And if you DO
-  rely on a spawn, delivery is a live defect — continuations are being dispatched
-  but never consumed, and coord's 7-day pending window drops them permanently — so
+  rely on a spawn, delivery is best-effort. The 2026-07-23 defect (continuations
+  dispatched but never consumed) is no longer the standing state, but nothing
+  guarantees delivery (`_gate-registration` → "Continuation
+  policy" holds the dated measurement), and one never claimed inside coord's
+  7-day pending window is dropped permanently. So
   treat it as best-effort and read the gate's `continuation_consumed_outcome`
   (a **null** outcome means never claimed, which is worse than a recorded
   `spawn_failed`). (Canonical: `_gate-registration` → "Continuation policy".)

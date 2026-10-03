@@ -67,6 +67,13 @@ coord HTTP route is auth-gated.
    (`gh`, `curl`, `jq`, `aws`, `git`) / coord MCP / coord SQL. A `check` starting with
    `MANUAL:` is UNKNOWN by definition — never auto-act on it. **Be conservative:** if you
    cannot positively confirm OPEN, it is CLOSED/UNKNOWN. Run independent checks in parallel.
+   **These OPEN/CLOSED words are this sweep's plan-block states, and they run the
+   OPPOSITE way to a coord gate's verdicts:** a coord gate reads `open` while it is
+   still waiting and `cleared` once its condition is met. So a coord gate row whose
+   verdict is `open` is CLOSED here, and one whose verdict is `cleared` is OPEN here;
+   `failed` / `misconfigured` are neither — list them in the UNKNOWN/MANUAL table
+   with the verdict, and under "Needs your attention", as a blocker that will never
+   clear on its own. Never copy a coord verdict word across unmapped.
    When a check reads coord gate rows: verdict **`withdrawn`** (registrant cancelled its
    own gate — coord PR #1247, landed) is **terminal and non-blocking** — report
    it distinctly from `cleared` and never as awaiting operator action.
@@ -78,7 +85,8 @@ coord HTTP route is auth-gated.
    - **CLOSED** table: `plan · id · what it's still waiting on` (one line each).
    - **UNKNOWN/MANUAL** table: `plan · id · why unknown / what human action it needs`.
    - A short **"Needs your attention"** list: machine-confirmed OPEN gates + notify-class
-     gates awaiting the operator (credentials/billing/strategy/on-page verification).
+     gates awaiting the operator (credentials/billing/strategy/on-page verification)
+     + coord gates whose verdict is `failed`/`misconfigured`.
 
 4. **Act only if `auto`** (step covered by the Arguments section). In `report` mode, do
    **not** edit any plan file — the console report is the entire output.
