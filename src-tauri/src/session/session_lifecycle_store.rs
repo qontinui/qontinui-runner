@@ -3006,6 +3006,12 @@ impl SessionLifecycleStore {
         f(self.unsynced_finished_records())
     }
 
+    /// Test seam: whether `finish_forward` is held right now (by anyone).
+    #[cfg(test)]
+    pub(crate) fn finish_forward_held(&self) -> bool {
+        self.finish_forward.try_lock().is_err()
+    }
+
     /// Clone of every record carrying a finished marker coord has not ACKed
     /// (`finished_at` set, `finish_synced` false) — the marks whose coord
     /// write is still owed. Filtered under the lock so a late-delivery pass

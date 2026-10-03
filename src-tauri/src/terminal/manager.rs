@@ -212,6 +212,11 @@ impl TerminalManager {
     /// Wire `session` to its coord session row — the ONE door every create
     /// path uses instead of calling [`TerminalSession::set_coord_session_id`]
     /// directly, so the coord-bind observer sees every binding.
+    ///
+    /// The observer runs with no manager lock held: the production observer
+    /// resolves through [`Self::coord_session_id_for_pinned`] (the `sessions`
+    /// lock) and takes the lifecycle store's `finish_forward`, so this must
+    /// never be called while holding `sessions` or from a finish observer.
     pub fn bind_coord_session(&self, session: &TerminalSession, coord_id: uuid::Uuid) {
         session.set_coord_session_id(coord_id);
         if let Some(obs) = self.coord_bind_observer.get() {
@@ -974,18 +979,30 @@ mod tests {
     #[test]
     fn bind_coord_session_fires_the_observer_with_the_pinned_id() {
         use std::sync::{Arc, Mutex};
-        let tm = TerminalManager::new();
+        let tm = Arc::new(TerminalManager::new());
         let session = Arc::new(crate::terminal::session::tests::make_test_session(
             Arc::new(Mutex::new(Vec::new())),
         ));
         tm.insert_for_test("term-1", session.clone());
         let seen: Arc<Mutex<Vec<(String, String, uuid::Uuid)>>> = Default::default();
+        let resolved_in_observer: Arc<Mutex<Vec<Option<uuid::Uuid>>>> = Default::default();
         {
             let seen = seen.clone();
+            let resolved_in_observer = resolved_in_observer.clone();
+            let weak = Arc::downgrade(&tm);
             tm.attach_coord_bind_observer(move |pinned, terminal, coord| {
                 seen.lock()
                     .unwrap()
                     .push((pinned.to_string(), terminal.to_string(), coord));
+                // The production observer resolves through the manager's
+                // `sessions` lock: this would self-deadlock if the bind ran
+                // the observer under that lock, and it must already see the
+                // bind in flight.
+                let tm = weak.upgrade().expect("manager alive");
+                resolved_in_observer
+                    .lock()
+                    .unwrap()
+                    .push(tm.coord_session_id_for_pinned(pinned));
             });
         }
         assert_eq!(
@@ -1005,6 +1022,11 @@ mod tests {
                 coord
             )],
             "the observer sees every bind, keyed by the pinned harness id"
+        );
+        assert_eq!(
+            *resolved_in_observer.lock().unwrap(),
+            vec![Some(coord)],
+            "inside the observer the bind is already visible to the lookup"
         );
         assert_eq!(
             tm.coord_session_id_for_pinned("test-pinned-session"),

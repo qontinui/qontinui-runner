@@ -1200,6 +1200,11 @@ impl AiCoordRegistrar {
     /// store attached, no record, not finished, or already synced).
     /// Best-effort. Runs from the coord-bind observer, outside every store
     /// lock, so reading the store here cannot deadlock.
+    ///
+    /// Lock order: this takes the lifecycle store's `finish_forward`, so it
+    /// must never be called from the store's finish observer, nor while
+    /// holding the store map, a registrar map, the TerminalManager `sessions`
+    /// lock or the outbox.
     pub fn deliver_owed_finish(
         &self,
         pinned_session_id: &str,
@@ -2417,6 +2422,53 @@ mod tests {
         assert!(
             reg.deliver_owed_finish(csid, &term, coord_id).is_empty(),
             "an ACKed mark owes coord nothing"
+        );
+    }
+
+    /// Review (adoption) W1: late delivery resolves and enqueues with the
+    /// store's `finish_forward` held, so an unmark cannot interleave between
+    /// its read of an unsynced mark and its `Finished` enqueue. Pinned at the
+    /// registrar, not only at the store helper: reverting `deliver_owed_to` to
+    /// a bare `unsynced_finished_records()` read fails this.
+    #[test]
+    fn late_delivery_resolves_with_the_forward_serializer_held() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _store_dir) = attach_store(&reg);
+        let held: Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        {
+            let weak = Arc::downgrade(&store);
+            let held = held.clone();
+            reg.attach_terminal_coord_lookup(move |_csid| {
+                let store = weak.upgrade().expect("store alive");
+                held.lock().unwrap().push(store.finish_forward_held());
+                None
+            });
+        }
+        for id in ["bound-pinned", "other-session"] {
+            store.record_open(crate::session::session_lifecycle_store::test_open_record(
+                id,
+            ));
+            store.set_finished(id, true, None).unwrap();
+        }
+        held.lock().unwrap().clear();
+
+        let coord_id = Uuid::new_v4();
+        assert_eq!(
+            reg.deliver_owed_finish("bound-pinned", "term-x", coord_id),
+            vec![FinishSync::Queued {
+                coord_session_id: coord_id
+            }]
+        );
+        let held = held.lock().unwrap();
+        assert!(
+            !held.is_empty(),
+            "the other session's mark was resolved through the terminal lookup"
+        );
+        assert!(
+            held.iter().all(|h| *h),
+            "every late-delivery resolution ran under finish_forward: {held:?}"
         );
     }
 
