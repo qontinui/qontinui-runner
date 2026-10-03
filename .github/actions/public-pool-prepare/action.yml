@@ -143,19 +143,25 @@ runs:
         #    default install puts in the job account's own ~/.cargo/bin).
         if [ "${CHECK_RUST}" = "true" ]; then
           me_u="$(id -u)"; me_n="$(id -un)"
-          if [ ! -d "${rustup_home}" ] || [ "$(stat -c %u "${rustup_home}")" = "${me_u}" ] \
-             || [ -n "$(find "${rustup_home}" \( -user "${me_n}" -o -writable \) -print -quit 2>/dev/null)" ]; then
+          if [ ! -d "${rustup_home}" ] || [ "$(stat -L -c %u "${rustup_home}")" = "${me_u}" ] \
+             || [ -n "$(find -H "${rustup_home}" \( -user "${me_n}" -o -writable \) -print -quit 2>/dev/null)" ]; then
             echo "::error title=public-pool RUSTUP_HOME is not operator-owned read-only::${rustup_home} is missing, owned by ${me_n}, or writable by it somewhere; a routed job could change the toolchain every later job runs. Host prerequisite: operator-owned, read-only RUSTUP_HOME with 1.95.0 (+clippy, rustfmt) preinstalled"
             exit 1
           fi
           command -v rustup >/dev/null || { echo "::error::rustup not on PATH for ${me_n} -- host prerequisite"; exit 1; }
-          cargo_bin="$(RUSTUP_HOME="${rustup_home}" rustup which --toolchain 1.95.0 cargo)"
+          cargo_bin="$(RUSTUP_HOME="${rustup_home}" rustup which --toolchain 1.95.0 cargo)" \
+            || { echo "::error::rustup which --toolchain 1.95.0 cargo failed -- host prerequisite"; exit 1; }
           tc_bin="$(dirname "${cargo_bin}")"
-          if [ "$(stat -c %u "${tc_bin}")" = "${me_u}" ] || [ -w "${tc_bin}" ]; then
+          case "$(readlink -f -- "${tc_bin}")" in
+            "$(readlink -f -- "${rustup_home}")"/toolchains/*) ;;
+            *) echo "::error::toolchain bin ${tc_bin} is not under ${rustup_home}/toolchains"; exit 1 ;;
+          esac
+          if [ "$(stat -L -c %u "${tc_bin}")" = "${me_u}" ] || [ -w "${tc_bin}" ]; then
             echo "::error::toolchain bin ${tc_bin} is owned or writable by ${me_n} -- host prerequisite"; exit 1
           fi
           "${tc_bin}/rustc" --version
-          comps="$(RUSTUP_HOME="${rustup_home}" rustup component list --toolchain 1.95.0 --installed)"
+          comps="$(RUSTUP_HOME="${rustup_home}" rustup component list --toolchain 1.95.0 --installed)" \
+            || { echo "::error::rustup component list failed -- host prerequisite"; exit 1; }
           for c in clippy rustfmt; do
             grep -q "^${c}" <<<"${comps}" || { echo "::error::toolchain 1.95.0 lacks ${c} -- host prerequisite"; exit 1; }
           done
@@ -185,9 +191,15 @@ runs:
             entries+=("${gb:-0} ${path}")
             total=$(( total + ${gb:-0} ))
           done < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\0' 2>/dev/null | sort -zn)
+          now="$(date +%s)"
           for e in "${entries[@]}"; do
             [ "${total}" -gt "${MAX_TARGET_GB}" ] || break
             gb="${e%% *}"; path="${e#* }"
+            # A key prepared within the last 3 h may belong to a job still building
+            # (job timeout 150 min); never prune it under that job.
+            if [ $(( now - $(stat -c %Y -- "${path}" 2>/dev/null || echo 0) )) -lt 10800 ]; then
+              continue
+            fi
             echo "target cache ${total} GiB > ${MAX_TARGET_GB}; removing ${path}"
             zap "${path}" || break
             total=$(( total - gb ))

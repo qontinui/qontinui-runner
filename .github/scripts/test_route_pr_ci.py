@@ -453,7 +453,9 @@ class PrepareActionShell(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "home/.cache/qontinui-runner-ci/targets"
-            for name, age_days in (("pr-old", 1), ("pr-new", 0), ("pr-stale", 5)):
+            # Created newest-first so creation order and age order disagree; ages
+            # are past the 3 h in-use window.
+            for name, age_days in (("pr-new", 0.5), ("pr-old", 1), ("pr-stale", 5)):
                 d = root / name
                 d.mkdir(parents=True)
                 (d / "blob").write_bytes(b"x" * 1024)
@@ -470,6 +472,52 @@ class PrepareActionShell(unittest.TestCase):
             self.assertIn("pr-9-test", left)
             env = (Path(tmp) / "env").read_text()
             self.assertIn(f"CARGO_TARGET_DIR={root}/pr-9-test", env)
+
+    def test_key_in_use_is_not_capped(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "home/.cache/qontinui-runner-ci/targets"
+            d = root / "pr-busy-test"
+            d.mkdir(parents=True)
+            (d / "blob").write_bytes(b"x")
+            t = time.time() - 3600  # prepared 1 h ago: still possibly building
+            os.utime(d, (t, t))
+            r = self.run_prepare(tmp, TARGET_KEY="pr-9-test", MAX_TARGET_GB="0")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertTrue(d.exists())
+
+    def test_failing_du_does_not_fail_the_job(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "dushim"
+            shim.mkdir()
+            (shim / "du").write_text("#!/bin/sh\necho '5\tx'\nexit 1\n")
+            (shim / "du").chmod(0o755)
+            (Path(tmp) / "home/.cache/qontinui-runner-ci/targets/pr-1-test").mkdir(parents=True)
+            r = self.run_prepare(tmp, TARGET_KEY="pr-9-test",
+                                 PATH=f"{shim}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+
+    def test_toolchain_bin_outside_rustup_home_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "home/.rustup").mkdir(parents=True)
+            (Path(tmp) / "home/.rustup").chmod(0o555)
+            shim, _ = self.shim_dir(tmp, os.getuid() + 1)
+            # stat shim reports foreign owner; find sees a 0555 dir owned by us ->
+            # the find arm refuses first, so make find report nothing via a shim.
+            (shim / "find").write_text("#!/bin/sh\nexit 0\n")
+            (shim / "find").chmod(0o755)
+            try:
+                r = self.run_prepare(tmp, CHECK_RUST="true", PATH=f"{shim}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+            finally:
+                (Path(tmp) / "home/.rustup").chmod(0o755)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("is not under", r.stdout)
 
     def test_bad_target_key_refused(self):
         import tempfile
