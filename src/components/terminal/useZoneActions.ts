@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { useDisplayTitleResolver } from "./displayTitle";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { computeQuickLaunchLayoutId, type SessionState } from "./useZoneLayout";
@@ -57,6 +58,7 @@ export function useZoneActions({
   incrementMetric,
   setNotification,
 }: UseZoneActionsParams) {
+  const resolveTitle = useDisplayTitleResolver();
   // Exports read the last rendered lines lazily at click time, straight out of
   // the page hot store — taking the whole map as a dependency re-created these
   // callbacks (and everything downstream of them) on every output frame.
@@ -216,7 +218,7 @@ export function useZoneActions({
       const state = stateTracking.sessionStates[tabId] ?? "idle";
       const output = hotStore.getLastOutputLines(tabId);
       lines.push("");
-      lines.push(`--- Zone ${Number(zoneStr) + 1}: ${tab.title} [${state}] ---`);
+      lines.push(`--- Zone ${Number(zoneStr) + 1}: ${resolveTitle(tab)} [${state}] ---`);
       if (tab.workingDir) lines.push(`    Dir: ${tab.workingDir}`);
       if (output.length > 0) {
         lines.push(...output);
@@ -233,7 +235,7 @@ export function useZoneActions({
       for (const tab of unassigned) {
         const state = stateTracking.sessionStates[tab.id] ?? "idle";
         const output = hotStore.getLastOutputLines(tab.id);
-        lines.push(`  ${tab.title} [${state}]`);
+        lines.push(`  ${resolveTitle(tab)} [${state}]`);
         if (output.length > 0) lines.push(...output.map((l) => `    ${l}`));
       }
     }
@@ -254,6 +256,7 @@ export function useZoneActions({
       return { exported: 0, cancelled: false, error: message };
     }
   }, [
+    resolveTitle,
     tabs,
     zoneLayout.layoutId,
     zoneLayout.assignments,
@@ -268,7 +271,7 @@ export function useZoneActions({
       if (!tabId) return;
       const tab = tabs.find((t) => t.id === tabId);
       const lines = hotStore.getLastOutputLines(tabId);
-      const title = tab?.title ?? `Zone ${zoneIndex + 1}`;
+      const title = tab ? resolveTitle(tab) : `Zone ${zoneIndex + 1}`;
       const state = stateTracking.sessionStates[tabId] ?? "idle";
       const label = labelsAndTags.zoneLabels[zoneIndex] ?? "";
 
@@ -320,7 +323,14 @@ export function useZoneActions({
         console.error("Export failed:", err);
       }
     },
-    [tabs, hotStore, stateTracking.sessionStates, labelsAndTags.zoneLabels, zoneLayout.assignments],
+    [
+      resolveTitle,
+      tabs,
+      hotStore,
+      stateTracking.sessionStates,
+      labelsAndTags.zoneLabels,
+      zoneLayout.assignments,
+    ],
   );
 
   return {

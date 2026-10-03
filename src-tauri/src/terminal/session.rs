@@ -1392,6 +1392,11 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// The `claude --name` this session was spawned with (runner-spawned
+    /// continuations only). Immutable once set; surfaced to the webview as the
+    /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
+    /// such field, so it travels beside it like `sessionIdsByTerminal`).
+    spawn_name: std::sync::OnceLock<String>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
     /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
@@ -2293,6 +2298,7 @@ impl TerminalSession {
             output_tx,
             grid,
             coord_session_id,
+            spawn_name: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
@@ -4039,6 +4045,16 @@ impl TerminalSession {
         }
     }
 
+    /// Record the spawn name (first write wins; it is immutable by design).
+    pub fn set_spawn_name(&self, name: String) {
+        let _ = self.spawn_name.set(name);
+    }
+
+    /// The `claude --name` this session was spawned with, if any.
+    pub fn spawn_name(&self) -> Option<String> {
+        self.spawn_name.get().cloned()
+    }
+
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
@@ -5199,6 +5215,7 @@ pub(crate) mod tests {
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            spawn_name: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),

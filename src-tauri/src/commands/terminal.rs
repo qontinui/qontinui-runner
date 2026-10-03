@@ -573,6 +573,11 @@ pub async fn terminal_close(
     })
 }
 
+/// Event announcing a runner-spawned session's `claude --name`:
+/// `{ terminalId, spawnName }`, emitted right after `terminal-created`. The
+/// frontend stores it as the immutable `TerminalTab.spawnName`.
+pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
+
 /// List all terminal sessions.
 ///
 /// Alongside the `terminals` array (`TerminalInfo`, which structurally does
@@ -605,6 +610,18 @@ pub fn terminal_list(
 ) -> Result<CommandResponse, String> {
     let terminals = terminal_manager.list();
 
+    // `{ terminal_id -> spawnName }` for runner-spawned sessions, so a
+    // reconnecting webview that missed `terminal-spawn-name` still gets it.
+    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = terminals
+        .iter()
+        .filter_map(|info| {
+            terminal_manager
+                .get(&info.id)
+                .and_then(|s| s.spawn_name())
+                .map(|n| (info.id.clone(), serde_json::Value::String(n)))
+        })
+        .collect();
+
     let mut session_ids_by_terminal = serde_json::Map::new();
     if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
         for info in &terminals {
@@ -626,6 +643,7 @@ pub fn terminal_list(
         data: Some(serde_json::json!({
             "terminals": terminals,
             "sessionIdsByTerminal": serde_json::Value::Object(session_ids_by_terminal),
+            "spawnNamesByTerminal": serde_json::Value::Object(spawn_names_by_terminal),
         })),
     })
 }
@@ -1876,6 +1894,13 @@ pub(crate) struct SessionCaptureHint {
     pub working_dir: String,
     /// Human-readable title for the restored grid tile.
     pub title: String,
+    /// The `claude --name` this spawn was launched with (already sanitised), or
+    /// `None` when it carries no name. At spawn it is (a) recorded as the commit
+    /// `Session-Name` trailer file for `claude_session_id`, (b) parked on the
+    /// terminal session, and (c) announced to the webview as
+    /// [`SPAWN_NAME_EVENT`] / `terminal_list`'s `spawnNamesByTerminal`, which the
+    /// frontend folds into the immutable `TerminalTab.spawnName`.
+    pub spawn_name: Option<String>,
     /// Page the session should land on (and be durably recorded against) so a
     /// restart re-lands the continuation on its page. `None` → `"default"`.
     pub page_id: Option<String>,
@@ -2193,6 +2218,7 @@ pub(crate) fn create_terminal_session_backend(
     // Keep a handle for the (optional) durable-record poller below, since the
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
+    let app_handle_for_spawn_name = app_handle.clone();
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -2212,6 +2238,30 @@ pub(crate) fn create_terminal_session_backend(
         // A gate continuation is coord-spawned: no picker chose a tenant.
         None,
     )?;
+
+    // Spawn name: park it on the session (so `terminal_list` and a reconnecting
+    // webview can read it), record the commit `Session-Name` trailer file for the
+    // pinned id, and announce it to the webview beside `terminal-created`.
+    if let Some(name) = capture_hint.as_ref().and_then(|h| h.spawn_name.clone()) {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_spawn_name(name.clone());
+        }
+        if let Some(sid) = capture_hint
+            .as_ref()
+            .and_then(|h| h.claude_session_id.as_deref())
+        {
+            if let Err(e) = crate::agent_worktree::custody::write_session_name(sid, &name) {
+                warn!(session_id = %sid, error = %e, "spawn name: trailer file write failed");
+            }
+        }
+        if let Err(e) = tauri::Emitter::emit(
+            &app_handle_for_spawn_name,
+            SPAWN_NAME_EVENT,
+            serde_json::json!({ "terminalId": info.id, "spawnName": name }),
+        ) {
+            warn!(error = %e, "spawn name: terminal-spawn-name emit failed");
+        }
+    }
 
     // Park the pre-acquired isolated edit context on the session so its
     // heartbeat + claim live as long as the PTY and release on close — the
@@ -2333,6 +2383,8 @@ pub(crate) fn create_terminal_session_backend(
                 config_dir,
                 working_dir,
                 title,
+                // Consumed earlier (session park + trailer file + event).
+                spawn_name: _,
                 page_id: hint_page_id,
                 claude_session_id: pinned_session_id,
                 zone_index: hint_zone_index,
@@ -3003,6 +3055,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "t".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,
@@ -3049,6 +3102,7 @@ mod tests {
             config_dir: None,
             working_dir: "/work/dir".to_string(),
             title: "Hinted".to_string(),
+            spawn_name: None,
             page_id: None,
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,

@@ -20,6 +20,7 @@ import {
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
+import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
 import { WorkerSessionCell } from "./WorkerSessionCell";
 import { SuggestionChip } from "./suggestions";
 import { ZoneHoverActions } from "./ZoneHoverActions";
@@ -180,6 +181,7 @@ function ZoneGridInner({
   onExportZone,
   onUserInputLine,
 }: ZoneGridProps) {
+  const resolveTitle = useDisplayTitleResolver();
   // Read all data from contexts
   const session = useTerminalSession();
   const {
@@ -627,7 +629,9 @@ function ZoneGridInner({
             style={{ height: `${MAXIMIZED_HEADER_HEIGHT_PX}px` }}
           >
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
-            <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
+            <span className="text-[10px] text-[#a9b1d6]">
+              <TabTitle tab={tab} />
+            </span>
             <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={singleViewZone} />
             {tab.claudeSessionId && (
               <button
@@ -936,7 +940,7 @@ function ZoneGridInner({
               const otherTab = tabs.find((t) => t.id === otherTabId);
               return {
                 index: idx,
-                title: otherTab?.title ?? `Zone ${idx + 1}`,
+                title: otherTab ? resolveTitle(otherTab) : `Zone ${idx + 1}`,
               };
             })
             .filter((z): z is { index: number; title: string } => z !== null);

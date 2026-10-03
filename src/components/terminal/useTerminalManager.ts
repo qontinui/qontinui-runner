@@ -22,9 +22,62 @@ import {
 
 const logger = createLogger("TerminalManager");
 
+/**
+ * The name the runner launched this terminal's session with (`--name`), if the
+ * given terminal info happens to carry one. The shared `TerminalInfo` schema has
+ * no such field, so the real channels are the `terminal-spawn-name` event and
+ * `terminal_list`'s `spawnNamesByTerminal` (see `applySpawnNames`); this stays
+ * as a defensive read for a backend that ever serialises it on the info itself.
+ */
+export function spawnNameOf(info: unknown): string | undefined {
+  const v = (info as { spawnName?: unknown } | null | undefined)?.spawnName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+}
+
+/** Pure `renameTab` reducer. Changes `title` ONLY — `spawnName` is immutable. */
+export function renameTabIn(tabs: TerminalTab[], id: string, title: string): TerminalTab[] {
+  return tabs.map((t) => (t.id === id ? { ...t, title } : t));
+}
+
+/**
+ * Fill `spawnName` on tabs that lack one, from a `terminalId -> name` map
+ * (the Rust `terminal-spawn-name` event / `terminal_list`'s
+ * `spawnNamesByTerminal`). It NEVER overwrites a name already held — the spawn
+ * name is immutable — and returns the SAME array when nothing changed so
+ * callers do not churn renders.
+ */
+export function applySpawnNames(
+  tabs: TerminalTab[],
+  names: Record<string, string>,
+): TerminalTab[] {
+  let changed = false;
+  const next = tabs.map((t) => {
+    if (t.spawnName) return t;
+    const n = names[t.id];
+    if (typeof n !== "string" || n.trim().length === 0) return t;
+    changed = true;
+    return { ...t, spawnName: n.trim() };
+  });
+  return changed ? next : tabs;
+}
+
+type SpawnNamesByTerminal = Record<string, string>;
+
+function spawnNamesFrom(data: unknown): SpawnNamesByTerminal {
+  const m = (data as { spawnNamesByTerminal?: unknown } | null | undefined)?.spawnNamesByTerminal;
+  return m && typeof m === "object" ? (m as SpawnNamesByTerminal) : {};
+}
+
 export interface TerminalTab {
   id: string;
   title: string;
+  /**
+   * Immutable spawn-time session name (D3). Unlike `title` — which OSC 0/2
+   * rewrites to the shell cwd via `renameTab` — this is set once from the
+   * backend terminal info and never touched by rename/title changes. Display
+   * goes through `resolveDisplayTitle` (`displayTitle.tsx`).
+   */
+  spawnName?: string;
   pid: number | null;
   isAlive: boolean;
   exitCode: number | null;
@@ -233,6 +286,7 @@ export function reduceCreatedTerminal(
     {
       id: info.id,
       title: info.title,
+      spawnName: spawnNameOf(info),
       pid: info.pid ?? null,
       isAlive: info.isAlive,
       exitCode: info.exitCode ?? null,
@@ -494,6 +548,7 @@ export function reconcileTabsWithBackend(
     .map<TerminalTab>((info) => ({
       id: info.id,
       title: info.title,
+      spawnName: spawnNameOf(info),
       pid: info.pid ?? null,
       isAlive: info.isAlive,
       exitCode: info.exitCode ?? null,
@@ -681,8 +736,7 @@ export function useTerminalManager(
    * terminal. One slot, not a queue: the operator closes remote tabs one at a
    * time, and the newest answer is the one that matters.
    */
-  const [remoteCloseNotice, setRemoteCloseNotice] =
-    useState<RemoteCloseNoticeState | null>(null);
+  const [remoteCloseNotice, setRemoteCloseNotice] = useState<RemoteCloseNoticeState | null>(null);
   const nextTitleNum = useRef(1);
   const [initialized, setInitialized] = useState(false);
   /**
@@ -790,7 +844,8 @@ export function useTerminalManager(
   const maybeAdoptWorker = useCallback(
     async (taskRunId: string): Promise<boolean> => {
       if (hiddenWorkerStateRef.current.dismissed.has(taskRunId)) return false;
-      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return false;
+      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId))
+        return false;
       const now = Date.now();
       // Bound the probe ledger: this manager hears EVERY AI session's events,
       // not just its own workers', and an entry is otherwise only removed on
@@ -820,9 +875,7 @@ export function useTerminalManager(
         logger.info(`Adopted Conductor worker ${taskRunId} onto page ${pageId}`);
         // The worker is on screen again, so it is no longer hidden — drop any
         // "could not be re-opened" entry left over from a failed restore.
-        applyHiddenWorkerState(
-          forgetAdoptedWorker(hiddenWorkerStateRef.current, tabId, taskRunId),
-        );
+        applyHiddenWorkerState(forgetAdoptedWorker(hiddenWorkerStateRef.current, tabId, taskRunId));
       }
       return tabId !== null;
     },
@@ -856,9 +909,7 @@ export function useTerminalManager(
       // transient (a failed `terminal_session_list_open`, or a record not yet
       // written), the live adoption probe brings the worker in on its next
       // event and `forgetAdoptedWorker` clears the entry re-listed here.
-      applyHiddenWorkerState(
-        recordRestoreMisses(hiddenWorkerStateRef.current, missed, Date.now()),
-      );
+      applyHiddenWorkerState(recordRestoreMisses(hiddenWorkerStateRef.current, missed, Date.now()));
     },
     [maybeAdoptWorker, applyHiddenWorkerState],
   );
@@ -902,6 +953,26 @@ export function useTerminalManager(
       }
       return result.tabs;
     });
+  }, []);
+
+  // Spawn name (`--name`) for a terminal the runner launched. Fired by Rust
+  // right after `terminal-created`; the tab may not exist yet, in which case
+  // the periodic `terminal_list` sweep (`reconcileClaudeSessionIds`) fills it.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    listen<{ terminalId: string; spawnName: string }>("terminal-spawn-name", (event) => {
+      const { terminalId, spawnName } = event.payload ?? {};
+      if (!terminalId || !spawnName) return;
+      setTabs((prev) => applySpawnNames(prev, { [terminalId]: spawnName }));
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   // Remote identity for a tab `terminal_attach_remote` opened (Phase 4). Fired
@@ -960,9 +1031,7 @@ export function useTerminalManager(
       // synthetic prev/next pair reflecting whether this id is new.
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
-      setTabs((prev) =>
-        reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
-      );
+      setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
       if (selectId !== null) {
         ingestedIds.current.add(info.id);
         logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
@@ -1038,9 +1107,7 @@ export function useTerminalManager(
             if (pendingBypass) pendingBypassMarks.current.delete(id);
             const pendingRemote = pendingRemoteMarks.current.get(id);
             if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
-            setTabs((prev) =>
-              reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
-            );
+            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
             ingestedIds.current.add(id);
             setActiveId(id);
             logger.info(`Terminal ${id} moved onto page ${pageId}`);
@@ -1108,6 +1175,9 @@ export function useTerminalManager(
       // spawns).
       const sessionIdsByTerminal =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
+      // The spawn name has no `TerminalInfo` field either (that type is the
+      // shared schema's); it rides beside the session ids.
+      const spawnNamesByTerminal = spawnNamesFrom(result.data);
 
       // Filter to terminals belonging to this page
       const pageTerminals = terminals.filter((t) => (t.pageId || "default") === pageId);
@@ -1146,6 +1216,7 @@ export function useTerminalManager(
         return {
           id: info.id,
           title: info.title,
+          spawnName: spawnNameOf(info) ?? spawnNamesByTerminal[info.id],
           pid: info.pid ?? null,
           isAlive: info.isAlive,
           exitCode: info.exitCode ?? null,
@@ -1201,8 +1272,14 @@ export function useTerminalManager(
       if (!result.success || !result.data) return;
       const map =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
-      if (Object.keys(map).length === 0) return;
-      setTabs((prev) => backfillClaudeSessionIds(prev, map));
+      const spawnNames = spawnNamesFrom(result.data);
+      if (Object.keys(map).length === 0 && Object.keys(spawnNames).length === 0) return;
+      setTabs((prev) =>
+        applySpawnNames(
+          Object.keys(map).length === 0 ? prev : backfillClaudeSessionIds(prev, map),
+          spawnNames,
+        ),
+      );
     } catch {
       // Best-effort backfill; the reconnect + transcript-poll writers still
       // cover the common cases if this sweep transiently fails.
@@ -1250,7 +1327,13 @@ export function useTerminalManager(
     const settled = settledIdsRef.current;
     for (const info of mine) settled.delete(info.id);
     setTabs((prev) => {
-      const next = reconcileTabsWithBackend(prev, mine, Date.now(), RESYNC_CREATE_GRACE_MS, settled);
+      const next = reconcileTabsWithBackend(
+        prev,
+        mine,
+        Date.now(),
+        RESYNC_CREATE_GRACE_MS,
+        settled,
+      );
       if (next === prev) return prev;
       const dropped = new Set(next.map((t) => t.id));
       for (const tab of prev) if (!dropped.has(tab.id)) settled.delete(tab.id);
@@ -1347,6 +1430,7 @@ export function useTerminalManager(
         const tab: TerminalTab = {
           id: info.id,
           title: info.title,
+          spawnName: spawnNameOf(info),
           pid: info.pid ?? null,
           isAlive: info.isAlive,
           exitCode: info.exitCode ?? null,
@@ -1394,109 +1478,112 @@ export function useTerminalManager(
     return id;
   }, []);
 
-  const closeTerminal = useCallback((id: string) => {
-    // Capture the closing tab's Claude session id (read-only) so we can record
-    // an EXPLICIT durable close after the state update. We read it out of the
-    // updater's `prev` without mutating inside the updater (StrictMode double-
-    // invokes updaters in dev).
-    let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
-    // A Conductor worker's tab is a VIEW: closing it hides the cell and
-    // nothing more. The Conductor owns the worker's lifetime, and its durable
-    // record must stay open so the next restore brings the cell back while
-    // the worker is still live. No close record, no `terminal_close` (there
-    // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
-    // inside the updater, which React may run later than this handler.
-    const closingTab = tabsRef.current.find((t) => t.id === id);
-    const sessionBacked = closingTab?.sessionBacked === true;
-    if (sessionBacked) {
-      // Record the dismissal AND the chip row together, so the close is
-      // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
-      // keeps running either way.
-      applyHiddenWorkerState(
-        hideWorker(hiddenWorkerStateRef.current, {
-          tabId: id,
-          taskRunId: closingTab?.taskRunId ?? null,
-          title: closingTab?.title ?? id,
-          hiddenAtMs: Date.now(),
-        }),
-      );
-    }
-    // Update React state immediately so the UI is responsive.
-    // The Rust-side close (process kill + thread join) runs in the background.
-    setTabs((prev) => {
-      closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
-      const next = prev.filter((t) => t.id !== id);
-      setActiveId((currentActive) => {
-        if (currentActive !== id) return currentActive;
-        const closedIndex = prev.findIndex((t) => t.id === id);
-        return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
-      });
-      return next;
-    });
-
-    // Record the durable session CLOSE for an explicit user close (only when
-    // the tab was running a Claude session). Fire-and-forget.
-    if (closeRecord) {
-      invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
-        // Best-effort — the live close still proceeds below.
-      });
-    }
-
-    // Only invoke Rust close for terminal tabs (plan tabs and worker views
-    // have no PTY)
-    if (!id.startsWith("plan-") && !sessionBacked) {
-      // Whatever the last close left on screen, it does not describe THIS
-      // one. Clearing first means a stale warning can never be read as the
-      // outcome of the close the operator just performed — and a close that
-      // never answers (the `.catch` below) leaves no notice at all rather
-      // than the previous one.
-      setRemoteCloseNotice(null);
-      invoke<CommandResponse>("terminal_close", { terminalId: id })
-        .then((res) => {
-          // A REMOTE tab's close reports what it did about the relay binding
-          // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
-          // terminal-stays-claimed, Phase 1). Discarding it — which this
-          // handler did until now — made a failed detach look exactly like a
-          // clean one, since the tab vanishes either way.
-          //
-          // `success === false` is guarded even though today's Tauri command
-          // rejects instead: a door that ever answers a failed close WITH a
-          // report must not raise a notice about a close that did not happen.
-          if (res?.success === false) return;
-          const report = parseRemoteDetach(res?.data);
-          if (!report) return; // local tab: nothing extra happened
-          const message = res.message ?? `Remote close outcome: ${report.outcome}`;
-          if (isCleanRemoteClose(report)) {
-            // Logged, not shown: see `isCleanRemoteClose` on what this arm
-            // does and does not prove. The runner's hedge is kept verbatim.
-            logger.info(`Remote tab ${id} closed: ${message}`);
-            return;
-          }
-          logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
-          setRemoteCloseNotice({ tabId: id, message, report });
-        })
-        .catch(() => {
-          // Terminal may already be gone (e.g. removed out-of-band by
-          // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
-          // list either way. No notice: we have no answer to report, and an
-          // UNKNOWN must not render as a claim about the binding.
-        })
-        .finally(() => {
-          // Re-read the authoritative list AFTER the close settles. The
-          // optimistic local removal above is a UI-responsiveness shortcut, not
-          // a source of truth: without this, a close that raced an out-of-band
-          // delete (or that closed the last tab the frontend knew about) left
-          // the tab list permanently diverged from the backend and the grid
-          // rendered zero zones forever.
-          void resyncTabs();
+  const closeTerminal = useCallback(
+    (id: string) => {
+      // Capture the closing tab's Claude session id (read-only) so we can record
+      // an EXPLICIT durable close after the state update. We read it out of the
+      // updater's `prev` without mutating inside the updater (StrictMode double-
+      // invokes updaters in dev).
+      let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
+      // A Conductor worker's tab is a VIEW: closing it hides the cell and
+      // nothing more. The Conductor owns the worker's lifetime, and its durable
+      // record must stay open so the next restore brings the cell back while
+      // the worker is still live. No close record, no `terminal_close` (there
+      // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
+      // inside the updater, which React may run later than this handler.
+      const closingTab = tabsRef.current.find((t) => t.id === id);
+      const sessionBacked = closingTab?.sessionBacked === true;
+      if (sessionBacked) {
+        // Record the dismissal AND the chip row together, so the close is
+        // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
+        // keeps running either way.
+        applyHiddenWorkerState(
+          hideWorker(hiddenWorkerStateRef.current, {
+            tabId: id,
+            taskRunId: closingTab?.taskRunId ?? null,
+            title: closingTab?.title ?? id,
+            hiddenAtMs: Date.now(),
+          }),
+        );
+      }
+      // Update React state immediately so the UI is responsive.
+      // The Rust-side close (process kill + thread join) runs in the background.
+      setTabs((prev) => {
+        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
+        const next = prev.filter((t) => t.id !== id);
+        setActiveId((currentActive) => {
+          if (currentActive !== id) return currentActive;
+          const closedIndex = prev.findIndex((t) => t.id === id);
+          return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
         });
-    }
-  }, [resyncTabs, applyHiddenWorkerState]);
+        return next;
+      });
+
+      // Record the durable session CLOSE for an explicit user close (only when
+      // the tab was running a Claude session). Fire-and-forget.
+      if (closeRecord) {
+        invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
+          // Best-effort — the live close still proceeds below.
+        });
+      }
+
+      // Only invoke Rust close for terminal tabs (plan tabs and worker views
+      // have no PTY)
+      if (!id.startsWith("plan-") && !sessionBacked) {
+        // Whatever the last close left on screen, it does not describe THIS
+        // one. Clearing first means a stale warning can never be read as the
+        // outcome of the close the operator just performed — and a close that
+        // never answers (the `.catch` below) leaves no notice at all rather
+        // than the previous one.
+        setRemoteCloseNotice(null);
+        invoke<CommandResponse>("terminal_close", { terminalId: id })
+          .then((res) => {
+            // A REMOTE tab's close reports what it did about the relay binding
+            // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
+            // terminal-stays-claimed, Phase 1). Discarding it — which this
+            // handler did until now — made a failed detach look exactly like a
+            // clean one, since the tab vanishes either way.
+            //
+            // `success === false` is guarded even though today's Tauri command
+            // rejects instead: a door that ever answers a failed close WITH a
+            // report must not raise a notice about a close that did not happen.
+            if (res?.success === false) return;
+            const report = parseRemoteDetach(res?.data);
+            if (!report) return; // local tab: nothing extra happened
+            const message = res.message ?? `Remote close outcome: ${report.outcome}`;
+            if (isCleanRemoteClose(report)) {
+              // Logged, not shown: see `isCleanRemoteClose` on what this arm
+              // does and does not prove. The runner's hedge is kept verbatim.
+              logger.info(`Remote tab ${id} closed: ${message}`);
+              return;
+            }
+            logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
+            setRemoteCloseNotice({ tabId: id, message, report });
+          })
+          .catch(() => {
+            // Terminal may already be gone (e.g. removed out-of-band by
+            // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
+            // list either way. No notice: we have no answer to report, and an
+            // UNKNOWN must not render as a claim about the binding.
+          })
+          .finally(() => {
+            // Re-read the authoritative list AFTER the close settles. The
+            // optimistic local removal above is a UI-responsiveness shortcut, not
+            // a source of truth: without this, a close that raced an out-of-band
+            // delete (or that closed the last tab the frontend knew about) left
+            // the tab list permanently diverged from the backend and the grid
+            // rendered zero zones forever.
+            void resyncTabs();
+          });
+      }
+    },
+    [resyncTabs, applyHiddenWorkerState],
+  );
 
   const dismissRemoteCloseNotice = useCallback(() => setRemoteCloseNotice(null), []);
 
   const renameTab = useCallback((id: string, title: string) => {
-    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)));
+    setTabs((prev) => renameTabIn(prev, id, title));
   }, []);
 
   const updateTab = useCallback(

@@ -547,6 +547,26 @@ impl SessionDirectory {
     }
 }
 
+/// Record `name` as the commit `Session-Name` for `session_id` by writing
+/// `<session-names dir>/<session_id>` (what `prepare-commit-msg` and
+/// [`SessionDirectory::discover`] read). `claude --name` writes neither, and the
+/// runner was a reader only until now. Refuses an id that is not a plain
+/// filename component. Returns the path written.
+pub(crate) fn write_session_name(session_id: &str, name: &str) -> std::io::Result<PathBuf> {
+    let id = session_id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session id is not a plain filename component",
+        ));
+    }
+    let dir = session_names_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(id.to_ascii_lowercase());
+    std::fs::write(&path, format!("{}\n", name.trim()))?;
+    Ok(path)
+}
+
 fn session_names_dir() -> PathBuf {
     if let Ok(over) = std::env::var("QONTINUI_SESSION_NAMES_DIR") {
         if !over.trim().is_empty() {
@@ -2120,5 +2140,33 @@ mod tests {
         assert!(got
             .iter()
             .all(|r| r.session_id.as_deref() != Some("noepoch")));
+    }
+
+    /// The spawn-time trailer file: `<QONTINUI_SESSION_NAMES_DIR>/<id>` holds the
+    /// name, is readable back through `SessionDirectory`, and an id that is not
+    /// a plain filename is refused.
+    #[test]
+    fn write_session_name_records_trailer_file_in_override_dir() {
+        // The ONE shared env lock (a module-local mutex excludes nothing that
+        // holds it), declared BEFORE the restore so the restore runs under it.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_NAMES_DIR"]);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("QONTINUI_SESSION_NAMES_DIR", tmp.path());
+        let id = "AAAA1111-2222-3333-4444-555555555555";
+        let path = write_session_name(id, "post-merge-runner#1863").unwrap();
+        assert_eq!(path, tmp.path().join(id.to_ascii_lowercase()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "post-merge-runner#1863\n"
+        );
+        let mut d = SessionDirectory::default();
+        d.load_names(tmp.path());
+        assert_eq!(
+            d.names.get(&id.to_ascii_lowercase()).map(String::as_str),
+            Some("post-merge-runner#1863")
+        );
+        assert!(write_session_name("../evil", "x").is_err());
+        assert!(write_session_name("", "x").is_err());
     }
 }
