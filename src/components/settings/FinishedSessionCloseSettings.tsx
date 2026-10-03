@@ -9,7 +9,9 @@ import type { LogFunction } from "./types";
  * `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
  * D3). The wind-down executor's `finished_close` arm graceful-`/exit`s a
  * session that was marked finished, has sat idle past the grace period, and
- * whose every worktree is clean and pushed — no drain needed. Because it acts
+ * whose every attributable worktree — its directory's repo, its
+ * coord-allocated worktrees and its isolated-edit worktrees — is clean and
+ * pushed; no drain needed. Because it acts
  * on the user's behalf, its off switch lives here and not only in the
  * environment. The transcript survives the close.
  *
@@ -30,7 +32,7 @@ export const FINISHED_SESSION_CLOSE_OPTIONS: ReadonlyArray<{
     value: "on",
     label: "On",
     explain:
-      "A finished session idle past the grace period, with every worktree clean and pushed, is closed — the default.",
+      "A finished session idle past the grace period, with every attributable worktree clean and pushed, is closed — the default.",
   },
   {
     value: "shadow",
@@ -118,10 +120,12 @@ export function FinishedSessionCloseSettings({ onLog }: { onLog: LogFunction }) 
       </h4>
       <div className="text-sm font-medium">Close finished sessions after grace</div>
       <p className="text-xs text-muted-foreground">
-        When a session is marked finished, sits idle past the grace period, and every worktree it
-        touched is committed and pushed, the runner exits it with <code>/exit</code> and closes its
-        window. A session with uncommitted, untracked or unpushed work — or one whose state cannot
-        be read — is never closed. The transcript is kept.
+        When a session is marked finished and sits idle past the grace period, the runner checks
+        every worktree it can attribute to the session: the repository its directory is in, the
+        worktrees coord allocated to it, and the worktrees its isolated-edit context created. If all
+        of them are committed and pushed, the runner exits the session with <code>/exit</code> and
+        closes its window. A session with uncommitted, untracked or unpushed work in any of them —
+        or one whose state cannot be read — is never closed. The transcript is kept.
       </p>
       {loadError && (
         <p

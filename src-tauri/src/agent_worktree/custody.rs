@@ -1144,6 +1144,10 @@ pub mod coord {
         /// instead of failing the whole survey.
         #[serde(default)]
         pub work_unit_id: Option<String>,
+        /// `coord.agent_worktrees.status` — `allocated` | `active` | `merging`
+        /// | `merged` | `abandoned`. `None` from a coord that omits it.
+        #[serde(default)]
+        pub ledger_status: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -1162,6 +1166,12 @@ pub mod coord {
     pub struct CoordSessionWorktrees {
         #[serde(default)]
         pub sessions: Vec<CoordSessionRow>,
+        /// Whether `coord.sessions.claude_code_session_id` — the bridge the
+        /// ledger join runs through — exists on that database. Absent or
+        /// `false` makes `sessions: []` UNKNOWN rather than "no worktrees";
+        /// `None` from a coord that predates the field.
+        #[serde(default)]
+        pub session_bridge_column_present: Option<bool>,
     }
 
     /// Project coord's five-valued session state onto the tri-state
@@ -1235,19 +1245,19 @@ pub mod coord {
             self.rows.is_empty()
         }
 
-        /// Every ledger worktree path allocated to `session_id` — a
+        /// Every ledger worktree row allocated to `session_id` — a
         /// `coord.sessions.id`, which is what this route keys its sessions on
-        /// (NOT a Claude session id). Paths are returned verbatim, so a
-        /// RELATIVE ledger path is the caller's to resolve against the
-        /// workspace root. Deduplicated, in ledger order.
-        pub fn worktree_paths_for_session(&self, session_id: &str) -> Vec<String> {
-            let mut out: Vec<String> = Vec::new();
+        /// (NOT a Claude session id). Paths are verbatim, so a RELATIVE ledger
+        /// path is the caller's to resolve against the workspace root. One row
+        /// per path, the first in ledger order.
+        pub fn worktrees_for_session(&self, session_id: &str) -> Vec<&CoordWorktreeRow> {
+            let mut out: Vec<&CoordWorktreeRow> = Vec::new();
             for (sid, _, row, _) in &self.rows {
                 if sid.eq_ignore_ascii_case(session_id)
                     && !row.worktree_path.is_empty()
-                    && !out.contains(&row.worktree_path)
+                    && !out.iter().any(|r| r.worktree_path == row.worktree_path)
                 {
-                    out.push(row.worktree_path.clone());
+                    out.push(row);
                 }
             }
             out
@@ -1335,6 +1345,114 @@ pub mod coord {
             .await
             .map_err(|e| format!("decode session-worktrees: {e}"))?;
         Ok(Some(CoordOwnership::from_response(parsed)))
+    }
+
+    /// The coord session states a session that can still be running is in —
+    /// every state but `closed`. The wind-down executor's custody gate reads
+    /// the attributed worktrees of a LIVE session, so these are the pages it
+    /// needs.
+    pub const LIVE_SESSION_STATES: [&str; 4] =
+        ["active", "pending_resolution", "stale", "expected"];
+
+    /// The ledger-row limit sent per page — coord's own clamp ceiling.
+    pub const SESSION_WORKTREES_PAGE_LIMIT: usize = 500;
+
+    /// PURE: a page is usable only when it is provably COMPLETE.
+    ///
+    /// * the session bridge column must be reported present — without it the
+    ///   join is inexpressible and `sessions: []` is unknown, not empty;
+    /// * the page must hold FEWER ledger rows than the limit sent: coord
+    ///   applies `LIMIT` to ledger rows tenant-wide, ordered by session id, so
+    ///   a page that reached it may have cut off the very session asked
+    ///   about — and a missing row would read as "nothing attributed".
+    pub fn validate_complete_page(
+        page: &CoordSessionWorktrees,
+        state: &str,
+        limit: usize,
+    ) -> Result<(), String> {
+        if page.session_bridge_column_present != Some(true) {
+            return Err(format!(
+                "coord's session-worktrees page for state={state} does not report the \
+                 claude_code_session_id bridge column present, so its rows cannot be trusted \
+                 as complete"
+            ));
+        }
+        let rows: usize = page.sessions.iter().map(|s| s.worktrees.len()).sum();
+        if rows >= limit {
+            return Err(format!(
+                "coord's session-worktrees page for state={state} returned {rows} ledger rows at \
+                 limit={limit}, so it may be truncated"
+            ));
+        }
+        Ok(())
+    }
+
+    /// PURE: validate every `(state, page)` and union them into one index.
+    pub fn ownership_from_pages(
+        pages: Vec<(&str, CoordSessionWorktrees)>,
+        limit: usize,
+    ) -> Result<CoordOwnership, String> {
+        let mut sessions: Vec<CoordSessionRow> = Vec::new();
+        for (state, page) in pages {
+            validate_complete_page(&page, state, limit)?;
+            sessions.extend(page.sessions);
+        }
+        Ok(CoordOwnership::from_response(CoordSessionWorktrees {
+            sessions,
+            session_bridge_column_present: Some(true),
+        }))
+    }
+
+    /// Fetch the attributed-worktree index for every LIVE session, complete or
+    /// not at all.
+    ///
+    /// [`fetch_ownership`] sends no `limit`, so coord serves its default 200
+    /// ledger rows TENANT-WIDE — on a fleet holding ~1,500 that silently
+    /// drops most sessions, and for a custody gate a dropped session reads as
+    /// "nothing attributed", i.e. clean. This reads one page per
+    /// [`LIVE_SESSION_STATES`] at [`SESSION_WORKTREES_PAGE_LIMIT`] and refuses
+    /// (`Err`) any page that is incomplete by [`validate_complete_page`], or
+    /// any non-2xx or undecodable answer. `Err` is `Unknown` at the gate.
+    ///
+    /// It is still a tenant-wide read to answer a one-session question. A
+    /// per-session filter on coord's route (`?session_id=`) would make it
+    /// complete by construction and cheap — a coord follow-up; until then a
+    /// tenant with more than 500 rows in one state reads as UNKNOWN here,
+    /// never as clean.
+    pub async fn fetch_live_ownership() -> Result<CoordOwnership, String> {
+        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+            return Err(
+                "no coord base is configured, so the session's worktree allocations cannot be read"
+                    .to_string(),
+            );
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("build custody http client: {e}"))?;
+        let mut pages = Vec::new();
+        for state in LIVE_SESSION_STATES {
+            let url = format!(
+                "{}/coord/sessions/worktrees?state={state}&limit={SESSION_WORKTREES_PAGE_LIMIT}",
+                base.trim_end_matches('/')
+            );
+            let resp = crate::coord_http::coord_get(&client, &url)
+                .send()
+                .await
+                .map_err(|e| format!("GET {url}: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let excerpt: String = body.chars().take(200).collect();
+                return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+            }
+            let page: CoordSessionWorktrees = resp
+                .json()
+                .await
+                .map_err(|e| format!("decode session-worktrees ({state}): {e}"))?;
+            pages.push((state, page));
+        }
+        ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)
     }
 
     #[cfg(test)]
@@ -1470,8 +1588,73 @@ pub mod coord {
             assert!(idx.reachable, "an EMPTY answer is still an answer");
         }
 
+        fn page(json: &str) -> CoordSessionWorktrees {
+            serde_json::from_str(json).unwrap()
+        }
+
         #[test]
-        fn worktree_paths_for_session_lists_only_that_sessions_rows() {
+        fn a_page_at_the_limit_may_be_truncated_and_is_refused() {
+            let full = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"a","worktrees":[{"worktreePath":"w1"},{"worktreePath":"w2"}]},
+                    {"sessionId":"b","worktrees":[{"worktreePath":"w3"}]}]}"#,
+            );
+            assert!(
+                validate_complete_page(&full, "active", 3).is_err(),
+                "3 rows at limit 3"
+            );
+            assert!(
+                validate_complete_page(&full, "active", 4).is_ok(),
+                "3 rows under limit 4"
+            );
+            assert!(ownership_from_pages(vec![("active", full)], 3).is_err());
+        }
+
+        #[test]
+        fn a_missing_or_false_bridge_column_is_refused() {
+            for json in [
+                r#"{"sessions":[]}"#,
+                r#"{"sessionBridgeColumnPresent":false,"sessions":[]}"#,
+            ] {
+                let err = validate_complete_page(&page(json), "stale", 500).unwrap_err();
+                assert!(err.contains("bridge column"), "{err}");
+            }
+            assert!(validate_complete_page(
+                &page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
+                "stale",
+                500
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn the_live_states_are_unioned_into_one_index() {
+            let active = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"s-act","worktrees":[{"worktreePath":"wt/act","ledgerStatus":"active"}]}]}"#,
+            );
+            let stale = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"s-old","worktrees":[{"worktreePath":"wt/old","ledgerStatus":"merged"}]}]}"#,
+            );
+            let idx =
+                ownership_from_pages(vec![("active", active), ("stale", stale)], 500).unwrap();
+            assert_eq!(
+                idx.worktrees_for_session("s-act")[0].worktree_path,
+                "wt/act"
+            );
+            let old = idx.worktrees_for_session("s-old");
+            assert_eq!(old[0].ledger_status.as_deref(), Some("merged"));
+            // One bad page poisons the whole read: a union that dropped it would
+            // be exactly the silent short read this exists to refuse.
+            let bad = page(r#"{"sessions":[]}"#);
+            let good = page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
+            assert!(ownership_from_pages(vec![("active", good), ("expected", bad)], 500).is_err());
+            assert!(LIVE_SESSION_STATES.iter().all(|s| *s != "closed"));
+        }
+
+        #[test]
+        fn worktrees_for_session_lists_only_that_sessions_rows() {
             let idx = index(
                 r#"{"sessions":[
                     {"sessionId":"AAAA-1","ownerSessionState":"active","worktrees":[
@@ -1481,15 +1664,20 @@ pub mod coord {
                     {"sessionId":"bbbb-2","ownerSessionState":"active","worktrees":[
                         {"worktreePath":"agent-worktrees/b/qontinui-web","repo":"qontinui-web"}]}]}"#,
             );
+            let paths: Vec<&str> = idx
+                .worktrees_for_session("aaaa-1")
+                .into_iter()
+                .map(|r| r.worktree_path.as_str())
+                .collect();
             assert_eq!(
-                idx.worktree_paths_for_session("aaaa-1"),
+                paths,
                 vec![
-                    "agent-worktrees/a/qontinui-runner".to_string(),
-                    "agent-worktrees/a/qontinui-schemas".to_string()
+                    "agent-worktrees/a/qontinui-runner",
+                    "agent-worktrees/a/qontinui-schemas"
                 ],
                 "case-insensitive on the uuid, deduplicated, in ledger order"
             );
-            assert!(idx.worktree_paths_for_session("cccc-3").is_empty());
+            assert!(idx.worktrees_for_session("cccc-3").is_empty());
         }
     }
 }

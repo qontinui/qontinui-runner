@@ -6198,14 +6198,24 @@ pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), Str
 /// the machine kill switch can override (see
 /// `session::finished_close::effective_mode`).
 ///
+/// `Err` when `settings.json` exists but could not be read or parsed: the
+/// `Settings` that load returns is a DEFAULT placeholder, and its default here
+/// is `on` — so reading it as the operator's value would turn a saved `off`
+/// back on exactly when the file is damaged. The caller treats `Err` as off.
+/// A genuine first run (no file) is authoritative and yields the default.
+///
 /// Read through [`read_settings_from_disk`], not [`load_settings`]: the
 /// wind-down executor calls this on every tick, and that door serves a cached
 /// parse and never writes the operator's file as a side effect of reading it.
-pub fn get_finished_session_close() -> FinishedSessionClose {
-    read_settings_from_disk()
-        .settings
-        .sessions
-        .finished_session_close
+pub fn get_finished_session_close() -> Result<FinishedSessionClose, String> {
+    let loaded = read_settings_from_disk();
+    if loaded.provenance.is_authoritative() {
+        Ok(loaded.settings.sessions.finished_session_close)
+    } else {
+        Err(loaded
+            .error
+            .unwrap_or_else(|| "settings.json could not be read".to_string()))
+    }
 }
 
 /// Persist the `finished_close` arm's switch.

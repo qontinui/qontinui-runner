@@ -34,10 +34,22 @@ fn payload(saved: FinishedSessionClose) -> serde_json::Value {
 /// the machine kill switch is engaged.
 #[tauri::command]
 pub fn finished_session_close_get() -> Result<CommandResponse, String> {
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: Some(payload(settings::get_finished_session_close())),
+    Ok(match settings::get_finished_session_close() {
+        Ok(saved) => CommandResponse {
+            success: true,
+            message: None,
+            data: Some(payload(saved)),
+        },
+        // The arm runs OFF while the file is unreadable; say why rather than
+        // render the placeholder default as the operator's choice.
+        Err(e) => CommandResponse {
+            success: false,
+            message: Some(format!(
+                "settings.json is unreadable ({e}) — the runner is not closing finished \
+                 sessions until it can read the saved value"
+            )),
+            data: None,
+        },
     })
 }
 

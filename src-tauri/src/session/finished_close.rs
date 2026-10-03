@@ -61,13 +61,42 @@ pub fn kill_switch_engaged() -> bool {
     ) == FinishedSessionClose::Off
 }
 
+/// PURE: [`effective_mode`] over a saved value that may not have been
+/// readable. An unreadable `settings.json` is OFF for this arm: the arm closes
+/// the user's windows, and a damaged file cannot tell us they had not
+/// switched it off — its placeholder default (`on`) is not their answer.
+pub fn mode_from(
+    saved: &Result<FinishedSessionClose, String>,
+    env: Option<&str>,
+) -> FinishedSessionClose {
+    match saved {
+        Ok(setting) => effective_mode(*setting, env),
+        Err(_) => FinishedSessionClose::Off,
+    }
+}
+
+/// Whether the last [`current_mode`] read found `settings.json` unreadable —
+/// kept so the warning is logged on the change, not on every 30 s tick.
+static SETTINGS_UNREADABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The mode the arm runs in right now: the saved setting, overridden by the
-/// machine kill switch.
+/// machine kill switch, and OFF while `settings.json` is unreadable.
 pub fn current_mode() -> FinishedSessionClose {
-    effective_mode(
-        crate::settings::get_finished_session_close(),
-        std::env::var(KILL_ENV).ok().as_deref(),
-    )
+    let saved = crate::settings::get_finished_session_close();
+    let unreadable = saved.is_err();
+    if SETTINGS_UNREADABLE.swap(unreadable, std::sync::atomic::Ordering::Relaxed) != unreadable {
+        match &saved {
+            Err(e) => tracing::warn!(
+                error = %e,
+                "finished_close: settings.json is unreadable, so the saved switch cannot be \
+                 known — the arm is OFF until it reads again (a damaged file must not turn a \
+                 saved `off` back on)"
+            ),
+            Ok(_) => tracing::info!("finished_close: settings.json is readable again"),
+        }
+    }
+    mode_from(&saved, std::env::var(KILL_ENV).ok().as_deref())
 }
 
 /// PURE: how often the arm runs a census — `max(TICK, grace / 4)`.
@@ -226,6 +255,27 @@ mod tests {
             for env in [None, Some("1"), Some(""), Some("yes")] {
                 assert_eq!(effective_mode(setting, env), setting, "{setting:?} {env:?}");
             }
+        }
+    }
+
+    /// Review item 4: an unreadable `settings.json` must not turn a saved
+    /// `off` back into the placeholder default `on`.
+    #[test]
+    fn an_unreadable_settings_file_is_off_for_this_arm() {
+        let unreadable: Result<FinishedSessionClose, String> =
+            Err("expected value at line 1 column 1".to_string());
+        assert_eq!(mode_from(&unreadable, None), FinishedSessionClose::Off);
+        assert_eq!(mode_from(&unreadable, Some("1")), FinishedSessionClose::Off);
+        for setting in [
+            FinishedSessionClose::On,
+            FinishedSessionClose::Shadow,
+            FinishedSessionClose::Off,
+        ] {
+            assert_eq!(mode_from(&Ok(setting), None), setting);
+            assert_eq!(
+                mode_from(&Ok(setting), Some("0")),
+                FinishedSessionClose::Off
+            );
         }
     }
 
