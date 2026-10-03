@@ -198,6 +198,31 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
     };
   }
 
+  // --- the TARGET's coord device drain refused it ----------------------------
+  // `handle_terminal_create` checks the drain BEFORE its create gate, so
+  // neither of these says anything about either create dial — and the relay
+  // passes both codes through by name (qontinui-web#1607).
+  if (code === "device_drained") {
+    return {
+      ...base,
+      headline: "That device is drained — it is not accepting new work",
+      remedy: [
+        "coord has drained that device, and its runner refuses remote creates until the drain lifts or expires. Nothing was spawned, and the create is not queued.",
+        "This is not the create dial: changing `accept_remote_create` will not help. Retry once the drain is lifted, or pick another device.",
+      ],
+    };
+  }
+  if (code === "drain_unreadable") {
+    return {
+      ...base,
+      headline: "That device cannot read its own drain state",
+      remedy: [
+        "Until it can confirm with coord that it is not drained, its runner fails closed and refuses remote creates. Nothing was spawned, and the create is not queued.",
+        "This reflects that runner's connection to coord, not anything about this request or your permissions: retry once it reads its drain state again.",
+      ],
+    };
+  }
+
   // --- the TARGET's own gate refused ---------------------------------------
   if (code === "remote_create_disabled") {
     return {
