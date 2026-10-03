@@ -18,18 +18,23 @@
 //! `/control/session-open` with no session id just before it execs the real
 //! `codex`; `session::provider_adapter::CodexAdapter` starts the capture.
 //!
-//! ## Why cwd + post-start mtime disambiguates
+//! ## Why cwd + post-start CREATION time disambiguates
 //!
 //! The runner does NOT relocate `CODEX_HOME` for a hand-started `codex`: the
 //! user's `codex login` lives there, and relocating it would log them out. The
 //! capture therefore scans a home that a concurrent Codex session — in another
-//! terminal, or outside the runner — may also be writing. The pair that names
-//! this terminal's session is:
+//! terminal, or outside the runner — may also be writing. What names this
+//! terminal's session is:
 //!
 //! - the line-1 `session_meta.cwd`, matched against the cwd the shim posted,
-//!   and
-//! - the file's mtime, at or after the moment the shim signalled, which drops
-//!   every older rollout.
+//! - the rollout's CREATION time — `session_meta.timestamp`, else the
+//!   `rollout-YYYY-MM-DDTHH-MM-SS-` stamp in its name — at or after the moment
+//!   the shim signalled. Not its mtime: an OLDER session still running in the
+//!   same cwd appends to its rollout on every turn, so its mtime is always
+//!   "after the start" and it used to be captured as the new session, and
+//! - its id not already being bound to ANOTHER open terminal — two Codex
+//!   sessions started in one cwd a moment apart must not both capture the
+//!   same rollout.
 //!
 //! ## Fail-open
 //!
@@ -62,9 +67,14 @@ const SESSION_META_TYPE: &str = "session_meta";
 /// The id keys of the `session_meta` payload, in preference order (0.159.1
 /// writes both with the same value).
 const ID_FIELDS: [&str; 2] = ["session_id", "id"];
-/// Tolerance for an mtime that lands a beat before the observed start
-/// (filesystem timestamp granularity, clock skew).
-const MTIME_SKEW_MS: i64 = 5_000;
+/// Tolerance for a creation time that lands a beat before the observed start
+/// (the filename stamp's one-second granularity, clock skew, the CLI writing
+/// its rollout a moment before the shim's signal is handled).
+const CREATED_SKEW_MS: i64 = 5_000;
+/// A rollout whose filename stamp is older than the start by more than this is
+/// skipped without opening it. A day covers any offset between the local time
+/// the stamp may be written in and UTC.
+const FILENAME_PREFILTER_MS: i64 = 24 * 60 * 60 * 1000;
 /// The close reason stamped on the terminal's other open records once the
 /// Codex session is captured.
 const SUPERSEDED_REASON: &str = "superseded-by-codex";
@@ -89,17 +99,10 @@ pub fn sessions_root(codex_home: &Path) -> PathBuf {
     codex_home.join(SESSIONS_SUBDIR)
 }
 
-/// A discovered rollout file and its mtime (epoch millis, the ranking key).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RolloutFile {
-    path: PathBuf,
-    modified_ms: i64,
-}
-
 /// Every `rollout-*.jsonl` under `sessions_root`, walked generically so a
 /// change to the `YYYY/MM/DD/` layout does not break it. An unreadable
 /// directory is skipped.
-fn collect_rollouts(sessions_root: &Path) -> Vec<RolloutFile> {
+fn collect_rollouts(sessions_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![sessions_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -118,17 +121,33 @@ fn collect_rollouts(sessions_root: &Path) -> Vec<RolloutFile> {
             if !is_rollout_file(&path) {
                 continue;
             }
-            let modified_ms = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_millis()).ok())
-                .unwrap_or(0);
-            out.push(RolloutFile { path, modified_ms });
+            out.push(path);
         }
     }
     out
+}
+
+/// The creation time (epoch millis) a rollout's NAME states:
+/// `rollout-YYYY-MM-DDTHH-MM-SS-<id>.jsonl`, read as local time (the frame
+/// the CLI stamps it in). `None` for a name without that stamp.
+fn filename_created_ms(path: &Path) -> Option<i64> {
+    use chrono::TimeZone;
+    let name = path.file_name()?.to_str()?;
+    let stamp = name.strip_prefix(ROLLOUT_PREFIX)?.get(..19)?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%S").ok()?;
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|t| t.timestamp_millis())
+}
+
+/// One rollout's line-1 facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMeta {
+    id: String,
+    cwd: Option<String>,
+    /// `session_meta.timestamp` (RFC 3339) as epoch millis, when present.
+    created_ms: Option<i64>,
 }
 
 /// Whether `path` names a Codex rollout (`rollout-*.jsonl`).
@@ -149,6 +168,10 @@ fn is_rollout_file(path: &Path) -> bool {
 /// second. `None` when the line is not JSON, is not a `session_meta` line, or
 /// carries no id.
 pub fn parse_session_meta_from_line1(line1: &str) -> Option<(String, Option<String>)> {
+    parse_meta(line1).map(|m| (m.id, m.cwd))
+}
+
+fn parse_meta(line1: &str) -> Option<SessionMeta> {
     let v: serde_json::Value = serde_json::from_str(line1.trim()).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some(SESSION_META_TYPE) {
         return None;
@@ -163,7 +186,14 @@ pub fn parse_session_meta_from_line1(line1: &str) -> Option<(String, Option<Stri
             .map(str::to_string)
     };
     let id = ID_FIELDS.iter().find_map(|name| field(name))?;
-    Some((id, field("cwd")))
+    let created_ms = field("timestamp")
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.timestamp_millis());
+    Some(SessionMeta {
+        id,
+        cwd: field("cwd"),
+        created_ms,
+    })
 }
 
 /// Normalize a path for a tolerant cwd compare: forward slashes, lowercase, no
@@ -205,24 +235,37 @@ fn read_first_line(path: &Path) -> Option<String> {
     Some(line)
 }
 
-/// The id of the newest rollout under `sessions_root` that was written at or
-/// after `started_ms` (within [`MTIME_SKEW_MS`]) and whose `session_meta.cwd`
-/// matches `want_cwd`. A rollout without a cwd cannot be attributed and is
-/// skipped. `None` when nothing qualifies.
+/// The id of the newest rollout under `sessions_root` CREATED at or after
+/// `started_ms` (within [`CREATED_SKEW_MS`]) whose `session_meta.cwd` matches
+/// `want_cwd` and whose id `bound_elsewhere` does not claim. A rollout without
+/// a cwd, or without any creation time, cannot be attributed and is skipped.
+/// `None` when nothing qualifies.
 pub fn capture_session_id_by_cwd(
     sessions_root: &Path,
     started_ms: i64,
     want_cwd: &str,
+    bound_elsewhere: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
-    let mut rollouts = collect_rollouts(sessions_root);
-    // Newest first, so the first match is the newest qualifying rollout.
-    rollouts.sort_by_key(|r| std::cmp::Reverse(r.modified_ms));
-    rollouts
-        .iter()
-        .take_while(|r| r.modified_ms + MTIME_SKEW_MS >= started_ms)
-        .filter_map(|r| read_first_line(&r.path))
-        .filter_map(|line| parse_session_meta_from_line1(&line))
-        .find_map(|(id, cwd)| cwd.filter(|c| cwd_matches(c, want_cwd)).map(|_| id))
+    collect_rollouts(sessions_root)
+        .into_iter()
+        .filter(|path| {
+            // Cheap: an old stamp in the name skips the open.
+            filename_created_ms(path).is_none_or(|ms| ms + FILENAME_PREFILTER_MS >= started_ms)
+        })
+        .filter_map(|path| {
+            let meta = parse_meta(&read_first_line(&path)?)?;
+            let created_ms = meta.created_ms.or_else(|| filename_created_ms(&path))?;
+            Some((meta, created_ms))
+        })
+        .filter(|(_, created_ms)| created_ms + CREATED_SKEW_MS >= started_ms)
+        .filter(|(meta, _)| {
+            meta.cwd
+                .as_deref()
+                .is_some_and(|c| cwd_matches(c, want_cwd))
+        })
+        .filter(|(meta, _)| !bound_elsewhere(&meta.id))
+        .max_by_key(|(_, created_ms)| *created_ms)
+        .map(|(meta, _)| meta.id)
 }
 
 /// Record and confirm a captured Codex session for `terminal_id`, then close
@@ -329,8 +372,17 @@ pub async fn capture_and_record_by_cwd(
     };
     let root = sessions_root(&home);
     let deadline = std::time::Instant::now() + timeout;
+    // A rollout whose session is already OPEN on another terminal is that
+    // terminal's, however well its cwd and time match this one.
+    let bound_elsewhere = |id: &str| {
+        store
+            .get(id)
+            .is_some_and(|r| r.state == "open" && r.terminal_id != start.terminal_id)
+    };
     loop {
-        if let Some(session_id) = capture_session_id_by_cwd(&root, start.started_ms, &start.cwd) {
+        if let Some(session_id) =
+            capture_session_id_by_cwd(&root, start.started_ms, &start.cwd, &bound_elsewhere)
+        {
             record_captured_session(
                 &store,
                 &session_id,
@@ -342,7 +394,7 @@ pub async fn capture_and_record_by_cwd(
                 terminal_id = %start.terminal_id,
                 codex_session = %session_id,
                 cwd = %start.cwd,
-                "session-restore: codex read-back captured the session id by cwd + mtime"
+                "session-restore: codex read-back captured the session id by cwd + creation time"
             );
             let recorded_dir = store
                 .get(&session_id)
@@ -445,6 +497,30 @@ mod tests {
         assert!(!cwd_matches("/home/u", "h:/ome/u"));
     }
 
+    /// Epoch millis → the RFC 3339 `session_meta.timestamp` form.
+    fn ts(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    fn meta(id: &str, cwd: &str, created_ms: i64) -> String {
+        format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{id}","timestamp":"{}","cwd":"{}"}}}}"#,
+            ts(created_ms),
+            cwd.replace('\\', "\\\\")
+        )
+    }
+
+    fn nobody(_: &str) -> bool {
+        false
+    }
+
+    /// A start well after the rollouts' filename stamps would pre-filter them;
+    /// these tests key everything off `session_meta.timestamp`, so their
+    /// filenames carry no stamp.
+    const T0: i64 = 1_790_000_000_000;
+
     /// Among several rollouts, the newest post-start one whose cwd matches
     /// wins — even when a rollout from another cwd is newer. A pre-start
     /// rollout in the same cwd is ignored.
@@ -453,44 +529,117 @@ mod tests {
         let dir = tempdir().unwrap();
         let day = sessions_root(dir.path()).join("2026").join("06").join("25");
         fs::create_dir_all(&day).unwrap();
+        let now = T0 as u64 + 1_000_000;
         write_rollout(
             &day,
-            "rollout-2026-06-25T08-00-00-pre.jsonl",
-            r#"{"type":"session_meta","payload":{"session_id":"pre-uuid","cwd":"C:/repos/widget"}}"#,
-            1_000,
+            "rollout-pre.jsonl",
+            &meta("pre-uuid", "C:/repos/widget", T0 - 60_000),
+            now,
         );
         write_rollout(
             &day,
-            "rollout-2026-06-25T11-00-00-other.jsonl",
-            r#"{"type":"session_meta","payload":{"session_id":"other-uuid","cwd":"C:/repos/elsewhere"}}"#,
-            300_000,
+            "rollout-other.jsonl",
+            &meta("other-uuid", "C:/repos/elsewhere", T0 + 300_000),
+            now,
         );
         write_rollout(
             &day,
-            "rollout-2026-06-25T10-00-00-ours.jsonl",
-            r#"{"type":"session_meta","payload":{"session_id":"ours-uuid","cwd":"C:\\Repos\\Widget"}}"#,
-            200_000,
+            "rollout-ours.jsonl",
+            &meta("ours-uuid", "C:\\Repos\\Widget", T0 + 200_000),
+            now,
         );
         // Not a rollout name: ignored even though its content would match.
         write_rollout(
             &day,
             "history.jsonl",
-            r#"{"type":"session_meta","payload":{"session_id":"nope","cwd":"C:/repos/widget"}}"#,
-            400_000,
+            &meta("nope", "C:/repos/widget", T0 + 400_000),
+            now,
         );
 
         let root = sessions_root(dir.path());
         assert_eq!(
-            capture_session_id_by_cwd(&root, 100_000, "C:/repos/widget"),
+            capture_session_id_by_cwd(&root, T0, "C:/repos/widget", &nobody),
             Some("ours-uuid".to_string())
         );
         assert_eq!(
-            capture_session_id_by_cwd(&root, 100_000, "C:/repos/nonexistent"),
+            capture_session_id_by_cwd(&root, T0, "C:/repos/nonexistent", &nobody),
             None
         );
-        // Started after every rollout was written: nothing qualifies.
+        // Started after every rollout was created: nothing qualifies.
         assert_eq!(
-            capture_session_id_by_cwd(&root, 900_000, "C:/repos/widget"),
+            capture_session_id_by_cwd(&root, T0 + 900_000, "C:/repos/widget", &nobody),
+            None
+        );
+    }
+
+    /// M4: an OLDER session still running in the same cwd keeps appending to
+    /// its rollout, so its mtime is always after the new start — it is not
+    /// the new session. Creation time decides, and an id already open on
+    /// another terminal is skipped.
+    #[test]
+    fn a_running_older_session_in_the_same_cwd_is_not_captured() {
+        let dir = tempdir().unwrap();
+        let day = sessions_root(dir.path()).join("2026").join("10").join("03");
+        fs::create_dir_all(&day).unwrap();
+        let root = sessions_root(dir.path());
+        // Created an hour before the start, written to a second ago.
+        write_rollout(
+            &day,
+            "rollout-old.jsonl",
+            &meta("old-running", "/w/proj", T0 - 3_600_000),
+            T0 as u64 + 60_000,
+        );
+        assert_eq!(
+            capture_session_id_by_cwd(&root, T0, "/w/proj", &nobody),
+            None,
+            "a busy older session's fresh mtime does not make it new"
+        );
+
+        // The real new session appears; another terminal already holds a
+        // second new one in the same cwd.
+        write_rollout(
+            &day,
+            "rollout-new.jsonl",
+            &meta("new-1", "/w/proj", T0 + 1_000),
+            T0 as u64,
+        );
+        write_rollout(
+            &day,
+            "rollout-new2.jsonl",
+            &meta("new-2", "/w/proj", T0 + 2_000),
+            T0 as u64,
+        );
+        assert_eq!(
+            capture_session_id_by_cwd(&root, T0, "/w/proj", &|id| id == "new-2"),
+            Some("new-1".to_string())
+        );
+    }
+
+    /// The filename stamp is the creation time when line 1 carries none.
+    #[test]
+    fn the_filename_stamp_is_the_creation_time_fallback() {
+        let dir = tempdir().unwrap();
+        let day = sessions_root(dir.path()).join("2026").join("10").join("03");
+        fs::create_dir_all(&day).unwrap();
+        let name = "rollout-2026-10-03T10-00-00-abc.jsonl";
+        write_rollout(
+            &day,
+            name,
+            r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/w"}}"#,
+            1,
+        );
+        let created = filename_created_ms(&day.join(name)).expect("stamp parses");
+        let root = sessions_root(dir.path());
+        assert_eq!(
+            capture_session_id_by_cwd(&root, created, "/w", &nobody),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            capture_session_id_by_cwd(&root, created + 60_000, "/w", &nobody),
+            None
+        );
+        assert_eq!(
+            filename_created_ms(Path::new("rollout-garbage.jsonl")),
             None
         );
     }
@@ -499,7 +648,7 @@ mod tests {
     fn capture_by_cwd_is_none_without_a_sessions_dir() {
         let dir = tempdir().unwrap();
         assert_eq!(
-            capture_session_id_by_cwd(&sessions_root(dir.path()), 0, "/w"),
+            capture_session_id_by_cwd(&sessions_root(dir.path()), 0, "/w", &nobody),
             None
         );
     }
