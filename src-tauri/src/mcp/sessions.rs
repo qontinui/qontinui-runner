@@ -201,19 +201,13 @@ fn resolve_spawn_cwd(requested: Option<&str>) -> Result<Option<String>, String> 
     Ok(Some(cwd.to_string()))
 }
 
-/// Why the spawn closure bailed, and — the part that matters for the task-run
-/// row — whether a usable session survived the failure.
-///
-/// The three failure points are not equivalent. `spawn failed` and
-/// `register failed` leave nothing the caller can talk to, so the row is dead
-/// and must be reconciled. `initial prompt failed` happens AFTER the child is
-/// spawned and registered in `SessionManager`: that session is live and still
-/// reachable on `POST /sessions/{id}/message`, so stamping its row
-/// `failed`/`completed_at` would be a lie about a running session.
+/// Why the spawn closure bailed. Every failure point — `spawn failed`,
+/// `initial prompt failed` and `register failed` — leaves nothing the caller
+/// can talk to: the initial prompt is sent BEFORE the session is registered,
+/// and a session that fails either step is closed while still unregistered.
+/// So the task-run row is always dead and is reconciled.
 struct SpawnFailure {
     message: String,
-    /// True when a registered, reachable session outlived the error.
-    session_live: bool,
 }
 
 async fn spawn_session(
@@ -386,28 +380,39 @@ async fn spawn_session(
             Err(e) => {
                 return Err(SpawnFailure {
                     message: format!("spawn failed: {}", e),
-                    session_live: false,
                 })
             }
         };
 
-        if let Err(e) = sm.register(&trid, session.clone()) {
-            // The child is spawned but unregistered, so nothing can reach it by
-            // id — the row is dead even though a process leaked (pre-existing).
+        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
+
+        // Initial prompt FIRST, then register (plan `2026-09-29-quiet-on-demand-…`, D4): an
+        // unregistered session is reachable by nothing — not the poller, the
+        // conductor nor HTTP — so `send_initial_prompt` cannot lose a race to
+        // another turn and be refused, leaving a registered session that never
+        // gets its brief. Same order as promotion and the rate-limit restart.
+        // The handshake output the closure exists to protect is emitted inside
+        // `spawn`, before either step; the first turn's output needs a model
+        // round-trip, far longer than the register call that follows.
+        if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
+            // Spawned but NOT registered: nothing can reach it, so close it
+            // (dropping the Arc on return would too) and report it dead.
+            let _ = session.close();
             return Err(SpawnFailure {
-                message: format!("register failed: {}", e),
-                session_live: false,
+                message: format!("initial prompt failed: {}", e),
             });
         }
 
-        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
-
-        if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
-            // Spawned AND registered: the session is live and addressable. Do
-            // not reconcile the row — only the first turn failed.
+        if let Err(e) = sm.register(&trid, session.clone()) {
+            // The child is spawned and prompted but unregistered, so nothing can
+            // reach it by id — close it and report the row dead.
+            // Accepted gap: the brief is already written, so after `close()`
+            // sends EOF the CLI may still run that first turn untracked —
+            // register fails only on a duplicate id (theoretical) or a poisoned
+            // lock (not expected).
+            let _ = session.close();
             return Err(SpawnFailure {
-                message: format!("initial prompt failed: {}", e),
-                session_live: true,
+                message: format!("register failed: {}", e),
             });
         }
 
@@ -452,22 +457,16 @@ async fn spawn_session(
             // dead spawn used to leave it reading `running` forever with
             // `sessions_count: 0` and an empty `output_log` — a row that looks
             // live to every consumer while the HTTP body says `state: "error"`.
-            //
-            // Only reconcile when nothing usable survived: `session_live` marks
-            // the `initial prompt failed` case, where the session is registered
-            // and still addressable on `POST /sessions/{id}/message`.
-            if !e.session_live {
-                if let Err(db_err) = state
-                    .app_state
-                    .pg_db
-                    .fail_task_run(&task_run_id, &e.message)
-                    .await
-                {
-                    warn!(
-                        "could not mark task run {} failed after spawn failure: {}",
-                        task_run_id, db_err
-                    );
-                }
+            if let Err(db_err) = state
+                .app_state
+                .pg_db
+                .fail_task_run(&task_run_id, &e.message)
+                .await
+            {
+                warn!(
+                    "could not mark task run {} failed after spawn failure: {}",
+                    task_run_id, db_err
+                );
             }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
@@ -533,6 +532,19 @@ pub struct SendMessageResponse {
     pub queued: bool,
 }
 
+/// `POST /sessions/{id}/message`'s error mapping: a quiet-barrier deferral
+/// (plan `2026-09-29-quiet-on-demand-…`, D4) is `409` carrying the
+/// `QUIET_BARRIER_DEFERRED` string — retry after release — and every other
+/// refusal stays a `500`.
+fn send_message_error(e: String) -> (StatusCode, String) {
+    crate::quiet_barrier::http_conflict(&e).unwrap_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("send_user_message failed: {}", e),
+        )
+    })
+}
+
 async fn send_message(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -562,12 +574,12 @@ async fn send_message(
     // out immediately, false when the worker was Processing and the
     // message was queued. Surface that as `queued` so callers can match
     // the Tauri command's behaviour.
-    let sent_immediately = session.send_user_message(&req.message).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("send_user_message failed: {}", e),
+    let sent_immediately = session
+        .send_user_message(
+            &req.message,
+            crate::quiet_barrier::SdkMessageCaller::HttpSessionMessage,
         )
-    })?;
+        .map_err(send_message_error)?;
 
     Ok(Json(SendMessageResponse {
         task_run_id: id,
@@ -1123,6 +1135,26 @@ async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: `POST /sessions/{id}/message`
+    /// maps a quiet-barrier deferral to `409 QUIET_BARRIER_DEFERRED` naming the
+    /// barrier, and leaves every other refusal a `500`.
+    #[test]
+    fn send_message_maps_a_barrier_deferral_to_409() {
+        let deferred = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "http_session_message",
+            "task-run-1",
+            "held",
+        );
+        let (status, body) = send_message_error(deferred);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.starts_with("QUIET_BARRIER_DEFERRED"), "{body}");
+        assert!(body.contains("rr-20260929T101500Z-a1b2c3"), "{body}");
+        let (status, body) = send_message_error("Cannot send message in state: closed".into());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.starts_with("send_user_message failed"), "{body}");
+    }
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
 

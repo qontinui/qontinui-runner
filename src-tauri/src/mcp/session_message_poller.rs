@@ -1377,6 +1377,40 @@ async fn report_gate_miss(
     surface_blocked_delivery(ctx, tracker, msg, to_session, reason, miss.detail(), now).await;
 }
 
+/// `Some(barrier_id)` when an inject refusal is a quiet-barrier deferral —
+/// the one refusal that must leave a message pending WITHOUT surfacing it as a
+/// blocked delivery.
+fn inject_deferred_by_quiet_barrier(err: &str) -> Option<&str> {
+    crate::quiet_barrier::deferred_barrier_id(err)
+}
+
+/// What one inject attempt means for the message — the branch order of
+/// [`deliver_once`]'s step 3, pinned as a pure function:
+///
+/// - `Delivered` → `record_push_ok` + `mark_injected` + ack;
+/// - `Deferred` (a quiet-barrier refusal from EITHER funnel) → `continue`
+///   with NO `surface_blocked_delivery` and NO `mark_injected`: the message
+///   stays pending in coord and the first tick after release delivers it;
+/// - `Refused` (anything else) → `surface_blocked_delivery`, stays pending.
+#[derive(Debug, PartialEq, Eq)]
+enum InjectVerdict {
+    Delivered(DeliveredArm),
+    Deferred { barrier_id: String },
+    Refused(String),
+}
+
+fn classify_inject(injected: Result<DeliveredArm, String>) -> InjectVerdict {
+    match injected {
+        Ok(arm) => InjectVerdict::Delivered(arm),
+        Err(e) => match inject_deferred_by_quiet_barrier(&e) {
+            Some(barrier_id) => InjectVerdict::Deferred {
+                barrier_id: barrier_id.to_string(),
+            },
+            None => InjectVerdict::Refused(e),
+        },
+    }
+}
+
 /// One delivery pass: pull pending → resolve → (idle-gate for PTY) → inject via
 /// the in-process primitive → mark delivered. Returns `Err` only for a
 /// tick-level failure (no JWT, coord unreachable, decode) — a per-message
@@ -1543,11 +1577,17 @@ async fn deliver_once(
         // delivered.
         let framed = frame_message(msg);
         let injected: Result<DeliveredArm, String> = match inject {
+            // The SDK queue is gated by the quiet barrier inside its own funnel
+            // (`ClaudeSession::send_user_message`, `SdkMessageCaller::
+            // SessionMessagePoller`, plan `2026-09-29-quiet-on-demand-…`, D4),
+            // which returns the typed deferral VERBATIM — so it takes the one
+            // branch below that leaves the message pending.
             Inject::Sdk(task_run_id) => {
                 crate::claude_session::worker_message::send_message_to_worker_via_handle(
                     &api_state.app_handle,
                     &task_run_id,
                     &framed,
+                    crate::quiet_barrier::SdkMessageCaller::SessionMessagePoller,
                 )
                 .await
                 .map(|()| DeliveredArm::Sdk)
@@ -1559,9 +1599,26 @@ async fn deliver_once(
                 )
                 .map(|_payload| DeliveredArm::Terminal),
         };
-        let arm = match injected {
-            Ok(arm) => arm,
-            Err(e) => {
+        let arm = match classify_inject(injected) {
+            InjectVerdict::Delivered(arm) => arm,
+            InjectVerdict::Deferred { barrier_id } => {
+                // A runner-restart quiet barrier holds this wake (plan
+                // `2026-09-29-quiet-on-demand-…`, D4) — refused by the PTY
+                // funnel or, for an SDK session, by the SDK message funnel.
+                // Deferred, NOT dropped: nothing reached the session, the
+                // message is neither marked
+                // injected locally nor acked to coord, so it stays in coord's
+                // `pending` set and the first tick after release delivers it.
+                // Not surfaced as a blocked delivery either — the hold is
+                // deliberate and bounded by the barrier's own deadline.
+                debug!(
+                    "session_message_poller: msg {} to session {to_session} deferred by \
+                     quiet barrier {} — stays pending",
+                    msg.message_id, barrier_id
+                );
+                continue;
+            }
+            InjectVerdict::Refused(e) => {
                 // debug, not warn: this repeats every poll tick while the
                 // refusal lasts, and `surface_blocked_delivery` below already
                 // writes the rate-limited info line naming `e`.
@@ -2803,6 +2860,75 @@ mod tests {
         assert_ne!(
             GateMiss::PromptNotEmpty.detail(),
             GateMiss::NotIdle.detail()
+        );
+    }
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: the refusal a quiet barrier
+    /// produces is recognised as a deferral (message stays pending, not
+    /// surfaced as blocked); every other inject refusal is not.
+    #[test]
+    fn a_quiet_barrier_refusal_is_recognised_as_a_deferral() {
+        let deferred = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "session_message_poller",
+            "term-1",
+            "held",
+        );
+        assert_eq!(
+            inject_deferred_by_quiet_barrier(&deferred),
+            Some("rr-20260929T101500Z-a1b2c3")
+        );
+        assert_eq!(
+            inject_deferred_by_quiet_barrier("TERMINAL_EXITED: gone"),
+            None
+        );
+    }
+
+    /// Note 13: `deliver_once`'s step-3 branch order. A quiet-barrier
+    /// deferral — from the PTY funnel OR the SDK message funnel — is
+    /// `Deferred`, never `Refused` (so it skips `surface_blocked_delivery`)
+    /// and never `Delivered` (so it skips `mark_injected` and the ack); any
+    /// other refusal is `Refused`; success is `Delivered`.
+    #[test]
+    fn a_deferral_from_either_funnel_skips_surfacing_and_marking() {
+        use crate::quiet_barrier::{
+            parse_record, sdk_wake_refusal, BarrierState, FileRecord, SdkMessageCaller,
+        };
+        let FileRecord::Recorded(barrier) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        let open = BarrierState::Open(barrier);
+        let sdk = sdk_wake_refusal(
+            SdkMessageCaller::SessionMessagePoller,
+            &open,
+            "task-run-1",
+            &["task-run-1".to_string()],
+        )
+        .expect("the SDK funnel defers the poller under a barrier");
+        let pty = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "session_message_poller",
+            "term-1",
+            "held",
+        );
+        for err in [sdk, pty] {
+            assert_eq!(
+                classify_inject(Err(err)),
+                InjectVerdict::Deferred {
+                    barrier_id: "rr-20260929T101500Z-a1b2c3".to_string()
+                }
+            );
+        }
+        assert_eq!(
+            classify_inject(Err("TERMINAL_EXITED: gone".into())),
+            InjectVerdict::Refused("TERMINAL_EXITED: gone".into())
+        );
+        assert_eq!(
+            classify_inject(Ok(DeliveredArm::Sdk)),
+            InjectVerdict::Delivered(DeliveredArm::Sdk)
         );
     }
 }

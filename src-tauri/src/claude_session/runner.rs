@@ -2534,14 +2534,18 @@ pub fn run_claude_session_interactive(
 
     let session = Arc::new(session);
 
-    // Register with session manager so frontend can interact
-    session_manager.register(task_run_id, session.clone())?;
-
     // Emit initial "ready" state
     emit_session_state(app_handle, task_run_id, session_id, session.state());
 
-    // Send the initial prompt
+    // Send the initial prompt, THEN register (plan `2026-09-29-quiet-on-demand-…`, D4): an
+    // unregistered session is reachable by nothing — not the poller, the
+    // conductor nor HTTP — so `send_initial_prompt` cannot lose a race to
+    // another turn and be refused, leaving a registered session that never
+    // gets its brief. Same order as promotion and the rate-limit restart.
     session.send_initial_prompt(prompt)?;
+
+    // Register with session manager so frontend can interact
+    session_manager.register(task_run_id, session.clone())?;
 
     // Emit "processing" state
     emit_session_state(app_handle, task_run_id, session_id, session.state());

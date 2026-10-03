@@ -617,6 +617,20 @@ fn deliver_compliance_nudge(
     mode: Mode,
 ) -> Option<VerdictResponse> {
     let nudge = nudge?;
+    // Quiet barrier (plan `2026-09-29-quiet-on-demand-…`, D4): a session that
+    // is ending its turn while a `runner-restart` barrier is open — or while
+    // the barrier store is unknown — is LET end it. Checked before the cap and
+    // the claim, so a held nudge consumes neither and stays eligible for a
+    // later turn after release.
+    if let Some(allow) = barrier_allows_stop(
+        session_key,
+        std::slice::from_ref(&nudge.session_id),
+        mode,
+        &crate::quiet_barrier::runner_restart_barrier_open(),
+        "compliance",
+    ) {
+        return Some(allow);
+    }
     let now = Instant::now();
     // Compliance gets its OWN key in the shared registry rather than sharing
     // the continuation arm's. Under the old hard-coded once-per-session cap it
@@ -687,6 +701,56 @@ fn deliver_compliance_nudge(
     })
 }
 
+/// PURE: the "allow stop" verdict a Stop-hook `block` — either arm's — turns
+/// into while `state` holds autonomous wakes; `None` when no barrier holds, or
+/// when one of `target_session_ids` is the barrier's own requester (exempt
+/// from it). `source` names the arm (`compliance` | `continuation`).
+fn barrier_allows_stop(
+    session_key: &str,
+    target_session_ids: &[String],
+    mode: Mode,
+    state: &crate::quiet_barrier::BarrierState,
+    source: &'static str,
+) -> Option<VerdictResponse> {
+    use crate::quiet_barrier::WakeDecision;
+    let WakeDecision::Defer { barrier_id, .. } = crate::quiet_barrier::wake_decision(
+        crate::quiet_barrier::WakeClass::Autonomous,
+        state,
+        target_session_ids,
+    ) else {
+        return None;
+    };
+    let what = if source == "compliance" {
+        "session-compliance nudge"
+    } else {
+        "session continuation"
+    };
+    let reason = format!(
+        "{what} held: quiet barrier {barrier_id} is holding autonomous wakes for a runner \
+         restart — allow stop"
+    );
+    info!(
+        session = %session_key,
+        mode = mode.as_str(),
+        status = source,
+        decision = "allow",
+        would_block = false,
+        targets = ?target_session_ids,
+        reason = %reason,
+        "continuation-verdict"
+    );
+    Some(VerdictResponse {
+        decision: "allow",
+        prompt: None,
+        mode: mode.as_str(),
+        reason,
+        would_block: false,
+        session: session_key.to_string(),
+        status_seen: source.to_string(),
+        source,
+    })
+}
+
 /// Compute the continuation verdict for `session_key` given the raw Stop-hook
 /// input payload. Fail-open end to end; never panics the caller.
 pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> VerdictResponse {
@@ -700,7 +764,17 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
     // second local flag). Fail-open — every error path yields `None`, and the
     // whole call is inert until coord serves the config route.
     let compliance = crate::mcp::session_compliance::observe_turn_end(hook_input).await;
+    verdict_after_observe(session_key, hook_input, mode, compliance).await
+}
 
+/// Everything [`continuation_verdict`] does after the compliance observation —
+/// split out so a test can drive it with a fixed `mode` and nudge.
+async fn verdict_after_observe(
+    session_key: &str,
+    hook_input: &Value,
+    mode: Mode,
+    compliance: Option<crate::mcp::session_compliance::ComplianceNudge>,
+) -> VerdictResponse {
     // Fast path: dark flag ⇒ allow with ZERO continuation coord traffic (the
     // hook is provisioned fleet-wide, so this is the hot path until the ramp).
     if mode == Mode::Off {
@@ -721,6 +795,26 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
             status_seen: "unconsulted".to_string(),
             source: "continuation",
         };
+    }
+
+    // Quiet barrier (plan `2026-09-29-quiet-on-demand-…`, D4): a session that
+    // is ending its turn while a `runner-restart` barrier is open — or while
+    // the barrier store is unknown — is LET end it. Checked BEFORE `decide`, so
+    // a held continuation records no cap slot, fetches no prompt and spends no
+    // coord round-trip. A held compliance nudge is allowed the same way inside
+    // `deliver_compliance_nudge`, so nothing is lost by returning here.
+    let mut barrier_targets = vec![session_key.to_string()];
+    if let Some(id) = session_id_from(hook_input) {
+        barrier_targets.push(id);
+    }
+    if let Some(allow) = barrier_allows_stop(
+        session_key,
+        &barrier_targets,
+        mode,
+        &crate::quiet_barrier::runner_restart_barrier_open(),
+        "continuation",
+    ) {
+        return allow;
     }
 
     let stop_hook_active = stop_hook_active_from(hook_input);
@@ -1102,6 +1196,118 @@ mod tests {
             // they still assert what they were written to assert.
             max_attempts: 1,
         }
+    }
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: under an open runner-restart
+    /// barrier the compliance nudge returns "allow stop" instead of `block`,
+    /// consumes neither the cap nor the claim, and blocks again after release.
+    #[test]
+    fn an_open_runner_restart_barrier_turns_the_nudge_into_allow_stop() {
+        use crate::quiet_barrier::{parse_record, with_test_state, BarrierState, FileRecord};
+        let FileRecord::Recorded(barrier) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        let key = "cv-quiet-barrier-allows-stop";
+        let held = with_test_state(BarrierState::Open(barrier), || {
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On)
+        })
+        .expect("a held nudge still answers — with allow");
+        assert_eq!(held.decision, "allow");
+        assert!(!held.would_block);
+        assert!(held.prompt.is_none());
+        assert!(
+            held.reason.contains("rr-20260929T101500Z-a1b2c3"),
+            "{}",
+            held.reason
+        );
+
+        // An UNKNOWN store fails closed the same way.
+        let unknown = with_test_state(BarrierState::Unknown("corrupt".into()), || {
+            deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On)
+        })
+        .expect("allow");
+        assert_eq!(unknown.decision, "allow");
+
+        // Released: the nudge was not consumed, so it blocks now.
+        let v = deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On)
+            .expect("the nudge is still eligible after release");
+        assert_eq!(v.decision, "block");
+    }
+
+    /// D4 for the CONTINUATION arm: under an open barrier a block-eligible
+    /// session (mode on, no status — `decide` would block) is let end its turn:
+    /// allow, no prompt, and no hourly-cap slot recorded. Returns before any
+    /// coord fetch, so the test needs no network.
+    #[test]
+    fn an_open_barrier_turns_the_continuation_block_into_allow_without_recording_the_cap() {
+        use crate::quiet_barrier::{parse_record, with_test_state, BarrierState, FileRecord};
+        let FileRecord::Recorded(barrier) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        let key = "cv-continuation-held-by-barrier";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for state in [
+            BarrierState::Open(barrier),
+            BarrierState::Unknown("corrupt".into()),
+        ] {
+            let v = with_test_state(state, || {
+                rt.block_on(verdict_after_observe(
+                    key,
+                    &json!({"session_id": "sess-not-the-requester"}),
+                    Mode::On,
+                    None,
+                ))
+            });
+            assert_eq!(v.decision, "allow");
+            assert_eq!(v.source, "continuation");
+            assert!(v.prompt.is_none());
+            assert!(!v.would_block);
+            assert!(v.reason.contains("allow stop"), "{}", v.reason);
+        }
+        assert!(
+            !cap_registry().would_exceed(key, Instant::now(), 1),
+            "a held continuation must not record an hourly-cap slot"
+        );
+    }
+
+    /// The barrier's own requester is EXEMPT (its stop is not held, so the
+    /// nudge still blocks); any other session is held; no barrier holds no one.
+    #[test]
+    fn the_barrier_requester_is_exempt_and_others_are_held() {
+        use crate::quiet_barrier::{parse_record, BarrierState, FileRecord};
+        let FileRecord::Recorded(mut barrier) = parse_record(
+            include_bytes!("../quiet_barrier/fixtures/open-runner-restart.json"),
+            None,
+        ) else {
+            panic!("fixture must parse");
+        };
+        barrier.requester_session_id = Some("sess-requester".to_string());
+        let state = BarrierState::Open(barrier);
+        let ids = |id: &str| vec![id.to_string()];
+        assert!(
+            barrier_allows_stop("k", &ids("sess-requester"), Mode::On, &state, "compliance")
+                .is_none()
+        );
+        assert!(
+            barrier_allows_stop("k", &ids("sess-other"), Mode::On, &state, "compliance").is_some()
+        );
+        assert!(barrier_allows_stop(
+            "k",
+            &ids("sess-other"),
+            Mode::On,
+            &BarrierState::Absent,
+            "continuation"
+        )
+        .is_none());
     }
 
     #[test]

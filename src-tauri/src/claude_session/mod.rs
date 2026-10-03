@@ -15,6 +15,7 @@ pub mod dispatcher;
 pub mod federation;
 pub mod launch_spec;
 pub mod manager;
+pub mod queued;
 pub mod resume;
 pub mod runner;
 pub mod session;

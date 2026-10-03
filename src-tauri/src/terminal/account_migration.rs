@@ -53,7 +53,7 @@ use std::sync::Mutex;
 
 use serde_json::json;
 use tauri::Emitter;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 
@@ -300,10 +300,24 @@ fn spawn_continue_nudge(terminal_id: String) {
 /// `initial_prompt` through the SAME bounded, stand-down-on-busy watcher
 /// instead of growing a second one that would drift from it. `label` only
 /// names the caller in the log lines.
+///
+/// The prompt lives only in this task's memory, so a runner restart drops it.
+/// It is therefore registered in [`crate::quiet_barrier::pending`] for the
+/// task's WHOLE life (registered before the spawn returns, cleared when the
+/// task ends for any reason): under a `runner-restart` quiet barrier the
+/// session is a `pending_autonomous_prompt` straggler, so the restart waits
+/// for the prompt (delivered after release) or the operator sees it.
 pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
     use tauri::Manager;
+    let pending = crate::quiet_barrier::pending::guard(
+        &terminal_id,
+        &pending_key(label),
+        "account-migration prompt-when-idle watcher",
+    );
     tauri::async_runtime::spawn(async move {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let _pending = pending;
+        let started = std::time::Instant::now();
+        let mut deadline = started + PROMPT_WHEN_IDLE_WINDOW;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let Some(app) = crate::tauri_app_handle::current() else {
@@ -343,9 +357,27 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
                     crate::terminal::session::PtyWriteCaller::AccountMigration,
                 ) {
                     Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
-                    Err(e) => {
-                        warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
-                    }
+                    Err(e) => match deferred_deadline(&e, started, std::time::Instant::now()) {
+                        // A quiet barrier holds autonomous wakes (plan
+                        // `2026-09-29-quiet-on-demand-…`, D4): keep watching
+                        // instead of giving up, so the prompt is re-evaluated —
+                        // busy/ready — after release rather than lost.
+                        Some(extended) => {
+                            if extended > deadline {
+                                deadline = extended;
+                            }
+                            debug!(
+                                terminal_id,
+                                label,
+                                error = %e,
+                                "prompt-when-idle: deferred by a quiet barrier — will retry"
+                            );
+                            continue;
+                        }
+                        None => {
+                            warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                        }
+                    },
                 }
                 return;
             }
@@ -359,6 +391,35 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
             }
         }
     });
+}
+
+/// The [`crate::quiet_barrier::pending`] key a prompt-when-idle watcher
+/// registers under.
+fn pending_key(label: &str) -> String {
+    format!("account_migration:{label}")
+}
+
+/// How long [`spawn_prompt_when_idle`] waits for the resumed CLI's idle prompt.
+const PROMPT_WHEN_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The hard bound on how long a quiet-barrier deferral may keep the watcher
+/// alive: past a `runner-restart` barrier's 1 h cap and the 2 h corrupt-file
+/// window, so a deferral never outlives every barrier that could cause it.
+const PROMPT_WHEN_IDLE_DEFERRAL_CAP: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60);
+
+/// PURE: when `err` is a quiet-barrier deferral, the watcher's extended
+/// deadline — a fresh [`PROMPT_WHEN_IDLE_WINDOW`] from `now`, never past
+/// `started + PROMPT_WHEN_IDLE_DEFERRAL_CAP`. `None` for any other error (the
+/// watcher gives up as before) and once the cap is reached.
+fn deferred_deadline(
+    err: &str,
+    started: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    crate::quiet_barrier::deferred_barrier_id(err)?;
+    let cap = started + PROMPT_WHEN_IDLE_DEFERRAL_CAP;
+    (now < cap).then(|| (now + PROMPT_WHEN_IDLE_WINDOW).min(cap))
 }
 
 /// Copy the session transcript from the source account's project dir into
@@ -1098,5 +1159,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("source transcript missing"), "got: {err}");
+    }
+
+    /// Item 5: the in-memory prompt is a registered pending deferral for the
+    /// watcher's whole life — present the moment the watcher is spawned, gone
+    /// once it ends (here: no app handle in a unit test, so it stands down on
+    /// its first tick).
+    #[test]
+    fn the_watcher_is_a_pending_autonomous_prompt_for_its_whole_life() {
+        let tid = "term-account-migration-pending-test";
+        spawn_prompt_when_idle(tid.to_string(), "continue".to_string(), "continue-nudge");
+        let pending = crate::quiet_barrier::pending::for_session(tid);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(
+            pending[0].starts_with("account_migration:continue-nudge"),
+            "{pending:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !crate::quiet_barrier::pending::for_session(tid).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the entry must clear when the watcher ends"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// A quiet-barrier deferral keeps the idle watcher alive (bounded), so the
+    /// migration nudge is re-evaluated after release instead of lost; any other
+    /// refusal still gives up.
+    #[test]
+    fn a_barrier_deferral_extends_the_watch_and_other_errors_do_not() {
+        let started = std::time::Instant::now();
+        let deferred = crate::quiet_barrier::deferred_error("rr-1", "account_migration", "t", "x");
+        let now = started + std::time::Duration::from_secs(170);
+        assert_eq!(
+            deferred_deadline(&deferred, started, now),
+            Some(now + PROMPT_WHEN_IDLE_WINDOW)
+        );
+        assert_eq!(
+            deferred_deadline("TERMINAL_EXITED: gone", started, now),
+            None
+        );
+        // Bounded: never past the cap, and nothing once the cap has passed.
+        let near_cap = started + PROMPT_WHEN_IDLE_DEFERRAL_CAP - std::time::Duration::from_secs(10);
+        assert_eq!(
+            deferred_deadline(&deferred, started, near_cap),
+            Some(started + PROMPT_WHEN_IDLE_DEFERRAL_CAP)
+        );
+        assert_eq!(
+            deferred_deadline(&deferred, started, started + PROMPT_WHEN_IDLE_DEFERRAL_CAP),
+            None
+        );
     }
 }

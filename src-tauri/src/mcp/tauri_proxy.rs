@@ -62,6 +62,13 @@ pub struct TauriInvokeResponse {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The HTTP status to answer with. Not serialized: every response but a
+    /// quiet-barrier deferral is `200` with `success` carrying the outcome
+    /// (the proxy's long-standing contract); a deferred `terminal_write`
+    /// answers `409` so an autonomous caller can tell "retry later" from
+    /// "failed" without parsing prose (plan `2026-09-29-quiet-on-demand-…`, D4).
+    #[serde(skip)]
+    pub status: StatusCode,
 }
 
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
@@ -79,6 +86,7 @@ impl TauriInvokeResponse {
             success: true,
             data: Some(data),
             error: None,
+            status: StatusCode::OK,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -86,7 +94,26 @@ impl TauriInvokeResponse {
             success: false,
             data: None,
             error: Some(msg.into()),
+            status: StatusCode::OK,
         }
+    }
+}
+
+/// A refused proxied `terminal_write`: a quiet-barrier deferral answers `409`
+/// with the barrier id in `data` (the error string carries it too); every other
+/// refusal keeps the proxy's `200 {success:false}` shape.
+fn terminal_write_refusal(e: String) -> TauriInvokeResponse {
+    match crate::quiet_barrier::deferred_barrier_id(&e).map(str::to_string) {
+        Some(barrier_id) => TauriInvokeResponse {
+            success: false,
+            data: Some(serde_json::json!({
+                "reason": crate::quiet_barrier::QUIET_BARRIER_DEFERRED,
+                "barrierId": barrier_id,
+            })),
+            error: Some(e),
+            status: StatusCode::CONFLICT,
+        },
+        None => TauriInvokeResponse::err(e),
     }
 }
 
@@ -112,7 +139,7 @@ pub(crate) struct ForbiddenResponse {
 pub async fn tauri_invoke_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<TauriInvokeRequest>,
-) -> Result<Json<TauriInvokeResponse>, (StatusCode, Json<ForbiddenResponse>)> {
+) -> Result<(StatusCode, Json<TauriInvokeResponse>), (StatusCode, Json<ForbiddenResponse>)> {
     if !ALLOWED_PROXIED_COMMANDS.contains(&req.command.as_str()) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -127,7 +154,7 @@ pub async fn tauri_invoke_handler(
     info!(command = %req.command, "tauri_proxy: dispatching command");
 
     let response = dispatch(state, req).await;
-    Ok(Json(response))
+    Ok((response.status, Json(response)))
 }
 
 // ============================================================================
@@ -364,7 +391,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 crate::terminal::session::PtyWriteCaller::TauriInvokeProxy,
             ) {
                 Ok(()) => TauriInvokeResponse::ok(serde_json::json!({ "success": true })),
-                Err(e) => TauriInvokeResponse::err(e),
+                Err(e) => terminal_write_refusal(e),
             }
         }
 
@@ -478,5 +505,34 @@ mod spawn_tenant_tests {
             spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
             Some(Some(a))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan `2026-09-29-quiet-on-demand-…`, D4: a proxied `terminal_write`
+    /// the quiet barrier deferred answers `409` naming the barrier; any other
+    /// refusal keeps the proxy's `200 {success:false}` contract.
+    #[test]
+    fn a_barrier_deferred_write_answers_409_with_the_barrier_id() {
+        let deferred = crate::quiet_barrier::deferred_error(
+            "rr-20260929T101500Z-a1b2c3",
+            "tauri_invoke_proxy",
+            "term-1",
+            "held",
+        );
+        let r = terminal_write_refusal(deferred);
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        assert!(!r.success);
+        let body = serde_json::to_value(&r).unwrap();
+        assert_eq!(body["data"]["barrierId"], "rr-20260929T101500Z-a1b2c3");
+        assert_eq!(body["data"]["reason"], "QUIET_BARRIER_DEFERRED");
+        assert!(body.get("status").is_none(), "status is not on the wire");
+
+        let r = terminal_write_refusal("TERMINAL_EXITED: gone".to_string());
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.data.is_none());
     }
 }
