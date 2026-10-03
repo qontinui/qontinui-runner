@@ -106,6 +106,14 @@ Every gate needs an anchor — one of two shapes:
   alembic-head claim goes terminal" → `claim_kind`+`resource_key` with a
   `claim_terminal` predicate.
 
+  **Never anchor a "watch / babysit this OPEN PR" continuation on
+  `claim:pr:<owner>/<repo>#<n>`**: coord's auto-PR hook registers (on PR open,
+  when enabled) its own open `pr_merged` gate on that exact anchor, so your
+  cleared continuation is held until the PR lands while `will_dispatch` still
+  reads `true`. Use a work-unit
+  anchor or a non-`pr` `claim_kind` (e.g. `babysit`). Canonical:
+  `_gate-registration` → "Anchor derivation (zero user input)".
+
 `$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`. Tenant always derives
 server-side from the session JWT — **never pass a tenant argument.**
 
