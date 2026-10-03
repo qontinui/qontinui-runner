@@ -84,7 +84,9 @@ struct IncomingControlResponse {
 /// `request_id` + `{"allowed": true}`) is ignored and the turn waits.
 fn tool_answer(resp: &IncomingControlResponse, request_id: &str) -> Option<(String, String)> {
     let body = resp.response.as_ref()?;
-    if body.get("subtype")?.as_str()? != "success" || body.get("request_id")?.as_str()? != request_id {
+    if body.get("subtype")?.as_str()? != "success"
+        || body.get("request_id")?.as_str()? != request_id
+    {
         return None;
     }
     let answer = body.get("response")?;
@@ -309,7 +311,10 @@ fn replay(fixture: &Path, exit_override: Option<i64>) -> i32 {
     let text = match std::fs::read_to_string(fixture) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("mock_claude_cli --replay: cannot read {}: {e}", fixture.display());
+            eprintln!(
+                "mock_claude_cli --replay: cannot read {}: {e}",
+                fixture.display()
+            );
             return 2;
         }
     };
@@ -343,7 +348,10 @@ fn replay(fixture: &Path, exit_override: Option<i64>) -> i32 {
     }) else {
         return exit_code;
     };
-    let runner_request_id = init.get("request_id").and_then(Value::as_str).unwrap_or_default();
+    let runner_request_id = init
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     for (line, v) in &frames[..handshake_end] {
         let recorded_id = v.pointer("/response/request_id").and_then(Value::as_str);
         match recorded_id {
@@ -359,7 +367,11 @@ fn replay(fixture: &Path, exit_override: Option<i64>) -> i32 {
     }
 
     // 2. The turn.
-    if await_stdin_frame(&mut lines, "a user message", |v| frame_type(v) == Some("user")).is_none() {
+    if await_stdin_frame(&mut lines, "a user message", |v| {
+        frame_type(v) == Some("user")
+    })
+    .is_none()
+    {
         return exit_code;
     }
     for (line, v) in &frames[handshake_end..] {

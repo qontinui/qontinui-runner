@@ -315,16 +315,33 @@ mod tests {
         let claude = structured_launch_profile("claude").expect("claude");
         assert_eq!(
             claude.permission_prompt_args,
-            vec!["--permission-mode", "default", "--permission-prompt-tool", "stdio"]
+            vec![
+                "--permission-mode",
+                "default",
+                "--permission-prompt-tool",
+                "stdio"
+            ]
         );
         let codex = structured_launch_profile("codex").unwrap_err();
-        assert!(codex.contains("no structured lane this runner implements"), "{codex}");
-        assert!(structured_launch_profile("gemini").unwrap_err().contains("unknown provider"));
+        assert!(
+            codex.contains("no structured lane this runner implements"),
+            "{codex}"
+        );
+        assert!(structured_launch_profile("gemini")
+            .unwrap_err()
+            .contains("unknown provider"));
     }
 
     #[test]
     fn the_record_is_a_structured_non_bypass_row_keyed_by_the_task_run() {
-        let r = structured_record("trid-1", "claude", Some("page-7".into()), 2, Some("t".into()), None);
+        let r = structured_record(
+            "trid-1",
+            "claude",
+            Some("page-7".into()),
+            2,
+            Some("t".into()),
+            None,
+        );
         assert_eq!(r.claude_session_id, "trid-1");
         assert_eq!(r.terminal_id, "trid-1");
         assert_eq!(r.task_run_id.as_deref(), Some("trid-1"));
@@ -336,14 +353,19 @@ mod tests {
         assert_eq!(wire["lane"], "structured");
         assert_eq!(wire["taskRunId"], "trid-1");
         // No page ⇒ the default page, never "".
-        assert_eq!(structured_record("x", "claude", Some(" ".into()), 0, None, None).page_id, "default");
+        assert_eq!(
+            structured_record("x", "claude", Some(" ".into()), 0, None, None).page_id,
+            "default"
+        );
     }
 
     #[test]
     fn decisions_are_validated() {
         assert_eq!(
             decision_from(PermissionChoice::Allow, None, None, None).unwrap(),
-            PermissionDecision::Allow { updated_input: None }
+            PermissionDecision::Allow {
+                updated_input: None
+            }
         );
         assert_eq!(
             decision_from(PermissionChoice::Deny, Some("no".into()), Some(true), None).unwrap(),
@@ -353,14 +375,26 @@ mod tests {
             }
         );
         assert!(decision_from(PermissionChoice::Allow, None, Some(true), None).is_err());
-        assert!(decision_from(PermissionChoice::Deny, None, None, Some(serde_json::json!({}))).is_err());
+        assert!(decision_from(
+            PermissionChoice::Deny,
+            None,
+            None,
+            Some(serde_json::json!({}))
+        )
+        .is_err());
         let wire: PermissionChoice = serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(wire, PermissionChoice::Deny);
     }
 
     #[test]
     fn a_structured_session_is_never_boot_resumed_as_a_chat() {
-        assert_ne!(STRUCTURED_SESSION_WORKFLOW_TYPE, AiSessionLaunch::chat().workflow_type);
-        assert_eq!(AiSessionLaunch::chat().permission, PermissionMode::BypassPermissions);
+        assert_ne!(
+            STRUCTURED_SESSION_WORKFLOW_TYPE,
+            AiSessionLaunch::chat().workflow_type
+        );
+        assert_eq!(
+            AiSessionLaunch::chat().permission,
+            PermissionMode::BypassPermissions
+        );
     }
 }

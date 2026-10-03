@@ -2000,7 +2000,11 @@ mod tests {
             {
                 let cmd_body = std::fs::read_to_string(dir.join(format!("{tool}.cmd")))
                     .expect("the .cmd identity shim exists on Windows");
-                assert_eq!(cmd_body.contains("--session-id"), !reads_id_back(tool), "{tool}");
+                assert_eq!(
+                    cmd_body.contains("--session-id"),
+                    !reads_id_back(tool),
+                    "{tool}"
+                );
             }
             #[cfg(unix)]
             {
@@ -2042,8 +2046,14 @@ mod tests {
         let codex = render_identity_for_test("codex", dir);
         assert!(codex.contains("TOOL=\"codex\""));
         assert!(!codex.contains("@@TOOL@@") && !codex.contains("@@SHIM_DIR@@"));
-        assert!(codex.contains("CODEX_HOME"), "reports a user-set CODEX_HOME");
-        assert!(codex.contains("pwd -W"), "posts the cwd in the CLI's own frame");
+        assert!(
+            codex.contains("CODEX_HOME"),
+            "reports a user-set CODEX_HOME"
+        );
+        assert!(
+            codex.contains("pwd -W"),
+            "posts the cwd in the CLI's own frame"
+        );
     }
 
     /// Q5(a). The identity dir is SHARED across every terminal of this runner

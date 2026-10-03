@@ -242,9 +242,8 @@ pub mod scripted_output_settings; // get/save the ScriptedOutputSettings (provid
 pub mod security_settings;
 pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
-pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6 — the persistent identity-shim PATH opt-in (delivery gate)
 pub mod session_failure; // The session-failure surface: active failures per terminal + the resume verifier's reports (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 7)
-pub mod structured_session; // The Terminal page's prompted structured launch + the permission responder (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 9)
+pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6 — the persistent identity-shim PATH opt-in (delivery gate)
 pub mod session_info; // One-shot session-identity projection (durable record ⨝ live registry ⨝ PR ledger) for the zone-header session-info dropdown
 pub mod setup_discovery; // Native (pure-Rust) setup-wizard discovery — no Python interpreter needed
 pub mod setup_wizard; // First-launch setup wizard commands
@@ -256,6 +255,7 @@ pub mod state_machine;
 pub mod state_machine_configs; // State machine config builder CRUD
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
+pub mod structured_session; // The Terminal page's prompted structured launch + the permission responder (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 9)
 pub mod subagent; // Subagent analysis dispatch (pi CLI / DeepSeek) — plan 2026-07-15
 pub mod task_sync; // renamed from ai_task_reporting
 pub mod tenant; // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 — active tenant resolver + per-machine pin

@@ -2379,7 +2379,9 @@ pub(crate) fn create_terminal_session_backend(
         .as_deref()
         .and_then(<[String]>::first)
         .and_then(|head| qontinui_runner_lib::cli_profile::profile_for_program(head))
-        .map_or(qontinui_runner_lib::cli_profile::claude::ID, |p| p.id.as_str());
+        .map_or(qontinui_runner_lib::cli_profile::claude::ID, |p| {
+            p.id.as_str()
+        });
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -3138,7 +3140,10 @@ mod tests {
         .expect("transcript");
         std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
         assert!(
-            crate::terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE).contains(&cfg),
+            crate::terminal::transcript::find_transcript_config_dirs(
+                &qontinui_runner_lib::cli_profile::claude::PROFILE
+            )
+            .contains(&cfg),
             "fixture must be discoverable, or this test proves nothing about a disk scan"
         );
 

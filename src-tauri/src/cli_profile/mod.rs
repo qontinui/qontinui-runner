@@ -307,14 +307,7 @@ mod tests {
                 "{program}"
             );
         }
-        for program in [
-            "gemini",
-            "claude-code",
-            "bash",
-            "",
-            ".exe",
-            "/usr/bin/",
-        ] {
+        for program in ["gemini", "claude-code", "bash", "", ".exe", "/usr/bin/"] {
             assert!(profile_for_program(program).is_none(), "{program}");
         }
     }
@@ -366,10 +359,7 @@ mod tests {
         ));
         // Ids are UUIDv7 — the template takes whatever id it is handed.
         let v7 = "01a0ef49-1234-7abc-8def-0123456789ab";
-        assert_eq!(
-            resume_argv(p, v7).unwrap(),
-            vec!["codex", "resume", v7]
-        );
+        assert_eq!(resume_argv(p, v7).unwrap(), vec!["codex", "resume", v7]);
         assert_eq!(restore_tier(p), RestoreTier::TerminalOnly);
         assert_eq!(account_env_var(p), Some("CODEX_HOME"));
         assert!(graceful_exit_text(p).is_err());
@@ -377,8 +367,14 @@ mod tests {
             p,
             "codex --dangerously-bypass-approvals-and-sandbox"
         ));
-        assert!(implies_auto_approve(p, "codex resume x --ask-for-approval never"));
-        assert!(!implies_auto_approve(p, "codex --ask-for-approval on-request"));
+        assert!(implies_auto_approve(
+            p,
+            "codex resume x --ask-for-approval never"
+        ));
+        assert!(!implies_auto_approve(
+            p,
+            "codex --ask-for-approval on-request"
+        ));
         let args = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(user_chose_session(p, &args(&["resume", "--last"])));
         assert!(!user_chose_session(p, &args(&["--model", "o3"])));

@@ -247,17 +247,20 @@ pub async fn resume_interrupted_workflows(
     // A session already registered here is one the operator launched after
     // this process started (the sweep runs a moment after the API is up) —
     // live, not interrupted.
-    let live_sessions = tauri::Manager::try_state::<
-        Arc<crate::claude_session::SessionManager>,
-    >(&app_handle)
-    .map(|s| s.inner().clone());
-    for task_run in structured_sessions
-        .iter()
-        .filter(|r| live_sessions.as_ref().is_none_or(|sm| sm.get(&r.id).is_none()))
-    {
+    let live_sessions =
+        tauri::Manager::try_state::<Arc<crate::claude_session::SessionManager>>(&app_handle)
+            .map(|s| s.inner().clone());
+    for task_run in structured_sessions.iter().filter(|r| {
+        live_sessions
+            .as_ref()
+            .is_none_or(|sm| sm.get(&r.id).is_none())
+    }) {
         let reason = "structured session interrupted by a runner restart (not resumable)";
         if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, reason).await {
-            warn!("Failed to close interrupted structured session {}: {}", task_run.id, e);
+            warn!(
+                "Failed to close interrupted structured session {}: {}",
+                task_run.id, e
+            );
         }
     }
 

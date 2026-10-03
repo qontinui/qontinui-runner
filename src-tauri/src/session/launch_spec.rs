@@ -365,7 +365,10 @@ pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: boo
     }
     let body = parts.join(" ");
 
-    match (&spec.config_dir, cli_profile::account_env_var(spec.provider)) {
+    match (
+        &spec.config_dir,
+        cli_profile::account_env_var(spec.provider),
+    ) {
         (Some(dir), Some(var)) if is_windows => format!("$env:{var}=\"{dir}\"; {body}"),
         (Some(dir), Some(var)) => format!("{var}=\"{dir}\" {body}"),
         _ => body,
@@ -447,7 +450,8 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // it can never override the caller — in its `--flag=value`
                 // spelling too, or a template could layer bypass into a
                 // prompted launch.
-                name if permission_names.contains(&name.split_once('=').map_or(name, |(n, _)| n)) => {}
+                name if permission_names
+                    .contains(&name.split_once('=').map_or(name, |(n, _)| n)) => {}
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
                 // Name is spec-owned when the caller supplies one: drop the
@@ -1561,7 +1565,11 @@ mod tests {
                 "--verbose",
             ]
         );
-        for bypass in ["--dangerously-skip-permissions", "bypassPermissions", "acceptEdits"] {
+        for bypass in [
+            "--dangerously-skip-permissions",
+            "bypassPermissions",
+            "acceptEdits",
+        ] {
             assert!(!argv.iter().any(|a| a == bypass), "{bypass} in {argv:?}");
         }
         assert!(PermissionMode::Prompt.prompts());
@@ -1589,8 +1597,14 @@ mod tests {
             "claude --some-future-flag x --model opus",
         ] {
             let argv = render_argv(&s, &tmpl(template), "claude");
-            assert!(!argv.iter().any(|a| a.contains("bypassPermissions")), "{template}: {argv:?}");
-            assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"), "{template}");
+            assert!(
+                !argv.iter().any(|a| a.contains("bypassPermissions")),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "{template}"
+            );
             for dropped in [
                 "--settings",
                 "--allowedTools",
@@ -1606,22 +1620,40 @@ mod tests {
                 1,
                 "{template}: {argv:?}"
             );
-            assert_eq!(value_after(&argv, "--permission-mode"), Some("default"), "{template}");
             assert_eq!(
-                argv.iter().filter(|a| *a == "--permission-prompt-tool").count(),
+                value_after(&argv, "--permission-mode"),
+                Some("default"),
+                "{template}"
+            );
+            assert_eq!(
+                argv.iter()
+                    .filter(|a| *a == "--permission-prompt-tool")
+                    .count(),
                 1,
                 "{template}: {argv:?}"
             );
-            assert_eq!(value_after(&argv, "--permission-prompt-tool"), Some("stdio"), "{template}");
+            assert_eq!(
+                value_after(&argv, "--permission-prompt-tool"),
+                Some("stdio"),
+                "{template}"
+            );
             // The template's other flags still layer in.
             assert_eq!(value_after(&argv, "--model"), Some("opus"), "{template}");
         }
         // Flags that cannot change the posture do layer in.
-        let argv = render_argv(&s, &tmpl("claude --add-dir /x --verbose --disallowedTools Bash"), "claude");
+        let argv = render_argv(
+            &s,
+            &tmpl("claude --add-dir /x --verbose --disallowedTools Bash"),
+            "claude",
+        );
         assert_eq!(value_after(&argv, "--add-dir"), Some("/x"));
         assert_eq!(value_after(&argv, "--disallowedTools"), Some("Bash"));
         // ...and a BYPASS launch is unaffected by the prompt-mode list.
-        let bypass = render_argv(&spec(), &tmpl("claude --allowedTools Bash --model opus"), "claude");
+        let bypass = render_argv(
+            &spec(),
+            &tmpl("claude --allowedTools Bash --model opus"),
+            "claude",
+        );
         assert_eq!(value_after(&bypass, "--allowedTools"), Some("Bash"));
     }
 

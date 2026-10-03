@@ -286,7 +286,9 @@ impl PermissionBroker {
             Some(Ok(tool)) => tool,
         };
         if !self.mode.prompts() {
-            self.write(&OutgoingControlResponse::allow_tool_use(request_id, tool.input));
+            self.write(&OutgoingControlResponse::allow_tool_use(
+                request_id, tool.input,
+            ));
             return ControlHandling::Allowed;
         }
 
@@ -425,7 +427,9 @@ impl PermissionBroker {
                     .map(|m| m.trim().to_string())
                     .filter(|m| !m.is_empty())
                     .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.to_string());
-                self.write(&OutgoingControlResponse::deny_tool_use(request_id, &message));
+                self.write(&OutgoingControlResponse::deny_tool_use(
+                    request_id, &message,
+                ));
                 PermissionResolvedNotice {
                     session_id: self.session_id.clone(),
                     request_id: request_id.to_string(),
@@ -530,7 +534,10 @@ impl PermissionSink for TauriPermissionSink {
         let text = match notice.outcome {
             PermissionOutcome::Allowed => format!("Permission granted: {}.", notice.tool_name),
             PermissionOutcome::Denied if notice.interrupt => {
-                format!("Permission denied: {} — interrupting the turn.", notice.tool_name)
+                format!(
+                    "Permission denied: {} — interrupting the turn.",
+                    notice.tool_name
+                )
             }
             PermissionOutcome::Denied => format!("Permission denied: {}.", notice.tool_name),
             PermissionOutcome::TimedOut => format!(
@@ -587,7 +594,11 @@ pub(crate) mod test_support {
     pub fn broker(
         mode: PermissionMode,
         timeout: Duration,
-    ) -> (Arc<PermissionBroker>, Arc<RecordingResponder>, Arc<RecordingSink>) {
+    ) -> (
+        Arc<PermissionBroker>,
+        Arc<RecordingResponder>,
+        Arc<RecordingSink>,
+    ) {
         let responder = Arc::new(RecordingResponder::default());
         let sink = Arc::new(RecordingSink::default());
         let broker = PermissionBroker::new(
@@ -629,21 +640,40 @@ mod tests {
     #[test]
     fn prompt_mode_parks_and_announces_with_the_request_fields() {
         let (b, out, sink) = broker(PermissionMode::Prompt, Duration::from_secs(60));
-        assert_eq!(b.handle_control_request(&request(WRITE_REQ)), ControlHandling::Parked);
-        assert!(out.lines().is_empty(), "nothing is answered until the operator decides");
+        assert_eq!(
+            b.handle_control_request(&request(WRITE_REQ)),
+            ControlHandling::Parked
+        );
+        assert!(
+            out.lines().is_empty(),
+            "nothing is answered until the operator decides"
+        );
         let pending = b.pending();
         assert_eq!(pending.len(), 1);
         let n = &pending[0];
         assert_eq!(n.request_id, "req-9");
         assert_eq!(n.tool_name, "Write");
-        assert_eq!(n.input, serde_json::json!({"file_path":"/w/probe.txt","content":"hello"}));
+        assert_eq!(
+            n.input,
+            serde_json::json!({"file_path":"/w/probe.txt","content":"hello"})
+        );
         assert_eq!(n.suggestions.len(), 1, "mapped from permission_suggestions");
         assert_eq!(n.tool_use_id.as_deref(), Some("toolu_1"));
         assert_eq!(n.timeout_secs, 60);
-        assert_eq!(sink.requested.lock().unwrap().as_slice(), pending.as_slice());
+        assert_eq!(
+            sink.requested.lock().unwrap().as_slice(),
+            pending.as_slice()
+        );
         // camelCase on the wire.
         let wire = serde_json::to_value(n).unwrap();
-        for key in ["sessionId", "requestId", "toolName", "input", "suggestions", "expiresAt"] {
+        for key in [
+            "sessionId",
+            "requestId",
+            "toolName",
+            "input",
+            "suggestions",
+            "expiresAt",
+        ] {
             assert!(wire.get(key).is_some(), "{key} in {wire}");
         }
     }
@@ -653,17 +683,31 @@ mod tests {
         let (b, out, sink) = broker(PermissionMode::Prompt, Duration::from_secs(60));
         b.handle_control_request(&request(WRITE_REQ));
         let resolved = b
-            .respond("req-9", PermissionDecision::Allow { updated_input: None })
+            .respond(
+                "req-9",
+                PermissionDecision::Allow {
+                    updated_input: None,
+                },
+            )
             .unwrap();
         assert_eq!(resolved.outcome, PermissionOutcome::Allowed);
         assert_eq!(
             out.lines(),
-            vec![r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-9","response":{"behavior":"allow","updatedInput":{"content":"hello","file_path":"/w/probe.txt"}}}}"#]
+            vec![
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-9","response":{"behavior":"allow","updatedInput":{"content":"hello","file_path":"/w/probe.txt"}}}}"#
+            ]
         );
         assert!(b.pending().is_empty());
         assert_eq!(sink.resolved.lock().unwrap().len(), 1);
         // A second answer to the same request is refused, not re-sent.
-        assert!(b.respond("req-9", PermissionDecision::Allow { updated_input: None }).is_err());
+        assert!(b
+            .respond(
+                "req-9",
+                PermissionDecision::Allow {
+                    updated_input: None
+                }
+            )
+            .is_err());
         assert_eq!(out.lines().len(), 1);
     }
 
@@ -671,10 +715,21 @@ mod tests {
     fn operator_allow_with_an_edited_input_sends_the_edit() {
         let (b, out, _) = broker(PermissionMode::Prompt, Duration::from_secs(60));
         b.handle_control_request(&request(WRITE_REQ));
-        assert!(b
-            .respond("req-9", PermissionDecision::Allow { updated_input: Some(serde_json::json!("x")) })
-            .is_err(), "a non-object input is refused");
-        assert_eq!(b.pending().len(), 1, "a refused edit leaves the request parked");
+        assert!(
+            b.respond(
+                "req-9",
+                PermissionDecision::Allow {
+                    updated_input: Some(serde_json::json!("x"))
+                }
+            )
+            .is_err(),
+            "a non-object input is refused"
+        );
+        assert_eq!(
+            b.pending().len(),
+            1,
+            "a refused edit leaves the request parked"
+        );
         b.respond(
             "req-9",
             PermissionDecision::Allow {
@@ -682,7 +737,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.lines()[0].contains(r#""updatedInput":{"content":"hi","file_path":"/w/other.txt"}"#));
+        assert!(out.lines()[0]
+            .contains(r#""updatedInput":{"content":"hi","file_path":"/w/other.txt"}"#));
     }
 
     #[test]
@@ -690,7 +746,13 @@ mod tests {
         let (b, out, _) = broker(PermissionMode::Prompt, Duration::from_secs(60));
         b.handle_control_request(&request(WRITE_REQ));
         let resolved = b
-            .respond("req-9", PermissionDecision::Deny { message: None, interrupt: true })
+            .respond(
+                "req-9",
+                PermissionDecision::Deny {
+                    message: None,
+                    interrupt: true,
+                },
+            )
             .unwrap();
         assert_eq!(resolved.outcome, PermissionOutcome::Denied);
         assert!(resolved.interrupt);
@@ -725,7 +787,14 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].outcome, PermissionOutcome::TimedOut);
         // The operator's late answer finds nothing to answer.
-        assert!(b.respond("req-9", PermissionDecision::Allow { updated_input: None }).is_err());
+        assert!(b
+            .respond(
+                "req-9",
+                PermissionDecision::Allow {
+                    updated_input: None
+                }
+            )
+            .is_err());
         assert_eq!(out.lines().len(), 1);
     }
 
@@ -733,7 +802,13 @@ mod tests {
     fn an_answered_request_never_times_out() {
         let (b, out, sink) = broker(PermissionMode::Prompt, Duration::from_millis(80));
         b.handle_control_request(&request(WRITE_REQ));
-        b.respond("req-9", PermissionDecision::Allow { updated_input: None }).unwrap();
+        b.respond(
+            "req-9",
+            PermissionDecision::Allow {
+                updated_input: None,
+            },
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(out.lines().len(), 1);
         assert_eq!(sink.resolved.lock().unwrap().len(), 1);
@@ -741,12 +816,20 @@ mod tests {
 
     #[test]
     fn bypass_mode_allows_in_the_sdk_shape_without_parking() {
-        for mode in [PermissionMode::BypassPermissions, PermissionMode::DangerouslySkip] {
+        for mode in [
+            PermissionMode::BypassPermissions,
+            PermissionMode::DangerouslySkip,
+        ] {
             let (b, out, sink) = broker(mode, Duration::from_secs(60));
-            assert_eq!(b.handle_control_request(&request(WRITE_REQ)), ControlHandling::Allowed);
+            assert_eq!(
+                b.handle_control_request(&request(WRITE_REQ)),
+                ControlHandling::Allowed
+            );
             assert_eq!(
                 out.lines(),
-                vec![r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-9","response":{"behavior":"allow","updatedInput":{"content":"hello","file_path":"/w/probe.txt"}}}}"#]
+                vec![
+                    r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-9","response":{"behavior":"allow","updatedInput":{"content":"hello","file_path":"/w/probe.txt"}}}}"#
+                ]
             );
             assert!(b.pending().is_empty());
             assert!(sink.requested.lock().unwrap().is_empty());
@@ -762,12 +845,16 @@ mod tests {
             ));
             assert_eq!(
                 handled,
-                ControlHandling::Refused("unsupported control request subtype: hook_callback".to_string())
+                ControlHandling::Refused(
+                    "unsupported control request subtype: hook_callback".to_string()
+                )
             );
             let malformed = b.handle_control_request(&request(
                 r#"{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","input":{}}}"#,
             ));
-            assert!(matches!(malformed, ControlHandling::Refused(ref e) if e.contains("tool_name")));
+            assert!(
+                matches!(malformed, ControlHandling::Refused(ref e) if e.contains("tool_name"))
+            );
             let lines = out.lines();
             assert_eq!(
                 lines[0],
@@ -876,9 +963,7 @@ mod tests {
                 }
                 out.push('"');
                 i += 1;
-            } else if c == '\''
-                && (next == Some('\\') || chars.get(i + 2) == Some(&'\''))
-            {
+            } else if c == '\'' && (next == Some('\\') || chars.get(i + 2) == Some(&'\'')) {
                 // A char literal ('{', '\n'); a lifetime has no closing quote.
                 out.push('\'');
                 i += 1;
@@ -913,7 +998,8 @@ mod tests {
             out.push_str(before);
             let after = after.get("#[cfg(test)]".len()..).unwrap_or("");
             let trimmed = after.trim_start();
-            let gated_mod = trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ")
+            let gated_mod = trimmed.starts_with("mod ")
+                || trimmed.starts_with("pub mod ")
                 || trimmed.starts_with("pub(crate) mod ");
             match (gated_mod, after.find('{'), after.find(';')) {
                 (true, Some(open), semi) if semi.is_none_or(|s| s > open) => {
@@ -945,7 +1031,9 @@ mod tests {
     /// The last argument of every `pattern` call in `file` (relative to
     /// `src/`), read from code only (comments and literals blanked).
     fn spawn_permission_args(file: &str, pattern: &str) -> Vec<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(file);
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
         let code = code_only(&src);
         let mut out = Vec::new();
@@ -1029,8 +1117,16 @@ mod tests {
             ("mcp/backend_relay.rs", SPAWN, &[BYPASS]),
             ("mcp/sessions.rs", SPAWN, &[BYPASS]),
             ("mcp/task_runs.rs", SPAWN, &[BYPASS]),
-            ("orchestration_loop/ai_session_executor.rs", SPAWN, &[BYPASS]),
-            ("claude_session/session.rs", "Self::spawn(", &["self.permissions.mode()", "permission"]),
+            (
+                "orchestration_loop/ai_session_executor.rs",
+                SPAWN,
+                &[BYPASS],
+            ),
+            (
+                "claude_session/session.rs",
+                "Self::spawn(",
+                &["self.permissions.mode()", "permission"],
+            ),
         ];
         for (file, pattern, want) in expect {
             assert_eq!(&spawn_permission_args(file, pattern), want, "{file}");
@@ -1040,7 +1136,10 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/ai_session.rs"),
         )
         .unwrap();
-        assert!(ai.contains("AiSessionLaunch::chat(),"), "create_ai_session must open a chat");
+        assert!(
+            ai.contains("AiSessionLaunch::chat(),"),
+            "create_ai_session must open a chat"
+        );
     }
 
     /// No production code outside the three files that implement the prompted
@@ -1062,7 +1161,11 @@ mod tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "rs") {
-                    let rel = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     let text = std::fs::read_to_string(&path).unwrap_or_default();
                     // Production code only (a test module may build a prompted
                     // broker to exercise it), and code only (a doc comment may
@@ -1075,7 +1178,10 @@ mod tests {
                 }
             }
         }
-        assert!(offenders.is_empty(), "PermissionMode::Prompt named outside the structured launch: {offenders:?}");
+        assert!(
+            offenders.is_empty(),
+            "PermissionMode::Prompt named outside the structured launch: {offenders:?}"
+        );
     }
 
     #[test]

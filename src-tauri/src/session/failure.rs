@@ -203,7 +203,12 @@ pub fn kind_of_error_text(text: &str) -> Option<FailureKind> {
     }
     // The account's usage window is used up. "token limit" is kept here
     // because the one-shot lane always treated it as account capacity.
-    if has(&["usage limit", "token limit", "out of usage", "out of extra usage"]) {
+    if has(&[
+        "usage limit",
+        "token limit",
+        "out of usage",
+        "out of extra usage",
+    ]) {
         return Some(FailureKind::QuotaExhausted);
     }
     if has(&[
@@ -301,9 +306,9 @@ pub fn actions_for(kind: FailureKind, resumable: bool) -> Vec<FailureAction> {
         FailureKind::RateLimited | FailureKind::Overloaded | FailureKind::InternalError => {
             vec![A::Retry]
         }
-        FailureKind::QuotaExhausted
-        | FailureKind::BudgetExhausted
-        | FailureKind::AccessDenied => vec![A::SwitchAccount],
+        FailureKind::QuotaExhausted | FailureKind::BudgetExhausted | FailureKind::AccessDenied => {
+            vec![A::SwitchAccount]
+        }
         FailureKind::ContextExhausted => vec![A::NewSession],
         FailureKind::AuthRequired => vec![A::Login],
         FailureKind::TransportLost | FailureKind::ProcessExited if resumable => {
@@ -693,10 +698,18 @@ mod tests {
             "API error (529): Overloaded",
             "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}",
         ] {
-            assert_eq!(kind_of_error_text(text), Some(FailureKind::Overloaded), "{text}");
+            assert_eq!(
+                kind_of_error_text(text),
+                Some(FailureKind::Overloaded),
+                "{text}"
+            );
         }
         for text in ["API error (429): rate limit", "Too Many Requests"] {
-            assert_eq!(kind_of_error_text(text), Some(FailureKind::RateLimited), "{text}");
+            assert_eq!(
+                kind_of_error_text(text),
+                Some(FailureKind::RateLimited),
+                "{text}"
+            );
         }
         assert_ne!(FailureKind::Overloaded, FailureKind::RateLimited);
         for kind in [FailureKind::Overloaded, FailureKind::RateLimited] {
@@ -808,7 +821,10 @@ mod tests {
                 "{phrase}"
             );
         }
-        for phrase in ["No conversation found with session ID: x", "Select a conversation to resume"] {
+        for phrase in [
+            "No conversation found with session ID: x",
+            "Select a conversation to resume",
+        ] {
             assert_eq!(
                 kind_of(FailureSignal::GridPhrase {
                     provider: p.id.clone(),
@@ -885,7 +901,9 @@ mod tests {
         assert_eq!(kind_of(stderr("")), None);
         // A plain transcript record is not an error record.
         assert_eq!(
-            kind_of(FailureSignal::TranscriptRecord(TranscriptFailureRecord::default())),
+            kind_of(FailureSignal::TranscriptRecord(
+                TranscriptFailureRecord::default()
+            )),
             None
         );
         // The per-turn rate-limit event reporting `allowed` (probe Q2).
@@ -958,16 +976,37 @@ mod tests {
     #[test]
     fn stderr_text_table() {
         let table = [
-            ("Claude AI usage limit reached|1790727000", FailureKind::QuotaExhausted),
-            ("5-hour limit reached ∙ resets 3am", FailureKind::QuotaExhausted),
-            ("You've hit your monthly spend limit", FailureKind::BudgetExhausted),
+            (
+                "Claude AI usage limit reached|1790727000",
+                FailureKind::QuotaExhausted,
+            ),
+            (
+                "5-hour limit reached ∙ resets 3am",
+                FailureKind::QuotaExhausted,
+            ),
+            (
+                "You've hit your monthly spend limit",
+                FailureKind::BudgetExhausted,
+            ),
             ("Credit balance is too low", FailureKind::BudgetExhausted),
             ("rate limit reached for requests", FailureKind::RateLimited),
-            ("API Error: 529 {\"type\":\"overloaded_error\"}", FailureKind::Overloaded),
-            ("Invalid API key · Please run /login", FailureKind::AuthRequired),
+            (
+                "API Error: 529 {\"type\":\"overloaded_error\"}",
+                FailureKind::Overloaded,
+            ),
+            (
+                "Invalid API key · Please run /login",
+                FailureKind::AuthRequired,
+            ),
             ("Prompt is too long", FailureKind::ContextExhausted),
-            ("API error (500): Internal server error", FailureKind::InternalError),
-            ("API error (400): invalid_request_error", FailureKind::BadRequest),
+            (
+                "API error (500): Internal server error",
+                FailureKind::InternalError,
+            ),
+            (
+                "API error (400): invalid_request_error",
+                FailureKind::BadRequest,
+            ),
         ];
         for (text, kind) in table {
             assert_eq!(kind_of(stderr(text)), Some(kind), "{text}");
@@ -984,7 +1023,10 @@ mod tests {
         assert!(profile_is_resumable(p));
         let f = classify(&FailureSignal::Exit { code: Some(1) }, p).unwrap();
         assert_eq!(f.recovery_policy, RecoveryPolicy::ResumeSameId);
-        assert_eq!(f.actions, vec![FailureAction::Resume, FailureAction::NewSession]);
+        assert_eq!(
+            f.actions,
+            vec![FailureAction::Resume, FailureAction::NewSession]
+        );
 
         let mut no_resume = p.clone();
         no_resume.resume = ResumeSpec::Unknown;
@@ -1038,12 +1080,17 @@ mod tests {
                 title_for(kind, FailureConfidence::Confirmed),
                 title_for(kind, FailureConfidence::Hint)
             );
-            assert!(title_for(kind, FailureConfidence::Hint).starts_with("May ")
-                || title_for(kind, FailureConfidence::Hint).contains(" may "));
+            assert!(
+                title_for(kind, FailureConfidence::Hint).starts_with("May ")
+                    || title_for(kind, FailureConfidence::Hint).contains(" may ")
+            );
             let _ = category_for(kind);
         }
         assert_eq!(policy_for(K::AuthRequired, true), RecoveryPolicy::Never);
-        assert_eq!(actions_for(K::AuthRequired, true), vec![FailureAction::Login]);
+        assert_eq!(
+            actions_for(K::AuthRequired, true),
+            vec![FailureAction::Login]
+        );
         assert_eq!(
             policy_for(K::ContextExhausted, true),
             RecoveryPolicy::HandoffNewSession

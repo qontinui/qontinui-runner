@@ -1101,9 +1101,8 @@ async fn spawn_looping_agent_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     // The briefing, composed with the tenant's cached policy body into one
     // `--append-system-prompt-file` when that cache exists, inline otherwise
     // (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`).

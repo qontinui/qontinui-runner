@@ -181,9 +181,9 @@ pub fn read_back_adapter(profile: &CliProfile) -> Option<&'static dyn SessionPro
         IdentitySource::ReadBack { capture } if capture == codex::CAPTURE_SESSION_FILE => {
             Some(&CodexAdapter)
         }
-        IdentitySource::ReadBack { .. } | IdentitySource::Pinned { .. } | IdentitySource::Unknown => {
-            None
-        }
+        IdentitySource::ReadBack { .. }
+        | IdentitySource::Pinned { .. }
+        | IdentitySource::Unknown => None,
     }
 }
 

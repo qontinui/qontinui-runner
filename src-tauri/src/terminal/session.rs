@@ -7020,7 +7020,10 @@ pub(crate) mod tests {
     #[test]
     fn spawn_record_provider_follows_the_launched_profile_identity() {
         use qontinui_runner_lib::cli_profile::{claude, codex, profile_for_program};
-        assert_eq!(TerminalSession::spawn_record_provider(None), Some(claude::ID));
+        assert_eq!(
+            TerminalSession::spawn_record_provider(None),
+            Some(claude::ID)
+        );
         assert_eq!(
             TerminalSession::spawn_record_provider(profile_for_program("claude")),
             Some(claude::ID)

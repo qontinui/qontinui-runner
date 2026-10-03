@@ -2447,11 +2447,12 @@ mod tests {
     /// empty-id refusal, and an id-carrying Codex post is an ordinary open.
     #[test]
     fn read_back_signal_is_an_id_less_post_from_a_read_back_provider() {
-        let with_provider = |terminal: &str, sid: &str, provider: Option<&str>| SessionOpenRequest {
-            provider: provider.map(str::to_string),
-            cwd: Some("/work".to_string()),
-            ..session_open_req(terminal, sid)
-        };
+        let with_provider =
+            |terminal: &str, sid: &str, provider: Option<&str>| SessionOpenRequest {
+                provider: provider.map(str::to_string),
+                cwd: Some("/work".to_string()),
+                ..session_open_req(terminal, sid)
+            };
         let adapter = read_back_signal(&with_provider("term-1", "", Some("codex")))
             .expect("codex start signal");
         assert_eq!(adapter.provider(), "codex");
@@ -2462,7 +2463,11 @@ mod tests {
             with_provider("term-1", "", None),
             with_provider("term-1", "", Some("gemini")),
             with_provider("", "", Some("codex")),
-            with_provider("term-1", "01a0ef49-1234-7abc-8def-0123456789ab", Some("codex")),
+            with_provider(
+                "term-1",
+                "01a0ef49-1234-7abc-8def-0123456789ab",
+                Some("codex"),
+            ),
         ] {
             assert!(read_back_signal(&req).is_none(), "{req:?}");
         }

@@ -130,28 +130,48 @@ fn replay_and_check(stem: &str) {
     let mut got = Vec::new();
 
     // Ordering is honoured: nothing before the initialize request…
-    assert!(mock.quiet_for(Duration::from_millis(200)), "{stem}: wrote before initialize");
+    assert!(
+        mock.quiet_for(Duration::from_millis(200)),
+        "{stem}: wrote before initialize"
+    );
     mock.send(&stdin[0]);
     // …the handshake answer, and nothing of the turn before the user message.
     let handshake = mock.recv().expect("handshake answer");
-    assert!(handshake.contains("\"type\":\"control_response\""), "{stem}");
+    assert!(
+        handshake.contains("\"type\":\"control_response\""),
+        "{stem}"
+    );
     got.push(handshake);
-    assert!(mock.quiet_for(Duration::from_millis(200)), "{stem}: turn began before the user message");
+    assert!(
+        mock.quiet_for(Duration::from_millis(200)),
+        "{stem}: turn began before the user message"
+    );
     mock.send(&stdin[1]);
 
     let mut replies = stdin[2..].iter();
     while got.len() < expected.len() {
-        let line = mock
-            .recv()
-            .unwrap_or_else(|| panic!("{stem}: stalled after {} of {} lines", got.len(), expected.len()));
+        let line = mock.recv().unwrap_or_else(|| {
+            panic!(
+                "{stem}: stalled after {} of {} lines",
+                got.len(),
+                expected.len()
+            )
+        });
         let is_request = serde_json::from_str::<Value>(&line)
             .map(|v| is_type(&v, "control_request"))
             .unwrap_or(false);
         got.push(line);
         if is_request {
             // The CLI waits for the answer — so does the mock.
-            assert!(mock.quiet_for(Duration::from_millis(200)), "{stem}: did not wait for the reply");
-            mock.send(replies.next().expect("a recorded reply to the control_request"));
+            assert!(
+                mock.quiet_for(Duration::from_millis(200)),
+                "{stem}: did not wait for the reply"
+            );
+            mock.send(
+                replies
+                    .next()
+                    .expect("a recorded reply to the control_request"),
+            );
         }
     }
     assert_eq!(got, expected, "{stem}: replay is byte-for-byte");
@@ -165,7 +185,11 @@ fn replay_and_check(stem: &str) {
             "{stem}: the recorded CLI hung until killed; so does the replay"
         );
     } else {
-        assert_eq!(mock.wait_exit(Duration::from_secs(10)), Some(expected_exit(stem)), "{stem}");
+        assert_eq!(
+            mock.wait_exit(Duration::from_secs(10)),
+            Some(expected_exit(stem)),
+            "{stem}"
+        );
     }
 }
 

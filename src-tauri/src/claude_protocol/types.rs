@@ -476,7 +476,12 @@ impl ResultMessage {
         if let Some(t) = result_text.filter(|t| !t.is_empty()) {
             return Some(t);
         }
-        if let Some(e) = self.error.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        if let Some(e) = self
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
             return Some(e.to_string());
         }
         match (self.terminal_reason.as_deref(), self.api_error_status) {
@@ -897,7 +902,10 @@ mod tests {
         assert_eq!(info.resets_at, Some(1_790_727_000));
         assert_eq!(info.rate_limit_type.as_deref(), Some("five_hour"));
         assert_eq!(info.overage_status.as_deref(), Some("rejected"));
-        assert_eq!(info.overage_disabled_reason.as_deref(), Some("org_level_disabled"));
+        assert_eq!(
+            info.overage_disabled_reason.as_deref(),
+            Some("org_level_disabled")
+        );
         assert_eq!(info.is_using_overage, Some(false));
         let windows = info.unified_windows.expect("windows");
         assert_eq!(windows["seven_day"].utilization, Some(0.44));
@@ -920,7 +928,10 @@ mod tests {
             Some(RateLimitStatus::Unknown("throttled_v2".into()))
         );
         assert!(!info.status.unwrap().is_allowed());
-        assert_eq!(info.resets_at, None, "a non-integer string is dropped, not fatal");
+        assert_eq!(
+            info.resets_at, None,
+            "a non-integer string is dropped, not fatal"
+        );
         assert_eq!(RateLimitStatus::from("rejected"), RateLimitStatus::Rejected);
         assert_eq!(RateLimitStatus::Rejected.as_str(), "rejected");
     }
@@ -940,8 +951,14 @@ mod tests {
         };
         assert_eq!(state("idle"), Some(CliSessionState::Idle));
         assert_eq!(state("running"), Some(CliSessionState::Running));
-        assert_eq!(state("requires_action"), Some(CliSessionState::RequiresAction));
-        assert_eq!(state("paused"), Some(CliSessionState::Unknown("paused".into())));
+        assert_eq!(
+            state("requires_action"),
+            Some(CliSessionState::RequiresAction)
+        );
+        assert_eq!(
+            state("paused"),
+            Some(CliSessionState::Unknown("paused".into()))
+        );
 
         let ClaudeOutputMessage::System(m) =
             decode(r#"{"type":"system","subtype":"thinking_tokens","tokens":12}"#)
@@ -954,7 +971,8 @@ mod tests {
             panic!("not system");
         };
         assert_eq!(m.subtype, Some(SystemSubtype::Unknown("brand_new".into())));
-        let ClaudeOutputMessage::System(m) = decode(r#"{"type":"system","subtype":"init","model":"m"}"#)
+        let ClaudeOutputMessage::System(m) =
+            decode(r#"{"type":"system","subtype":"init","model":"m"}"#)
         else {
             panic!("not system");
         };
@@ -976,7 +994,10 @@ mod tests {
         assert_eq!(r.is_error, Some(true));
         assert_eq!(r.api_error_status, Some(404));
         assert_eq!(r.terminal_reason.as_deref(), Some("api_error"));
-        assert!(!r.extra.contains_key("is_error"), "lifted out of the extra bag");
+        assert!(
+            !r.extra.contains_key("is_error"),
+            "lifted out of the extra bag"
+        );
         assert_eq!(
             r.error_text().as_deref(),
             Some("There's an issue with the selected model.")
@@ -985,7 +1006,10 @@ mod tests {
         let ok = decode(r#"{"type":"result","subtype":"success","is_error":false,"result":"hi"}"#);
         assert!(ok.is_success_result());
         let legacy = decode(r#"{"type":"result","subtype":"success"}"#);
-        assert!(legacy.is_success_result(), "no is_error field keeps the old meaning");
+        assert!(
+            legacy.is_success_result(),
+            "no is_error field keeps the old meaning"
+        );
         let error_subtype = decode(r#"{"type":"result","subtype":"error_max_turns"}"#);
         assert!(!error_subtype.is_success_result());
     }
@@ -1011,7 +1035,8 @@ mod tests {
             Some("the text")
         );
         assert_eq!(
-            text(r#"{"type":"result","subtype":"error","error":"Something went wrong"}"#).as_deref(),
+            text(r#"{"type":"result","subtype":"error","error":"Something went wrong"}"#)
+                .as_deref(),
             Some("Something went wrong")
         );
         assert_eq!(
@@ -1019,7 +1044,10 @@ mod tests {
                 .as_deref(),
             Some("api_error (HTTP 529)")
         );
-        assert_eq!(text(r#"{"type":"result","subtype":"success","is_error":true}"#), None);
+        assert_eq!(
+            text(r#"{"type":"result","subtype":"success","is_error":true}"#),
+            None
+        );
     }
 
     /// The errored turn's synthetic assistant frame carries its typed code.
