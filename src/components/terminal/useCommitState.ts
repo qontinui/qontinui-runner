@@ -54,6 +54,13 @@ export interface CommitState {
   repo_roots: string[];
   merging_repos: string[];
   generated_at_ms: number;
+  /** `true` when this is not a current answer: either the runner shed the
+   *  probe under memory pressure and answered with its last known state
+   *  (`mcp::ai_session::poll_commit_state`), or the poll got no answer at all
+   *  and `mergeProbeAnswers` pinned the tab to `"unknown"`. `generated_at_ms`
+   *  is then the last answer's stamp, not the poll's. Absent on payloads from
+   *  runners predating the field — read as fresh. */
+  stale?: boolean;
 }
 
 /** How long a `CommitState` is considered fresh before we pin it to
@@ -66,6 +73,39 @@ const POLL_INTERVAL_MS = 30_000;
 interface CommitStateEvent {
   task_run_id: string;
   state: CommitState;
+}
+
+/** One tab's poll answer: a `CommitState`, or `null` when the runner answered
+ *  `success: false` — it does NOT know (e.g. the probe was shed under memory
+ *  pressure with no recent answer). */
+export interface ProbeAnswer {
+  tabId: string;
+  state: CommitState | null;
+}
+
+/** Fold a poll batch into the per-tab state map.
+ *
+ *  A `null` answer pins the tab to `"unknown"` (marked `stale`) rather than
+ *  keeping its previous state: leaving it would show an answer the runner just
+ *  said it cannot vouch for as current, for up to `STALE_CAP_MS`. Returns
+ *  `prev` itself when nothing changed, so React skips the re-render. */
+export function mergeProbeAnswers(
+  prev: Record<string, CommitState>,
+  answers: ProbeAnswer[],
+): Record<string, CommitState> {
+  const next = { ...prev };
+  let dirty = false;
+  for (const { tabId, state } of answers) {
+    if (state) {
+      next[tabId] = state;
+    } else {
+      const previous = prev[tabId];
+      if (!previous || (previous.status === "unknown" && previous.stale)) continue;
+      next[tabId] = { ...previous, status: "unknown", stale: true };
+    }
+    dirty = true;
+  }
+  return dirty ? next : prev;
 }
 
 export function useCommitState(tabs: TerminalTab[]): Record<string, CommitState> {
@@ -133,26 +173,28 @@ export function useCommitState(tabs: TerminalTab[]): Record<string, CommitState>
       snapshot.map(async (tab) => {
         const taskRunId = tab.claudeSessionId;
         if (!taskRunId) return null;
-        const resp = await invoke<CommandResponse>("get_session_commit_state", {
-          taskRunId,
-        });
-        if (!resp.success || !resp.data) return null;
+        // No answer — `success: false` (the runner does NOT know, e.g. the
+        // probe was shed under memory pressure with no recent answer) or a
+        // failed IPC call — is UNKNOWN. Keeping the previous state would show
+        // it as current for up to STALE_CAP_MS, so the tab is pinned instead.
+        let resp: CommandResponse;
+        try {
+          resp = await invoke<CommandResponse>("get_session_commit_state", {
+            taskRunId,
+          });
+        } catch (err) {
+          logger.warn("get_session_commit_state failed:", err);
+          return { tabId: tab.id, state: null };
+        }
+        if (!resp.success || !resp.data) return { tabId: tab.id, state: null };
         return { tabId: tab.id, state: resp.data as CommitState };
       }),
     );
 
     if (!activeRef.current) return;
 
-    setRawStates((prev) => {
-      const next = { ...prev };
-      let dirty = false;
-      for (const r of results) {
-        if (r.status !== "fulfilled" || !r.value) continue;
-        next[r.value.tabId] = r.value.state;
-        dirty = true;
-      }
-      return dirty ? next : prev;
-    });
+    const answers = results.flatMap((r) => (r.status === "fulfilled" && r.value ? [r.value] : []));
+    setRawStates((prev) => mergeProbeAnswers(prev, answers));
   }, []);
 
   // ── 30 s background poll ────────────────────────────────────

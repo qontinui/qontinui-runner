@@ -54,8 +54,16 @@ pub struct CommitState {
     /// Subset of `repo_roots` that are mid-merge (`MERGE_HEAD` and friends).
     pub merging_repos: Vec<String>,
     /// Wall-clock millis at the moment the probe finished. Frontend uses
-    /// this to debounce/dedupe.
+    /// this to debounce/dedupe, and — when `stale` — to say how old the
+    /// answer is.
     pub generated_at_ms: u64,
+    /// `true` iff this is NOT a fresh probe: the frontend's commit-state poll
+    /// was shed under memory pressure and answered with the last known state
+    /// (`mcp::ai_session::poll_commit_state`). Always `false` on a fresh probe,
+    /// so the `commit-state-changed` event payload means what it always did.
+    /// `#[serde(default)]` so a payload predating the field reads as fresh.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +86,7 @@ impl CommitState {
             repo_roots: Vec::new(),
             merging_repos: Vec::new(),
             generated_at_ms: now_ms(),
+            stale: false,
         }
     }
 }
@@ -586,6 +595,7 @@ mod tests {
             repo_roots: vec!["/a".into()],
             merging_repos: vec![],
             generated_at_ms: 42,
+            stale: false,
         };
         let v: serde_json::Value = serde_json::to_value(&cs).unwrap();
         // Pin the snake_case keys — frontend TS interface uses these
@@ -597,6 +607,7 @@ mod tests {
             "repo_roots",
             "merging_repos",
             "generated_at_ms",
+            "stale",
         ] {
             assert!(
                 v.get(key).is_some(),
@@ -605,5 +616,20 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// A payload written before `stale` existed deserializes as fresh.
+    #[test]
+    fn commit_state_without_stale_reads_as_fresh() {
+        let cs: CommitState = serde_json::from_value(serde_json::json!({
+            "status": "dirty",
+            "touched_count": 1,
+            "dirty_count": 1,
+            "repo_roots": [],
+            "merging_repos": [],
+            "generated_at_ms": 7,
+        }))
+        .unwrap();
+        assert!(!cs.stale);
     }
 }
