@@ -3,7 +3,7 @@
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, error, info, warn};
@@ -30,7 +30,17 @@ pub struct TerminalManager {
     /// `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`).
     /// Removed with the session in [`Self::close`].
     remote_panes: Mutex<HashMap<TerminalId, Arc<super::remote_pane_io::RemotePaneIo>>>,
+    /// Told `(pinned harness id, terminal id, coord session id)` every time a
+    /// terminal is wired to its coord session row
+    /// ([`Self::bind_coord_session`]). main.rs
+    /// attaches the finished-marker late delivery here, so a mark made before
+    /// the terminal had a coord row is not stranded local-only. Unattached →
+    /// binding just sets the id.
+    coord_bind_observer: OnceLock<CoordBindObserver>,
 }
+
+/// See [`TerminalManager::coord_bind_observer`].
+type CoordBindObserver = Box<dyn Fn(&str, &str, uuid::Uuid) + Send + Sync>;
 
 /// Whether opening a terminal in `dir` should pre-accept Claude's workspace
 /// trust for it.
@@ -157,6 +167,25 @@ fn is_within(dir: &str, root: &str) -> bool {
     d == r || d.starts_with(&r_prefix)
 }
 
+/// The rule behind [`TerminalManager::coord_session_id_for_pinned`], over
+/// `(pinned harness id, coord session id)` for every live terminal — pure so
+/// the production rule is unit-testable without a PTY: the coord row of a live
+/// terminal PINNED to `claude_session_id` that has one.
+///
+/// It resolves by pinned id ONLY. A session the provider adopted onto a
+/// terminal (`/clear`) resolves through its predecessor's id instead
+/// (`TerminalSessionRecord::adopted_from`), never through whatever terminal it
+/// happens to name: a typed `claude --resume X` names a pane pinned to some
+/// other id, and that pane's row is not X's.
+pub(crate) fn resolve_pinned_coord<'a>(
+    terminals: impl Iterator<Item = (&'a str, Option<uuid::Uuid>)>,
+    claude_session_id: &str,
+) -> Option<uuid::Uuid> {
+    terminals
+        .filter(|(pinned, _)| *pinned == claude_session_id)
+        .find_map(|(_, coord)| coord)
+}
+
 impl TerminalManager {
     /// Create a new terminal manager with an empty interceptor pipeline.
     pub fn new() -> Self {
@@ -165,7 +194,44 @@ impl TerminalManager {
             interceptor: Arc::new(OutputInterceptor::new()),
             remote_identities: Mutex::new(HashMap::new()),
             remote_panes: Mutex::new(HashMap::new()),
+            coord_bind_observer: OnceLock::new(),
         }
+    }
+
+    /// Attach the coord-bind observer (once, at startup). See
+    /// [`Self::coord_bind_observer`].
+    pub fn attach_coord_bind_observer(
+        &self,
+        f: impl Fn(&str, &str, uuid::Uuid) + Send + Sync + 'static,
+    ) {
+        if self.coord_bind_observer.set(Box::new(f)).is_err() {
+            warn!("terminal manager: coord-bind observer already attached — ignoring");
+        }
+    }
+
+    /// Wire `session` to its coord session row — the ONE door every create
+    /// path uses instead of calling [`TerminalSession::set_coord_session_id`]
+    /// directly, so the coord-bind observer sees every binding.
+    pub fn bind_coord_session(&self, session: &TerminalSession, coord_id: uuid::Uuid) {
+        session.set_coord_session_id(coord_id);
+        if let Some(obs) = self.coord_bind_observer.get() {
+            obs(session.pinned_session_id(), session.id(), coord_id);
+        }
+    }
+
+    /// The coord session id of the live terminal whose pinned harness id is
+    /// `pinned_session_id` — the id a terminal-hosted `claude` runs under and
+    /// that its coord row is registered by. `None` when no live terminal is
+    /// pinned to it, or that terminal has no coord row yet. See
+    /// [`resolve_pinned_coord`].
+    pub fn coord_session_id_for_pinned(&self, pinned_session_id: &str) -> Option<uuid::Uuid> {
+        let sessions = self.sessions.lock().ok()?;
+        resolve_pinned_coord(
+            sessions
+                .values()
+                .map(|s| (s.pinned_session_id(), s.coord_session_id())),
+            pinned_session_id,
+        )
     }
 
     /// Record the pane behind a remote tab (see `remote_panes`).
@@ -899,6 +965,39 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    /// The production rule behind `coord_session_id_for_pinned`: a live
+    /// terminal pinned to the id, and only one that has a coord row.
+    #[test]
+    fn coord_session_id_for_pinned_resolves_only_a_pinned_terminal_with_a_row() {
+        use super::resolve_pinned_coord;
+        let (c1, c2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let live = || {
+            vec![
+                ("pinned-1", Some(c1)),
+                ("pinned-2", Some(c2)),
+                ("pinned-3", None),
+                // A second terminal pinned to the same id (a re-spawn) — the
+                // one with a row wins over the one without.
+                ("pinned-3", Some(c2)),
+                ("pinned-4", None),
+            ]
+            .into_iter()
+        };
+        assert_eq!(resolve_pinned_coord(live(), "pinned-1"), Some(c1));
+        assert_eq!(resolve_pinned_coord(live(), "pinned-2"), Some(c2));
+        assert_eq!(resolve_pinned_coord(live(), "pinned-3"), Some(c2));
+        assert_eq!(
+            resolve_pinned_coord(live(), "pinned-4"),
+            None,
+            "a pinned terminal with no coord row yet resolves nothing"
+        );
+        assert_eq!(
+            resolve_pinned_coord(live(), "typed-resume"),
+            None,
+            "an id no terminal is pinned to never resolves by terminal"
+        );
+    }
 
     /// Every close path clears BOTH remote maps. `close` and `close_all`
     /// always did; `close_after_graceful_exit` cleared only the identity, so

@@ -4558,7 +4558,7 @@ async fn register_remote_created_session(
             let Some(session) = tm.get(terminal_id) else {
                 return Err(terminal_gone_after_confirm(&registry, coord_id));
             };
-            session.set_coord_session_id(coord_id);
+            tm.bind_coord_session(&session, coord_id);
             // Close the coord mirror the instant the PTY exits, instead of
             // leaving a ghost for coord's stale watcher to reap. Same
             // idempotent door the explicit close uses.

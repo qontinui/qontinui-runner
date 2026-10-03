@@ -1353,6 +1353,7 @@ fn registry_record_from_restore_payload(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
     }
 }
 

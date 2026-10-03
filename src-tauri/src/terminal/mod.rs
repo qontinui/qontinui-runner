@@ -625,8 +625,10 @@ coord_ask_question(policy_gap={{category, proposed_clause, tier_applied}}). \
 With tier_applied set it records non-blocking (pre-answered) — you do not wait.
 
 Report status transitions via coord_report_status \
-(working | blocked | waiting_human | finished). Set finished only after \
-cleanup (worktrees, branches) is done.
+(working | blocked | waiting_human | finished), always passing \
+claude_code_session_id = $CLAUDE_CODE_SESSION_ID. Set finished only after \
+cleanup (worktrees, branches) is done; to mark yourself finished, run \
+/finish-session.
 
 Before starting new work, check the communal work ledger so you do not \
 duplicate a peer: coord_who_is_working_on, then coord_declare_intent to \
@@ -1768,7 +1770,7 @@ When you would ask the user a question: fetch the relevant policy and DECIDE, re
 
 When no policy clause covers a decision and you apply a category-default tier to proceed, report the gap so a clause can be authored: coord_ask_question(policy_gap={category, proposed_clause, tier_applied}). With tier_applied set it records non-blocking (pre-answered) — you do not wait.
 
-Report status transitions via coord_report_status (working | blocked | waiting_human | finished). Set finished only after cleanup (worktrees, branches) is done.
+Report status transitions via coord_report_status (working | blocked | waiting_human | finished), always passing claude_code_session_id = $CLAUDE_CODE_SESSION_ID. Set finished only after cleanup (worktrees, branches) is done; to mark yourself finished, run /finish-session.
 
 Before starting new work, check the communal work ledger so you do not duplicate a peer: coord_who_is_working_on, then coord_declare_intent to record your own scope.
 
