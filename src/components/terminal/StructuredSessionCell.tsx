@@ -409,6 +409,7 @@ export function ConversationView({
   toolActivity,
   readStatus,
   lastReadError,
+  kind = "worker",
 }: {
   messages: readonly AiMessage[];
   streamingContent: string;
@@ -417,7 +418,10 @@ export function ConversationView({
   toolActivity: string | null;
   readStatus: SessionReadStatus;
   lastReadError: string | null;
+  /** Words the empty and unreadable states for what the cell hosts. */
+  kind?: StructuredSessionKind;
 }) {
+  const copy = kindCopy(kind);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
   const onScroll = useCallback(() => {
@@ -440,18 +444,16 @@ export function ConversationView({
     >
       {readStatus === "failed" && (
         <div className="rounded border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-1 text-[11px] text-fuchsia-300">
-          UNKNOWN — this worker&apos;s state and transcript could not be read
-          {lastReadError ? `: ${lastReadError}` : ""}. Live output still streams in if the worker is
-          alive.
+          UNKNOWN — this {copy.noun}&apos;s state and transcript could not be read
+          {lastReadError ? `: ${lastReadError}` : ""}. Live output still streams in if the{" "}
+          {copy.noun} is alive.
         </div>
       )}
       {readStatus === "pending" && nothingYet && (
-        <div className="px-1 py-2 text-[11px] text-zinc-500">attaching to the worker session…</div>
+        <div className="px-1 py-2 text-[11px] text-zinc-500">attaching to the {copy.noun} session…</div>
       )}
       {readStatus === "ok" && nothingYet && !isProcessing && (
-        <div className="px-1 py-2 text-[11px] text-zinc-500">
-          No transcript yet — the worker has not produced output.
-        </div>
+        <div className="px-1 py-2 text-[11px] text-zinc-500">{copy.emptyTranscript}</div>
       )}
       {messages.map((msg, i) =>
         msg.role === "ai" ? (
@@ -522,7 +524,7 @@ export interface PermissionResolved {
   sessionId: string;
   requestId: string;
   toolName: string;
-  outcome: "allowed" | "denied" | "timed_out" | "session_ended";
+  outcome: "allowed" | "denied" | "timed_out" | "session_ended" | "superseded";
   message?: string | null;
   interrupt: boolean;
 }
@@ -579,7 +581,26 @@ export function resolvedLabel(r: PermissionResolved): string {
       return `No decision in time — the runner denied ${r.toolName} (fail closed).`;
     case "session_ended":
       return `The session ended before ${r.toolName} was answered.`;
+    case "superseded":
+      return `The CLI replaced the ${r.toolName} request with a new one before it was answered.`;
   }
+}
+
+/** What `respond_session_permission` returns (Rust `PermissionResponseOutcome`). */
+export interface PermissionResponseOutcome {
+  resolved: PermissionResolved;
+  /** Set when a deny asked to interrupt and the interrupt could not be sent. */
+  interruptError?: string | null;
+}
+
+/**
+ * The warning to show for an answer whose deny went through but whose
+ * interrupt did not — the turn is still running. `null` when there is
+ * nothing to warn about. Pure.
+ */
+export function interruptFailureText(outcome: PermissionResponseOutcome | null): string | null {
+  if (!outcome?.interruptError) return null;
+  return `Denied ${outcome.resolved.toolName}, but the interrupt could not be sent — the turn is still running: ${outcome.interruptError}`;
 }
 
 /** The arguments `respond_session_permission` takes for an answer. Pure. */
@@ -703,6 +724,7 @@ function useSessionPermissions(sessionId: string) {
   const [lastResolved, setLastResolved] = useState<PermissionResolved | null>(null);
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
   const [answerError, setAnswerError] = useState<{ id: string; error: string } | null>(null);
+  const [interruptWarning, setInterruptWarning] = useState<string | null>(null);
   /**
    * Requests known to be over — resolved by an event or answered here. The
    * mount read can return a snapshot taken before a resolution that was
@@ -764,8 +786,13 @@ function useSessionPermissions(sessionId: string) {
     async (requestId: string, choice: PermissionAnswer) => {
       setBusyIds((ids) => new Set(ids).add(requestId));
       setAnswerError(null);
+      setInterruptWarning(null);
       try {
-        await invoke("respond_session_permission", respondArgs(sessionId, requestId, choice));
+        const outcome = await invoke<PermissionResponseOutcome | null>(
+          "respond_session_permission",
+          respondArgs(sessionId, requestId, choice),
+        );
+        setInterruptWarning(interruptFailureText(outcome));
         // The resolved event removes the card; remove it here too so a missed
         // event cannot leave live-looking buttons for an answered request.
         resolvedIdsRef.current.add(requestId);
@@ -783,7 +810,16 @@ function useSessionPermissions(sessionId: string) {
     [sessionId],
   );
 
-  return { requests, readStatus, readError, lastResolved, busyIds, answerError, answer };
+  return {
+    requests,
+    readStatus,
+    readError,
+    lastResolved,
+    busyIds,
+    answerError,
+    interruptWarning,
+    answer,
+  };
 }
 
 /** The structured-session kinds the cell labels. */
@@ -792,19 +828,27 @@ export type StructuredSessionKind = "worker" | "structured";
 /** Header label and steering wording per kind. Pure. */
 export function kindCopy(kind: StructuredSessionKind): {
   label: string;
+  /** What the cell calls the thing it hosts, in running text. */
+  noun: string;
   steerQueued: string;
   steerNow: string;
+  /** The empty-transcript line after a successful read. */
+  emptyTranscript: string;
 } {
   return kind === "worker"
     ? {
         label: "Worker",
+        noun: "worker",
         steerQueued: "Steer the worker — queued until its current turn ends",
         steerNow: "Steer the worker — sent immediately",
+        emptyTranscript: "No transcript yet — the worker has not produced output.",
       }
     : {
         label: "Structured",
+        noun: "session",
         steerQueued: "Message the session — queued until its current turn ends",
         steerNow: "Message the session — sent immediately",
+        emptyTranscript: "No transcript yet — send the session a message to start it.",
       };
 }
 
@@ -996,6 +1040,15 @@ export function StructuredSessionCell({ tab, taskRunId, visible, kind }: Structu
           {resolvedLabel(permissions.lastResolved)}
         </div>
       )}
+      {permissions.interruptWarning && (
+        <div
+          className="border-b border-[#2a2d3d] px-2 py-0.5 text-[10px] text-amber-300"
+          data-permission-interrupt-failed
+          role="alert"
+        >
+          {permissions.interruptWarning}
+        </div>
+      )}
       {kind === "structured" && permissions.readStatus === "failed" && (
         <div
           className="border-b border-[#2a2d3d] px-2 py-0.5 text-[10px] text-fuchsia-300"
@@ -1017,6 +1070,7 @@ export function StructuredSessionCell({ tab, taskRunId, visible, kind }: Structu
           toolActivity={session.toolActivity}
           readStatus={session.readStatus}
           lastReadError={session.lastReadError}
+          kind={kind}
         />
       ) : (
         <div className="flex min-h-0 flex-1 flex-col">
