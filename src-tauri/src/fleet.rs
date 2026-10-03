@@ -58,6 +58,19 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// Kernel pressure axes for the host lane — load 1/5/15, PSI, the `oom_kill`
+/// counter and `boot_id`, each with a `measured` manifest (plan
+/// `2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity-and-coord-has-no-resource-model`
+/// §3.4). Consumed by [`resource_sample`] and [`computer`].
+pub(crate) mod host_axes;
+
+/// The fleet computer as a first-class entity: identity, static capacity,
+/// watched services, events and `POST /coord/computers/report` (same plan,
+/// Phase 2 + the runner half of Phase 6). Ticked from
+/// [`spawn_budget_republisher`] so it inherits that function's shared-state
+/// ownership gate, exactly like [`resource_sample`].
+pub(crate) mod computer;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -939,12 +952,17 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // payload fires immediately — the first sample lands one sample
             // interval in, the first re-assert one full budget period in.
             let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+            // The computer reporter (identity, services, events) rides this
+            // same gated loop — no timer or gate of its own. Rebuilt per
+            // supervised run; its durable state lives on disk.
+            let mut reporter = computer::Reporter::new();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                reporter.tick().await;
 
                 if tokio::time::Instant::now() < next_budget {
                     continue;
