@@ -390,6 +390,8 @@ pub async fn terminal_create(
                 // spawn's does. A no-op for a terminal the registry does not
                 // hold — every ordinary operator tab.
                 let exited_terminal_id = info.id.clone();
+                // tauri's handle rather than `Handle::try_current()`: it is always
+                // available here, and the waiter thread that fires the hook has none.
                 let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
                 session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
@@ -2363,8 +2365,8 @@ pub(crate) fn create_terminal_session_backend(
                 // hook can tell `agent_runtime` a continuation slot just freed and
                 // a deferred (AtCap) continuation can be re-polled promptly. The
                 // notify is a no-op unless this terminal is a registered
-                // continuation session, so operator tabs (a different create path)
-                // never trigger a poll. The PTY waiter that fires this hook is a
+                // continuation session, so an ordinary operator tab never
+                // triggers a poll. The PTY waiter that fires this hook is a
                 // bare OS thread with no tokio runtime, so capture the current
                 // runtime handle HERE (this fn runs under tokio) for the poll to
                 // spawn on.

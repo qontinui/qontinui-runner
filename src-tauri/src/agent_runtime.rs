@@ -3594,9 +3594,10 @@ impl Drop for AnchorReservation {
 // Capacity-freed re-poll (Defect A item 3, layered on #484)
 // =============================================================================
 
-/// Capacity-freed re-poll trigger: called from the continuation terminal's
-/// on-exit hook (`create_terminal_session_backend`, `commands/terminal.rs`) the
-/// instant a continuation-spawned PTY exits.
+/// Capacity-freed re-poll trigger: called from two on-exit hooks in
+/// `commands/terminal.rs` — `create_terminal_session_backend`'s (a
+/// continuation-spawned PTY) and `terminal_create`'s (the pane a boot restore
+/// resumes a continuation into, plan 2026-10-03 D3) — the instant the PTY exits.
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
 /// it WAS a registered continuation session — kicks an immediate
@@ -3604,14 +3605,12 @@ impl Drop for AnchorReservation {
 /// drains promptly into the freed slot instead of waiting for an unrelated WS
 /// reconnect.
 ///
-/// **Operator tabs never trigger a poll.** Operator-opened terminals are created
-/// via `terminal_create` (a different path) and are never inserted into the
-/// continuation registry, so the `was_continuation` test below is `false` for
-/// them and this is a pure no-op. (`create_terminal_session_backend` — the only
-/// caller that wires this hook — is reached ONLY from the gate-continuation
-/// path.) Even so, the registry check is kept as defense-in-depth so a future
-/// caller of the backend helper can't accidentally trigger poll storms on
-/// unrelated tab closes.
+/// **Ordinary operator tabs never trigger a poll.** An operator tab is not in
+/// the continuation registry, so the deregister below misses and this returns
+/// early — a pure no-op. The only `terminal_create` panes that ARE registered
+/// are boot-restored continuations (D3), and for those the poll is wanted:
+/// they held a cap slot. The registry check is what keeps unrelated tab closes
+/// from causing poll storms.
 ///
 /// No device id → no-op (the poll has no target); a deferral that happened
 /// without a resolvable device id is covered by the WS-reconnect catch-up.
