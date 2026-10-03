@@ -39,8 +39,13 @@
 //!
 //! plus runner-local STRUCTURAL refinements ADDED to vocabulary classes
 //! (which the file's header permits; see `RUNNER_REFINEMENTS`). The vocabulary
-//! is narrower than this roster was before it, and these restore the Rust-shaped
-//! coverage it does not carry: to `repo_layout`, a product sibling repo named
+//! is narrower than this roster was before it, and these restore PART of the
+//! Rust-shaped coverage it does not carry — `repo_layout` and
+//! `supervisor_dependency` only. `tenant_literal` and `machine_path` are
+//! deliberately left at the vocabulary's width (the fleet's own tenant/org
+//! literals and fleet drive/home paths), so arbitrary UUID literals and generic
+//! install paths such as `C:\Program Files\…` are no longer reported. The
+//! refinements: to `repo_layout`, a product sibling repo named
 //! BARE as a path component in a literal (`workspace.join("qontinui-web")`,
 //! `"multistate"`, `"ui-bridge"`); to `supervisor_dependency`, a call to a
 //! snake_case helper named for the supervisor (`check_supervisor_available()`)
@@ -214,7 +219,7 @@ const RUNNER_REFINEMENTS: &[(&str, LocalPattern)] = &[
     // product repo named BARE as a path component — `workspace.join("qontinui-web")`,
     // `"**/qontinui-web/**"`, `const WEB_REPO_DIR = "qontinui-web"`,
     // `["qontinui", "multistate"]` — is the same workspace-layout assumption in
-    // Rust's spelling. Restores the roster's pre-vocabulary coverage.
+    // Rust's spelling. Restores the roster's pre-vocabulary repo_layout coverage.
     (
         "repo_layout",
         LocalPattern {
@@ -2742,10 +2747,11 @@ fn swap_rule_base_unreadable_is_an_error_with_the_reason() {
     git_ok(repo, &["add", "-A"]);
     git_ok(repo, &["commit", "-q", "-m", "only"]);
     let err = merge_base_roster(repo).expect_err("no main ref");
-    assert!(
-        err.contains("origin/main") && err.contains("main:"),
-        "{err}"
-    );
+    // Both refs must be tried and reported: `origin/main: …` first, then the
+    // local-`main` fallback after the `; ` separator (`"origin/main:"` alone
+    // already contains `main:`, so that would not prove the fallback ran).
+    assert!(err.starts_with("origin/main:"), "{err}");
+    assert!(err.contains("; main:"), "{err}");
 }
 
 /// The widened bare-port refinement: suffixes and range ends hit; a
