@@ -9,8 +9,15 @@
 //!
 //! ```text
 //! resolution order (per command name):
-//!     fresh fetch (qontinui-web)  →  disk cache  →  embedded default
+//!     account override (fresh fetch, else disk cache)
+//!       →  canonical qontinui-claude-config@origin/main  →  embedded default
 //! ```
+//!
+//! The canonical rung is `crate::canonical_corpus`: a runner-owned bare mirror
+//! of the repository the embedded bodies are vendored from, refreshed off the
+//! spawn path and read here from memory. It only ever REPLACES an embedded
+//! default by name (it never adds a command the bundle lacks), and its bodies
+//! pass the same [`validate_override`] rules an account override passes.
 //!
 //! ## Override-by-name, NOT concatenation
 //!
@@ -117,6 +124,12 @@ pub enum CommandSource {
     /// earlier successful fetch. Never carried by the build, and reached only
     /// when the fetch was `FetchOutcome::Unavailable`.
     DiskCache,
+    /// Read from the runner's mirror of `qontinui-claude-config` at
+    /// `origin/main` (`crate::canonical_corpus`). A PER-BODY rung, never a
+    /// registry arm: [`AgentCommandRegistry::resolution_arm`] reports which arm
+    /// of the ACCOUNT layer answered, and this is not one of them. Which
+    /// snapshot the body came from rides on [`ResolvedCommand::canonical`].
+    Canonical,
 }
 
 impl CommandSource {
@@ -129,6 +142,7 @@ impl CommandSource {
             CommandSource::Builtin => "builtin",
             CommandSource::Served => "served",
             CommandSource::DiskCache => "disk_cache",
+            CommandSource::Canonical => "canonical",
         }
     }
 }
@@ -143,6 +157,9 @@ pub struct ResolvedCommand {
     pub body: String,
     /// Which layer supplied [`body`](Self::body).
     pub source: CommandSource,
+    /// The `origin/main` snapshot a [`CommandSource::Canonical`] body was read
+    /// at; `None` for every other source.
+    pub canonical: Option<crate::canonical_corpus::CanonicalSnapshot>,
 }
 
 impl ResolvedCommand {
@@ -183,21 +200,29 @@ fn validate_name(name: &str) -> Result<(), String> {
 /// rather than assumed because this function cannot tell them apart and the
 /// difference is the measurement.
 fn validate_override(cmd: &AgentCommand, source: CommandSource) -> Result<ResolvedCommand, String> {
-    let name = cmd.name.trim();
+    validate_body(&cmd.name, &cmd.body, source)
+}
+
+/// The rules [`validate_override`] applies, over a bare name and body — so a
+/// canonical body read out of the git mirror passes exactly the checks an
+/// account override passes, with no second notion of "valid".
+fn validate_body(name: &str, body: &str, source: CommandSource) -> Result<ResolvedCommand, String> {
+    let name = name.trim();
     validate_name(name)?;
-    if cmd.body.trim().is_empty() {
+    if body.trim().is_empty() {
         return Err("override body is empty".to_string());
     }
-    if cmd.body.len() > MAX_BODY_BYTES {
+    if body.len() > MAX_BODY_BYTES {
         return Err(format!(
             "override body is {} bytes, over the {MAX_BODY_BYTES}-byte limit",
-            cmd.body.len()
+            body.len()
         ));
     }
     Ok(ResolvedCommand {
         name: name.to_string(),
-        body: cmd.body.clone(),
+        body: body.to_string(),
         source,
+        canonical: None,
     })
 }
 
@@ -214,6 +239,9 @@ fn validate_override(cmd: &AgentCommand, source: CommandSource) -> Result<Resolv
 #[derive(Debug, Clone)]
 pub struct AgentCommandRegistry {
     builtin: Vec<ResolvedCommand>,
+    /// Canonical replacements for embedded defaults, by name. Outranked by an
+    /// account override; outranks the embedded default.
+    canonical: Vec<ResolvedCommand>,
     overrides: Vec<ResolvedCommand>,
     /// Which arm of [`resolve_registry`]'s three-rung order actually answered.
     /// See [`AgentCommandRegistry::resolution_arm`].
@@ -237,8 +265,10 @@ impl AgentCommandRegistry {
                     name: (*name).to_string(),
                     body: (*body).to_string(),
                     source: CommandSource::Builtin,
+                    canonical: None,
                 })
                 .collect(),
+            canonical: Vec::new(),
             overrides: Vec::new(),
             // Nothing has been layered on yet, so the embedded floor is what
             // answered. `set_overrides` moves this up when an arm supplies one.
@@ -298,6 +328,38 @@ impl AgentCommandRegistry {
         self.overrides.len()
     }
 
+    /// Install the canonical rung: every body in `commands` that names an
+    /// EMBEDDED default and passes [`validate_body`] replaces that default
+    /// (unless an account override outranks it). A name the bundle lacks is
+    /// ignored — the canonical repo holds far more commands than this binary
+    /// provisions, and this rung refreshes the bundle rather than widening it.
+    /// Returns the number accepted.
+    pub(crate) fn set_canonical(
+        &mut self,
+        commands: &crate::canonical_corpus::CanonicalCommands,
+    ) -> usize {
+        let mut accepted = Vec::new();
+        for builtin in &self.builtin {
+            let Some(body) = commands.bodies.get(&builtin.name) else {
+                continue;
+            };
+            match validate_body(&builtin.name, body, CommandSource::Canonical) {
+                Ok(mut resolved) => {
+                    resolved.canonical = Some(commands.snapshot.clone());
+                    accepted.push(resolved);
+                }
+                Err(why) => warn!(
+                    "agent_commands: ignoring the canonical body of {:?} at {} ({why}) — \
+                     falling back to the embedded default for it",
+                    builtin.name,
+                    commands.snapshot.short()
+                ),
+            }
+        }
+        self.canonical = accepted;
+        self.canonical.len()
+    }
+
     /// Which arm of [`resolve_registry`]'s `fresh fetch → disk cache → embedded
     /// default` order answered for this registry.
     ///
@@ -314,16 +376,20 @@ impl AgentCommandRegistry {
     }
 
     /// The resolved command set, in a stable order: every embedded default (in
-    /// bundle order), replaced in place by a same-named account override,
-    /// followed by account commands that have no embedded counterpart.
+    /// bundle order), replaced in place by a same-named account override, else
+    /// by a same-named canonical body, followed by account commands that have
+    /// no embedded counterpart.
     pub fn all(&self) -> Vec<&ResolvedCommand> {
         let mut out: Vec<&ResolvedCommand> =
             Vec::with_capacity(self.builtin.len() + self.overrides.len());
         for b in &self.builtin {
-            match self.overrides.iter().find(|o| o.name == b.name) {
-                Some(o) => out.push(o),
-                None => out.push(b),
-            }
+            let chosen = self
+                .overrides
+                .iter()
+                .find(|o| o.name == b.name)
+                .or_else(|| self.canonical.iter().find(|c| c.name == b.name))
+                .unwrap_or(b);
+            out.push(chosen);
         }
         let builtin_names: HashSet<&str> = self.builtin.iter().map(|c| c.name.as_str()).collect();
         for o in &self.overrides {
@@ -334,11 +400,12 @@ impl AgentCommandRegistry {
         out
     }
 
-    /// Resolve one command by name (override wins).
+    /// Resolve one command by name (override, then canonical, then embedded).
     pub fn get(&self, name: &str) -> Option<&ResolvedCommand> {
         self.overrides
             .iter()
             .find(|c| c.name == name)
+            .or_else(|| self.canonical.iter().find(|c| c.name == name))
             .or_else(|| self.builtin.iter().find(|c| c.name == name))
     }
 
@@ -350,6 +417,15 @@ impl AgentCommandRegistry {
     /// How many account overrides are installed.
     pub fn override_count(&self) -> usize {
         self.overrides.len()
+    }
+
+    /// How many embedded defaults the canonical rung replaced — the canonical
+    /// bodies actually SERVED, i.e. not themselves outranked by an override.
+    pub fn canonical_count(&self) -> usize {
+        self.all()
+            .iter()
+            .filter(|c| c.source == CommandSource::Canonical)
+            .count()
     }
 }
 
@@ -572,17 +648,26 @@ async fn fetch_overrides_async(base_url: &str) -> FetchOutcome {
 // Resolution
 // ---------------------------------------------------------------------------
 
-/// Pure resolver: turn one [`FetchOutcome`] plus whatever the cache held into
-/// the registry to provision. Split out from [`resolve_registry`] so every
-/// resolution gate is testable without a backend or a filesystem.
+/// Pure resolver: turn one [`FetchOutcome`] plus whatever the cache held and
+/// whatever canonical snapshot is loaded into the registry to provision. Split
+/// out from [`resolve_registry`] so every resolution gate is testable without a
+/// backend, a filesystem or a git mirror.
+///
+/// Per command: account override (`Served`, else `DiskCache`) → canonical →
+/// embedded default. `canonical: None` is byte-identically the pre-canonical
+/// behaviour.
 ///
 /// Returns the registry and, when the caller should persist something, the
 /// cache action to take.
 pub(crate) fn resolve_with(
     outcome: FetchOutcome,
     cached: Option<Vec<AgentCommand>>,
+    canonical: Option<&crate::canonical_corpus::CanonicalCommands>,
 ) -> (AgentCommandRegistry, CacheAction) {
     let mut registry = AgentCommandRegistry::new();
+    if let Some(commands) = canonical {
+        registry.set_canonical(commands);
+    }
     match outcome {
         FetchOutcome::Fresh(commands) => {
             let n = registry.set_overrides(commands.clone(), CommandSource::Served);
@@ -627,7 +712,9 @@ pub(crate) enum CacheAction {
     Keep,
 }
 
-/// Resolve the command set to provision: fresh fetch → disk cache → embedded
+/// Resolve the command set to provision: fresh fetch → disk cache for the
+/// account layer, then the canonical rung's last loaded snapshot
+/// ([`crate::canonical_corpus::latest`], a memory read), then the embedded
 /// defaults.
 ///
 /// Never fails and never panics. Every layer degrades to the next one; the
@@ -651,11 +738,15 @@ pub fn resolve_registry() -> AgentCommandRegistry {
         (FetchOutcome::Unavailable(_), Some(p)) => read_cache_at(p, &base_url),
         _ => None,
     };
-    let (registry, action) = resolve_with(outcome, cached);
+    let canonical = crate::canonical_corpus::latest();
+    let (registry, action) =
+        resolve_with(outcome, cached, canonical.as_deref().map(|c| &c.commands));
     info!(
-        "agent_commands: resolved via the {} arm ({} override(s) over {} embedded default(s))",
+        "agent_commands: resolved via the {} arm ({} override(s), {} canonical body(ies) over {} \
+         embedded default(s))",
         registry.resolution_arm().as_str(),
         registry.override_count(),
+        registry.canonical_count(),
         registry.builtin_count(),
     );
     if let Some(p) = &path {
@@ -691,7 +782,7 @@ mod tests {
     /// bodies are byte-identical to what `include_str!` embedded.
     #[test]
     fn no_account_resolves_embedded_defaults_byte_identically() {
-        let (registry, action) = resolve_with(FetchOutcome::NoAccount, None);
+        let (registry, action) = resolve_with(FetchOutcome::NoAccount, None, None);
         assert_eq!(action, CacheAction::Clear);
         assert_eq!(registry.override_count(), 0);
 
@@ -713,8 +804,11 @@ mod tests {
     #[test]
     fn override_replaces_the_default_by_name() {
         let first = crate::fleet_commands::FLEET_COMMANDS[0].0;
-        let (registry, action) =
-            resolve_with(FetchOutcome::Fresh(vec![cmd(first, "# mine\n")]), None);
+        let (registry, action) = resolve_with(
+            FetchOutcome::Fresh(vec![cmd(first, "# mine\n")]),
+            None,
+            None,
+        );
         assert!(matches!(action, CacheAction::Store(_)));
 
         let resolved = registry.all();
@@ -742,6 +836,7 @@ mod tests {
         let (registry, _) = resolve_with(
             FetchOutcome::Fresh(vec![cmd("my-command", "# mine\n")]),
             None,
+            None,
         );
         let resolved = registry.all();
         assert_eq!(
@@ -759,6 +854,7 @@ mod tests {
         let (registry, action) = resolve_with(
             FetchOutcome::Unavailable("connection refused".to_string()),
             Some(vec![cmd(first, "# cached\n")]),
+            None,
         );
         assert_eq!(action, CacheAction::Keep);
         assert_eq!(registry.get(first).unwrap().body, "# cached\n");
@@ -775,8 +871,11 @@ mod tests {
     #[test]
     fn unavailable_with_no_cache_falls_back_to_defaults() {
         let first = crate::fleet_commands::FLEET_COMMANDS[0].0;
-        let (registry, action) =
-            resolve_with(FetchOutcome::Unavailable("dns failure".to_string()), None);
+        let (registry, action) = resolve_with(
+            FetchOutcome::Unavailable("dns failure".to_string()),
+            None,
+            None,
+        );
         assert_eq!(action, CacheAction::Keep);
         assert_eq!(registry.override_count(), 0);
         assert_eq!(registry.get(first).unwrap().source, CommandSource::Builtin);
@@ -790,14 +889,15 @@ mod tests {
         let default_body = crate::fleet_commands::FLEET_COMMANDS[0].1;
 
         // Empty body.
-        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![cmd(first, "   \n")]), None);
+        let (registry, _) =
+            resolve_with(FetchOutcome::Fresh(vec![cmd(first, "   \n")]), None, None);
         assert_eq!(registry.override_count(), 0);
         assert_eq!(registry.get(first).unwrap().body, default_body);
         assert_eq!(registry.get(first).unwrap().source, CommandSource::Builtin);
 
         // Oversized body.
         let huge = "x".repeat(MAX_BODY_BYTES + 1);
-        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![cmd(first, &huge)]), None);
+        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![cmd(first, &huge)]), None, None);
         assert_eq!(registry.override_count(), 0);
         assert_eq!(registry.get(first).unwrap().body, default_body);
     }
@@ -847,6 +947,7 @@ mod tests {
         let (registry, _) = resolve_with(
             FetchOutcome::Fresh(vec![cmd("../../evil", "# pwn\n")]),
             None,
+            None,
         );
         assert_eq!(registry.override_count(), 0);
         assert_eq!(
@@ -862,6 +963,7 @@ mod tests {
         let (registry, _) = resolve_with(
             FetchOutcome::Fresh(vec![cmd("dupe", "# first\n"), cmd("dupe", "# second\n")]),
             None,
+            None,
         );
         assert_eq!(registry.override_count(), 1);
         assert_eq!(registry.get("dupe").unwrap().body, "# first\n");
@@ -871,7 +973,7 @@ mod tests {
     /// and it replaces the cache rather than leaving a stale one in place.
     #[test]
     fn empty_fresh_fetch_clears_the_override_layer() {
-        let (registry, action) = resolve_with(FetchOutcome::Fresh(vec![]), None);
+        let (registry, action) = resolve_with(FetchOutcome::Fresh(vec![]), None, None);
         assert_eq!(registry.override_count(), 0);
         assert_eq!(action, CacheAction::Store(vec![]));
     }
@@ -934,14 +1036,19 @@ mod tests {
         let first = crate::fleet_commands::FLEET_COMMANDS[0].0;
 
         // Arm 1 — a live fetch answered.
-        let (served, _) = resolve_with(FetchOutcome::Fresh(vec![cmd(first, "# wire\n")]), None);
+        let (served, _) = resolve_with(
+            FetchOutcome::Fresh(vec![cmd(first, "# wire\n")]),
+            None,
+            None,
+        );
         // Arm 2 — the fetch failed and the on-disk cache answered.
         let (cached, _) = resolve_with(
             FetchOutcome::Unavailable("connection refused".to_string()),
             Some(vec![cmd(first, "# cached\n")]),
+            None,
         );
         // Arm 3 — nothing above answered; the embedded floor did.
-        let (embedded, _) = resolve_with(FetchOutcome::NoAccount, None);
+        let (embedded, _) = resolve_with(FetchOutcome::NoAccount, None, None);
 
         let arms = [
             served.resolution_arm(),
@@ -973,8 +1080,11 @@ mod tests {
     /// merely because the cache was the arm that was tried.
     #[test]
     fn unavailable_with_no_cache_reports_the_embedded_arm() {
-        let (registry, _) =
-            resolve_with(FetchOutcome::Unavailable("dns failure".to_string()), None);
+        let (registry, _) = resolve_with(
+            FetchOutcome::Unavailable("dns failure".to_string()),
+            None,
+            None,
+        );
         assert_eq!(registry.resolution_arm(), CommandSource::Builtin);
     }
 
@@ -983,7 +1093,7 @@ mod tests {
     /// is a network reading, not an absence of one.
     #[test]
     fn an_empty_fresh_fetch_still_records_the_served_arm() {
-        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![]), None);
+        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![]), None, None);
         assert_eq!(registry.override_count(), 0);
         assert_eq!(registry.resolution_arm(), CommandSource::Served);
         // ...and the BODIES are still stated, per command, as embedded.

@@ -478,3 +478,23 @@ note = "Runs check_supervisor_available on a blocking thread and passes == Some(
 reviewed = [
     "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
 ]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/canonical_corpus.rs"
+symbol = "resolve_url"
+disposition = "fallback_correct"
+note = "Middle rung of the canonical mirror's clone-URL resolution: read the workspace qontinui-claude-config checkout's remote.origin.url when that checkout exists; absent, the https://github.com/qontinui/qontinui-claude-config.git default answers. Off the spawn path; no checkout is read or written beyond that one bounded git config."
+reviewed = [
+    ".map(|root| root.join(\"qontinui-claude-config\"))",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/provenance.rs"
+symbol = "const CANONICAL_REPO"
+disposition = "fallback_correct"
+note = "The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk."
+reviewed = [
+    "const CANONICAL_REPO: &str = \"qontinui-claude-config\";",
+]

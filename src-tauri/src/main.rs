@@ -64,6 +64,9 @@ mod build_drift;
 // and the plan's Design decision 1 requires the SHIPPED app binary to emit it —
 // `bundle.externalBin` ships only two sidecars, so a helper bin would not be in
 // the installer and could not answer the question at all.
+/// The canonical-generation rung: the runner's bare mirror of
+/// `qontinui-claude-config`, refreshed off the spawn path.
+mod canonical_corpus;
 mod capability_manifest;
 mod check_executor;
 mod check_generation;
@@ -213,6 +216,8 @@ mod projects;
 mod prompt_library;
 mod prompt_snippets;
 mod prompts;
+/// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
+mod provenance;
 /// The shared tracked-destination guard both fleet provisioners consult.
 mod provision_guard;
 mod rag;
@@ -243,6 +248,9 @@ mod sdk_features;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
+/// Which `.claude/` tree a spawned session is served, measured at the seam
+/// for the `[served-corpus: …]` header line of `QONTINUI_RUNNER_CONTEXT`.
+mod served_corpus;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)

@@ -479,6 +479,12 @@ impl Rung {
     /// - `Served` → [`Rung::Served`] (fetched over the network this run).
     /// - `DiskCache` → [`Rung::DiskCache`] (this device's own cache file).
     ///
+    /// - `Canonical` → [`Rung::Served`], WITH a caveat. It is a per-body rung
+    ///   (the runner's git mirror of `qontinui-claude-config`, fetched at run
+    ///   time) and never a registry arm, so a resolution-arm row never carries
+    ///   it; the caveat says so rather than letting it pass for the account's
+    ///   served arm.
+    ///
     /// Exhaustive with no `_` arm, deliberately: a variant added upstream must
     /// break this build rather than silently default.
     #[must_use]
@@ -487,6 +493,13 @@ impl Rung {
             CommandSource::Builtin => (Rung::Embedded, None),
             CommandSource::Served => (Rung::Served, None),
             CommandSource::DiskCache => (Rung::DiskCache, None),
+            CommandSource::Canonical => (
+                Rung::Served,
+                Some(
+                    "canonical: a per-body rung (the runner's git mirror of \
+                     qontinui-claude-config origin/main), not an account-layer arm",
+                ),
+            ),
         }
     }
 
@@ -986,6 +999,16 @@ pub enum SkipReason {
     /// bucket. Nothing here is an error value: the pass continues and the spawn
     /// proceeds, the session simply lacks that skill.
     Rejected(String),
+    /// The session's WHOLE `.claude/` tree is authored by the enclosing
+    /// repository (it tracks paths under `.claude/`), so the provisioner did
+    /// not run at all for this workdir.
+    ///
+    /// Distinct from [`SkipReason::GitTracked`] on purpose: that one says
+    /// "this destination FILE is tracked", this one says "the whole tree is the
+    /// repo's own" — different facts with different remedies. It is also the
+    /// answer when the tracked-tree probe did not answer inside its budget and
+    /// the skip was taken to avoid clobbering files it could not see.
+    RepoAuthored,
 }
 
 impl SkipReason {
@@ -997,6 +1020,7 @@ impl SkipReason {
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
+            SkipReason::RepoAuthored => "repo_authored",
         }
     }
 
@@ -1010,6 +1034,11 @@ impl SkipReason {
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
+            SkipReason::RepoAuthored => {
+                "the workdir's .claude/ is authored by its repository — provisioning skipped \
+                 for the whole tree"
+                    .to_string()
+            }
         }
     }
 }
@@ -1057,6 +1086,11 @@ pub struct ProvisionReport {
     pub destination: Option<String>,
     /// Provisioner-specific extra, in its own vocabulary.
     pub detail: Option<String>,
+    /// When the pass ran (the report is built as the pass begins, and a pass
+    /// lasts milliseconds). Load-bearing for a reader of the ledger that may
+    /// be looking at a PREVIOUS spawn's report for the same workdir — the
+    /// served-corpus header line renders it as `as-of`.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ProvisionReport {
@@ -1071,6 +1105,7 @@ impl ProvisionReport {
             rung,
             destination: None,
             detail: None,
+            at: chrono::Utc::now(),
         }
     }
 
@@ -1925,6 +1960,24 @@ pub fn render_manifest_doc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_authored_is_its_own_skip_reason() {
+        assert_eq!(SkipReason::RepoAuthored.wire(), "repo_authored");
+        assert_ne!(SkipReason::RepoAuthored, SkipReason::GitTracked);
+        assert!(SkipReason::RepoAuthored
+            .describe()
+            .contains("authored by its repository"));
+        let json = serde_json::to_value(SkipReason::RepoAuthored).unwrap();
+        assert_eq!(json["reason"], "repo_authored");
+    }
+
+    #[test]
+    fn a_report_is_stamped_when_its_pass_runs() {
+        let before = chrono::Utc::now();
+        let report = ProvisionReport::new("fleet_commands", 1, Rung::Embedded);
+        assert!(report.at >= before && report.at <= chrono::Utc::now());
+    }
     use std::collections::BTreeSet;
 
     fn unobserved_inputs() -> ManifestInputs {
@@ -2177,6 +2230,7 @@ mod tests {
                 CommandSource::Builtin => assert_eq!(rung, Rung::Embedded),
                 CommandSource::Served => assert_eq!(rung, Rung::Served),
                 CommandSource::DiskCache => assert_eq!(rung, Rung::DiskCache),
+                CommandSource::Canonical => unreachable!("not a registry arm"),
             }
             assert!(
                 note.is_none(),
@@ -2193,6 +2247,15 @@ mod tests {
             all.len(),
             "two arms sharing a rung is the collapse Phase 3 removed"
         );
+    }
+
+    /// The canonical per-body rung is not an account-layer arm, and its
+    /// mapping says so rather than passing for `served`.
+    #[test]
+    fn the_canonical_command_source_carries_its_caveat() {
+        let (rung, note) = Rung::from_command_source(CommandSource::Canonical);
+        assert_eq!(rung, Rung::Served);
+        assert!(note.is_some_and(|n| n.contains("per-body")), "{note:?}");
     }
 
     /// The observation builder states the upstream variant in `detail`, so the
