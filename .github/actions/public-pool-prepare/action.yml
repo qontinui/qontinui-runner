@@ -1,0 +1,117 @@
+# Make a PERSISTENT public-pool host safe for one routed job, before anything
+# else in that job runs. Used ONLY on the self-hosted lane (the caller guards it
+# with `if: env.SELF_HOSTED_LANE == 'true'`); the hosted lane never runs it.
+#
+# Plan 2026-10-03-runner-pr-branch-windows-ci-has-no-off-hosted-path (qontinui-
+# dev-notes), Phase 1. A hosted runner is a fresh VM per job; a public-pool host
+# (`merytshost-public` today, user `runner-public`, no sudo) is not. Three things
+# this workflow assumed of a fresh VM are false there, and each is handled here:
+#
+#   1. SIBLING CHECKOUTS PERSIST. `checkout-sibling` checks each sibling out to
+#      `$GITHUB_WORKSPACE/../<name>` and REFUSES a destination that already
+#      exists (by design: it is the one contract for sibling checkouts). On a
+#      persistent host the previous job's siblings are still there, so this step
+#      removes exactly the named sibling directories -- never anything else under
+#      the workspace parent -- before the caller's checkout-sibling steps run.
+#
+#   2. NO SUDO, NO APT. The hosted lane `sudo apt-get install`s the webkit/gtk
+#      build deps; `runner-public` cannot, and must not be given sudo. They are a
+#      host prerequisite installed once by the operator; this step VERIFIES them
+#      (dpkg-query) and fails naming what is missing, rather than letting a
+#      cargo build fail an hour later on a missing pkg-config file.
+#
+#   3. A PERSISTENT TARGET DIR replaces rust-cache. `actions/checkout` cleans the
+#      workspace (`git clean -ffdx`), so `./target` would be cold every run. The
+#      target dir is pointed OUTSIDE the workspace, at a per-host cache under the
+#      runner account's home, and wiped when it grows past `max-target-gb`.
+#
+# It also clears AMBIENT-STATE POISON left behind by a job that died between
+# ci.yml's `Poison ambient state` and `Unpoison ambient state` steps. `runner-
+# public` is a dedicated account with no qontinui state, so anything under
+# `~/.qontinui` other than the three poison files is unexpected real state: the
+# step refuses (fails) rather than delete it.
+name: public-pool-prepare
+description: Prepare a persistent public-pool host for one routed job (self-hosted lane only).
+inputs:
+  siblings:
+    description: Space-separated sibling repo names this job checks out with checkout-sibling.
+    required: false
+    default: ''
+  check-build-deps:
+    description: "'true' to verify the Linux webkit/gtk build dependencies are installed."
+    required: false
+    default: 'false'
+  max-target-gb:
+    description: Wipe the persistent target dir when it is larger than this many GiB.
+    required: false
+    default: '200'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SIBLINGS: ${{ inputs.siblings }}
+        CHECK_BUILD_DEPS: ${{ inputs.check-build-deps }}
+        MAX_TARGET_GB: ${{ inputs.max-target-gb }}
+      run: |
+        set -euo pipefail
+        echo "public-pool host: $(hostname) user=$(id -un) runner=${RUNNER_NAME:-?}"
+
+        # 1. Stale sibling checkouts -- exactly the named directories.
+        parent="$(cd "${GITHUB_WORKSPACE}/.." && pwd)"
+        for name in ${SIBLINGS}; do
+          case "${name}" in
+            ''|*/*|.|..) echo "::error::refusing sibling name '${name}'"; exit 1 ;;
+          esac
+          if [ "${parent}/${name}" = "${GITHUB_WORKSPACE}" ]; then
+            echo "::error::sibling '${name}' is the workspace itself"; exit 1
+          fi
+          if [ -e "${parent}/${name}" ]; then
+            echo "removing stale sibling checkout ${parent}/${name}"
+            rm -rf -- "${parent:?}/${name}"
+          fi
+        done
+
+        # 2. Host build prerequisites (verified, never installed).
+        if [ "${CHECK_BUILD_DEPS}" = "true" ]; then
+          missing=()
+          for pkg in libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev \
+                     libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev \
+                     libatspi2.0-dev at-spi2-core; do
+            if ! dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"; then
+              missing+=("${pkg}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=public-pool host is missing build deps::${missing[*]} -- install them on the host once (operator, apt); runner-public has no sudo by design"
+            exit 1
+          fi
+          echo "build deps present"
+        fi
+
+        # 3. Persistent target dir outside the cleaned workspace.
+        target="${HOME}/.cache/qontinui-runner-ci/target"
+        mkdir -p "${target}"
+        size_gb="$(du -s --block-size=1G "${target}" 2>/dev/null | cut -f1 || echo 0)"
+        if [ "${size_gb:-0}" -gt "${MAX_TARGET_GB}" ]; then
+          echo "persistent target ${target} is ${size_gb} GiB > ${MAX_TARGET_GB}; wiping"
+          rm -rf -- "${target:?}"
+          mkdir -p "${target}"
+        fi
+        echo "CARGO_TARGET_DIR=${target}" >> "${GITHUB_ENV}"
+        echo "CARGO_TARGET_DIR=${target} (${size_gb:-0} GiB)"
+
+        # 4. Leftover ambient-state poison from a job that died mid-bracket.
+        q="${HOME}/.qontinui"
+        if [ -d "${q}" ]; then
+          unexpected="$(find "${q}" -mindepth 1 -maxdepth 1 \
+            ! -name machine.json ! -name profiles.json ! -name coord-device-jwt -print)"
+          if [ -n "${unexpected}" ]; then
+            echo "::error::${q} holds state that is not ci.yml's poison -- a public-pool account must have no qontinui state:"
+            echo "${unexpected}"
+            exit 1
+          fi
+          rm -f -- "${q}/machine.json" "${q}/profiles.json" "${q}/coord-device-jwt"
+          rmdir -- "${q}" 2>/dev/null || true
+          echo "cleared leftover poison in ${q}"
+        fi
