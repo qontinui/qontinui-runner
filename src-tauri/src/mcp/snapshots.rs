@@ -493,8 +493,12 @@ fn worktree_form(rb: &RepoBase, rel: &str, id: git2::Oid) -> Result<Vec<u8>, Str
         .find_object(rb.tree, Some(git2::ObjectType::Tree))
         .map_err(|e| format!("base tree {}: {e}", rb.base.sha))?;
     let mut checkout = git2::build::CheckoutBuilder::new();
+    // `refresh(false)`: the repository is opened fresh per report, so its
+    // index and attributes are already current — re-reading them from disk
+    // for every converted file is the cost this skips.
     checkout
         .target_dir(scratch.path())
+        .refresh(false)
         .force()
         .recreate_missing(true)
         .update_index(false)
