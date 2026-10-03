@@ -50,6 +50,7 @@
 
 import { writePtyById } from "./writePtyById";
 import type { TerminalWriteResult } from "./terminalWriteResult";
+import { describeThrown } from "@/lib/utils";
 
 /** Machine-readable failure code: the write path gave back no envelope. */
 export const TERMINAL_WRITE_UNREPORTED = "TERMINAL_WRITE_UNREPORTED";
@@ -173,7 +174,7 @@ export async function deliverApprovals(
         route,
         delivered: false,
         code: "TERMINAL_WRITE_THREW",
-        error: err instanceof Error ? err.message : String(err),
+        error: describeThrown(err, "terminal write threw"),
       });
       continue;
     }

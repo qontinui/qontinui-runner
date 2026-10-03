@@ -18,6 +18,7 @@ import type {
   WebSyncStatus,
 } from "../../../types/context";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface CommandResponse {
   success: boolean;
@@ -137,7 +138,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
 
       return result.data ?? null;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeThrown(err, "API request failed");
       console.error(`[CONTEXTS] API error: ${message}`);
       throw err;
     }
@@ -151,7 +152,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       const result = await apiRequest<ContextWithMetadata[]>("GET", "/contexts");
       setContexts(result || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load contexts");
+      setError(describeThrown(err, "Failed to load contexts"));
     }
   }, []);
 
@@ -199,7 +200,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to create context");
+        setError(describeThrown(err, "Failed to create context"));
         return null;
       } finally {
         setLoading(false);
@@ -233,7 +234,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to update context");
+        setError(describeThrown(err, "Failed to update context"));
         return null;
       } finally {
         setLoading(false);
@@ -258,7 +259,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       setContexts((prev) => prev.filter((c) => c.id !== id));
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete context");
+      setError(describeThrown(err, "Failed to delete context"));
       return false;
     } finally {
       setLoading(false);
@@ -287,7 +288,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
         }
         return result;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to duplicate context");
+        setError(describeThrown(err, "Failed to duplicate context"));
         return null;
       } finally {
         setLoading(false);
@@ -307,7 +308,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       setContexts((prev) => prev.map((c) => (c.id === id ? { ...c, enabled: true } : c)));
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to enable context");
+      setError(describeThrown(err, "Failed to enable context"));
       return false;
     } finally {
       setLoading(false);
@@ -325,7 +326,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       setContexts((prev) => prev.map((c) => (c.id === id ? { ...c, enabled: false } : c)));
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to disable context");
+      setError(describeThrown(err, "Failed to disable context"));
       return false;
     } finally {
       setLoading(false);
@@ -346,7 +347,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       );
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to sync context to web");
+      setError(describeThrown(err, "Failed to sync context to web"));
       return false;
     } finally {
       setLoading(false);
@@ -367,7 +368,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
       );
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to dismiss context sync");
+      setError(describeThrown(err, "Failed to dismiss context sync"));
       return false;
     } finally {
       setLoading(false);
@@ -383,7 +384,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
     try {
       await Promise.all([loadContexts(), loadCategories(), loadTags()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to refresh");
+      setError(describeThrown(err, "Failed to refresh"));
     } finally {
       setLoading(false);
     }

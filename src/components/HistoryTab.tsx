@@ -41,6 +41,7 @@ import { createLogger } from "@/lib/logger";
 const logger = createLogger("HistoryTab");
 import { FixedVirtualList } from "./ui";
 import { PatternIndicator } from "./history/PatternIndicator";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Client-side ceiling for the data-loading Tauri invokes (iter4 B-2). Without
@@ -323,7 +324,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }
     try {
       await Promise.all([fetchGuiRuns(), fetchAiRuns()]);
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err));
+      setError(describeThrown(err, "Failed to load run history"));
     } finally {
       setLoading(false);
     }

@@ -11,6 +11,7 @@ import React, { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Smartphone, Check, AlertCircle, Upload } from "lucide-react";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Hook
@@ -30,7 +31,7 @@ export function useShareToMobile() {
       setShared(true);
       setTimeout(() => setShared(false), 2000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Share to mobile failed");
       setError(msg);
       console.error("Share to mobile failed:", msg);
     } finally {
@@ -141,7 +142,7 @@ export function ShareFileButton({ filePath, className = "", size = 14 }: ShareFi
       setUploaded(true);
       setTimeout(() => setUploaded(false), 2000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Share file to mobile failed");
       setError(msg);
       console.error("Share file to mobile failed:", msg);
     } finally {

@@ -14,6 +14,7 @@ import type {
   ListKnownIssuesQuery,
   IssuePatternTemplate,
 } from "@qontinui/shared-types";
+import { describeThrown } from "@/lib/utils";
 
 export function useKnownIssues() {
   const [issues, setIssues] = useState<KnownIssue[]>([]);
@@ -31,7 +32,7 @@ export function useKnownIssues() {
       setIssues(result);
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to list known issues");
       setError(msg);
       return [];
     } finally {
@@ -50,7 +51,7 @@ export function useKnownIssues() {
       setIssues(result);
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to find issues for spec");
       setError(msg);
       return [];
     } finally {
@@ -66,7 +67,7 @@ export function useKnownIssues() {
       setIssues((prev) => [...prev, result]);
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to create known issue");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -81,7 +82,7 @@ export function useKnownIssues() {
       setIssues((prev) => prev.map((i) => (i.id === id ? result : i)));
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to update known issue");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -92,7 +93,7 @@ export function useKnownIssues() {
       await invoke<boolean>("delete_known_issue", { id });
       setIssues((prev) => prev.filter((i) => i.id !== id));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to delete known issue");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -108,7 +109,7 @@ export function useKnownIssues() {
         prev.map((i) => (i.id === id ? { ...i, status: "resolved" as const } : i)),
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to resolve known issue");
       setError(msg);
       throw new Error(msg, { cause: err });
     }
@@ -120,7 +121,7 @@ export function useKnownIssues() {
       setTemplates(result);
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to load pattern templates");
       setError(msg);
       return [];
     }
