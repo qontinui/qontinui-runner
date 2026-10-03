@@ -3875,7 +3875,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     // boot-restored session's may not be this boot's — plan 2026-10-03 D3);
     // the capacity re-poll below is this device's own business.
     let outcome_device_id = outcome_device_for(&session, local_device_id);
-    if local_device_id.is_none() && outcome_device_id.is_none() {
+    if outcome_device_id.is_none() {
         return;
     }
     let Some(handle) = rt_handle else {
