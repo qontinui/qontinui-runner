@@ -23,12 +23,15 @@ use tracing::{info, warn};
 
 use super::CommandResponse;
 use crate::mcp::remote_terminal::{
-    client, AttachError, AttachRefusal, AttachedReply, GrantRenewer, RenewedGrant, ATTACH_TIMEOUT,
+    client, schedule_grant_renewal, AttachError, AttachRefusal, AttachedReply, GrantRenewer,
+    RenewedGrant, ATTACH_TIMEOUT,
 };
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
 use crate::terminal::pane_io::PaneIo;
-use crate::terminal::remote_pane_io::{DetachOutcome, RemotePaneIo, ERROR_EXIT_CODE};
+use crate::terminal::remote_pane_io::{
+    parse_grant_expiry, DetachOutcome, RemotePaneIo, ERROR_EXIT_CODE,
+};
 use crate::terminal::types::{RemoteTabIdentity, RemoteTerminalInfo};
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
@@ -749,13 +752,17 @@ pub(crate) async fn open_remote_tab(
             attached.ring,
         )
         .with_session_id(session_uuid.to_string())
-        .with_target_device_id(target_id.clone()),
+        .with_target_device_id(target_id.clone())
+        .with_grant_expires_at(parse_grant_expiry(minted.expires_at.as_ref())),
     );
     // So a reattach that finds this grant expired can mint the next one.
     client().set_grant_renewer(Arc::new(CoordGrantRenewer {
         app: app_handle.clone(),
     }));
     client().register_pane(pane.clone());
+    // Renewed ahead of each expiry: the relay evicts an expired grant's
+    // attachment whether or not the tab is in use.
+    schedule_grant_renewal(client(), &pane);
 
     let device_label = non_blank(device_label).unwrap_or_else(|| short_id(&target_id));
     let title = format!(
@@ -872,6 +879,7 @@ impl GrantRenewer for CoordGrantRenewer {
                 "remote attach: grant renewed for a reattach"
             );
             Ok(RenewedGrant {
+                expires_at: parse_grant_expiry(minted.expires_at.as_ref()),
                 grant: minted.grant,
                 grant_jti: minted.grant_jti,
             })
@@ -1908,7 +1916,7 @@ mod interactivity_command_tests {
             AttachedRing::default(),
         ));
         tm.set_remote_pane("tab-1", pane.clone());
-        pane.set_grant("jti-2", "g2");
+        pane.set_grant("jti-2", "g2", None);
         let r = remote_interactivity_response(&tm, "tab-1", |jti| {
             (jti == "jti-2").then(|| pane.clone())
         })
