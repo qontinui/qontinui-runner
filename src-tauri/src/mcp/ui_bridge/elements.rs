@@ -2574,7 +2574,7 @@ pub async fn ui_bridge_execute_component_action_handler(
 /// React registry occasionally pruning elements between calls.
 pub async fn ui_bridge_discover_handler(
     State(state): State<Arc<ApiState>>,
-    request: Option<Json<UIBridgeDiscoveryRequest>>,
+    request: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Discovering elements");
 
@@ -2583,31 +2583,29 @@ pub async fn ui_bridge_discover_handler(
     // axum default of 400'ing on `EOF while parsing a value` was needless
     // friction for manual testers and MCP clients sending bare POSTs.
     // Note: an explicit body (even `{"force": false}`) is preserved as-is.
-    let request = match request {
-        Some(Json(r)) => r,
-        None => UIBridgeDiscoveryRequest {
-            force: Some(true),
-            ..Default::default()
-        },
+    let body = match request {
+        Some(Json(v)) => v,
+        None => serde_json::json!({ "force": true }),
     };
 
-    // Collapse the top-level and nested-`options` spellings into one set of
-    // filters before building the IPC payload. Reading `request.root` etc.
-    // directly here is what silently dropped an `{"options": {...}}` body.
-    let opts = request.resolve();
+    // Forward the body WHOLE (as `find` does), with the typed filters
+    // resolved across both spellings — see
+    // `UIBridgeDiscoveryRequest::discover_ipc_request`. The previous six-key
+    // allowlist silently dropped `includeMedia`/`includeContent`/`text`/….
+    let (options, force) = UIBridgeDiscoveryRequest::discover_ipc_request(&body).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(api_error(format!(
+                "Failed to deserialize the JSON body into the target type: {e}"
+            ))),
+        )
+    })?;
 
     let payload = serde_json::json!({
-        "options": {
-            "root": opts.root,
-            "interactiveOnly": opts.interactive_only,
-            "includeHidden": opts.include_hidden,
-            "limit": opts.limit,
-            "types": opts.types,
-            "selector": opts.selector
-        },
+        "options": options,
         // Top-level (not inside options) — force is a meta-flag about
         // registry state rather than a discovery filter.
-        "force": opts.force.unwrap_or(false)
+        "force": force
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {

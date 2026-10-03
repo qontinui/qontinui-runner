@@ -65,6 +65,30 @@ export function readModalContext(bridge: unknown): unknown {
 }
 
 /**
+ * Build the `FindRequest` the `discover` arm hands to `bridge.discover()`.
+ *
+ * Options are read from nested `payload.options` or, failing that, the payload
+ * root. `toFindRequest` carries them by identity — this arm used to run its own
+ * allowlist, which had drifted from the `find` arm's list even though both call
+ * `bridge.discover()` with the same SDK type.
+ *
+ * `includeHidden` is seeded beneath the caller's own filters, exactly as the
+ * `find` arm does, so an explicit `false` still wins. Without the seed the two
+ * arms answered the same request differently: the SDK executor behind
+ * `bridge.discover()` filters on `!options.includeHidden`, so an unset flag
+ * dropped off-viewport and zero-rect elements on `discover` only. The Rust
+ * handler omits an unset `includeHidden` rather than sending `null`, which
+ * would override this seed.
+ */
+export function toDiscoverRequest(payload: object): Record<string, unknown> {
+  const nested = (payload as { options?: unknown }).options;
+  return {
+    includeHidden: true,
+    ...toFindRequest(nested ?? payload),
+  };
+}
+
+/**
  * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
@@ -84,12 +108,7 @@ export function useDiscoveryEvents(
 
       switch (type) {
         case "discover": {
-          // Extract options from nested payload.options or top-level payload fields.
-          // `toFindRequest` carries them by identity — this arm used to run its
-          // own allowlist, which had drifted from the `find` arm's list below
-          // even though both call `bridge.discover()` with the same SDK type.
-          const discoverSource = (payload.options ?? payload) as Record<string, unknown>;
-          const discoverOptions = toFindRequest(discoverSource);
+          const discoverOptions = toDiscoverRequest(payload);
 
           // Force-rescan path: useAutoRegister listens for `ui-bridge-route-change`
           // and on receipt clears the registry, bbox trackers, and the local
@@ -157,9 +176,11 @@ export function useDiscoveryEvents(
             unknown
           >;
           // `includeHidden` is seeded before the caller's own filters so an
-          // explicit `false` still wins. The SDK has defaulted it to true since
-          // 0.22.0, so this only pins the runner's behaviour against a future
-          // default change.
+          // explicit `false` still wins. `FindRequest` documents a TRUE default,
+          // but the executor behind `bridge.discover()` filters on
+          // `!options.includeHidden`, so without this seed an unset flag would
+          // drop hidden elements. `toDiscoverRequest` seeds the `discover` arm
+          // the same way.
           const findOptions: Record<string, unknown> = {
             includeHidden: true,
             ...toFindRequest(source),
