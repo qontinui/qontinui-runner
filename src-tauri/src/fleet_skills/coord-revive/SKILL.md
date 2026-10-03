@@ -1085,7 +1085,9 @@ always did: a door works. Then
 re-issue your lost call as a raw JSON-RPC `tools/call` against that door (for a
 loopback door, the proxy nonce from that file — carried as
 `X-Coord-Mcp-Proxy-Key: <nonce>` on older configs and as
-`Authorization: Bearer <nonce>` on ones written after the header move; the
+`Authorization: Bearer <nonce>` on ones written after the header move, and
+expanded from your own environment when written as
+`${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` — the script does that itself; the
 script reports which header name it used. The minted bearer for L3), then
 verify by read. On total failure it prints `VERDICT: DEAD` naming
 every exhausted door and its typed reason; run `coord doctor` next.
@@ -1211,16 +1213,24 @@ rather than reach — starting with the fact that its `url=` is the MINT, not a
 door to re-issue a write over.** This rung hands back a *bearer*; spend it on
 `$COORD_HTTP_URL/mcp` (coord tools by name) or on the device-authed hand-written
 `/coord/…` REST routes, which `/gate`'s **write-forwarder REST** rung spells
-out. It is **not** carried
-onto `$COORD_HTTP_URL/mcp`: that door's device-JWT-only constraint is unchanged. The bootstrap token is an **agent** principal minted against
+out. `$COORD_HTTP_URL/mcp` **does** accept it — as `principal_kind: agent`,
+not `device` (measured 2026-09-26 with `coord_work_unit_refresh_citations`, and
+2026-10-02 with `coord_query_identity` and `coord_work_unit_list_citations`, each
+HTTP 200 `isError:false`). This section used to say the opposite ("not carried
+onto `/mcp`: that door's device-JWT-only constraint is unchanged"); no such
+constraint answers today. Which tools that principal may call is `tools/list`'s
+answer over the same bearer, never this page's. The bootstrap token is an **agent** principal minted against
 a device UUID, not a device principal — so it is scoped by whatever coord grants
 an agent in this tenant, and this script asserts nothing beyond what its control
 read measured: that the bearer authenticates. It verified `GET
-/coord/agent-findings`; it did **not** probe `$COORD_HTTP_URL/mcp`, so a `401` or
-a `-32601` there is that door's own verdict, not a refutation of L5. And it is a
-**short-lived, over-broad** credential (~4h, carrying scopes far wider than any
-one recovery write) obtained from a route whose exposure is an open operator
-decision — use it for the write you came for and discard it.
+/coord/agent-findings`; the script does **not** probe `$COORD_HTTP_URL/mcp` with
+it, so a `401` or a `-32601` there is that door's own verdict about that tool for
+this principal, not a refutation of L5. And it is a
+**short-lived** credential (~4h). It is **not** over-broad, whatever this page
+used to say: measured 2026-09-04, every scope in the minted token was empty or
+false, narrower than the sibling `/agents/allocate` token — the same reading
+`PARTIAL_BOOTSTRAP` prints, and the two must report in one spelling. Use it for
+the write you came for and discard it.
 
 A bare `LIVE` that overstates its own reach is the same defect as a false
 `DEAD`, one level down: `DEAD` was made falsifiable by L4 and by the `SCOPE:`
@@ -1421,12 +1431,17 @@ this one — in its own words — *"usually cannot"*.
 # http://127.0.0.1:<port>/coord-mcp. Post-Phase-2 configs carry it under
 # `Authorization: Bearer <nonce>`; older ones under X-Coord-Mcp-Proxy-Key.
 LOG=~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl   # resolve yours -- see the warning above
+# A value written as `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}` is an env
+# reference: expand it from this shell's environment (what Claude Code sent),
+# never take the prefix of the literal reference text.
 PREFIX=$(python3 -c "
-import json
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from mcp_env_ref import expand_env_ref
 h = json.load(open('.mcp.json'))['mcpServers']['coord-mcp'].get('headers', {})
-tok = h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', ''))
+tok = expand_env_ref(h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', '')))
 print(tok.split()[-1][:8] if tok else '')
-")
+" "<workspace-root>/qontinui-claude-config/scripts/lib")
 [ -n "$PREFIX" ] || echo "no nonce in .mcp.json headers -- resolve it by hand"
 grep -F "\"key_prefix\":\"$PREFIX\"" "$LOG" | jq -c '{ts,event,workdir,cause,pid}'
 ```
