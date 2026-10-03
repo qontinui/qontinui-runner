@@ -9,6 +9,10 @@ export interface CommandResponse {
   data: unknown;
 }
 
+/** Which lane hosts a session: the CLI's TUI in a PTY, or its structured
+ * (stream-json) protocol. Wire spelling of Rust `SessionLane`. */
+export type SessionLane = "pty" | "structured";
+
 /**
  * A durable Claude-session OPEN record from the backend session registry
  * (`terminal_session_list_open`). Keyed by the stable `claudeSessionId`, this
@@ -51,9 +55,16 @@ export interface TerminalSessionRecord {
   closedAt?: number;
   /** Why the session closed. */
   closeReason?: string;
-  /** Which AI-CLI provider owns this session (`"claude"`, `"gemini"`). Absent
-   * on records predating the field — read as `"claude"`. */
+  /** Which AI-CLI provider owns this session — a served CLI profile id
+   * (`"claude"`, `"codex"`). Absent on records predating the field — read as
+   * `"claude"`. */
   provider?: string;
+  /**
+   * Which lane hosts the session — mirrors Rust `SessionLane`
+   * (`session_lifecycle_store.rs`). The runner always sends it; absent reads
+   * as `"pty"`, the serde default for records written before the field.
+   */
+  lane?: SessionLane;
   /**
    * How `claudeSessionId` was bound — see `SessionOrigin` in
    * `sessionRecordArgs.ts` for the authored (write-side) union and the full

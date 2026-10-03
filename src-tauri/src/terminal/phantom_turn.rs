@@ -885,7 +885,9 @@ pub fn spawn_watch(
             tokio::spawn(async move {
                 let Ok(watch) = tokio::task::spawn_blocking(move || {
                     build(
-                        super::transcript::find_claude_config_dirs(),
+                        super::transcript::find_transcript_config_dirs(
+                            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+                        ),
                         TailStart::RecentTail,
                     )
                 })

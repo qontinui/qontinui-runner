@@ -400,6 +400,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: DEFAULT_PROVIDER.to_string(),
+            lane: crate::session::session_lifecycle_store::SessionLane::Pty,
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: Some(3),

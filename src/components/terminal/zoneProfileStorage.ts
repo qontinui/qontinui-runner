@@ -16,6 +16,14 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+/**
+ * The provider every {@link ZoneSessionInfo} belongs to. A zone profile's
+ * format predates providers — its sessions are Claude Code session ids
+ * (`claudeSessionId`), the same assumption the runner's lifecycle store makes
+ * for a record saved before it carried a provider (`DEFAULT_PROVIDER`).
+ */
+export const ZONE_SESSION_PROVIDER = "claude";
+
 /** A Claude session pinned to a zone index by a saved profile. */
 export interface ZoneSessionInfo {
   zoneIndex: number;

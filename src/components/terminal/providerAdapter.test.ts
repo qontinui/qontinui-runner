@@ -18,6 +18,7 @@ import {
   cliProfilesLoaded,
   descriptorFromProfile,
   loadCliProfiles,
+  providerLabel,
   providerDescriptorFor,
   resetCliProfiles,
   setCliProfiles,
@@ -183,5 +184,82 @@ describe("descriptorFromProfile honesty", () => {
     expect(detectClaudeHandshake("? for shortcuts", hp)).toBe(false);
     expect(detectResumeFailure("No conversation found", hp)).toBe(false);
     expect(d.restoreTier()).toBe("terminal-only");
+  });
+});
+
+describe("ptyResumeLine", () => {
+  const id = "0d5e9a8c-1111-2222-3333-444455556666";
+
+  it("renders the served profile's resume, PTY args, auto-approve flags and account env", () => {
+    const d = descriptorFromProfile(claudeProfile());
+    expect(d.ptyResumeLine(id, { isWindows: false, autoApprove: true })).toBe(
+      `claude --teammate-mode in-process --permission-mode bypassPermissions --resume ${id}`,
+    );
+    expect(
+      d.ptyResumeLine(id, { configDir: "/h/.claude-x", isWindows: false, autoApprove: false }),
+    ).toBe(`CLAUDE_CONFIG_DIR="/h/.claude-x" claude --teammate-mode in-process --resume ${id}`);
+    expect(
+      d.ptyResumeLine(id, { configDir: "C:\\c\\.claude-x", isWindows: true, autoApprove: false }),
+    ).toBe(
+      `$env:CLAUDE_CONFIG_DIR="C:\\c\\.claude-x"; claude --teammate-mode in-process --resume ${id}`,
+    );
+  });
+
+  it("types nothing for a profile that declares no resume by id", () => {
+    const d = descriptorFromProfile({ ...claudeProfile(), resume: { kind: "unknown" } });
+    expect(d.ptyResumeLine(id, { isWindows: false, autoApprove: true })).toBeNull();
+  });
+
+  it("drops the env prefix when the profile names no account env var", () => {
+    const d = descriptorFromProfile({ ...claudeProfile(), accountIsolation: { kind: "unknown" } });
+    expect(d.ptyResumeLine(id, { configDir: "/h/x", isWindows: false, autoApprove: false })).toBe(
+      `claude --teammate-mode in-process --resume ${id}`,
+    );
+  });
+});
+
+describe("the served Codex profile (Phase 6)", () => {
+  const v7 = "01a0ef49-1234-7abc-8def-0123456789ab";
+
+  it("resolves, reads its id back, and restores terminal-only while continuity is unknown", () => {
+    setCliProfiles(profiles);
+    const codex = providerDescriptorFor("codex");
+    expect(codex?.provider).toBe("codex");
+    expect(codex?.displayName).toBe("Codex CLI");
+    expect(codex?.readsIdBack).toBe(true);
+    expect(codex?.restoreTier()).toBe("terminal-only");
+    expect(codex?.resumeCommand(v7)).toEqual(["codex", "resume", v7]);
+    // No markers are claimed for an unauthenticated probe.
+    const hp = codex?.handshakePatterns();
+    expect(hp?.success).toEqual([]);
+    expect(hp?.failurePatterns).toEqual([]);
+    // Claude pins its id.
+    expect(providerDescriptorFor("claude")?.readsIdBack).toBe(false);
+  });
+
+  it("puts a positional resume's flags after the subcommand, a flag resume's after the program", () => {
+    setCliProfiles(profiles);
+    expect(
+      providerDescriptorFor("codex")?.ptyResumeLine(v7, {
+        configDir: "/h/.codex-work",
+        isWindows: false,
+        autoApprove: true,
+      }),
+    ).toBe(`CODEX_HOME="/h/.codex-work" codex resume ${v7} --dangerously-bypass-approvals-and-sandbox`);
+    const claudeLine = providerDescriptorFor("claude")?.ptyResumeLine("sess", {
+      isWindows: false,
+      autoApprove: true,
+    });
+    expect(claudeLine?.startsWith("claude --teammate-mode in-process --permission-mode")).toBe(true);
+    expect(claudeLine?.endsWith("--resume sess")).toBe(true);
+  });
+});
+
+describe("providerLabel", () => {
+  it("names a served provider by its display name and an unknown one by its id", () => {
+    setCliProfiles(profiles);
+    expect(providerLabel("codex")).toBe("Codex CLI");
+    expect(providerLabel("claude")).toBe("Claude Code");
+    expect(providerLabel("totally-new")).toBe("totally-new");
   });
 });

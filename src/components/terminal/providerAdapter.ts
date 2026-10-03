@@ -67,15 +67,41 @@ export interface HandshakePatterns {
   titlePatterns?: RegExp[];
 }
 
+/** How {@link SessionProviderDescriptor.ptyResumeLine} renders a resume. */
+export interface PtyResumeOptions {
+  /** The account's config dir, set through the profile's account env var. */
+  configDir?: string;
+  /** Render PowerShell env assignments (`$env:K="v"; `) instead of POSIX. */
+  isWindows: boolean;
+  /** Add the profile's auto-approve flags, so the resumed session never stalls on a prompt. */
+  autoApprove: boolean;
+}
+
 /** The capability surface the boot-restore UX needs from one provider. */
 export interface SessionProviderDescriptor {
   /** Provider id (`"claude"`). Matches a session record's `provider`. */
   provider: string;
+  /** Human-readable CLI name (`"Claude Code"`, `"Codex CLI"`). */
+  displayName: string;
+  /**
+   * Whether the CLI mints its own session id, which the runner reads back
+   * after launch (Codex), instead of taking one pinned on its argv (Claude).
+   * A launch of such a provider has no id up front: its record stays
+   * provisional until the runner's capture stamps the tab.
+   */
+  readsIdBack: boolean;
   /**
    * The deterministic, non-interactive resume argv for `sessionId`, or `null`
    * when the provider declares no resume by id.
    */
   resumeCommand(sessionId: string): string[] | null;
+  /**
+   * The shell line (no trailing Enter) that resumes `sessionId` in a PTY
+   * pane: the account env assignment, then the resume argv with the
+   * profile's PTY-only args and — when asked — its auto-approve flags right
+   * after the program. `null` when the provider declares no resume by id.
+   */
+  ptyResumeLine(sessionId: string, options: PtyResumeOptions): string | null;
   /** Resume success/failure handshake patterns. */
   handshakePatterns(): HandshakePatterns;
   /** Declared restore capability for the honest-UX surface. */
@@ -93,7 +119,21 @@ export interface ServedCliProfile {
   id: string;
   displayName: string;
   programs: string[];
+  identity?:
+    | { kind: "pinned"; flag: string }
+    | { kind: "read_back"; capture: string }
+    | { kind: "unknown" };
   resume?: { kind: "by_id_argv"; template: string[] } | { kind: "none" } | { kind: "unknown" };
+  accountIsolation?:
+    | { kind: "env_var"; name: string }
+    | { kind: "home_dir" }
+    | { kind: "none" }
+    | { kind: "unknown" };
+  autoApprove?:
+    | { kind: "flags"; argv: string[]; detect: string[] }
+    | { kind: "none" }
+    | { kind: "unknown" };
+  ptyArgs?: string[];
   handshake?: {
     success?: string[];
     failure?: string[];
@@ -123,10 +163,36 @@ export function descriptorFromProfile(profile: ServedCliProfile): SessionProvide
   // the profile also says HOW to resume.
   const tier: RestoreTier =
     profile.restoreTier === "full" && template !== null ? "full" : "terminal-only";
+  const resumeCommand = (sessionId: string): string[] | null =>
+    template === null ? null : template.map((arg) => arg.split(ID_PLACEHOLDER).join(sessionId));
+  const accountEnvVar =
+    profile.accountIsolation?.kind === "env_var" ? profile.accountIsolation.name : null;
+  const autoApproveArgv = profile.autoApprove?.kind === "flags" ? profile.autoApprove.argv : [];
+  const ptyArgs = profile.ptyArgs ?? [];
+  const idAt = template === null ? -1 : template.indexOf(ID_PLACEHOLDER);
+  const idRidesFlag = idAt > 0 && (template?.[idAt - 1] ?? "").startsWith("-");
   return {
     provider: profile.id,
-    resumeCommand: (sessionId: string) =>
-      template === null ? null : template.map((arg) => arg.split(ID_PLACEHOLDER).join(sessionId)),
+    displayName: profile.displayName,
+    readsIdBack: profile.identity?.kind === "read_back",
+    resumeCommand,
+    ptyResumeLine: (sessionId: string, options: PtyResumeOptions) => {
+      const argv = resumeCommand(sessionId);
+      if (argv === null || argv.length === 0) return null;
+      const [program, ...rest] = argv;
+      const flags = [...ptyArgs, ...(options.autoApprove ? autoApproveArgv : [])];
+      // Mirrors Rust `session/launch_spec.rs`: an id carried by a flag
+      // (`claude --resume <id>`) takes the flags right after the program; a
+      // positional id (`codex resume <id>`) is a subcommand, which must come
+      // first, so its flags follow the whole template.
+      const line = (idRidesFlag ? [program, ...flags, ...rest] : [program, ...rest, ...flags]).join(
+        " ",
+      );
+      if (!options.configDir || accountEnvVar === null) return line;
+      return options.isWindows
+        ? `$env:${accountEnvVar}="${options.configDir}"; ${line}`
+        : `${accountEnvVar}="${options.configDir}" ${line}`;
+    },
     handshakePatterns: () => patterns,
     restoreTier: () => tier,
   };
@@ -204,4 +270,13 @@ export function providerDescriptorFor(
 ): SessionProviderDescriptor | null {
   if (descriptors === null || provider === undefined) return null;
   return descriptors.get(provider) ?? null;
+}
+
+/**
+ * The label a surface shows for `provider`: its served profile's display name,
+ * else the raw provider id — a provider the runner serves no profile for is
+ * named as itself, never relabelled as another CLI.
+ */
+export function providerLabel(provider: string): string {
+  return providerDescriptorFor(provider)?.displayName ?? provider;
 }
