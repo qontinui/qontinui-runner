@@ -52,6 +52,11 @@ interface CommandResponse<T> {
   data: T | null;
 }
 
+/** What the getter returns when `settings.json` itself cannot be read. */
+interface SettingsUnreadablePayload {
+  settings_unreadable: true;
+}
+
 interface FinishedSessionClosePayload {
   finished_session_close: FinishedSessionClose;
   effective: FinishedSessionClose;
@@ -62,16 +67,25 @@ interface FinishedSessionClosePayload {
 export function FinishedSessionCloseSettings({ onLog }: { onLog: LogFunction }) {
   const [payload, setPayload] = useState<FinishedSessionClosePayload | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // `settings.json` is unreadable: the runner refuses every settings write
+  // until the file is repaired, so offering the radios would only fail.
+  const [settingsUnreadable, setSettingsUnreadable] = useState(false);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    invoke<CommandResponse<FinishedSessionClosePayload>>("finished_session_close_get")
+    invoke<CommandResponse<FinishedSessionClosePayload | SettingsUnreadablePayload>>(
+      "finished_session_close_get",
+    )
       .then((r) => {
         if (cancelled) return;
-        if (r.success && r.data) setPayload(r.data);
-        else setLoadError(r.message ?? "the runner returned no value");
+        if (r.success && r.data && !("settings_unreadable" in r.data)) {
+          setPayload(r.data);
+          return;
+        }
+        setLoadError(r.message ?? "the runner returned no value");
+        if (r.data && "settings_unreadable" in r.data) setSettingsUnreadable(true);
       })
       .catch((err) => {
         if (!cancelled) setLoadError(String(err));
@@ -132,7 +146,10 @@ export function FinishedSessionCloseSettings({ onLog }: { onLog: LogFunction }) 
           className="text-xs text-red-400"
           data-ui-bridge-id="settings.finished-session-close-load-error"
         >
-          Current value unknown — {loadError}. Picking a value below still saves it.
+          Current value unknown — {loadError}.{" "}
+          {settingsUnreadable
+            ? "Saving is unavailable until settings.json is repaired; until then the runner closes no finished session."
+            : "Picking a value below still saves it."}
         </p>
       )}
       {payload?.kill_switch_engaged && (
@@ -156,7 +173,7 @@ export function FinishedSessionCloseSettings({ onLog }: { onLog: LogFunction }) 
               name="finished_session_close"
               value={opt.value}
               checked={value === opt.value}
-              disabled={saving}
+              disabled={saving || settingsUnreadable}
               onChange={() => void save(opt.value)}
               className="mt-0.5"
             />

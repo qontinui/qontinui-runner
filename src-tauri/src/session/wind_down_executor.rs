@@ -818,6 +818,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         pass,
         workspace_root: None,
         probe: GitCustodyProbe::default(),
+        pass_ownership: None,
     };
     close_batch(CloseArm::Drain, candidates, &effects).await;
 }
@@ -872,8 +873,9 @@ pub(crate) trait FinishedCloseWorld: Sync {
         &'p [LiveClaudeProcess],
         &'p wind_down_observer::ObservedInputs,
     );
-    /// The attributed-worktree read, made once per pass.
-    async fn ownership(&self) -> OwnershipRead;
+    /// The attributed-worktree read, made once per pass, with the liveness of
+    /// `claude_session_ids`' coord rows.
+    async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead;
     /// The root a relative ledger path is anchored on.
     fn workspace_root(&self) -> Option<PathBuf>;
     /// What is known about one candidate before probing.
@@ -888,13 +890,17 @@ pub(crate) trait FinishedCloseWorld: Sync {
     /// Publish this pass's custody verdicts for `/restart-readiness`.
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]);
     /// Run [`close_batch`] for the `finished_close` arm over `clean`, through
-    /// this world's [`CloseEffects`]. `None` when there is no pane manager to
-    /// close anything through.
+    /// this world's [`CloseEffects`]. `ownership` is the pass's own read,
+    /// made at `ownership_read_at`, which the per-close custody re-check may
+    /// reuse (see [`OWNERSHIP_REUSE_MAX_AGE`]). `None` when there is no pane
+    /// manager to close anything through.
     async fn close_clean(
         &self,
         pass: &Self::Pass,
         clean: Vec<(String, String)>,
         workspace_root: Option<PathBuf>,
+        ownership: &OwnershipRead,
+        ownership_read_at: Instant,
     ) -> Option<Vec<CandidateOutcome>>;
 }
 
@@ -976,7 +982,9 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         };
     }
 
-    let ownership = world.ownership().await;
+    let candidate_ids: Vec<String> = candidates.iter().map(|(s, _)| s.clone()).collect();
+    let ownership = world.ownership(&candidate_ids).await;
+    let ownership_read_at = Instant::now();
     let workspace_root = world.workspace_root();
     let mut judged: Vec<(String, CustodyVerdict)> = Vec::new();
     let mut clean: Vec<(String, String)> = Vec::new();
@@ -1020,7 +1028,7 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         "wind_down_executor: finished_close — closing finished, custody-clean sessions"
     );
     let outcomes = world
-        .close_clean(&pass, clean, workspace_root)
+        .close_clean(&pass, clean, workspace_root, &ownership, ownership_read_at)
         .await
         .unwrap_or_default();
     FinishedCloseTick::Ran { judged, outcomes }
@@ -1074,8 +1082,8 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
         (&pass.pass.report.terminal_hosted, &pass.observed)
     }
 
-    async fn ownership(&self) -> OwnershipRead {
-        wind_down_observer::fetch_ownership().await
+    async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead {
+        wind_down_observer::fetch_ownership(claude_session_ids).await
     }
 
     fn workspace_root(&self) -> Option<PathBuf> {
@@ -1104,6 +1112,8 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
         pass: &LiveCensus,
         clean: Vec<(String, String)>,
         workspace_root: Option<PathBuf>,
+        ownership: &OwnershipRead,
+        ownership_read_at: Instant,
     ) -> Option<Vec<CandidateOutcome>> {
         use tauri::Manager;
         let manager = self
@@ -1123,6 +1133,7 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
             pass: &pass.pass,
             workspace_root,
             probe: self.probe,
+            pass_ownership: Some((ownership, ownership_read_at)),
         };
         Some(close_batch(CloseArm::FinishedClose, clean, &effects).await)
     }
@@ -1420,6 +1431,21 @@ struct LiveCloseEffects<'a> {
     workspace_root: Option<PathBuf>,
     /// The custody probe the per-close re-check runs.
     probe: GitCustodyProbe,
+    /// `finished_close` only: the pass's own ownership read and when it was
+    /// made, reused by the re-check while it is fresh enough.
+    pass_ownership: Option<(&'a OwnershipRead, Instant)>,
+}
+
+/// How old the pass's ownership read may be and still serve a per-close
+/// custody re-check. A batch's later closes can start minutes after the pass
+/// (each waits up to [`EXIT_DEADLINE`]); past this age the re-check reads
+/// coord again rather than trust an allocation list that old. Within it, one
+/// read serves the whole batch instead of four tenant-wide reads per close.
+pub const OWNERSHIP_REUSE_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// PURE: may a re-check reuse an ownership read made at `read_at`?
+pub fn ownership_reusable(read_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(read_at) <= OWNERSHIP_REUSE_MAX_AGE
 }
 
 #[async_trait::async_trait]
@@ -1445,13 +1471,25 @@ impl CloseEffects for LiveCloseEffects<'_> {
     }
 
     async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict {
-        let ownership = wind_down_observer::fetch_ownership().await;
+        let reused = self
+            .pass_ownership
+            .filter(|(_, read_at)| ownership_reusable(*read_at, Instant::now()))
+            .map(|(read, _)| read);
+        // A re-fetch that fails is an `Err`, which the gate reads as Unknown.
+        let fetched;
+        let ownership = match reused {
+            Some(read) => read,
+            None => {
+                fetched = wind_down_observer::fetch_ownership(&[session_id.to_string()]).await;
+                &fetched
+            }
+        };
         let context =
             wind_down_observer::custody_context(self.app, self.pass, session_id, terminal_id);
         judge_custody(
             &self.probe,
             &context,
-            &ownership,
+            ownership,
             self.workspace_root.as_deref(),
             session_id,
         )
@@ -3407,8 +3445,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CustodyProbe for TreeProbe {
-        async fn exists(&self, _path: &Path) -> bool {
-            true
+        async fn exists(&self, _path: &Path) -> Result<bool, String> {
+            Ok(true)
         }
         async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
             Ok(Some(dir.to_path_buf()))
@@ -3511,8 +3549,15 @@ mod tests {
         ) {
             (&pass.0, &pass.1)
         }
-        async fn ownership(&self) -> OwnershipRead {
-            Ok(CoordOwnership::default())
+        async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead {
+            // Every candidate's coord session is live and holds no rows.
+            let mut index = CoordOwnership::default();
+            let live: Vec<String> = claude_session_ids
+                .iter()
+                .map(|s| format!("coord-{s}"))
+                .collect();
+            index.mark_live(live.iter().map(String::as_str));
+            Ok(index)
         }
         fn workspace_root(&self) -> Option<PathBuf> {
             Some(PathBuf::from("/ws"))
@@ -3540,6 +3585,8 @@ mod tests {
             _pass: &Self::Pass,
             clean: Vec<(String, String)>,
             _workspace_root: Option<PathBuf>,
+            _ownership: &OwnershipRead,
+            _ownership_read_at: Instant,
         ) -> Option<Vec<CandidateOutcome>> {
             Some(close_batch(CloseArm::FinishedClose, clean, &self.effects).await)
         }
@@ -3636,6 +3683,95 @@ mod tests {
         );
         assert_eq!(off.census_calls(), 0);
         assert_eq!(off.published.lock().unwrap().clone(), vec![Vec::new()]);
+    }
+
+    /// Round-2 suggestion 6: the pass's ownership read serves the re-checks
+    /// while it is at most a minute old, and not after.
+    #[test]
+    fn the_pass_ownership_read_is_reused_for_at_most_a_minute() {
+        let t0 = Instant::now();
+        assert!(ownership_reusable(t0, t0));
+        assert!(ownership_reusable(t0, t0 + OWNERSHIP_REUSE_MAX_AGE));
+        assert!(!ownership_reusable(
+            t0,
+            t0 + OWNERSHIP_REUSE_MAX_AGE + Duration::from_millis(1)
+        ));
+    }
+
+    /// Round-2 CRITICAL 1, end to end: a candidate whose coord session is not
+    /// known live (auto-closed) is never closed, whatever its trees show.
+    #[tokio::test]
+    async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
+        struct ClosedCoordWorld(FakeWorld);
+        // Same world, but the ownership read marks nothing live.
+        let world = FakeWorld::with_sessions(&["t1"]);
+        let mut last = None;
+        let report = finished_close_tick(
+            &ClosedCoordWorld(world),
+            ClockVerdict::Trustworthy,
+            &mut last,
+            Instant::now(),
+            GRACE,
+        )
+        .await;
+        let FinishedCloseTick::Ran { judged, outcomes } = report else {
+            panic!("the census should have run");
+        };
+        assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));
+        assert!(outcomes.is_empty());
+
+        #[async_trait::async_trait]
+        impl FinishedCloseWorld for ClosedCoordWorld {
+            type Pass = <FakeWorld as FinishedCloseWorld>::Pass;
+            fn mode(&self) -> FinishedSessionClose {
+                self.0.mode()
+            }
+            fn open_terminal_records(&self) -> usize {
+                self.0.open_terminal_records()
+            }
+            async fn census(&self) -> Option<Self::Pass> {
+                self.0.census().await
+            }
+            fn census_view<'p>(
+                &self,
+                pass: &'p Self::Pass,
+            ) -> (
+                &'p [LiveClaudeProcess],
+                &'p wind_down_observer::ObservedInputs,
+            ) {
+                self.0.census_view(pass)
+            }
+            async fn ownership(&self, _ids: &[String]) -> OwnershipRead {
+                Ok(CoordOwnership::default())
+            }
+            fn workspace_root(&self) -> Option<PathBuf> {
+                self.0.workspace_root()
+            }
+            fn custody_context(
+                &self,
+                pass: &Self::Pass,
+                s: &str,
+                t: &str,
+            ) -> SessionCustodyContext {
+                self.0.custody_context(pass, s, t)
+            }
+            fn probe(&self) -> &dyn CustodyProbe {
+                self.0.probe()
+            }
+            fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
+                self.0.publish_custody(verdicts)
+            }
+            async fn close_clean(
+                &self,
+                pass: &Self::Pass,
+                clean: Vec<(String, String)>,
+                root: Option<PathBuf>,
+                ownership: &OwnershipRead,
+                at: Instant,
+            ) -> Option<Vec<CandidateOutcome>> {
+                self.0.close_clean(pass, clean, root, ownership, at).await
+            }
+        }
     }
 
     /// Review item 9: custody probing stops once a batch's worth of clean

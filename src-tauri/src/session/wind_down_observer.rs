@@ -528,9 +528,10 @@ pub type OwnershipRead = Result<CoordOwnership, String>;
 
 /// Read coord's attributed-worktree index for every live session —
 /// `custody::coord::fetch_live_ownership`, which is complete or `Err`, never
-/// a silently short page (its docs say why the plain survey read is not).
-pub async fn fetch_ownership() -> OwnershipRead {
-    custody::coord::fetch_live_ownership().await
+/// a silently short page (its docs say why the plain survey read is not) —
+/// with the liveness of `claude_session_ids`' coord rows read after it.
+pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
+    custody::coord::fetch_live_ownership(claude_session_ids).await
 }
 
 /// What the runner knows about one candidate before any probe runs.
@@ -613,8 +614,10 @@ pub struct AttributedWorktree {
 ///
 /// `Err` — which the gate reads as `Unknown` — when the index could not be
 /// read, when the pane carries no coord session id (its allocations cannot be
-/// looked up at all), or when a ledger path is relative and no workspace root
-/// resolves to anchor it.
+/// looked up at all), when that session is not POSITIVELY known live (coord
+/// auto-closes idle sessions, and a closed session's rows are on no live page
+/// — so its absence is not "no worktrees"), or when a ledger path is relative
+/// and no workspace root resolves to anchor it.
 pub fn attributed_worktrees(
     ownership: &OwnershipRead,
     coord_session_id: Option<&str>,
@@ -627,6 +630,12 @@ pub fn attributed_worktrees(
                 .to_string(),
         );
     };
+    if !index.is_known_live(session_id) {
+        return Err(format!(
+            "coord session {session_id} not on any live page (closed or unknown), so the \
+             worktrees allocated to it cannot be read"
+        ));
+    }
     index
         .worktrees_for_session(session_id)
         .into_iter()
@@ -655,8 +664,9 @@ pub fn attributed_worktrees(
 /// seam so the gather is testable without either.
 #[async_trait::async_trait]
 pub trait CustodyProbe: Send + Sync {
-    /// Does `path` exist at all?
-    async fn exists(&self, path: &Path) -> bool;
+    /// Does `path` exist at all? `Err` when that could not be determined —
+    /// only a positive "not found" is `Ok(false)`.
+    async fn exists(&self, path: &Path) -> Result<bool, String>;
     /// The root of the worktree containing `dir`. `Ok(None)` when `dir` is in
     /// no repository at all; `Err` when `dir` cannot be read.
     async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String>;
@@ -708,16 +718,28 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         };
     };
 
+    let mut members: Vec<CustodyMember> = Vec::new();
     let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
     for worktree in &attributed {
-        if worktree.retired && !probe.exists(&worktree.path).await {
-            continue;
+        if worktree.retired {
+            match probe.exists(&worktree.path).await {
+                // Reaped: its work is over and nothing is left to lose.
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => {
+                    members.push(CustodyMember {
+                        path: worktree.path.display().to_string(),
+                        state: MemberState::ProbeFailed(e),
+                        slot_wip_state: None,
+                    });
+                    continue;
+                }
+            }
         }
         named.push((worktree.path.as_path(), false));
     }
     named.extend(isolated.iter().map(|p| (p.as_path(), false)));
 
-    let mut members: Vec<CustodyMember> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for (path, is_session_dir) in named {
@@ -858,10 +880,12 @@ impl GitCustodyProbe {
             .map_err(|e| format!("git {} printed {count:?}: {e}", args.join(" ")))
     }
 
-    /// The full ref name of `HEAD`'s upstream when one is configured AND still
-    /// resolves; `None` for a detached `HEAD` (`symbolic-ref -q` exits 1), a
-    /// branch with no upstream (`for-each-ref` prints nothing), and an
-    /// upstream whose ref is gone (`show-ref --verify -q` exits 1).
+    /// The full ref name of `HEAD`'s upstream when one is configured, is a
+    /// REMOTE-tracking ref, and still resolves; `None` for a detached `HEAD`
+    /// (`symbolic-ref -q` exits 1), a branch with no upstream (`for-each-ref`
+    /// prints nothing), an upstream that is a LOCAL branch (`--track main`:
+    /// `main..HEAD == 0` proves nothing was pushed), and an upstream whose ref
+    /// is gone (`show-ref --verify -q` exits 1).
     async fn resolved_upstream(&self, root: &Path) -> Result<Option<String>, String> {
         let head = self.git(root, &["symbolic-ref", "-q", "HEAD"]).await?;
         match head.status.code() {
@@ -873,7 +897,7 @@ impl GitCustodyProbe {
         let upstream = self
             .git_ok(root, &["for-each-ref", "--format=%(upstream)", &head_ref])
             .await?;
-        if upstream.is_empty() {
+        if !upstream.starts_with("refs/remotes/") {
             return Ok(None);
         }
         let exists = self
@@ -899,15 +923,19 @@ fn failed_git(args: &[&str], output: &std::process::Output) -> String {
 
 #[async_trait::async_trait]
 impl CustodyProbe for GitCustodyProbe {
-    async fn exists(&self, path: &Path) -> bool {
+    async fn exists(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_path_buf();
-        // A walk that dies answers `true`: "exists" keeps the row in the set,
-        // where its probe then fails closed — never a silent skip.
+        // Only `NotFound` is "missing". Permission denied, a stale mount or a
+        // walk that died says nothing about whether the worktree was reaped.
         qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-            std::fs::symlink_metadata(&path).is_ok()
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            }
         })
         .await
-        .unwrap_or(true)
+        .map_err(|e| format!("existence check died: {e}"))?
     }
 
     async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
@@ -1105,6 +1133,8 @@ mod tests {
         slots: HashMap<PathBuf, String>,
         /// paths that do not exist at all.
         missing: HashSet<PathBuf>,
+        /// paths whose existence cannot be determined.
+        exists_unreadable: HashSet<PathBuf>,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
@@ -1124,8 +1154,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CustodyProbe for FakeProbe {
-        async fn exists(&self, path: &Path) -> bool {
-            !self.missing.contains(path)
+        async fn exists(&self, path: &Path) -> Result<bool, String> {
+            if self.exists_unreadable.contains(path) {
+                return Err(format!("{}: permission denied", path.display()));
+            }
+            Ok(!self.missing.contains(path))
         }
         async fn worktree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
             self.calls
@@ -1325,6 +1358,18 @@ mod tests {
         );
         assert!(custody_gate(&reaped).is_clean());
 
+        // Round-2 suggestion 5: a retired row whose existence cannot be read
+        // is not "reaped" — it is a failed probe.
+        probe.exists_unreadable.insert(PathBuf::from("/ws/denied"));
+        let denied = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![retired("/ws/denied")]),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&denied).reason(), Some("probe_failed"));
+
         let lost = gather_custody(
             &probe,
             &context(Some("/ws"), &[]),
@@ -1370,10 +1415,11 @@ mod tests {
         assert_eq!(session_dir_from(None, None), None);
     }
 
-    fn ownership(json: &str) -> OwnershipRead {
-        Ok(CoordOwnership::from_response(
-            serde_json::from_str(json).unwrap(),
-        ))
+    /// An index read from `json`, with `live` marked positively live.
+    fn ownership(json: &str, live: &[&str]) -> OwnershipRead {
+        let mut index = CoordOwnership::from_response(serde_json::from_str(json).unwrap());
+        index.mark_live(live.iter().copied());
+        Ok(index)
     }
 
     #[test]
@@ -1384,6 +1430,7 @@ mod tests {
                 {"worktreePath":"/abs/wt","repo":"repo2","ledgerStatus":"merged"},
                 {"worktreePath":"/abs/old","repo":"repo3","ledgerStatus":"abandoned"},
                 {"worktreePath":"/abs/new","repo":"repo4"}]}]}"#,
+            &["c-1", "c-other"],
         );
         assert_eq!(
             attributed_worktrees(&own, Some("c-1"), Some(Path::new("/ws"))).unwrap(),
@@ -1407,13 +1454,36 @@ mod tests {
         );
         assert_eq!(
             attributed_worktrees(&own, Some("c-other"), None).unwrap(),
-            Vec::<AttributedWorktree>::new()
+            Vec::<AttributedWorktree>::new(),
+            "a session positively known live that holds no rows has nothing attributed"
         );
+    }
+
+    /// Round-2 CRITICAL 1: a pane whose coord session is on NO validated live
+    /// page and not otherwise known live — coord auto-closed it — is Unknown,
+    /// never "nothing attributed". Its rows (a dirty sibling, say) may exist.
+    #[tokio::test]
+    async fn a_coord_session_absent_from_every_live_page_is_unknown() {
+        let own = ownership(
+            r#"{"sessions":[{"sessionId":"c-live","worktrees":[{"worktreePath":"/abs/a"}]}]}"#,
+            &["c-live"],
+        );
+        let err =
+            attributed_worktrees(&own, Some("c-autoclosed"), Some(Path::new("/ws"))).unwrap_err();
+        assert!(err.contains("not on any live page"), "{err}");
+        let inputs = gather_custody(
+            &FakeProbe::default().root("/ws/wt/a", "/ws/wt/a"),
+            &context(Some("/ws/wt/a"), &[]),
+            attributed_worktrees(&own, Some("c-autoclosed"), Some(Path::new("/ws"))),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("ownership_unreadable"));
     }
 
     #[test]
     fn attributed_worktrees_fail_closed_without_a_read_or_a_coord_id() {
-        let own = ownership(r#"{"sessions":[]}"#);
+        let own = ownership(r#"{"sessions":[]}"#, &["c-1"]);
         assert!(attributed_worktrees(&own, None, Some(Path::new("/ws"))).is_err());
         let failed: OwnershipRead = Err("coord returned 503".to_string());
         assert_eq!(
@@ -1556,6 +1626,38 @@ mod tests {
         assert_eq!(probe.member_state(&linked).await, one_unpushed);
         git(&linked, &["switch", "-q", "--detach", "origin/main"]);
         assert_eq!(probe.member_state(&linked).await, clean);
+
+        // Round-2 WARNING 3: an upstream that is a LOCAL branch proves nothing
+        // was pushed. `--track main` with a local-only commit: `main..HEAD`
+        // would read 0 — the probe must count commits on no remote ref.
+        git(&linked, &["switch", "-q", "--detach", "origin/main"]);
+        git(
+            &linked,
+            &["branch", "-q", "-f", "local-base", "origin/main"],
+        );
+        git(
+            &linked,
+            &[
+                "switch",
+                "-q",
+                "-c",
+                "tracks-local",
+                "--track",
+                "local-base",
+            ],
+        );
+        std::fs::write(linked.join("tracked-local.txt"), "mine").unwrap();
+        git(&linked, &["add", "tracked-local.txt"]);
+        git(
+            &linked,
+            &["commit", "-q", "-m", "local only, local upstream"],
+        );
+        git(&linked, &["branch", "-q", "-f", "local-base", "HEAD"]);
+        assert_eq!(
+            probe.member_state(&linked).await,
+            one_unpushed,
+            "`local-base..HEAD` is 0, but the commit is on no remote"
+        );
 
         // Review item 7a: an upstream whose remote-tracking ref was pruned (its
         // branch deleted on the remote) falls back to "on any remote ref".

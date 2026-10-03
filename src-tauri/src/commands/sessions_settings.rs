@@ -41,14 +41,16 @@ pub fn finished_session_close_get() -> Result<CommandResponse, String> {
             data: Some(payload(saved)),
         },
         // The arm runs OFF while the file is unreadable; say why rather than
-        // render the placeholder default as the operator's choice.
+        // render the placeholder default as the operator's choice. Saving is
+        // refused too (`update_settings` will not write over a file it could
+        // not read), which `settings_unreadable` tells the panel.
         Err(e) => CommandResponse {
             success: false,
             message: Some(format!(
                 "settings.json is unreadable ({e}) — the runner is not closing finished \
                  sessions until it can read the saved value"
             )),
-            data: None,
+            data: Some(json!({ "settings_unreadable": true })),
         },
     })
 }

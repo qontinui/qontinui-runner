@@ -1209,6 +1209,11 @@ pub mod coord {
         by_path: std::collections::HashMap<String, usize>,
         /// coord answered at all. `false` ⇒ absence is UNKNOWN, not "no owner".
         pub reachable: bool,
+        /// `coord.sessions.id`s (lowercased) POSITIVELY known to be in a live
+        /// state when this index was read — see [`fetch_live_ownership`].
+        /// Empty for an index built by [`Self::from_response`] alone, which
+        /// asserts nothing about liveness.
+        live_sessions: std::collections::HashSet<String>,
     }
 
     impl CoordOwnership {
@@ -1234,7 +1239,22 @@ pub mod coord {
                 rows,
                 by_path,
                 reachable: true,
+                live_sessions: std::collections::HashSet::new(),
             }
+        }
+
+        /// Record `session_ids` as positively live when this index was read.
+        pub fn mark_live<'a>(&mut self, session_ids: impl IntoIterator<Item = &'a str>) {
+            self.live_sessions
+                .extend(session_ids.into_iter().map(str::to_ascii_lowercase));
+        }
+
+        /// Is `session_id` (a `coord.sessions.id`) positively known live? Only
+        /// then does an absence of its rows mean "no worktrees" — a session
+        /// coord has CLOSED drops off every live page with its rows.
+        pub fn is_known_live(&self, session_id: &str) -> bool {
+            self.live_sessions
+                .contains(&session_id.to_ascii_lowercase())
         }
 
         pub fn len(&self) -> usize {
@@ -1397,10 +1417,29 @@ pub mod coord {
             validate_complete_page(&page, state, limit)?;
             sessions.extend(page.sessions);
         }
-        Ok(CoordOwnership::from_response(CoordSessionWorktrees {
+        let on_live_pages: Vec<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
+        let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
             sessions,
             session_bridge_column_present: Some(true),
-        }))
+        });
+        // Every session on a validated live page was live when the page was read.
+        index.mark_live(on_live_pages.iter().map(String::as_str));
+        Ok(index)
+    }
+
+    /// PURE: the `coord.sessions.id`s a work-status read shows in a LIVE
+    /// state ([`LIVE_SESSION_STATES`]).
+    pub fn live_coord_sessions(
+        liveness: &std::collections::HashMap<
+            String,
+            crate::mcp::session_work_status::CoordLiveness,
+        >,
+    ) -> Vec<String> {
+        liveness
+            .values()
+            .filter(|l| LIVE_SESSION_STATES.contains(&l.state.as_str()))
+            .map(|l| l.coord_session_id.clone())
+            .collect()
     }
 
     /// Fetch the attributed-worktree index for every LIVE session, complete or
@@ -1419,7 +1458,26 @@ pub mod coord {
     /// complete by construction and cheap — a coord follow-up; until then a
     /// tenant with more than 500 rows in one state reads as UNKNOWN here,
     /// never as clean.
-    pub async fn fetch_live_ownership() -> Result<CoordOwnership, String> {
+    ///
+    /// ## Liveness: why a session missing from every page is not "no rows"
+    ///
+    /// The route's ledger join is an INNER lateral off
+    /// `coord.agent_worktrees`, so a session with no worktree rows is OMITTED,
+    /// not listed with an empty array — and coord auto-closes a `stale` /
+    /// `pending_resolution` session after `COORD_SESSION_AUTOCLOSE_SECS`
+    /// without a heartbeat ever reopening it, so a live pane can carry a
+    /// session id that is on no live page while its rows still exist. Absence
+    /// is therefore ambiguous. After the pages, this reads coord's
+    /// `/coord/sessions/work-status` for `claude_session_ids` and marks as
+    /// live (`CoordOwnership::is_known_live`) every row it shows in a live
+    /// state, on top of every session the pages listed. The order is
+    /// load-bearing: liveness only ever moves to `closed`, so a session live
+    /// AFTER the pages were read was live while they were, and its rows — if
+    /// it had any — are on them. A degraded work-status read marks nothing,
+    /// which leaves an absent session Unknown.
+    pub async fn fetch_live_ownership(
+        claude_session_ids: &[String],
+    ) -> Result<CoordOwnership, String> {
         let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
             return Err(
                 "no coord base is configured, so the session's worktree allocations cannot be read"
@@ -1452,7 +1510,11 @@ pub mod coord {
                 .map_err(|e| format!("decode session-worktrees ({state}): {e}"))?;
             pages.push((state, page));
         }
-        ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)
+        let mut index = ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)?;
+        let status = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        let live = live_coord_sessions(&status.liveness_by_session_id);
+        index.mark_live(live.iter().map(String::as_str));
+        Ok(index)
     }
 
     #[cfg(test)]
@@ -1651,6 +1713,45 @@ pub mod coord {
             let good = page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
             assert!(ownership_from_pages(vec![("active", good), ("expected", bad)], 500).is_err());
             assert!(LIVE_SESSION_STATES.iter().all(|s| *s != "closed"));
+        }
+
+        #[test]
+        fn sessions_on_live_pages_and_live_work_status_rows_are_known_live() {
+            use crate::mcp::session_work_status::CoordLiveness;
+            let active = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"S-PAGE","worktrees":[{"worktreePath":"wt/a"}]}]}"#,
+            );
+            let mut idx = ownership_from_pages(vec![("active", active)], 500).unwrap();
+            assert!(idx.is_known_live("s-page"), "listed on a live page");
+            assert!(!idx.is_known_live("s-rowless"));
+
+            let liveness: std::collections::HashMap<String, CoordLiveness> = [
+                ("claude-a", "s-rowless", "active"),
+                ("claude-b", "s-closed", "closed"),
+            ]
+            .into_iter()
+            .map(|(c, s, st)| {
+                (
+                    c.to_string(),
+                    CoordLiveness {
+                        coord_session_id: s.to_string(),
+                        state: st.to_string(),
+                    },
+                )
+            })
+            .collect();
+            let live = live_coord_sessions(&liveness);
+            idx.mark_live(live.iter().map(String::as_str));
+            assert!(
+                idx.is_known_live("s-rowless"),
+                "live, simply holding no rows"
+            );
+            assert!(!idx.is_known_live("s-closed"), "closed is never live");
+            // An index built from a response alone asserts no liveness.
+            assert!(
+                !CoordOwnership::from_response(page(r#"{"sessions":[]}"#)).is_known_live("s-page")
+            );
         }
 
         #[test]
