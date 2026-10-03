@@ -355,9 +355,14 @@ pub(crate) enum SessionBus {
 }
 
 /// The session-bus socket zbus would connect to when no
-/// `DBUS_SESSION_BUS_ADDRESS` is set: `$XDG_RUNTIME_DIR/bus`, or — when
-/// `XDG_RUNTIME_DIR` is unset/blank, as zbus's `Address::session()` falls back
-/// — `/run/user/<euid>/bus`. PURE.
+/// `DBUS_SESSION_BUS_ADDRESS` is set: `$XDG_RUNTIME_DIR/bus`, or
+/// `/run/user/<euid>/bus` when `XDG_RUNTIME_DIR` is unset — the caller reads it
+/// with `std::env::var` (UTF-8, as zbus's `Address::session()` does, so a
+/// non-UTF-8 value falls back too). One deliberate difference: zbus turns a
+/// set-but-BLANK value into `/bus`; this treats blank as unset. That only ever
+/// finds MORE sockets (`/run/user/<euid>/bus` exists on a lingering box,
+/// `/bus` never does), so it errs toward `Failed`, never toward a false
+/// "absent by design". PURE.
 pub(crate) fn session_bus_socket(xdg_runtime_dir: Option<&Path>, euid: u32) -> PathBuf {
     match xdg_runtime_dir.filter(|d| !d.as_os_str().is_empty()) {
         Some(d) => d.join("bus"),
@@ -375,6 +380,21 @@ pub(crate) fn session_bus_absent_by_design(
     socket: &Path,
 ) -> bool {
     dbus_session_bus_address.is_none_or(|a| a.trim().is_empty()) && !socket.exists()
+}
+
+/// The row key for a unit the D-Bus scan loaded under `listed` (the name it
+/// was listed or loaded by): its own `Id` property — its canonical name, as
+/// `systemctl show` reports it — falling back to `listed`. Returns `None` when
+/// that key was already seen this scan: an alias and its target are ONE unit,
+/// one row. PURE.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn unit_row_key(
+    seen: &mut std::collections::BTreeSet<String>,
+    id_prop: Option<String>,
+    listed: String,
+) -> Option<String> {
+    let id = id_prop.unwrap_or(listed);
+    seen.insert(id.clone()).then_some(id)
 }
 
 /// The unit name a `ListUnitFilesByPatterns` / `list-unit-files` row
@@ -509,7 +529,9 @@ pub(crate) mod linux {
                 },
                 None => {
                     let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
-                    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+                    let xdg = std::env::var("XDG_RUNTIME_DIR")
+                        .ok()
+                        .map(std::path::PathBuf::from);
                     // SAFETY: geteuid has no preconditions and cannot fail.
                     let euid = unsafe { libc::geteuid() };
                     let socket = super::session_bus_socket(xdg.as_deref(), euid);
@@ -665,8 +687,7 @@ pub(crate) mod linux {
             // Key on the unit's own `Id` (its canonical name), as
             // `systemctl show` does: a name that resolves to an already-seen
             // unit is the same unit, not a second row.
-            let id = str_prop(&unit, "Id").unwrap_or(name);
-            if seen_ids.insert(id.clone()) {
+            if let Some(id) = super::unit_row_key(&mut seen_ids, str_prop(&unit, "Id"), name) {
                 out.push(props_from_maps(id, &unit, &svc));
             }
         }
@@ -1289,6 +1310,35 @@ DISPLAY_NAME: Print Spooler\r
         assert_eq!(
             session_bus_socket(Some(Path::new("/tmp/xdg-example")), 4242),
             PathBuf::from("/tmp/xdg-example/bus")
+        );
+    }
+
+    /// The D-Bus scan keys a row on the unit's own `Id`: an alias loaded after
+    /// its target (or the reverse) collapses to the canonical name, once.
+    #[test]
+    fn dbus_rows_are_keyed_by_id_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        assert_eq!(
+            unit_row_key(
+                &mut seen,
+                Some("actions.runner.example-org.box.service".into()),
+                "actions.runner.example-org.box.service".into()
+            ),
+            Some("actions.runner.example-org.box.service".to_string())
+        );
+        // An alias name resolving to the same unit: no second row.
+        assert_eq!(
+            unit_row_key(
+                &mut seen,
+                Some("actions.runner.example-org.box.service".into()),
+                "actions.runner.example-alias.service".into()
+            ),
+            None
+        );
+        // No Id property: the listed name is the key.
+        assert_eq!(
+            unit_row_key(&mut seen, None, "actions.runner.other.service".into()),
+            Some("actions.runner.other.service".to_string())
         );
     }
 
