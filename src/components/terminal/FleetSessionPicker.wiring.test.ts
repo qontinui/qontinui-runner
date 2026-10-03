@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, it, expect } from "vitest";
 
-import { assertAnchored, subjectDir } from "../../lib/__test-helpers__/assertAnchored";
+import { assertAnchored, callsOf, subjectDir } from "../../lib/__test-helpers__/assertAnchored";
 
 // `subjectDir` is this directory, or the mutation probe's staged copy of it
 // (see FleetSessionPicker.wiring.test.mutants.json) — the file reads are the
@@ -76,49 +76,6 @@ function codeOf(text: string): string {
  *    argument would end the slice early; the arity check turns that from a
  *    confusing green-ish failure into a stated one.
  */
-/**
- * The full text of every `<needle>…)` call in `code` (comments already
- * stripped by the caller), found by paren counting.
- *
- * This exists because `/useEffect\([^)]*setAppliedQuery/` and
- * `/setServer\([^)]*limit:/` were UNSATISFIABLE for the code shapes they
- * forbid: `[^)]*` cannot cross the `)` of `() =>`, so an effect or functional
- * update written the way this codebase writes them can never match. Measured by
- * mutating the source to contain exactly the forbidden shape (see
- * FleetSessionPicker.wiring.test.mutants.json) — it stayed green. Slicing the
- * call and asserting on its text has no such blind spot.
- *
- * Throws when `needle` occurs nowhere, so "no call contains X" can never be
- * satisfied by a scan that found no calls, and when a call never closes.
- */
-function callsOf(code: string, needle: string): string[] {
-  const calls: string[] = [];
-  let from = 0;
-  for (;;) {
-    const at = code.indexOf(needle, from);
-    if (at < 0) break;
-    const open = at + needle.length - 1;
-    let depth = 0;
-    let end = -1;
-    for (let i = open; i < code.length; i += 1) {
-      if (code[i] === "(") depth += 1;
-      else if (code[i] === ")") {
-        depth -= 1;
-        if (depth === 0) {
-          end = i;
-          break;
-        }
-      }
-    }
-    if (end < 0) throw new Error(`unbalanced ${needle} call`);
-    calls.push(code.slice(at, end + 1));
-    from = end + 1;
-  }
-  if (calls.length === 0)
-    throw new Error(`no ${needle} call found; a scan of nothing proves nothing`);
-  return calls;
-}
-
 function emptyReadArgs(): string[] {
   const code = codeOf(SOURCE);
   const needle = "fleetEmptyReadMessage(";
