@@ -2743,10 +2743,12 @@ mod tests {
     }
 
     /// Every single failing ELIGIBILITY input keeps a session out of the arm
-    /// entirely. (The custody inputs — untracked, unpushed, no upstream, a
+    /// entirely. (The custody inputs — untracked, unpushed, a failed probe, a
     /// failed ownership read, no directory, a primary checkout, a captured or
     /// deferred slot — are pinned one each against `custody_gate` itself in
-    /// `wind_down`'s tests, and through the gather in `wind_down_observer`'s.)
+    /// `wind_down`'s tests, and through the gather in `wind_down_observer`'s;
+    /// the no-upstream rule — clean when every commit is on a remote ref,
+    /// unpushed otherwise — is pinned against a real git there.)
     #[test]
     fn each_single_failing_eligibility_input_is_never_a_finished_close_candidate() {
         let past_grace = GRACE_MS;
@@ -2841,8 +2843,9 @@ mod tests {
             )
             .custody(
                 "t3",
-                CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+                CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
                     path: "/ws/b".to_string(),
+                    detail: "git status timed out".to_string(),
                 }),
             );
         let outcomes = close_batch(

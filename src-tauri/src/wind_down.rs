@@ -407,10 +407,13 @@ pub enum MemberState {
     Probed {
         /// `git status --porcelain` printed anything, untracked files included.
         dirty: bool,
-        /// Commits on `HEAD` that `@{upstream}` does not have. `None` when the
-        /// branch has no upstream (or `HEAD` is detached), so "pushed" cannot
-        /// be established.
-        ahead: Option<u64>,
+        /// Commits reachable from `HEAD` that are not pushed. With an upstream:
+        /// `rev-list --count @{upstream}..HEAD`. With none (including a
+        /// detached `HEAD`): `rev-list --count HEAD --not --remotes` — commits
+        /// on NO remote-tracking ref. So a freshly allocated worktree that made
+        /// no commits, sitting on `origin/main`'s commit with no upstream, is
+        /// `0`: nothing of its own exists to lose.
+        ahead: u64,
     },
     /// A probe could not be completed — it failed, timed out, or the path is
     /// not a worktree at all.
@@ -451,7 +454,8 @@ pub enum CustodyDirty {
     SharedCheckout { path: String },
     /// A member has uncommitted changes or untracked files.
     Uncommitted { path: String },
-    /// A member has commits its upstream does not.
+    /// A member has commits its upstream does not — or, with no upstream,
+    /// commits that are on no remote-tracking ref at all.
     Unpushed { path: String, ahead: u64 },
     /// The session's own custody slot says its work was not left clean.
     WipSlot { path: String, wip_state: String },
@@ -464,8 +468,6 @@ pub enum CustodyUnknown {
     NoSessionDir,
     /// The attributed-worktree read failed.
     OwnershipUnreadable { detail: String },
-    /// A member's branch has no upstream, so "pushed" cannot be established.
-    NoUpstream { path: String },
     /// A member's probe failed or timed out.
     ProbeFailed { path: String, detail: String },
 }
@@ -499,7 +501,7 @@ impl CustodyDirty {
                 format!("{path} has uncommitted changes or untracked files")
             }
             Self::Unpushed { path, ahead } => {
-                format!("{path} is {ahead} commit(s) ahead of its upstream")
+                format!("{path} has {ahead} commit(s) that are not pushed")
             }
             Self::WipSlot { path, wip_state } => {
                 format!("this session's custody slot in {path} reads wip_state={wip_state}")
@@ -513,7 +515,6 @@ impl CustodyUnknown {
         match self {
             Self::NoSessionDir => "no_session_dir",
             Self::OwnershipUnreadable { .. } => "ownership_unreadable",
-            Self::NoUpstream { .. } => "no_upstream",
             Self::ProbeFailed { .. } => "probe_failed",
         }
     }
@@ -527,7 +528,6 @@ impl CustodyUnknown {
             Self::OwnershipUnreadable { detail } => {
                 format!("the session's attributed worktrees could not be read: {detail}")
             }
-            Self::NoUpstream { path } => format!("{path} has no upstream to compare against"),
             Self::ProbeFailed { path, detail } => format!("{path}: {detail}"),
         }
     }
@@ -578,8 +578,10 @@ impl CustodyVerdict {
 ///    order: a primary checkout, then uncommitted changes, the session's own
 ///    custody slot, and unpushed commits. Dirty outranks a sibling's unknown
 ///    because it is the more useful thing to report, and neither closes.
-/// 4. **Any member that could not be judged → `Unknown`**: a failed probe or
-///    a branch with no upstream.
+/// 4. **Any member that could not be judged → `Unknown`**: a probe that
+///    failed or timed out. A branch with no upstream is NOT one — the probe
+///    then counts the commits on no remote-tracking ref (see
+///    [`MemberState::Probed::ahead`]), which is a definite answer.
 /// 5. Otherwise **`Clean`** — including a session with NO members at all,
 ///    which is a session sitting outside any repo (the workspace root) that
 ///    no worktree is attributed to.
@@ -613,10 +615,7 @@ pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
                 wip_state: state.to_string(),
             });
         }
-        if let MemberState::Probed {
-            ahead: Some(ahead), ..
-        } = member.state
-        {
+        if let MemberState::Probed { ahead, .. } = member.state {
             if ahead > 0 {
                 return CustodyVerdict::Dirty(CustodyDirty::Unpushed { path, ahead });
             }
@@ -628,11 +627,6 @@ pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
                 return CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
                     path: member.path.clone(),
                     detail: detail.clone(),
-                })
-            }
-            MemberState::Probed { ahead: None, .. } => {
-                return CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
-                    path: member.path.clone(),
                 })
             }
             MemberState::Probed { .. } | MemberState::PrimaryCheckout => {}
@@ -1161,7 +1155,7 @@ mod tests {
             path: path.to_string(),
             state: MemberState::Probed {
                 dirty: false,
-                ahead: Some(0),
+                ahead: 0,
             },
             slot_wip_state: Some("clean".to_string()),
         }
@@ -1188,7 +1182,7 @@ mod tests {
         let mut m = clean_member("/ws/a");
         m.state = MemberState::Probed {
             dirty: true,
-            ahead: Some(0),
+            ahead: 0,
         };
         assert_eq!(
             custody_gate(&custody(vec![m])),
@@ -1203,7 +1197,7 @@ mod tests {
         let mut m = clean_member("/ws/a");
         m.state = MemberState::Probed {
             dirty: false,
-            ahead: Some(2),
+            ahead: 2,
         };
         let v = custody_gate(&custody(vec![m]));
         assert_eq!(
@@ -1214,21 +1208,6 @@ mod tests {
             })
         );
         assert_eq!(v.reason(), Some("unpushed"));
-    }
-
-    #[test]
-    fn no_upstream_is_unknown_never_clean() {
-        let mut m = clean_member("/ws/a");
-        m.state = MemberState::Probed {
-            dirty: false,
-            ahead: None,
-        };
-        assert_eq!(
-            custody_gate(&custody(vec![m])),
-            CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
-                path: "/ws/a".to_string()
-            })
-        );
     }
 
     #[test]
@@ -1309,7 +1288,7 @@ mod tests {
         let mut dirty = clean_member("/ws/agent-worktrees/x/repo");
         dirty.state = MemberState::Probed {
             dirty: true,
-            ahead: Some(0),
+            ahead: 0,
         };
         assert_eq!(custody_gate(&custody(vec![dirty])).as_str(), "dirty");
     }
@@ -1319,7 +1298,7 @@ mod tests {
         let mut sibling = clean_member("/ws/b");
         sibling.state = MemberState::Probed {
             dirty: false,
-            ahead: Some(1),
+            ahead: 1,
         };
         let v = custody_gate(&custody(vec![
             clean_member("/ws/a"),
@@ -1342,7 +1321,7 @@ mod tests {
         let mut dirty = clean_member("/ws/b");
         dirty.state = MemberState::Probed {
             dirty: true,
-            ahead: Some(0),
+            ahead: 0,
         };
         assert_eq!(
             custody_gate(&custody(vec![unknown, dirty])).as_str(),
@@ -1353,16 +1332,17 @@ mod tests {
     #[test]
     fn the_custody_view_carries_the_verdict_and_is_omitted_when_absent() {
         let v = CustodyView::from_verdict(
-            &CustodyVerdict::Unknown(CustodyUnknown::NoUpstream {
+            &CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
                 path: "/ws/a".to_string(),
+                detail: "git status timed out".to_string(),
             }),
             42,
         );
         assert_eq!(
             serde_json::to_value(&v).unwrap(),
             serde_json::json!({
-                "verdict": "unknown", "reason": "no_upstream",
-                "detail": "/ws/a has no upstream to compare against", "judgedAt": 42
+                "verdict": "unknown", "reason": "probe_failed",
+                "detail": "/ws/a: git status timed out", "judgedAt": 42
             })
         );
         // A view the arm never judged serialises with no `custody` key at all.

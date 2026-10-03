@@ -760,6 +760,9 @@ impl GitCustodyProbe {
             // some other repository than the one named by `-C`.
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
+            // A probe must never touch the network: in a partial clone a
+            // missing object would otherwise be lazily fetched.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         match tokio::time::timeout(self.timeout, cmd.output()).await {
@@ -783,35 +786,53 @@ impl GitCustodyProbe {
         }
     }
 
-    /// Commits on `HEAD` its upstream lacks; `Ok(None)` when there is no
-    /// upstream to compare against (a detached `HEAD`, or a branch with no
-    /// `branch.<name>.merge`). Decided from exit codes, never from git's
-    /// (localisable) error text.
-    async fn ahead_of_upstream(&self, root: &Path) -> Result<Option<u64>, String> {
-        // `symbolic-ref -q` exits 1 on a detached HEAD.
+    /// Commits reachable from `HEAD` that are not pushed.
+    ///
+    /// * **With an upstream** — `rev-list --count @{upstream}..HEAD`.
+    /// * **With none, or a detached `HEAD`** — `rev-list --count HEAD --not
+    ///   --remotes`: the commits on NO remote-tracking ref. `0` means every
+    ///   commit at `HEAD` is already on some remote, so nothing is unpushed;
+    ///   that is the shape of a freshly allocated worktree that made no
+    ///   commits (it sits on `origin/main`'s commit with no upstream), the
+    ///   most common finished session there is.
+    ///
+    /// Which arm applies is decided from exit codes, never from git's
+    /// (localisable) error text. Every call is local — `rev-list` reads
+    /// remote-tracking refs as this clone last saw them and fetches nothing,
+    /// and [`Self::git`] sets `GIT_NO_LAZY_FETCH` so a partial clone cannot
+    /// fetch a missing object behind the probe's back. `Err` only when a git
+    /// call failed or timed out.
+    async fn unpushed_commits(&self, root: &Path) -> Result<u64, String> {
+        let args: &[&str] = if self.has_upstream(root).await? {
+            &["rev-list", "--count", "@{upstream}..HEAD"]
+        } else {
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"]
+        };
+        let count = self.git_ok(root, args).await?;
+        count
+            .parse::<u64>()
+            .map_err(|e| format!("git {} printed {count:?}: {e}", args.join(" ")))
+    }
+
+    /// Does `HEAD` name a branch with a configured upstream? `false` for a
+    /// detached `HEAD` (`symbolic-ref -q` exits 1) and for a branch with no
+    /// `branch.<name>.merge` (`config --get` exits 1).
+    async fn has_upstream(&self, root: &Path) -> Result<bool, String> {
         let head = self.git(root, &["symbolic-ref", "-q", "HEAD"]).await?;
         match head.status.code() {
             Some(0) => {}
-            Some(1) => return Ok(None),
+            Some(1) => return Ok(false),
             _ => return Err(failed_git(&["symbolic-ref", "-q", "HEAD"], &head)),
         }
         let head_ref = String::from_utf8_lossy(&head.stdout).trim().to_string();
         let branch = head_ref.strip_prefix("refs/heads/").unwrap_or(&head_ref);
         let key = format!("branch.{branch}.merge");
-        // `config --get` exits 1 when the key is absent: no upstream.
         let merge = self.git(root, &["config", "--get", &key]).await?;
         match merge.status.code() {
-            Some(0) => {}
-            Some(1) => return Ok(None),
-            _ => return Err(failed_git(&["config", "--get", &key], &merge)),
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(failed_git(&["config", "--get", &key], &merge)),
         }
-        let count = self
-            .git_ok(root, &["rev-list", "--count", "@{upstream}..HEAD"])
-            .await?;
-        count
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|e| format!("git rev-list --count printed {count:?}: {e}"))
     }
 }
 
@@ -855,7 +876,7 @@ impl CustodyProbe for GitCustodyProbe {
             Ok(out) => out,
             Err(e) => return MemberState::ProbeFailed(e),
         };
-        match self.ahead_of_upstream(root).await {
+        match self.unpushed_commits(root).await {
             Ok(ahead) => MemberState::Probed {
                 dirty: !status.is_empty(),
                 ahead,
@@ -1056,7 +1077,7 @@ mod tests {
                 .cloned()
                 .unwrap_or(MemberState::Probed {
                     dirty: false,
-                    ahead: Some(0),
+                    ahead: 0,
                 })
         }
         async fn slot_wip_state(&self, root: &Path, _claude_session_id: &str) -> Option<String> {
@@ -1097,7 +1118,7 @@ mod tests {
                 "/ws/agent-worktrees/a/repo",
                 MemberState::Probed {
                     dirty: true,
-                    ahead: Some(0),
+                    ahead: 0,
                 },
             );
         let none = gather_custody(&probe, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
@@ -1126,7 +1147,7 @@ mod tests {
                 "/ws/wt/b",
                 MemberState::Probed {
                     dirty: false,
-                    ahead: Some(3),
+                    ahead: 3,
                 },
             );
         let inputs = gather_custody(
@@ -1289,9 +1310,10 @@ mod tests {
         );
     }
 
-    /// The four D2c cases the plan names — clean, an untracked file, an
-    /// unpushed commit, no upstream — plus the primary-checkout case, through
-    /// the SHIPPED probe and a real git.
+    /// The D2c cases — clean, an untracked file, an unpushed commit, and a
+    /// branch with no upstream both with and without a local-only commit —
+    /// plus a detached HEAD and the primary-checkout case, through the
+    /// SHIPPED probe and a real git.
     #[tokio::test]
     async fn the_git_probe_reads_clean_untracked_unpushed_and_no_upstream() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1331,7 +1353,7 @@ mod tests {
         let probe = GitCustodyProbe::default();
         let clean = MemberState::Probed {
             dirty: false,
-            ahead: Some(0),
+            ahead: 0,
         };
 
         // The root walk resolves a subdirectory to its worktree root.
@@ -1351,7 +1373,7 @@ mod tests {
             probe.member_state(&linked).await,
             MemberState::Probed {
                 dirty: true,
-                ahead: Some(0)
+                ahead: 0
             }
         );
 
@@ -1362,7 +1384,7 @@ mod tests {
             probe.member_state(&linked).await,
             MemberState::Probed {
                 dirty: false,
-                ahead: Some(1)
+                ahead: 1
             }
         );
 
@@ -1371,15 +1393,26 @@ mod tests {
         git(&linked, &["fetch", "-q", "origin"]);
         assert_eq!(probe.member_state(&linked).await, clean);
 
-        // A branch with no upstream: "pushed" cannot be established.
+        // No upstream, HEAD on a remote-tracking ref's commit — the freshly
+        // allocated worktree that made no commits: nothing is unpushed.
         git(&linked, &["switch", "-q", "-c", "no-upstream"]);
-        assert_eq!(
-            probe.member_state(&linked).await,
-            MemberState::Probed {
-                dirty: false,
-                ahead: None
-            }
-        );
+        assert_eq!(probe.member_state(&linked).await, clean);
+
+        // No upstream, one local-only commit: on no remote ref, so unpushed.
+        std::fs::write(linked.join("local.txt"), "mine").unwrap();
+        git(&linked, &["add", "local.txt"]);
+        git(&linked, &["commit", "-q", "-m", "on no remote"]);
+        let one_unpushed = MemberState::Probed {
+            dirty: false,
+            ahead: 1,
+        };
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+
+        // A detached HEAD has no upstream either and is judged the same way.
+        git(&linked, &["switch", "-q", "--detach"]);
+        assert_eq!(probe.member_state(&linked).await, one_unpushed);
+        git(&linked, &["switch", "-q", "--detach", "origin/main"]);
+        assert_eq!(probe.member_state(&linked).await, clean);
 
         // The primary clone's `.git` is a directory.
         assert_eq!(
