@@ -10,6 +10,7 @@ import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profile
 import {
   installOsFor,
   launchEntry,
+  structuredLaunchOffer,
   type CliAvailability,
   type LaunchMenuProfile,
 } from "./providerLaunchMenu";
@@ -84,5 +85,29 @@ describe("launchEntry", () => {
       state: "probing",
       enabled: false,
     });
+  });
+});
+
+describe("structuredLaunchOffer (Phase 9)", () => {
+  const claude = (): LaunchMenuProfile => {
+    const p = profiles.find((x) => x.id === "claude");
+    if (!p) throw new Error("served_profiles.json has no claude profile");
+    return p;
+  };
+
+  it("offers a structured session for Claude — the lane the runner speaks", () => {
+    expect(structuredLaunchOffer(claude())).toEqual({ offered: true });
+  });
+
+  it("never offers one for Codex, whose app-server lane the runner does not implement", () => {
+    const verdict = structuredLaunchOffer(codex());
+    expect(verdict.offered).toBe(false);
+    if (!verdict.offered) expect(verdict.reason).toContain("codex_app_server");
+  });
+
+  it("refuses an unverified permission capability or a profile with no prompt arguments", () => {
+    expect(structuredLaunchOffer({ ...claude(), typedPermission: "unknown" }).offered).toBe(false);
+    expect(structuredLaunchOffer({ ...claude(), permissionPromptArgs: [] }).offered).toBe(false);
+    expect(structuredLaunchOffer({ id: "x", displayName: "X" }).offered).toBe(false);
   });
 });

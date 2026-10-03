@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { RefreshCw, TerminalSquare } from "lucide-react";
+import { ListTree, RefreshCw, TerminalSquare } from "lucide-react";
 
 import {
   installOsFor,
   launchEntry,
+  structuredLaunchOffer,
   type CliAvailability,
   type LaunchMenuProfile,
 } from "./providerLaunchMenu";
@@ -14,12 +15,23 @@ import {
  * each with its availability (plan
  * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
  * Phase 6). The roster comes from the runner (`terminal_cli_profiles`), never
- * from this file; the row verdicts are `providerLaunchMenu.ts`'s. Every launch
- * is a PTY session — see that module for why no structured lane is offered.
+ * from this file; the row verdicts are `providerLaunchMenu.ts`'s. A row's
+ * main button is the default, a PTY session; a provider whose structured lane
+ * the runner implements also gets an explicit "structured" choice (plan Phase
+ * 9) — a stream-json session that asks before each tool call. This menu is an
+ * interactive surface, which is the only place a structured (prompting) launch
+ * is offered: one with nobody watching would stall on its first request.
  *
  * Rendered in `SessionManagerPanel`'s Live view beside `StewardControl`.
  */
-export function ProviderLaunchMenu({ onLaunch }: { onLaunch: (provider: string) => void }) {
+export function ProviderLaunchMenu({
+  onLaunch,
+  onLaunchStructured,
+}: {
+  onLaunch: (provider: string) => void;
+  /** Absent ⇒ the host offers no structured launch. */
+  onLaunchStructured?: (provider: string) => void;
+}) {
   const [profiles, setProfiles] = useState<LaunchMenuProfile[] | null>(null);
   const [rosterError, setRosterError] = useState<string | null>(null);
   /** Probe verdict per id: absent key = in flight, `null` = the probe could not run. */
@@ -97,8 +109,10 @@ export function ProviderLaunchMenu({ onLaunch }: { onLaunch: (provider: string) 
           os,
           probeErrors[profile.id],
         );
+        const structured = structuredLaunchOffer(profile);
         return (
           <div key={entry.id} className="px-3 py-1" data-testid={`provider-launch-row-${entry.id}`}>
+            <div className="flex items-center gap-1">
             <button
               type="button"
               data-ui-bridge-id={`terminal.provider-launch-${entry.id}`}
@@ -120,6 +134,21 @@ export function ProviderLaunchMenu({ onLaunch }: { onLaunch: (provider: string) 
                 </span>
               )}
             </button>
+            {onLaunchStructured && structured.offered && (
+              <button
+                type="button"
+                data-ui-bridge-id={`terminal.provider-launch-structured-${entry.id}`}
+                data-testid={`provider-launch-structured-${entry.id}`}
+                disabled={!entry.enabled}
+                onClick={() => onLaunchStructured(entry.id)}
+                className="shrink-0 inline-flex items-center gap-0.5 rounded border border-[#2a2d3d] px-1 py-px text-[10px] text-[#7aa2f7] hover:bg-[#2a2d3d] disabled:opacity-50"
+                title={`Open a structured ${entry.label} session that asks before each tool call`}
+              >
+                <ListTree className="w-3 h-3" />
+                structured
+              </button>
+            )}
+            </div>
             {entry.installCommand && (
               <div
                 className="mt-0.5 ml-5 text-[10px] text-[#565f89]"

@@ -70,8 +70,31 @@ struct UserMessagePayload {
 struct IncomingControlResponse {
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    response: Option<Value>,
     #[serde(flatten)]
     _data: serde_json::Map<String, Value>,
+}
+
+/// The `can_use_tool` answer a control response carries, judged the way Claude
+/// Code 2.1.285 judges it (plan 2026-09-20-ai-session-handling-is-claude-shaped,
+/// Phase 2 probe Q1): only the SDK's nested shape —
+/// `{"response":{"subtype":"success","request_id":<id>,"response":{"behavior":…}}}`
+/// — answers the request; anything else (the runner's former top-level
+/// `request_id` + `{"allowed": true}`) is ignored and the turn waits.
+fn tool_answer(resp: &IncomingControlResponse, request_id: &str) -> Option<(String, String)> {
+    let body = resp.response.as_ref()?;
+    if body.get("subtype")?.as_str()? != "success" || body.get("request_id")?.as_str()? != request_id {
+        return None;
+    }
+    let answer = body.get("response")?;
+    let behavior = answer.get("behavior")?.as_str()?.to_string();
+    let message = answer
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((behavior, message))
 }
 
 // ============================================================================
@@ -473,11 +496,25 @@ fn main() {
                     }
                 }
             }
-            IncomingMessage::ControlResponse(_resp) => {
-                // This is the runner approving a tool use request.
-                // In tool_use mode, now send the actual response.
+            IncomingMessage::ControlResponse(resp) => {
+                // The runner answering the tool-use request. In tool_use mode,
+                // finish the turn — but only for an answer the real CLI would
+                // accept (see `tool_answer`).
                 if mode == "tool_use" {
-                    send_assistant_and_result("Tool approved, executed successfully.", "default");
+                    match tool_answer(&resp, "mock_tool_req_1") {
+                        Some((behavior, _)) if behavior == "allow" => send_assistant_and_result(
+                            "Tool approved, executed successfully.",
+                            "default",
+                        ),
+                        Some((behavior, message)) if behavior == "deny" => send_assistant_and_result(
+                            &format!("Tool denied: {message}"),
+                            "default",
+                        ),
+                        _ => eprintln!(
+                            "mock_claude_cli: ignoring a control_response the CLI would not accept: {:?}",
+                            resp.response
+                        ),
+                    }
                 }
             }
         }

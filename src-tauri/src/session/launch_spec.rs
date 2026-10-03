@@ -54,9 +54,10 @@ const SESSION_ID_PLACEHOLDER: &str = "{sessionId}";
 
 /// Caller-authoritative permission posture. Always wins over any permission flag
 /// found in an operator template. Defaults to `BypassPermissions` — every
-/// current spawn site is autonomous and must never stall on a prompt. Both
-/// spellings come from the profile's [`AutoApprove::Flags`]; a profile that
-/// declares none renders no permission flag at all ([`permission_flags`]).
+/// autonomous spawn site must never stall on a prompt. The bypass spellings
+/// come from the profile's [`AutoApprove::Flags`], the prompt spelling from its
+/// `permission_prompt_args`; a profile that declares neither renders no
+/// permission flag at all ([`permission_flags`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
     /// The profile's `auto_approve.argv` (Claude `--permission-mode
@@ -68,6 +69,23 @@ pub enum PermissionMode {
     /// skip-everything form (Claude `--dangerously-skip-permissions`) — the
     /// autonomous `agent_runtime` sites.
     DangerouslySkip,
+    /// No auto-approval: the profile's `permission_prompt_args` (Claude
+    /// `--permission-prompt-tool stdio`) so each tool approval arrives on the
+    /// structured lane as a typed request the runner answers (plan
+    /// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+    /// Phase 9). **Never a default and never an autonomous site's choice** —
+    /// only an operator's explicit structured launch from an interactive
+    /// surface asks for it, because a request nobody answers stalls the turn
+    /// until the runner's fail-closed deny.
+    Prompt,
+}
+
+impl PermissionMode {
+    /// Whether tool approvals are the runner's to answer (the CLI asks), as
+    /// opposed to bypassed at launch.
+    pub fn prompts(self) -> bool {
+        self == PermissionMode::Prompt
+    }
 }
 
 /// Operator-configured optional launch templates, resolved for one Claude
@@ -426,8 +444,10 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
         for unit in parse_units(body) {
             match unit.name.as_str() {
                 // Permission is spec-owned: drop any template permission flag so
-                // it can never override the caller.
-                name if permission_names.contains(&name) => {}
+                // it can never override the caller — in its `--flag=value`
+                // spelling too, or a template could layer bypass into a
+                // prompted launch.
+                name if permission_names.contains(&name.split_once('=').map_or(name, |(n, _)| n)) => {}
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
                 // Name is spec-owned when the caller supplies one: drop the
@@ -456,6 +476,18 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 }
                 // Any other operator flag is layered in, unless the caller's
                 // extra_required already provides that flag (spec wins).
+                // A prompted launch layers in only the template flags known
+                // not to touch permissions — fail closed: a flag this list
+                // does not name (`--settings` carrying a `defaultMode`,
+                // `--allowedTools`, a bypass spelling a newer CLI adds) could
+                // stop the session asking.
+                name if spec.permission.prompts() && !prompt_mode_admits(name) => {
+                    tracing::warn!(
+                        flag = %name,
+                        "launch template flag dropped: a prompted launch layers in only flags \
+                         that cannot change its permission posture"
+                    );
+                }
                 _ => {
                     if provided.contains(&unit.name) {
                         tracing::warn!(
@@ -565,32 +597,69 @@ fn is_command_of(s: &str, profile: &CliProfile) -> bool {
         .is_some_and(|p| p.id == profile.id)
 }
 
+/// The operator-template flags a [`PermissionMode::Prompt`] launch layers in —
+/// every one of them unable to change whether the CLI asks before a tool call.
+/// Anything else in a template (`--settings`, `--allowedTools`,
+/// `--allow-dangerously-skip-permissions`, a positional, a flag a newer CLI
+/// adds) is dropped from a prompted launch. `--model` and the session flags are
+/// decided before this list is consulted.
+const PROMPT_MODE_TEMPLATE_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--verbose",
+    "--debug",
+    "--fallback-model",
+    "--max-turns",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--teammate-mode",
+];
+
+/// Whether a prompted launch keeps template flag `name` (`--flag` or
+/// `--flag=value`).
+fn prompt_mode_admits(name: &str) -> bool {
+    let flag = name.split_once('=').map_or(name, |(n, _)| n);
+    PROMPT_MODE_TEMPLATE_FLAGS.contains(&flag)
+}
+
 /// The caller-authoritative permission flags for `mode` under `profile`
-/// ([`PermissionMode`]). Empty when the profile declares no auto-approval.
+/// ([`PermissionMode`]). Empty when the profile declares no auto-approval (a
+/// bypass mode) or no prompt arguments ([`PermissionMode::Prompt`]). A prompted
+/// launch never carries a bypass flag.
 fn permission_flags(profile: &CliProfile, mode: PermissionMode) -> Vec<String> {
-    let AutoApprove::Flags { argv, detect } = &profile.auto_approve else {
-        return Vec::new();
+    let bypass = match &profile.auto_approve {
+        AutoApprove::Flags { argv, detect } => Some((argv, detect)),
+        _ => None,
     };
-    match mode {
-        PermissionMode::BypassPermissions => argv.clone(),
-        PermissionMode::DangerouslySkip => detect
+    match (mode, bypass) {
+        (PermissionMode::Prompt, _) => profile.permission_prompt_args.clone(),
+        (_, None) => Vec::new(),
+        (PermissionMode::BypassPermissions, Some((argv, _))) => argv.clone(),
+        (PermissionMode::DangerouslySkip, Some((argv, detect))) => detect
             .first()
             .map(|spelling| shell_tokenize(spelling))
             .unwrap_or_else(|| argv.clone()),
     }
 }
 
-/// Every flag NAME `profile` spells auto-approval with — the first token of
-/// its auto-approve argv and of each detect spelling, cut at `=`. A template
-/// flag with one of these names is dropped: permission is caller-owned.
+/// Every flag NAME `profile` spells auto-approval or prompt routing with — the
+/// first token of its auto-approve argv and of each detect spelling, and every
+/// flag in its `permission_prompt_args`, cut at `=`. A template flag with one of these
+/// names is dropped: permission is caller-owned, so a template can neither
+/// upgrade a prompted launch to bypass nor re-route its prompts.
 fn permission_flag_names(profile: &CliProfile) -> Vec<&str> {
-    let AutoApprove::Flags { argv, detect } = &profile.auto_approve else {
-        return Vec::new();
+    let (argv, detect): (&[String], &[String]) = match &profile.auto_approve {
+        AutoApprove::Flags { argv, detect } => (argv, detect),
+        _ => (&[], &[]),
     };
     argv.first()
         .map(String::as_str)
         .into_iter()
         .chain(detect.iter().filter_map(|d| d.split_whitespace().next()))
+        .chain(profile.permission_prompt_args.iter().map(String::as_str))
         .map(|token| token.split_once('=').map_or(token, |(name, _)| name))
         .filter(|name| name.starts_with('-'))
         .collect()
@@ -1450,9 +1519,125 @@ mod tests {
                 "--permission-mode",
                 "--dangerously-skip-permissions",
                 "--permission-mode",
-                "--permission-mode"
+                "--permission-mode",
+                "--permission-mode",
+                "--permission-prompt-tool"
             ]
         );
+    }
+
+    /// `Prompt` renders the profile's prompt-routing args and NO bypass flag
+    /// (Phase 9): Claude gets `--permission-mode default` (so an account's
+    /// `settings.json` `defaultMode` cannot pre-empt the prompts) and
+    /// `--permission-prompt-tool stdio`, the spelling the Phase 2 probe verified
+    /// against 2.1.285.
+    #[test]
+    fn prompt_mode_renders_the_prompt_tool_and_no_bypass() {
+        let mut s = spec();
+        s.permission = PermissionMode::Prompt;
+        s.session_id = Some("sid".to_string());
+        s.extra_required = vec![
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ];
+        let argv = render_argv(&s, &LaunchConfig::default(), "/bin/claude");
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/claude",
+                "--permission-mode",
+                "default",
+                "--permission-prompt-tool",
+                "stdio",
+                "--session-id",
+                "sid",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+            ]
+        );
+        for bypass in ["--dangerously-skip-permissions", "bypassPermissions", "acceptEdits"] {
+            assert!(!argv.iter().any(|a| a == bypass), "{bypass} in {argv:?}");
+        }
+        assert!(PermissionMode::Prompt.prompts());
+        assert!(!PermissionMode::default().prompts());
+        assert_eq!(PermissionMode::default(), PermissionMode::BypassPermissions);
+    }
+
+    /// The template-permission-flag-is-dropped invariant holds for `Prompt`
+    /// too: an operator template carrying a bypass flag cannot upgrade a
+    /// prompted launch to bypass, nor re-route its prompts elsewhere.
+    #[test]
+    fn prompt_mode_drops_a_template_bypass_or_prompt_route() {
+        let mut s = spec();
+        s.permission = PermissionMode::Prompt;
+        for template in [
+            "claude --dangerously-skip-permissions --model opus",
+            "claude --permission-mode bypassPermissions --model opus",
+            "claude --permission-mode=bypassPermissions --model opus",
+            "claude --permission-mode acceptEdits --model opus",
+            "claude --permission-prompt-tool mcp__evil__approve --model opus",
+            r#"claude --settings '{"permissions":{"defaultMode":"bypassPermissions"}}' --model opus"#,
+            "claude --allowedTools Bash,Write,Edit --model opus",
+            "claude --allowed-tools=Bash --model opus",
+            "claude --allow-dangerously-skip-permissions --model opus",
+            "claude --some-future-flag x --model opus",
+        ] {
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(!argv.iter().any(|a| a.contains("bypassPermissions")), "{template}: {argv:?}");
+            assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"), "{template}");
+            for dropped in [
+                "--settings",
+                "--allowedTools",
+                "--allowed-tools=Bash",
+                "--allow-dangerously-skip-permissions",
+                "--some-future-flag",
+                "acceptEdits",
+            ] {
+                assert!(!argv.iter().any(|a| a == dropped), "{template}: {argv:?}");
+            }
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--permission-mode").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--permission-mode"), Some("default"), "{template}");
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--permission-prompt-tool").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--permission-prompt-tool"), Some("stdio"), "{template}");
+            // The template's other flags still layer in.
+            assert_eq!(value_after(&argv, "--model"), Some("opus"), "{template}");
+        }
+        // Flags that cannot change the posture do layer in.
+        let argv = render_argv(&s, &tmpl("claude --add-dir /x --verbose --disallowedTools Bash"), "claude");
+        assert_eq!(value_after(&argv, "--add-dir"), Some("/x"));
+        assert_eq!(value_after(&argv, "--disallowedTools"), Some("Bash"));
+        // ...and a BYPASS launch is unaffected by the prompt-mode list.
+        let bypass = render_argv(&spec(), &tmpl("claude --allowedTools Bash --model opus"), "claude");
+        assert_eq!(value_after(&bypass, "--allowedTools"), Some("Bash"));
+    }
+
+    /// A profile with no known prompt args renders no permission flag at all
+    /// for a prompted launch — never a fallback to bypass.
+    #[test]
+    fn prompt_mode_on_a_profile_without_prompt_args_renders_nothing() {
+        assert!(codex().permission_prompt_args.is_empty());
+        assert!(permission_flags(codex(), PermissionMode::Prompt).is_empty());
+        let s = LaunchSpec {
+            provider: codex(),
+            permission: PermissionMode::Prompt,
+            ..Default::default()
+        };
+        let argv = render_argv(&s, &LaunchConfig::default(), "codex");
+        assert!(!argv.iter().any(|a| a.contains("bypass")), "{argv:?}");
     }
 
     #[test]

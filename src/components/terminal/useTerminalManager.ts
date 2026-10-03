@@ -143,7 +143,7 @@ export interface TerminalTab {
    * its only writer and always sets {@link sessionBacked} beside it, so a tab
    * carrying this is a worker view and never a pty tab.
    *
-   * It is an identity, not a behaviour switch: `WorkerSessionCell` keys the
+   * It is an identity, not a behaviour switch: `StructuredSessionCell` keys the
    * conversation and steering channels on it, and `closeTerminal` records it
    * so a hidden worker can be found again. The `Worker N` title pin is NOT
    * enforced from here — see `ZoneGrid::onTitleChange`, which no longer tests
@@ -157,13 +157,21 @@ export interface TerminalTab {
    * worker (`dispatch_subtask`) — and NOT by a PTY. `id === taskRunId`, `pid`
    * is null, and there is no terminal process to attach to: `terminal_list`
    * never lists it, `terminal_close` cannot kill it, and `terminal-output`
-   * never carries its text. The grid renders it through `WorkerSessionCell`
+   * never carries its text. The grid renders it through `StructuredSessionCell`
    * (conversation via `ai-output` / `claude-session-state`, steering via
    * `send_user_message`) instead of `TerminalInstance`; `reconcileTabsWithBackend`
    * keeps it across `terminal_list` re-syncs; `closeTerminal` drops the tab
    * without touching the worker, whose lifetime the Conductor owns.
    */
   sessionBacked?: boolean;
+  /**
+   * True for a structured session the operator launched from the Terminal
+   * page (`create_structured_session`): it runs in `Prompt` mode, so the CLI
+   * asks before each tool call and the cell shows a permission card. Set by
+   * `workerTabFromRecord` from the record (`lane: "structured"` with
+   * `bypassPermissions: false`); absent on a Conductor worker, which bypasses.
+   */
+  promptsForPermission?: boolean;
   /**
    * True when the PTY child runs Claude with tool permissions bypassed
    * (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions`).
@@ -373,7 +381,14 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 export function workerTabFromRecord(
   rec: Pick<
     TerminalSessionRecord,
-    "claudeSessionId" | "terminalId" | "taskRunId" | "title" | "workingDir" | "openedAt"
+    | "claudeSessionId"
+    | "terminalId"
+    | "taskRunId"
+    | "title"
+    | "workingDir"
+    | "openedAt"
+    | "lane"
+    | "bypassPermissions"
   >,
   now: number = Date.now(),
 ): TerminalTab | null {
@@ -389,7 +404,21 @@ export function workerTabFromRecord(
     claudeSessionId: rec.claudeSessionId,
     taskRunId: rec.taskRunId,
     sessionBacked: true,
+    ...(rec.lane === "structured" && rec.bypassPermissions === false
+      ? { promptsForPermission: true }
+      : {}),
   };
+}
+
+/**
+ * Whether closing `tab` should END its session rather than hide a view of it:
+ * an operator's structured launch (`promptsForPermission`), which no Conductor
+ * owns. Pure.
+ */
+export function isOperatorOwnedStructuredTab(
+  tab: Pick<TerminalTab, "sessionBacked" | "promptsForPermission" | "taskRunId"> | undefined,
+): boolean {
+  return tab?.sessionBacked === true && tab.promptsForPermission === true && !!tab.taskRunId;
 }
 
 /**
@@ -541,7 +570,7 @@ export function reconcileTabsWithBackend(
     if (t.type === "plan" || t.id.startsWith("plan-")) return true;
     if (t.__synthetic) return true;
     // A Conductor worker has no PTY; `terminal_list` is the wrong census for
-    // it (its liveness is the SessionManager's, read by `WorkerSessionCell`).
+    // it (its liveness is the SessionManager's, read by `StructuredSessionCell`).
     if (t.sessionBacked) return true;
     // The runner has already announced this terminal's exit, so its absence
     // from the list is a real teardown, not a create the snapshot predates.
@@ -1497,107 +1526,118 @@ export function useTerminalManager(
     return id;
   }, []);
 
-  const closeTerminal = useCallback(
-    (id: string) => {
-      // Capture the closing tab's Claude session id (read-only) so we can record
-      // an EXPLICIT durable close after the state update. We read it out of the
-      // updater's `prev` without mutating inside the updater (StrictMode double-
-      // invokes updaters in dev).
-      let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
-      // A Conductor worker's tab is a VIEW: closing it hides the cell and
-      // nothing more. The Conductor owns the worker's lifetime, and its durable
-      // record must stay open so the next restore brings the cell back while
-      // the worker is still live. No close record, no `terminal_close` (there
-      // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
-      // inside the updater, which React may run later than this handler.
-      const closingTab = tabsRef.current.find((t) => t.id === id);
-      const sessionBacked = closingTab?.sessionBacked === true;
-      if (sessionBacked) {
-        // Record the dismissal AND the chip row together, so the close is
-        // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
-        // keeps running either way.
-        applyHiddenWorkerState(
-          hideWorker(hiddenWorkerStateRef.current, {
-            tabId: id,
-            taskRunId: closingTab?.taskRunId ?? null,
-            title: closingTab?.title ?? id,
-            hiddenAtMs: Date.now(),
-          }),
-        );
-      }
-      // Update React state immediately so the UI is responsive.
-      // The Rust-side close (process kill + thread join) runs in the background.
-      setTabs((prev) => {
-        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
-        const next = prev.filter((t) => t.id !== id);
-        setActiveId((currentActive) => {
-          if (currentActive !== id) return currentActive;
-          const closedIndex = prev.findIndex((t) => t.id === id);
-          return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
-        });
-        return next;
+  const closeTerminal = useCallback((id: string) => {
+    // Capture the closing tab's Claude session id (read-only) so we can record
+    // an EXPLICIT durable close after the state update. We read it out of the
+    // updater's `prev` without mutating inside the updater (StrictMode double-
+    // invokes updaters in dev).
+    let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
+    // A Conductor worker's tab is a VIEW: closing it hides the cell and
+    // nothing more. The Conductor owns the worker's lifetime, and its durable
+    // record must stay open so the next restore brings the cell back while
+    // the worker is still live. No close record, no `terminal_close` (there
+    // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
+    // inside the updater, which React may run later than this handler.
+    const closingTab = tabsRef.current.find((t) => t.id === id);
+    const sessionBacked = closingTab?.sessionBacked === true;
+    // An operator's structured launch (plan 2026-09-20 Phase 9) is NOT a view
+    // onto someone else's session: nothing else owns its lifetime, so closing
+    // its tab ends it — the session is closed and its record closed, exactly
+    // as closing a PTY tab ends that terminal. Hiding it instead would leave a
+    // prompting session running with no cell to answer it.
+    const operatorOwned = isOperatorOwnedStructuredTab(closingTab);
+    const viewOnly = sessionBacked && !operatorOwned;
+    if (viewOnly) {
+      // Record the dismissal AND the chip row together, so the close is
+      // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
+      // keeps running either way.
+      applyHiddenWorkerState(
+        hideWorker(hiddenWorkerStateRef.current, {
+          tabId: id,
+          taskRunId: closingTab?.taskRunId ?? null,
+          title: closingTab?.title ?? id,
+          hiddenAtMs: Date.now(),
+        }),
+      );
+    }
+    // Update React state immediately so the UI is responsive.
+    // The Rust-side close (process kill + thread join) runs in the background.
+    setTabs((prev) => {
+      closeRecord = viewOnly ? null : buildSessionCloseRecord(prev, id);
+      const next = prev.filter((t) => t.id !== id);
+      setActiveId((currentActive) => {
+        if (currentActive !== id) return currentActive;
+        const closedIndex = prev.findIndex((t) => t.id === id);
+        return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
       });
+      return next;
+    });
 
-      // Record the durable session CLOSE for an explicit user close (only when
-      // the tab was running a Claude session). Fire-and-forget.
-      if (closeRecord) {
-        invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
-          // Best-effort — the live close still proceeds below.
+    // Record the durable session CLOSE for an explicit user close (only when
+    // the tab was running a Claude session). Fire-and-forget.
+    if (closeRecord) {
+      invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
+        // Best-effort — the live close still proceeds below.
+      });
+    }
+
+    if (operatorOwned && closingTab?.taskRunId) {
+      const taskRunId = closingTab.taskRunId;
+      invoke<CommandResponse>("close_ai_session", { taskRunId }).catch((err) => {
+        logger.warn(`closing structured session ${taskRunId} failed: ${err}`);
+      });
+    }
+
+    // Only invoke Rust close for terminal tabs (plan tabs and worker views
+    // have no PTY)
+    if (!id.startsWith("plan-") && !sessionBacked) {
+      // Whatever the last close left on screen, it does not describe THIS
+      // one. Clearing first means a stale warning can never be read as the
+      // outcome of the close the operator just performed — and a close that
+      // never answers (the `.catch` below) leaves no notice at all rather
+      // than the previous one.
+      setRemoteCloseNotice(null);
+      invoke<CommandResponse>("terminal_close", { terminalId: id })
+        .then((res) => {
+          // A REMOTE tab's close reports what it did about the relay binding
+          // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
+          // terminal-stays-claimed, Phase 1). Discarding it — which this
+          // handler did until now — made a failed detach look exactly like a
+          // clean one, since the tab vanishes either way.
+          //
+          // `success === false` is guarded even though today's Tauri command
+          // rejects instead: a door that ever answers a failed close WITH a
+          // report must not raise a notice about a close that did not happen.
+          if (res?.success === false) return;
+          const report = parseRemoteDetach(res?.data);
+          if (!report) return; // local tab: nothing extra happened
+          const message = res.message ?? `Remote close outcome: ${report.outcome}`;
+          if (isCleanRemoteClose(report)) {
+            // Logged, not shown: see `isCleanRemoteClose` on what this arm
+            // does and does not prove. The runner's hedge is kept verbatim.
+            logger.info(`Remote tab ${id} closed: ${message}`);
+            return;
+          }
+          logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
+          setRemoteCloseNotice({ tabId: id, message, report });
+        })
+        .catch(() => {
+          // Terminal may already be gone (e.g. removed out-of-band by
+          // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
+          // list either way. No notice: we have no answer to report, and an
+          // UNKNOWN must not render as a claim about the binding.
+        })
+        .finally(() => {
+          // Re-read the authoritative list AFTER the close settles. The
+          // optimistic local removal above is a UI-responsiveness shortcut, not
+          // a source of truth: without this, a close that raced an out-of-band
+          // delete (or that closed the last tab the frontend knew about) left
+          // the tab list permanently diverged from the backend and the grid
+          // rendered zero zones forever.
+          void resyncTabs();
         });
-      }
-
-      // Only invoke Rust close for terminal tabs (plan tabs and worker views
-      // have no PTY)
-      if (!id.startsWith("plan-") && !sessionBacked) {
-        // Whatever the last close left on screen, it does not describe THIS
-        // one. Clearing first means a stale warning can never be read as the
-        // outcome of the close the operator just performed — and a close that
-        // never answers (the `.catch` below) leaves no notice at all rather
-        // than the previous one.
-        setRemoteCloseNotice(null);
-        invoke<CommandResponse>("terminal_close", { terminalId: id })
-          .then((res) => {
-            // A REMOTE tab's close reports what it did about the relay binding
-            // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
-            // terminal-stays-claimed, Phase 1). Discarding it — which this
-            // handler did until now — made a failed detach look exactly like a
-            // clean one, since the tab vanishes either way.
-            //
-            // `success === false` is guarded even though today's Tauri command
-            // rejects instead: a door that ever answers a failed close WITH a
-            // report must not raise a notice about a close that did not happen.
-            if (res?.success === false) return;
-            const report = parseRemoteDetach(res?.data);
-            if (!report) return; // local tab: nothing extra happened
-            const message = res.message ?? `Remote close outcome: ${report.outcome}`;
-            if (isCleanRemoteClose(report)) {
-              // Logged, not shown: see `isCleanRemoteClose` on what this arm
-              // does and does not prove. The runner's hedge is kept verbatim.
-              logger.info(`Remote tab ${id} closed: ${message}`);
-              return;
-            }
-            logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
-            setRemoteCloseNotice({ tabId: id, message, report });
-          })
-          .catch(() => {
-            // Terminal may already be gone (e.g. removed out-of-band by
-            // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
-            // list either way. No notice: we have no answer to report, and an
-            // UNKNOWN must not render as a claim about the binding.
-          })
-          .finally(() => {
-            // Re-read the authoritative list AFTER the close settles. The
-            // optimistic local removal above is a UI-responsiveness shortcut, not
-            // a source of truth: without this, a close that raced an out-of-band
-            // delete (or that closed the last tab the frontend knew about) left
-            // the tab list permanently diverged from the backend and the grid
-            // rendered zero zones forever.
-            void resyncTabs();
-          });
-      }
-    },
-    [resyncTabs, applyHiddenWorkerState],
-  );
+    }
+  }, [resyncTabs, applyHiddenWorkerState]);
 
   const dismissRemoteCloseNotice = useCallback(() => setRemoteCloseNotice(null), []);
 

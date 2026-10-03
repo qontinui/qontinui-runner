@@ -295,18 +295,35 @@ mod tests {
         assert_eq!(parsed["request_id"], "req_int_roundtrip");
     }
 
-    /// Verify the encode/decode roundtrip for control responses (tool approval).
+    /// Control responses encode in the SDK's nested shape — the only one the
+    /// CLI accepts (Phase 2 probe Q1): `request_id` inside `response`, never at
+    /// the top level, and never the ignored `{"allowed": true}`.
     #[test]
-    fn test_encode_decode_roundtrip_control_response() {
+    fn test_encode_control_responses_in_the_sdk_shape() {
         use super::super::types::OutgoingControlResponse;
 
-        let approval = OutgoingControlResponse::allow_tool("req_tool_roundtrip");
-        let encoded = encode_message(&approval).unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
-        assert_eq!(parsed["type"], "control_response");
-        assert_eq!(parsed["request_id"], "req_tool_roundtrip");
-        assert_eq!(parsed["response"]["allowed"], true);
+        let allow = OutgoingControlResponse::allow_tool_use(
+            "req_tool_roundtrip",
+            serde_json::json!({"command": "ls"}),
+        );
+        assert_eq!(
+            encode_message(&allow).unwrap(),
+            "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\
+             \"request_id\":\"req_tool_roundtrip\",\"response\":{\"behavior\":\"allow\",\
+             \"updatedInput\":{\"command\":\"ls\"}}}}\n"
+        );
+        let deny = OutgoingControlResponse::deny_tool_use("r2", "no");
+        assert_eq!(
+            encode_message(&deny).unwrap(),
+            "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\
+             \"request_id\":\"r2\",\"response\":{\"behavior\":\"deny\",\"message\":\"no\"}}}\n"
+        );
+        let error = OutgoingControlResponse::error("r3", "unsupported control request subtype: x");
+        assert_eq!(
+            encode_message(&error).unwrap(),
+            "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\
+             \"request_id\":\"r3\",\"error\":\"unsupported control request subtype: x\"}}\n"
+        );
     }
 
     /// Verify streaming text delta accumulation pattern.

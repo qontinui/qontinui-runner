@@ -516,6 +516,44 @@ pub struct CliControlRequestPayload {
     pub data: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The `subtype` of a control request asking to run a tool.
+pub const CAN_USE_TOOL: &str = "can_use_tool";
+
+/// A `can_use_tool` request's payload, as Claude Code 2.1.285 sends it (probe
+/// Q1): `tool_name`, `display_name`, `input`, `description`,
+/// `permission_suggestions`, `tool_use_id`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CanUseToolRequest {
+    pub tool_name: String,
+    /// The tool's arguments. An allow echoes it back as `updatedInput`.
+    #[serde(default)]
+    pub input: serde_json::Value,
+    /// Permission-rule changes the CLI offers alongside the request (e.g.
+    /// `{"type":"setMode","mode":"acceptEdits","destination":"session"}`).
+    #[serde(default)]
+    pub permission_suggestions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl CliControlRequestPayload {
+    /// This payload as a `can_use_tool` request. `None` for another subtype;
+    /// `Some(Err)` names what a malformed `can_use_tool` is missing.
+    pub fn as_can_use_tool(&self) -> Option<Result<CanUseToolRequest, String>> {
+        if self.subtype != CAN_USE_TOOL {
+            return None;
+        }
+        Some(
+            serde_json::from_value(serde_json::Value::Object(self.data.clone()))
+                .map_err(|e| format!("malformed can_use_tool request: {e}")),
+        )
+    }
+}
+
 /// Control response FROM the CLI (response to our control request).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CliControlResponse {
@@ -607,31 +645,82 @@ impl OutgoingControlRequest {
     }
 }
 
-/// Control response TO the CLI (answering CLI's control requests).
-#[derive(Debug, Clone, Serialize)]
+/// Control response TO the CLI (answering a control request the CLI sent).
+///
+/// The wire shape is the reference SDK's, and the ONLY one the CLI accepts
+/// (plan `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 2 probe Q1, fixtures `tests/fixtures/cli_protocol/claude/2.1.285/can_use_tool_*`):
+///
+/// ```json
+/// {"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{…}}}
+/// {"type":"control_response","response":{"subtype":"error","request_id":"<id>","error":"…"}}
+/// ```
+///
+/// The `request_id` rides INSIDE `response`. The runner's former
+/// `{"type":"control_response","response":{"allowed":true},"request_id":…}` was
+/// silently ignored by Claude Code 2.1.285 and the turn hung forever
+/// (`can_use_tool_runner_shape_ignored`), so it has no constructor here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutgoingControlResponse {
     #[serde(rename = "type")]
-    pub msg_type: String, // always "control_response"
-    pub response: OutgoingControlResponsePayload,
-    pub request_id: String,
+    msg_type: &'static str, // always "control_response"
+    pub response: ControlResponseBody,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct OutgoingControlResponsePayload {
-    #[serde(flatten)]
-    pub data: serde_json::Map<String, serde_json::Value>,
+/// The body of an [`OutgoingControlResponse`], tagged by `subtype`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum ControlResponseBody {
+    /// The request was handled; `response` is the subtype-specific answer.
+    Success {
+        request_id: String,
+        response: serde_json::Value,
+    },
+    /// The request could not be handled; `error` says why.
+    Error { request_id: String, error: String },
 }
 
 impl OutgoingControlResponse {
-    /// Approve a `can_use_tool` request (auto-allow in bypass mode).
-    pub fn allow_tool(request_id: &str) -> Self {
-        let mut data = serde_json::Map::new();
-        data.insert("allowed".to_string(), serde_json::Value::Bool(true));
+    fn new(response: ControlResponseBody) -> Self {
         Self {
-            msg_type: "control_response".to_string(),
-            response: OutgoingControlResponsePayload { data },
-            request_id: request_id.to_string(),
+            msg_type: "control_response",
+            response,
         }
+    }
+
+    /// Allow a `can_use_tool` request. `updated_input` is the input the tool
+    /// runs with — the request's own `input` unless the operator edited it.
+    pub fn allow_tool_use(request_id: &str, updated_input: serde_json::Value) -> Self {
+        Self::new(ControlResponseBody::Success {
+            request_id: request_id.to_string(),
+            response: serde_json::json!({
+                "behavior": "allow",
+                "updatedInput": updated_input,
+            }),
+        })
+    }
+
+    /// Deny a `can_use_tool` request. The CLI hands `message` to the model as
+    /// the denied call's error `tool_result` and the turn continues; the
+    /// result lists the call in `permission_denials` and is NOT an errored
+    /// turn (probe Q1, `can_use_tool_sdk_deny`).
+    pub fn deny_tool_use(request_id: &str, message: &str) -> Self {
+        Self::new(ControlResponseBody::Success {
+            request_id: request_id.to_string(),
+            response: serde_json::json!({
+                "behavior": "deny",
+                "message": message,
+            }),
+        })
+    }
+
+    /// Refuse a control request the runner does not handle — never a
+    /// fabricated success.
+    pub fn error(request_id: &str, error: &str) -> Self {
+        Self::new(ControlResponseBody::Error {
+            request_id: request_id.to_string(),
+            error: error.to_string(),
+        })
     }
 }
 

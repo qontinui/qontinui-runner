@@ -218,7 +218,10 @@ pub async fn resume_interrupted_workflows(
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    let running_workflows: Vec<crate::database::types::TaskRun> = match app_state
+    let (structured_sessions, running_workflows): (
+        Vec<crate::database::types::TaskRun>,
+        Vec<crate::database::types::TaskRun>,
+    ) = match app_state
         .pg_db
         .get_resumable_task_runs_for_runner(my_port)
         .await
@@ -227,12 +230,36 @@ pub async fn resume_interrupted_workflows(
             .into_iter()
             // AI chat sessions are resumed by resume_ai_sessions, not here.
             .filter(|r| r.workflow_type.as_deref() != Some("chat"))
-            .collect(),
+            .partition(|r| {
+                r.workflow_type.as_deref()
+                    == Some(crate::commands::structured_session::STRUCTURED_SESSION_WORKFLOW_TYPE)
+            }),
         Err(e) => {
             error!("Failed to query resumable task runs: {}", e);
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
+
+    // An operator's structured (permission-prompting) session is not a
+    // workflow and is never resumed: a boot resume has no operator watching,
+    // and the chat resume re-spawns in bypass. Close its row honestly instead
+    // of letting the workflow branch fail it with a lookup-miss reason.
+    // A session already registered here is one the operator launched after
+    // this process started (the sweep runs a moment after the API is up) —
+    // live, not interrupted.
+    let live_sessions = tauri::Manager::try_state::<
+        Arc<crate::claude_session::SessionManager>,
+    >(&app_handle)
+    .map(|s| s.inner().clone());
+    for task_run in structured_sessions
+        .iter()
+        .filter(|r| live_sessions.as_ref().is_none_or(|sm| sm.get(&r.id).is_none()))
+    {
+        let reason = "structured session interrupted by a runner restart (not resumable)";
+        if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, reason).await {
+            warn!("Failed to close interrupted structured session {}: {}", task_run.id, e);
+        }
+    }
 
     if running_workflows.is_empty() {
         info!("No interrupted unified workflows found to resume");

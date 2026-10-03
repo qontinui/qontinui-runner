@@ -62,6 +62,9 @@ struct StructuredLaneRestart {
     session_id: String,
     session_ctx: Option<AiSessionContext>,
     working_dir: String,
+    /// The dead session's posture: a restart never changes it (a prompted
+    /// session restarted in bypass would silently stop asking).
+    permission: crate::session::launch_spec::PermissionMode,
 }
 
 impl crate::session::failure_recovery::StructuredRestart for StructuredLaneRestart {
@@ -72,6 +75,7 @@ impl crate::session::failure_recovery::StructuredRestart for StructuredLaneResta
             self.session_ctx.as_ref(),
             &self.working_dir,
             rotate_account,
+            self.permission,
         )
     }
 }
@@ -129,6 +133,15 @@ impl TurnPersistSender {
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
+}
+
+/// What [`ClaudeSession::respond_permission`] did.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionResponseOutcome {
+    pub resolved: super::permission::PermissionResolvedNotice,
+    /// Set when a deny asked to interrupt and the interrupt could not be sent.
+    pub interrupt_error: Option<String>,
 }
 
 /// An interactive Claude CLI session.
@@ -215,6 +228,11 @@ pub struct ClaudeSession {
     /// default is ON) or the coord session id / device id couldn't be
     /// resolved — a strict no-op.
     agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+    /// Answers the CLI's control requests by subtype and holds this session's
+    /// parked permission requests (plan
+    /// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+    /// Phase 9). Shared with the stdout reader.
+    permissions: Arc<super::permission::PermissionBroker>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -246,10 +264,15 @@ impl ClaudeSession {
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
         cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
         agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+        // Caller-authoritative permission posture. Every autonomous site
+        // passes `PermissionMode::BypassPermissions`; only an operator's
+        // structured launch from an interactive surface passes `Prompt`
+        // (pinned by `permission::tests::every_spawn_site_*`).
+        permission: crate::session::launch_spec::PermissionMode,
     ) -> Result<Self, String> {
         info!(
-            "Spawning interactive Claude session: {} in {}",
-            session_id, working_dir
+            "Spawning interactive Claude session: {} in {} (permission: {:?})",
+            session_id, working_dir, permission
         );
 
         // Spawn CLI with stream-json input AND output. The Command itself is
@@ -365,7 +388,7 @@ impl ClaudeSession {
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
         let spec = crate::session::launch_spec::LaunchSpec {
-            permission: crate::session::launch_spec::PermissionMode::BypassPermissions,
+            permission,
             session_id: session_id_pin,
             resume_id: resume_id_pin,
             model: model_override.map(|m| m.to_string()),
@@ -575,6 +598,16 @@ impl ClaudeSession {
         // Create shared state
         let state_tracker = SessionStateTracker::new();
         let stdin_writer = Arc::new(StdinWriter::new(stdin));
+        let permissions = super::permission::PermissionBroker::new(
+            session_id,
+            permission,
+            super::permission::decision_timeout(None),
+            stdin_writer.clone(),
+            Arc::new(super::permission::TauriPermissionSink::new(
+                app_handle.clone(),
+                session_ctx.clone(),
+            )),
+        );
         let pending_messages: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let accumulated_output = Arc::new(Mutex::new(String::new()));
         let user_has_interacted = Arc::new(AtomicBool::new(false));
@@ -753,6 +786,7 @@ impl ClaudeSession {
         // follows it are one failure (plan 2026-09-20-ai-session-handling-is-
         // claude-shaped, Phase 8).
         let frame_ledger_key = session_id.to_string();
+        let permissions_for_stdout = permissions.clone();
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
@@ -778,7 +812,9 @@ impl ClaudeSession {
                     match result {
                         Ok(line) => {
                             line_count += 1;
-                            let preview = crate::str_utils::truncate_str(&line, 150);
+                            // Never the raw control/system frames: the
+                            // init response carries account identity.
+                            let preview = dispatcher::stdout_log_preview(&line);
                             info!("[STDOUT_READER] Line #{}: {}", line_count, preview);
 
                             // Update activity
@@ -814,6 +850,7 @@ impl ClaudeSession {
                                 fallback_id_for_stdout.as_deref(),
                                 worktree_id_for_stdout.as_deref(),
                                 &mut frame_ledger,
+                                &permissions_for_stdout,
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -847,6 +884,10 @@ impl ClaudeSession {
             } else {
                 warn!("[STDOUT_READER] No stdout handle available!");
             }
+
+            // The CLI's stdout is closed: no parked permission request can be
+            // answered any more, so none may keep offering buttons.
+            permissions_for_stdout.end_session("the session's CLI stopped");
 
             // Flush remaining line buffer
             dispatcher::flush_line_buffer(
@@ -1301,6 +1342,7 @@ impl ClaudeSession {
                     session_id: session_id_for_waiter.clone(),
                     session_ctx: session_ctx_for_waiter.clone(),
                     working_dir: working_dir_for_waiter.clone(),
+                    permission,
                 });
                 // Say what is happening in the session's own output, as the
                 // pre-taxonomy path did, before any recovery runs.
@@ -1424,6 +1466,7 @@ impl ClaudeSession {
             federation_ctx,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             agent_log_emitter,
+            permissions,
         })
     }
 
@@ -1559,6 +1602,44 @@ impl ClaudeSession {
             );
             Ok(false)
         }
+    }
+
+    /// This session's permission posture.
+    pub fn permission_mode(&self) -> crate::session::launch_spec::PermissionMode {
+        self.permissions.mode()
+    }
+
+    /// The permission requests waiting on the operator, oldest first. Empty
+    /// for a bypass session, which never parks one.
+    pub fn pending_permissions(&self) -> Vec<super::permission::PermissionRequestNotice> {
+        self.permissions.pending()
+    }
+
+    /// Answer parked permission request `request_id`. A deny that asks for it
+    /// is followed by the session's ordinary interrupt; the answer stands even
+    /// when that interrupt cannot be sent (the turn may already be ending), and
+    /// the returned notice says whether it was.
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        decision: super::permission::PermissionDecision,
+    ) -> Result<PermissionResponseOutcome, String> {
+        let resolved = self.permissions.respond(request_id, decision)?;
+        let interrupt_error = if resolved.interrupt {
+            self.interrupt().err()
+        } else {
+            None
+        };
+        if let Some(e) = &interrupt_error {
+            warn!(
+                "Permission deny on session {} asked to interrupt, and the interrupt was not sent: {}",
+                self.session_id, e
+            );
+        }
+        Ok(PermissionResponseOutcome {
+            resolved,
+            interrupt_error,
+        })
     }
 
     /// Send an interrupt request.
@@ -1762,6 +1843,9 @@ impl ClaudeSession {
     )]
     pub fn close(&self) -> Result<(), String> {
         info!("Closing session {}", self.session_id);
+
+        // Nothing parked can be answered once the CLI is gone.
+        self.permissions.end_session("the session was closed");
 
         // Worktree-isolation Phase 3 — drop the re-acquired isolated edit
         // context first so the claim-release fire-and-forget posts ahead of
@@ -1996,6 +2080,8 @@ impl ClaudeSession {
             // respawn so promotion is continuous on the dashboard. The handle is
             // a cheap clone over the same emitter service; `None` stays a no-op.
             self.agent_log_emitter.clone(),
+            // Promotion moves the process, never its permission posture.
+            self.permissions.mode(),
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -2042,6 +2128,7 @@ impl ClaudeSession {
         session_ctx: Option<&AiSessionContext>,
         working_dir: &str,
         rotate_account: bool,
+        permission: crate::session::launch_spec::PermissionMode,
     ) -> Result<(), String> {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
@@ -2095,6 +2182,8 @@ impl ClaudeSession {
             // emitter; a restart is a fresh process and the prior waiter
             // already emitted `session_closed`. No-op here.
             None,
+            // The restarted process keeps the dead one's posture.
+            permission,
         ) {
             Ok(s) => Arc::new(s),
             Err(e) => {

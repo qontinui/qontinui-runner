@@ -267,6 +267,9 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // task-run session — the same capability as `POST /terminals/{id}/write`.
     "GET /sessions/{id}/review",
     "/sessions/{id}/review/*",
+    // The permission requests a structured session is waiting on, each with
+    // the tool's full input (commands, file contents) — the transcript's class.
+    "GET /sessions/{id}/permission-requests",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",

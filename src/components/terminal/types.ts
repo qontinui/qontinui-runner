@@ -41,7 +41,7 @@ export interface TerminalSessionRecord {
    * worker is an in-process stream-json `ClaudeSession`, not a PTY: its
    * `terminalId` equals this value and names no terminal process, so the
    * restore path must never `terminal_create` a shell for it. The grid renders
-   * such a record through `WorkerSessionCell` (`useTerminalManager`
+   * such a record through `StructuredSessionCell` (`useTerminalManager`
    * `adoptWorkerTab`).
    */
   taskRunId?: string;
@@ -65,6 +65,13 @@ export interface TerminalSessionRecord {
    * as `"pty"`, the serde default for records written before the field.
    */
   lane?: SessionLane;
+  /**
+   * Whether the session runs with tool permissions bypassed — Rust
+   * `bypass_permissions`. `false` is a KNOWN "asks before each tool" (a
+   * structured launch in `Prompt` mode, `commands/structured_session.rs`);
+   * absent means not recorded, never "asks".
+   */
+  bypassPermissions?: boolean;
   /**
    * How `claudeSessionId` was bound — see `SessionOrigin` in
    * `sessionRecordArgs.ts` for the authored (write-side) union and the full

@@ -19,6 +19,7 @@
 //!
 //! | `resume_flag_aliases`, `session_choice_args` | `terminal/session.rs` `explicit_session_id_from`, `bin/qontinui_shim.rs` `user_chose_session` (Phase 5) |
 //! | `pty_args` | Phase 2 probe Q4 (`--teammate-mode in-process`) |
+//! | `permission_prompt_args` | Phase 2 probe Q1 (`--permission-prompt-tool stdio`; Phase 9 renders it for a prompted launch) |
 //!
 //! Phase 5 replaced the graceful-exit and bypass-detection copies with
 //! lookups on this profile, and Phase 7 the usage-limit scan's: it now scans
@@ -73,6 +74,19 @@ fn profile() -> CliProfile {
         // `--teammate-mode auto` splits the caller's tmux window. The flag is
         // hidden (absent from `--help`); see the note below.
         pty_args: strings(&["--teammate-mode", "in-process"]),
+        // Phase 2 probe Q1 (2.1.285, Linux): with `--permission-prompt-tool
+        // stdio` and no bypass flag the CLI sends
+        // `control_request{subtype:"can_use_tool"}` on stdout and waits for the
+        // runner's answer. HIDDEN in 2.1.285's --help; see the
+        // `typed_permission` note below. `--permission-mode default` states the
+        // probe's own (flagless) mode explicitly, so an account settings.json
+        // `permissions.defaultMode` cannot pre-empt the prompts.
+        permission_prompt_args: strings(&[
+            "--permission-mode",
+            "default",
+            "--permission-prompt-tool",
+            "stdio",
+        ]),
         account_isolation: AccountIsolation::EnvVar {
             name: "CLAUDE_CONFIG_DIR".to_string(),
         },
@@ -169,9 +183,22 @@ fn profile() -> CliProfile {
              markers against 2.1.286's first paint of a resumed session (Linux, 51/53 live \
              panes verified). Windows and macOS are unverified.",
             "typed_permission: control_request{subtype:can_use_tool} arrives only without a \
-             bypass mode and with the hidden flag `--permission-prompt-tool stdio` (2.1.285 \
-             --help lists `--permission-prompts host|none` instead). The CLI accepts only the \
-             SDK's nested control_response shape.",
+             bypass mode and with `--permission-prompt-tool stdio` (permission_prompt_args), \
+             the flag the reference SDK passes. It is HIDDEN in 2.1.285's --help, which lists \
+             `--permission-prompts host|none` instead; the runner relies on \
+             `--permission-prompt-tool stdio` because that is the spelling the Phase 2 probe \
+             verified against 2.1.285 on Linux (fixtures can_use_tool_sdk_allow_with_session_\
+             state_events, can_use_tool_sdk_deny, can_use_tool_runner_shape_ignored). \
+             `--permission-prompts host` was not probed. permission_prompt_args also passes \
+             `--permission-mode default` — the documented default mode, i.e. the probe's own \
+             flagless mode stated explicitly — so an account settings.json \
+             permissions.defaultMode (e.g. bypassPermissions) cannot pre-empt the prompts; that \
+             flag was not separately probed. An account's own permissions.allow rules still \
+             let matching tools run without a request. The CLI accepts only the SDK's nested \
+             control_response ({subtype:success, request_id, response:{behavior:allow, \
+             updatedInput} | {behavior:deny, message}}); a deny reaches the model as an error \
+             tool_result and is not an errored turn. Any other shape is silently ignored and \
+             the turn hangs.",
             "turn_boundary_event: system/session_state_changed (idle|running|requires_action) \
              is emitted only when the child env sets CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1. \
              Without it the event never arrives, so a spawn that does not set it must treat \
