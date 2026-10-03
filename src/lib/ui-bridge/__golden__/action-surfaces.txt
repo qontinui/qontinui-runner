@@ -4,10 +4,10 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 174
+# total: 175
 #   guarded: 22
 #   literal: 54
-#   registry: 41
+#   registry: 42
 #   delegated: 9
 #   builtin: 15
 #   fixture: 33
@@ -71,20 +71,20 @@ src/components/terminal/TerminalInstance.tsx:1809	guarded	element	writeToTermina
 src/components/terminal/TerminalInstance.tsx:1854	literal	element	paste	schema=no	arity=0	effect=destructive
 src/components/terminal/TerminalInstance.tsx:1891	guarded	element	pasteText	schema=no	arity=-	effect=destructive
 src/components/terminal/TerminalInstance.tsx:1938	guarded	element	getScrollback	schema=no	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:247	literal	component	create-terminal	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:270	delegated	component	buildCreatePlainTerminalAction	schema=no	arity=-	effect=-
-src/components/terminal/TerminalPage.tsx:273	literal	component	list-terminals	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:292	literal	component	open-terminal-window	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:302	literal	component	pop-out-active-terminal	schema=no	arity=0	effect=write
-src/components/terminal/TerminalPage.tsx:322	guarded	component	pop-out-page	schema=yes	arity=-	effect=write
-src/components/terminal/TerminalPage.tsx:341	guarded	component	move-terminal-to-window	schema=yes	arity=-	effect=write
-src/components/terminal/TerminalPage.tsx:375	guarded	component	maximize-zone	schema=yes	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:400	literal	component	restore-zone	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:413	guarded	component	toggle-maximize-zone	schema=yes	arity=-	effect=read
-src/components/terminal/TerminalPage.tsx:434	literal	component	get-zone-view-state	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:447	literal	component	list-runner-windows	schema=no	arity=0	effect=read
-src/components/terminal/TerminalPage.tsx:459	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
-src/components/terminal/TerminalPage.tsx:533	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
+src/components/terminal/TerminalPage.tsx:249	literal	component	create-terminal	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:272	delegated	component	buildCreatePlainTerminalAction	schema=no	arity=-	effect=-
+src/components/terminal/TerminalPage.tsx:275	literal	component	list-terminals	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:294	literal	component	open-terminal-window	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:304	literal	component	pop-out-active-terminal	schema=no	arity=0	effect=write
+src/components/terminal/TerminalPage.tsx:324	guarded	component	pop-out-page	schema=yes	arity=-	effect=write
+src/components/terminal/TerminalPage.tsx:343	guarded	component	move-terminal-to-window	schema=yes	arity=-	effect=write
+src/components/terminal/TerminalPage.tsx:377	guarded	component	maximize-zone	schema=yes	arity=-	effect=read
+src/components/terminal/TerminalPage.tsx:402	literal	component	restore-zone	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:415	guarded	component	toggle-maximize-zone	schema=yes	arity=-	effect=read
+src/components/terminal/TerminalPage.tsx:436	literal	component	get-zone-view-state	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:449	literal	component	list-runner-windows	schema=no	arity=0	effect=read
+src/components/terminal/TerminalPage.tsx:461	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
+src/components/terminal/TerminalPage.tsx:535	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
 src/components/terminal/ZoneLayoutPicker.tsx:98	guarded	component	select-layout	schema=yes	arity=-	effect=write
 src/components/terminal/ZoneLayoutPicker.tsx:135	literal	component	list-layouts	schema=no	arity=0	effect=read
 src/components/terminal/ZoneProfilePicker.tsx:239	guarded	component	load-profile	schema=yes	arity=-	effect=destructive
@@ -123,9 +123,10 @@ src/components/terminal/commands/uibridge.test.ts:270	fixture	free	test.bare	sch
 src/components/terminal/commands/uibridge.test.ts:300	fixture	free	test.proto	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:330	fixture	free	test.flagged	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:404	fixture	free	test.ai-text	schema=yes	arity=0	effect=-
-src/components/terminal/commands/usePromptLibraryCommands.test.ts:77	fixture	free	terminal.help	schema=no	arity=0	effect=-
-src/components/terminal/commands/usePromptLibraryCommands.test.ts:105	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
-src/components/terminal/commands/usePromptLibraryCommands.ts:118	registry	free	-	schema=yes	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.test.ts:85	fixture	free	terminal.help	schema=no	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.test.ts:113	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.ts:130	registry	free	-	schema=yes	arity=0	effect=-
+src/components/terminal/commands/usePromptLibraryCommands.ts:177	registry	free	-	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:654	registry	free	terminal.focus	schema=yes	arity=1	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:728	registry	free	terminal.spawn	schema=yes	arity=1	effect=-
 src/components/terminal/commands/useTerminalCommands.ts:755	registry	free	terminal.spawn-ai	schema=yes	arity=1	effect=-

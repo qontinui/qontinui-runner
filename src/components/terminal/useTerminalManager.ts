@@ -1654,5 +1654,12 @@ export function useTerminalManager(
      */
     remoteCloseNotice,
     dismissRemoteCloseNotice,
+    /**
+     * This page's `defaultWorkingDir` as `createTerminal` applies it. Exposed
+     * so a spawn door that does NOT go through `createTerminal` (the fan-out
+     * create, which posts a working dir to `POST /fanout`) can default to the
+     * same directory a normal launch on this page uses.
+     */
+    defaultWorkingDir,
   };
 }

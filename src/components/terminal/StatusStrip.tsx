@@ -59,6 +59,9 @@ import { useTerminalSession, useZoneMetadata } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
+import { FanoutStrip } from "./FanoutStrip";
+import { fanoutStripVisible } from "./fanoutStripModel";
+import { useFanoutRuns } from "./useFanoutRuns";
 import { MinimapToggle } from "./MinimapToggle";
 import { PruneTerminalsButton } from "./PruneTerminalsButton";
 import { usePrunePlan } from "./usePrunePlan";
@@ -170,9 +173,15 @@ export function StatusStrip() {
   // 1Hz heartbeat so the "Xm" duration text advances. Stops nothing —
   // the strip auto-hides when there's nothing to show, so the interval
   // only burns cycles while something requires attention.
-  const [, setTick] = useState(0);
+  //
+  // The heartbeat carries the clock itself (`now`) rather than a bare tick
+  // counter: the stuck-lock memo below reads `now` as a dependency, so the
+  // age actually advances each second (a tick the memo did not depend on
+  // re-rendered the strip without re-computing the age), and no render calls
+  // the impure `Date.now()`.
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), HEARTBEAT_MS);
+    const id = setInterval(() => setNow(Date.now()), HEARTBEAT_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -223,7 +232,6 @@ export function StatusStrip() {
     let stuck = 0;
     let maxMs = 0;
     let longestTabId: string | null = null;
-    const now = Date.now();
     for (const [tabId, lockState] of Object.entries(fileLockStates ?? {})) {
       if (lockState.kind !== "waiting") continue;
       stuck++;
@@ -241,9 +249,9 @@ export function StatusStrip() {
       maxStuckMs: maxMs,
       longestStuckTabId: longestTabId,
     };
-    // The tick covers cadence-driven re-eval for the maxStuckMs reading;
+    // `now` covers cadence-driven re-eval for the maxStuckMs reading;
     // fileLockStates covers state-driven re-eval.
-  }, [fileLockStates]);
+  }, [fileLockStates, now]);
 
   // See {@link unionSessionCount} — gating on the Claude-session count alone
   // hid the entire strip on a page holding live PTY tabs and no Claude session.
@@ -261,6 +269,13 @@ export function StatusStrip() {
   const isMultiSession = sessionOrPaneCount > 1;
 
   const wrapperCount = wrapperTools.length;
+
+  // Fan-out runs (plan 2026-09-20-…-prompt-matrix-fan-out Phase 7). Owned here
+  // so the auto-hide gate below sees it: an active run, or an UNREADABLE
+  // scheduler, keeps the strip up — the latter so UNKNOWN is visible rather
+  // than indistinguishable from "no runs".
+  const fanout = useFanoutRuns();
+  const fanoutVisible = fanoutStripVisible(fanout.state);
 
   // Phase 9f — visual indicators lifted from ZoneStatusBar. These
   // surface ambient session-shape info (count, non-attention state
@@ -291,7 +306,8 @@ export function StatusStrip() {
     stuckLocks > 0 ||
     isMultiSession ||
     planFileName !== null ||
-    isPlanLoading;
+    isPlanLoading ||
+    fanoutVisible;
 
   const focusNextError = useCallback(() => {
     zoneLayout.focusNextError(sessionStates);
@@ -339,6 +355,9 @@ export function StatusStrip() {
           <BatchActions />
         </>
       )}
+      {/* Fan-out runs — beside the batch controls: both act on many
+          sessions at once. Renders nothing when there are no active runs. */}
+      <FanoutStrip api={fanout} />
       {externalNeedsInputCount > 0 && (
         <Pill
           icon={<span className="w-1.5 h-1.5 rounded-full bg-[#e0af68]/50" aria-hidden />}

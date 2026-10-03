@@ -1094,6 +1094,111 @@
       "provenance": {
         "source": "ai-generated"
       }
+    },
+    {
+      "id": "term-fanout-preview",
+      "name": "Prompt Fan-Out Preview",
+      "description": "The prompt-library modal in fan-out mode (`/fanout`, or \"Fan out…\" beside Start/Insert/Copy). One prompt template × a matrix (`axis:v1,v2;axis:v1,v2`, zip or product) renders a preview row per member — title, rendered prompt (expandable), missing parameters, errors/warnings and a per-member collision probe — with max-concurrent, account policy (best headroom per member or one fixed account), title template and working directory. Rows can be unticked; Create is disabled while any ticked row has an error or a missing parameter, and posts exactly the ticked rows to the runner's `POST /fanout`. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7.",
+      "assertions": [
+        {
+          "id": "term-fanout-preview-elem-0",
+          "description": "The fan-out form renders inside the prompt modal.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.fanout-preview"
+            },
+            "label": "FanoutPanel container"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-fanout-preview-elem-1",
+          "description": "The matrix input is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.fanout-matrix"
+            },
+            "label": "Fan-out matrix field"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-fanout-preview-elem-2",
+          "description": "The Create button is present (enabled only when every ticked row is clean).",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.fanout-create"
+            },
+            "label": "Fan-out Create button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "term-fanout-running",
+      "name": "Prompt Fan-Out Running",
+      "description": "While a fan-out run is active the status strip shows one pill per run — `run <slug> — N running · M queued · K refused (<reason>)` — fed by the runner's `fanout-changed` event with a `GET /fanout` poll as fallback. It expands to the member list with Cancel-queued, Release-slot (admitted members) and max-concurrent ± controls. An unreadable scheduler renders `fan-out UNKNOWN — <error>` instead of an empty strip; with no active runs nothing renders. Plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out Phase 7.",
+      "assertions": [
+        {
+          "id": "term-fanout-running-elem-0",
+          "description": "The fan-out strip renders while a run is active (or the scheduler is UNKNOWN).",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.fanout-strip"
+            },
+            "label": "FanoutStrip"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-fanout-running-elem-1",
+          "description": "Each active run renders an expandable pill.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.fanout-strip-toggle"
+            },
+            "label": "Fan-out run pill"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
     }
   ],
   "transitions": []

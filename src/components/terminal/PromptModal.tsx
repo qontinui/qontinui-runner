@@ -13,6 +13,12 @@
  *   terminal WITHOUT a trailing `\r`, so the operator reviews before
  *   submitting.
  * - "Copy" — clipboard.
+ * - "Fan out…" — one template × a matrix of values → N capped sessions
+ *   (plan `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`
+ *   Phase 7). Switches the right pane to `FanoutPanel`, which previews every
+ *   member and posts exactly the ticked rows to the runner's `POST /fanout`.
+ *   The parameter form stays visible there: its values are the FIXED values,
+ *   and a matrix axis of the same name overrides them per member.
  *
  * Overlay skeleton (fixed inset-0 z-50, Escape + backdrop close) copied
  * from `DocFinderModal.tsx`. Degraded auth states render an explicit
@@ -24,7 +30,9 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
+  ArrowLeft,
   Copy,
+  Layers,
   Loader2,
   Play,
   RefreshCw,
@@ -35,6 +43,7 @@ import {
 
 import { writeClipboard } from "@/lib/clipboard";
 
+import { FanoutPanel, type FanoutModalContext } from "./FanoutPanel";
 import type { PromptLibraryAuth, PromptParameter, PromptTemplate } from "./promptLibraryApi";
 import {
   initialParamValues,
@@ -68,7 +77,16 @@ interface PromptModalProps {
   /** Prefill (NO trailing `\r`) the rendered text into a session. */
   onInsert: (tabId: string, text: string) => void;
   onClose: () => void;
+  /**
+   * Enables the "Fan out…" action. Absent → the action is not offered (a
+   * caller that cannot supply accounts and a working dir cannot fan out).
+   */
+  fanout?: FanoutModalContext;
+  /** Open straight into fan-out mode (the `/fanout` command). */
+  initialMode?: PromptModalMode;
 }
+
+export type PromptModalMode = "prompt" | "fanout";
 
 /* ── Component ────────────────────────────────────────────────────────── */
 
@@ -84,7 +102,10 @@ export function PromptModal({
   onSpawn,
   onInsert,
   onClose,
+  fanout,
+  initialMode = "prompt",
 }: PromptModalProps) {
+  const [mode, setMode] = useState<PromptModalMode>(fanout ? initialMode : "prompt");
   const [search, setSearch] = useState("");
   const [selectedSlug, setSelectedSlug] = useState<string | null>(initialSlug ?? null);
   const [values, setValues] = useState<PromptParamValues>({});
@@ -225,11 +246,23 @@ export function PromptModal({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
       onClick={handleBackdropClick}
     >
-      <div className="bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl w-[760px] max-h-[80vh] h-[560px] flex flex-col overflow-hidden">
+      <div
+        data-ui-bridge-id="terminal.prompt-modal"
+        data-mode={mode}
+        className={`bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl max-h-[85vh] flex flex-col overflow-hidden ${
+          mode === "fanout" ? "w-[1040px] max-w-[95vw] h-[720px]" : "w-[760px] h-[560px]"
+        }`}
+      >
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-[#2a2d3d]">
-          <Sparkles className="w-4 h-4 text-[#7aa2f7]" />
-          <h2 className="text-sm font-medium text-[#c0caf5] flex-1">Prompts</h2>
+          {mode === "fanout" ? (
+            <Layers className="w-4 h-4 text-[#bb9af7]" />
+          ) : (
+            <Sparkles className="w-4 h-4 text-[#7aa2f7]" />
+          )}
+          <h2 className="text-sm font-medium text-[#c0caf5] flex-1">
+            {mode === "fanout" ? "Fan out a prompt" : "Prompts"}
+          </h2>
           <button
             onClick={onRefresh}
             title="Refresh prompt library"
@@ -350,7 +383,25 @@ export function PromptModal({
                     )}
                   </div>
 
+                  {mode === "fanout" && fanout && (
+                    <button
+                      type="button"
+                      data-ui-bridge-id="terminal.fanout-back"
+                      onClick={() => setMode("prompt")}
+                      className="self-start flex items-center gap-1 text-[11px] text-[#565f89] hover:text-[#a9b1d6] transition-colors"
+                    >
+                      <ArrowLeft className="w-3 h-3" />
+                      Back to single session
+                    </button>
+                  )}
+
                   {/* Parameter form */}
+                  {mode === "fanout" && selected.parameters.length > 0 && (
+                    <div className="text-[10px] text-[#565f89]">
+                      Fixed values for every member — a matrix axis with the same name overrides one
+                      per member.
+                    </div>
+                  )}
                   {selected.parameters.length > 0 && (
                     <div className="flex flex-col gap-2.5">
                       {selected.parameters
@@ -366,89 +417,114 @@ export function PromptModal({
                     </div>
                   )}
 
-                  {/* Actions */}
-                  <div className="flex flex-col gap-2 mt-1">
-                    <button
-                      onClick={() => void handleSpawn()}
-                      disabled={!canRun}
-                      title={
-                        canRun
-                          ? "Start a new AI session with this prompt"
-                          : `Fill required fields: ${missing.join(", ")}`
-                      }
-                      className="flex items-center justify-center gap-2 px-4 py-2.5 bg-[#7aa2f7] hover:bg-[#6a92e7] disabled:bg-[#2a2d3d] disabled:text-[#565f89] text-[#1a1b26] text-sm font-medium rounded transition-colors"
-                    >
-                      <Play className="w-4 h-4" />
-                      Start new session
-                    </button>
-                    <div className="flex items-center gap-3 text-[11px]">
-                      <div className="relative">
+                  {mode === "fanout" && fanout ? (
+                    <FanoutPanel
+                      // Fresh form per template: unticks, edits and a create
+                      // verdict made under one template must not carry over.
+                      key={selected.name}
+                      template={selected}
+                      fixedValues={values}
+                      context={fanout}
+                    />
+                  ) : (
+                    <>
+                      {/* Actions */}
+                      <div className="flex flex-col gap-2 mt-1">
                         <button
-                          onClick={() => setShowInsertMenu((v) => !v)}
-                          disabled={!canRun || sessions.length === 0}
+                          onClick={() => void handleSpawn()}
+                          disabled={!canRun}
                           title={
-                            sessions.length === 0
-                              ? "No open terminal sessions"
-                              : "Prefill the prompt into an open session (you press Enter)"
+                            canRun
+                              ? "Start a new AI session with this prompt"
+                              : `Fill required fields: ${missing.join(", ")}`
                           }
-                          className="flex items-center gap-1 text-[#7aa2f7] hover:text-[#9bb8fb] disabled:text-[#565f89] transition-colors"
+                          className="flex items-center justify-center gap-2 px-4 py-2.5 bg-[#7aa2f7] hover:bg-[#6a92e7] disabled:bg-[#2a2d3d] disabled:text-[#565f89] text-[#1a1b26] text-sm font-medium rounded transition-colors"
                         >
-                          Insert into session
-                          <ChevronDown className="w-3 h-3" />
+                          <Play className="w-4 h-4" />
+                          Start new session
                         </button>
-                        {showInsertMenu && sessions.length > 0 && (
-                          <div className="absolute bottom-full left-0 mb-1 min-w-[220px] max-h-[200px] overflow-y-auto scrollbar-dark bg-[#13141f] border border-[#2a2d3d] rounded shadow-xl z-10">
-                            {sessions.map((s) => (
-                              <button
-                                key={s.id}
-                                onClick={() => handleInsert(s.id)}
-                                className="w-full text-left px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#24283b] transition-colors truncate"
-                              >
-                                {s.title}
-                                {s.id === defaultInsertTarget?.id && (
-                                  <span className="text-[#565f89]"> · focused</span>
-                                )}
-                              </button>
-                            ))}
+                        <div className="flex items-center gap-3 text-[11px]">
+                          <div className="relative">
+                            <button
+                              onClick={() => setShowInsertMenu((v) => !v)}
+                              disabled={!canRun || sessions.length === 0}
+                              title={
+                                sessions.length === 0
+                                  ? "No open terminal sessions"
+                                  : "Prefill the prompt into an open session (you press Enter)"
+                              }
+                              className="flex items-center gap-1 text-[#7aa2f7] hover:text-[#9bb8fb] disabled:text-[#565f89] transition-colors"
+                            >
+                              Insert into session
+                              <ChevronDown className="w-3 h-3" />
+                            </button>
+                            {showInsertMenu && sessions.length > 0 && (
+                              <div className="absolute bottom-full left-0 mb-1 min-w-[220px] max-h-[200px] overflow-y-auto scrollbar-dark bg-[#13141f] border border-[#2a2d3d] rounded shadow-xl z-10">
+                                {sessions.map((s) => (
+                                  <button
+                                    key={s.id}
+                                    onClick={() => handleInsert(s.id)}
+                                    className="w-full text-left px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#24283b] transition-colors truncate"
+                                  >
+                                    {s.title}
+                                    {s.id === defaultInsertTarget?.id && (
+                                      <span className="text-[#565f89]"> · focused</span>
+                                    )}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => void handleCopy()}
+                            disabled={!canRun}
+                            className="flex items-center gap-1 text-[#7aa2f7] hover:text-[#9bb8fb] disabled:text-[#565f89] transition-colors"
+                          >
+                            <Copy className="w-3 h-3" />
+                            Copy
+                          </button>
+                          {fanout && (
+                            <button
+                              type="button"
+                              data-ui-bridge-id="terminal.prompt-modal-fanout"
+                              onClick={() => setMode("fanout")}
+                              title="Run this prompt once per row of a matrix, N at a time"
+                              className="flex items-center gap-1 text-[#bb9af7] hover:text-[#cdb4fa] transition-colors"
+                            >
+                              <Layers className="w-3 h-3" />
+                              Fan out…
+                            </button>
+                          )}
+                          {feedback && <span className="text-[#9ece6a]">{feedback}</span>}
+                        </div>
+                        {missing.length > 0 && (
+                          <div className="text-[10px] text-[#565f89]">
+                            Fill the required fields to continue: {missing.join(", ")}
                           </div>
                         )}
                       </div>
-                      <button
-                        onClick={() => void handleCopy()}
-                        disabled={!canRun}
-                        className="flex items-center gap-1 text-[#7aa2f7] hover:text-[#9bb8fb] disabled:text-[#565f89] transition-colors"
-                      >
-                        <Copy className="w-3 h-3" />
-                        Copy
-                      </button>
-                      {feedback && <span className="text-[#9ece6a]">{feedback}</span>}
-                    </div>
-                    {missing.length > 0 && (
-                      <div className="text-[10px] text-[#565f89]">
-                        Fill the required fields to continue: {missing.join(", ")}
-                      </div>
-                    )}
-                  </div>
 
-                  {/* Read-only rendered preview, collapsed by default */}
-                  <div className="border-t border-[#2a2d3d] pt-2">
-                    <button
-                      onClick={() => setShowPreview((v) => !v)}
-                      className="flex items-center gap-1 text-[11px] text-[#565f89] hover:text-[#a9b1d6] transition-colors"
-                    >
-                      {showPreview ? (
-                        <ChevronDown className="w-3 h-3" />
-                      ) : (
-                        <ChevronRight className="w-3 h-3" />
-                      )}
-                      Show what will run
-                    </button>
-                    {showPreview && (
-                      <pre className="mt-2 p-3 bg-[#13141f] border border-[#2a2d3d] rounded text-[11px] text-[#a9b1d6] whitespace-pre-wrap break-words max-h-[180px] overflow-y-auto scrollbar-dark">
-                        {rendered}
-                      </pre>
-                    )}
-                  </div>
+                      {/* Read-only rendered preview, collapsed by default */}
+                      <div className="border-t border-[#2a2d3d] pt-2">
+                        <button
+                          onClick={() => setShowPreview((v) => !v)}
+                          className="flex items-center gap-1 text-[11px] text-[#565f89] hover:text-[#a9b1d6] transition-colors"
+                        >
+                          {showPreview ? (
+                            <ChevronDown className="w-3 h-3" />
+                          ) : (
+                            <ChevronRight className="w-3 h-3" />
+                          )}
+                          Show what will run
+                        </button>
+                        {showPreview && (
+                          <pre className="mt-2 p-3 bg-[#13141f] border border-[#2a2d3d] rounded text-[11px] text-[#a9b1d6] whitespace-pre-wrap break-words max-h-[180px] overflow-y-auto scrollbar-dark">
+                            {rendered}
+                          </pre>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
               ) : prompts.length === 0 ? (
                 /* No library at all — say so, and say WHY when the fetch told
