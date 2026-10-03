@@ -52,6 +52,13 @@ pub mod runner_breadcrumb;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 
+// Wire types whose only producers live in the runner BIN, hoisted here so the
+// schema-export pipeline (`schema_export`) can see them; the bin re-exports
+// each. Session 4e (plan 2026-09-12-residual-work-from-the-april-2026-plan-audit).
+pub mod known_issue_types;
+pub mod skill_types;
+pub mod ui_bridge_action_plan;
+
 // Temp-file-then-rename writer. Declared in BOTH the lib and the runner bin
 // (same file, like `process_helpers` / `coord_doctor`) because
 // `secure_storage` — which compiles into both crates — needs it: the encrypted
