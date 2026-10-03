@@ -31,7 +31,9 @@ use serde::{Deserialize, Serialize};
 /// does: [`CreateKnownIssueRequest::validate`] and
 /// [`UpdateKnownIssueRequest::validate`] refuse a non-object before it is
 /// stored. (`step_template` has no writer at all.) A row stored before that
-/// check existed is not rewritten.
+/// check existed is served with a non-object value as absent (`{}` / `None`,
+/// logged by the Postgres row mapper), and an update to that row then
+/// persists the normalized value — the bad value is not kept.
 type JsonObject = serde_json::Map<String, serde_json::Value>;
 
 /// Refuse a JSON-object field that holds anything but an object. `null` is
