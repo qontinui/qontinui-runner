@@ -4674,6 +4674,10 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 2: the triage-stamp door. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
     // is the grant authority; this list only forwards.
     "coord_mark_findings_triaged",
+    // Plan 2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+    // Phase 1: the by-id read-back of a memory write receipt. A pure read; added
+    // WITH the coord tool so the receipt's own door never answers -32601.
+    "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
@@ -16358,6 +16362,10 @@ mod coord_mcp_body_gate_tests {
             "coord_alert_queue",
             "coord_alert_claim",
             "coord_alert_release",
+            // The by-id memory read-back (plan 2026-09-21-a-memory-write-
+            // receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
+            // Phase 1), pinned with the coord tool rather than after a -32601.
+            "coord_memory_get",
         ] {
             assert!(
                 gate(serde_json::json!({
