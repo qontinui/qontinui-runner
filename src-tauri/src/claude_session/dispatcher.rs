@@ -30,7 +30,7 @@ use tauri::{Emitter, Manager};
 use tracing::{debug, info, trace, warn};
 
 use crate::claude_protocol::codec::decode_message;
-use crate::claude_protocol::types::{CliSessionState, ClaudeOutputMessage, SystemSubtype};
+use crate::claude_protocol::types::{ClaudeOutputMessage, CliSessionState, SystemSubtype};
 use crate::commands::ai_session::emit_session_state;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
@@ -167,7 +167,8 @@ pub fn observe_frame(
                 let state = sys.state.clone();
                 match &state {
                     Some(CliSessionState::Idle) => {
-                        out.transitioned_to = turn_end_transition(tracker, "session_state_changed:idle");
+                        out.transitioned_to =
+                            turn_end_transition(tracker, "session_state_changed:idle");
                         out.ready_for_next = true;
                     }
                     Some(CliSessionState::RequiresAction) => {
@@ -319,7 +320,9 @@ pub fn stdout_log_preview(line: &str) -> String {
         },
         // A line that merely names a control frame without parsing is held
         // back too, rather than trusted to be harmless.
-        Err(_) if line.contains("\"control_") => format!("<unparsed control frame, {} bytes>", line.len()),
+        Err(_) if line.contains("\"control_") => {
+            format!("<unparsed control frame, {} bytes>", line.len())
+        }
         _ => truncate_str(line, 150).to_string(),
     }
 }
@@ -342,7 +345,8 @@ fn report_structured_failure(
     signal: &FailureSignal,
 ) {
     let provider = qontinui_runner_lib::cli_profile::claude::ID;
-    let Some(failure) = failure_recovery::record_only(session_key, Lane::Structured, provider, signal)
+    let Some(failure) =
+        failure_recovery::record_only(session_key, Lane::Structured, provider, signal)
     else {
         return;
     };
@@ -1181,7 +1185,10 @@ mod tests {
 
     impl Replay {
         fn failures(&self) -> Vec<&FailureSignal> {
-            self.frames.iter().filter_map(|(_, o)| o.failure.as_ref()).collect()
+            self.frames
+                .iter()
+                .filter_map(|(_, o)| o.failure.as_ref())
+                .collect()
         }
 
         /// The frame type at which the session went Processing -> Ready.
@@ -1252,7 +1259,11 @@ mod tests {
         let result = &r.frames.iter().find(|(t, _)| t == "result").unwrap().1;
         assert!(result.turn_succeeded && result.turn_ended && result.ready_for_next);
         assert!(r.ledger.unrecognized_counts().is_empty());
-        assert_eq!(r.ledger.cli_state(), None, "no state events without the env var");
+        assert_eq!(
+            r.ledger.cli_state(),
+            None,
+            "no state events without the env var"
+        );
         assert_eq!(scenario("plain_turn")["exit_code"], 0);
     }
 
@@ -1265,7 +1276,10 @@ mod tests {
     fn fixture_errored_turn_is_reported_failed_and_its_exit_is_one_failure() {
         let r = replay("errored_turn_invalid_model");
         let result = &r.frames.iter().find(|(t, _)| t == "result").unwrap().1;
-        assert!(!result.turn_succeeded, "subtype success + is_error true is not a success");
+        assert!(
+            !result.turn_succeeded,
+            "subtype success + is_error true is not a success"
+        );
         let failures = r.failures();
         assert_eq!(failures.len(), 1);
         let FailureSignal::StructuredEvent {
@@ -1281,10 +1295,16 @@ mod tests {
         assert_eq!(error_code.as_deref(), Some("model_not_found"));
         assert_eq!(*api_status, Some(404));
         assert_eq!(*rate_limit_status, None);
-        assert!(message.as_deref().unwrap_or_default().contains("issue with the selected model"));
+        assert!(message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issue with the selected model"));
         let classified = classify(failures[0], profile()).unwrap();
         assert_eq!(classified.kind, FailureKind::BadRequest);
-        assert_eq!(classified.evidence.source, FailureEvidenceSource::StructuredEvent);
+        assert_eq!(
+            classified.evidence.source,
+            FailureEvidenceSource::StructuredEvent
+        );
         assert_eq!(classified.evidence.confidence, FailureConfidence::Confirmed);
         // The session still leaves Processing on the fallback path.
         assert_eq!(r.turn_ended_ready_at(), vec!["result".to_string()]);
@@ -1310,8 +1330,12 @@ mod tests {
         let stderr = sc["stderr"].as_str().unwrap().to_string();
         let on_stderr =
             failure_recovery::report(target(), provider, None, FailureSignal::Stderr(stderr));
-        let on_exit =
-            failure_recovery::report(target(), provider, None, FailureSignal::Exit { code: exit_code });
+        let on_exit = failure_recovery::report(
+            target(),
+            provider,
+            None,
+            FailureSignal::Exit { code: exit_code },
+        );
         assert_eq!(on_stderr.unwrap().id, recorded.id);
         assert_eq!(on_exit.unwrap().id, recorded.id);
         let active = failure_recovery::active(&key);
@@ -1345,7 +1369,11 @@ mod tests {
         assert_eq!(r.ledger.cli_state(), Some(&CliSessionState::Idle));
         assert_eq!(r.count("system:session_state_changed:requires_action"), 1);
         assert!(r.count("system:thinking_tokens") >= 1);
-        assert!(r.ledger.unrecognized_counts().is_empty(), "{:?}", r.ledger.unrecognized_counts());
+        assert!(
+            r.ledger.unrecognized_counts().is_empty(),
+            "{:?}",
+            r.ledger.unrecognized_counts()
+        );
         assert_eq!(r.count("rate_limit_event"), 1);
         assert!(r.failures().is_empty());
 
@@ -1373,7 +1401,10 @@ mod tests {
         assert!(r.failures().is_empty());
         assert_eq!(r.count("rate_limit_event"), 1);
         assert_eq!(r.turn_ended_ready_at(), vec!["result".to_string()]);
-        assert!(r.frames.iter().any(|(t, o)| t == "result" && o.turn_succeeded));
+        assert!(r
+            .frames
+            .iter()
+            .any(|(t, o)| t == "result" && o.turn_succeeded));
         assert_eq!(scenario("can_use_tool_sdk_deny")["exit_code"], 0);
     }
 
@@ -1395,7 +1426,11 @@ mod tests {
         );
     }
 
-    fn observe_one(ledger: &mut FrameLedger, tracker: &SessionStateTracker, line: &str) -> FrameOutcome {
+    fn observe_one(
+        ledger: &mut FrameLedger,
+        tracker: &SessionStateTracker,
+        line: &str,
+    ) -> FrameOutcome {
         observe_frame(ledger, &decode_message(line).unwrap(), line.len(), tracker)
     }
 
@@ -1420,7 +1455,10 @@ mod tests {
         else {
             panic!("structured event expected");
         };
-        assert_eq!(rate_limit_status.as_deref(), Some(RateLimitStatus::Rejected.as_str()));
+        assert_eq!(
+            rate_limit_status.as_deref(),
+            Some(RateLimitStatus::Rejected.as_str())
+        );
         assert_eq!(reset_at.as_deref(), Some("2026-09-30T00:10:00+00:00"));
         let f = classify(&signal, profile()).unwrap();
         assert_eq!(f.kind, FailureKind::QuotaExhausted);
@@ -1431,7 +1469,11 @@ mod tests {
             &tracker,
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"some_future_status"}}"#,
         );
-        let f = classify(&unseen.failure.expect("an unseen status is not allowed"), profile()).unwrap();
+        let f = classify(
+            &unseen.failure.expect("an unseen status is not allowed"),
+            profile(),
+        )
+        .unwrap();
         assert_eq!(f.kind, FailureKind::Unknown);
 
         for line in [
@@ -1439,7 +1481,11 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
             r#"{"type":"rate_limit_event"}"#,
         ] {
-            assert_eq!(observe_one(&mut ledger, &tracker, line).failure, None, "{line}");
+            assert_eq!(
+                observe_one(&mut ledger, &tracker, line).failure,
+                None,
+                "{line}"
+            );
         }
     }
 
@@ -1449,18 +1495,37 @@ mod tests {
     fn unrecognized_frames_are_counted_and_named_once() {
         let tracker = SessionStateTracker::new();
         let mut ledger = FrameLedger::new("dispatcher-test-unrecognized");
-        let first = observe_one(&mut ledger, &tracker, r#"{"type":"stream_event","event":{}}"#);
+        let first = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"stream_event","event":{}}"#,
+        );
         assert_eq!(first.first_unrecognized.as_deref(), Some("stream_event"));
         for _ in 0..2 {
             let again = observe_one(&mut ledger, &tracker, r#"{"type":"stream_event"}"#);
             assert_eq!(again.first_unrecognized, None);
         }
-        let sys = observe_one(&mut ledger, &tracker, r#"{"type":"system","subtype":"hook_started"}"#);
-        assert_eq!(sys.first_unrecognized.as_deref(), Some("system:hook_started"));
-        // Known subtypes are not counted.
-        observe_one(&mut ledger, &tracker, r#"{"type":"system","subtype":"thinking_tokens"}"#);
+        let sys = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"system","subtype":"hook_started"}"#,
+        );
         assert_eq!(
-            ledger.unrecognized_counts().iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(),
+            sys.first_unrecognized.as_deref(),
+            Some("system:hook_started")
+        );
+        // Known subtypes are not counted.
+        observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"system","subtype":"thinking_tokens"}"#,
+        );
+        assert_eq!(
+            ledger
+                .unrecognized_counts()
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect::<Vec<_>>(),
             vec![("stream_event", 3), ("system:hook_started", 1)]
         );
     }
@@ -1489,7 +1554,9 @@ mod tests {
             r#"{"type":"result","subtype":"error_during_execution","errors":["boom"]}"#,
         );
         let FailureSignal::StructuredEvent {
-            error_code, message, ..
+            error_code,
+            message,
+            ..
         } = next.failure.unwrap()
         else {
             panic!("structured event expected");
@@ -1508,7 +1575,11 @@ mod tests {
         tracker.transition(SessionState::Processing).unwrap();
         tracker.transition(SessionState::Interrupting).unwrap();
         let mut ledger = FrameLedger::new("dispatcher-test-fallback");
-        let r = observe_one(&mut ledger, &tracker, r#"{"type":"result","subtype":"success"}"#);
+        let r = observe_one(
+            &mut ledger,
+            &tracker,
+            r#"{"type":"result","subtype":"success"}"#,
+        );
         assert_eq!(r.transitioned_to, Some(SessionState::Ready));
         assert!(r.turn_succeeded);
         let idle = observe_one(
@@ -1523,7 +1594,9 @@ mod tests {
     // ── Phase 9: control requests answered by subtype ─────────────────────
 
     use crate::claude_session::permission::test_support::broker;
-    use crate::claude_session::permission::{ControlHandling, PermissionDecision, PermissionOutcome};
+    use crate::claude_session::permission::{
+        ControlHandling, PermissionDecision, PermissionOutcome,
+    };
     use crate::session::launch_spec::PermissionMode;
 
     /// What the probe actually sent the CLI, line by line.
@@ -1566,8 +1639,13 @@ mod tests {
         panic!("{stem}: no control request");
     }
 
-    fn sent(out: &crate::claude_session::permission::test_support::RecordingResponder) -> Vec<serde_json::Value> {
-        out.lines().iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+    fn sent(
+        out: &crate::claude_session::permission::test_support::RecordingResponder,
+    ) -> Vec<serde_json::Value> {
+        out.lines()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     /// `can_use_tool_sdk_allow_with_session_state_events` in `Prompt` mode: the
@@ -1583,8 +1661,13 @@ mod tests {
         assert_eq!(state, Some(CliSessionState::RequiresAction));
         assert!(out.lines().is_empty());
         assert_eq!(sink.requested.lock().unwrap()[0].tool_name, "Write");
-        b.respond(&request_id, PermissionDecision::Allow { updated_input: None })
-            .unwrap();
+        b.respond(
+            &request_id,
+            PermissionDecision::Allow {
+                updated_input: None,
+            },
+        )
+        .unwrap();
         assert_eq!(sent(&out), vec![fixture_stdin(stem)[2].clone()]);
         assert_eq!(scenario(stem)["write_target_created"], true);
     }
@@ -1617,7 +1700,10 @@ mod tests {
     #[test]
     fn fixture_bypass_answers_the_request_that_used_to_hang() {
         let stem = "can_use_tool_runner_shape_ignored";
-        let (b, out, _) = broker(PermissionMode::BypassPermissions, std::time::Duration::from_secs(60));
+        let (b, out, _) = broker(
+            PermissionMode::BypassPermissions,
+            std::time::Duration::from_secs(60),
+        );
         let (handled, request_id, _) = replay_to_control_request(stem, &b);
         assert_eq!(handled, ControlHandling::Allowed);
         let replies = sent(&out);
@@ -1629,7 +1715,10 @@ mod tests {
         assert_eq!(replies[0]["response"]["subtype"], "success");
         assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
         assert_eq!(replies[0]["response"]["response"]["behavior"], "allow");
-        assert!(replies[0].get("request_id").is_none(), "request_id rides inside response");
+        assert!(
+            replies[0].get("request_id").is_none(),
+            "request_id rides inside response"
+        );
         // The echoed input is the request's own.
         let accepted = &fixture_stdin("can_use_tool_sdk_allow_with_session_state_events")[2];
         assert_eq!(
@@ -1652,7 +1741,10 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
         assert_eq!(replies[0]["response"]["response"]["behavior"], "deny");
-        assert_eq!(sink.resolved.lock().unwrap()[0].outcome, PermissionOutcome::TimedOut);
+        assert_eq!(
+            sink.resolved.lock().unwrap()[0].outcome,
+            PermissionOutcome::TimedOut
+        );
     }
 
     /// Any other subtype is refused with an `error`, in either posture.
@@ -1690,13 +1782,20 @@ mod tests {
         let req = r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"content":"secret"}}}"#;
         assert!(!stdout_log_preview(req).contains("secret"));
         let sys = r#"{"type":"system","subtype":"init","cwd":"/home/x"}"#;
-        assert_eq!(stdout_log_preview(sys), format!("<system:init frame, {} bytes>", sys.len()));
+        assert_eq!(
+            stdout_log_preview(sys),
+            format!("<system:init frame, {} bytes>", sys.len())
+        );
         let broken = r#"{"type":"control_response","response":{"account":"#;
         assert!(stdout_log_preview(broken).starts_with("<unparsed control frame"));
         // Every other line keeps its short preview.
-        let text = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        let text =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
         assert_eq!(stdout_log_preview(text), text);
-        for line in std::fs::read_to_string(fixture_dir().join("plain_turn.ndjson")).unwrap().lines() {
+        for line in std::fs::read_to_string(fixture_dir().join("plain_turn.ndjson"))
+            .unwrap()
+            .lines()
+        {
             if line.starts_with(r#"{"type":"control_"#) || line.starts_with(r#"{"type":"system""#) {
                 assert!(stdout_log_preview(line).starts_with('<'), "{line}");
             }

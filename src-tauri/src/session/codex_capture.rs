@@ -385,14 +385,17 @@ mod tests {
 
     #[test]
     fn line1_yields_the_nested_id_and_cwd() {
-        let line = r#"{"type":"session_meta","payload":{"session_id":"abc","cwd":"C:\\repos\\widget"}}"#;
+        let line =
+            r#"{"type":"session_meta","payload":{"session_id":"abc","cwd":"C:\\repos\\widget"}}"#;
         assert_eq!(
             parse_session_meta_from_line1(line),
             Some(("abc".to_string(), Some("C:\\repos\\widget".to_string())))
         );
         // No cwd: the id still parses.
         assert_eq!(
-            parse_session_meta_from_line1(r#"{"type":"session_meta","payload":{"session_id":"abc"}}"#),
+            parse_session_meta_from_line1(
+                r#"{"type":"session_meta","payload":{"session_id":"abc"}}"#
+            ),
             Some(("abc".to_string(), None))
         );
     }
@@ -508,10 +511,7 @@ mod tests {
             Some(PathBuf::from("/accounts/work/.codex"))
         );
         // Blank is not an override.
-        assert_ne!(
-            effective_codex_home(Some("  ")),
-            Some(PathBuf::from("  "))
-        );
+        assert_ne!(effective_codex_home(Some("  ")), Some(PathBuf::from("  ")));
     }
 
     /// The captured record is a confirmed, authoritative Codex record.
@@ -528,7 +528,10 @@ mod tests {
         );
         let rec = store.get("codex-sess-1").expect("record written");
         assert_eq!(rec.provider, codex::ID);
-        assert!(rec.confirmed_at.is_some(), "a captured session is confirmed");
+        assert!(
+            rec.confirmed_at.is_some(),
+            "a captured session is confirmed"
+        );
         assert_eq!(rec.terminal_id, "term-1");
         assert_eq!(rec.title.as_deref(), Some("repo"));
         assert_eq!(rec.config_dir.as_deref(), Some("/accounts/work/.codex"));
@@ -610,7 +613,10 @@ mod tests {
             .collect();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].claude_session_id, "codex-x");
-        assert_eq!(store.get("earlier").map(|r| r.state), Some("closed".to_string()));
+        assert_eq!(
+            store.get("earlier").map(|r| r.state),
+            Some("closed".to_string())
+        );
     }
 
     /// The async entry point finds a rollout that appears after it starts,
@@ -622,11 +628,11 @@ mod tests {
         let home = dir.path().join("codex-home");
         let day = sessions_root(&home).join("2026").join("10").join("03");
         fs::create_dir_all(&day).unwrap();
-        let line = r#"{"type":"session_meta","payload":{"session_id":"live-1","cwd":"/work/proj"}}"#;
+        let line =
+            r#"{"type":"session_meta","payload":{"session_id":"live-1","cwd":"/work/proj"}}"#;
         fs::write(day.join("rollout-2026-10-03T10-00-00-live-1.jsonl"), line).unwrap();
-        let store = std::sync::Arc::new(
-            SessionLifecycleStore::open(dir.path().join("s.json")).unwrap(),
-        );
+        let store =
+            std::sync::Arc::new(SessionLifecycleStore::open(dir.path().join("s.json")).unwrap());
 
         let reported = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = reported.clone();
@@ -646,7 +652,10 @@ mod tests {
         let (id, account) = reported.lock().unwrap().clone().expect("reported");
         assert_eq!(id, "live-1");
         assert_eq!(account, home.to_string_lossy());
-        assert_eq!(store.get("live-1").map(|r| r.provider), Some(codex::ID.to_string()));
+        assert_eq!(
+            store.get("live-1").map(|r| r.provider),
+            Some(codex::ID.to_string())
+        );
 
         let never = std::sync::Arc::new(std::sync::Mutex::new(false));
         let flag = never.clone();
@@ -664,6 +673,9 @@ mod tests {
         )
         .await;
         assert!(!*never.lock().unwrap());
-        assert!(store.open_records().iter().all(|r| r.terminal_id != "term-b"));
+        assert!(store
+            .open_records()
+            .iter()
+            .all(|r| r.terminal_id != "term-b"));
     }
 }

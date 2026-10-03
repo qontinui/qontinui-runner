@@ -1353,7 +1353,13 @@ impl ClaudeSession {
                             None => f.title.clone(),
                         };
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            emit_ai_output(&app_handle_for_waiter, &text, "status", None, Some(ctx));
+                            emit_ai_output(
+                                &app_handle_for_waiter,
+                                &text,
+                                "status",
+                                None,
+                                Some(ctx),
+                            );
                         }));
                     }
                 };
@@ -2397,8 +2403,10 @@ mod tests {
         // CLI reports its own turn state only when asked (probe Q2), and the
         // credential scrub that runs after must not strip the request.
         assert!(
-            envs.iter().any(|(k, v)| k == crate::claude_protocol::SESSION_STATE_EVENTS_ENV
-                && v.as_deref() == Some("1")),
+            envs.iter().any(
+                |(k, v)| k == crate::claude_protocol::SESSION_STATE_EVENTS_ENV
+                    && v.as_deref() == Some("1")
+            ),
             "the structured lane must ask the CLI for session_state_changed frames"
         );
     }

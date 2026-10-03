@@ -66,7 +66,10 @@ const HINT_DEBOUNCE: Duration = Duration::from_secs(300);
 ///
 /// The match is generous on purpose: a false hint costs one probe-confirmed
 /// no-op downstream, while a missed hint strands a session on a dead account.
-fn normalized_indicates_usage_limit<'a>(normalized: &str, phrases: &'a [String]) -> Option<&'a str> {
+fn normalized_indicates_usage_limit<'a>(
+    normalized: &str,
+    phrases: &'a [String],
+) -> Option<&'a str> {
     phrases
         .iter()
         .map(String::as_str)
@@ -257,11 +260,9 @@ mod tests {
     /// The Claude profile's declared phrases — the list a Claude session's
     /// grid is scanned for.
     fn phrases() -> &'static [String] {
-        &qontinui_runner_lib::cli_profile::profile_for(
-            qontinui_runner_lib::cli_profile::claude::ID,
-        )
-        .unwrap()
-        .usage_limit_phrases
+        &qontinui_runner_lib::cli_profile::profile_for(qontinui_runner_lib::cli_profile::claude::ID)
+            .unwrap()
+            .usage_limit_phrases
     }
 
     fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
