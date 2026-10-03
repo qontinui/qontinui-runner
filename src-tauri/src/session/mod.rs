@@ -404,6 +404,28 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// One operator-input EPISODE — the supply half of the operator-touch
+    /// instrument: a human (or an ambiguous door) put input on a session's
+    /// PTY in this 60-second bucket (plan
+    /// `2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record`,
+    /// Phase 2). Producer: [`crate::terminal::operator_input`], hooked into
+    /// the `TerminalSession::write` / `submit_prompt` funnel, at most one per
+    /// `(terminal, channel, bucket)`.
+    ///
+    /// Drained to `POST /coord/sessions/operator-input`, payload forwarded
+    /// VERBATIM: `session_id`, `channel`, `actor_class` (`human` | `unknown`
+    /// — never `automated`, which the coord route is specified to refuse;
+    /// plan Phase 1, coord PR pending), `session_state_at_input`,
+    /// `occurred_at` (bucket start) and the caller-formed `idempotency_key`
+    /// `<session_id>:input:<channel>:<bucket>`. Never content, never a byte
+    /// count.
+    ///
+    /// Best-effort, same posture as [`Self::OperatorTouch`]. ⚠️ Same
+    /// load-bearing-arm hazard: without its `push_record` arm the kind is
+    /// ACK-DROPPED silently — `every_session_outbox_kind_has_a_dispatch_arm`
+    /// fails if it is missed.
+    #[serde(rename = "operator_input")]
+    OperatorInput,
 }
 
 impl SessionEventKind {
@@ -428,6 +450,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::OperatorInput => "operator_input",
         }
     }
 }

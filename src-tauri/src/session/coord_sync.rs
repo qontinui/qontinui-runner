@@ -1007,9 +1007,11 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 /// All these are coord writes that are NOT session lifecycle events — a
 /// helper task, the two closeout kinds from plan
 /// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`, an
-/// agent-notification, and an operator touch (plan
+/// agent-notification, an operator touch (plan
 /// `2026-08-27-operator-touch-observation-runner-emitter` §2c: "Emit is
-/// best-effort and must never block or slow a session"). Stalling a
+/// best-effort and must never block or slow a session"), and an operator
+/// input (plan `2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record`
+/// Phase 2 — observability of the keyboard must never cost it). Stalling a
 /// session's `started`/`closed` behind any of them would be worse than
 /// losing one of them, which is exactly the trade the posture encodes.
 fn is_best_effort_kind(kind: &str) -> bool {
@@ -1018,6 +1020,7 @@ fn is_best_effort_kind(kind: &str) -> bool {
         || kind == SessionEventKind::FindingPosted.as_str()
         || kind == SessionEventKind::AgentNotification.as_str()
         || kind == SessionEventKind::OperatorTouch.as_str()
+        || kind == SessionEventKind::OperatorInput.as_str()
 }
 
 /// How many per-session push chains run at once (plan
@@ -1752,6 +1755,28 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // See `every_session_outbox_kind_has_a_dispatch_arm` and
             // `operator_touch_posts_to_the_dedicated_route`.
             let url = format!("{base}/coord/sessions/operator-touch");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
+        }
+        "operator_input" => {
+            // Operator-input episode (plan
+            // 2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record,
+            // Phase 2). POST /coord/sessions/operator-input with the payload
+            // built by crate::terminal::operator_input forwarded VERBATIM —
+            // it already carries the caller-formed idempotency key. The coord
+            // route is being built to this contract (plan Phase 1, coord PR
+            // pending): tenant from the device JWT, key tenant-prefixed via
+            // the operator-touch route's `stored_idempotency_key`. Until it
+            // deploys, these rows are lost under the best-effort posture
+            // (Ack-dropped) rather than blocking session lifecycle events.
+            //
+            // ⚠️ LOAD-BEARING, same hazard as "operator_touch" above: without
+            // this arm the kind falls to the `other` catch-all, is ACKed and
+            // DROPPED, and every operator-hour reads a clean, wrong zero. See
+            // `every_session_outbox_kind_has_a_dispatch_arm` and
+            // `drain_pushes_operator_input_to_the_dedicated_route`.
+            let url = format!("{base}/coord/sessions/operator-input");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
                 .send()
                 .await
@@ -3432,6 +3457,7 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
+            SessionEventKind::OperatorInput,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -3606,6 +3632,8 @@ mod tests {
         events_status: Option<u16>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
+        /// Bodies accepted by `POST /coord/sessions/operator-input`.
+        operator_inputs: Vec<JsonValue>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -3963,6 +3991,17 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/sessions/operator-input",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.operator_inputs.push(body.clone());
+                        (AxumStatus::OK, Json(json!({ "recorded": true }))).into_response()
                     },
                 ),
             )
@@ -4339,6 +4378,80 @@ mod tests {
 
         // ACKed (at-least-once delivery confirmed) — the fake route answers
         // 200, which is a success status for this best-effort kind.
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// `operator_input` end-to-end through a real drain: an empty
+    /// `operator_inputs` recording means `push_record` has no arm and the row
+    /// was Ack-DROPPED by the catch-all. Also pins the DEDICATED route and the
+    /// verbatim payload (no tenant, no content).
+    #[tokio::test]
+    async fn drain_pushes_operator_input_to_the_dedicated_route() {
+        use crate::terminal::operator_input::{
+            input_payload, ActorClass, Channel, Door, OpenedEpisode, SessionStateAtInput,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let payload = input_payload(
+            session_id,
+            OpenedEpisode {
+                door: Door {
+                    actor_class: ActorClass::Human,
+                    channel: Channel::LocalTerminal,
+                },
+                bucket: 1_726_000_020,
+                previous: i64::MIN,
+            },
+            SessionStateAtInput::AtPrompt,
+        );
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::OperatorInput,
+                payload,
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.operator_inputs.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.operator_inputs.len(), 1);
+        assert!(
+            g.events.is_empty() && g.operator_touches.is_empty(),
+            "operator_input rides its own route"
+        );
+        let body = &g.operator_inputs[0];
+        assert_eq!(body["session_id"], json!(session_id.to_string()));
+        assert_eq!(body["channel"], json!("local_terminal"));
+        assert_eq!(body["actor_class"], json!("human"));
+        assert_eq!(body["session_state_at_input"], json!("at_prompt"));
+        assert_eq!(
+            body["idempotency_key"],
+            json!(format!("{session_id}:input:local_terminal:1726000020"))
+        );
+        assert!(body.get("tenant_id").is_none());
+        drop(g);
+
         wait_until(Duration::from_secs(3), || {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
@@ -6861,6 +6974,8 @@ mod tests {
             SessionEventKind::HelperTaskCreated,
             SessionEventKind::GateRegistration,
             SessionEventKind::FindingPosted,
+            SessionEventKind::OperatorTouch,
+            SessionEventKind::OperatorInput,
         ] {
             assert!(is_best_effort_kind(kind.as_str()), "{kind:?}");
         }

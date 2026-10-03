@@ -1449,6 +1449,10 @@ pub struct TerminalSession {
     /// Written after bytes reach the wire; read by the phantom-turn detector
     /// via [`Self::last_input`]. See [`PtyInputSlots`].
     last_input: Mutex<PtyInputSlots>,
+    /// The operator-input episode latch: per channel, the 60s bucket this
+    /// terminal last emitted an operator-input event for. Lives and dies
+    /// with the terminal. See [`super::operator_input`].
+    operator_input: super::operator_input::InputEpisodes,
 }
 
 /// The settled screen behind a [`TerminalSession::idle_quiescence_probe`].
@@ -2300,6 +2304,7 @@ impl TerminalSession {
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            operator_input: Default::default(),
             pinned_session_id,
             wire_flow,
         })
@@ -3370,6 +3375,15 @@ impl TerminalSession {
         } else {
             InputSlot::Write
         };
+        // Operator-input episode (plan
+        // `2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record`
+        // Phase 2): AFTER the control-response exclusion, so the emulator's
+        // own replies never read as a human at the keyboard. A zero-byte
+        // write moved nothing and is not input either. Takes the caller tag
+        // and a timestamp — never `data`.
+        if slot == InputSlot::Write && !data.is_empty() {
+            super::operator_input::on_input(self, &caller, chrono::Utc::now().timestamp());
+        }
         self.record_input(
             PtyInputObservation {
                 caller,
@@ -3624,6 +3638,11 @@ impl TerminalSession {
         // child can act on even if the trailing CR below fails — record it
         // here rather than after the CR, or a half-written submit would read
         // as "no input" to the phantom-turn detector.
+        //
+        // A submit is always input (no control-response exclusion applies to
+        // a framed paste), so the operator-input episode hook runs
+        // unconditionally — same funnel as `write`, never the body.
+        super::operator_input::on_input(self, &caller, chrono::Utc::now().timestamp());
         self.record_input(
             PtyInputObservation {
                 caller,
@@ -4149,6 +4168,28 @@ impl TerminalSession {
         let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
         let snap = guard.text_snapshot();
         (snap.lines, snap.cursor_row)
+    }
+
+    /// [`Self::grid_text`] WITHOUT blocking: `None` when another thread holds
+    /// the grid lock right now. For the PTY write path, which must never wait
+    /// on the reader thread's grid update (plan
+    /// `2026-09-20-agents-sustained-per-operator-hour-needs-an-operator-touch-record`,
+    /// Vet V4). A poisoned lock is not contention and is read through, like
+    /// [`Self::grid_text`].
+    pub fn try_grid_text(&self) -> Option<(Vec<String>, u16)> {
+        let guard = match self.grid.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let snap = guard.text_snapshot();
+        Some((snap.lines, snap.cursor_row))
+    }
+
+    /// This terminal's operator-input episode latch
+    /// ([`super::operator_input::InputEpisodes`]).
+    pub fn operator_input_episodes(&self) -> &super::operator_input::InputEpisodes {
+        &self.operator_input
     }
 
     /// The rendered grid with the cursor position — the input the graceful-exit
@@ -5208,6 +5249,7 @@ pub(crate) mod tests {
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
             last_input: Mutex::new(PtyInputSlots::default()),
+            operator_input: Default::default(),
             pinned_session_id: "test-pinned-session".to_string(),
         }
     }
@@ -8378,5 +8420,173 @@ pub(crate) mod tests {
             0,
             "no byte reached the parser — the old gate signal is blind to this"
         );
+    }
+
+    // ---- operator-input emitter (plan 2026-09-20-agents-sustained-per-
+    // operator-hour-needs-an-operator-touch-record, Phase 2) ----------------
+
+    /// A live fixture BOUND to a coord session id, so the funnel reaches the
+    /// attributed path (state read + enqueue) instead of stopping at
+    /// `unattributed`.
+    fn attributed_session() -> LiveTestSession {
+        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        session.set_coord_session_id(uuid::Uuid::new_v4());
+        session
+    }
+
+    /// Driven through the real `write` funnel: each producer on a fresh,
+    /// attributed terminal opens an episode iff its door is `human` or
+    /// `unknown`.
+    #[test]
+    fn write_opens_an_operator_input_episode_only_for_human_and_ambiguous_doors() {
+        use crate::terminal::operator_input::actor_class_of;
+        let every = [
+            PtyWriteCaller::HttpSubmitPrompt,
+            PtyWriteCaller::LoopingAgentNudge,
+            PtyWriteCaller::AccountMigration,
+            PtyWriteCaller::SessionMessagePoller,
+            PtyWriteCaller::AutoResponse {
+                rule_id: "r".to_string(),
+            },
+            PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::TauriTerminalWrite,
+            PtyWriteCaller::TauriInvokeProxy,
+            PtyWriteCaller::RemoteTerminalInput,
+            PtyWriteCaller::HttpWrite,
+            PtyWriteCaller::WebSocketInput,
+            PtyWriteCaller::PtyTransport,
+            PtyWriteCaller::ClaudeCliTransport,
+            PtyWriteCaller::LaunchInitialCommand,
+            PtyWriteCaller::HttpCreateInitialCommand,
+            PtyWriteCaller::StewardLaunchCommand,
+            PtyWriteCaller::GracefulExit,
+            PtyWriteCaller::Test,
+        ];
+        let mut emitting = 0;
+        for caller in every {
+            let expected = u64::from(actor_class_of(&caller).is_some());
+            emitting += expected;
+            let session = attributed_session();
+            let tag = caller.to_string();
+            session.write(b"x", caller).expect("live fixture write");
+            assert_eq!(
+                session.operator_input_episodes().opened(),
+                expected,
+                "{tag}"
+            );
+        }
+        assert_eq!(emitting, 6, "two human doors + four ambiguous doors");
+    }
+
+    /// `submit_prompt` is the second funnel and carries the same hook.
+    #[test]
+    fn submit_prompt_opens_an_operator_input_episode_for_an_ambiguous_door() {
+        let session = attributed_session();
+        session
+            .submit_prompt("redirect", PtyWriteCaller::HttpSubmitPrompt)
+            .expect("live fixture submit");
+        assert_eq!(session.operator_input_episodes().opened(), 1);
+        let nudge = attributed_session();
+        nudge
+            .submit_prompt("nudge", PtyWriteCaller::LoopingAgentNudge)
+            .expect("live fixture submit");
+        assert_eq!(nudge.operator_input_episodes().opened(), 0);
+    }
+
+    /// 500 keystrokes on an attributed terminal → one episode and ONE state
+    /// read (two of each only if the loop straddled a bucket boundary, which
+    /// the bracketing reads detect). The global counters move with it: the
+    /// latch is counted and the episode reaches the enqueue path, where the
+    /// outbox thread — no Tauri app in a unit test — counts it `dropped`.
+    /// Other tests move the same process-wide counters concurrently, so the
+    /// global assertions are lower bounds on deltas, never equalities.
+    #[test]
+    fn five_hundred_attributed_writes_read_state_once_and_reach_the_enqueue_path() {
+        use crate::session::operator_touch::epoch_bucket;
+        let counter = |key: &str| {
+            crate::terminal::operator_input::health_json()[key]
+                .as_u64()
+                .expect("counter")
+        };
+        let latched_before = counter("latched");
+        let delivered_before = counter("emitted") + counter("dropped");
+
+        let session = attributed_session();
+        let before = epoch_bucket(chrono::Utc::now().timestamp());
+        for _ in 0..500 {
+            session
+                .write(b"k", PtyWriteCaller::TauriTerminalWrite)
+                .expect("live fixture write");
+        }
+        let after = epoch_bucket(chrono::Utc::now().timestamp());
+        let expected = if before == after { 1 } else { 2 };
+        let episodes = session.operator_input_episodes();
+        assert_eq!(episodes.opened(), expected);
+        assert_eq!(
+            episodes.state_reads(),
+            expected,
+            "the grid is read on the latch-opening write only, never per keystroke"
+        );
+        assert!(counter("latched") >= latched_before + expected);
+
+        // The outbox thread settles asynchronously.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while counter("emitted") + counter("dropped") < delivered_before + expected {
+            assert!(
+                Instant::now() < deadline,
+                "the episode never reached the outbox thread"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Unattributed (no coord session id): the latch is rolled back, so no
+    /// state read happens and the bucket is NOT burned — binding the coord id
+    /// mid-bucket lets the very next write emit.
+    #[test]
+    fn an_unattributed_write_does_not_burn_the_bucket() {
+        let session = LiveTestSession::new(Arc::new(Mutex::new(Vec::new())));
+        session
+            .write(b"a", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        let episodes = session.operator_input_episodes();
+        assert_eq!(episodes.opened(), 0);
+        assert_eq!(episodes.state_reads(), 0);
+        session.set_coord_session_id(uuid::Uuid::new_v4());
+        session
+            .write(b"b", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        assert_eq!(episodes.opened(), 1);
+        assert_eq!(episodes.state_reads(), 1);
+    }
+
+    /// A focus report is the emulator talking, not a person — no episode.
+    #[test]
+    fn a_focus_report_only_chunk_or_an_empty_write_opens_no_operator_input_episode() {
+        let session = attributed_session();
+        session
+            .write(b"\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        session
+            .write(b"\x1b[O\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        assert_eq!(session.operator_input_episodes().opened(), 0);
+        assert!(session.last_input().last_control_response.is_some());
+        // Nor does a zero-byte write: nothing reached the PTY.
+        session
+            .write(&[], PtyWriteCaller::TauriTerminalWrite)
+            .expect("live fixture write");
+        assert_eq!(session.operator_input_episodes().opened(), 0);
+        assert_eq!(session.operator_input_episodes().state_reads(), 0);
+    }
+
+    /// The non-blocking grid read answers `None` under contention, never waits.
+    #[test]
+    fn try_grid_text_does_not_block_on_a_held_grid() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert!(session.try_grid_text().is_some());
+        let grid = session.grid();
+        let _held = grid.lock().unwrap();
+        assert!(session.try_grid_text().is_none());
     }
 }
