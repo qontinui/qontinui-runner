@@ -1,6 +1,6 @@
 ---
 name: return-to-main
-description: "Nightly return-to-main maintenance for THIS device's primary checkouts, launched by the runner's own scheduler (plan 2026-09-13-nightly-return-to-main-sweep). Proves the machine quiet with machine-quiesce-check.sh, runs the deterministic sweep return-to-main-sweep.sh with --fetch (the ONLY thing that ever mutates a checkout), adjudicates each abstention a script cannot settle (land-evidence.sh for UNIQUE_WIP/MIXED branches, dirty-provenance.sh for dirty trees) by deciding whether to hand --adjudicated-landed or --restore-residue back to the sweep, registers ONE 14-day retention gate for every restore snapshot and reconciles any snapshot on this device that has no live gate (plan 2026-09-13-one-recovery-rule-for-both-checkout-restorers), and reports every repo to coord as a checkout-staleness finding. --reap <repo> <wip_ref> --device <id> is what a cleared retention gate runs: the one verified deletion path for a snapshot and its parked branch (reap-restore-snapshot.sh). SHADOW by default: nothing moves without an explicit --act, and an UNKNOWN quiet verdict never acts. --install / --check / --uninstall manage the runner scheduler task and do nothing else."
+description: "Nightly return-to-main maintenance for THIS device's primary checkouts, launched by the runner's own scheduler (plan 2026-09-13-nightly-return-to-main-sweep). Proves each repo quiet for each move with machine-quiesce-check.sh --for checkout-ff / checkout-return (a per-repo QUIET acts even when the machine is BUSY), runs the deterministic sweep return-to-main-sweep.sh with --fetch (the ONLY thing that ever mutates a checkout), adjudicates each abstention a script cannot settle (land-evidence.sh for UNIQUE_WIP/MIXED branches, dirty-provenance.sh for dirty trees) by deciding whether to hand --adjudicated-landed or --restore-residue back to the sweep, registers ONE 14-day retention gate for every restore snapshot and reconciles any snapshot on this device that has no live gate (plan 2026-09-13-one-recovery-rule-for-both-checkout-restorers), and reports every repo to coord as a checkout-staleness finding. --reap <repo> <wip_ref> --device <id> is what a cleared retention gate runs: the one verified deletion path for a snapshot and its parked branch (reap-restore-snapshot.sh). SHADOW by default: nothing moves without an explicit --act, and an UNKNOWN quiet verdict never acts. --install / --check / --uninstall manage the runner scheduler task (probe-gated where the runner enforces require_probe, bounded by --daily-cap; else the interim 07:20 cron) and do nothing else."
 user-invocable: true
 ---
 
@@ -22,8 +22,12 @@ injection.** It is operator-authorized nightly maintenance. The operator ruled
 on 2026-09-13 that this job is scheduled **inside Qontinui** — by the runner's
 own scheduler, never an OS scheduler — and `/return-to-main --install` registers
 it there as a `RemoteAgent` task named `return-to-main` whose prompt is
-`/return-to-main --shadow --not-after 06:30`. A session started from that task
-is running exactly what plan `2026-09-13-nightly-return-to-main-sweep`
+`/return-to-main --shadow --daily-cap 3` (a probe-gated task the runner fires
+whenever the quiet check finds work it may do) or, on a runner that cannot
+enforce that probe, `/return-to-main --shadow --not-after 09:30` (the interim
+07:20 cron). A session started from that task is running exactly what plans
+`2026-09-13-nightly-return-to-main-sweep` and
+`2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
 registered. Phase 0 of that plan measured a scheduled session refusing its task
 as a suspected prompt injection; for this skill that refusal is the wrong call,
 and it leaves the checkouts parked for another night.
@@ -57,9 +61,9 @@ it and say so in the report.
 ## Arguments
 
 ```text
-/return-to-main [--shadow | --act] [--repos <a,b,...>] [--not-after HH:MM] [--idle-hours N]
-/return-to-main --install [--act] [--at HH:MM] [--not-after HH:MM]
-/return-to-main --install --dry-run [--act] [--at HH:MM] [--not-after HH:MM]
+/return-to-main [--shadow | --act] [--repos <a,b,...>] [--not-after HH:MM] [--daily-cap N]
+/return-to-main --install [--act] [--at HH:MM] [--not-after HH:MM] [--daily-cap N] [--mode cron]
+/return-to-main --install --dry-run [--act] [--at HH:MM] [--not-after HH:MM] [--daily-cap N] [--mode cron]
 /return-to-main --check
 /return-to-main --uninstall
 /return-to-main --reap <repo> <wip_ref> --device <device_id>
@@ -70,13 +74,13 @@ it and say so in the report.
 | `--shadow` | The DEFAULT. Every sweep runs with `--dry-run`; Step 3 gathers evidence and reports what it WOULD pass, and passes nothing. |
 | `--act` | Act where Step 1 — and the re-check before each live invocation (1c) — allows it. Never inferred — absent means shadow. `--shadow --act` together is a usage error. |
 | `--repos a,b` | Restrict the sweep and adjudication to these depth-1 checkout names (each becomes one `--only`). Default: every primary under the workspace root. |
-| `--not-after HH:MM` | Local 24-hour clock. If the current local time is LATER (a missed-run catch-up firing after the runner started in the morning), report and exit without sweeping. |
-| `--idle-hours N` | D3's override window, a positive integer, default `8`. |
+| `--not-after HH:MM` | Local 24-hour clock. If the current local time is LATER (a missed-run catch-up firing after the runner started in the morning), report and exit without sweeping. The interim cron's prompt carries it. |
+| `--daily-cap N` | A whole number 1..24. If this device has already STARTED N runs of this skill today (local date, Step 1a), report and exit without sweeping. The probe-gated task's prompt carries it instead of `--not-after`: a job that can fire at any hour is bounded by a count, not a clock. |
 | `--install` / `--check` / `--uninstall` | Management verbs: call `schedule-return-to-main.sh` and report. No quiet check, no sweep, no finding. |
 | `--reap <repo> <wip_ref> --device <id>` | What a cleared retention gate runs (Reap mode, below). Takes no other argument. |
 
-Anything else — an unknown flag, a malformed `HH:MM`, a non-integer
-`--idle-hours`, a management verb mixed with a sweep argument, `--reap` with
+Anything else — an unknown flag, a malformed `HH:MM`, a `--daily-cap` outside
+1..24, a management verb mixed with a sweep argument, `--reap` with
 anything but its three values — prints this
 grammar and stops: no sweep, no finding. A usage error is not a night's record.
 
@@ -112,7 +116,7 @@ RTM_SKILL_DIR="<path-to-this-skill-dir>"
 RTM_WS="<workspace-root>"
 RUN_DIR="$RTM_WS/.dev-logs/return-to-main/$(date -u +%Y%m%dT%H%M%SZ)"
 { mkdir -p "$(dirname "$RUN_DIR")" && mkdir "$RUN_DIR"; } || RUN_DIR="$(mktemp -d)" || RUN_DIR=""
-RTM_HELPERS="machine-quiesce-check.sh session-census.sh return-to-main-sweep.sh classify-branch-state.sh land-evidence.sh dirty-provenance.sh schedule-return-to-main.sh reap-restore-snapshot.sh recovery-ref-census.sh lib"
+RTM_HELPERS="machine-quiesce-check.sh session-census.sh touch-ledger-read.sh return-to-main-sweep.sh classify-branch-state.sh land-evidence.sh dirty-provenance.sh schedule-return-to-main.sh reap-restore-snapshot.sh recovery-ref-census.sh lib"
 if [ -n "$RUN_DIR" ] && mkdir -p "$RUN_DIR/bin"; then
   for n in $RTM_HELPERS; do
     src=""
@@ -143,8 +147,24 @@ DIRTYPROV="$(rtm_script dirty-provenance.sh)"
 SCHEDULE="$(rtm_script schedule-return-to-main.sh)"
 REAP="$(rtm_script reap-restore-snapshot.sh)"
 CENSUS="$(rtm_script recovery-ref-census.sh)"
-[ -n "$RUN_DIR" ] && for v in RTM_WS RUN_DIR QUIESCE SWEEP CLASSIFY LANDEV DIRTYPROV SCHEDULE REAP CENSUS; do printf '%s=%q\n' "$v" "${!v}"; done >"$RUN_DIR/run.env"
+REPOS="<the --repos value, empty when none was given>"
+# The wait budget ends a reserve (<= 30 min) before THIS task's own timeout_seconds, capped at
+# 2 h -- read off the installed task through the registration helper's --check
+# (bash + curl, no JSON parser), because a box still carrying an older install
+# has a shorter timeout than schedule-return-to-main.sh now writes.
+RTM_CHECK="$( [ -n "$SCHEDULE" ] && bash "$SCHEDULE" --check --root "$RTM_WS" 2>/dev/null )"
+RTM_TASK_TIMEOUT="$(printf '%s\n' "$RTM_CHECK" | sed -n 's/.*timeout_seconds: *\([0-9][0-9]*\).*/\1/p' | head -1)"
+RTM_TIMEOUT_SOURCE=read
+case "$RTM_CHECK" in *"timeout_seconds: <unset"*) RTM_TASK_TIMEOUT=600; RTM_TIMEOUT_SOURCE="unset: runner default" ;; esac
+case "$RTM_TASK_TIMEOUT" in ''|*[!0-9]*) RTM_TASK_TIMEOUT=3600; RTM_TIMEOUT_SOURCE="unreadable: assumed" ;; esac  # the shortest timeout ever installed
+RTM_RESERVE=$(( RTM_TASK_TIMEOUT / 2 ))   # kept for Steps 3-5: half the timeout, at most 30 min
+[ "$RTM_RESERVE" -gt 1800 ] && RTM_RESERVE=1800
+RTM_WAIT_BUDGET=$(( RTM_TASK_TIMEOUT - RTM_RESERVE ))
+[ "$RTM_WAIT_BUDGET" -gt 7200 ] && RTM_WAIT_BUDGET=7200
+RTM_WAIT_DEADLINE=$(( $(date +%s) + RTM_WAIT_BUDGET ))  # see "The turn never ends while a helper runs"
+[ -n "$RUN_DIR" ] && for v in RTM_WS RUN_DIR QUIESCE SWEEP CLASSIFY LANDEV DIRTYPROV SCHEDULE REAP CENSUS REPOS RTM_WAIT_DEADLINE; do printf '%s=%q\n' "$v" "${!v}"; done >"$RUN_DIR/run.env"
 echo "return-to-main: run directory ${RUN_DIR:-<none>}"
+echo "return-to-main: task timeout ${RTM_TASK_TIMEOUT}s (${RTM_TIMEOUT_SOURCE}), wait budget ${RTM_WAIT_BUDGET}s"
 ```
 
 **Run Step 0 once per night, never again.** Shell state does not survive
@@ -168,6 +188,7 @@ wrapper.
 | `RUN_DIR` is empty (neither the run directory nor `mktemp -d` could be made) | Nothing can be copied or logged: the night is UNKNOWN. Sweep nothing; print the Step 5 report as this session's output. |
 | `QUIESCE` or `SWEEP` empty | No quiet verdict or no sweep is possible: the night is UNKNOWN. Sweep nothing, still write the Step 5 report (a gap must be visible in the nightly record, not silent). |
 | `RESOLVED` says `session-census.sh` or `lib` is `MISSING` | Do not work around it. The helpers that need them fail closed on their own (the quiet check's census probe reads unknown, so the verdict is UNKNOWN; a helper whose lib guard needs `lib/` refuses), and the report quotes `RESOLVED`. |
+| `RESOLVED` says `touch-ledger-read.sh` is `MISSING` (a runner-only device: it lives in the config repo's `scripts/`, not in this skill's bundle) | Nothing to work around: the quiet check's `touch_ledger` probe reads unknown, so every WORKING session blocks every repo and idle ones still block nothing. Quote `RESOLVED` in the report. |
 | `CLASSIFY`, `LANDEV` or `DIRTYPROV` empty | Step 1 and Step 2 run normally; every Step 3 row that needed the missing script is reported UNKNOWN and no argument is passed for it. |
 | `SCHEDULE` empty | The management verbs report UNKNOWN. |
 | `CENSUS` empty | Step 4 registers and reconciles nothing and says so: every snapshot this run wrote is reported `retention gate NOT registered -- recovery-ref-census.sh missing`. |
@@ -179,6 +200,117 @@ Also confirm `RTM_WS` is the right directory: at least one `"$RTM_WS"/*/.git`
 must be a directory. If none is, the placeholder was substituted wrongly — stop
 and report UNKNOWN rather than sweep nothing and call it a clean night.
 
+### The turn never ends while a helper runs
+
+**A scheduled run is a headless `claude -p` session, and in that mode ENDING A
+TURN ENDS THE PROCESS.** Nothing wakes it again. A background-task notification,
+a "fallback wakeup" and a promise to "pick the run up when it finishes" are
+all lost, and so is everything after Step 2. The scheduler then records
+the run `completed` and `success: true`, because the process exited 0.
+
+This is measured, not hypothetical. On the Windows operator box,
+pass A of the dry-run sweep (39 checkouts, `--fetch` with a 120 s timeout per
+repo, run sequentially) took 15, 65 and 100 minutes on 2026-09-26, -28 and -30
+(`run_start` → `run_end` in each night's `pass-a.jsonl`). On -29 the first pass
+aborted in bash after 8 decisions and a second one, `pass-a2.jsonl`, took 45. Every one
+of those runs overran the Bash tool's foreground limit, so the harness moved it
+to the background. Three sessions then wrote a progress note and stopped. Their
+logs in the runner's per-run `scheduler-runs/` directory each end in one, for
+example *"I'll wait for it to complete … I'll be notified automatically"*, or
+*"A 20-minute fallback wakeup is set"*. Each sweep finished on its own after the
+session was gone, and no Step 3, 4 or 5 ever ran: three successful-looking
+nights with no record. The fourth night was killed by the job timeout instead.
+That one shows up as `scheduled session exceeded timeout_seconds`. Coord
+finding `4ba5c4c8` (the 2026-09-29 graduation review) listed 09-26, -28 and
+-29 among this box's nights with no record. This section is why
+they had none.
+
+So every helper call that can outlast one Bash call runs as a LAUNCH plus
+repeated bounded WAITs. No pass is launched, and no 1c re-check is taken for
+one, once `RTM_WAIT_DEADLINE` has passed. The launch refuses such a pass
+itself. Today that means each sweep invocation, which can run
+past the tool's limit on a loaded box. Run every WAIT in the same turn,
+back to back, until the helper's exit marker exists or the deadline passes.
+
+**Launch.** Issue it as a Bash call with `run_in_background: true` **and
+`timeout: 7200000`**. Both are needed. A foreground call that overruns is
+killed with the sweep inside it. A background call keeps the harness's default
+limit of 30 minutes unless the timeout is raised, and the sweep has run 100.
+7200000 ms is the tool's ceiling, and it equals the two-hour cap on the wait
+budget. It is also a hard stop: the harness ends a launch two hours after it
+began, and a sweep still running then is killed with it, possibly part-way
+through a move. That is why nothing new is launched past the deadline. The
+sweep's own snapshot-before-move keeps an interrupted move recoverable
+(`checkout-restore-contract.md`). Fill in three values from the pass's
+own line in Step 2 or Step 3. `OUT` is its `>` target, and `PASS_CMD` is the
+line up to that `>`. The wait's `LOG` is its `--log` file. Every marker hangs
+off `OUT`, so the summary lands exactly where Step 2 or Step 3 reads it. The
+exit marker is written only after the helper returns, through a rename, so its
+presence means the `--json` summary and the pass log are complete. A launch
+that cannot start writes a `refused:` marker instead, so the wait never spins
+on a pass that was never launched:
+
+```bash
+. "<RUN_DIR>/run.env"
+SWEEP_ARGS=()
+for r in $(printf '%s' "$REPOS" | tr ',' ' '); do SWEEP_ARGS+=(--only "$r"); done
+OUT="$RUN_DIR/pass-a.json"   # that pass line's ">" target, e.g. "$RUN_DIR/pass-b.json" or "$RUN_DIR/residue-<repo>.json"
+PASS_CMD=()                  # fill in: that pass line, up to its first ">"
+[ -d "${RUN_DIR:-}" ] || { echo "return-to-main: run.env did not load -- nothing launched" >&2; exit 2; }
+rm -f "$OUT.exit" "$OUT.exit.tmp" "$OUT.pid"
+if [ "${#PASS_CMD[@]}" -eq 0 ]; then echo "refused: PASS_CMD was empty" >"$OUT.exit"; exit 2; fi
+if [ "$(date +%s)" -ge "$RTM_WAIT_DEADLINE" ]; then echo "refused: past the night's wait deadline" >"$OUT.exit"; exit 2; fi
+"${PASS_CMD[@]}" >"$OUT" 2>"$OUT.err" &
+echo "$!" >"$OUT.pid"   # the SWEEP's own pid -- the wait's DIED check watches it, not this shell
+wait "$!"; rc=$?
+echo "$rc" >"$OUT.exit.tmp" && mv "$OUT.exit.tmp" "$OUT.exit"
+```
+
+**Wait.** Issue it as a FOREGROUND call. It returns within 100 seconds,
+under the Bash tool's default 120 s limit, so a wait issued without a
+`timeout` is still never moved to the background. Repeat it as often as the
+pass needs. Even a full two-hour budget is about 72 waits, which the task's
+`max_turns` (400) covers:
+
+```bash
+. "<RUN_DIR>/run.env"
+OUT="$RUN_DIR/pass-a.json"   # the same OUT as its launch
+LOG="$RUN_DIR/pass-a.jsonl"  # that pass line's --log file
+[ -d "${RUN_DIR:-}" ] || { echo "WAIT REFUSED: run.env did not load"; exit 2; }
+end=$(( SECONDS + 100 ))
+alive() { [ ! -s "$OUT.pid" ] || kill -0 "$(cat "$OUT.pid")" 2>/dev/null; }
+while [ ! -s "$OUT.exit" ] && [ "$SECONDS" -lt "$end" ] && [ "$(date +%s)" -lt "$RTM_WAIT_DEADLINE" ] && alive; do sleep 10; done
+if [ -s "$OUT.exit" ]; then echo "DONE exit=$(cat "$OUT.exit") $OUT"
+elif [ -s "$OUT.pid" ] && ! kill -0 "$(cat "$OUT.pid")" 2>/dev/null && { sleep 5; [ ! -s "$OUT.exit" ]; }; then echo "DIED: the sweep is gone and no exit marker was written $OUT"
+elif [ -s "$OUT.exit" ]; then echo "DONE exit=$(cat "$OUT.exit") $OUT"   # the marker landed during the 5 s grace
+elif [ "$(date +%s)" -ge "$RTM_WAIT_DEADLINE" ]; then echo "DEADLINE: still running at $(date -u +%H:%MZ) $OUT"
+else n="$(grep -c '"event":"decision"' "$LOG" 2>/dev/null)" || n=0; echo "RUNNING: ${n:-0} decision rows so far $OUT"; fi
+```
+
+| Wait prints | What you do next — in this same turn |
+|---|---|
+| `DONE exit=<n>` | Read the summary and the log exactly as Step 2 says; `<n>` is the sweep's exit code. |
+| `DONE exit=refused: …` | Nothing was launched. A refusal past the deadline is final: that pass is UNKNOWN, so go on as for `DEADLINE`. For any other refusal, fix what it names and launch again under a fresh `--log` and `OUT` (for example `pass-a2`), so the new launch can never read the old marker. |
+| (none of these: the harness says the WAIT itself was moved to the background) | The call ran longer than the harness allowed. Issue a new WAIT at once, and never end the turn on that notice. |
+| `DIED` | The sweep process is gone and nothing recorded its exit, for example because a harness limit killed it. That pass is UNKNOWN; report it, and read its log for how far it got. Relaunch only a `--dry-run` pass, and only while the wait budget lasts. Give the relaunch a fresh `--log` and `OUT` (for example `pass-a2.jsonl` and `pass-a2.json`): a reused log would carry a second `run_start` and read UNKNOWN. A pass that could act is not relaunched. Its repos stay as the dead pass left them, and the night goes on as for `DEADLINE`. |
+| `WAIT REFUSED` | `<RUN_DIR>` was substituted wrongly. Use the literal path Step 0 printed. |
+| `RUNNING` | Issue the same WAIT again at once. Do not write a progress note, and do not end the turn. A progress note followed by an ended turn is exactly the failure above. |
+| `DEADLINE` | Stop waiting. That pass's table is UNKNOWN (*"did not finish within the night's wait budget"*), and so is every later pass that depended on it. Never kill the sweep: it may be mid-fast-forward, and its own log records how it ends. Go straight to Step 4 for snapshots that already exist, then Step 5. |
+
+`RTM_WAIT_DEADLINE` is Step 0 plus the wait budget. The budget is this task's
+own `timeout_seconds` less a reserve for Steps 3 to 5, capped at two hours.
+The reserve is 30 minutes, or half the timeout when that is shorter, so even
+the runner's 600 s default leaves time to post the finding. It is read off the
+installed task through `--check`, taken as 600 when the task leaves it unset
+(the runner's default), and as 3600 when it cannot be read. Step 0 prints the
+timeout, where it came from and the budget; the Step 5 header quotes that line. With the 10800 that
+`schedule-return-to-main.sh` installs, the third hour is left for adjudication,
+gates and the report. A box still carrying an older 3600 install waits only 30
+minutes, and `--check` reports the timeout as drift until `--install` runs
+again. A night that runs out of time
+therefore still posts a finding that says so. A night that posts nothing
+cannot be shown not to have timed out.
+
 ## Management verbs — `--install`, `--check`, `--uninstall`
 
 These call the registration helper and report; they run no quiet check, no
@@ -186,14 +318,29 @@ sweep and post no finding.
 
 ```bash
 bash "$SCHEDULE" --check
-bash "$SCHEDULE" --install --not-after 06:30
-bash "$SCHEDULE" --install --act --not-after 06:30
-bash "$SCHEDULE" --dry-run --at 04:20 --not-after 06:30
+bash "$SCHEDULE" --install
+bash "$SCHEDULE" --install --act
+bash "$SCHEDULE" --dry-run --at 07:20 --not-after 09:30 --daily-cap 3
+bash "$SCHEDULE" --install --mode cron
 bash "$SCHEDULE" --uninstall
 ```
 
-Pass `--act`, `--at` and `--not-after` through only when the user gave them.
-`--install` alone registers the task in SHADOW. `--install --act` is the Phase 7
+Pass `--act`, `--at`, `--not-after`, `--daily-cap` and `--mode` through only
+when the user gave them. **The helper picks the schedule, from the runner's own
+capability, and prints which one and why on its first line** (`scheduling mode:
+condition (...)` or `scheduling mode: cron (...)`) — quote that line. Where the
+runner's `GET /health` advertises `require_probe` in `schedulerConditions` it
+registers a `Condition` schedule gated by a `requireProbe` that runs
+`machine-quiesce-check.sh --for checkout-ff --exit-quiet-if-any-repo` every 5
+minutes (the task fires when some repo is QUIET for a fast-forward and has
+something to do, then waits 2 hours), with `--daily-cap` in the prompt.
+Anywhere else — the field or entry absent, the runner not answering — it
+registers the interim cron (07:20 local, `--not-after 09:30`), because a runner
+that does not enforce the probe would drop it and fire the task every 2 hours
+around the clock. `--check` repeats that read and exits `3` (UNGATED) for a
+`Condition` task on a runner that no longer advertises the probe, `2` when the
+capability cannot be read beside one. `--mode cron` forces the cron; nothing
+forces the condition form. `--install` alone registers the task in SHADOW. `--install --act` is the Phase 7
 graduation: register it only once the graduation criterion — seven recorded
 shadow nights with zero refuted would-return / would-adjudicate decisions, no
 unexplained UNKNOWN quiet verdict, no run hitting its timeout — is visible in
@@ -299,9 +446,9 @@ curl -sS -X POST "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/gates/$GATE
 Read `outcome_recorded` in the response: an HTTP 200 on its own does not mean
 the outcome was recorded.
 
-## Step 1 — The late-fire bound, then the quiet verdict
+## Step 1 — The late-fire and daily bounds, then the quiet verdict
 
-**1a. `--not-after`.** Zero-padded `HH:MM` compares correctly as a string:
+**1a. `--not-after` and `--daily-cap`.** Zero-padded `HH:MM` compares correctly as a string:
 
 ```bash
 NOW_HM="$(date +%H:%M)"
@@ -315,136 +462,163 @@ Step 5 finding ("skipped: late fire at HH:MM, bound HH:MM") so the nightly
 record has no silent hole — the missed-run catch-up is exactly the case
 `--not-after` exists for.
 
-**1b. Quiet.** One call, output kept for the report:
+With `--daily-cap N`, record this run in one state file per local date FIRST,
+then read this run's own POSITION in it. Appending one short line is atomic
+(`O_APPEND`), so two runs that start in the same instant get two different
+positions -- a count-then-append would let both read "under the cap" and both
+sweep:
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce.json" 2>"$RUN_DIR/quiesce.err"
-QRC=$?
+CAP_DIR="$HOME/.qontinui/return-to-main"
+CAP_FILE="$CAP_DIR/runs-$(date +%Y-%m-%d).log"
+if [ -n "$DAILY_CAP" ]; then
+  CAP_MARK="$(date -u +%Y-%m-%dT%H:%M:%SZ) ${CLAUDE_CODE_SESSION_ID:-unknown-session} $$-$RANDOM$RANDOM"
+  if ! mkdir -p "$CAP_DIR" || ! printf '%s\n' "$CAP_MARK" >>"$CAP_FILE"; then
+    echo "return-to-main: this run could not be recorded in $CAP_FILE -- UNKNOWN, not sweeping"
+  else
+    CAP_POS="$(grep -nxF -- "$CAP_MARK" "$CAP_FILE" | head -1 | cut -d: -f1)"
+    if [ -z "$CAP_POS" ]; then
+      echo "return-to-main: this run's own line is not readable back from $CAP_FILE -- UNKNOWN, not sweeping"
+    elif [ "$CAP_POS" -gt "$DAILY_CAP" ]; then
+      echo "return-to-main: this is run $CAP_POS started today, --daily-cap $DAILY_CAP -- not sweeping"
+    else
+      echo "return-to-main: run $CAP_POS of at most $DAILY_CAP today"
+    fi
+  fi
+  find "$CAP_DIR" -name 'runs-*.log' -mtime +14 -delete 2>/dev/null
+fi
 ```
 
-Read `verdict`, `blocking[]`, `overridable[]`, `per_repo{}`, the TOP-LEVEL
-`.newest_transcript_write` object and `probes[]` from the file. The exit code
-and the `verdict` field must agree; if they do not, or the file is not
-parseable JSON, the verdict is UNKNOWN.
+A capped or UNKNOWN run sweeps nothing and runs no quiet check, and posts the
+short Step 5 finding ("skipped: daily cap N reached, run P today" or
+"skipped: daily-cap state unreadable") -- the cap is what bounds a task that the
+runner may fire at any hour, so a cap that cannot be counted is not honoured by
+guessing. It counts runs STARTED on this device, whatever they did (a capped
+run's own line counts too, which only keeps the cap reached); a run started by
+hand with `--daily-cap` counts as well, and one started without it neither
+counts nor is bounded.
+
+**1b. Quiet, per repo and per move.** Plan
+`2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
+(Phase 3). A machine-wide verdict on a box that is never empty of sessions is
+BUSY every night, so this job asks the narrower question each move needs: may
+THIS move happen to THIS repo? Two calls, outputs kept for the report:
+
+```bash
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-ff.json" 2>"$RUN_DIR/quiesce-ff.err"; echo "checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-return.json" 2>"$RUN_DIR/quiesce-return.err"; echo "checkout-return exit $?"
+```
+
+`--for checkout-ff` judges a fast-forward of R's default branch and a residue
+restore in R; `--for checkout-return` judges switching R off a parked branch
+(its blockers are a superset: every session not `finished` that ever touched
+R's primary checkout blocks it too). From each file read the top-level
+`verdict`, `per_repo{R}.verdict` and `per_repo{R}.blocking[]` (each entry has a
+`class` and a `why`), `per_repo_summary` and `probes[]`. The machine-wide
+`verdict` and the exit code must agree; if they do not, or the file is not
+parseable JSON, or any `per_repo` entry has no `verdict`, that file reads
+UNKNOWN for every repo.
 
 | `machine-quiesce-check.sh` exit | `verdict` | Meaning |
 |---|---|---|
-| `0` | `QUIET` | Nothing live was found and every signal was read |
-| `1` | `BUSY` | Something is live; `blocking[]` and `overridable[]` say what |
-| `3` | `UNKNOWN` | Some signal could not be read — including a runner readiness `false` the check cannot attribute to a process it itemised, and, on Windows, a `node` process whose command line the census could not read (census `unreadable_nodes`, probe `census` reading `unknown`) — it cannot be told apart from a Claude Code session |
+| `0` | `QUIET` | Machine-wide: nothing live was found and every signal was read |
+| `1` | `BUSY` | Machine-wide: something is live somewhere; the per-repo verdicts say where it matters |
+| `3` | `UNKNOWN` | Machine-wide: some signal could not be read — including a runner readiness `false` the check cannot attribute to a process it itemised, and, on Windows, a `node` process whose command line the census could not read (census `unreadable_nodes`, probe `census` reading `unknown`) — it cannot be told apart from a Claude Code session |
 | `4` | — | Usage: a defect in this skill's call; quote the message |
+| `5` | — | Only under `--exit-quiet-if-any-repo` (the scheduler's probe, never passed here): repos are QUIET but none has anything to do |
 
-D3, as this skill applies it:
+The machine-wide exit is reported, not acted on: a BUSY machine is the normal
+state of a 24x7 box. What decides each repo is its OWN verdict:
 
-| Quiet result | Run mode |
-|---|---|
-| exit 0, `QUIET`, `blocking` and `overridable` both empty | Act-eligible everywhere — if `--act` was passed |
-| exit 1, `BUSY`, `blocking` non-empty | **SHADOW for the whole run.** A live runner-hosted or AI session, a running build, an active coord session row, or an external agent of any family other than Claude Code (Codex, pi, a node-hosted non-Claude agent — class `external_agent_no_idle_signal`) is never overridable. |
-| exit 1, `BUSY`, `blocking` empty, `overridable` non-empty, every `overridable` entry `kind: "claude"` | **Per-repo override** (below) |
-| exit 1, `BUSY`, `blocking` empty, an `overridable` entry whose `kind` is not `claude` | **SHADOW for the whole run.** The check files every non-Claude agent under `blocking[]`; one under `overridable[]` comes from a build of the check that predates that rule, and the override was never granted to it. |
-| exit 3 `UNKNOWN`; exit 4; any other exit; unparseable; exit/verdict disagree; `QUIET` with a non-empty list; `BUSY` with both lists empty | **SHADOW for the whole run.** UNKNOWN never acts [policy: verification-and-evidence `silent-empty-is-unknown`]. |
+| `checkout-ff` `per_repo[R].verdict` | `checkout-return` `per_repo[R].verdict` | R under `--act` may |
+|---|---|---|
+| `QUIET` | `QUIET` | fast-forward, residue restore, return, adjudicated return (ACT for every move) |
+| `QUIET` | `BUSY` or `UNKNOWN` | fast-forward and residue restore only; a return — adjudicated or not — stays SHADOW |
+| `BUSY` or `UNKNOWN` | anything | nothing: SHADOW |
+| R missing from `per_repo`, or its file UNKNOWN (above) | — | nothing: SHADOW |
 
-A `probes[]` row reading `not_applicable` (no supervisor on this box, no
-cargo-guard lock) is not UNKNOWN and forces nothing — that is the D3 arm that
-keeps the job alive on a user's box.
+**A per-repo `QUIET` is act-eligible (under `--act`) even when the machine-wide
+verdict is BUSY.** That is the point of the per-repo verdict: an idle session
+somewhere, or a build of another repo, no longer holds every checkout.
+**Whole-night SHADOW remains only for what the check could not read**: a
+machine-level probe the move stands on (census, runner instances, readiness,
+runner coverage, supervisor builds) reading `unknown` leaves every repo it has
+not already blocked `UNKNOWN` — never QUIET — so nothing acts [policy:
+verification-and-evidence `silent-empty-is-unknown`]. A `probes[]` row reading
+`not_applicable` (no supervisor on this box, no cargo-guard lock, coord under
+`checkout-ff`, which reads no coord row) is not UNKNOWN and forces nothing —
+that is the D3 arm that keeps the job alive on a user's box.
 
-**The per-repo override** (overridable-only BUSY: an external interactive
-Claude Code process the runner cannot see, and nothing else). **Non-Claude
-agents are never overridable.** Both idle signals the override reads — custody
-records (written by Claude Code's Stop hook) and transcript writes — are Claude
-Code's own, so a Codex, pi or other agent working in a checkout would read idle
-while it edits; the check therefore reports every such process in `blocking[]`,
-and they arrive here as a whole-night SHADOW, never as a candidate for this
-override. For each repo `R` in scope, R is act-eligible only when ALL of these
-hold:
+What blocks a repo, as the check decides it (the class and reason are in each
+`blocking[]` entry; quote them, never paraphrase them into "busy"):
 
-1. `per_repo[R]` exists. A repo missing from it is SHADOW.
-2. `last_custody_seen` is older than now minus `--idle-hours`. A null value
-   counts as idle ONLY when the check proves there is no record rather than an
-   unreadable one: the repo's `custody_status` reads `none` where the check
-   emits that field, else the `probes[]` row named `custody` reads `ok`. A null
-   beside `custody_status: unknown`, an `unknown` custody probe, or no way to
-   tell, is SHADOW.
-3. The TOP-LEVEL, machine-wide `.newest_transcript_write.at` is older than the
-   same window. That is the object at the ROOT of the check's JSON
-   (`{"at", "age_s", "project"}`, the newest transcript write by any account in
-   any project folder) — **not** `per_repo[R].newest_transcript_write`. The
-   per-repo value is attributed by project folder, so a session whose cwd is
-   outside the workspace (an external Claude window editing a primary with
-   `git -C`) is not counted in it; it is NOT the idle test and never stands in
-   for this one. The transcript signal is machine-wide — a transcript written by
-   any account in the window keeps every repo in SHADOW. A root value of `null`
-   counts as idle ONLY when the `probes[]` row named `transcripts` reads `ok`
-   (projects directories were read and hold no transcript at all). The key
-   missing from the root (a build of the check predating it), a value that is
-   neither `null` nor an object carrying `.at`, an `.at` that does not parse, or
-   a `null` beside a `transcripts` probe that is not `ok`, is SHADOW for every
-   repo.
-4. Both timestamps — `per_repo[R].last_custody_seen` and the root
-   `.newest_transcript_write.at` — parse. Compute ages with GNU
-   `date -u -d <ts> +%s` (Git Bash and Linux); where `date -d` is unavailable
-   (BSD `date` on macOS) use Python's `datetime.fromisoformat`. A value neither
-   parses is SHADOW for that repo.
+- a session **working** (census activity `working`, or `unknown` — never
+  quiet) whose touch-ledger touches within the touch window (6 h) name R, or
+  are unattributed, or cannot be attributed at all (no session id, no ledger
+  for it, no ledger directory on this box) — so on a box where the touch-ledger
+  hook is not installed yet, every working session blocks every repo;
+- a build that reads R's working tree (sourced in R, or a path dependency lands
+  in R), a fresh cargo-guard lock or supervisor slot for R, a git lock in R, a
+  runner AI session whose cwd or worktree names R;
+- **every agent of a family with no activity reader — Codex, pi, a node-hosted
+  non-Claude agent (class `external_agent_no_idle_signal`) — blocks every repo;
+  it is never judged idle**, because neither the activity axis nor the touch
+  ledger can see it working;
+- for `checkout-return` only: a session not `finished` that ever touched R's
+  primary checkout (its next commit would land on the wrong branch).
 
-Under the override only the moves D3 bounds it to may run: a sweep return or
-fast-forward (LANDED_DUPLICATE on a clean tree), an adjudicated-landed return,
-and a **residue restore** (`--restore-residue`). The restore is inside D3's
-nothing-to-lose set by construction: it applies only to files
-`dirty-provenance.sh` marks `restorable: true` — a residue class (bytes that
-exactly match a historical upstream blob or a runner-bundle blob, or differ
-only by EOL) at a path inside the runner provisioner's footprint,
-`.claude/commands/**` or `.claude/skills/**`; never a mode-only change — and
-only when EVERY modified tracked file is restorable (exit 0). The sweep writes a
-`refs/wip/` snapshot before it restores anything — so a live edit, which
-classifies `UNIQUE`, blocks it; a residue-class file outside the footprint, which
-a person may have reverted on purpose, blocks it; and any restore is
-recoverable from the snapshot. Withholding it
-under the override would leave `qontinui-claude-config` dirty forever on a box
-that keeps interactive windows open overnight, which is the delivery loop this
-job exists to break (plan D3, resolved at implementation 2026-09-13).
+Idle, waiting and stale sessions block no fast-forward, and a build of another
+repo blocks nothing here.
 
 Write one reasoning line per repo into the report, for example:
 
 ```text
-qontinui-runner: ACT    (custody last_seen 2026-09-13T01:12Z = 9.3h > 8h; machine-wide newest transcript 10.1h > 8h)
-qontinui-web:    SHADOW (custody last_seen 2026-09-13T08:40Z = 1.9h < 8h)
-qontinui-coord:  SHADOW (last_custody_seen null and the custody probe read unknown)
+qontinui-runner: ACT ff+return  (checkout-ff QUIET; checkout-return QUIET)
+qontinui-web:    ACT ff only    (checkout-return BUSY: external_session pid 4182, not finished, touched qontinui-web in its life)
+qontinui-coord:  SHADOW         (checkout-ff BUSY: build_process pid 9921, reads qontinui-coord)
+ui-bridge:       SHADOW         (checkout-ff UNKNOWN: restart_readiness:9876 timed out)
 ```
 
-The effective mode of a repo is ACT only when `--act` was passed AND it is
-act-eligible above; every other repo is SHADOW.
+The effective mode of a repo for a move is ACT only when `--act` was passed AND
+the table above allows that move; every other repo and move is SHADOW.
 
-**1c. Re-check immediately before every live sweep invocation.** The verdict in
-1b is one reading. The invocations that act — the single act pass, pass B, and
-each residue or adjudicated re-run in Step 3, every one of which fetches first —
-run minutes to an hour later, and a session spawned after 1b would never be
-seen. So immediately before EVERY sweep invocation that has no `--dry-run`, run
-the check again into a file named for that invocation, read it, and run nothing
-else between the reading and the invocation it gates:
+**1c. Re-check immediately before every live sweep invocation.** The verdicts
+in 1b are one reading. The invocations that act — pass B, and each residue or
+adjudicated re-run in Step 3, every one of which fetches first — run minutes to
+an hour later, and a session that starts working after 1b would never be seen.
+So immediately before EVERY sweep invocation that has no `--dry-run`, run the
+check again — the class or classes that invocation's moves need — into files
+named for that invocation, read them, and run nothing else between the reading
+and the invocation it gates:
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-$LABEL.json" 2>"$RUN_DIR/quiesce-$LABEL.err"; echo "re-check exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-$LABEL-ff.json" 2>"$RUN_DIR/quiesce-$LABEL-ff.err"; echo "re-check checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-$LABEL-return.json" 2>"$RUN_DIR/quiesce-$LABEL-return.err"; echo "re-check checkout-return exit $?"
 ```
 
-`$LABEL` is `act`, `pass-b`, `residue-<repo>` or `adjudicated-<repo>`. Read the
-file exactly as 1b (exit/verdict agreement, the `kind` rule), then:
+`$LABEL` is `pass-b`, `residue-<repo>`, `adjudicated-<repo>` or
+`superseded-<repo>`. Read each file exactly as 1b, then hand the sweep the
+repos THIS reading allows — never the 1b ones:
 
-| The repo was ACT under | The re-check reads | The invocation |
+| The move | Passed to the sweep only when THIS re-check reads | Sweep argument |
 |---|---|---|
-| a `QUIET` verdict | exit 0 `QUIET`, both lists empty | runs as written |
-| a `QUIET` verdict | anything else — BUSY of any kind, UNKNOWN, unparseable, exit/verdict disagreeing | runs with `--dry-run` added |
-| the per-repo override | exit 0 `QUIET`; or overridable-only BUSY (every entry `kind: "claude"`) with the repo still act-eligible by all four override conditions, re-evaluated against THIS file's `per_repo[R]` (conditions 1, 2) and its top-level, machine-wide `.newest_transcript_write.at` (condition 3 — never `per_repo[R].newest_transcript_write`; a missing or unparseable top-level value is SHADOW) | runs as written |
-| the per-repo override | anything else — the repo no longer act-eligible, `blocking[]` non-empty, UNKNOWN, unparseable | runs with `--dry-run` added |
+| fast-forward, residue restore | `checkout-ff` `per_repo[R].verdict` `QUIET` | `--quiet-ff R` |
+| return, adjudicated or superseded return | `checkout-ff` AND `checkout-return` `per_repo[R].verdict` both `QUIET` | `--quiet-return R` (with `--quiet-ff R`) |
 
-**A re-check only ever downgrades.** A repo it puts in SHADOW stays SHADOW for
-the rest of the night — a later QUIET does not restore it (hard rule 9) — and a
-re-check reading UNKNOWN or a non-empty `blocking[]` puts every remaining
-invocation of the night in SHADOW, the same whole-night rule as 1b. Pass B is
-the only invocation naming several repos: when a re-check downgrades some of
-them, drop those repos' `--only` from it — each already has its dry-run row in
-pass A — and run it live for the rest; it gets `--dry-run` only when no ACT repo
-is left. Every downgrade goes into the report: the invocation, the re-check
-file, and the verdict, `blocking[]` entry or override condition that failed.
+Build that argument list — `QUIET_ARGS` — afresh from EACH invocation's own
+re-check files, limited to repos 1b left ACT for that move. Every live
+invocation carries `--per-repo-quiet "${QUIET_ARGS[@]}"`, so the sweep itself refuses a
+move whose repo is not on the matching list (it logs `ABSTAINED
+not_quiet_for_checkout_ff` / `not_quiet_for_checkout_return`, and an empty list
+is a real answer — nothing moves). A re-check file that is unparseable, or
+whose exit and machine-wide `verdict` disagree, allows nothing: the invocation
+runs with `--dry-run` added.
+
+**A re-check only ever downgrades.** A repo and move it puts in SHADOW stay
+SHADOW for the rest of the night — a later QUIET does not restore them (hard
+rule 9) — and never does a re-check make a move ACT that 1b left SHADOW. Every
+downgrade goes into the report: the invocation, the re-check file, the repo,
+and the `blocking[]` entry or UNKNOWN probe that caused it.
 
 **1d. The agent alert queue — `return_to_main`.** Until plan
 `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work` this job
@@ -528,44 +702,53 @@ SWEEP_ARGS=()
 for r in $(printf '%s' "$REPOS" | tr ',' ' '); do SWEEP_ARGS+=(--only "$r"); done
 ```
 
-Three cases, decided by Step 1:
+Two cases, decided by Step 1:
 
 | Case | Passes |
 |---|---|
-| No repo is ACT (shadow requested, quiet forced shadow, or the override left every repo shadow) | Pass A only, with `--dry-run` |
-| Every repo in scope is ACT (QUIET and `--act`) | The 1c re-check (`LABEL=act`), then one act pass, no `--dry-run` |
-| Some ACT, some SHADOW (the override) | Pass A with `--dry-run` over the whole scope, then the 1c re-check (`LABEL=pass-b`), then pass B without `--dry-run`, with one `--only` per still-ACT repo whose pass-A action was `WOULD_RETURN` or `WOULD_FAST_FORWARD` |
+| No repo is ACT for any move (shadow requested, or every repo BUSY / UNKNOWN for `checkout-ff`) | Pass A only, with `--dry-run` |
+| At least one repo is ACT for some move (`--act`, and its `checkout-ff` verdict QUIET) | Pass A with `--dry-run` over the whole scope, then the 1c re-check (`LABEL=pass-b`), then pass B without `--dry-run`: `--per-repo-quiet`, the re-check's `--quiet-ff` / `--quiet-return` lists, and one `--only` per still-ACT repo whose pass-A action was `WOULD_RETURN` or `WOULD_FAST_FORWARD` |
 
-Every invocation gets its OWN log, `--log "$RUN_DIR/pass-<name>.jsonl"` —
-pass A:
+**Every sweep invocation below runs as a LAUNCH plus WAITs** ("The turn never
+ends while a helper runs", Step 0). The lines below are each pass's command.
+Fill the launch block's `OUT` and `PASS_CMD`, and the wait's `LOG`, from
+that pass's line. Shell state does not carry between calls, so the launch
+template rebuilds `SWEEP_ARGS` from `REPOS` (run.env carries it). Paste every
+other value the line uses in as a literal, in the launch and in the wait
+alike: pass B's `QUIET_ARGS` and `ACT_ONLY`, Step 3's `REPO`, and 3a's pinned
+`H`.
+An empty one turns `residue-$REPO.json` into `residue-.json` and
+`--only "$REPO"` into `--only ""`.
+Then wait in the same turn until the exit marker exists. Never run a sweep as
+a bare foreground call and end the turn when the harness backgrounds it.
+
+Pass A is never gated: its dry-run rows are what the report shows for every
+repo, SHADOW ones included. Pass B moves only what its re-check allowed, and the
+sweep enforces that itself (1c). Every invocation gets its OWN log,
+`--log "$RUN_DIR/pass-<name>.jsonl"` — pass A:
 
 ```bash
 bash "$SWEEP" --dry-run --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-a.jsonl" "${SWEEP_ARGS[@]}" >"$RUN_DIR/pass-a.json"
 ```
 
-The act pass — only after its re-check, read as 1c says:
-
-```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-act.json" 2>"$RUN_DIR/quiesce-act.err"; echo "re-check exit $?"
-```
-
-```bash
-bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-act.jsonl" "${SWEEP_ARGS[@]}" >"$RUN_DIR/pass-act.json"
-```
-
 Pass B — only after its re-check, read as 1c says:
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-pass-b.json" 2>"$RUN_DIR/quiesce-pass-b.err"; echo "re-check exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-pass-b-ff.json" 2>"$RUN_DIR/quiesce-pass-b-ff.err"; echo "re-check checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-pass-b-return.json" 2>"$RUN_DIR/quiesce-pass-b-return.err"; echo "re-check checkout-return exit $?"
 ```
 
 ```bash
-bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-b.jsonl" "${ACT_ONLY[@]}" >"$RUN_DIR/pass-b.json"
+bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-b.jsonl" --per-repo-quiet "${QUIET_ARGS[@]}" "${ACT_ONLY[@]}" >"$RUN_DIR/pass-b.json"
 ```
 
-(`ACT_ONLY` holds `--only <repo>` pairs for the repos still ACT after the
-re-check, built the same way as `SWEEP_ARGS`. When the re-check downgrades a
-pass, run that same line with `--dry-run` added, per 1c.)
+(`QUIET_ARGS` holds `--quiet-ff <repo>` for each repo the pass-B re-check reads
+`checkout-ff` QUIET and 1b left ACT, and `--quiet-return <repo>` for each it
+reads QUIET for both classes and 1b left ACT for returns. `ACT_ONLY` holds
+`--only <repo>` pairs for the repos on either list whose pass-A action was
+`WOULD_RETURN` or `WOULD_FAST_FORWARD`, built the same way as `SWEEP_ARGS`.
+When the re-check leaves no repo on either list, run that same line with
+`--dry-run` added, per 1c.)
 
 | `return-to-main-sweep.sh` exit | Meaning |
 |---|---|
@@ -668,7 +851,7 @@ the upstream tip (listed under `untracked` as "on upstream").
 
 | `dirty-provenance.sh` exit | Decision |
 |---|---|
-| `0`, and the summary reads `untracked: … 0 not on upstream` | Every dirty path is already on main (or in-footprint residue). ACT repo — under a QUIET verdict, or act-eligible under the per-repo override: the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below), which removes exactly those files and lets the repo fast-forward. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. |
+| `0`, and the summary reads `untracked: … 0 not on upstream` | Every dirty path is already on main (or in-footprint residue). ACT repo for a fast-forward (1b: its `checkout-ff` verdict QUIET): the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below), which removes exactly those files and lets the repo fast-forward. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. |
 | `0`, with any `untracked-not-on-upstream:` line | The tracked dirt is restorable but an untracked file is content upstream lacks, which the sweep never removes. Leave the repo and list those untracked paths. |
 | `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. |
 | `3` | UNKNOWN. Leave it. |
@@ -679,13 +862,15 @@ config-repo checkout; this job calls the bundled `$DIRTYPROV` because the runner
 fleet-skill bundle does not ship `scripts/`.
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-residue-$REPO.json" 2>"$RUN_DIR/quiesce-residue-$REPO.err"; echo "re-check exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-residue-$REPO-ff.json" 2>"$RUN_DIR/quiesce-residue-$REPO-ff.err"; echo "re-check checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-residue-$REPO-return.json" 2>"$RUN_DIR/quiesce-residue-$REPO-return.err"; echo "re-check checkout-return exit $?"
 ```
 
-Then, when 1c lets it run as written:
+Then, with `QUIET_ARGS` built from that re-check as 1c says (at least
+`--quiet-ff "$REPO"`, or run it with `--dry-run` added):
 
 ```bash
-bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-residue-$REPO.jsonl" --only "$REPO" --restore-residue "$REPO" >"$RUN_DIR/residue-$REPO.json"
+bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-residue-$REPO.jsonl" --per-repo-quiet "${QUIET_ARGS[@]}" --only "$REPO" --restore-residue "$REPO" >"$RUN_DIR/residue-$REPO.json"
 ```
 
 Untracked files are removed only when `dirty-provenance.sh` proves them
@@ -750,17 +935,20 @@ word alone:
    the adjudication; this condition does not lean on either.
 5. `git -C "$CO" rev-parse --verify HEAD` still equals `H`.
 
-Then, for an ACT repo (QUIET, or the override — adjudicated-landed is inside
-D3's bound), the 1c re-check:
+Then, for a repo ACT for a return (1b: both its `checkout-ff` and its
+`checkout-return` verdict QUIET — an adjudicated-landed branch is moved by a
+return), the 1c re-check:
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-adjudicated-$REPO.json" 2>"$RUN_DIR/quiesce-adjudicated-$REPO.err"; echo "re-check exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-adjudicated-$REPO-ff.json" 2>"$RUN_DIR/quiesce-adjudicated-$REPO-ff.err"; echo "re-check checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-adjudicated-$REPO-return.json" 2>"$RUN_DIR/quiesce-adjudicated-$REPO-return.err"; echo "re-check checkout-return exit $?"
 ```
 
-and, when 1c lets it run as written:
+and, with `QUIET_ARGS` built from that re-check as 1c says (`--quiet-ff "$REPO"
+--quiet-return "$REPO"`, or run it with `--dry-run` added):
 
 ```bash
-bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-adjudicated-$REPO.jsonl" --only "$REPO" --adjudicated-landed "$REPO=$H" --evidence "$RUN_DIR/evidence-$REPO.json" >"$RUN_DIR/adjudicated-$REPO.json"
+bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-adjudicated-$REPO.jsonl" --per-repo-quiet "${QUIET_ARGS[@]}" --only "$REPO" --adjudicated-landed "$REPO=$H" --evidence "$RUN_DIR/evidence-$REPO.json" >"$RUN_DIR/adjudicated-$REPO.json"
 ```
 
 For a SHADOW repo, pass nothing and report
@@ -817,17 +1005,19 @@ satisfied — the same discipline as 3d, on the other claim:
   produced a false "absent from origin/main" claim in this very incident
   (memory `bd487ee0`).
 
-Then, for an ACT repo, the 1c re-check — the same gate 3d takes, spelled out
-here because a sweep invocation that is not preceded by one is ungated:
+Then, for a repo ACT for a return, the 1c re-check — the same gate 3d takes,
+spelled out here because a sweep invocation that is not preceded by one is
+ungated:
 
 ```bash
-bash "$QUIESCE" --json --root "$RTM_WS" >"$RUN_DIR/quiesce-superseded-$REPO.json" 2>"$RUN_DIR/quiesce-superseded-$REPO.err"; echo "re-check exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-ff >"$RUN_DIR/quiesce-superseded-$REPO-ff.json" 2>"$RUN_DIR/quiesce-superseded-$REPO-ff.err"; echo "re-check checkout-ff exit $?"
+bash "$QUIESCE" --json --root "$RTM_WS" --for checkout-return >"$RUN_DIR/quiesce-superseded-$REPO-return.json" 2>"$RUN_DIR/quiesce-superseded-$REPO-return.err"; echo "re-check checkout-return exit $?"
 ```
 
-and, when 1c lets it run as written:
+and, with `QUIET_ARGS` built from that re-check as 1c says:
 
 ```bash
-bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-superseded-$REPO.jsonl" --only "$REPO" --adjudicated-superseded "$REPO=$H" --evidence "$RUN_DIR/evidence-$REPO.json" >"$RUN_DIR/superseded-$REPO.json"
+bash "$SWEEP" --fetch --json --root "$RTM_WS" --log "$RUN_DIR/pass-superseded-$REPO.jsonl" --per-repo-quiet "${QUIET_ARGS[@]}" --only "$REPO" --adjudicated-superseded "$REPO=$H" --evidence "$RUN_DIR/evidence-$REPO.json" >"$RUN_DIR/superseded-$REPO.json"
 ```
 
 For a SHADOW repo, pass nothing and report `WOULD pass --adjudicated-superseded
@@ -960,11 +1150,14 @@ Never report a snapshot as gated unless you have read its `gate_id` back.
 | Retention gate | the gate_id Step 4 read back for this row's snapshot(s), or `NOT registered: <why>` |
 
 **The header** carries: host, local and UTC time, requested mode and effective
-mode per repo, the quiet verdict with `blocking[]` / `overridable[]`
-summarised, the per-repo D3 reasoning lines, every 1c re-check (its file, its
+mode per repo and per move, the machine-wide verdict and both `--for` files'
+`per_repo_summary`, the per-repo reasoning lines of 1b (with each blocking
+entry's `class` and `why`), every 1c re-check (its file, its
 verdict, and each downgrade it caused and why), the `--not-after` bound,
 `$RUN_DIR/bin/RESOLVED` (which rung each helper was copied from), the `--json`
-summary of every sweep invocation, the Step 4b reconciliation counts (refs,
+summary of every sweep invocation, Step 0's task-timeout / wait-budget line,
+every pass that ended `DEADLINE`, `DIED` or `refused:` and why, the Step 4b
+reconciliation counts (refs,
 gated, registered tonight, not reconciled with reasons), the 1d queue read
 (which door carried it — queue or fallback — its completeness signal, and each
 row's id, repo, `device_id` and claim `status`, including every downgrade a claim
@@ -1048,10 +1241,14 @@ steward's job, not this job's.
    clears and all six of its checks pass (`checkout-restore-contract.md`). The
    sweep considers only depth-1 checkouts whose `.git` is a directory; nothing
    here widens that.
-3. **Never act while quiet is UNKNOWN.** An unreadable signal is UNKNOWN, never
-   idle, and UNKNOWN is shadow for the whole night. Quiet is re-read
-   immediately before every live sweep invocation (1c), and a re-check only
-   ever downgrades. A non-Claude agent is never overridable.
+3. **Never act on a repo whose own verdict is not QUIET.** An unreadable signal
+   is UNKNOWN, never idle, and a repo reading UNKNOWN is SHADOW; a probe the
+   whole check stands on reading unknown leaves every repo UNKNOWN. A move
+   needs its own class QUIET (`checkout-ff` for a fast-forward or residue
+   restore, both classes for a return), re-read immediately before every live
+   sweep invocation (1c) and enforced by the sweep's `--per-repo-quiet`; a
+   re-check only ever downgrades. A non-Claude agent (Codex, pi) is never
+   judged idle.
 4. **Never act on UNIQUE content.** One UNIQUE file, or land evidence that is
    PARTIAL, NONE or UNKNOWN, leaves the repo exactly as it was found.
 5. **Never read `.git/index` mtimes — or any file mtime inside a checkout — as
@@ -1071,6 +1268,12 @@ steward's job, not this job's.
    `--adjudicated-landed` SHA other than the HEAD you pinned in 3a, or an
    evidence file you did not generate for that repo tonight.
 10. **Never `gh pr merge`**, and never open a PR from this job.
+11. **Never end a turn while a helper is running, and never end the session
+    without the Step 5 finding.** A scheduled run is headless, and an ended
+    turn is an ended process. Wait as "The turn never ends while a helper
+    runs" says. When the wait budget runs out, report the pass UNKNOWN and
+    post the finding anyway. A night with no finding is indistinguishable
+    from a night that hung.
 
 ## Recovery, and what a moved checkout keeps
 
@@ -1081,6 +1284,7 @@ are the `-residue` refs). The report's `wip_ref` column is the per-repo pointer.
 The branch and the snapshot both stay for at least the 14-day retention
 window. After that, only a reap that proved the branch holds nothing that a ref
 or a landed patch does not hold removes them. Nothing this job does is
-unrecoverable within that window, which is why D3 lets it act on a box with an
-idle interactive window open — and why every move is reported. The full recipe
+unrecoverable within that window, which is why a per-repo QUIET (Step 1b) lets
+it act on a box with idle interactive sessions open — and why every move is
+reported. The full recipe
 is in `checkout-restore-contract.md`.
