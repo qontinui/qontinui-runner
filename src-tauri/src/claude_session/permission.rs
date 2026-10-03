@@ -146,6 +146,11 @@ pub enum PermissionOutcome {
     TimedOut,
     /// The session ended first; nothing was sent (there is no CLI to tell).
     SessionEnded,
+    /// The CLI sent a NEW request under the same id while this one was still
+    /// parked. Nothing is sent for the old one — an answer naming that id
+    /// would be read as the answer to the new request — but it is resolved,
+    /// so no surface keeps live buttons for it.
+    Superseded,
 }
 
 /// The `session-permission-resolved` payload.
@@ -256,10 +261,14 @@ impl PermissionBroker {
         self.lock().len()
     }
 
-    fn write(&self, response: &OutgoingControlResponse) {
-        if let Err(e) = self.responder.respond(response) {
+    /// Send one control response. A failure is logged AND returned: a caller
+    /// that reports what it answered must not report an answer the CLI never
+    /// received.
+    fn write(&self, response: &OutgoingControlResponse) -> Result<(), String> {
+        self.responder.respond(response).map_err(|e| {
             warn!(session = %self.session_id, "failed to send control response: {e}");
-        }
+            format!("the answer could not be sent to the CLI: {e}")
+        })
     }
 
     /// Answer — or park — one control request from the CLI. Logs the subtype,
@@ -275,18 +284,20 @@ impl PermissionBroker {
             None => {
                 let error = format!("unsupported control request subtype: {subtype}");
                 warn!(session = %self.session_id, request_id, "{error}");
-                self.write(&OutgoingControlResponse::error(request_id, &error));
+                // A failed write is already logged; the CLI stays unanswered
+                // either way and its own timeout applies.
+                let _ = self.write(&OutgoingControlResponse::error(request_id, &error));
                 return ControlHandling::Refused(error);
             }
             Some(Err(error)) => {
                 warn!(session = %self.session_id, request_id, "{error}");
-                self.write(&OutgoingControlResponse::error(request_id, &error));
+                let _ = self.write(&OutgoingControlResponse::error(request_id, &error));
                 return ControlHandling::Refused(error);
             }
             Some(Ok(tool)) => tool,
         };
         if !self.mode.prompts() {
-            self.write(&OutgoingControlResponse::allow_tool_use(
+            let _ = self.write(&OutgoingControlResponse::allow_tool_use(
                 request_id, tool.input,
             ));
             return ControlHandling::Allowed;
@@ -309,13 +320,35 @@ impl PermissionBroker {
             timeout_secs: self.timeout.as_secs(),
         };
         let (cancel, cancelled) = mpsc::channel::<()>();
-        self.lock().insert(
+        let replaced = self.lock().insert(
             request_id.to_string(),
             Parked {
                 notice: notice.clone(),
                 cancel,
             },
         );
+        if let Some(previous) = replaced {
+            // Never silently dropped: its timer is stopped and every surface
+            // hears it is over. No answer is sent for it — the id now names
+            // the new request.
+            let _ = previous.cancel.send(());
+            warn!(
+                session = %self.session_id,
+                request_id,
+                "a new permission request reused a parked request's id; the old one is superseded"
+            );
+            self.sink.resolved(&PermissionResolvedNotice {
+                session_id: self.session_id.clone(),
+                request_id: request_id.to_string(),
+                tool_name: previous.notice.tool_name,
+                outcome: PermissionOutcome::Superseded,
+                message: Some(
+                    "The CLI sent a new request under the same id, so this one was withdrawn unanswered."
+                        .to_string(),
+                ),
+                interrupt: false,
+            });
+        }
         info!(
             session = %self.session_id,
             request_id,
@@ -371,7 +404,7 @@ impl PermissionBroker {
             tool = %parked.notice.tool_name,
             "permission request timed out; denied"
         );
-        self.write(&OutgoingControlResponse::deny_tool_use(request_id, message));
+        let _ = self.write(&OutgoingControlResponse::deny_tool_use(request_id, message));
         self.sink.resolved(&PermissionResolvedNotice {
             session_id: self.session_id.clone(),
             request_id: request_id.to_string(),
@@ -399,20 +432,27 @@ impl PermissionBroker {
                 return Err("updatedInput must be a JSON object of tool arguments".to_string());
             }
         }
-        let parked = self.lock().remove(request_id).ok_or_else(|| {
-            format!(
-                "no pending permission request {request_id} on session {} (already answered, timed out, or never asked)",
-                self.session_id
-            )
-        })?;
-        let _ = parked.cancel.send(());
-        let notice = parked.notice;
+        // The pending set stays locked across the write, so the request's
+        // timer cannot deny it concurrently, and it is removed only once its
+        // answer is actually sent. A failed send leaves it parked (its timer
+        // still running) and is an error — the operator is never told an
+        // unsent answer was given.
+        let mut pending = self.lock();
+        let notice = pending
+            .get(request_id)
+            .map(|p| p.notice.clone())
+            .ok_or_else(|| {
+                format!(
+                    "no pending permission request {request_id} on session {} (already answered, timed out, or never asked)",
+                    self.session_id
+                )
+            })?;
         let resolved = match decision {
             PermissionDecision::Allow { updated_input } => {
                 self.write(&OutgoingControlResponse::allow_tool_use(
                     request_id,
                     updated_input.unwrap_or(notice.input),
-                ));
+                ))?;
                 PermissionResolvedNotice {
                     session_id: self.session_id.clone(),
                     request_id: request_id.to_string(),
@@ -429,7 +469,7 @@ impl PermissionBroker {
                     .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.to_string());
                 self.write(&OutgoingControlResponse::deny_tool_use(
                     request_id, &message,
-                ));
+                ))?;
                 PermissionResolvedNotice {
                     session_id: self.session_id.clone(),
                     request_id: request_id.to_string(),
@@ -440,6 +480,10 @@ impl PermissionBroker {
                 }
             }
         };
+        if let Some(parked) = pending.remove(request_id) {
+            let _ = parked.cancel.send(());
+        }
+        drop(pending);
         info!(
             session = %self.session_id,
             request_id,
@@ -545,6 +589,10 @@ impl PermissionSink for TauriPermissionSink {
                 notice.tool_name,
                 notice.message.as_deref().unwrap_or("denied (fail closed).")
             ),
+            PermissionOutcome::Superseded => format!(
+                "Permission request for {} was replaced by a new request from the CLI.",
+                notice.tool_name
+            ),
             PermissionOutcome::SessionEnded => return,
         };
         self.status_line(&text);
@@ -627,6 +675,71 @@ mod tests {
     }
 
     const WRITE_REQ: &str = r#"{"type":"control_request","request_id":"req-9","request":{"subtype":"can_use_tool","tool_name":"Write","display_name":"Write","input":{"file_path":"/w/probe.txt","content":"hello"},"description":"probe.txt","permission_suggestions":[{"type":"setMode","mode":"acceptEdits","destination":"session"}],"tool_use_id":"toolu_1"}}"#;
+
+    /// A responder whose sends fail (the CLI's stdin is gone).
+    struct BrokenStdin;
+    impl ControlResponder for BrokenStdin {
+        fn respond(&self, _: &OutgoingControlResponse) -> Result<(), String> {
+            Err("broken pipe".into())
+        }
+    }
+
+    /// An answer that could not be SENT is an error, never a reported
+    /// Allowed/Denied — and the request stays parked, still answerable (or
+    /// still bounded by its timer).
+    #[test]
+    fn an_unsent_answer_is_an_error_and_the_request_stays_parked() {
+        let sink = Arc::new(super::test_support::RecordingSink::default());
+        let b = PermissionBroker::new(
+            "permission-test-broken",
+            PermissionMode::Prompt,
+            Duration::from_secs(60),
+            Arc::new(BrokenStdin),
+            sink.clone(),
+        );
+        assert_eq!(
+            b.handle_control_request(&request(WRITE_REQ)),
+            ControlHandling::Parked
+        );
+        for decision in [
+            PermissionDecision::Allow {
+                updated_input: None,
+            },
+            PermissionDecision::Deny {
+                message: None,
+                interrupt: false,
+            },
+        ] {
+            let err = b.respond("req-9", decision).unwrap_err();
+            assert!(err.contains("broken pipe"), "{err}");
+        }
+        assert!(
+            sink.resolved.lock().unwrap().is_empty(),
+            "no outcome is announced for an answer the CLI never got"
+        );
+        assert_eq!(b.pending().len(), 1, "still parked");
+    }
+
+    /// A new request reusing a parked request's id resolves the old one
+    /// (superseded, nothing sent for it) instead of silently replacing it.
+    #[test]
+    fn a_reused_request_id_supersedes_the_parked_request() {
+        let (b, out, sink) = broker(PermissionMode::Prompt, Duration::from_secs(60));
+        b.handle_control_request(&request(WRITE_REQ));
+        let again = WRITE_REQ.replace("\"tool_name\":\"Write\"", "\"tool_name\":\"Edit\"");
+        assert_eq!(
+            b.handle_control_request(&request(&again)),
+            ControlHandling::Parked
+        );
+        let resolved = sink.resolved.lock().unwrap().clone();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].outcome, PermissionOutcome::Superseded);
+        assert_eq!(resolved[0].tool_name, "Write");
+        assert!(out.lines().is_empty(), "no answer names the reused id");
+        let pending = b.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_name, "Edit");
+    }
 
     #[test]
     fn decision_timeout_defaults_bounds_and_honours_a_request() {
