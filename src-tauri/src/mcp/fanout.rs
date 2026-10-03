@@ -19,10 +19,13 @@
 //! * `PATCH /fanout/{id}` ← `{maxConcurrent}` → `CapOutcome`
 //! * `POST /fanout/{id}/members/{index}/release` → `RunView`
 //!
-//! Until the dispatcher has loaded its ledger from PostgreSQL (the boot settle,
-//! or while PG is unreachable) EVERY route answers `503` with `code:
-//! "FANOUT_LEDGER_NOT_LOADED"` and the reason — never `200 []`, which would
-//! read as "no runs" while the ledger may hold active ones. `POST /fanout` is
+//! Until the dispatcher has loaded its ledger from PostgreSQL EVERY route
+//! answers `503` with the reason — never `200 []`, which would read as "no
+//! runs" while the ledger may hold active ones. The `code` says which: `code:
+//! "FANOUT_LEDGER_NOT_LOADED"` while the boot settle has not run the first load
+//! yet (expected, transient — the strip stays quiet), `code:
+//! "FANOUT_LEDGER_LOAD_FAILED"` once a load was attempted and failed (PG
+//! unreadable — the strip shows UNKNOWN). `POST /fanout` is
 //! refused too: see `FanoutDispatcher::create` for the double-spawn it closes.
 //! A member's `index` is its position in the posted list; an optional
 //! `previewIndex` on each posted member is stored and echoed so the strip can
@@ -39,7 +42,7 @@ use tauri::Manager;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::fanout::dispatcher::{CapOutcome, FanoutDispatcher, NewRun, OpError};
+use crate::fanout::dispatcher::{CapOutcome, FanoutDispatcher, NewRun, NotLoaded, OpError};
 use crate::fanout::model::{build_members, ConfigDirPolicy, MemberInput, RunView};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -55,18 +58,26 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
     (status, Json(api_error(message)))
 }
 
-/// The machine-readable code on a refusal served because the ledger is not
-/// loaded — the UI renders it as UNKNOWN, never as "no runs".
+/// The machine-readable code on a refusal served because the ledger has not
+/// been loaded YET (the boot settle) — the UI renders a quiet "loading", never
+/// "no runs".
 pub const LEDGER_NOT_LOADED_CODE: &str = "FANOUT_LEDGER_NOT_LOADED";
 
-fn not_loaded(message: String) -> Refusal {
-    warn!("HTTP /fanout: {message}");
+/// The code on a refusal served because the last ledger load FAILED — the UI
+/// renders it as UNKNOWN, visibly.
+pub const LEDGER_LOAD_FAILED_CODE: &str = "FANOUT_LEDGER_LOAD_FAILED";
+
+fn not_loaded(why: NotLoaded) -> Refusal {
+    let code = if why.load_failed {
+        warn!("HTTP /fanout: {}", why.reason);
+        LEDGER_LOAD_FAILED_CODE
+    } else {
+        tracing::debug!("HTTP /fanout: {}", why.reason);
+        LEDGER_NOT_LOADED_CODE
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiResponse::<()>::error_with_code(
-            message,
-            LEDGER_NOT_LOADED_CODE,
-        )),
+        Json(ApiResponse::<()>::error_with_code(why.reason, code)),
     )
 }
 
@@ -322,13 +333,30 @@ mod tests {
 
     #[test]
     fn fanout_not_loaded_is_a_typed_503() {
-        let (status, Json(body)) = op_refusal(OpError::NotLoaded("not loaded yet".to_string()));
+        let (status, Json(body)) = op_refusal(OpError::NotLoaded(NotLoaded {
+            load_failed: false,
+            reason: "not loaded yet".to_string(),
+        }));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["success"], false);
         assert_eq!(wire["code"], LEDGER_NOT_LOADED_CODE);
         assert_eq!(wire["error"], "not loaded yet");
         assert!(wire.get("data").is_none(), "never an empty list: {wire}");
+    }
+
+    /// A failed load and the boot settle are told apart by code, so the strip
+    /// can stay quiet for one and show UNKNOWN for the other.
+    #[test]
+    fn fanout_a_failed_load_has_its_own_code() {
+        let (status, Json(body)) = op_refusal(OpError::NotLoaded(NotLoaded {
+            load_failed: true,
+            reason: "connection refused".to_string(),
+        }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["code"], LEDGER_LOAD_FAILED_CODE);
+        assert_ne!(LEDGER_LOAD_FAILED_CODE, LEDGER_NOT_LOADED_CODE);
     }
 
     #[test]

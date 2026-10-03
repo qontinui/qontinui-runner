@@ -73,7 +73,7 @@ export function matrixExpandErrorMessage(e: MatrixExpandError): string {
 export function rowErrorLabel(e: FanoutRowError): string {
   switch (e.kind) {
     case "prompt_too_long":
-      return `prompt is ${e.bytes} bytes; the argv bound is ${e.max}`;
+      return `prompt's escaped argv length is ${e.cost}; the bound is ${e.max}`;
     case "empty_prompt":
       return "prompt is blank";
     case "prompt_contains_nul":
@@ -262,7 +262,7 @@ export function judgeFanoutCreate(posted: number, outcome: FanoutCapOutcome): Fa
   const clampNote =
     outcome.clampedFrom !== null
       ? `Max concurrent clamped from ${outcome.clampedFrom} to ${outcome.run.maxConcurrent} ` +
-        `(this tenant's fan-out bound is ${outcome.fanoutBound})`
+        `(this runner's fan-out bound is ${outcome.fanoutBound})`
       : null;
   return {
     ok: true,
@@ -335,4 +335,73 @@ export function collisionProbeLabel(state: CollisionProbeState | undefined): {
       ? `No predicted collisions, but the AI extractor was ${String(state.report.ai_status)} — regex-only result`
       : "No predicted collisions with live sessions",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Collision probes: fire each once, a few at a time
+// ---------------------------------------------------------------------------
+
+/** How many collision probes run at once. */
+export const PROBE_CONCURRENCY = 4;
+
+/** The probe cache key: one probe per (working dir, prompt). */
+export function probeKey(cwd: string, prompt: string): string {
+  return `${cwd}\u0000${prompt}`;
+}
+
+/**
+ * The prompts still needing a probe: those with no answer yet for this `cwd`
+ * and none in flight. An edit that leaves a row's prompt as it was does not
+ * re-probe it.
+ */
+export function promptsToProbe(
+  prompts: readonly string[],
+  cwd: string,
+  answered: Readonly<Record<string, unknown>>,
+  inFlight: ReadonlySet<string>,
+): string[] {
+  return prompts.filter((p) => {
+    const key = probeKey(cwd, p);
+    return !(key in answered) && !inFlight.has(key);
+  });
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight. Stops starting
+ * new ones once `signal` aborts; resolves when every started one settles.
+ */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length && !signal?.aborted) {
+      const item = items[next++];
+      await worker(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, lane));
+}
+
+// ---------------------------------------------------------------------------
+// Create once per request
+// ---------------------------------------------------------------------------
+
+/**
+ * Why Create is blocked for a request body that was already created in this
+ * modal, or `null`. Keyed on the exact body, and never cleared by edits: an
+ * un-tick and re-tick, or an edit and revert, lands back on a body that
+ * already queued N sessions, and creating it again would queue N more.
+ */
+export function alreadyCreatedReason(
+  createdRuns: ReadonlyMap<string, string>,
+  requestKey: string,
+): string | null {
+  const runId = createdRuns.get(requestKey);
+  return runId === undefined
+    ? null
+    : `This exact fan-out was already created (run ${runId.slice(0, 8)}) — change it to create another`;
 }

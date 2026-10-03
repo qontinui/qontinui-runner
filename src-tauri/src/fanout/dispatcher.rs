@@ -3,16 +3,24 @@
 //! Every mutation — create, cancel, PATCH, release and the admission tick —
 //! runs under ONE async mutex over the in-memory book, so the cap is exact by
 //! construction: no two admissions can each read "one slot free" and both
-//! spawn. Every transition is written through to the store; the book is
-//! reloaded from it at runner start and its `admitted` members reconciled
-//! against the terminals that survived ([`FanoutDispatcher::boot`]).
+//! spawn. The spawn ITSELF runs outside that mutex: a tick records each
+//! admission (`admitted`, persisted) under the lock, releases it, spawns, and
+//! re-takes it to record what the spawn came to. A member being spawned is
+//! `admitted`, so it counts toward the cap and is never picked twice; it is
+//! marked in-flight so liveness does not release it and an operator release
+//! is refused until its spawn settles; and a cancel that lands meanwhile is
+//! honoured when a spawn that did not happen returns it. Every transition is
+//! written through to the store; the book is reloaded from it at runner start
+//! and its `admitted` members reconciled against the terminals that survived
+//! ([`FanoutDispatcher::boot`]).
 //!
 //! The three seams — [`FanoutStore`], [`FanoutHost`], [`FanoutEvents`] — are
 //! traits so the admission rules are tested against an in-memory ledger and a
 //! recording spawner (see `tests` below); production wires PostgreSQL
 //! (`database::pg::fanout`) and the Tauri host (`fanout::host`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -65,7 +73,8 @@ pub(crate) enum SpawnOutcome {
     /// The `parallel_fanout` admission bound was occupied: stays queued.
     BoundOccupied { detail: String },
     /// A resource-guard, authorization or spawn error. The member goes
-    /// `refused` with this reason and is retried on the next tick.
+    /// `refused` with this reason and returns to the queue after a backoff
+    /// that grows while the same kind of refusal repeats.
     Refused { reason: String },
 }
 
@@ -77,10 +86,17 @@ pub(crate) enum Liveness {
     Live { terminal_id: String },
     /// The session carries the runner-local finished marker.
     Finished,
-    /// Its terminal exited or is gone.
+    /// Its terminal exited (present and dead), or its record is closed.
     Exited,
-    /// The host cannot tell (no terminal manager in this process). Never
-    /// releases a slot: an unknown is not a death.
+    /// Its lifecycle record is open and unfinished, but no terminal answers
+    /// for it — a session mid-respawn, or one session restore has not rebound
+    /// yet. Held for [`LIVENESS_GRACE`] before it is read as an exit.
+    Unconfirmed,
+    /// No lifecycle record exists and no terminal answers: the session may
+    /// never have started.
+    Unrecorded,
+    /// The host cannot tell (no terminal manager, an unreadable lifecycle
+    /// store). Never releases a slot: an unknown is not a death.
     Unknown,
 }
 
@@ -90,7 +106,8 @@ pub(crate) trait FanoutHost: Send + Sync {
     /// `Some(reason)` while autonomous spawns are deferred by coord's device
     /// drain. A cheap pre-check: the spawn itself re-checks as the authority.
     fn drain_deferral(&self) -> Option<String>;
-    /// The tenant's current `parallel_fanout` bound.
+    /// This runner's current `parallel_fanout` bound. It resolves per device
+    /// (the runner's own registry row), not per tenant.
     async fn fanout_bound(&self) -> u32;
     /// Spawn one member.
     async fn spawn_fanout_member(&self, req: MemberSpawnRequest) -> SpawnOutcome;
@@ -120,10 +137,20 @@ pub(crate) struct NewRun {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CapOutcome {
     pub run: RunView,
-    /// The `parallel_fanout` bound the cap was clamped against.
+    /// This runner's `parallel_fanout` bound the cap was clamped against.
     pub fanout_bound: u32,
     /// What the caller asked for, when the clamp changed it.
     pub clamped_from: Option<u32>,
+}
+
+/// Why the book cannot be served: it does not reflect the ledger yet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NotLoaded {
+    /// `true` once a load was attempted and failed (PostgreSQL unreadable);
+    /// `false` while the boot settle has not run the first load yet.
+    pub load_failed: bool,
+    /// The operator-facing reason.
+    pub reason: String,
 }
 
 /// Why an operator operation was refused.
@@ -137,8 +164,8 @@ pub(crate) enum OpError {
     Store(String),
     /// The ledger has not been loaded into the book yet (or the last load
     /// failed): what this runner holds is UNKNOWN, so nothing is answered from
-    /// — or changed in — the book. Carries the operator-facing reason.
-    NotLoaded(String),
+    /// — or changed in — the book.
+    NotLoaded(NotLoaded),
 }
 
 /// Whether the book reflects the durable ledger. Until it is `Loaded`, an
@@ -155,19 +182,23 @@ pub(crate) enum LedgerState {
 
 impl LedgerState {
     /// Why the book cannot be served, or `None` once it is loaded.
-    pub(crate) fn not_loaded_reason(&self) -> Option<String> {
+    pub(crate) fn not_loaded(&self) -> Option<NotLoaded> {
         match self {
             LedgerState::Loaded => None,
-            LedgerState::Pending => Some(
-                "the fan-out ledger has not been loaded yet — the runner loads and reconciles \
-                 its active runs from PostgreSQL after the boot settle, so its runs are \
-                 UNKNOWN until then"
+            LedgerState::Pending => Some(NotLoaded {
+                load_failed: false,
+                reason: "the fan-out ledger has not been loaded yet — the runner loads and \
+                         reconciles its active runs from PostgreSQL after the boot settle, so its \
+                         runs are UNKNOWN until then"
                     .to_string(),
-            ),
-            LedgerState::Failed(e) => Some(format!(
-                "the fan-out ledger could not be loaded from PostgreSQL ({e}) — this runner's \
-                 runs are UNKNOWN until a load succeeds (retried every tick)"
-            )),
+            }),
+            LedgerState::Failed(e) => Some(NotLoaded {
+                load_failed: true,
+                reason: format!(
+                    "the fan-out ledger could not be loaded from PostgreSQL ({e}) — this \
+                     runner's runs are UNKNOWN until a load succeeds (retried every tick)"
+                ),
+            }),
         }
     }
 }
@@ -175,11 +206,102 @@ impl LedgerState {
 /// How long a completed run stays listed after it completes.
 const COMPLETED_RETENTION: chrono::Duration = chrono::Duration::hours(24);
 
+/// A run loaded at runner start with no activity (create, admission or
+/// release) for longer than this is not resumed: its waiting members are
+/// cancelled with [`reason::STALE_AFTER_RESTART`]. Owner instance names are
+/// reused — a temp runner torn down days ago and a new one under the same name
+/// share a key — and nobody is waiting on a queue that old; re-creating the
+/// run from the prompt modal is one click. Admitted members are still
+/// reconciled against their sessions as usual.
+pub(crate) const STALE_RUN_AGE: chrono::Duration = chrono::Duration::hours(24);
+
+/// How long an admitted member may read [`Liveness::Unconfirmed`] before the
+/// slot is released as an exit. Covers a respawn and the restore rebind, which
+/// run after the boot settle.
+pub(crate) const LIVENESS_GRACE: chrono::Duration = chrono::Duration::seconds(120);
+
+/// The first retry delay after a refusal; it doubles while the same kind of
+/// refusal repeats, up to [`RETRY_MAX`].
+const RETRY_BASE: chrono::Duration = chrono::Duration::seconds(5);
+const RETRY_MAX: chrono::Duration = chrono::Duration::minutes(5);
+
+/// A refused member's backoff, keyed on the kind of refusal.
+#[derive(Debug, Clone, PartialEq)]
+struct RetryState {
+    /// [`reason_class`] of the last refusal.
+    class: String,
+    /// Consecutive refusals of that class.
+    attempts: u32,
+    next_at: DateTime<Utc>,
+}
+
+/// The stable part of a refusal reason: up to the first `:`, else all of it.
+/// `resource_guard:critical: commit charge at 97%` and `… at 98%` are the same
+/// refusal; a different class restarts the backoff.
+fn reason_class(why: &str) -> String {
+    why.split(':').next().unwrap_or(why).trim().to_string()
+}
+
+/// The delay before attempt `attempts + 1`: `RETRY_BASE · 2^(attempts-1)`,
+/// capped at [`RETRY_MAX`].
+fn retry_delay(attempts: u32) -> chrono::Duration {
+    let shift = attempts.saturating_sub(1).min(16);
+    let secs = RETRY_BASE.num_seconds().saturating_mul(1_i64 << shift);
+    chrono::Duration::seconds(secs.min(RETRY_MAX.num_seconds()))
+}
+
 struct RunEntry {
     run: FanoutRun,
     members: Vec<FanoutMember>,
     /// When the run became `completed` in this process, for retention.
     completed_at: Option<DateTime<Utc>>,
+    /// Backoff per refused member index. In-memory: a restart retries at once.
+    retry: HashMap<u32, RetryState>,
+    /// Member indices whose spawn is in flight outside the book lock.
+    spawning: HashSet<u32>,
+    /// Since when (and under which release reason) a member has read
+    /// [`Liveness::Unconfirmed`].
+    unconfirmed: HashMap<u32, (DateTime<Utc>, String)>,
+    /// An operator cancelled the run's waiting members: a member whose spawn
+    /// was in flight and did not happen is cancelled too, never re-queued.
+    cancel_requested: bool,
+}
+
+impl RunEntry {
+    fn new(run: FanoutRun, members: Vec<FanoutMember>) -> Self {
+        Self {
+            run,
+            members,
+            completed_at: None,
+            retry: HashMap::new(),
+            spawning: HashSet::new(),
+            unconfirmed: HashMap::new(),
+            cancel_requested: false,
+        }
+    }
+
+    /// The wire view, with each refused member's backoff.
+    fn view(&self) -> RunView {
+        let mut v = RunView::of(&self.run, &self.members);
+        for m in v.members.iter_mut() {
+            if let Some(r) = self.retry.get(&m.index) {
+                m.refusals = r.attempts;
+                if m.state == MemberState::Refused {
+                    m.next_retry_at = Some(r.next_at.to_rfc3339());
+                }
+            }
+        }
+        v
+    }
+
+    /// The most recent thing that happened to the run.
+    fn last_activity(&self) -> DateTime<Utc> {
+        self.members
+            .iter()
+            .flat_map(|m| [m.admitted_at, m.released_at])
+            .flatten()
+            .fold(self.run.created_at, Ord::max)
+    }
 }
 
 #[derive(Default)]
@@ -189,6 +311,11 @@ struct Book {
     booted: bool,
 }
 
+/// One admission recorded under the lock, to be spawned outside it.
+struct PendingSpawn {
+    req: MemberSpawnRequest,
+}
+
 pub(crate) struct FanoutDispatcher {
     owner_instance: String,
     store: Arc<dyn FanoutStore>,
@@ -196,12 +323,15 @@ pub(crate) struct FanoutDispatcher {
     events: Arc<dyn FanoutEvents>,
     book: tokio::sync::Mutex<Book>,
     /// The views last published, newest run first — what the read routes
-    /// serve, so a read never waits behind a spawn holding the book.
+    /// serve, so a read never waits behind the book.
     published: RwLock<Arc<Vec<RunView>>>,
     /// Whether `published` reflects the ledger. Written under the book lock;
     /// read lock-free beside `published`.
     ledger: RwLock<LedgerState>,
     wake: tokio::sync::Notify,
+    /// Seconds added to the wall clock — moved only by tests, to step through
+    /// backoffs and grace windows without sleeping.
+    clock_skew_secs: AtomicI64,
 }
 
 impl FanoutDispatcher {
@@ -220,7 +350,12 @@ impl FanoutDispatcher {
             published: RwLock::new(Arc::new(Vec::new())),
             ledger: RwLock::new(LedgerState::Pending),
             wake: tokio::sync::Notify::new(),
+            clock_skew_secs: AtomicI64::new(0),
         }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::seconds(self.clock_skew_secs.load(Ordering::SeqCst))
     }
 
     /// Ask the admission loop to tick now rather than at its next interval.
@@ -251,8 +386,8 @@ impl FanoutDispatcher {
     /// Every run this runner holds, newest first — or, until the ledger is
     /// loaded, the reason it cannot say. An unloaded book is never served as
     /// an empty list: that would read as "no runs".
-    pub(crate) fn list(&self) -> Result<Arc<Vec<RunView>>, String> {
-        if let Some(why) = self.ledger_state().not_loaded_reason() {
+    pub(crate) fn list(&self) -> Result<Arc<Vec<RunView>>, NotLoaded> {
+        if let Some(why) = self.ledger_state().not_loaded() {
             return Err(why);
         }
         Ok(match self.published.read() {
@@ -262,19 +397,21 @@ impl FanoutDispatcher {
     }
 
     /// One run (`Ok(None)`: the loaded ledger has no such run).
-    pub(crate) fn get(&self, id: Uuid) -> Result<Option<RunView>, String> {
+    pub(crate) fn get(&self, id: Uuid) -> Result<Option<RunView>, NotLoaded> {
         Ok(self.list()?.iter().find(|r| r.id == id).cloned())
     }
 
     /// Refuse an operation while the book does not reflect the ledger.
-    fn require_booted(book: &Book, ledger: &LedgerState) -> Result<(), OpError> {
+    /// `booted` is only ever read and written under the book lock.
+    fn require_booted(&self, book: &Book) -> Result<(), OpError> {
         if book.booted {
             return Ok(());
         }
         Err(OpError::NotLoaded(
-            ledger
-                .not_loaded_reason()
-                .unwrap_or_else(|| "the fan-out ledger has not been loaded yet".to_string()),
+            self.ledger_state().not_loaded().unwrap_or(NotLoaded {
+                load_failed: false,
+                reason: "the fan-out ledger has not been loaded yet".to_string(),
+            }),
         ))
     }
 
@@ -285,12 +422,13 @@ impl FanoutDispatcher {
     /// window would be inserted into PG, picked up by the concurrent
     /// [`Self::boot`] load, possibly admitted (spawned) by the first tick after
     /// it — and then overwritten in the book by this call's all-queued copy,
-    /// so the next tick would spawn its members a second time. `booted` never
-    /// goes back to false, so checking it once up front closes that window.
+    /// so the next tick would spawn its members a second time. `booted` is
+    /// read under the book lock and never goes back to false, so checking it
+    /// once up front closes that window.
     pub(crate) async fn create(&self, new: NewRun) -> Result<CapOutcome, OpError> {
         {
             let book = self.book.lock().await;
-            Self::require_booted(&book, &self.ledger_state())?;
+            self.require_booted(&book)?;
         }
         let bound = self.host.fanout_bound().await;
         let max_concurrent = clamp_max_concurrent(new.requested_max_concurrent, bound);
@@ -302,7 +440,7 @@ impl FanoutDispatcher {
             max_concurrent,
             config_dir_policy: new.config_dir_policy,
             working_dir: new.working_dir,
-            created_at: Utc::now(),
+            created_at: self.now(),
             state: RunState::Active,
             owner_instance: self.owner_instance.clone(),
         };
@@ -313,14 +451,7 @@ impl FanoutDispatcher {
         let view = RunView::of(&run, &new.members);
         {
             let mut book = self.book.lock().await;
-            book.runs.insert(
-                run.id,
-                RunEntry {
-                    run,
-                    members: new.members,
-                    completed_at: None,
-                },
-            );
+            book.runs.insert(run.id, RunEntry::new(run, new.members));
             self.publish(&book);
         }
         info!(
@@ -341,10 +472,11 @@ impl FanoutDispatcher {
 
     /// Cancel every member that has not been admitted (`queued`, and `refused`,
     /// which is a queued member whose last attempt failed). An admitted
-    /// member's session is never touched.
+    /// member's session is never touched; one whose spawn is still in flight
+    /// is cancelled if that spawn does not happen.
     pub(crate) async fn cancel(&self, id: Uuid) -> Result<RunView, OpError> {
         let mut book = self.book.lock().await;
-        Self::require_booted(&book, &self.ledger_state())?;
+        self.require_booted(&book)?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -363,8 +495,10 @@ impl FanoutDispatcher {
                 .update_member(id, &next[pos])
                 .await
                 .map_err(OpError::Store)?;
+            entry.retry.remove(&next[pos].index);
             entry.members[pos] = next[pos].clone();
         }
+        entry.cancel_requested = true;
         let view = self.settle_run_state(entry).await;
         self.publish(&book);
         drop(book);
@@ -372,7 +506,7 @@ impl FanoutDispatcher {
         Ok(view)
     }
 
-    /// Set `max_concurrent`, clamped to the current `parallel_fanout` bound.
+    /// Set `max_concurrent`, clamped to this runner's `parallel_fanout` bound.
     pub(crate) async fn set_max_concurrent(
         &self,
         id: Uuid,
@@ -381,7 +515,7 @@ impl FanoutDispatcher {
         let bound = self.host.fanout_bound().await;
         let max_concurrent = clamp_max_concurrent(requested, bound);
         let mut book = self.book.lock().await;
-        Self::require_booted(&book, &self.ledger_state())?;
+        self.require_booted(&book)?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -390,7 +524,7 @@ impl FanoutDispatcher {
         next.max_concurrent = max_concurrent;
         self.store.update_run(&next).await.map_err(OpError::Store)?;
         entry.run = next;
-        let view = RunView::of(&entry.run, &entry.members);
+        let view = entry.view();
         self.publish(&book);
         drop(book);
         self.events.changed(&view);
@@ -403,10 +537,10 @@ impl FanoutDispatcher {
     }
 
     /// Release member `index`'s slot. The session keeps running; only its
-    /// claim on the cap ends.
+    /// claim on the cap ends. Refused while the member's spawn is in flight.
     pub(crate) async fn release(&self, id: Uuid, index: u32) -> Result<RunView, OpError> {
         let mut book = self.book.lock().await;
-        Self::require_booted(&book, &self.ledger_state())?;
+        self.require_booted(&book)?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -423,13 +557,20 @@ impl FanoutDispatcher {
                 current.state.as_str()
             )));
         }
+        if entry.spawning.contains(&index) {
+            return Err(OpError::Conflict(format!(
+                "member {index} is being spawned — its slot can be released once the spawn \
+                 settles"
+            )));
+        }
         let mut next = current.clone();
-        mark_released(&mut next, reason::OPERATOR_RELEASE);
+        mark_released(&mut next, reason::OPERATOR_RELEASE, self.now());
         self.store
             .update_member(id, &next)
             .await
             .map_err(OpError::Store)?;
         entry.members[pos] = next;
+        entry.unconfirmed.remove(&index);
         let view = self.settle_run_state(entry).await;
         self.publish(&book);
         drop(book);
@@ -441,7 +582,9 @@ impl FanoutDispatcher {
     /// Load this instance's active runs and reconcile their admitted members
     /// against the sessions that survived the restart. Idempotent: a run
     /// already in the book is left as it is, and an admitted member whose
-    /// session is still alive stays admitted — never re-spawned.
+    /// session is still alive stays admitted — never re-spawned. A loaded run
+    /// idle past [`STALE_RUN_AGE`] has its waiting members cancelled rather
+    /// than admitted.
     pub(crate) async fn boot(&self) -> Result<(), String> {
         let mut book = self.book.lock().await;
         if book.booted {
@@ -454,12 +597,13 @@ impl FanoutDispatcher {
                 return Err(e);
             }
         };
+        let now = self.now();
+        let mut fresh = Vec::new();
         for (run, members) in loaded {
-            book.runs.entry(run.id).or_insert(RunEntry {
-                run,
-                members,
-                completed_at: None,
-            });
+            if let std::collections::btree_map::Entry::Vacant(slot) = book.runs.entry(run.id) {
+                fresh.push(run.id);
+                slot.insert(RunEntry::new(run, members));
+            }
         }
         let mut changed = Vec::new();
         let ids: Vec<Uuid> = book.runs.keys().copied().collect();
@@ -467,10 +611,16 @@ impl FanoutDispatcher {
             let Some(entry) = book.runs.get_mut(&id) else {
                 continue;
             };
-            if self
-                .reconcile_admitted(entry, reason::RUNNER_RESTARTED)
-                .await
+            let mut touched = false;
+            if fresh.contains(&id)
+                && now.signed_duration_since(entry.last_activity()) > STALE_RUN_AGE
             {
+                touched |= self.cancel_stale(entry).await;
+            }
+            touched |= self
+                .reconcile_admitted(entry, reason::RUNNER_RESTARTED, now)
+                .await;
+            if touched {
                 changed.push(self.settle_run_state(entry).await);
             }
         }
@@ -490,57 +640,219 @@ impl FanoutDispatcher {
         Ok(())
     }
 
-    /// One admission pass: release slots whose sessions ended, return refused
-    /// members to the queue, then admit the lowest queued index of each run
-    /// while `admitted < min(max_concurrent, parallel_fanout bound)`.
-    pub(crate) async fn tick(&self) {
-        let mut book = self.book.lock().await;
-        if !book.booted {
-            return;
+    /// Cancel a stale run's waiting members (see [`STALE_RUN_AGE`]).
+    async fn cancel_stale(&self, entry: &mut RunEntry) -> bool {
+        let run_id = entry.run.id;
+        let mut changed = false;
+        for m in entry
+            .members
+            .iter_mut()
+            .filter(|m| matches!(m.state, MemberState::Queued | MemberState::Refused))
+        {
+            m.state = MemberState::Cancelled;
+            m.reason = Some(reason::STALE_AFTER_RESTART.to_string());
+            self.persist_member(run_id, m).await;
+            changed = true;
         }
+        if changed {
+            warn!(run_id = %run_id, created_at = %entry.run.created_at,
+                "fanout: a stale run was loaded at start — its waiting members are cancelled, \
+                 not admitted");
+        }
+        changed
+    }
+
+    /// One admission pass: release slots whose sessions ended, return refused
+    /// members whose backoff elapsed to the queue, then admit the lowest
+    /// queued index of each run while
+    /// `admitted < min(max_concurrent, parallel_fanout bound)`.
+    ///
+    /// The admissions are recorded under the book lock; the spawns run after
+    /// it is released ([`Self::spawn_admitted`]).
+    pub(crate) async fn tick(&self) {
+        // Read before taking the book: the bound may resolve the registry
+        // over the network.
         let bound = self.host.fanout_bound().await;
         let drain = self.host.drain_deferral();
+        let now = self.now();
+        let mut pending = Vec::new();
         let mut changed = Vec::new();
-        let mut halt = false;
-        let ids: Vec<Uuid> = book
-            .runs
-            .iter()
-            .filter(|(_, e)| e.run.state == RunState::Active)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            let Some(entry) = book.runs.get_mut(&id) else {
-                continue;
-            };
-            let before = RunView::of(&entry.run, &entry.members);
-            self.reconcile_admitted(entry, reason::TERMINAL_EXIT).await;
-            self.requeue_refused(entry).await;
-            self.mark_drain(entry, drain.as_deref()).await;
-            if !halt && drain.is_none() {
-                halt = self.admit(entry, bound).await;
+        {
+            let mut book = self.book.lock().await;
+            if !book.booted {
+                return;
             }
-            let after = self.settle_run_state(entry).await;
-            if after != before {
-                changed.push(after);
+            let mut halt = false;
+            let ids: Vec<Uuid> = book
+                .runs
+                .iter()
+                .filter(|(_, e)| e.run.state == RunState::Active)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                let Some(entry) = book.runs.get_mut(&id) else {
+                    continue;
+                };
+                let before = entry.view();
+                self.reconcile_admitted(entry, reason::TERMINAL_EXIT, now)
+                    .await;
+                self.requeue_refused(entry, now).await;
+                self.mark_drain(entry, drain.as_deref()).await;
+                if !halt && drain.is_none() {
+                    halt = self.admit(entry, bound, now, &mut pending).await;
+                }
+                let after = self.settle_run_state(entry).await;
+                if after != before {
+                    changed.push(after);
+                }
             }
+            book.runs.retain(|_, e| {
+                e.completed_at
+                    .is_none_or(|at| now.signed_duration_since(at) < COMPLETED_RETENTION)
+            });
+            self.publish(&book);
         }
-        let now = Utc::now();
-        book.runs.retain(|_, e| {
-            e.completed_at
-                .is_none_or(|at| now.signed_duration_since(at) < COMPLETED_RETENTION)
-        });
-        self.publish(&book);
-        drop(book);
         for view in &changed {
             self.events.changed(view);
         }
+        self.spawn_admitted(pending).await;
+    }
+
+    /// Spawn the admissions a tick recorded, one at a time and with the book
+    /// UNLOCKED, recording each outcome under the lock as it lands. A drain or
+    /// an occupied bound stops the rest of the batch; a refusal stops the rest
+    /// of that run. A member not attempted goes back to the queue.
+    async fn spawn_admitted(&self, pending: Vec<PendingSpawn>) {
+        let mut halt_all = false;
+        let mut halted_runs: HashSet<Uuid> = HashSet::new();
+        for PendingSpawn { req } in pending {
+            let outcome = if halt_all || halted_runs.contains(&req.run_id) {
+                None
+            } else {
+                // A task of its own, so a panicking spawn is an outcome rather
+                // than a member stranded in flight.
+                let host = self.host.clone();
+                let r = req.clone();
+                Some(
+                    match tokio::spawn(async move { host.spawn_fanout_member(r).await }).await {
+                        Ok(o) => o,
+                        Err(e) => SpawnOutcome::Refused {
+                            reason: format!("spawn task failed: {e}"),
+                        },
+                    },
+                )
+            };
+            match &outcome {
+                Some(SpawnOutcome::DeferredByDrain { .. } | SpawnOutcome::BoundOccupied { .. }) => {
+                    halt_all = true;
+                }
+                Some(SpawnOutcome::Refused { .. }) => {
+                    halted_runs.insert(req.run_id);
+                }
+                _ => {}
+            }
+            self.record_spawn(&req, outcome).await;
+        }
+    }
+
+    /// Record what one spawn came to (`None`: it was not attempted).
+    async fn record_spawn(&self, req: &MemberSpawnRequest, outcome: Option<SpawnOutcome>) {
+        let now = self.now();
+        let view = {
+            let mut book = self.book.lock().await;
+            let Some(entry) = book.runs.get_mut(&req.run_id) else {
+                warn!(run_id = %req.run_id, index = req.index,
+                    "fanout: a spawn settled for a run the book no longer holds");
+                return;
+            };
+            entry.spawning.remove(&req.index);
+            let cancel_requested = entry.cancel_requested;
+            let Some(pos) = entry.members.iter().position(|m| {
+                m.index == req.index
+                    && m.state == MemberState::Admitted
+                    && m.claude_session_id.as_deref() == Some(req.claude_session_id.as_str())
+            }) else {
+                warn!(run_id = %req.run_id, index = req.index,
+                    "fanout: a spawn settled for a member no longer admitted under its session");
+                return;
+            };
+            let run_id = entry.run.id;
+            let member = &mut entry.members[pos];
+            match outcome {
+                Some(SpawnOutcome::Spawned { terminal_id }) => {
+                    info!(run_id = %run_id, index = member.index, terminal_id = %terminal_id,
+                        "fanout: member admitted");
+                    member.terminal_id = Some(terminal_id);
+                    entry.retry.remove(&req.index);
+                }
+                not_spawned if cancel_requested => {
+                    info!(run_id = %run_id, index = member.index, outcome = ?not_spawned,
+                        "fanout: spawn did not happen after a cancel — member cancelled");
+                    unadmit(
+                        member,
+                        MemberState::Cancelled,
+                        Some(reason::CANCELLED.to_string()),
+                    );
+                    entry.retry.remove(&req.index);
+                }
+                Some(SpawnOutcome::DeferredByDrain { reason: why }) => {
+                    info!(run_id = %run_id, index = member.index, drain = %why,
+                        "fanout: admission deferred by the device drain");
+                    unadmit(
+                        member,
+                        MemberState::Queued,
+                        Some(reason::RUNNER_DRAINING.to_string()),
+                    );
+                }
+                Some(SpawnOutcome::BoundOccupied { detail }) => {
+                    info!(run_id = %run_id, index = member.index, detail = %detail,
+                        "fanout: parallel_fanout bound occupied — retrying next tick");
+                    unadmit(
+                        member,
+                        MemberState::Queued,
+                        Some(reason::FANOUT_BOUND_OCCUPIED.to_string()),
+                    );
+                }
+                Some(SpawnOutcome::Refused { reason: why }) => {
+                    let class = reason_class(&why);
+                    let attempts = match entry.retry.get(&req.index) {
+                        Some(r) if r.class == class => r.attempts.saturating_add(1),
+                        _ => 1,
+                    };
+                    let next_at = now + retry_delay(attempts);
+                    warn!(run_id = %run_id, index = member.index, reason = %why, attempts,
+                        next_retry_at = %next_at, "fanout: member refused — retried after a backoff");
+                    unadmit(member, MemberState::Refused, Some(why));
+                    entry.retry.insert(
+                        req.index,
+                        RetryState {
+                            class,
+                            attempts,
+                            next_at,
+                        },
+                    );
+                }
+                None => unadmit(member, MemberState::Queued, None),
+            }
+            let member = entry.members[pos].clone();
+            self.persist_member(run_id, &member).await;
+            let view = self.settle_run_state(entry).await;
+            self.publish(&book);
+            view
+        };
+        self.events.changed(&view);
     }
 
     /// Release every admitted member whose session ended (the finished marker,
     /// or its terminal exited), recording `exit_reason` for an exit. A live
-    /// member that moved terminals is re-pointed. Returns whether anything
-    /// changed.
-    async fn reconcile_admitted(&self, entry: &mut RunEntry, exit_reason: &str) -> bool {
+    /// member that moved terminals is re-pointed. A member whose spawn is in
+    /// flight is skipped. Returns whether anything changed.
+    async fn reconcile_admitted(
+        &self,
+        entry: &mut RunEntry,
+        exit_reason: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
         let run_id = entry.run.id;
         let mut changed = false;
         for m in entry
@@ -548,47 +860,71 @@ impl FanoutDispatcher {
             .iter_mut()
             .filter(|m| m.state == MemberState::Admitted)
         {
+            if entry.spawning.contains(&m.index) {
+                continue;
+            }
             let Some(csid) = m.claude_session_id.clone() else {
                 // Admitted with no session id cannot occur through `admit`;
                 // a hand-edited row is released rather than holding a slot
                 // nothing can ever free.
-                mark_released(m, exit_reason);
+                mark_released(m, exit_reason, now);
                 self.persist_member(run_id, m).await;
                 changed = true;
                 continue;
             };
-            match self.host.liveness(&csid, m.terminal_id.as_deref()) {
+            let liveness = self.host.liveness(&csid, m.terminal_id.as_deref());
+            if !matches!(liveness, Liveness::Unconfirmed | Liveness::Unknown) {
+                entry.unconfirmed.remove(&m.index);
+            }
+            let release = match liveness {
                 Liveness::Live { terminal_id } => {
                     if m.terminal_id.as_deref() != Some(terminal_id.as_str()) {
                         m.terminal_id = Some(terminal_id);
                         self.persist_member(run_id, m).await;
                         changed = true;
                     }
+                    None
                 }
-                Liveness::Finished => {
-                    mark_released(m, reason::FINISHED);
-                    self.persist_member(run_id, m).await;
-                    changed = true;
+                Liveness::Finished => Some(reason::FINISHED.to_string()),
+                Liveness::Exited => Some(exit_reason.to_string()),
+                // No record and no terminal: a member whose spawn was never
+                // recorded may never have run — not the same as one that did.
+                Liveness::Unrecorded if m.terminal_id.is_none() => {
+                    Some(reason::SPAWN_UNCONFIRMED.to_string())
                 }
-                Liveness::Exited => {
-                    mark_released(m, exit_reason);
-                    self.persist_member(run_id, m).await;
-                    changed = true;
+                Liveness::Unrecorded => Some(exit_reason.to_string()),
+                Liveness::Unconfirmed => {
+                    let (since, why) = entry
+                        .unconfirmed
+                        .entry(m.index)
+                        .or_insert_with(|| (now, exit_reason.to_string()))
+                        .clone();
+                    (now.signed_duration_since(since) >= LIVENESS_GRACE).then_some(why)
                 }
-                Liveness::Unknown => {}
+                Liveness::Unknown => None,
+            };
+            if let Some(why) = release {
+                entry.unconfirmed.remove(&m.index);
+                mark_released(m, &why, now);
+                self.persist_member(run_id, m).await;
+                changed = true;
             }
         }
         changed
     }
 
-    /// `refused → queued`, keeping the reason visible.
-    async fn requeue_refused(&self, entry: &mut RunEntry) {
+    /// `refused → queued` once the member's backoff has elapsed, keeping the
+    /// reason visible.
+    async fn requeue_refused(&self, entry: &mut RunEntry, now: DateTime<Utc>) {
         let run_id = entry.run.id;
         for m in entry
             .members
             .iter_mut()
             .filter(|m| m.state == MemberState::Refused)
         {
+            if entry.retry.get(&m.index).is_some_and(|r| r.next_at > now) {
+                continue;
+            }
             m.state = MemberState::Queued;
             self.persist_member(run_id, m).await;
         }
@@ -619,13 +955,20 @@ impl FanoutDispatcher {
         }
     }
 
-    /// Admit queued members of one run up to its cap. Returns `true` when the
-    /// whole tick must stop admitting (the drain or the bound said no, or the
-    /// ledger failed) — a run-local refusal only stops this run.
-    async fn admit(&self, entry: &mut RunEntry, bound: u32) -> bool {
+    /// Admit queued members of one run up to its cap, recording each admission
+    /// and queueing its spawn on `pending`. Returns `true` when the whole tick
+    /// must stop admitting (the ledger could not record an admission).
+    async fn admit(
+        &self,
+        entry: &mut RunEntry,
+        bound: u32,
+        now: DateTime<Utc>,
+        pending: &mut Vec<PendingSpawn>,
+    ) -> bool {
         let cap = entry.run.max_concurrent.min(bound).max(1) as usize;
         let run_id = entry.run.id;
         loop {
+            // In-flight spawns are `admitted`, so they count here.
             let admitted = entry
                 .members
                 .iter()
@@ -647,15 +990,15 @@ impl FanoutDispatcher {
 
             // Record the admission BEFORE spawning, under a freshly minted
             // session id: a crash between the two then reads, on restart, as an
-            // admitted member with no live session (released), never as a
-            // queued one that would be spawned a second time.
+            // admitted member with no session (released `spawn_unconfirmed`),
+            // never as a queued one that would be spawned a second time.
             let csid = Uuid::new_v4().to_string();
             let mut admitted_member = entry.members[pos].clone();
             admitted_member.state = MemberState::Admitted;
             admitted_member.claude_session_id = Some(csid.clone());
             admitted_member.terminal_id = None;
             admitted_member.reason = None;
-            admitted_member.admitted_at = Some(Utc::now());
+            admitted_member.admitted_at = Some(now);
             admitted_member.released_at = None;
             if let Err(e) = self.store.update_member(run_id, &admitted_member).await {
                 warn!(run_id = %run_id, index = admitted_member.index, error = %e,
@@ -663,58 +1006,22 @@ impl FanoutDispatcher {
                 entry.members[pos].reason = Some(reason::STORE_UNAVAILABLE.to_string());
                 return true;
             }
+            let index = admitted_member.index;
             entry.members[pos] = admitted_member;
-
-            let req = MemberSpawnRequest {
-                run_id,
-                index: entry.members[pos].index,
-                title: entry.members[pos].title.clone(),
-                prompt: entry.members[pos].prompt.clone(),
-                working_dir: entry.run.working_dir.clone(),
-                tenant_id: entry.run.tenant_id,
-                config_dir_policy: entry.run.config_dir_policy.clone(),
-                claude_session_id: csid,
-            };
-            let outcome = self.host.spawn_fanout_member(req).await;
-            let member = &mut entry.members[pos];
-            let (halt_tick, halt_run) = match outcome {
-                SpawnOutcome::Spawned { terminal_id } => {
-                    info!(run_id = %run_id, index = member.index, terminal_id = %terminal_id,
-                        "fanout: member admitted");
-                    member.terminal_id = Some(terminal_id);
-                    (false, false)
-                }
-                SpawnOutcome::DeferredByDrain { reason: why } => {
-                    info!(run_id = %run_id, index = member.index, drain = %why,
-                        "fanout: admission deferred by the device drain");
-                    unadmit(
-                        member,
-                        MemberState::Queued,
-                        reason::RUNNER_DRAINING.to_string(),
-                    );
-                    (true, true)
-                }
-                SpawnOutcome::BoundOccupied { detail } => {
-                    info!(run_id = %run_id, index = member.index, detail = %detail,
-                        "fanout: parallel_fanout bound occupied — retrying next tick");
-                    unadmit(
-                        member,
-                        MemberState::Queued,
-                        reason::FANOUT_BOUND_OCCUPIED.to_string(),
-                    );
-                    (true, true)
-                }
-                SpawnOutcome::Refused { reason: why } => {
-                    warn!(run_id = %run_id, index = member.index, reason = %why,
-                        "fanout: member refused — it returns to the queue next tick");
-                    unadmit(member, MemberState::Refused, why);
-                    (false, true)
-                }
-            };
-            self.persist_member(run_id, member).await;
-            if halt_run {
-                return halt_tick;
-            }
+            entry.spawning.insert(index);
+            entry.unconfirmed.remove(&index);
+            pending.push(PendingSpawn {
+                req: MemberSpawnRequest {
+                    run_id,
+                    index,
+                    title: entry.members[pos].title.clone(),
+                    prompt: entry.members[pos].prompt.clone(),
+                    working_dir: entry.run.working_dir.clone(),
+                    tenant_id: entry.run.tenant_id,
+                    config_dir_policy: entry.run.config_dir_policy.clone(),
+                    claude_session_id: csid,
+                },
+            });
         }
     }
 
@@ -724,7 +1031,7 @@ impl FanoutDispatcher {
         if state != entry.run.state {
             entry.run.state = state;
             if state == RunState::Completed {
-                entry.completed_at = Some(Utc::now());
+                entry.completed_at = Some(self.now());
                 info!(run_id = %entry.run.id, "fanout: run completed");
             }
             if let Err(e) = self.store.update_run(&entry.run).await {
@@ -732,7 +1039,7 @@ impl FanoutDispatcher {
                     "fanout: could not persist the run's state — the book keeps it");
             }
         }
-        RunView::of(&entry.run, &entry.members)
+        entry.view()
     }
 
     /// Write-through for a transition the tick has already decided. A failed
@@ -747,11 +1054,7 @@ impl FanoutDispatcher {
     }
 
     fn publish(&self, book: &Book) {
-        let mut views: Vec<RunView> = book
-            .runs
-            .values()
-            .map(|e| RunView::of(&e.run, &e.members))
-            .collect();
+        let mut views: Vec<RunView> = book.runs.values().map(RunEntry::view).collect();
         views.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         let views = Arc::new(views);
         match self.published.write() {
@@ -761,19 +1064,19 @@ impl FanoutDispatcher {
     }
 }
 
-fn mark_released(m: &mut FanoutMember, why: &str) {
+fn mark_released(m: &mut FanoutMember, why: &str, now: DateTime<Utc>) {
     m.state = MemberState::Released;
     m.reason = Some(why.to_string());
-    m.released_at = Some(Utc::now());
+    m.released_at = Some(now);
 }
 
 /// Undo an admission that did not produce a session.
-fn unadmit(m: &mut FanoutMember, state: MemberState, why: String) {
+fn unadmit(m: &mut FanoutMember, state: MemberState, why: Option<String>) {
     m.state = state;
     m.claude_session_id = None;
     m.terminal_id = None;
     m.admitted_at = None;
-    m.reason = Some(why);
+    m.reason = why;
 }
 
 #[cfg(test)]
@@ -856,6 +1159,14 @@ mod tests {
         max_live: AtomicU32,
         cap_limit: AtomicU32,
         no_terminal_manager: std::sync::atomic::AtomicBool,
+        /// Sessions whose record is open but no terminal answers.
+        unconfirmed: Mutex<HashSet<String>>,
+        /// Sessions with no record and no terminal.
+        unrecorded: Mutex<HashSet<String>>,
+        /// When set, every spawn waits for a permit — a spawn held in flight.
+        gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        /// Spawns that have STARTED (before the gate).
+        started: AtomicU32,
     }
 
     impl MockHost {
@@ -882,6 +1193,11 @@ mod tests {
             self.bound.load(Ordering::SeqCst)
         }
         async fn spawn_fanout_member(&self, req: MemberSpawnRequest) -> SpawnOutcome {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             // Yield so concurrent releases interleave with the spawn.
             tokio::task::yield_now().await;
             self.spawns.lock().unwrap().push(req.clone());
@@ -890,8 +1206,18 @@ mod tests {
                     return o;
                 }
             }
-            let mut live = self.live.lock().unwrap();
             let terminal_id = format!("term-{}-{}", req.run_id.simple(), req.index);
+            // A session a test marked finished while its spawn was in flight
+            // finished at once: it never holds a live terminal.
+            if self
+                .finished
+                .lock()
+                .unwrap()
+                .contains(&req.claude_session_id)
+            {
+                return SpawnOutcome::Spawned { terminal_id };
+            }
+            let mut live = self.live.lock().unwrap();
             live.insert(req.claude_session_id.clone(), terminal_id.clone());
             let n = live.len() as u32;
             assert!(
@@ -907,6 +1233,12 @@ mod tests {
             }
             if self.finished.lock().unwrap().contains(claude_session_id) {
                 return Liveness::Finished;
+            }
+            if self.unconfirmed.lock().unwrap().contains(claude_session_id) {
+                return Liveness::Unconfirmed;
+            }
+            if self.unrecorded.lock().unwrap().contains(claude_session_id) {
+                return Liveness::Unrecorded;
             }
             match self.live.lock().unwrap().get(claude_session_id) {
                 Some(t) => Liveness::Live {
@@ -972,6 +1304,11 @@ mod tests {
             events,
             d,
         }
+    }
+
+    /// Move the dispatcher's clock forward without sleeping.
+    fn advance(d: &FanoutDispatcher, secs: i64) {
+        d.clock_skew_secs.fetch_add(secs, Ordering::SeqCst);
     }
 
     fn states(view: &RunView) -> Vec<MemberState> {
@@ -1188,7 +1525,10 @@ mod tests {
             .starts_with("resource_guard:critical:"));
         assert!(v.members[0].claude_session_id.is_none());
         assert_eq!(v.counts.admitted, 0);
-        // Next tick: back to the queue, then admitted.
+        assert_eq!(v.members[0].refusals, 1);
+        assert!(v.members[0].next_retry_at.is_some());
+        // Once the first backoff has elapsed: back to the queue, then admitted.
+        advance(&f.d, 5);
         f.d.tick().await;
         let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(states(&v), vec![Admitted, Admitted, Queued]);
@@ -1483,9 +1823,18 @@ mod tests {
         f.d.tick().await;
         f.d.tick().await; // no change → no event
         let evs = f.events.0.lock().unwrap().clone();
-        assert_eq!(evs.len(), 2);
-        assert_eq!(evs[1].id, id);
+        // The admission (recorded before the spawn), then the spawn's outcome.
+        assert_eq!(evs.len(), 3);
+        assert!(evs.iter().all(|e| e.id == id));
         assert_eq!(evs[1].counts.admitted, 1);
+        assert!(
+            evs[1].members[0].terminal_id.is_none(),
+            "announced in flight"
+        );
+        assert!(
+            evs[2].members[0].terminal_id.is_some(),
+            "then with its terminal"
+        );
     }
 
     fn unbooted(store: Arc<MemoryStore>, host: Arc<MockHost>) -> FanoutDispatcher {
@@ -1505,8 +1854,9 @@ mod tests {
         let d = unbooted(f.store.clone(), f.host.clone());
         assert_eq!(d.ledger_state(), LedgerState::Pending);
         let err = d.list().unwrap_err();
-        assert!(err.contains("not been loaded yet"), "{err}");
-        assert!(d.get(id).unwrap_err().contains("UNKNOWN"));
+        assert!(err.reason.contains("not been loaded yet"), "{err:?}");
+        assert!(!err.load_failed, "the boot settle is not a failed load");
+        assert!(d.get(id).unwrap_err().reason.contains("UNKNOWN"));
         // Every operator op refuses with the same reason and changes nothing.
         assert!(matches!(d.cancel(id).await, Err(OpError::NotLoaded(_))));
         assert!(matches!(d.release(id, 0).await, Err(OpError::NotLoaded(_))));
@@ -1546,12 +1896,15 @@ mod tests {
             LedgerState::Failed("connection refused".to_string())
         );
         let err = d.list().unwrap_err();
+        assert!(err.load_failed);
         assert!(
-            err.contains("could not be loaded") && err.contains("connection refused"),
-            "{err}"
+            err.reason.contains("could not be loaded") && err.reason.contains("connection refused"),
+            "{err:?}"
         );
         match d.create(new_run(1, 1, None)).await {
-            Err(OpError::NotLoaded(why)) => assert!(why.contains("connection refused"), "{why}"),
+            Err(OpError::NotLoaded(why)) => {
+                assert!(why.reason.contains("connection refused"), "{why:?}")
+            }
             other => panic!("expected NotLoaded, got {other:?}"),
         }
         // The retry succeeds: an empty list is now a real answer.
@@ -1559,5 +1912,290 @@ mod tests {
         d.boot().await.unwrap();
         assert!(d.list().unwrap().is_empty());
         assert!(d.create(new_run(1, 1, None)).await.is_ok());
+    }
+
+    fn refuse_next(host: &MockHost, why: &str) {
+        host.scripted
+            .lock()
+            .unwrap()
+            .push_back(SpawnOutcome::Refused {
+                reason: why.to_string(),
+            });
+    }
+
+    /// A persistent refusal is retried on a doubling backoff keyed on the
+    /// refusal's class — never at tick rate — and a different class restarts it.
+    #[tokio::test]
+    async fn fanout_a_persistent_refusal_backs_off_instead_of_retrying_every_tick() {
+        let f = fixture(15).await;
+        let id = f.d.create(new_run(1, 1, None)).await.unwrap().run.id;
+        for _ in 0..3 {
+            refuse_next(&f.host, "no authenticated Claude account on this runner");
+        }
+        f.d.tick().await; // attempt 1 → refused, retry in 5 s
+        assert_eq!(f.host.spawn_count(), 1);
+        for _ in 0..5 {
+            f.d.tick().await; // inside the backoff: no attempt
+        }
+        assert_eq!(
+            f.host.spawn_count(),
+            1,
+            "a refusal must not retry at tick rate"
+        );
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].state, MemberState::Refused);
+        assert_eq!(v.members[0].refusals, 1);
+        advance(&f.d, 5);
+        f.d.tick().await; // attempt 2 → refused, retry in 10 s
+        assert_eq!(f.host.spawn_count(), 2);
+        assert_eq!(f.d.get(id).unwrap().unwrap().members[0].refusals, 2);
+        advance(&f.d, 5);
+        f.d.tick().await;
+        assert_eq!(
+            f.host.spawn_count(),
+            2,
+            "the second delay is twice the first"
+        );
+        advance(&f.d, 5);
+        f.d.tick().await; // attempt 3 → refused, retry in 20 s
+        assert_eq!(f.host.spawn_count(), 3);
+        assert_eq!(f.d.get(id).unwrap().unwrap().members[0].refusals, 3);
+        // A different kind of refusal restarts the backoff at its base.
+        refuse_next(&f.host, "resource_guard:critical: commit charge at 97%");
+        advance(&f.d, 20);
+        f.d.tick().await;
+        assert_eq!(f.host.spawn_count(), 4);
+        assert_eq!(f.d.get(id).unwrap().unwrap().members[0].refusals, 1);
+        // …and two of the same class with different detail share it.
+        refuse_next(&f.host, "resource_guard:critical: commit charge at 98%");
+        advance(&f.d, 5);
+        f.d.tick().await;
+        assert_eq!(f.d.get(id).unwrap().unwrap().members[0].refusals, 2);
+        // A successful spawn clears it.
+        advance(&f.d, 10);
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].state, MemberState::Admitted);
+        assert_eq!(
+            (v.members[0].refusals, v.members[0].next_retry_at.clone()),
+            (0, None)
+        );
+    }
+
+    #[test]
+    fn fanout_retry_delay_doubles_and_caps() {
+        let secs: Vec<i64> = (1..=9).map(|a| retry_delay(a).num_seconds()).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(retry_delay(u32::MAX).num_seconds(), 300);
+        assert_eq!(
+            reason_class("resource_guard:critical: x"),
+            "resource_guard".to_string()
+        );
+    }
+
+    /// The spawn runs with the book UNLOCKED: while one is held in flight,
+    /// reads, operator ops and a second tick all complete — and the in-flight
+    /// member still counts toward the cap, is never spawned twice, and cannot
+    /// be released out from under its spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fanout_a_spawn_in_flight_does_not_hold_the_book() {
+        let f = fixture(15).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.host.gate.lock().unwrap() = Some(gate.clone());
+        let id = f.d.create(new_run(4, 2, None)).await.unwrap().run.id;
+        let ticker = {
+            let d = f.d.clone();
+            tokio::spawn(async move { d.tick().await })
+        };
+        // Wait until the first spawn is in flight.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while f.host.started.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "spawn never started");
+            tokio::task::yield_now().await;
+        }
+        let quick = std::time::Duration::from_secs(2);
+        // Both cap slots are admitted (in flight), visible to a reader.
+        let v = f.d.get(id).unwrap().unwrap();
+        use MemberState::*;
+        assert_eq!(states(&v), vec![Admitted, Admitted, Queued, Queued]);
+        // A second tick completes and admits nothing: the cap is full.
+        tokio::time::timeout(quick, f.d.tick())
+            .await
+            .expect("tick blocked on a spawn");
+        assert_eq!(f.host.started.load(Ordering::SeqCst), 1);
+        // Releasing an in-flight member is refused, not raced.
+        let r = tokio::time::timeout(quick, f.d.release(id, 0))
+            .await
+            .expect("release blocked on a spawn");
+        assert!(
+            matches!(r, Err(OpError::Conflict(ref m)) if m.contains("being spawned")),
+            "{r:?}"
+        );
+        // A PATCH and a cancel complete too.
+        tokio::time::timeout(quick, f.d.set_max_concurrent(id, 2))
+            .await
+            .expect("PATCH blocked on a spawn")
+            .unwrap();
+        let v = tokio::time::timeout(quick, f.d.cancel(id))
+            .await
+            .expect("cancel blocked on a spawn")
+            .unwrap();
+        assert_eq!(states(&v), vec![Admitted, Admitted, Cancelled, Cancelled]);
+        // Let both spawns land.
+        gate.add_permits(2);
+        ticker.await.unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(states(&v), vec![Admitted, Admitted, Cancelled, Cancelled]);
+        assert!(v.members.iter().take(2).all(|m| m.terminal_id.is_some()));
+        assert_eq!(f.host.spawn_count(), 2, "nothing spawned twice");
+    }
+
+    /// A cancel that lands while a member's spawn is in flight wins if that
+    /// spawn does not happen: the member is cancelled, never re-queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fanout_a_cancel_during_a_spawn_that_fails_cancels_the_member() {
+        let f = fixture(15).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.host.gate.lock().unwrap() = Some(gate.clone());
+        refuse_next(&f.host, "resource_guard:critical: low memory");
+        let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
+        let ticker = {
+            let d = f.d.clone();
+            tokio::spawn(async move { d.tick().await })
+        };
+        while f.host.started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        f.d.cancel(id).await.unwrap();
+        gate.add_permits(1);
+        ticker.await.unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(
+            states(&v),
+            vec![MemberState::Cancelled, MemberState::Cancelled]
+        );
+        assert_eq!(v.state, RunState::Completed);
+        advance(&f.d, 600);
+        f.d.tick().await;
+        assert_eq!(f.host.started.load(Ordering::SeqCst), 1, "never retried");
+    }
+
+    /// An open record with no terminal answering (mid-respawn, not yet
+    /// rebound) holds its slot for the grace window, then releases.
+    #[tokio::test]
+    async fn fanout_unconfirmed_liveness_holds_the_slot_for_a_grace_window() {
+        let f = fixture(15).await;
+        let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
+        f.d.tick().await;
+        let first = csid(&f.d.get(id).unwrap().unwrap(), 0);
+        f.host.exit(&first);
+        f.host.unconfirmed.lock().unwrap().insert(first.clone());
+        f.d.tick().await;
+        advance(&f.d, LIVENESS_GRACE.num_seconds() - 1);
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(
+            v.members[0].state,
+            MemberState::Admitted,
+            "inside the grace window"
+        );
+        assert_eq!(v.members[1].state, MemberState::Queued);
+        // Rebinding inside the window clears it…
+        f.host.unconfirmed.lock().unwrap().remove(&first);
+        f.host
+            .live
+            .lock()
+            .unwrap()
+            .insert(first.clone(), "term-rebound".to_string());
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].terminal_id.as_deref(), Some("term-rebound"));
+        // …and a fresh unconfirmed spell starts a fresh window, past which the
+        // slot is released.
+        f.host.exit(&first);
+        f.host.unconfirmed.lock().unwrap().insert(first.clone());
+        f.d.tick().await;
+        advance(&f.d, LIVENESS_GRACE.num_seconds());
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(v.members[0].state, MemberState::Released);
+        assert_eq!(v.members[0].reason.as_deref(), Some(reason::TERMINAL_EXIT));
+        assert_eq!(v.members[1].state, MemberState::Admitted);
+    }
+
+    /// A member admitted but never recorded as spawned (a crash between the
+    /// admission and the spawn), with no session record, is released as
+    /// `spawn_unconfirmed` — not as `runner_restarted`, which says it ran.
+    #[tokio::test]
+    async fn fanout_a_member_lost_before_its_spawn_is_spawn_unconfirmed() {
+        let f = fixture(15).await;
+        let id = f.d.create(new_run(2, 2, None)).await.unwrap().run.id;
+        f.d.tick().await;
+        let v = f.d.get(id).unwrap().unwrap();
+        // Member 0's row says admitted with no terminal; nothing recorded it.
+        let lost = csid(&v, 0);
+        {
+            let mut rows = f.store.rows.lock().unwrap();
+            rows.get_mut(&id).unwrap().1[0].terminal_id = None;
+        }
+        f.host.exit(&lost);
+        f.host.unrecorded.lock().unwrap().insert(lost);
+        // Member 1 ran and its terminal died with the runner.
+        f.host.exit(&csid(&v, 1));
+        let restarted = unbooted(f.store.clone(), f.host.clone());
+        restarted.boot().await.unwrap();
+        let w = restarted.get(id).unwrap().unwrap();
+        assert_eq!(
+            w.members[0].reason.as_deref(),
+            Some(reason::SPAWN_UNCONFIRMED)
+        );
+        assert_eq!(
+            w.members[1].reason.as_deref(),
+            Some(reason::RUNNER_RESTARTED)
+        );
+    }
+
+    /// A run idle past the staleness bound is not resumed at runner start:
+    /// its waiting members are cancelled with `stale_after_restart`, nothing
+    /// is spawned, and a fresh run in the same ledger is admitted as usual.
+    #[tokio::test]
+    async fn fanout_a_stale_run_is_not_admitted_after_a_restart() {
+        let f = fixture(15).await;
+        let stale = f.d.create(new_run(3, 1, None)).await.unwrap().run.id;
+        {
+            let mut rows = f.store.rows.lock().unwrap();
+            rows.get_mut(&stale).unwrap().0.created_at =
+                Utc::now() - STALE_RUN_AGE - chrono::Duration::hours(1);
+        }
+        let fresh = f.d.create(new_run(1, 1, None)).await.unwrap().run.id;
+        let spawned_before = f.host.spawn_count();
+        // A later runner reusing the owner name.
+        let later = unbooted(f.store.clone(), f.host.clone());
+        later.boot().await.unwrap();
+        let v = later.get(stale).unwrap().unwrap();
+        assert!(v.members.iter().all(|m| m.state == MemberState::Cancelled
+            && m.reason.as_deref() == Some(reason::STALE_AFTER_RESTART)));
+        assert_eq!(v.state, RunState::Completed);
+        later.tick().await;
+        assert_eq!(f.host.spawn_count(), spawned_before + 1);
+        assert_eq!(
+            later.get(fresh).unwrap().unwrap().members[0].state,
+            MemberState::Admitted
+        );
+        // A run whose last admission is recent is not stale, however old.
+        let busy = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
+        {
+            let mut rows = f.store.rows.lock().unwrap();
+            let row = rows.get_mut(&busy).unwrap();
+            row.0.created_at = Utc::now() - chrono::Duration::days(3);
+            row.1[0].state = MemberState::Released;
+            row.1[0].released_at = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+        let again = unbooted(f.store.clone(), f.host.clone());
+        again.boot().await.unwrap();
+        assert_eq!(
+            again.get(busy).unwrap().unwrap().members[1].state,
+            MemberState::Queued
+        );
     }
 }
