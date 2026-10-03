@@ -1568,8 +1568,9 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
     )
 }
 
-/// The thread lane's live verdict, folded and evaluated. Shared by
-/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+/// The thread lane's live reading, ceilings and verdict. [`lane_verdicts`] is its
+/// only caller, so the gate ([`probe_for_spawn`]) and the `/health` report can
+/// never drift.
 ///
 /// **The single call site of
 /// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
@@ -1587,10 +1588,16 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
 /// honest. `evaluate_threads` and the ceilings it compares against are
 /// untouched; the `GateObservation.observed` every refusal quotes is the
 /// graded number, and [`note_graded_trip`] logs the raw one beside it.
-fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
+fn thread_lane_verdict(local: &SessionGuardSettings) -> ThreadLane {
     let ceilings = effective_thread_ceilings(local);
+    let lane = |graded: Option<usize>, verdict: SpawnGate| ThreadLane {
+        graded,
+        warn_ceiling: ceilings.warn_thread_count,
+        critical_ceiling: ceilings.critical_thread_count,
+        verdict,
+    };
     let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
-        return evaluate_threads(None, &ceilings);
+        return lane(None, evaluate_threads(None, &ceilings));
     };
     let census = crate::health_monitor::thread_name_census_memoized();
     let reading = graded_thread_reading(
@@ -1602,45 +1609,43 @@ fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     );
     let verdict = evaluate_threads(Some(reading.graded), &ceilings);
     note_graded_trip(&verdict, &reading);
-    verdict
+    lane(Some(reading.graded), verdict)
 }
 
-/// The thread lane's verdict on its own, live — **the entry point for callers
-/// that are not a spawn.**
-///
-/// Phase 1 of `2026-08-30-load-aware-spawn-admission-control` calls this from
-/// `agent_runtime::evaluate_continuation_guard`, and it needs a DIFFERENT
-/// threshold from the one [`admit_spawn`] enforces. The asymmetry is deliberate
-/// and belongs to the caller, which is why this returns the whole
-/// [`SpawnGate`] rather than a bool:
-///
-/// - A **gate continuation** may defer at [`SpawnGate::Warn`]. It can wait and
-///   be re-delivered, nobody is sitting in front of it, and back-pressure that
-///   arrives early is the entire point of a queue — so the cheap verdict is the
-///   right one to act on.
-/// - An **operator's own spawn** is refused only at [`SpawnGate::Critical`], and
-///   even then overridably ([`admit_spawn`]). Refusing a human's terminal on a
-///   soft signal is the false positive this module's doctrine ranks worst.
-///
-/// So: match on the verdict, act at the severity your caller's cost of waiting
-/// justifies. Do not invent a second set of thresholds — the numbers are folded
-/// once, from settings and the fleet, by [`effective_thread_ceilings`].
-///
-/// Short-circuits on a disabled guard before touching the sensor, exactly as
-/// [`probe_for_spawn`] does: a machine owner who turned the guard off pays
-/// nothing.
-pub(crate) fn thread_pressure() -> SpawnGate {
-    let local = crate::settings::get_session_guard_settings();
-    if !local.enabled {
-        return SpawnGate::Proceed;
-    }
-    thread_lane_verdict(&local)
+/// What [`thread_lane_verdict`] read and decided.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadLane {
+    /// The GRADED thread count (raw minus the idle blocking pool). `None` when
+    /// the OS thread table could not be read — UNKNOWN, never zero.
+    pub(crate) graded: Option<usize>,
+    /// The effective ceilings the reading was judged against.
+    pub(crate) warn_ceiling: usize,
+    pub(crate) critical_ceiling: usize,
+    pub(crate) verdict: SpawnGate,
 }
 
-/// Both lanes' verdicts, with the memory reading and the floors it was judged
-/// against, read ONCE — the one place the live readings are taken, so
-/// [`probe_for_spawn`] (the gate) and the `/health` `spawnAdmission` block (the
-/// report) can never compute different verdicts from different reads.
+/// Both lanes' readings and verdicts, taken ONCE — see [`lane_verdicts`].
+#[derive(Debug, Clone)]
+pub(crate) struct LaneVerdicts {
+    /// The memory lane the reading came from ([`Lane::as_str`]).
+    pub(crate) memory_lane: &'static str,
+    /// Free commit as read (`MemAvailable` off Windows). `None` is UNKNOWN.
+    pub(crate) free_commit_bytes: Option<u64>,
+    /// Free physical memory as read. Reported, never judged.
+    pub(crate) free_phys_bytes: Option<u64>,
+    /// The effective floors the commit reading was judged against.
+    pub(crate) warn_free_commit_bytes: u64,
+    pub(crate) critical_free_commit_bytes: u64,
+    /// The memory lane's verdict.
+    pub(crate) memory: SpawnGate,
+    /// The thread lane's graded reading, ceilings and verdict.
+    pub(crate) threads: ThreadLane,
+}
+
+/// Both lanes' readings and verdicts, read ONCE — the one place the live
+/// readings are taken, so [`probe_for_spawn`] (the gate) and the `/health`
+/// `spawnAdmission` block (the report) can never compute different verdicts
+/// from different reads.
 ///
 /// `None` when the session guard is disabled: no reading is taken at all, which
 /// is the cost argument [`probe_for_spawn`]'s doc makes.
@@ -1648,23 +1653,6 @@ pub(crate) fn thread_pressure() -> SpawnGate {
 /// **Logs nothing on its own** apart from what the two lane folds already log on
 /// a transition, so a polled route can call it freely; the shadowed-lane `warn!`
 /// belongs to the gate, not to a read.
-#[derive(Debug, Clone)]
-pub(crate) struct LaneVerdicts {
-    /// The memory lane the reading came from ([`Lane::as_str`]).
-    pub(crate) memory_lane: &'static str,
-    /// Free commit as read (`MemAvailable` off Windows). `None` is UNKNOWN.
-    pub(crate) free_commit_bytes: Option<u64>,
-    /// Free physical memory as read. Reported, never judged (see below).
-    pub(crate) free_phys_bytes: Option<u64>,
-    /// The effective floors the commit reading was judged against.
-    pub(crate) warn_free_commit_bytes: u64,
-    pub(crate) critical_free_commit_bytes: u64,
-    /// The memory lane's verdict.
-    pub(crate) memory: SpawnGate,
-    /// The thread lane's verdict (graded reading against the effective ceilings).
-    pub(crate) threads: SpawnGate,
-}
-
 pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
     let local = crate::settings::get_session_guard_settings();
     if !local.enabled {
@@ -1695,8 +1683,12 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
 /// The composed (heavier-lane) verdict of a [`LaneVerdicts`], without the
 /// shadowed-lane log [`probe_for_spawn`] writes. For a report, not a gate.
 pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
-    compose_lanes(lanes.memory.clone(), lanes.threads.clone()).0
+    compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone()).0
 }
+
+/// The shadowed (lane, severity) [`probe_for_spawn`] last logged, so its line is
+/// written on a TRANSITION rather than on every call.
+static LAST_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
 
 /// Live verdict: read the limits, take one reading per lane, evaluate both,
 /// report the heavier.
@@ -1731,15 +1723,11 @@ pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
 ///
 /// The fleet terms are folded in AFTER the readings, because the lane to look
 /// the memory floors up under comes from the reading itself.
-/// The shadowed (lane, severity) [`probe_for_spawn`] last logged, so its line is
-/// written on a TRANSITION rather than on every call.
-static LAST_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
-
 pub(crate) fn probe_for_spawn() -> SpawnGate {
     let Some(lanes) = lane_verdicts() else {
         return SpawnGate::Proceed;
     };
-    let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads);
+    let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads.verdict);
     // The lane that tripped but lost the report. Logged so the operator's log
     // says both, even though the toast or the refusal can only say one. The
     // severity word comes from the shadowed verdict itself, not from the

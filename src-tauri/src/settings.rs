@@ -2949,7 +2949,7 @@ pub struct SessionGuardSettings {
     /// protect: tokio's blocking pool, whose default `max_blocking_threads` is
     /// **512**. 256 is half of it — half the pool consumed is the point where
     /// back-pressure starts being worth its cost, and it is the number
-    /// `thread_pressure`'s WARN band hands to a gate continuation deciding
+    /// the thread lane's WARN band hands to a gate continuation deciding
     /// whether to wait.
     ///
     /// The obvious alternative was to reuse
