@@ -261,7 +261,7 @@
 #      `--adjudicated-landed` was the ONLY argument that could move a MIXED
 #      branch, so a session that correctly concluded "superseded" had to assert
 #      "landed" to act at all. On 2026-09-16 that is exactly what happened: a
-#      decision row on `qontinui-dev-notes` reads `verdict_source: adjudicated`
+#      decision row on a plans repository reads `verdict_source: adjudicated`
 #      for 8 commits that demonstrably never landed, while the evidence file
 #      beside it says SUPERSEDED_BY_UPSTREAM. A ledger that cannot distinguish
 #      "landed" from "superseded" will eventually be used to prove something

@@ -838,8 +838,8 @@ forever.
 **`--adjudicated-landed` is NEVER the argument for superseded content.** Until
 `--adjudicated-superseded` existed it was the only argument that could move such
 a branch, so a session that correctly concluded "superseded" had to assert
-"landed" to act at all. On 2026-09-16 that is exactly what happened on
-`qontinui-dev-notes`: the durable decision row reads `verdict_source:
+"landed" to act at all. On 2026-09-16 that is exactly what happened on a
+plans repository: the durable decision row reads `verdict_source:
 adjudicated` for 8 commits that demonstrably never landed, while the evidence
 file beside it says `SUPERSEDED_BY_UPSTREAM`. A ledger that cannot distinguish
 the two will eventually be used to prove something false.
