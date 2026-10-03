@@ -16,6 +16,15 @@ import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sess
 import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import {
+  isAuthoritativePermissionAsk,
+  isInferredVerdict,
+  isNeedsInputState,
+  stateChipTitle,
+  type AgentTruthEntry,
+} from "../agentTruth";
+import { useAgentMetrics } from "../agentMetrics";
+import { AgentMetricsStrip } from "../AgentMetricsStrip";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
 import { ActivitySparkline } from "./ActivitySparkline";
@@ -111,6 +120,7 @@ function CompactZoneCardInner({
   state,
   zoneIndex,
   lastLines,
+  agentTruth,
   onQuickApprove,
   onQuickReject,
   onSendCommand,
@@ -136,6 +146,12 @@ function CompactZoneCardInner({
   state: SessionState;
   zoneIndex: number;
   lastLines: string[];
+  /**
+   * The runner's verdict for this tab. The quick Approve/Reject buttons stay
+   * enabled on an inferred needs-input (the operator is choosing this pane)
+   * but are labelled "inferred" unless `isAuthoritativePermissionAsk` holds.
+   */
+  agentTruth?: AgentTruthEntry;
   onQuickApprove?: () => void;
   onQuickReject?: () => void;
   onSendCommand?: (text: string) => void;
@@ -157,7 +173,9 @@ function CompactZoneCardInner({
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
   tagColor?: string;
 }) {
-  const needsInput = state === "needs-input";
+  const needsInput = isNeedsInputState(state);
+  const approvalInferred = !isAuthoritativePermissionAsk(agentTruth?.verdict);
+  const agentMetrics = useAgentMetrics(tab.id);
   const [cardState, dispatch] = useReducer(
     compactCardReducer,
     { zoneLabel, note },
@@ -315,8 +333,14 @@ function CompactZoneCardInner({
           </svg>
         ) : (
           <div
-            className={`w-2 h-2 rounded-full shrink-0 ${state === "needs-input" ? "animate-pulse" : ""}`}
-            style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
+            className={`w-2 h-2 rounded-full shrink-0 ${needsInput ? "animate-pulse" : ""}`}
+            style={{
+              backgroundColor: STATE_BORDER_COLORS[state],
+              opacity: isInferredVerdict(agentTruth?.verdict) ? 0.6 : 1,
+            }}
+            title={stateChipTitle(state, agentTruth)}
+            data-session-state={state}
+            data-state-inferred={isInferredVerdict(agentTruth?.verdict) ? "true" : undefined}
           />
         )}
         <span className="text-[11px] text-[#c0caf5] font-medium truncate flex-1">{tab.title}</span>
@@ -349,7 +373,11 @@ function CompactZoneCardInner({
             excludes the compact card), so this cannot double-register an id.
             Self-hides for a tab with no Claude session, like every other mount
             site. */}
-        <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIndex} />
+        <SessionInfoDropdown
+          claudeSessionId={tab.claudeSessionId}
+          zoneIndex={zoneIndex}
+          agentTruth={agentTruth}
+        />
         {lastLines.length > 0 && (
           <button
             className={`p-0.5 rounded transition-colors shrink-0 ${
@@ -565,6 +593,13 @@ function CompactZoneCardInner({
         </div>
       )}
 
+      {/* Context / cost / 5h headroom with source + age (Phase 7). Only a tab
+          running an agent can have them: a Claude session, or any tab the runner
+          has already reported metrics for. */}
+      {(tab.claudeSessionId || agentMetrics) && (
+        <AgentMetricsStrip metrics={agentMetrics} className="shrink-0" />
+      )}
+
       {cardState.showFilter && (
         <CompactFilterBar
           outputFilter={cardState.outputFilter}
@@ -587,6 +622,7 @@ function CompactZoneCardInner({
       {needsInput && onQuickApprove ? (
         <CompactInputActions
           yesNo={yesNo}
+          inferred={approvalInferred}
           commandText={cardState.commandText}
           onCommandTextChange={(value) => dispatch({ type: "SET_COMMAND_TEXT", value })}
           onQuickApprove={onQuickApprove}
@@ -669,7 +705,7 @@ function QuickSwitchDropdown({
         <div className="px-2 py-1.5 text-[10px] text-[#565f89]">No other sessions</div>
       ) : (
         otherTabs.map((t) => {
-          const tState = sessionStates[t.id] ?? "idle";
+          const tState = sessionStates[t.id] ?? "unknown";
           return (
             <button
               key={t.id}
@@ -807,6 +843,7 @@ function CompactOutputLines({
 
 function CompactInputActions({
   yesNo,
+  inferred,
   commandText,
   onCommandTextChange,
   onQuickApprove,
@@ -814,6 +851,8 @@ function CompactInputActions({
   onSendCommand,
 }: {
   yesNo: boolean;
+  /** True unless the runner reports a hook permission ask — the buttons then read "inferred". */
+  inferred: boolean;
   commandText: string;
   onCommandTextChange: (value: string) => void;
   onQuickApprove: () => void;
@@ -835,7 +874,7 @@ function CompactInputActions({
             }}
           >
             <Check className="w-3 h-3" />
-            Approve
+            {inferred ? "Approve (inferred)" : "Approve"}
           </button>
           {onQuickReject && (
             <button
@@ -849,7 +888,7 @@ function CompactInputActions({
               }}
             >
               <X className="w-3 h-3" />
-              Reject
+              {inferred ? "Reject (inferred)" : "Reject"}
             </button>
           )}
         </div>

@@ -1422,6 +1422,8 @@ pub(crate) fn fleet_policy_dial_reading(
 /// the writer itself uses, and the existence bit comes from a plain `stat`.
 pub(crate) fn claude_settings_carrier_reading(
     reg: crate::session::claude_hook::StopHookRegistration,
+    events: crate::session::claude_hook::AgentEventHooks,
+    ingest: Option<&crate::terminal::agent_state::IngestCounters>,
     path: &std::path::Path,
     exists: bool,
     env_injected: Option<&str>,
@@ -1450,15 +1452,25 @@ pub(crate) fn claude_settings_carrier_reading(
              `claude` directly with no shim in the chain. BOTH append `--settings` ONLY when \
              that file exists (fail-open), so a `false` here means spawned sessions get NO \
              hook: no SessionStart confirmation, no SessionStart policy injection, no \
-             PreCompact, and no Stop. {}",
+             PreCompact, and no Stop. {} Agent-event http hooks (SessionStart, \
+             UserPromptSubmit, PermissionRequest, Notification, Stop, StopFailure, SessionEnd \
+             → POST /terminals/agent-event): {}; the port is part of the file name because \
+             it is baked into the hook URLs. Ingest counters: {}.",
             path.display(),
             exists,
             reg.as_str(),
             injected,
+            events.describe(),
+            match ingest {
+                Some(c) => c.summary(),
+                None => "not read".to_string(),
+            },
         ),
         format!(
             "session::claude_hook::settings_path(session_restore_dir(), \
-             StopHookRegistration::from_env()) — variant read live from env {}",
+             StopHookRegistration::from_env(), AgentEventHooks::from_env()) — variant read live \
+             from env {} and the bound runner API port; counters from \
+             terminal::agent_state::ingest_counters()",
             crate::mcp::continuation_verdict::FLAG_ENV
         ),
         captured_at,
@@ -1820,9 +1832,12 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
     // rather than materialized: see `claude_settings_carrier_reading` on why a
     // diagnostic must not write the file it is describing.
     let hook_reg = crate::session::claude_hook::StopHookRegistration::from_env();
+    let hook_events = crate::session::claude_hook::AgentEventHooks::from_env();
+    let hook_ingest = crate::terminal::agent_state::ingest_counters();
     let hook_path = crate::session::claude_hook::settings_path(
         &crate::session::claude_hook::session_restore_dir(),
         hook_reg,
+        hook_events,
     );
     let hook_exists = hook_path.is_file();
     let hook_env = std::env::var(crate::session::claude_hook::CLAUDE_SETTINGS_ENV).ok();
@@ -1862,6 +1877,8 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
         )),
         claude_settings_carrier: Some(claude_settings_carrier_reading(
             hook_reg,
+            hook_events,
+            Some(&hook_ingest),
             &hook_path,
             hook_exists,
             hook_env.as_deref(),
@@ -3360,6 +3377,13 @@ mod tests {
 
         let armed = claude_settings_carrier_reading(
             StopHookRegistration::Registered,
+            crate::session::claude_hook::AgentEventHooks::Registered { port: 9876 },
+            Some(&crate::terminal::agent_state::IngestCounters {
+                received: 3,
+                accepted: 2,
+                dropped_unknown_event: 1,
+                ..Default::default()
+            }),
             Path::new("C:/hooks/claude_hook_settings.json"),
             true,
             None,
@@ -3374,6 +3398,9 @@ mod tests {
         );
         assert!(value.contains("on disk: true"), "got {value}");
         assert!(value.contains("variant `registered`"), "got {value}");
+        assert!(value.contains("registered (port 9876)"), "got {value}");
+        assert!(value.contains("received=3"), "got {value}");
+        assert!(value.contains("unknown_event=1"), "got {value}");
         assert!(
             value.contains("BOTH append `--settings` ONLY when that file exists (fail-open)"),
             "the row must state WHY existence is the load-bearing fact: {value}"
@@ -3395,6 +3422,8 @@ mod tests {
         // spawned sessions get no hook at all.
         let dark = claude_settings_carrier_reading(
             StopHookRegistration::Omitted,
+            crate::session::claude_hook::AgentEventHooks::Omitted,
+            None,
             Path::new("C:/hooks/claude_hook_settings-nostop.json"),
             false,
             None,
@@ -3487,6 +3516,8 @@ mod tests {
 
         let LayerReading::Known { value, .. } = claude_settings_carrier_reading(
             StopHookRegistration::Registered,
+            crate::session::claude_hook::AgentEventHooks::Omitted,
+            None,
             Path::new("C:/hooks/claude_hook_settings.json"),
             true,
             Some(jwt),

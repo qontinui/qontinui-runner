@@ -213,6 +213,21 @@ pub mod looping_agent;
 // `mcp::restart_readiness`).
 pub mod wind_down;
 
+// Agent truth (plan `2026-09-20-terminal-session-state-comes-from-events-not-
+// screen-scraping`, Phase 2): the ONE pure, clock-injected reducer that merges
+// hook / sideband / statusline / transcript / screen / regex observations into
+// a per-terminal verdict. In the lib crate beside `wind_down` for the same
+// reason: the whole precedence decision is `--lib`-tested, while the impure
+// ingest glue lives in the bin and adapts into this module's projections.
+pub mod agent_truth;
+
+// The pure half of the Claude Code hook ingest (same plan, Phases 3-4): the
+// allowlist projection the `POST /terminals/agent-event` route runs on every
+// body, and the `HookDelivery` decision. In the lib so the golden event
+// fixtures (`tests/claude_event_fixtures.rs`) drive the very projection the
+// route runs.
+pub mod agent_event;
+
 // "Did the server evaluate this request and refuse it, or did the transport
 // blip?" — the ONE structural-vs-transient HTTP classifier, plus the denial
 // tags a server names on the refusal. In the lib for the same reason as

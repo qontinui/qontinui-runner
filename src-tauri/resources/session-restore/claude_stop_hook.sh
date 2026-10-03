@@ -8,9 +8,12 @@
 #
 # THIS hook is the one whose REGISTRATION is gated, so — alone among the four
 # bundled scripts — its carrier is fixed: it is only ever registered in
-# `claude_hook_settings.json`, the ARMED variant. The dark variant
-# (`claude_hook_settings-nostop.json`) carries no `Stop` key at all, which is
-# what stops Claude spawning a `bash` for this script once per assistant turn.
+# `claude_hook_settings.json`, the ARMED variant (`claude_hook_settings-p<port>.json`
+# when the runner's agent-event http hooks are registered for that port). The
+# dark variant (`claude_hook_settings-nostop.json`, likewise port-suffixed)
+# carries no Stop COMMAND at all — only the spawn-free http agent-event entry —
+# which is what stops Claude spawning a `bash` for this script once per
+# assistant turn.
 # The short-circuit below therefore no longer covers runner-spawned sessions;
 # it still covers a HAND-STARTED `claude` that picks up an armed carrier left on
 # disk by a previously-armed runner. See `session::claude_hook`.

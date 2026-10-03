@@ -134,6 +134,18 @@ pub fn snapshot_context_low(lines: &[String], threshold_pct: u32) -> bool {
     false
 }
 
+/// The `N` of the first `"… until auto-compact: N%"` countdown on the rendered
+/// screen, if one is visible and parses. Feeds the `grid` context reading of
+/// the runner's session metrics (the value is measured against the
+/// auto-compact point, not the full window).
+pub fn snapshot_until_autocompact_pct(lines: &[String]) -> Option<u32> {
+    lines.iter().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let idx = lower.find(AUTO_COMPACT_MARKER)?;
+        parse_leading_percentage(lower.get(idx + AUTO_COMPACT_MARKER.len()..)?)
+    })
+}
+
 /// Parse the first `N%` in `s` (skipping leading whitespace/noise up to the
 /// first digit run). `None` when no `digits + '%'` shape is present.
 #[expect(
@@ -258,6 +270,22 @@ mod tests {
         // A just-spawned tab (blank grid) must read NOT idle — conservative.
         assert!(!snapshot_looks_idle(&lines(&["", "", ""]), 0));
         assert!(!snapshot_looks_idle(&[], 0));
+    }
+
+    #[test]
+    fn snapshot_until_autocompact_pct_reads_the_countdown() {
+        assert_eq!(
+            snapshot_until_autocompact_pct(&lines(&["x", "Context left until auto-compact: 8%"])),
+            Some(8)
+        );
+        assert_eq!(
+            snapshot_until_autocompact_pct(&lines(&["context low"])),
+            None
+        );
+        assert_eq!(
+            snapshot_until_autocompact_pct(&lines(&["until auto-compact: soon"])),
+            None
+        );
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────

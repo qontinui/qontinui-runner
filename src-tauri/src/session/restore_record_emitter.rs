@@ -667,6 +667,9 @@ mod tests {
         fn restore_tier(&self) -> RestoreTier {
             RestoreTier::TerminalOnly
         }
+        fn state_capabilities(&self) -> qontinui_runner_lib::agent_truth::StateCapabilities {
+            crate::session::provider_adapter::ClaudeAdapter.state_capabilities()
+        }
     }
 
     #[derive(serde::Deserialize)]

@@ -38,6 +38,7 @@ import {
   type SessionState,
   type ZoneAssignments,
 } from "../useZoneLayout";
+import { isNeedsInputState } from "../agentTruth";
 
 /** Read-only snapshot of every piece of state the rules can branch on. */
 export interface SuggestionContext {
@@ -135,7 +136,7 @@ export function ruleErrorInZone(ctx: SuggestionContext): ChipCandidate[] {
 export function ruleStuckNeedsInput(ctx: SuggestionContext): ChipCandidate[] {
   const out: ChipCandidate[] = [];
   for (const [zoneStr, tabId] of Object.entries(ctx.assignments)) {
-    if (ctx.sessionStates[tabId] !== "needs-input") continue;
+    if (!isNeedsInputState(ctx.sessionStates[tabId])) continue;
     const since = ctx.stateEntryMs[tabId];
     if (typeof since !== "number") continue;
     const elapsedMs = ctx.nowMs - since;

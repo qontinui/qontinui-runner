@@ -286,6 +286,10 @@ fn scan_once_blocking() {
     // only registered looping agents — see
     // `operator_touch_watch`'s module docs for why that seam was rejected.
     super::operator_touch_watch::scan_idle_touches_once();
+    // Agent truth changes with time alone (freshness TTLs, a human answering
+    // a permission prompt, `HookDelivery` turning `Absent`): re-publish on the
+    // same tick. No grid read. Plan 2026-09-20-terminal-session-state-….
+    super::agent_state::publish_all_once();
 }
 
 pub fn spawn_grid_scan_loop() {

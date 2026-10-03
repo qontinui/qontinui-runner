@@ -9,6 +9,12 @@ import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import {
+  isInferredVerdict,
+  isNeedsInputState,
+  stateChipTitle,
+  type AgentTruthEntry,
+} from "../agentTruth";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
@@ -46,6 +52,7 @@ export function ZoneLabel({
   allTabs,
   assignments,
   sessionStates,
+  agentTruth,
   onAssignTab,
   isPinned,
   onTogglePin,
@@ -65,6 +72,8 @@ export function ZoneLabel({
   allTabs: TerminalTab[];
   assignments: ZoneAssignments;
   sessionStates: Record<string, SessionState>;
+  /** The runner's verdict for this tab — drives the "inferred" affordance and the dropdown's state-source row. */
+  agentTruth?: AgentTruthEntry;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
   isPinned?: boolean;
   onTogglePin?: () => void;
@@ -140,9 +149,15 @@ export function ZoneLabel({
     >
       <div
         className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-          state === "needs-input" ? "animate-pulse" : ""
+          isNeedsInputState(state) ? "animate-pulse" : ""
         }`}
-        style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
+        style={{
+          backgroundColor: STATE_BORDER_COLORS[state],
+          opacity: isInferredVerdict(agentTruth?.verdict) ? 0.6 : 1,
+        }}
+        title={stateChipTitle(state, agentTruth)}
+        data-session-state={state}
+        data-state-inferred={isInferredVerdict(agentTruth?.verdict) ? "true" : undefined}
       />
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{tab.title}</span>
 
@@ -173,7 +188,11 @@ export function ZoneLabel({
           Claude session id — when the read is unavailable it shows a muted
           "?" with the reason, so absence-of-data never renders the same as
           "this session opened no PRs" (G5). */}
-      <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIndex} />
+      <SessionInfoDropdown
+        claudeSessionId={tab.claudeSessionId}
+        zoneIndex={zoneIndex}
+        agentTruth={agentTruth}
+      />
 
       {outputLineCount !== undefined && outputLineCount > 0 && (
         <span className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0">
@@ -262,7 +281,7 @@ export function ZoneLabel({
                 {allTabs.map((t) => {
                   const isCurrent = t.id === tab.id;
                   const assignedZone = Object.entries(assignments).find(([, id]) => id === t.id);
-                  const tabState = sessionStates[t.id] ?? "idle";
+                  const tabState = sessionStates[t.id] ?? "unknown";
 
                   return (
                     <button
@@ -279,7 +298,7 @@ export function ZoneLabel({
                       }`}
                     >
                       <div
-                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${tabState === "needs-input" ? "animate-pulse" : ""}`}
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${isNeedsInputState(tabState) ? "animate-pulse" : ""}`}
                         style={{ backgroundColor: STATE_BORDER_COLORS[tabState] }}
                       />
                       <span className="text-[10px] truncate flex-1">{t.title}</span>

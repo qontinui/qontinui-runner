@@ -27,6 +27,7 @@ import type {
   SessionSortBy,
   AccountUsageInfo,
 } from "./useSessionManager";
+import { isNeedsInputState } from "./agentTruth";
 
 interface SessionManagerHeaderProps {
   loading: boolean;
@@ -307,12 +308,12 @@ export function SessionManagerHeader({
           <button
             ref={filterNeedsInputRef}
             data-ui-bridge-id={SESSION_MANAGER_HEADER_IDS.filterNeedsInput}
-            aria-pressed={statusFilter === "needs-input"}
+            aria-pressed={isNeedsInputState(statusFilter)}
             onClick={() =>
-              onStatusFilterChange(statusFilter === "needs-input" ? "all" : "needs-input")
+              onStatusFilterChange(isNeedsInputState(statusFilter) ? "all" : "needs-input")
             }
             className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-              statusFilter === "needs-input"
+              isNeedsInputState(statusFilter)
                 ? "bg-[#e0af68]/20 text-[#e0af68] border border-[#e0af68]/30"
                 : "bg-[#1a1b26] text-[#e0af68]/70 border border-[#2a2d3d] hover:bg-[#e0af68]/10"
             }`}
