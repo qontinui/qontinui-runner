@@ -24,6 +24,14 @@ export const FALLBACK_TITLE = "Terminal";
 /** A bare drive (`C:`, `c:\`) or home (`~`, `~/`) path. */
 const BARE_ROOT_RE = /^(?:[A-Za-z]:[\\/]?|~[\\/]?)$/;
 
+/**
+ * A shell's default OSC 0/2 title, `user@host: <cwd>` (bash/zsh prompt titles).
+ * A shell in the home directory sends `user@host: ~`, which carries no path
+ * separator, so the separator test alone lets the cwd through (seen live on a
+ * temp runner: a titlebar reading `spinak@merytshost: ~`).
+ */
+const SHELL_PROMPT_TITLE_RE = /^[^\s@]+@[^\s:]+:/;
+
 function clean(s: string | undefined | null): string | undefined {
   if (typeof s !== "string") return undefined;
   const t = s.trim();
@@ -36,6 +44,7 @@ export function isPathShapedTitle(title: string, workingDir?: string): boolean {
   if (t.length === 0) return true;
   if (t.includes("/") || t.includes("\\")) return true;
   if (BARE_ROOT_RE.test(t)) return true;
+  if (SHELL_PROMPT_TITLE_RE.test(t)) return true;
   const wd = clean(workingDir);
   return wd !== undefined && t === wd;
 }
