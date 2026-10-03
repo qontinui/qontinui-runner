@@ -845,8 +845,9 @@ pub struct RunnerRestartUnreported {
 ///   "prior": a record that cannot say when its gate was bound is UNKNOWN, and
 ///   a post would race this process's own exit hook.
 ///
-/// The detail uses runner#1902's grammar, class first, so coord#2729 can
-/// classify it as `crashed` and re-deliver.
+/// The detail uses the exit-class grammar proposed by runner#1902, class first,
+/// so that once coord#2729 lands it classifies the loss as `crashed` and
+/// re-delivers it (both PRs are still open).
 pub fn runner_restart_unreported_report(
     rec: &TerminalSessionRecord,
     current_boot_ms: i64,
@@ -874,6 +875,20 @@ pub fn runner_restart_unreported_report(
         consuming_device_id,
         detail,
     })
+}
+
+/// The close observer's D2 step, as production runs it: read the
+/// just-closed record back through the observer's `Weak` store handle and
+/// decide via [`runner_restart_unreported_report`]. `main.rs`'s close-observer
+/// closure calls exactly this, so a test of it tests the production path.
+/// `None` when the store is gone, the record absent, or the decision says no.
+pub fn runner_restart_report_on_close(
+    store: &std::sync::Weak<SessionLifecycleStore>,
+    claude_session_id: &str,
+    current_boot_ms: i64,
+) -> Option<RunnerRestartUnreported> {
+    let rec = store.upgrade()?.get(claude_session_id)?;
+    runner_restart_unreported_report(&rec, current_boot_ms)
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -2533,22 +2548,35 @@ impl SessionLifecycleStore {
         self.snapshot_change(std::iter::once(changed));
     }
 
-    /// Adopt a gate continuation resumed by THIS process generation (plan
-    /// `2026-10-03-…` D3): when the OPEN record for `claude_session_id`
-    /// carries a gate identity bound by a PRIOR generation
-    /// (`gate_bound_boot_ms < current_boot_ms`, or no stamp at all), re-stamp
+    /// Adopt a gate continuation resumed by THIS process generation's boot
+    /// restore (plan `2026-10-03-…` D3): when the OPEN record for
+    /// `claude_session_id` carries a gate identity bound by a PRIOR generation
+    /// (`gate_bound_boot_ms < current_boot_ms`, or no stamp at all) AND this
+    /// boot's restore pass marked it, re-stamp
     /// `gate_bound_boot_ms = current_boot_ms` and return
-    /// `(terminal_id, gate_id)` so the caller can re-register the terminal as a
-    /// live continuation.
+    /// `(terminal_id, gate_id, consuming_device_id)` so the caller can
+    /// re-register the terminal as a live continuation.
+    ///
+    /// **The restore marker is required.** Reopening is not restoring: an
+    /// operator resuming a long-settled continuation by hand days later
+    /// (Past Sessions, shell integration) re-records it through the same doors,
+    /// and adopting that would re-register a continuation for a gate that was
+    /// resolved long ago and hold a cap slot for it. The boot-restore drain
+    /// stamps `restored_from_boot_at` via
+    /// [`Self::mark_restore_pending`] BEFORE it types the resume, i.e. before
+    /// either re-record door can fire, and the stamp is sticky — unlike
+    /// `restore_pending_at`, which the verified branch clears in a race with
+    /// the re-assert. So the predicate is `restored_from_boot_at >=
+    /// current_boot_ms`.
     ///
     /// `None` — and no write — for a record that is closed, absent, carries no
-    /// gate, or is already bound to this generation. That last arm makes the
-    /// call idempotent: every re-record after the first adoption is a no-op.
+    /// gate, was not restored by this boot, or is already bound to this
+    /// generation. That last arm makes the call idempotent.
     pub fn adopt_restored_gate(
         &self,
         claude_session_id: &str,
         current_boot_ms: i64,
-    ) -> Option<(String, uuid::Uuid)> {
+    ) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
         let (changed, adopted) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -2561,10 +2589,20 @@ impl SessionLifecycleStore {
             if rec.state != "open" || rec.terminal_id.trim().is_empty() {
                 return None;
             }
+            if !rec
+                .restored_from_boot_at
+                .is_some_and(|t| t >= current_boot_ms)
+            {
+                return None;
+            }
             let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
             if rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms) {
                 return None;
             }
+            let consuming_device_id = rec
+                .gate_consuming_device_id
+                .as_deref()
+                .and_then(|d| uuid::Uuid::parse_str(d.trim()).ok());
             rec.gate_bound_boot_ms = Some(current_boot_ms);
             let changed = rec.clone();
             self.persist(
@@ -2573,7 +2611,7 @@ impl SessionLifecycleStore {
                     rec: Box::new(changed.clone()),
                 }],
             );
-            let adopted = (changed.terminal_id.clone(), gate_id);
+            let adopted = (changed.terminal_id.clone(), gate_id, consuming_device_id);
             (changed, adopted)
         };
         info!(
@@ -8494,12 +8532,9 @@ mod gate_continuation_tests {
         {
             let fired = fired.clone();
             let weak = Arc::downgrade(&s);
+            // The SAME function main.rs's close observer calls.
             s.attach_close_observer(move |csid| {
-                if let Some(r) = weak
-                    .upgrade()
-                    .and_then(|st| st.get(csid))
-                    .and_then(|r| runner_restart_unreported_report(&r, boot))
-                {
+                if let Some(r) = runner_restart_report_on_close(&weak, csid, boot) {
                     fired.lock().unwrap().push(r);
                 }
             });
@@ -8588,9 +8623,15 @@ mod gate_continuation_tests {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
         s.record_open(gate_row(100));
+        // Not restored by this boot yet → not adopted.
+        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
+        // This boot's restore pass marks it.
+        s.mark_restore_pending(&csid);
         let adopted = s.adopt_restored_gate(&csid, 200).expect("prior generation adopts");
         assert_eq!(adopted.0, old_row().terminal_id);
         assert_eq!(adopted.1.to_string(), GATE);
+        assert_eq!(adopted.2.map(|d| d.to_string()).as_deref(), Some(DEVICE));
         assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(200));
         // Idempotent: already this generation's.
         assert_eq!(s.adopt_restored_gate(&csid, 200), None);
@@ -8598,6 +8639,7 @@ mod gate_continuation_tests {
         let mut plain = old_row();
         plain.claude_session_id = "plain".to_string();
         s.record_open(plain);
+        s.mark_restore_pending("plain");
         assert_eq!(s.adopt_restored_gate("plain", 200), None);
         // Closed → nothing.
         s.record_close(&csid, "no-terminal");
