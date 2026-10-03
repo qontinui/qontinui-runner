@@ -459,13 +459,19 @@ mod tests {
     /// and budget exhaustion rotate.
     #[test]
     fn test_only_account_capacity_rotates() {
-        for msg in ["Claude API error (429): rate limit exceeded", "Too Many Requests"] {
+        for msg in [
+            "Claude API error (429): rate limit exceeded",
+            "Too Many Requests",
+        ] {
             let kind = failure_kind(msg);
             assert_eq!(kind, Some(FailureKind::RateLimited), "{msg}");
             assert!(!migrates_account(kind), "{msg}");
             assert!(is_capacity_signal(kind), "{msg}");
         }
-        for msg in ["Claude AI usage limit reached|1790727000", "token limit exceeded"] {
+        for msg in [
+            "Claude AI usage limit reached|1790727000",
+            "token limit exceeded",
+        ] {
             let kind = failure_kind(msg);
             assert_eq!(kind, Some(FailureKind::QuotaExhausted), "{msg}");
             assert!(migrates_account(kind), "{msg}");

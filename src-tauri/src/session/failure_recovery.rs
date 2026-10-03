@@ -159,11 +159,9 @@ impl FailureNoticeSink for TauriFailureSink {
         }
         if crate::event_system::ws_notification_has_receivers(&app) {
             match serde_json::to_value(notice) {
-                Ok(v) => crate::event_system::broadcast_ws_notification(
-                    &app,
-                    SESSION_FAILURE_EVENT,
-                    &v,
-                ),
+                Ok(v) => {
+                    crate::event_system::broadcast_ws_notification(&app, SESSION_FAILURE_EVENT, &v)
+                }
                 Err(e) => warn!(error = %e, "session-failure notice did not serialize"),
             }
         }
@@ -251,7 +249,12 @@ pub fn clear_on_evidence(key: &str, evidence: Evidence) {
 fn clear_on_evidence_with(sink: &dyn FailureNoticeSink, key: &str, evidence: Evidence) {
     let gone = remove_where(key, |f| cleared_by(f.kind, evidence));
     if !gone.is_empty() {
-        info!(key, ?evidence, cleared = gone.len(), "session failure(s) cleared by evidence");
+        info!(
+            key,
+            ?evidence,
+            cleared = gone.len(),
+            "session failure(s) cleared by evidence"
+        );
     }
     announce_cleared(sink, key, gone);
 }
@@ -357,7 +360,10 @@ fn exit_tail_of_structured_failure(
     let RecoveryTarget::Structured { session_id, .. } = target else {
         return None;
     };
-    if !matches!(signal, FailureSignal::Exit { .. } | FailureSignal::Stderr(_)) {
+    if !matches!(
+        signal,
+        FailureSignal::Exit { .. } | FailureSignal::Stderr(_)
+    ) {
         return None;
     }
     active(session_id)
@@ -506,7 +512,10 @@ fn execute_pty(
         }
         RecoveryPolicy::ResumeSameId => {
             let Some(record) = record else {
-                info!(terminal_id, "exited pane has no session record — nothing to resume");
+                info!(
+                    terminal_id,
+                    "exited pane has no session record — nothing to resume"
+                );
                 return;
             };
             tauri::async_runtime::spawn(async move {
@@ -550,7 +559,11 @@ fn execute_structured(session_id: &str, restart: &dyn StructuredRestart, policy:
                 );
                 return;
             };
-            info!(session_id, delay_secs = delay.as_secs(), "backing off before an in-place restart");
+            info!(
+                session_id,
+                delay_secs = delay.as_secs(),
+                "backing off before an in-place restart"
+            );
             std::thread::sleep(delay);
             false
         }
@@ -627,10 +640,8 @@ fn resume_in_place(record: &TerminalSessionRecord) -> Result<String, String> {
         .as_deref()
         .ok_or("session has no working dir")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    if !crate::terminal::account_migration::migration_cap_permits(
-        &record.claude_session_id,
-        now_ms,
-    ) {
+    if !crate::terminal::account_migration::migration_cap_permits(&record.claude_session_id, now_ms)
+    {
         return Err("session's respawn cap is spent".into());
     }
     let app = crate::tauri_app_handle::current().ok_or("no app handle")?;
@@ -753,11 +764,26 @@ mod tests {
     /// Every kind has exactly the clear rule the module docs state.
     #[test]
     fn clear_rules_table() {
-        assert!(cleared_by(FailureKind::ResumeFailed, Evidence::HandshakeVerified));
-        assert!(!cleared_by(FailureKind::QuotaExhausted, Evidence::HandshakeVerified));
-        assert!(cleared_by(FailureKind::QuotaExhausted, Evidence::QuotaNotExhausted));
-        assert!(!cleared_by(FailureKind::RateLimited, Evidence::QuotaNotExhausted));
-        assert!(!cleared_by(FailureKind::ResumeFailed, Evidence::QuotaNotExhausted));
+        assert!(cleared_by(
+            FailureKind::ResumeFailed,
+            Evidence::HandshakeVerified
+        ));
+        assert!(!cleared_by(
+            FailureKind::QuotaExhausted,
+            Evidence::HandshakeVerified
+        ));
+        assert!(cleared_by(
+            FailureKind::QuotaExhausted,
+            Evidence::QuotaNotExhausted
+        ));
+        assert!(!cleared_by(
+            FailureKind::RateLimited,
+            Evidence::QuotaNotExhausted
+        ));
+        assert!(!cleared_by(
+            FailureKind::ResumeFailed,
+            Evidence::QuotaNotExhausted
+        ));
         for kind in [
             FailureKind::Unknown,
             FailureKind::ProcessExited,
@@ -802,7 +828,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(frame.kind, FailureKind::QuotaExhausted);
-        assert!(restart.0.lock().unwrap().is_empty(), "no recovery while the child runs");
+        assert!(
+            restart.0.lock().unwrap().is_empty(),
+            "no recovery while the child runs"
+        );
 
         // The exit, carrying a stderr the classifier would call a rate limit.
         let exit = report(
@@ -818,13 +847,25 @@ mod tests {
         assert_eq!(*restart.0.lock().unwrap(), vec![true]);
 
         // A non-zero exit with no stderr folds the same way.
-        report(target(), provider(), None, FailureSignal::Exit { code: Some(1) }).unwrap();
+        report(
+            target(),
+            provider(),
+            None,
+            FailureSignal::Exit { code: Some(1) },
+        )
+        .unwrap();
         assert_eq!(active(key).len(), 1);
 
         // A successful turn clears it; a later exit is then its own failure.
         clear_on_evidence_with(&Recorder::default(), key, Evidence::TurnSucceeded);
         assert!(active(key).is_empty());
-        let fresh = report(target(), provider(), None, FailureSignal::Exit { code: Some(1) }).unwrap();
+        let fresh = report(
+            target(),
+            provider(),
+            None,
+            FailureSignal::Exit { code: Some(1) },
+        )
+        .unwrap();
         assert_ne!(fresh.id, frame.id);
         assert_eq!(fresh.kind, FailureKind::ProcessExited);
         remove_where(key, |_| true);
@@ -844,8 +885,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(exit_tail_of_structured_failure(&pty(pty_key), &FailureSignal::Exit { code: Some(1) })
-            .is_none());
+        assert!(exit_tail_of_structured_failure(
+            &pty(pty_key),
+            &FailureSignal::Exit { code: Some(1) }
+        )
+        .is_none());
         remove_where(pty_key, |_| true);
     }
 
@@ -857,14 +901,24 @@ mod tests {
         let sink = Recorder::default();
         let key = "fr-test-term-1";
         let target = pty(key);
-        let first =
-            record_and_announce(&sink, &target, provider(), Some("/acct".into()), &grid("usage limit reached"))
-                .unwrap();
+        let first = record_and_announce(
+            &sink,
+            &target,
+            provider(),
+            Some("/acct".into()),
+            &grid("usage limit reached"),
+        )
+        .unwrap();
         assert_eq!(first.kind, FailureKind::QuotaExhausted);
         assert_eq!(first.account.as_deref(), Some("/acct"));
-        let again =
-            record_and_announce(&sink, &target, provider(), None, &grid("usage limit reached"))
-                .unwrap();
+        let again = record_and_announce(
+            &sink,
+            &target,
+            provider(),
+            None,
+            &grid("usage limit reached"),
+        )
+        .unwrap();
         assert_eq!(again.id, first.id, "a repeat keeps the row's id");
         assert_eq!(active(key).len(), 1);
         assert_eq!(
@@ -876,8 +930,14 @@ mod tests {
         );
 
         // A different kind stacks beside it.
-        record_and_announce(&sink, &target, provider(), None, &FailureSignal::HandshakeTimeout)
-            .unwrap();
+        record_and_announce(
+            &sink,
+            &target,
+            provider(),
+            None,
+            &FailureSignal::HandshakeTimeout,
+        )
+        .unwrap();
         assert_eq!(active(key).len(), 2);
         sink.take();
 
@@ -888,7 +948,10 @@ mod tests {
         // The probe confirms: re-worded, re-announced, still active.
         confirm(&sink, key, FailureKind::QuotaExhausted);
         let confirmed = active(key);
-        assert_eq!(confirmed[0].evidence.confidence, FailureConfidence::Confirmed);
+        assert_eq!(
+            confirmed[0].evidence.confidence,
+            FailureConfidence::Confirmed
+        );
         assert_eq!(confirmed[0].title, "Usage quota exhausted");
         assert_eq!(sink.take(), vec![(FailureKind::QuotaExhausted, true)]);
 
@@ -921,10 +984,22 @@ mod tests {
         let live_key = "fr-prune-live".to_string();
         let dead_key = "fr-prune-dead".to_string();
         let structured_key = "fr-prune-structured".to_string();
-        let f = record_and_announce(&sink, &pty(&live_key), provider(), None, &FailureSignal::HandshakeTimeout)
-            .unwrap();
-        record_and_announce(&sink, &pty(&dead_key), provider(), None, &FailureSignal::HandshakeTimeout)
-            .unwrap();
+        let f = record_and_announce(
+            &sink,
+            &pty(&live_key),
+            provider(),
+            None,
+            &FailureSignal::HandshakeTimeout,
+        )
+        .unwrap();
+        record_and_announce(
+            &sink,
+            &pty(&dead_key),
+            provider(),
+            None,
+            &FailureSignal::HandshakeTimeout,
+        )
+        .unwrap();
         record_and_announce(
             &sink,
             &RecoveryTarget::Structured {
@@ -939,9 +1014,16 @@ mod tests {
 
         let live: HashSet<&String> = [&live_key].into_iter().collect();
         prune_dead_terminals(&live, |k| k.starts_with("fr-prune-"));
-        assert!(active(&dead_key).is_empty(), "a closed terminal's failures go with it");
+        assert!(
+            active(&dead_key).is_empty(),
+            "a closed terminal's failures go with it"
+        );
         assert_eq!(active(&live_key).len(), 1);
-        assert_eq!(active(&structured_key).len(), 1, "structured keys are not terminals");
+        assert_eq!(
+            active(&structured_key).len(),
+            1,
+            "structured keys are not terminals"
+        );
 
         assert!(!dismiss(&live_key, "not-an-id"));
         assert!(dismiss(&live_key, &f.id));

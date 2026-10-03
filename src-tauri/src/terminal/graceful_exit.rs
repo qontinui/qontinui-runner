@@ -568,12 +568,14 @@ where
     match initial.subtree_claude.len() {
         0 => return GracefulExitOutcome::NoLiveClaude,
         1 => {}
-        n => return GracefulExitOutcome::Refused {
-            reason: format!(
+        n => {
+            return GracefulExitOutcome::Refused {
+                reason: format!(
                 "{n} AI CLI processes in the pane — a nested one does not leave with a typed exit"
             ),
-            claude_pids,
-        },
+                claude_pids,
+            }
+        }
     }
     if initial.top_level_children > 0 {
         return GracefulExitOutcome::Refused {

@@ -6315,9 +6315,8 @@ async fn run_continuation_terminal(
     // carries the runner-context briefing and that briefing's memory clause is
     // gated on the per-session provisioning OUTCOME (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-    let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -6809,7 +6808,9 @@ fn continuation_transcript_paths(
     selected_config_dir
         .map(std::path::PathBuf::from)
         .into_iter()
-        .chain(crate::terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE))
+        .chain(crate::terminal::transcript::find_transcript_config_dirs(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        ))
         .map(|dir| {
             crate::terminal::transcript::session_transcript_path(&dir, workdir, pinned_session_id)
         })
@@ -7417,9 +7418,8 @@ async fn run_condition_check_terminal(
         let ai = crate::settings::get_ai_settings();
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
-    let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
-        selected_config_dir.as_deref(),
-    );
+    let launch_cfg =
+        crate::session::launch_spec::LaunchConfig::from_settings(selected_config_dir.as_deref());
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
         // UNKNOWN, and honestly so: this function does NO coord-mcp
         // provisioning of its own — it relies entirely on the downstream PTY

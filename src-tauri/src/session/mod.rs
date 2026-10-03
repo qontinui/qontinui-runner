@@ -60,8 +60,8 @@ pub mod attach; // Remote-attach grants: the `attach_request` directive arm + de
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
+pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod codex_capture; // Codex read-back identity: the session id from its rollout file, matched by cwd (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 6)
-pub mod closeout_spool;// Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)

@@ -50,8 +50,8 @@ fn claude_fixture_dir() -> PathBuf {
 }
 
 fn read_frames(path: &Path) -> Vec<Value> {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .enumerate()
@@ -86,7 +86,9 @@ fn can_use_tool_request(frames: &[Value]) -> Option<&Value> {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())) {
+    for entry in
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    {
         let p = entry.unwrap().path();
         if p.is_dir() {
             walk(&p, out);
@@ -108,7 +110,11 @@ fn every_checked_in_fixture_line_parses_as_json() {
         .iter()
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ndjson"))
         .collect();
-    assert!(!ndjson.is_empty(), "no .ndjson fixtures under {}", fixtures_root().display());
+    assert!(
+        !ndjson.is_empty(),
+        "no .ndjson fixtures under {}",
+        fixtures_root().display()
+    );
     for p in ndjson {
         let frames = read_frames(p);
         assert!(!frames.is_empty(), "{} is empty", p.display());
@@ -122,7 +128,10 @@ fn every_checked_in_fixture_line_parses_as_json() {
         }
     }
     // Every manifest parses and names files that exist.
-    for m in files.iter().filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("manifest.json")) {
+    for m in files
+        .iter()
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("manifest.json"))
+    {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(m).unwrap())
             .unwrap_or_else(|e| panic!("{} is not JSON: {e}", m.display()));
         let dir = m.parent().unwrap();
@@ -142,10 +151,17 @@ fn checked_in_fixtures_are_redacted() {
     for p in files {
         let text = std::fs::read_to_string(&p).unwrap();
         for needle in ["/home/", "/Users/", "C:\\\\Users", "/run/user/", "sk-ant-"] {
-            assert!(!text.contains(needle), "{} contains unredacted `{needle}`", p.display());
+            assert!(
+                !text.contains(needle),
+                "{} contains unredacted `{needle}`",
+                p.display()
+            );
         }
         // Account block: identifiers replaced, not dropped.
-        for f in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        for f in text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        {
             if let Some(acct) = f.pointer("/response/response/account") {
                 assert_eq!(acct["email"], "redacted", "{}", p.display());
                 assert_eq!(acct["organization"], "redacted", "{}", p.display());
@@ -166,7 +182,10 @@ fn q1_can_use_tool_arrives_and_sdk_allow_is_accepted() {
     assert!(req["request"]["tool_use_id"].is_string());
 
     let sent = fixture("can_use_tool_sdk_allow_with_session_state_events.stdin.ndjson");
-    let resp = sent.iter().find(|f| is_type(f, "control_response")).expect("response sent");
+    let resp = sent
+        .iter()
+        .find(|f| is_type(f, "control_response"))
+        .expect("response sent");
     assert_eq!(resp["response"]["subtype"], "success");
     assert_eq!(resp["response"]["request_id"], req["request_id"]);
     assert_eq!(resp["response"]["response"]["behavior"], "allow");
@@ -187,11 +206,20 @@ fn q1_runner_allowed_true_shape_is_ignored_by_the_cli() {
     let frames = fixture("can_use_tool_runner_shape_ignored.ndjson");
     assert!(can_use_tool_request(&frames).is_some());
     let sent = fixture("can_use_tool_runner_shape_ignored.stdin.ndjson");
-    let resp = sent.iter().find(|f| is_type(f, "control_response")).unwrap();
+    let resp = sent
+        .iter()
+        .find(|f| is_type(f, "control_response"))
+        .unwrap();
     assert_eq!(resp["response"], json!({"allowed": true}));
-    assert!(result_frame(&frames).is_none(), "turn must hang with the runner shape");
+    assert!(
+        result_frame(&frames).is_none(),
+        "turn must hang with the runner shape"
+    );
     let last = frames.last().unwrap();
-    assert!(!is_type(last, "user"), "no tool_result after the runner-shaped reply");
+    assert!(
+        !is_type(last, "user"),
+        "no tool_result after the runner-shaped reply"
+    );
 }
 
 /// Q1: an SDK-shaped deny reaches the model as an error tool_result and is
@@ -201,9 +229,16 @@ fn q1_sdk_deny_becomes_error_tool_result_and_permission_denial() {
     let frames = fixture("can_use_tool_sdk_deny.ndjson");
     let tool_result = frames
         .iter()
-        .find(|f| is_type(f, "user") && f.pointer("/message/content/0/type").and_then(Value::as_str) == Some("tool_result"))
+        .find(|f| {
+            is_type(f, "user")
+                && f.pointer("/message/content/0/type").and_then(Value::as_str)
+                    == Some("tool_result")
+        })
         .expect("tool_result for the denied call");
-    assert_eq!(tool_result.pointer("/message/content/0/is_error"), Some(&Value::Bool(true)));
+    assert_eq!(
+        tool_result.pointer("/message/content/0/is_error"),
+        Some(&Value::Bool(true))
+    );
     let result = result_frame(&frames).unwrap();
     assert_eq!(result["permission_denials"][0]["tool_name"], "Write");
     assert_eq!(result["is_error"], false, "a denial is not an errored turn");
@@ -214,9 +249,15 @@ fn q1_sdk_deny_becomes_error_tool_result_and_permission_denial() {
 #[test]
 fn q2_rate_limit_event_default_session_state_changed_opt_in() {
     let plain = fixture("plain_turn.ndjson");
-    let rl = plain.iter().find(|f| is_type(f, "rate_limit_event")).expect("rate_limit_event");
+    let rl = plain
+        .iter()
+        .find(|f| is_type(f, "rate_limit_event"))
+        .expect("rate_limit_event");
     for k in ["status", "resetsAt", "rateLimitType"] {
-        assert!(rl["rate_limit_info"].get(k).is_some(), "rate_limit_info.{k}");
+        assert!(
+            rl["rate_limit_info"].get(k).is_some(),
+            "rate_limit_info.{k}"
+        );
     }
     assert!(!plain.iter().any(|f| is_system(f, "session_state_changed")));
 
@@ -247,7 +288,10 @@ fn q3_invalid_model_is_success_subtype_with_is_error_and_nonzero_exit() {
         &std::fs::read_to_string(claude_fixture_dir().join("manifest.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest["scenarios"]["errored_turn_invalid_model"]["exit_code"], 1);
+    assert_eq!(
+        manifest["scenarios"]["errored_turn_invalid_model"]["exit_code"],
+        1
+    );
     assert_eq!(manifest["scenarios"]["plain_turn"]["exit_code"], 0);
 }
 
@@ -255,7 +299,8 @@ fn q3_invalid_model_is_success_subtype_with_is_error_and_nonzero_exit() {
 // Live probes — #[ignore], need a logged-in `claude`
 // ─────────────────────────────────────────────────────────────────────────────
 
-const WRITE_PROMPT: &str = "Use the Write tool to create a file named probe.txt in the current directory \
+const WRITE_PROMPT: &str =
+    "Use the Write tool to create a file named probe.txt in the current directory \
 containing exactly the text: hello. Do not use any other tool. Then reply DONE.";
 const PONG_PROMPT: &str = "Reply with exactly the single word: pong";
 
@@ -290,7 +335,10 @@ struct Recording {
 
 impl Recording {
     fn frames(&self) -> Vec<Value> {
-        self.stdout.iter().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        self.stdout
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
     }
 }
 
@@ -344,7 +392,14 @@ fn run_scenario(sc: &Scenario) -> Recording {
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(claude_bin());
     cmd.current_dir(&cwd)
-        .args(["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"])
+        .args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+        ])
         .args(["--session-id", &session_id, "--model", sc.model])
         // Isolate from the operator's user settings / hooks / MCP servers: a
         // user-level allowlist or defaultMode would suppress `can_use_tool`.
@@ -373,12 +428,20 @@ fn run_scenario(sc: &Scenario) -> Recording {
     });
 
     let mut sent = Vec::new();
-    write_line(&mut child, &mut sent, &json!({
-        "type": "control_request", "request": {"subtype": "initialize", "protocolVersion": "1"}, "request_id": "req_1"
-    }));
-    write_line(&mut child, &mut sent, &json!({
-        "type": "user", "message": {"role": "user", "content": sc.prompt}, "session_id": "default"
-    }));
+    write_line(
+        &mut child,
+        &mut sent,
+        &json!({
+            "type": "control_request", "request": {"subtype": "initialize", "protocolVersion": "1"}, "request_id": "req_1"
+        }),
+    );
+    write_line(
+        &mut child,
+        &mut sent,
+        &json!({
+            "type": "user", "message": {"role": "user", "content": sc.prompt}, "session_id": "default"
+        }),
+    );
 
     let deadline = Instant::now() + sc.budget;
     let mut out = Vec::new();
@@ -394,7 +457,8 @@ fn run_scenario(sc: &Scenario) -> Recording {
             Ok(line) => {
                 if let Ok(f) = serde_json::from_str::<Value>(&line) {
                     if is_type(&f, "control_request")
-                        && f.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")
+                        && f.pointer("/request/subtype").and_then(Value::as_str)
+                            == Some("can_use_tool")
                     {
                         let rid = f["request_id"].as_str().unwrap_or_default().to_string();
                         if let Some(r) = respond(sc.responder, &rid, &f["request"]) {
@@ -423,7 +487,9 @@ fn run_scenario(sc: &Scenario) -> Recording {
         }
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() < exit_deadline => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) if Instant::now() < exit_deadline => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
             _ => {
                 let _ = child.kill();
                 killed = true;
@@ -455,19 +521,46 @@ fn redact(rec: &Recording) -> (String, String) {
     let mut maps: HashMap<&'static str, HashMap<String, String>> = HashMap::new();
     let cwd = rec.cwd.to_string_lossy().to_string();
     let rules: Vec<(Regex, &str)> = vec![
-        (Regex::new(r#""signature":"[^"]*""#).unwrap(), r#""signature":"redacted""#),
-        (Regex::new(r#""organization":"(?:[^"\\]|\\.)*""#).unwrap(), r#""organization":"redacted""#),
-        (Regex::new(r#""email":"[^"]*""#).unwrap(), r#""email":"redacted""#),
+        (
+            Regex::new(r#""signature":"[^"]*""#).unwrap(),
+            r#""signature":"redacted""#,
+        ),
+        (
+            Regex::new(r#""organization":"(?:[^"\\]|\\.)*""#).unwrap(),
+            r#""organization":"redacted""#,
+        ),
+        (
+            Regex::new(r#""email":"[^"]*""#).unwrap(),
+            r#""email":"redacted""#,
+        ),
         (Regex::new(r#""pid":\d+"#).unwrap(), r#""pid":0"#),
     ];
     let paths: Vec<(Regex, &str)> = vec![
-        (Regex::new(r#"/run/user/\d+/[^"\s]*"#).unwrap(), "/redacted/run"),
-        (Regex::new(r#"(?:/home|/Users)/[^"\s]*"#).unwrap(), "/redacted/path"),
-        (Regex::new(r#"-(?:home|Users)-[^/"\s]*"#).unwrap(), "-redacted-cwd"),
-        (Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap(), "redacted"),
+        (
+            Regex::new(r#"/run/user/\d+/[^"\s]*"#).unwrap(),
+            "/redacted/run",
+        ),
+        (
+            Regex::new(r#"(?:/home|/Users)/[^"\s]*"#).unwrap(),
+            "/redacted/path",
+        ),
+        (
+            Regex::new(r#"-(?:home|Users)-[^/"\s]*"#).unwrap(),
+            "-redacted-cwd",
+        ),
+        (
+            Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap(),
+            "redacted",
+        ),
     ];
     let ids: Vec<(&'static str, Regex)> = vec![
-        ("uuid", Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap()),
+        (
+            "uuid",
+            Regex::new(
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+            )
+            .unwrap(),
+        ),
         ("toolu", Regex::new(r"toolu_[A-Za-z0-9]+").unwrap()),
         ("msg", Regex::new(r"msg_[A-Za-z0-9]{12,}").unwrap()),
         ("req", Regex::new(r"req_[A-Za-z0-9]{16,}").unwrap()),
@@ -508,9 +601,13 @@ fn redact(rec: &Recording) -> (String, String) {
 fn persist(stem: &str, rec: &Recording) -> PathBuf {
     let (stdout, stdin) = redact(rec);
     let dir = if std::env::var("CLI_PROBES_RECORD").as_deref() == Ok("1") {
-        fixtures_root().join("claude").join(installed_claude_version())
+        fixtures_root()
+            .join("claude")
+            .join(installed_claude_version())
     } else {
-        std::env::temp_dir().join("cli_probes").join(installed_claude_version())
+        std::env::temp_dir()
+            .join("cli_probes")
+            .join(installed_claude_version())
     };
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{stem}.ndjson")), stdout).unwrap();
@@ -521,7 +618,9 @@ fn persist(stem: &str, rec: &Recording) -> PathBuf {
     let mut manifest: Value = std::fs::read_to_string(&manifest_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| json!({"cli": "claude", "cli_version": installed_claude_version(), "scenarios": {}}));
+        .unwrap_or_else(
+            || json!({"cli": "claude", "cli_version": installed_claude_version(), "scenarios": {}}),
+        );
     let entry = &mut manifest["scenarios"][stem];
     if !entry.is_object() {
         *entry = json!({});
@@ -530,7 +629,11 @@ fn persist(stem: &str, rec: &Recording) -> PathBuf {
     entry["stdin"] = json!(format!("{stem}.stdin.ndjson"));
     entry["exit_code"] = json!(rec.exit_code);
     entry["killed_by_probe_watchdog"] = json!(rec.killed);
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap() + "\n").unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+    )
+    .unwrap();
     eprintln!(
         "[cli_probes] {stem}: exit={:?} killed={} frames={} -> {}",
         rec.exit_code,
@@ -559,7 +662,10 @@ fn live_plain_turn() {
     let r = result_frame(&frames).expect("result frame");
     assert_eq!(r["is_error"], false);
     assert_eq!(rec.exit_code, Some(0));
-    assert!(frames.iter().any(|f| is_type(f, "rate_limit_event")), "Q2: rate_limit_event expected");
+    assert!(
+        frames.iter().any(|f| is_type(f, "rate_limit_event")),
+        "Q2: rate_limit_event expected"
+    );
 }
 
 #[test]
@@ -578,7 +684,10 @@ fn live_errored_turn_invalid_model() {
     persist(sc.stem, &rec);
     let frames = rec.frames();
     let r = result_frame(&frames).expect("result frame");
-    assert_eq!(r["is_error"], true, "Q3: is_error expected on an errored turn");
+    assert_eq!(
+        r["is_error"], true,
+        "Q3: is_error expected on an errored turn"
+    );
     assert_ne!(rec.exit_code, Some(0), "Q3: non-zero exit expected");
 }
 
@@ -597,14 +706,22 @@ fn live_can_use_tool_sdk_allow() {
     let rec = run_scenario(&sc);
     persist(sc.stem, &rec);
     let frames = rec.frames();
-    assert!(can_use_tool_request(&frames).is_some(), "Q1: can_use_tool expected");
+    assert!(
+        can_use_tool_request(&frames).is_some(),
+        "Q1: can_use_tool expected"
+    );
     assert_eq!(result_frame(&frames).expect("result")["is_error"], false);
     assert_eq!(
-        std::fs::read_to_string(rec.cwd.join("probe.txt")).ok().as_deref(),
+        std::fs::read_to_string(rec.cwd.join("probe.txt"))
+            .ok()
+            .as_deref(),
         Some("hello"),
         "the allowed Write must have run"
     );
-    assert!(frames.iter().any(|f| is_system(f, "session_state_changed")), "Q2: session_state_changed expected under the env opt-in");
+    assert!(
+        frames.iter().any(|f| is_system(f, "session_state_changed")),
+        "Q2: session_state_changed expected under the env opt-in"
+    );
 }
 
 #[test]
@@ -625,7 +742,10 @@ fn live_can_use_tool_sdk_deny() {
     assert!(can_use_tool_request(&frames).is_some());
     let r = result_frame(&frames).expect("result");
     assert_eq!(r["permission_denials"][0]["tool_name"], "Write");
-    assert!(!rec.cwd.join("probe.txt").exists(), "a denied Write must not run");
+    assert!(
+        !rec.cwd.join("probe.txt").exists(),
+        "a denied Write must not run"
+    );
 }
 
 #[test]
@@ -646,7 +766,10 @@ fn live_can_use_tool_runner_shape_is_ignored() {
     assert!(can_use_tool_request(&frames).is_some());
     // If this starts failing, the CLI began accepting the runner's shape:
     // re-record and revisit Phase 9's responder decision.
-    assert!(result_frame(&frames).is_none(), "runner-shaped reply unexpectedly completed the turn");
+    assert!(
+        result_frame(&frames).is_none(),
+        "runner-shaped reply unexpectedly completed the turn"
+    );
     assert!(rec.killed);
     assert!(!rec.cwd.join("probe.txt").exists());
 }
