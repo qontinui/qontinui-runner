@@ -4131,6 +4131,12 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   reads a quiesced machine as idle), `coord_next_step_settings_effective`
 ///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
 ///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
+///   and, NOT found by that diff but granted on coord's device floor by
+///   qontinui-coord#2733 (plan `2026-08-27-operator-touch-read-and-surface`),
+///   `coord_operator_touches` — a read-only operator-touch read whose
+///   `answer_via` points each `agent_dispatchable` touch at
+///   `coord_answer_agent_question` (question-backed) or the gate verbs
+///   (gate-backed). Until #2733 lands, coord refuses the forwarded call;
 /// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
 ///   fixer takes before acting on a PR it did not author),
 ///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
@@ -4223,6 +4229,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_next_step_settings_effective",
     "coord_notify_sensitive_action",
     "coord_operator_touch_classify",
+    "coord_operator_touches",
     "coord_orient",
     "coord_pending_agent_questions",
     "coord_post_finding",
@@ -15960,7 +15967,7 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
-    /// The agent escalate-evidence door and the ten device-floor names found
+    /// The agent escalate-evidence door and the device-floor names found
     /// beside it (see [`COORD_MCP_ALLOWED_TOOLS`]'s note) must be forwarded,
     /// while the operator escape hatch for the same block stays withheld. A
     /// literal enumeration, so dropping any one name — or moving the operator
@@ -15975,6 +15982,7 @@ mod coord_mcp_body_gate_tests {
             "coord_land_provenance_backfill",
             "coord_next_step_settings_effective",
             "coord_operator_touch_classify",
+            "coord_operator_touches",
             "coord_pending_agent_questions",
             "coord_primary_tree_branch_status",
             "coord_withdraw_agent_question",
