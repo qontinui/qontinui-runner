@@ -12,6 +12,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import {
+  admitAgentState,
   describeSkippedInferred,
   fetchTerminalAgentStates,
   isAuthoritativePermissionAsk,
@@ -206,6 +207,70 @@ describe("isNewerAgentState (M2: a snapshot never overwrites a newer event)", ()
     expect(isNewerAgentState(undefined, 1, "event")).toBe(true);
     expect(isNewerAgentState(5, undefined, "event")).toBe(true);
     expect(isNewerAgentState(5, undefined, "row")).toBe(true);
+  });
+});
+
+describe("publish epoch (N2: a restarted runner's seq restarts at 0)", () => {
+  it("lets a different epoch win whatever the seqs say, for events and rows", () => {
+    expect(isNewerAgentState(500, 1, "event", "boot-a", "boot-b")).toBe(true);
+    expect(isNewerAgentState(500, 1, "row", "boot-a", "boot-b")).toBe(true);
+    // Held from a runner build with no epoch: the first epoch'd verdict wins.
+    expect(isNewerAgentState(500, 1, "event", undefined, "boot-b")).toBe(true);
+  });
+
+  it("orders seqs as before within one epoch", () => {
+    expect(isNewerAgentState(5, 4, "event", "boot-a", "boot-a")).toBe(false);
+    expect(isNewerAgentState(5, 6, "event", "boot-a", "boot-a")).toBe(true);
+    expect(isNewerAgentState(5, 4, "row", "boot-a", "boot-a")).toBe(false);
+  });
+
+  it("resets the held seq on a new epoch, so the new runner's next event applies", () => {
+    let held = admitAgentState(undefined, { seq: 500, epoch: "boot-a" }, "event");
+    expect(held).toEqual({ seq: 500, epoch: "boot-a" });
+    // Runner restarted: seq 1 in a new epoch replaces seq 500.
+    held = admitAgentState(held!, { seq: 1, epoch: "boot-b" }, "event");
+    expect(held).toEqual({ seq: 1, epoch: "boot-b" });
+    // ...and the new epoch's seq 2 is newer, while a duplicate is not.
+    expect(admitAgentState(held!, { seq: 2, epoch: "boot-b" }, "event")).toEqual({
+      seq: 2,
+      epoch: "boot-b",
+    });
+    expect(admitAgentState(held!, { seq: 1, epoch: "boot-b" }, "event")).toBeNull();
+  });
+
+  it("keeps the held epoch for a runner build that sends none", () => {
+    expect(admitAgentState({ seq: 3, epoch: "boot-a" }, { seq: 4 }, "event")).toEqual({
+      seq: 4,
+      epoch: "boot-a",
+    });
+  });
+});
+
+describe("verdictOverridesLocalState after PROCESS EXIT (L6 leftover)", () => {
+  it("never lets a hook verdict replace a pane's exit-derived state", () => {
+    for (const state of [
+      { name: "working" },
+      { name: "turn_ended" },
+      { name: "needs_you", reason: "permission" },
+      { name: "failed", kind: "rate_limited" },
+      { name: "ended", why: "x" },
+    ] as AgentState[]) {
+      for (const source of ["hook", "sideband", "statusline", "transcript"] as const) {
+        for (const local of ["completed", "error"] as const) {
+          expect(verdictOverridesLocalState(verdict({ state, source }), local, true)).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("lets a new session start (`starting`) replace it", () => {
+    const start = verdict({ state: { name: "starting" }, source: "hook" });
+    expect(verdictOverridesLocalState(start, "completed", true)).toBe(true);
+    expect(verdictOverridesLocalState(start, "error", true)).toBe(true);
+  });
+
+  it("is unchanged for a live pane", () => {
+    expect(verdictOverridesLocalState(verdict({ source: "hook" }), "completed", false)).toBe(true);
   });
 });
 

@@ -494,16 +494,20 @@ mod tests {
         use crate::terminal::agent_state::AgentStateSlot;
         use qontinui_runner_lib::agent_truth::StateCapabilities;
 
+        // Identity clocks (reducer timeline == wall), so `set_at_ms` reads
+        // back as the stamp recorded.
+        let view =
+            |slot: &Mutex<AgentStateSlot>| slot.lock().unwrap().sideband_view_at(1_000, 1_000);
         let slot = Mutex::new(AgentStateSlot::new(StateCapabilities::claude()));
         assert!(record_observed_state(&slot, &status("working"), 100));
         assert_eq!(
-            slot.lock().unwrap().sideband_view(),
+            view(&slot),
             Some(ObservedAgentState {
                 state: "working".into(),
                 set_at_ms: 100
             })
         );
-        assert!(slot.lock().unwrap().sideband_view().unwrap().is_working());
+        assert!(view(&slot).unwrap().is_working());
 
         // A tool-name-only payload says nothing about working vs not.
         let stateless = AgentStatus {
@@ -511,12 +515,44 @@ mod tests {
             ..Default::default()
         };
         assert!(!record_observed_state(&slot, &stateless, 200));
-        assert_eq!(slot.lock().unwrap().sideband_view().unwrap().set_at_ms, 100);
+        assert_eq!(view(&slot).unwrap().set_at_ms, 100);
 
         assert!(record_observed_state(&slot, &status("finished"), 300));
-        let last = slot.lock().unwrap().sideband_view().unwrap();
+        let last = view(&slot).unwrap();
         assert_eq!((last.state.as_str(), last.set_at_ms), ("finished", 300));
         assert!(!last.is_working());
+    }
+
+    /// N1: the sideband is stamped on the reducer's MONOTONIC clock, but
+    /// wind-down folds `set_at_ms` with wall-clock stamps — so it must leave
+    /// the slot as wall clock even when the two timelines have drifted apart.
+    #[test]
+    fn sideband_set_at_is_wall_clock_even_when_the_anchor_is_skewed() {
+        use crate::terminal::agent_state::{self, AgentStateSlot};
+        use qontinui_runner_lib::agent_truth::StateCapabilities;
+
+        const HOUR_MS: i64 = 3_600_000;
+        agent_state::set_test_anchor_skew_ms(HOUR_MS);
+        let wall = || chrono::Utc::now().timestamp_millis();
+        let mono = i64::try_from(agent_state::now_ms()).unwrap();
+        let skew = mono - wall();
+        let slot = Mutex::new(AgentStateSlot::new(StateCapabilities::claude()));
+        // Stamped exactly as `dispatch` stamps it.
+        let accepted = record_observed_state(&slot, &status("working"), mono);
+        let view = slot.lock().unwrap().sideband_view();
+        let wall_after = wall();
+        agent_state::set_test_anchor_skew_ms(0);
+
+        assert!(
+            (skew - HOUR_MS).abs() < 1_000,
+            "the seam skewed the reducer clock (skew {skew}ms)"
+        );
+        assert!(accepted);
+        let set_at = view.expect("a sideband report").set_at_ms;
+        assert!(
+            (wall_after - set_at).abs() < 50,
+            "set_at_ms {set_at} is wall clock (now {wall_after})"
+        );
     }
 
     // ---- parsing ---------------------------------------------------------

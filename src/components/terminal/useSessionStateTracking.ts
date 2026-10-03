@@ -7,7 +7,7 @@ import {
   fetchTerminalAgentStates,
   isEventSourced,
   isNeedsInputState,
-  isNewerAgentState,
+  admitAgentState,
   isTerminalAgentStateEvent,
   offerAgentObservation,
   sessionStateToObservation,
@@ -15,6 +15,7 @@ import {
   verdictToSessionState,
   type AgentStateOrigin,
   type AgentTruthEntry,
+  type HeldAgentSeq,
   type TerminalAgentStateEvent,
 } from "./agentTruth";
 import { applyActivityDigest } from "./activityDigestTracking";
@@ -141,8 +142,13 @@ export function useSessionStateTracking(
    */
   const sessionStatesRef = useRef<Record<string, SessionState>>({});
   const agentVerdictsRef = useRef<Record<string, AgentTruthEntry>>({});
-  /** Highest runner publish `seq` applied per terminal (see `isNewerAgentState`). */
-  const agentSeqRef = useRef<Record<string, number>>({});
+  /** Highest runner publish `seq` (and its epoch) applied per terminal (see `admitAgentState`). */
+  const agentSeqRef = useRef<Record<string, HeldAgentSeq>>({});
+  /**
+   * Terminals whose PROCESS has exited. Their exit-derived `completed` /
+   * `error` is final: only a new session start may replace it (L6).
+   */
+  const exitedRef = useRef<Record<string, true>>({});
 
   const setSessionStates = useCallback<
     React.Dispatch<React.SetStateAction<Record<string, SessionState>>>
@@ -193,6 +199,7 @@ export function useSessionStateTracking(
         for (const tab of currentTabs) {
           const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
           const current = next[tab.id] ?? "unknown";
+          if (!tab.isAlive) exitedRef.current[tab.id] = true;
           if (!tab.isAlive && current !== "completed" && current !== "error") {
             next[tab.id] = tab.exitCode === 0 || tab.exitCode === null ? "completed" : "error";
             changed = true;
@@ -288,6 +295,9 @@ export function useSessionStateTracking(
     for (const id of Object.keys(activityBuffersRef.current)) {
       if (!tabIdSet.has(id)) delete activityBuffersRef.current[id];
     }
+    for (const id of Object.keys(exitedRef.current)) {
+      if (!tabIdSet.has(id)) delete exitedRef.current[id];
+    }
   }, [tabs, hotStore, setSessionStates]);
 
   // ── Runner verdicts (`terminal-agent-state`) ──────────────────────────────
@@ -301,8 +311,11 @@ export function useSessionStateTracking(
       if (!isTerminalAgentStateEvent(payload)) return;
       // The initial snapshot can resolve AFTER a live event; an older verdict
       // must never overwrite a newer one.
-      if (!isNewerAgentState(agentSeqRef.current[payload.terminalId], payload.seq, origin)) return;
-      if (typeof payload.seq === "number") agentSeqRef.current[payload.terminalId] = payload.seq;
+      const id = payload.terminalId;
+      // A new epoch (a restarted runner) always wins and resets the held seq.
+      const held = admitAgentState(agentSeqRef.current[id], payload, origin);
+      if (!held) return;
+      agentSeqRef.current[id] = held;
       const entry: AgentTruthEntry = {
         verdict: payload.verdict,
         hookDelivery: payload.hookDelivery ?? { status: "unknown" },
@@ -314,10 +327,14 @@ export function useSessionStateTracking(
       if (entry.verdict.state.name === "unknown") return;
       if (!tabsRef.current.some((t) => t.id === payload.terminalId)) return;
       // An echo of the webview's own fallback offer never overwrites what the
-      // webview derived since (e.g. `completed` on process exit).
-      if (!verdictOverridesLocalState(entry.verdict, sessionStatesRef.current[payload.terminalId])) {
+      // webview derived since, and once the pane's PROCESS exited only a new
+      // session start may replace the exit-derived state (L6).
+      const exited =
+        !!exitedRef.current[id] || tabsRef.current.some((t) => t.id === id && !t.isAlive);
+      if (!verdictOverridesLocalState(entry.verdict, sessionStatesRef.current[id], exited)) {
         return;
       }
+      if (exited) delete exitedRef.current[id];
       const mapped = verdictToSessionState(entry.verdict);
       setSessionStates((prev) =>
         prev[payload.terminalId] === mapped ? prev : { ...prev, [payload.terminalId]: mapped },
@@ -444,6 +461,7 @@ export function useSessionStateTracking(
 
   const handleExit = useCallback((terminalId: string, exitCode: number | null) => {
     // Note: the caller (TerminalPage) should also call updateTab to set isAlive/exitCode
+    exitedRef.current[terminalId] = true;
     setSessionStates((prev) => ({
       ...prev,
       [terminalId]: exitCode === 0 || exitCode === null ? "completed" : "error",

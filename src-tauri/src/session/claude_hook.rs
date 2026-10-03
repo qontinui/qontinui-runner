@@ -29,10 +29,11 @@
 //!     corresponding materialized script. **`permissions.allow` rides this same
 //!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
 //!     built structurally rather than by text surgery — see [`build_settings`].
-//!     The `Stop` key is registered ONLY when the continuation flag is armed
-//!     (see [`StopHookRegistration`]); a dark session gets the `-nostop` file,
-//!     which has no `Stop` key at all, so Claude never spawns `bash` for it once
-//!     per assistant turn. The two variants use DISTINCT FILENAMES because the
+//!     The `Stop` COMMAND hook is registered ONLY when the continuation flag is
+//!     armed (see [`StopHookRegistration`]); a dark session gets the `-nostop`
+//!     file, which has no Stop COMMAND hook (the http agent-event Stop hook is
+//!     present when the runner port resolves), so Claude never spawns `bash`
+//!     for it once per assistant turn. The two variants use DISTINCT FILENAMES because the
 //!     hook dir is machine-global — see [`session_restore_dir`].
 //!   * the agent-event `type: "http"` hooks ([`AGENT_EVENT_HOOKS`], plan
 //!     `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
@@ -104,7 +105,8 @@ const HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_s
 /// The script is materialized UNCONDITIONALLY (so [`hook_files`] stays
 /// variant-independent), but its REGISTRATION in the delivered settings is
 /// gated on the flag — see [`StopHookRegistration`]. A dark session therefore
-/// gets no `Stop` key at all rather than a registered hook whose script exits
+/// gets no Stop COMMAND hook (the http agent-event Stop hook is present when
+/// the runner port resolves) rather than a registered hook whose script exits
 /// immediately: the script-level early exit still cost one `bash` spawn per
 /// assistant turn, which is exactly what the gating removes.
 const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
@@ -275,7 +277,8 @@ impl AgentEventHooks {
 /// Whether the delivered settings registers the `Stop` continuation hook.
 ///
 /// The Stop-hook SCRIPT is always materialized; this decides only whether the
-/// settings file carries a `hooks.Stop` key. Claude Code spawns `bash` once per
+/// settings file carries the `hooks.Stop` COMMAND hook (the http agent-event
+/// Stop hook rides both variants when the runner port resolves). Claude Code spawns `bash` once per
 /// assistant turn for every registered `Stop` hook — even one that exits
 /// immediately — so a dark session must not register it at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

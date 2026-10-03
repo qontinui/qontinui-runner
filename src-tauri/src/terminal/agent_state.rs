@@ -96,7 +96,66 @@ fn wall_now_ms() -> u64 {
 /// The process's one `Instant` ↔ unix-millis anchor, taken on first use.
 fn clock_anchor() -> (Instant, u64) {
     static ANCHOR: OnceLock<(Instant, u64)> = OnceLock::new();
-    *ANCHOR.get_or_init(|| (Instant::now(), wall_now_ms()))
+    let (base, base_ms) = *ANCHOR.get_or_init(|| (Instant::now(), wall_now_ms()));
+    (base, apply_test_anchor_skew(base_ms))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: shifts this THREAD's view of the anchor's unix millis, to
+    /// model a wall clock that stepped after the anchor was taken.
+    static TEST_ANCHOR_SKEW_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: skew this thread's anchor by `skew_ms` (0 restores it).
+#[cfg(test)]
+pub(crate) fn set_test_anchor_skew_ms(skew_ms: i64) {
+    TEST_ANCHOR_SKEW_MS.with(|c| c.set(skew_ms));
+}
+
+#[cfg(test)]
+fn apply_test_anchor_skew(base_ms: u64) -> u64 {
+    let skew = TEST_ANCHOR_SKEW_MS.with(|c| c.get());
+    base_ms.saturating_add_signed(skew)
+}
+
+#[cfg(not(test))]
+fn apply_test_anchor_skew(base_ms: u64) -> u64 {
+    base_ms
+}
+
+/// Map a reducer stamp ([`now_ms`] timeline) to wall-clock unix millis, for a
+/// consumer that compares it with `chrono::Utc::now()` / `Date.now()`. The
+/// reducer's timeline drifts from the wall clock by every wall step since the
+/// anchor, so the stamp is carried over as an AGE: `wall_now - (mono_now -
+/// mono_ts)` (a future stamp clamps to `wall_now`).
+fn mono_to_wall_at(mono_ts: u64, mono_now: u64, wall_now: u64) -> u64 {
+    wall_now.saturating_sub(mono_now.saturating_sub(mono_ts))
+}
+
+/// The inverse of [`mono_to_wall_at`]: a wall-clock stamp (the grid-idle
+/// tracker's) placed on the reducer's timeline by its age.
+fn wall_to_mono_at(wall_ts: u64, mono_now: u64, wall_now: u64) -> u64 {
+    mono_now.saturating_sub(wall_now.saturating_sub(wall_ts))
+}
+
+/// A verdict with every reducer stamp it carries mapped to wall clock — the
+/// form that leaves this module (events, reads, rows).
+fn verdict_to_wall(v: Verdict, mono_now: u64, wall_now: u64) -> Verdict {
+    use qontinui_runner_lib::agent_truth::Disagreement;
+    let to_wall = |t: u64| mono_to_wall_at(t, mono_now, wall_now);
+    Verdict {
+        since_ms: v.since_ms.map(to_wall),
+        disagreement: v.disagreement.map(|d| match d {
+            Disagreement::QuietWhileWorking { grid_idle_since_ms } => {
+                Disagreement::QuietWhileWorking {
+                    grid_idle_since_ms: to_wall(grid_idle_since_ms),
+                }
+            }
+            other => other,
+        }),
+        ..v
+    }
 }
 
 /// The reducer's clock: unix millis that never step backwards. Derived from
@@ -112,9 +171,16 @@ pub fn now_ms() -> u64 {
 fn instant_to_unix_ms(at: Instant) -> u64 {
     let (base, base_ms) = clock_anchor();
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    // FLOOR on both sides of the anchor (an instant 0.5ms before it is -1, not
+    // 0), so `at + 1s` always maps exactly 1000ms later — truncating toward
+    // the anchor made an instant just before it collide with one just after.
     match at.checked_duration_since(base) {
         Some(after) => base_ms.saturating_add(ms(after)),
-        None => base_ms.saturating_sub(ms(base.duration_since(at))),
+        None => {
+            let before = base.duration_since(at);
+            let ceil = ms(before) + u64::from(before.subsec_nanos() % 1_000_000 != 0);
+            base_ms.saturating_sub(ceil)
+        }
     }
 }
 
@@ -221,6 +287,15 @@ pub fn note_unreadable_body(why: UnreadableBody) {
 /// replaced under the same terminal id.
 static PUBLISH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// This process's publish epoch: a random boot id minted once. `seq` restarts
+/// at 0 with every runner process, so a webview that outlives a runner
+/// restart compares seqs only within one epoch — a different epoch always
+/// wins and resets the seq it holds.
+pub fn publish_epoch() -> &'static str {
+    static EPOCH: OnceLock<String> = OnceLock::new();
+    EPOCH.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // The slot
 // ---------------------------------------------------------------------------
@@ -318,6 +393,16 @@ impl AgentStateSlot {
     /// always read (`working | waiting_human | blocked | finished`). Kept until
     /// plan Phase 9 moves wind-down onto the verdict.
     pub fn sideband_view(&self) -> Option<ObservedAgentState> {
+        self.sideband_view_at(now_ms(), wall_now_ms())
+    }
+
+    /// [`Self::sideband_view`] against explicit clocks (`mono_now` on the
+    /// reducer's timeline, `wall_now` unix wall millis).
+    pub(crate) fn sideband_view_at(
+        &self,
+        mono_now: u64,
+        wall_now: u64,
+    ) -> Option<ObservedAgentState> {
         let (state, at) = self.truth.last_reported(Source::Sideband)?;
         let word = match state {
             AgentState::Working => "working",
@@ -325,9 +410,11 @@ impl AgentStateSlot {
             AgentState::Failed { .. } => "blocked",
             _ => "finished",
         };
+        // `at` is on the reducer's monotonic timeline; wind-down folds
+        // `set_at_ms` with wall-clock stamps, so it leaves as wall clock.
         Some(ObservedAgentState {
             state: word.to_string(),
-            set_at_ms: i64::try_from(at).unwrap_or(i64::MAX),
+            set_at_ms: i64::try_from(mono_to_wall_at(at, mono_now, wall_now)).unwrap_or(i64::MAX),
         })
     }
 
@@ -421,6 +508,8 @@ pub struct LastSeenAges {
 #[serde(rename_all = "camelCase")]
 pub struct AgentStateEvent {
     pub terminal_id: String,
+    /// [`publish_epoch`]: `seq` is ordered only within one epoch.
+    pub epoch: &'static str,
     /// This publish's per-terminal sequence number (strictly increasing).
     pub seq: u64,
     pub verdict: Verdict,
@@ -432,6 +521,8 @@ pub struct AgentStateEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalAgentState {
     pub terminal_id: String,
+    /// [`publish_epoch`]: `seq` is ordered only within one epoch.
+    pub epoch: &'static str,
     /// The `seq` of the terminal's last publish when this row was read. The
     /// row is at least as new as that publish, so a reader holding a HIGHER
     /// `seq` (from an event) must discard the row.
@@ -714,6 +805,7 @@ pub fn read_session(
     let (metrics, _) = crate::terminal::agent_metrics::compute(session, terminal_id, false);
     TerminalAgentState {
         terminal_id: terminal_id.to_string(),
+        epoch: publish_epoch(),
         seq,
         verdict,
         hook_delivery: delivery,
@@ -744,6 +836,7 @@ fn compute(
     consume: bool,
 ) -> (TerminalAgentStateParts, bool) {
     let now = now_ms();
+    let wall_now = wall_now_ms();
     let slots = session.last_input();
     let input = InputEvidence {
         // Any human or runner input, control responses excluded — the
@@ -752,8 +845,9 @@ fn compute(
     };
     let runner_submit_ms = slots.last_submit.as_ref().map(|o| instant_to_unix_ms(o.at));
     let grid = with_grid.then(|| match session.observe_grid_idle() {
+        // The tracker stamps wall clock; the reducer runs on `now_ms`.
         qontinui_runner_lib::wind_down::GridIdle::Idle { since_ms } => GridIdle::Idle {
-            since_ms: u64::try_from(since_ms).unwrap_or(0),
+            since_ms: wall_to_mono_at(u64::try_from(since_ms).unwrap_or(0), now, wall_now),
         },
         qontinui_runner_lib::wind_down::GridIdle::Busy => GridIdle::Busy,
         qontinui_runner_lib::wind_down::GridIdle::Unknown => GridIdle::Unknown,
@@ -783,6 +877,9 @@ fn compute(
     let changed = consume && guard.take_if_changed(verdict, &delivery);
     let ages = guard.last_seen_ages(now);
     let seq = guard.published_seq();
+    // Change detection above compared reducer-timeline verdicts; what leaves
+    // the module is wall clock.
+    let verdict = verdict_to_wall(verdict, now, wall_now);
     (
         TerminalAgentStateParts {
             verdict,
@@ -821,6 +918,7 @@ pub fn publish_session(session: &crate::terminal::session::TerminalSession, term
             &app,
             &AgentStateEvent {
                 terminal_id: terminal_id.to_string(),
+                epoch: publish_epoch(),
                 seq: parts.seq,
                 verdict: parts.verdict,
                 hook_delivery: parts.delivery,
@@ -1372,6 +1470,53 @@ mod tests {
     }
 
     #[test]
+    fn agent_event_reducer_stamps_cross_the_boundary_by_age() {
+        // The reducer's timeline runs an hour ahead of the wall clock (a wall
+        // step back since the anchor): a stamp 5s old is still 5s old.
+        let (mono_now, wall_now) = (NOW + 3_600_000, NOW);
+        assert_eq!(
+            mono_to_wall_at(mono_now - 5_000, mono_now, wall_now),
+            NOW - 5_000
+        );
+        assert_eq!(
+            wall_to_mono_at(NOW - 5_000, mono_now, wall_now),
+            mono_now - 5_000
+        );
+        // A future stamp clamps to "now" rather than wrapping.
+        assert_eq!(mono_to_wall_at(mono_now + 10, mono_now, wall_now), wall_now);
+
+        use qontinui_runner_lib::agent_truth::{Confidence, Disagreement};
+        let v = Verdict {
+            state: AgentState::Working,
+            source: Some(Source::Hook),
+            since_ms: Some(mono_now - 7_000),
+            confidence: Some(Confidence::Authoritative),
+            disagreement: Some(Disagreement::QuietWhileWorking {
+                grid_idle_since_ms: mono_now - 2_000,
+            }),
+        };
+        let w = verdict_to_wall(v, mono_now, wall_now);
+        assert_eq!(w.since_ms, Some(NOW - 7_000));
+        assert_eq!(
+            w.disagreement,
+            Some(Disagreement::QuietWhileWorking {
+                grid_idle_since_ms: NOW - 2_000
+            })
+        );
+        assert_eq!(
+            (w.state, w.source, w.confidence),
+            (v.state, v.source, v.confidence)
+        );
+    }
+
+    #[test]
+    fn agent_event_publish_epoch_is_one_boot_id_per_process() {
+        let e = publish_epoch();
+        assert_eq!(e.len(), 32, "a uuid boot id: {e}");
+        assert!(std::ptr::eq(e, publish_epoch()), "minted once");
+    }
+
+    #[test]
     fn agent_event_publish_change_detection() {
         let mut slot = AgentStateSlot::new(StateCapabilities::claude());
         let d = HookDelivery::Unknown { evidence: None };
@@ -1384,6 +1529,7 @@ mod tests {
     fn agent_event_wire_payload_is_camel_case() {
         let ev = AgentStateEvent {
             terminal_id: "t1".into(),
+            epoch: publish_epoch(),
             seq: 7,
             verdict: Verdict::UNKNOWN,
             hook_delivery: HookDelivery::Installed,
@@ -1391,6 +1537,7 @@ mod tests {
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["terminalId"], "t1");
         assert_eq!(v["seq"], 7);
+        assert_eq!(v["epoch"], publish_epoch());
         assert_eq!(v["verdict"]["state"]["name"], "unknown");
         assert_eq!(
             v["hookDelivery"],
@@ -1398,6 +1545,7 @@ mod tests {
         );
         let row = TerminalAgentState {
             terminal_id: "t1".into(),
+            epoch: publish_epoch(),
             seq: 3,
             verdict: Verdict::UNKNOWN,
             hook_delivery: HookDelivery::Installed,
@@ -1409,6 +1557,7 @@ mod tests {
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["seq"], 3);
+        assert_eq!(v["epoch"], publish_epoch());
         assert_eq!(v["lastSeenAgeMs"]["hook"], 5);
         assert!(v["lastSeenAgeMs"]["screen_stability"].is_null());
         assert!(v["metrics"]["contextUsedPct"].is_null());
