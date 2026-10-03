@@ -352,7 +352,7 @@ def main() -> int:
     # A workflow_dispatch runs on this repo's own ref; a pull_request carries its head repo.
     same_repo = event == "workflow_dispatch" or (bool(head_repo) and head_repo.lower() == repo.lower())
     stall_minutes = env_number("RUNNER_PUBLIC_POOL_STALL_MINUTES", DEFAULT_STALL_MINUTES)
-    max_depth = int(env_number("RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH))
+    max_depth = max(1, int(env_number("RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)))
     lanes = {os_key: os.environ.get(LANE_VARS[os_key]) for os_key in POOL_LABELS}
     sources = {os_key: os.environ.get(f"{LANE_VARS[os_key]}_SOURCE") or f"repo variable {LANE_VARS[os_key]}" for os_key in POOL_LABELS}
 

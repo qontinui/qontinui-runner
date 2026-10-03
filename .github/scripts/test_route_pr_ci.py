@@ -367,5 +367,122 @@ class TreePins(unittest.TestCase):
         self.assertIn("|| true", str(route["steps"][-1].get("run", "")))
 
 
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class PrepareActionShell(unittest.TestCase):
+    """Runs public-pool-prepare's actual shell body against temp dirs.
+
+    The YAML-shape pins cannot see a shell defect (a glob under `set -f` once made
+    the size cap dead code), so this executes the script itself.
+    """
+
+    ACTION = HERE.parent / "actions" / "public-pool-prepare" / "action.yml"
+
+    def run_prepare(self, tmp, **env_over):
+        import subprocess
+
+        with open(self.ACTION, encoding="utf-8") as fh:
+            script = yaml.safe_load(fh)["runs"]["steps"][0]["run"]
+        tmp = Path(tmp)
+        for d in ("work/qontinui-runner", "home", "rt"):
+            (tmp / d).mkdir(parents=True, exist_ok=True)
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp / "home"),
+            "RUNNER_OS": "Linux",
+            "RUNNER_TEMP": str(tmp / "rt"),
+            "GITHUB_RUN_ID": "7",
+            "GITHUB_WORKSPACE": str(tmp / "work/qontinui-runner"),
+            "GITHUB_ENV": str(tmp / "env"),
+            "GITHUB_PATH": str(tmp / "path"),
+            "SIBLINGS": "",
+            "CHECK_BUILD_DEPS": "false",
+            "CHECK_RUST": "false",
+            "MAX_TARGET_GB": "200",
+            "TARGET_KEY": "",
+        }
+        env.update(env_over)
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+
+    def test_no_glob_while_set_f(self):
+        text = self.ACTION.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r'"\}?/\*/?', "a glob would be inert under set -f")
+
+    def test_siblings_removed_symlinks_not_followed(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "work/ui-bridge/x").mkdir(parents=True)
+            outside = t / "outside"
+            outside.mkdir()
+            (outside / "f").write_text("keep")
+            outside.chmod(0o555)
+            (t / "work/qontinui-schemas").symlink_to(outside)
+            r = self.run_prepare(tmp, SIBLINGS="ui-bridge qontinui-schemas")
+            mode_after = outside.stat().st_mode & 0o777
+            outside.chmod(0o755)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertFalse((t / "work/ui-bridge").exists())
+            self.assertFalse((t / "work/qontinui-schemas").is_symlink())
+            self.assertTrue((outside / "f").exists())
+            self.assertEqual(oct(mode_after), oct(0o555), "symlink target was chmod-ed through the link")
+            self.assertTrue((t / "work/qontinui-runner").exists())
+
+    def test_bad_sibling_name_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertNotEqual(self.run_prepare(tmp, SIBLINGS="../x").returncode, 0)
+            self.assertNotEqual(self.run_prepare(tmp, SIBLINGS="*").returncode, 0)
+
+    def test_env_exports_and_no_target_without_key(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.run_prepare(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            env = (Path(tmp) / "env").read_text()
+            self.assertNotIn("CARGO_TARGET_DIR=", env)
+            for key in ("HOME=", "CARGO_HOME=", "RUSTUP_HOME=", "XDG_CONFIG_HOME=", "XDG_CACHE_HOME="):
+                self.assertIn(key, env)
+            self.assertIn(f"HOME={tmp}/rt/home", env)
+
+    def test_cap_prunes_oldest_first_and_stale_by_age(self):
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "home/.cache/qontinui-runner-ci/targets"
+            for name, age_days in (("pr-old", 1), ("pr-new", 0), ("pr-stale", 5)):
+                d = root / name
+                d.mkdir(parents=True)
+                (d / "blob").write_bytes(b"x" * 1024)
+                t = time.time() - age_days * 86400
+                os.utime(d, (t, t))
+            r = self.run_prepare(tmp, TARGET_KEY="pr-9-test", MAX_TARGET_GB="0")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            left = sorted(p.name for p in root.iterdir())
+            self.assertNotIn("pr-stale", left)   # age prune
+            self.assertNotIn("pr-old", left)     # cap prune, oldest first
+            self.assertIn("pr-9-test", left)
+            env = (Path(tmp) / "env").read_text()
+            self.assertIn(f"CARGO_TARGET_DIR={root}/pr-9-test", env)
+
+    def test_bad_target_key_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertNotEqual(self.run_prepare(tmp, TARGET_KEY="../escape").returncode, 0)
+
+    def test_writable_rustup_home_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "home/.rustup").mkdir(parents=True)
+            r = self.run_prepare(tmp, CHECK_RUST="true")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("RUSTUP_HOME is not operator-owned", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

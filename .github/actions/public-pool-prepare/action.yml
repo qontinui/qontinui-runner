@@ -95,7 +95,12 @@ runs:
         grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null || true
 
         # Remove a path, tolerating read-only modes; never fail the job on it.
-        zap() { chmod -R u+w -- "$1" 2>/dev/null || true; rm -rf -- "$1" 2>/dev/null || { echo "::warning::could not remove $1"; return 1; }; }
+        zap() {
+          # A symlink is removed, never followed (chmod -R would follow it).
+          if [ -L "$1" ]; then rm -f -- "$1"; return; fi
+          chmod -R u+w -- "$1" 2>/dev/null || true
+          rm -rf -- "$1" 2>/dev/null || { echo "::warning::could not remove $1"; return 1; }
+        }
 
         # 1. Stale sibling checkouts -- exactly the named directories.
         parent="$(cd "${GITHUB_WORKSPACE}/.." && pwd)"
@@ -132,23 +137,30 @@ runs:
         real_home="${HOME}"
         rustup_home="${RUSTUP_HOME:-${real_home}/.rustup}"
 
-        # 5 (run early). Rust toolchain: verified, never installed; RUSTUP_HOME read-only.
+        # 5. (runs before 3 and 4) Rust toolchain: verified, never installed. The job account must neither
+        #    own nor be able to write RUSTUP_HOME (any level) or the toolchain's bin;
+        #    PATH gets the TOOLCHAIN's bin dir, never the rustup proxy dir (which a
+        #    default install puts in the job account's own ~/.cargo/bin).
         if [ "${CHECK_RUST}" = "true" ]; then
-          if [ -w "${rustup_home}" ]; then
-            echo "::error title=public-pool RUSTUP_HOME is writable::${rustup_home} is writable by $(id -un); a routed job could change the toolchain every later job runs. Host prerequisite: operator-owned, read-only RUSTUP_HOME with 1.95.0 (+clippy, rustfmt) preinstalled"
+          me_u="$(id -u)"; me_n="$(id -un)"
+          if [ ! -d "${rustup_home}" ] || [ "$(stat -c %u "${rustup_home}")" = "${me_u}" ] \
+             || [ -n "$(find "${rustup_home}" -maxdepth 3 \( -user "${me_n}" -o -writable \) -print -quit 2>/dev/null)" ]; then
+            echo "::error title=public-pool RUSTUP_HOME is not operator-owned read-only::${rustup_home} is missing, owned by ${me_n}, or writable by it somewhere; a routed job could change the toolchain every later job runs. Host prerequisite: operator-owned, read-only RUSTUP_HOME with 1.95.0 (+clippy, rustfmt) preinstalled"
             exit 1
           fi
-          rustup_bin="$(command -v rustup || true)"
-          if [ -z "${rustup_bin}" ]; then
-            echo "::error::rustup not on PATH for $(id -un) -- host prerequisite"; exit 1
+          command -v rustup >/dev/null || { echo "::error::rustup not on PATH for ${me_n} -- host prerequisite"; exit 1; }
+          cargo_bin="$(RUSTUP_HOME="${rustup_home}" rustup which --toolchain 1.95.0 cargo)"
+          tc_bin="$(dirname "${cargo_bin}")"
+          if [ "$(stat -c %u "${tc_bin}")" = "${me_u}" ] || [ -w "${tc_bin}" ]; then
+            echo "::error::toolchain bin ${tc_bin} is owned or writable by ${me_n} -- host prerequisite"; exit 1
           fi
-          RUSTUP_HOME="${rustup_home}" rustup run 1.95.0 rustc --version
-          comps="$(RUSTUP_HOME="${rustup_home}" rustup component list --toolchain 1.95.0 --installed 2>/dev/null || true)"
+          "${tc_bin}/rustc" --version
+          comps="$(RUSTUP_HOME="${rustup_home}" rustup component list --toolchain 1.95.0 --installed)"
           for c in clippy rustfmt; do
             grep -q "^${c}" <<<"${comps}" || { echo "::error::toolchain 1.95.0 lacks ${c} -- host prerequisite"; exit 1; }
           done
           echo "RUSTUP_TOOLCHAIN=1.95.0" >> "${GITHUB_ENV}"
-          echo "$(dirname "${rustup_bin}")" >> "${GITHUB_PATH}"
+          echo "${tc_bin}" >> "${GITHUB_PATH}"
         fi
 
         # 3. Persistent per-key target dir outside the cleaned workspace (real home).
@@ -161,18 +173,22 @@ runs:
           # Prune keys untouched for 3+ days.
           while IFS= read -r -d '' d; do zap "${d}" || true; done \
             < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -mtime +2 -print0 2>/dev/null)
-          # Oldest first while over the cap; one du, then subtract.
-          declare -A sizes=()
+          # Oldest first while over the cap. `set -f` is on, so enumerate with
+          # find, never a glob.
+          entries=()
           total=0
-          while IFS=$'\t' read -r gb path; do
-            sizes["${path}"]="${gb}"; total=$(( total + gb ))
-          done < <(du -s --block-size=1G "${root}"/*/ 2>/dev/null || true)
-          while [ "${total}" -gt "${MAX_TARGET_GB}" ]; do
-            oldest="$(ls -1dtr "${root}"/*/ 2>/dev/null | head -1 || true)"
-            [ -n "${oldest}" ] || break
-            echo "target cache ${total} GiB > ${MAX_TARGET_GB}; removing ${oldest}"
-            zap "${oldest%/}" || break
-            total=$(( total - ${sizes["${oldest}"]:-0} ))
+          while IFS= read -r line; do
+            path="${line#* }"
+            gb="$(du -s --block-size=1G -- "${path}" 2>/dev/null | awk 'NR==1{print $1+0}')"
+            entries+=("${gb:-0} ${path}")
+            total=$(( total + ${gb:-0} ))
+          done < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          for e in "${entries[@]}"; do
+            [ "${total}" -gt "${MAX_TARGET_GB}" ] || break
+            gb="${e%% *}"; path="${e#* }"
+            echo "target cache ${total} GiB > ${MAX_TARGET_GB}; removing ${path}"
+            zap "${path}" || break
+            total=$(( total - gb ))
           done
           target="${root}/${TARGET_KEY}"
           mkdir -p "${target}"
