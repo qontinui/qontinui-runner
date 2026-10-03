@@ -2219,6 +2219,7 @@ async fn health(
         native_ui_wedged: native_ui.wedged,
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
+        pg_schema_ok: schema_ok,
         relay_connected,
         // M7: a credential-dark runner is DEGRADED, not healthy. `None` while
         // no refresher pass has concluded — UNKNOWN, never health.

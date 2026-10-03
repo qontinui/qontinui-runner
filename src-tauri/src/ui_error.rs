@@ -1446,11 +1446,15 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
 ///   as unknown, not degraded. `Some(false)` = the data layer is unreachable →
 ///   degraded, so `/health` stops reporting "healthy" while every PG-backed
 ///   panel is dead (iter4 B-5).
+/// * `pg_schema_ok` — the connect succeeded but a relation the runner needs is
+///   absent (`/health` `database.schema_ok`). `Some(false)` → degraded; `None`
+///   (not probed, connect failed, probe errored) is unknown, not degraded.
 ///
 /// All four sinks (`/health`, the operations heartbeat, the web-backend
 /// heartbeat relay, and the UI-Bridge diagnostics surfaces) call this so their
 /// `derived_status` stays in lockstep. Only the `/health` handler passes a
-/// probed `pg_reachable`; the others pass `None`. All four DO pass a real
+/// probed `pg_reachable` and `pg_schema_ok`; the others pass `None`, so a
+/// reachable-but-unmigrated database degrades `/health` alone. All four DO pass a real
 /// `ui_dead` — the heartbeat sinks especially, since nothing polls `/health`
 /// on an end user's machine and the heartbeats are the only path by which a
 /// dead UI is ever visible off-box. All four also pass a real
@@ -1459,7 +1463,7 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
 /// The sub-signals [`compute_derived_status`] weighs.
 ///
 /// A struct rather than a positional argument list because the inputs are
-/// now five consecutive, mutually interchangeable `Option<bool>`s:
+/// several consecutive, mutually interchangeable `Option<bool>`s:
 /// transposing two of them compiles silently and yields a wrong health
 /// verdict, on the one function every fleet probe trusts. Named fields make
 /// that a compile error instead.
@@ -1485,6 +1489,18 @@ pub struct HealthInputs {
     pub embedding_reachable: Option<bool>,
     /// Bounded PG liveness; `None` when not probed.
     pub pg_reachable: Option<bool>,
+    /// Does the schema the runner needs exist, not merely "can we connect"
+    /// (`/health` `database.schema_ok`, plan
+    /// `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`).
+    /// `Some(false)` only when the connect succeeded AND a required relation
+    /// is provably absent; `None` (not probed, connect failed, probe errored)
+    /// is UNKNOWN and never degrades — a connect failure already degrades via
+    /// `pg_reachable`.
+    ///
+    /// Without this input a reachable-but-unmigrated database left
+    /// `derived_status: "healthy"` while every alembic-owned query failed —
+    /// the green signal two independent sessions read as "the DB is fine".
+    pub pg_schema_ok: Option<bool>,
     /// Backend WS relay liveness; `None` when no relay is expected.
     pub relay_connected: Option<bool>,
     /// M7 — can this runner's own coord credential answer RIGHT NOW?
@@ -1507,6 +1523,7 @@ pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
         "errored"
     } else if matches!(i.embedding_reachable, Some(false))
         || matches!(i.pg_reachable, Some(false))
+        || matches!(i.pg_schema_ok, Some(false))
         || matches!(i.relay_connected, Some(false))
         || matches!(i.coord_credential_can_answer, Some(false))
     {
@@ -1714,6 +1731,39 @@ mod tests {
                 ..Default::default()
             }),
             "degraded"
+        );
+    }
+
+    #[test]
+    fn derived_status_degraded_when_pg_schema_missing() {
+        // Reachable-but-unmigrated: the connect succeeds, a required relation
+        // is absent → degraded, not the green that hid it.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                pg_schema_ok: Some(false),
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn derived_status_unknown_pg_schema_is_healthy_not_degraded() {
+        // A schema probe that could not run is UNKNOWN, never a degrade.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                ui_dead: Some(false),
+                embedding_reachable: Some(true),
+                pg_reachable: Some(true),
+                pg_schema_ok: None,
+                relay_connected: Some(true),
+                ..Default::default()
+            }),
+            "healthy"
         );
     }
 
