@@ -97,31 +97,18 @@ impl UserInputMessage {
     }
 }
 
-/// Control response (runner -> CLI, for tool approval)
-#[derive(Debug, Serialize)]
-struct OutgoingControlResponse {
-    #[serde(rename = "type")]
-    msg_type: String,
-    response: OutgoingControlResponseData,
-    request_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OutgoingControlResponseData {
-    #[serde(flatten)]
-    data: serde_json::Map<String, Value>,
-}
-
-impl OutgoingControlResponse {
-    fn allow_tool(request_id: &str) -> Self {
-        let mut data = serde_json::Map::new();
-        data.insert("allowed".to_string(), Value::Bool(true));
-        Self {
-            msg_type: "control_response".to_string(),
-            response: OutgoingControlResponseData { data },
-            request_id: request_id.to_string(),
-        }
-    }
+/// Control response (runner -> CLI, for tool approval), in the SDK's nested
+/// shape — the only one Claude Code accepts (plan
+/// 2026-09-20-ai-session-handling-is-claude-shaped, Phase 2 probe Q1).
+fn allow_tool_use(request_id: &str) -> Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {"behavior": "allow", "updatedInput": {}},
+        },
+    })
 }
 
 /// Generic output message for parsing CLI responses
@@ -590,7 +577,17 @@ fn test_tool_use_approval() {
         .expect("Tool request should have request_id");
 
     // Send approval
-    let approval = OutgoingControlResponse::allow_tool(tool_request_id);
+    // The former `{"allowed": true}` shape is ignored, as the real CLI ignores
+    // it: nothing arrives until the SDK-shaped answer.
+    send_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "type": "control_response",
+            "response": {"allowed": true},
+            "request_id": tool_request_id,
+        }),
+    );
+    let approval = allow_tool_use(tool_request_id);
     send_msg(&mut stdin, &approval);
 
     // Read assistant response

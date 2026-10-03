@@ -30,9 +30,7 @@ use tauri::{Emitter, Manager};
 use tracing::{debug, info, trace, warn};
 
 use crate::claude_protocol::codec::decode_message;
-use crate::claude_protocol::types::{
-    CliSessionState, ClaudeOutputMessage, OutgoingControlResponse, SystemSubtype,
-};
+use crate::claude_protocol::types::{CliSessionState, ClaudeOutputMessage, SystemSubtype};
 use crate::commands::ai_session::emit_session_state;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
@@ -41,6 +39,7 @@ use crate::session::failure_recovery::{self, Evidence, Lane};
 use crate::str_utils::truncate_str;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
+use super::permission::PermissionBroker;
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
 
@@ -296,6 +295,35 @@ fn turn_end_transition(tracker: &SessionStateTracker, cause: &str) -> Option<Ses
     }
 }
 
+/// What the stdout reader may log at `info!` about one raw CLI line.
+///
+/// Control frames and `system` frames are logged as their type and byte length
+/// ONLY: the `initialize` control_response carries the account's email and
+/// organisation, a `can_use_tool` request carries the tool's full input, and
+/// `system:init` lists the cwd, tools and MCP servers. Every other line keeps
+/// the short preview the reader has always logged.
+pub fn stdout_log_preview(line: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(rename = "type")]
+        frame_type: Option<String>,
+        subtype: Option<String>,
+    }
+    match serde_json::from_str::<Head>(line) {
+        Ok(Head {
+            frame_type: Some(t),
+            subtype,
+        }) if t.starts_with("control_") || t == "system" => match subtype {
+            Some(sub) => format!("<{t}:{sub} frame, {} bytes>", line.len()),
+            None => format!("<{t} frame, {} bytes>", line.len()),
+        },
+        // A line that merely names a control frame without parsing is held
+        // back too, rather than trusted to be harmless.
+        Err(_) if line.contains("\"control_") => format!("<unparsed control frame, {} bytes>", line.len()),
+        _ => truncate_str(line, 150).to_string(),
+    }
+}
+
 /// Epoch seconds -> RFC 3339, the failure record's `reset_at` form.
 fn epoch_to_rfc3339(secs: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(secs, 0).map(|t| t.to_rfc3339())
@@ -376,7 +404,9 @@ pub struct DispatcherResult {
 /// - Text extraction and event emission
 /// - Finding parsing
 /// - Progress parsing
-/// - Control request auto-approval
+/// - Control requests, answered by subtype through the session's
+///   [`PermissionBroker`] (allowed in a bypass mode, parked for the operator
+///   in `Prompt` mode, refused with an `error` for any other subtype)
 /// - Applying [`observe_frame`]'s outcome: state transitions, typed
 ///   failures, the next queued message
 ///
@@ -411,6 +441,8 @@ pub fn dispatch_line(
     // This session's frame bookkeeping (unrecognised-type counts, the CLI's
     // reported state, the pending error code of an errored turn).
     ledger: &mut FrameLedger,
+    // This session's control-request answerer (plan Phase 9).
+    permissions: &Arc<PermissionBroker>,
 ) -> Option<String> {
     // Decode the NDJSON line. An unlisted frame type is NOT an error (it
     // decodes as `Other`); only a malformed line lands here.
@@ -471,10 +503,13 @@ pub fn dispatch_line(
         );
     }
 
-    // Handle control requests from CLI (auto-approve tool use in bypass mode)
+    // Handle control requests from the CLI — by subtype (plan Phase 9).
     if let Some(ctrl_req) = msg.as_control_request() {
-        // Emit tool activity event so the frontend can show what the AI is doing
-        if ctrl_req.request.subtype == "can_use_tool" {
+        // Emit tool activity event so the frontend can show what the AI is
+        // doing — in a bypass mode only, where the request IS the call. A
+        // prompted request has not run and may never run; its permission card
+        // says what it wants instead.
+        if ctrl_req.request.subtype == "can_use_tool" && !permissions.mode().prompts() {
             if let Some(tool_name) = ctrl_req
                 .request
                 .data
@@ -487,7 +522,7 @@ pub fn dispatch_line(
                 }));
             }
         }
-        handle_control_request(ctrl_req, stdin_writer);
+        permissions.handle_control_request(ctrl_req);
         return None;
     }
 
@@ -592,31 +627,6 @@ pub fn dispatch_line(
     }
 
     Some(text)
-}
-
-/// Handle a control request from the CLI.
-/// In bypass permissions mode, we auto-approve everything.
-fn handle_control_request(
-    ctrl_req: &crate::claude_protocol::types::CliControlRequest,
-    stdin_writer: &Arc<StdinWriter>,
-) {
-    let subtype = &ctrl_req.request.subtype;
-    debug!("CLI control request: subtype={}", subtype);
-
-    if let Some(ref request_id) = ctrl_req.request_id {
-        // Auto-approve tool use requests (we run in bypassPermissions mode)
-        let response = OutgoingControlResponse::allow_tool(request_id);
-        if let Err(e) = stdin_writer.write_message(&response) {
-            warn!("Failed to send control response: {}", e);
-        } else {
-            trace!("Auto-approved control request: {}", subtype);
-        }
-    } else {
-        warn!(
-            "CLI control request without request_id, cannot respond: {}",
-            subtype
-        );
-    }
 }
 
 /// Format a human-readable description of a tool activity.
@@ -1508,5 +1518,188 @@ mod tests {
         );
         assert_eq!(idle.transitioned_to, None);
         assert!(idle.ready_for_next, "a queued message may still go on idle");
+    }
+
+    // ── Phase 9: control requests answered by subtype ─────────────────────
+
+    use crate::claude_session::permission::test_support::broker;
+    use crate::claude_session::permission::{ControlHandling, PermissionDecision, PermissionOutcome};
+    use crate::session::launch_spec::PermissionMode;
+
+    /// What the probe actually sent the CLI, line by line.
+    fn fixture_stdin(stem: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(fixture_dir().join(format!("{stem}.stdin.ndjson")))
+            .unwrap_or_else(|e| panic!("{stem}: {e}"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Replay `stem` through the frame logic and a broker in `mode`, the way
+    /// `dispatch_line` does, stopping at the first control request. Returns
+    /// the broker's handling, the request id and the CLI's state at that
+    /// moment.
+    fn replay_to_control_request(
+        stem: &str,
+        b: &Arc<crate::claude_session::permission::PermissionBroker>,
+    ) -> (ControlHandling, String, Option<CliSessionState>) {
+        let text = std::fs::read_to_string(fixture_dir().join(format!("{stem}.ndjson"))).unwrap();
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        let mut ledger = FrameLedger::new(format!("dispatcher-test-{stem}"));
+        for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            let msg = decode_message(line).unwrap();
+            observe_frame(&mut ledger, &msg, line.len(), &tracker);
+            if i == 0 {
+                tracker.transition(SessionState::Processing).unwrap();
+            }
+            if let Some(req) = msg.as_control_request() {
+                let handled = b.handle_control_request(req);
+                return (
+                    handled,
+                    req.request_id.clone().unwrap(),
+                    ledger.cli_state().cloned(),
+                );
+            }
+        }
+        panic!("{stem}: no control request");
+    }
+
+    fn sent(out: &crate::claude_session::permission::test_support::RecordingResponder) -> Vec<serde_json::Value> {
+        out.lines().iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// `can_use_tool_sdk_allow_with_session_state_events` in `Prompt` mode: the
+    /// request is parked (the CLI said `requires_action` just before it), and
+    /// the operator's allow is EXACTLY the reply the CLI accepted — same
+    /// request id, `updatedInput` echoing the request's input.
+    #[test]
+    fn fixture_prompt_allow_is_the_reply_the_cli_accepted() {
+        let stem = "can_use_tool_sdk_allow_with_session_state_events";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_secs(60));
+        let (handled, request_id, state) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Parked);
+        assert_eq!(state, Some(CliSessionState::RequiresAction));
+        assert!(out.lines().is_empty());
+        assert_eq!(sink.requested.lock().unwrap()[0].tool_name, "Write");
+        b.respond(&request_id, PermissionDecision::Allow { updated_input: None })
+            .unwrap();
+        assert_eq!(sent(&out), vec![fixture_stdin(stem)[2].clone()]);
+        assert_eq!(scenario(stem)["write_target_created"], true);
+    }
+
+    /// `can_use_tool_sdk_deny`: the operator's deny is exactly the deny the CLI
+    /// accepted (and turned into an error tool_result, not an errored turn).
+    #[test]
+    fn fixture_prompt_deny_is_the_reply_the_cli_accepted() {
+        let stem = "can_use_tool_sdk_deny";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_secs(60));
+        let (handled, request_id, _) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Parked);
+        let resolved = b
+            .respond(
+                &request_id,
+                PermissionDecision::Deny {
+                    message: Some("denied by cli probe".to_string()),
+                    interrupt: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved.outcome, PermissionOutcome::Denied);
+        assert_eq!(sent(&out), vec![fixture_stdin(stem)[2].clone()]);
+        assert_eq!(sink.resolved.lock().unwrap().len(), 1);
+    }
+
+    /// `can_use_tool_runner_shape_ignored`: the request that hung the CLI under
+    /// the old `{"allowed": true}` is answered, in a bypass mode, with the SDK
+    /// allow — never the ignored shape again.
+    #[test]
+    fn fixture_bypass_answers_the_request_that_used_to_hang() {
+        let stem = "can_use_tool_runner_shape_ignored";
+        let (b, out, _) = broker(PermissionMode::BypassPermissions, std::time::Duration::from_secs(60));
+        let (handled, request_id, _) = replay_to_control_request(stem, &b);
+        assert_eq!(handled, ControlHandling::Allowed);
+        let replies = sent(&out);
+        assert_eq!(replies.len(), 1);
+        let ignored = &fixture_stdin(stem)[2];
+        assert_eq!(ignored["response"], serde_json::json!({"allowed": true}));
+        assert_ne!(&replies[0], ignored);
+        assert_eq!(replies[0]["type"], "control_response");
+        assert_eq!(replies[0]["response"]["subtype"], "success");
+        assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
+        assert_eq!(replies[0]["response"]["response"]["behavior"], "allow");
+        assert!(replies[0].get("request_id").is_none(), "request_id rides inside response");
+        // The echoed input is the request's own.
+        let accepted = &fixture_stdin("can_use_tool_sdk_allow_with_session_state_events")[2];
+        assert_eq!(
+            replies[0]["response"]["response"]["updatedInput"],
+            accepted["response"]["response"]["updatedInput"]
+        );
+    }
+
+    /// An unanswered fixture request is denied at the bound (fail closed).
+    #[test]
+    fn fixture_prompt_request_times_out_to_a_deny() {
+        let stem = "can_use_tool_sdk_deny";
+        let (b, out, sink) = broker(PermissionMode::Prompt, std::time::Duration::from_millis(50));
+        let (_, request_id, _) = replay_to_control_request(stem, &b);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while out.lines().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let replies = sent(&out);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["response"]["request_id"], request_id.as_str());
+        assert_eq!(replies[0]["response"]["response"]["behavior"], "deny");
+        assert_eq!(sink.resolved.lock().unwrap()[0].outcome, PermissionOutcome::TimedOut);
+    }
+
+    /// Any other subtype is refused with an `error`, in either posture.
+    #[test]
+    fn unknown_control_subtype_is_an_error_response() {
+        for mode in [PermissionMode::BypassPermissions, PermissionMode::Prompt] {
+            let (b, out, _) = broker(mode, std::time::Duration::from_secs(60));
+            let msg = decode_message(
+                r#"{"type":"control_request","request_id":"q1","request":{"subtype":"mcp_message","server_name":"x","message":{}}}"#,
+            )
+            .unwrap();
+            b.handle_control_request(msg.as_control_request().unwrap());
+            assert_eq!(
+                sent(&out),
+                vec![serde_json::json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": "q1",
+                        "error": "unsupported control request subtype: mcp_message",
+                    }
+                })]
+            );
+        }
+    }
+
+    /// The stdout reader never logs a control or system frame's body: the
+    /// `initialize` response carries the account's email and organisation.
+    #[test]
+    fn stdout_log_preview_holds_back_control_and_system_frames() {
+        let init = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{"account":{"email":"someone@example.com","organization":"Org"}}}}"#;
+        let p = stdout_log_preview(init);
+        assert!(!p.contains("example.com") && !p.contains("Org"), "{p}");
+        assert_eq!(p, format!("<control_response frame, {} bytes>", init.len()));
+        let req = r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"content":"secret"}}}"#;
+        assert!(!stdout_log_preview(req).contains("secret"));
+        let sys = r#"{"type":"system","subtype":"init","cwd":"/home/x"}"#;
+        assert_eq!(stdout_log_preview(sys), format!("<system:init frame, {} bytes>", sys.len()));
+        let broken = r#"{"type":"control_response","response":{"account":"#;
+        assert!(stdout_log_preview(broken).starts_with("<unparsed control frame"));
+        // Every other line keeps its short preview.
+        let text = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        assert_eq!(stdout_log_preview(text), text);
+        for line in std::fs::read_to_string(fixture_dir().join("plain_turn.ndjson")).unwrap().lines() {
+            if line.starts_with(r#"{"type":"control_"#) || line.starts_with(r#"{"type":"system""#) {
+                assert!(stdout_log_preview(line).starts_with('<'), "{line}");
+            }
+        }
     }
 }

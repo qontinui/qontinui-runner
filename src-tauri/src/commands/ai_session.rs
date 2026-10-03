@@ -476,6 +476,54 @@ pub async fn create_ai_session(
     app_state: tauri::State<'_, StorageCompartment>,
     task_name: Option<String>,
 ) -> Result<CommandResponse, String> {
+    open_ai_session(
+        app_handle,
+        &session_manager,
+        &ai_coord_registrar,
+        &app_state,
+        task_name,
+        AiSessionLaunch::chat(),
+    )
+    .await
+}
+
+/// How [`open_ai_session`] launches the session.
+pub(crate) struct AiSessionLaunch {
+    /// Caller-authoritative permission posture.
+    pub permission: crate::session::launch_spec::PermissionMode,
+    /// The CLI's cwd. `None` ⇒ the runner's own cwd (the chat default).
+    pub working_dir: Option<String>,
+    /// The task run's `workflow_type`. Only `"chat"` rows are resumed at
+    /// boot (`get_resumable_chat_sessions_for_runner`), and that resume
+    /// re-spawns in bypass — so a prompted session must NOT be `"chat"`.
+    pub workflow_type: &'static str,
+}
+
+impl AiSessionLaunch {
+    /// The UI's "new chat": bypass, the runner's cwd, resumed at boot.
+    pub(crate) fn chat() -> Self {
+        Self {
+            permission: crate::session::launch_spec::PermissionMode::BypassPermissions,
+            working_dir: None,
+            workflow_type: "chat",
+        }
+    }
+}
+
+/// The body of [`create_ai_session`], shared with the Terminal page's
+/// structured launch (`commands::structured_session`), which differs only in
+/// its [`AiSessionLaunch`].
+pub(crate) async fn open_ai_session(
+    app_handle: tauri::AppHandle,
+    session_manager: &tauri::State<'_, Arc<SessionManager>>,
+    ai_coord_registrar: &tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
+    app_state: &tauri::State<'_, StorageCompartment>,
+    task_name: Option<String>,
+    launch: AiSessionLaunch,
+) -> Result<CommandResponse, String> {
     let task_run_id = uuid::Uuid::new_v4().to_string();
     let name = task_name.unwrap_or_else(|| "New Chat".to_string());
 
@@ -524,7 +572,7 @@ pub async fn create_ai_session(
     // "no task run ⇒ no session" contract is unchanged.
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")
-        .with_workflow_type("chat");
+        .with_workflow_type(launch.workflow_type);
     let create_task_run = app_state.pg_db().create_task_run(&input);
 
     // Session-automation Phase 0 (R1) — register the authenticated session into
@@ -559,10 +607,14 @@ pub async fn create_ai_session(
     let handle = app_handle.clone();
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
+    let permission = launch.permission;
+    let working_dir_override = launch.working_dir.clone();
     let spawn_task = spawn_blocking_tracked(move || {
-        let working_dir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let working_dir = working_dir_override.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
 
         // Create an AiSessionContext so output events include the taskRunId.
         // Without this, emit_ai_output would emit events with taskRunId=null
@@ -593,6 +645,9 @@ pub async fn create_ai_session(
             None,              // tool_policy
             Some(&cli_session_ctx),
             agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
+            // The launch's posture: bypass for the chat (`AiSessionLaunch::chat`),
+            // `Prompt` only for the Terminal page's structured launch.
+            permission,
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -617,6 +672,8 @@ pub async fn create_ai_session(
         }
     });
 
+    let working_dir_for_response = launch.working_dir;
+
     // The PG insert and the CLI spawn are independent — run them together and
     // pay `max(db, spawn)` instead of `db + spawn`.
     let (create_result, spawn_result) = tokio::join!(create_task_run, spawn_task);
@@ -634,7 +691,7 @@ pub async fn create_ai_session(
             }
         }
         teardown_coord_session_for_failed_task_run(
-            &ai_coord_registrar,
+            ai_coord_registrar,
             emitter_for_teardown.as_ref(),
             &task_run_id,
         );
@@ -675,6 +732,7 @@ pub async fn create_ai_session(
             data: Some(serde_json::json!({
                 "task_run_id": task_run_id,
                 "state": "ready",
+                "working_dir": working_dir_for_response,
             })),
         }),
         Ok(Err(e)) => Ok(CommandResponse {
@@ -2020,6 +2078,8 @@ pub async fn resume_ai_sessions(
                 None, // tool_policy
                 Some(&cli_session_ctx),
                 agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
+                // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+                crate::session::launch_spec::PermissionMode::BypassPermissions,
             )
             .map_err(|e| format!("spawn failed: {}", e))?;
 

@@ -2517,6 +2517,8 @@ pub fn run_claude_session_interactive(
         tool_policy,
         None, // cli_session_ctx — non-chat spawn; CLI generates its own id
         None, // agent_log_emitter — non-interactive path, no coord agent_logs
+        // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+        crate::session::launch_spec::PermissionMode::BypassPermissions,
     )?;
 
     // Register with Doctor health monitoring

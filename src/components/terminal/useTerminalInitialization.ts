@@ -1150,7 +1150,7 @@ export function useTerminalInitialization({
           // `reconcileAssignments` place it — every worker record is written
           // with `zone_index: 0`, so binding its recorded zone would stack
           // all of them onto one zone. Its state, transcript and steering
-          // come from the SessionManager through `WorkerSessionCell`.
+          // come from the SessionManager through `StructuredSessionCell`.
           if (isWorkerRecord(rec)) {
             adoptWorkerTab(rec);
             continue;

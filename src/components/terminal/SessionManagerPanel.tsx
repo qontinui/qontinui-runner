@@ -41,6 +41,8 @@ interface SessionManagerPanelProps {
    * provider launch menu. Wired in `TerminalPage`; undefined ⇒ no menu.
    */
   onLaunchProvider?: (provider: string) => void;
+  /** Launch a structured (permission-prompting) session of `provider` (plan Phase 9). */
+  onLaunchStructured?: (provider: string) => void;
 }
 
 /** Human-readable status group labels. */
@@ -116,6 +118,7 @@ export function SessionManagerPanel({
   sessionLockStates,
   onResumePastSession,
   onLaunchProvider,
+  onLaunchStructured,
 }: SessionManagerPanelProps) {
   const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
@@ -228,7 +231,9 @@ export function SessionManagerPanel({
         <PastSessionsView onResumePastSession={onResumePastSession} />
       ) : (
         <>
-      {onLaunchProvider && <ProviderLaunchMenu onLaunch={onLaunchProvider} />}
+      {onLaunchProvider && (
+        <ProviderLaunchMenu onLaunch={onLaunchProvider} onLaunchStructured={onLaunchStructured} />
+      )}
       <StewardControl />
       <SessionManagerHeader
         loading={loading}

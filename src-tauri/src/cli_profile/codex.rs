@@ -66,6 +66,9 @@ fn profile() -> CliProfile {
         // an existing session; either way the user chose the session.
         session_choice_args: strings(&["resume", "fork"]),
         pty_args: Vec::new(),
+        // The structured lane the runner speaks for Codex does not exist yet
+        // (`codex app-server` is follow-up A), so no prompted launch is offered.
+        permission_prompt_args: Vec::new(),
         // `CODEX_HOME` selects the directory holding Codex's auth, config and
         // sessions (default `~/.codex`). It is a variable naming one
         // per-account directory — the same shape as `CLAUDE_CONFIG_DIR` — so
