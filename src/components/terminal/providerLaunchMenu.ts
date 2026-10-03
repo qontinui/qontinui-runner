@@ -17,8 +17,9 @@
  * structured lane is one the RUNNER implements (Claude stream-json; Codex's
  * `codex app-server` is declared by its profile but not spoken by the runner),
  * whose typed permission requests are verified, and which names the arguments
- * that route them to the runner ({@link structuredLaunchOffer}). A structured
- * session asks before each tool call through a permission card.
+ * that route them to the runner ({@link structuredLaunchOffer}). In a
+ * structured session a tool call the CLI's own permission rules do not
+ * already allow asks the operator through a permission card.
  *
  * Kept free of React and Tauri so the runner's node-environment vitest can
  * cover it (`providerLaunchMenu.test.ts`).
@@ -66,6 +67,50 @@ export function structuredLaunchOffer(profile: LaunchMenuProfile): StructuredLau
     return { offered: false, reason: "no argument routes permission requests to the runner" };
   }
   return { offered: true };
+}
+
+/**
+ * The structured button's tooltip. Accurate about who asks: the CLI applies
+ * its own `permissions.allow` rules first, and only a call those rules do not
+ * settle reaches the runner as a permission card — so it is NOT "every tool
+ * call". Pure.
+ */
+export function structuredLaunchTitle(label: string): string {
+  return `Open a structured ${label} session — a tool call your ${label} permission rules don't already allow asks you first`;
+}
+
+/**
+ * How long after a probe reports a CLI ABSENT the menu probes it once more.
+ * A CLI auto-update swaps its binary on PATH, and a probe that lands in that
+ * window reads "not installed" for a CLI that is there a second later.
+ */
+export const ABSENT_REPROBE_DELAY_MS = 3_000;
+
+/**
+ * Whether a probe verdict earns one automatic re-probe: only an ABSENT
+ * verdict, and only on the first probe — never a loop. Pure.
+ */
+export function shouldReprobeAbsent(
+  verdict: CliAvailability | null | undefined,
+  attempt: number,
+): boolean {
+  return attempt === 0 && verdict?.available === false;
+}
+
+/**
+ * The working directory a structured launch starts in: the cwd of the
+ * terminal in the focused zone, when it has one. `null` otherwise — the
+ * runner then starts the session in the user's home directory, never in the
+ * runner process's own cwd. Pure.
+ */
+export function structuredLaunchCwd(
+  tabs: ReadonlyArray<{ id: string; workingDir?: string }>,
+  assignments: Readonly<Record<number, string | null | undefined>>,
+  focusedZone: number,
+): string | null {
+  const tabId = assignments[focusedZone];
+  const cwd = tabId ? tabs.find((t) => t.id === tabId)?.workingDir : undefined;
+  return cwd && cwd.trim() !== "" ? cwd : null;
 }
 
 /** Wire shape of `cli_profile_availability` (Rust `CliAvailability`). */

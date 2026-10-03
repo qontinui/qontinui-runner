@@ -61,6 +61,7 @@ import { useTerminalInitialization, runVerifiedResume } from "./useTerminalIniti
 import { SessionFailureBanner } from "./SessionFailureBanner";
 import { RestoreTerminalOnlyNote } from "./RestoreTerminalOnlyNote";
 import { dismissSessionFailure, useSessionFailures } from "./useSessionFailures";
+import { structuredLaunchCwd } from "./providerLaunchMenu";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -1350,7 +1351,8 @@ function TerminalPageInner({
         provider,
         pageId,
         zoneIndex: Math.max(emptyZone, 0),
-        workingDir: null,
+        // The focused terminal's cwd; with none, the runner uses the home dir.
+        workingDir: structuredLaunchCwd(tabs, zoneLayout.assignments, zoneLayout.focusedZone),
         title: null,
       });
     } catch (e) {
