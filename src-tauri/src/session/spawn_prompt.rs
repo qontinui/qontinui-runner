@@ -2026,6 +2026,19 @@ mod script_tests {
             "rm -f ${x:?}",
             "rm -f ${x:?x is unset}",
             "rm -f \"${x:?}\"",
+            // ANSI-C / locale quoting: the blanked segment must not read as an
+            // identifier (`$'a'` blanks to `$%`).
+            "rm $'a'",
+            "rm $\"x\"",
+            // Keywords need a command-start position of their own, and a
+            // trailing space: neither is `do` / `then` here.
+            "echo dorm $x",
+            "echo to do rm $x",
+            "echo then rm $x",
+            // A JSON `\\n` preceded by a backslash is a literal backslash-n (or a
+            // line continuation), not a newline command start.
+            "printf a\\nrm $x",
+            "printf a\\\\nrm $x",
         ] {
             for pretty in [false, true] {
                 let out = run_bash_guard(&pre_tool_use_payload("Bash", command, pretty), &[]);
@@ -2051,17 +2064,38 @@ mod script_tests {
             ("rm -f ${x:-/tmp/y}", Some("$x")),
             // A quoted segment BEFORE the real command start does not hide it.
             ("echo \"it's; done\"; rm $x", Some("$x")),
+            // Multi-letter UNBRACED names are named WHOLE — the reason must
+            // never name a variable the command does not have (Phase 0).
+            ("rm -rf $DIR", Some("$DIR")),
+            ("rm $foo", Some("$foo")),
+            ("rm -rf /x/$HOME_DIR/y", Some("$HOME_DIR")),
+            ("rm ${DIR}", Some("$DIR")),
+            // Keywords at a real command start.
+            ("for a in b; do rm $item; done", Some("$item")),
+            ("if t; then :; else rm $other; fi", Some("$other")),
+            ("cd /w\ndo rm $q", Some("$q")),
+            // KNOWN FALSE POSITIVE, accepted per D2 (one rewrite turn): quotes
+            // NESTED inside a double-quoted `"$(...)"` are not tracked by the
+            // builtin-only blanking, so the inner `$f` reads as unquoted.
+            ("rm -f \"$(dirname \"$f\")\"/x", Some("$f")),
         ] {
             let reason = guard_deny_reason(&run_bash_guard(
                 &pre_tool_use_payload("Bash", command, false),
                 &[],
             ));
+            // EXACT name, not `contains`: `$D` is a substring of `$DIR`.
+            let named = reason
+                .split_once("built from ")
+                .and_then(|(_, rest)| rest.split_once(", and"))
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| panic!("{command:?}: no named variable in {reason}"));
             match names {
-                Some(var) => assert!(reason.contains(var), "{command:?}: {reason}"),
-                None => assert!(
-                    reason.contains("a $(...) expansion"),
-                    "{command:?}: {reason}"
-                ),
+                Some(var) => {
+                    assert_eq!(named, var, "{command:?}: {reason}");
+                    let guarded = format!("rm -f \"${{{}:?}}\"", var.trim_start_matches('$'));
+                    assert!(reason.contains(&guarded), "{command:?}: {reason}");
+                }
+                None => assert_eq!(named, "a $(...) expansion", "{command:?}: {reason}"),
             }
         }
     }

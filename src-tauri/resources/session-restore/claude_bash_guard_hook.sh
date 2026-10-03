@@ -80,7 +80,10 @@ set -u
 # ROW 0 — `rm` on a path built from an UNQUOTED variable expansion.
 #   Matches `rm` (any flags, any earlier operands) at COMMAND-START position —
 #   the start of the command string, or right after `;` `&` `|` `(` `{`, an
-#   escaped newline, or ` then` / ` do` / ` else`, all OUTSIDE quotes — whose
+#   escaped newline (a JSON `\n` NOT preceded by a backslash — `\\n` is a
+#   literal backslash-n, not a newline), or a `then ` / `do ` / `else ` keyword
+#   that itself sits at a command start (`; do `, never `echo to do `), all
+#   OUTSIDE quotes — whose
 #   operand contains an unquoted `$name`, `${name` or `$(` on the same line
 #   before any separator, redirect, `#` or `)`.
 #   Boundary decisions, each pinned by a test:
@@ -90,6 +93,10 @@ set -u
 #       Narrow by design (plan D2): a missed quoted case costs one prompt, as
 #       today. The same blanking makes `git commit -m "fix; rm $x"` and
 #       `printf 'a\nrm $x'` non-matches.
+#     - KNOWN FALSE POSITIVE, accepted per D2 (one rewrite turn): quotes
+#       NESTED inside a double-quoted `"$(...)"` are not tracked, so
+#       `rm -f "$(dirname "$f")"/x` blanks the wrong spans and is denied
+#       naming `$f`. Tracking nesting needs a parser, not builtins.
 #     - `rm -f ${x:?}` does NOT match: `${name:?…}` aborts on an empty value,
 #       and it is the very rewrite the reason recommends.
 #     - `rm -f /tmp/$x` matches: the path still collapses when `$x` is empty.
@@ -98,7 +105,7 @@ set -u
 #       `rm $x` written inside a heredoc never draws a deny.
 #     - `rm -f "/literal/path"` and `rm -rf build/` carry no expansion.
 rule_pattern=(
-  '(^|;|&|\||\(|\{|\\n| then| do| else) *rm +[^;&|<>$'"'"'#)\]*\$(\{[A-Za-z_][A-Za-z0-9_]*([^:A-Za-z0-9_]|:[^?]|$)|[A-Za-z_]|\()'
+  '(^|;|&|\||\(|\{|(^|[^\])\\n|(^|;|[^\]\\n) *(then|do|else) ) *rm +[^;&|<>$'"'"'#)\]*\$(\{[A-Za-z_][A-Za-z0-9_]*([^:A-Za-z0-9_]|:[^?]|$)|[A-Za-z_][A-Za-z0-9_]*|\()'
 )
 rule_message=(
   'Not run: this command passes rm a path built from @VAR@, and Claude Code stops that for operator approval (\"Dangerous rm operation on possibly-empty variable path\") because an empty value collapses the path toward the filesystem root. Rewrite the command so no approval is needed, then run it again. Best: drop the rm if it only cleans up something the command does not need. Otherwise write to a literal path or one made by mktemp, or refuse an empty value before deleting: rm -f \"${@NAME@:?}\" or [ -n \"$@NAME@\" ] && rm -f \"$@NAME@\".'
@@ -137,16 +144,18 @@ esac
 # data), then single-quoted. In the JSON-escaped text a shell `"` is `\"`, a
 # shell backslash is `\\`, so a double-quoted segment is `\"`, then tokens that
 # are a plain character, a JSON escape other than `\"` / `\\`, or a shell
-# backslash followed by any one token, then `\"`. Each pass removes at least
+# backslash followed by any one token, then `\"`. A segment becomes `%`, which
+# can neither start an identifier nor separate commands, so `$'a'` / `$"x"`
+# blank to `$%` and never read as an expansion. Each pass removes at least
 # two characters, so both loops terminate. An unbalanced quote is simply left
 # in place (the rules then see more text, never less).
 dq_re='\\"([^\]|\\[^"\]|\\\\([^\]|\\.))*\\"'
 while [[ $cmd =~ $dq_re ]]; do
-  cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"
+  cmd="${cmd/"${BASH_REMATCH[0]}"/%}"
 done
 sq_re="'[^']*'"
 while [[ $cmd =~ $sq_re ]]; do
-  cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"
+  cmd="${cmd/"${BASH_REMATCH[0]}"/%}"
 done
 
 name_re='\$\{?([A-Za-z_][A-Za-z0-9_]*)'

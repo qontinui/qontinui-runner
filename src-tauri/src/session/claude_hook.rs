@@ -504,7 +504,7 @@ fn materialize_from_template(
     }
 
     let script_path = base_dir.join(HOOK_SCRIPT_NAME);
-    if let Err(e) = std::fs::write(&script_path, HOOK_SCRIPT.as_bytes()) {
+    if let Err(e) = write_atomically(&script_path, HOOK_SCRIPT.as_bytes(), true) {
         tracing::warn!(error = %e, path = %script_path.display(), "session-restore: claude hook script write failed");
         return None;
     }
@@ -514,7 +514,7 @@ fn materialize_from_template(
     // rides the SAME settings file, so it inherits the identical delivery +
     // fail-open posture as the SessionStart hook.
     let stop_script_path = base_dir.join(STOP_HOOK_SCRIPT_NAME);
-    if let Err(e) = std::fs::write(&stop_script_path, STOP_HOOK_SCRIPT.as_bytes()) {
+    if let Err(e) = write_atomically(&stop_script_path, STOP_HOOK_SCRIPT.as_bytes(), true) {
         tracing::warn!(error = %e, path = %stop_script_path.display(), "session-restore: claude stop-hook script write failed");
         return None;
     }
@@ -523,7 +523,11 @@ fn materialize_from_template(
     // PreCompact hook (context-exhaustion handoff, session-autonomy-fabric
     // Phase 7) — same carrier, same fail-open posture.
     let precompact_script_path = base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME);
-    if let Err(e) = std::fs::write(&precompact_script_path, PRECOMPACT_HOOK_SCRIPT.as_bytes()) {
+    if let Err(e) = write_atomically(
+        &precompact_script_path,
+        PRECOMPACT_HOOK_SCRIPT.as_bytes(),
+        true,
+    ) {
         tracing::warn!(error = %e, path = %precompact_script_path.display(), "session-restore: claude precompact-hook script write failed");
         return None;
     }
@@ -534,7 +538,7 @@ fn materialize_from_template(
     // the EXISTING `SessionStart` block, so the confirmation hook above keeps
     // its silent-stdout contract while this one carries the injected text.
     let policy_script_path = base_dir.join(POLICY_HOOK_SCRIPT_NAME);
-    if let Err(e) = std::fs::write(&policy_script_path, POLICY_HOOK_SCRIPT.as_bytes()) {
+    if let Err(e) = write_atomically(&policy_script_path, POLICY_HOOK_SCRIPT.as_bytes(), true) {
         tracing::warn!(error = %e, path = %policy_script_path.display(), "session-restore: claude policy-hook script write failed");
         return None;
     }
@@ -545,7 +549,11 @@ fn materialize_from_template(
     // carrier, same fail-open posture. Materialized whatever the dial says;
     // only its REGISTRATION is gated.
     let bash_guard_script_path = base_dir.join(BASH_GUARD_HOOK_SCRIPT_NAME);
-    if let Err(e) = std::fs::write(&bash_guard_script_path, BASH_GUARD_HOOK_SCRIPT.as_bytes()) {
+    if let Err(e) = write_atomically(
+        &bash_guard_script_path,
+        BASH_GUARD_HOOK_SCRIPT.as_bytes(),
+        true,
+    ) {
         tracing::warn!(error = %e, path = %bash_guard_script_path.display(), "session-restore: claude bash-guard script write failed");
         return None;
     }
@@ -573,7 +581,7 @@ fn materialize_from_template(
         }
     };
     let settings_path = settings_path(base_dir, variant);
-    if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
+    if let Err(e) = write_atomically(&settings_path, settings.as_bytes(), false) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
         return None;
     }
@@ -800,6 +808,44 @@ fn cached_materialization(base_dir: &Path, want: CarrierVariant) -> Option<PathB
     } else {
         None
     }
+}
+
+/// Write `bytes` to `path` so that NO reader ever sees a partial file, and
+/// skip the write entirely when `path` already holds exactly `bytes`.
+///
+/// The session-restore dir is machine-global and its scripts are RUN by live
+/// sessions while other spawns materialize them: a truncate-then-write left a
+/// window in which a concurrent Bash call ran a half-written guard script,
+/// which exits 2 on the syntax error — and exit 2 from a `PreToolUse` hook
+/// BLOCKS the tool call. So the bytes go to a temp file in the SAME directory
+/// (same filesystem, so the rename is atomic), are made executable there when
+/// `executable` (the scripts; not the carrier JSON), and are renamed over the
+/// target: a reader opens either the old file or the new
+/// one, never a mix. The unchanged-bytes skip makes the steady state (every
+/// runner instance writing identical constants) touch nothing at all. A
+/// failed rename removes its temp file and returns the error, so the caller's
+/// fail-open path (no `--settings`) applies.
+fn write_atomically(path: &Path, bytes: &[u8], executable: bool) -> std::io::Result<()> {
+    if std::fs::read(path).map(|b| b == bytes).unwrap_or(false) {
+        return Ok(());
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes)?;
+    if executable {
+        set_executable(&tmp);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(unix)]
@@ -2096,5 +2142,48 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(session.contains(r"o'\''brien"), "{session}");
+    }
+
+    /// A changed file is replaced in one rename (a NEW inode at the path, no
+    /// temp file left behind, so no reader can open a partial file); an
+    /// unchanged one is not rewritten at all (the SAME inode).
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_replaces_whole_files_and_skips_identical_bytes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.sh");
+        let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+
+        write_atomically(&path, b"first", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
+            0o111,
+            "executable before it is ever visible at the path"
+        );
+        let first = ino(&path);
+
+        write_atomically(&path, b"first", true).unwrap();
+        assert_eq!(ino(&path), first, "identical bytes are not rewritten");
+
+        write_atomically(&path, b"second, longer", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+        assert_ne!(
+            ino(&path),
+            first,
+            "a change lands by rename, never in place"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }
