@@ -47,8 +47,14 @@ import {
   useUIStateCx,
 } from "./contexts";
 import { SessionInfoDropdown } from "./SessionInfoDropdown";
-import { ZonePromptsPanel, PROMPTS_PANEL_RIGHT_WIDTH_PX } from "./ZonePromptsPanel";
+import { ZonePromptsPanel } from "./ZonePromptsPanel";
+import { SessionReviewPanel, SessionReviewToggle } from "./SessionReviewPanel";
+import { reviewBadgeState } from "./sessionReviewView";
+import { useSessionReview } from "./useSessionReview";
 import {
+  PROMPTS_PANEL_GEOMETRY,
+  REVIEW_PANEL_GEOMETRY,
+  toggleZonePanel,
   promptsPanelAvailable,
   promptsPanelOrientation,
   promptsStripHeight,
@@ -75,6 +81,32 @@ export function promptTabsStorageKey(pageId: string): string {
 
 function loadPromptTabs(pageId: string): Set<string> {
   return new Set(instanceStorage.getJSON<string[]>(promptTabsStorageKey(pageId), []));
+}
+
+/** Per-page storage key for the set of tabs showing their review panel. */
+export function reviewTabsStorageKey(pageId: string): string {
+  return pageKey(pageId, "zone-review-tabs");
+}
+
+interface PanelTabs {
+  prompts: ReadonlySet<string>;
+  review: ReadonlySet<string>;
+}
+
+function loadPanelTabs(pageId: string): PanelTabs {
+  return {
+    prompts: loadPromptTabs(pageId),
+    review: new Set(instanceStorage.getJSON<string[]>(reviewTabsStorageKey(pageId), [])),
+  };
+}
+
+/**
+ * Whether a tab offers the PTY review panel: a Claude session to key the
+ * review on, not a Conductor worker (its cell carries its own review in the
+ * Changes pane) and not a plan viewer.
+ */
+function reviewPanelAvailable(tab: TerminalTab | undefined, promptsAvailable: boolean): boolean {
+  return promptsAvailable && !!tab && !tab.sessionBacked && tab.type !== "plan";
 }
 
 /**
@@ -291,7 +323,13 @@ function ZoneGridInner({
   // layout changes underneath it (unlike `pinnedZones`, which is a property of
   // the zone and gets migrated on layout change). Persisted per page so a
   // reopened window comes back with the same panels showing.
-  const [promptTabs, setPromptTabs] = useState<Set<string>>(() => loadPromptTabs(pageId));
+  //
+  // The review panel (`SessionReviewPanel`) shares the same overlay slot, so
+  // both open-sets live in one state and `toggleZonePanel` keeps them
+  // mutually exclusive per tab.
+  const [panelTabs, setPanelTabs] = useState<PanelTabs>(() => loadPanelTabs(pageId));
+  const promptTabs = panelTabs.prompts;
+  const reviewTabs = panelTabs.review;
   // Which page the state in `promptTabs` actually belongs to.
   //
   // ZoneGrid does NOT remount on a page switch (App.tsx dropped the
@@ -306,18 +344,17 @@ function ZoneGridInner({
       // Adopting the new page's persisted state IS the effect; the write
       // below is skipped this pass, so the old page's Set is never persisted
       // under the new page's key.
-      setPromptTabs(loadPromptTabs(pageId));
+      setPanelTabs(loadPanelTabs(pageId));
       return;
     }
-    instanceStorage.setJSON(promptTabsStorageKey(pageId), [...promptTabs]);
-  }, [promptTabs, pageId]);
+    instanceStorage.setJSON(promptTabsStorageKey(pageId), [...panelTabs.prompts]);
+    instanceStorage.setJSON(reviewTabsStorageKey(pageId), [...panelTabs.review]);
+  }, [panelTabs, pageId]);
   const togglePromptsForTab = useCallback((tabId: string) => {
-    setPromptTabs((prev) => {
-      const next = new Set(prev);
-      if (next.has(tabId)) next.delete(tabId);
-      else next.add(tabId);
-      return next;
-    });
+    setPanelTabs((prev) => toggleZonePanel(prev, tabId, "prompts"));
+  }, []);
+  const toggleReviewForTab = useCallback((tabId: string) => {
+    setPanelTabs((prev) => toggleZonePanel(prev, tabId, "review"));
   }, []);
 
   const gridRef = useRef<HTMLDivElement>(null);
@@ -609,12 +646,31 @@ function ZoneGridInner({
       />
     ));
 
+  // The maximized view renders its own header (below, after the early
+  // return), so its review read is hooked here, unconditionally.
+  const maximizedTab =
+    isSingleView && layout.id !== "single"
+      ? tabs.find((t) => t.id === assignments[singleViewZone])
+      : undefined;
+  const maximizedReviewAvailable =
+    reviewPanelAvailable(maximizedTab, !!maximizedTab?.claudeSessionId) &&
+    tabClassification.get(maximizedTab?.id ?? "") !== "hidden";
+  const maximizedReview = useSessionReview(
+    maximizedReviewAvailable ? (maximizedTab?.claudeSessionId ?? null) : null,
+    { visible: maximizedReviewAvailable },
+  );
+
   if (isSingleView && layout.id !== "single") {
-    const tabId = assignments[singleViewZone];
-    const tab = tabs.find((t) => t.id === tabId);
+    const tab = maximizedTab;
     // A maximized zone owns the page, so its prompts go in the full-height
     // right-hand column rather than the short strip a tiled zone gets.
     const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
+    const maximizedReviewOpen = maximizedReviewAvailable && !!tab && reviewTabs.has(tab.id);
+    const maximizedPanelWidth = maximizedReviewOpen
+      ? REVIEW_PANEL_GEOMETRY.rightWidthPx
+      : maximizedPromptsOpen
+        ? PROMPTS_PANEL_GEOMETRY.rightWidthPx
+        : undefined;
 
     return (
       <div
@@ -648,6 +704,14 @@ function ZoneGridInner({
                 <MessageSquare className="w-3 h-3" />
               </button>
             )}
+            {maximizedReviewAvailable && (
+              <SessionReviewToggle
+                open={maximizedReviewOpen}
+                onToggle={() => toggleReviewForTab(tab.id)}
+                badge={reviewBadgeState(maximizedReview.changes, maximizedReview.review)}
+                iconClassName="w-3 h-3"
+              />
+            )}
             <span className="text-[9px] text-[#565f89] ml-auto">
               Esc or double-click to restore
             </span>
@@ -666,6 +730,16 @@ function ZoneGridInner({
               onClose={() => togglePromptsForTab(tab.id)}
             />
           )}
+
+        {tab && maximizedReviewOpen && (
+          <SessionReviewPanel
+            handle={maximizedReview}
+            terminalId={tab.id}
+            orientation="right"
+            topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
+            onClose={() => toggleReviewForTab(tab.id)}
+          />
+        )}
 
         {/* eslint-disable-next-line react-hooks/refs -- terminalRefs is a stable Map-cache (see above). */}
         {layout.zones.map((_, zoneIdx) => {
@@ -697,9 +771,8 @@ function ZoneGridInner({
                       // this it covers the terminal's first line — it always
                       // did; naming its height is what made that visible.
                       paddingTop: `${MAXIMIZED_HEADER_HEIGHT_PX}px`,
-                      paddingRight: maximizedPromptsOpen
-                        ? `${PROMPTS_PANEL_RIGHT_WIDTH_PX}px`
-                        : undefined,
+                      paddingRight:
+                        maximizedPanelWidth !== undefined ? `${maximizedPanelWidth}px` : undefined,
                     }
                   : undefined
               }
@@ -825,6 +898,8 @@ function ZoneGridInner({
           onClearZoneFilter={clearZoneFilter}
           promptsOpen={promptTabs.has(assignments[zoneIdx] ?? "")}
           onTogglePromptsForTab={togglePromptsForTab}
+          reviewOpen={reviewTabs.has(assignments[zoneIdx] ?? "")}
+          onToggleReviewForTab={toggleReviewForTab}
           isSingleView={isSingleView}
         />
       ))}
@@ -1045,6 +1120,8 @@ function ZoneCellInner({
   onClearZoneFilter,
   promptsOpen,
   onTogglePromptsForTab,
+  reviewOpen,
+  onToggleReviewForTab,
   isSingleView,
 }: {
   zone: { col: string; row: string };
@@ -1121,6 +1198,9 @@ function ZoneCellInner({
   /** Is the operator's prompts panel showing for this zone's tab? */
   promptsOpen: boolean;
   onTogglePromptsForTab: (tabId: string) => void;
+  /** Is the review panel showing for this zone's tab? (Exclusive with prompts.) */
+  reviewOpen: boolean;
+  onToggleReviewForTab: (tabId: string) => void;
   /**
    * True when this zone has the whole page (the `single` layout). Selects the
    * prompts panel's orientation: a full-page zone gets the right-hand column,
@@ -1160,6 +1240,10 @@ function ZoneCellInner({
   const handleTogglePrompts = useCallback(
     () => (tabId ? onTogglePromptsForTab(tabId) : undefined),
     [onTogglePromptsForTab, tabId],
+  );
+  const handleToggleReview = useCallback(
+    () => (tabId ? onToggleReviewForTab(tabId) : undefined),
+    [onToggleReviewForTab, tabId],
   );
 
   // Per-tab TerminalInstance callbacks, hoisted out of JSX so the memoized
@@ -1233,9 +1317,20 @@ function ZoneCellInner({
     claudeSessionId: tab?.claudeSessionId,
     showCompactCard,
   });
-  const showPromptsPanel = promptsAvailable && promptsOpen;
+  const reviewAvailable = reviewPanelAvailable(tab, promptsAvailable);
+  // The review panel and the prompts panel share one overlay slot.
+  const showReviewPanel = reviewAvailable && reviewOpen;
+  const showPromptsPanel = promptsAvailable && promptsOpen && !showReviewPanel;
+  // Changes + read state for the badge and the panel. Visible-gated: a zone
+  // behind a compact card (or virtualized) reads nothing.
+  const review = useSessionReview(reviewAvailable ? (tab?.claudeSessionId ?? null) : null, {
+    visible: reviewAvailable,
+  });
+  const reviewBadge = reviewBadgeState(review.changes, review.review);
+  const panelOpen = showPromptsPanel || showReviewPanel;
+  const panelGeometry = showReviewPanel ? REVIEW_PANEL_GEOMETRY : PROMPTS_PANEL_GEOMETRY;
   // Measured only while a panel is open — a closed panel allocates no observer.
-  const zoneHeightPx = useElementHeight(zoneElRef, showPromptsPanel);
+  const zoneHeightPx = useElementHeight(zoneElRef, panelOpen);
   const zoneHeaderPx = showLabels || soloSessionInfo ? ZONE_HEADER_HEIGHT_PX : 0;
   const filterBarPx = showFilterInput === zoneIdx ? ZONE_FILTER_BAR_HEIGHT_PX : 0;
   const promptsChromeTopPx = zoneHeaderPx + filterBarPx;
@@ -1243,14 +1338,16 @@ function ZoneCellInner({
     isSingleView,
     zoneHeightPx,
     chromeTopPx: promptsChromeTopPx,
+    geometry: panelGeometry,
   });
-  const promptsStripPx = promptsStripHeight(zoneHeightPx, promptsChromeTopPx);
+  const promptsStripPx = promptsStripHeight(zoneHeightPx, promptsChromeTopPx, panelGeometry);
   const bodyPad = zoneBodyPadding({
     zoneHeaderPx,
     filterBarPx,
-    promptsOpen: showPromptsPanel,
+    promptsOpen: panelOpen,
     isSingleView,
     zoneHeightPx,
+    geometry: panelGeometry,
   });
   const isFlashing = tab && flashingTabs?.has(tab.id);
   const isStale = tab && staleTabs?.has(tab.id);
@@ -1494,6 +1591,15 @@ function ZoneCellInner({
               filterActive={!!zoneFilters[zoneIdx]}
               onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
               promptsVisible={showPromptsPanel}
+              reviewSlot={
+                reviewAvailable ? (
+                  <SessionReviewToggle
+                    open={showReviewPanel}
+                    onToggle={handleToggleReview}
+                    badge={reviewBadge}
+                  />
+                ) : undefined
+              }
             />
           )}
           {/* D1: the single-zone layout renders no `ZoneLabel`, so before this
@@ -1528,6 +1634,13 @@ function ZoneCellInner({
                 >
                   <MessageSquare className="w-2.5 h-2.5" />
                 </button>
+              )}
+              {reviewAvailable && (
+                <SessionReviewToggle
+                  open={showReviewPanel}
+                  onToggle={handleToggleReview}
+                  badge={reviewBadge}
+                />
               )}
             </div>
           )}
@@ -1577,6 +1690,16 @@ function ZoneCellInner({
               topOffsetPx={promptsChromeTopPx}
               heightPx={promptsStripPx}
               onClose={handleTogglePrompts}
+            />
+          )}
+          {showReviewPanel && (
+            <SessionReviewPanel
+              handle={review}
+              terminalId={tab.id}
+              orientation={promptsOrientation}
+              topOffsetPx={promptsChromeTopPx}
+              heightPx={promptsStripPx}
+              onClose={handleToggleReview}
             />
           )}
           {!showCompactCard && isMultiZone && (
