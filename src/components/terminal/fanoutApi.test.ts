@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FANOUT_LEDGER_NOT_LOADED,
   isFanoutCapOutcome,
   isFanoutRunList,
   isFanoutRunView,
@@ -58,6 +59,25 @@ describe("parseFanoutEnvelope", () => {
       ok: false,
       status: 503,
       error: "GET /fanout: HTTP 503",
+    });
+  });
+
+  it("an unloaded ledger's 503 keeps the reason and the code — never an empty list", () => {
+    const r = parseFanoutEnvelope(
+      503,
+      {
+        success: false,
+        error: "the fan-out ledger has not been loaded yet",
+        code: FANOUT_LEDGER_NOT_LOADED,
+      },
+      isFanoutRunList,
+      "GET /fanout",
+    );
+    expect(r).toEqual({
+      ok: false,
+      status: 503,
+      error: "the fan-out ledger has not been loaded yet",
+      code: FANOUT_LEDGER_NOT_LOADED,
     });
   });
 

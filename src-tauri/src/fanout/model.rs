@@ -149,10 +149,16 @@ pub struct FanoutRun {
     pub owner_instance: String,
 }
 
-/// One member of a run. `index` is its position in the previewed list.
+/// One member of a run. `index` is its position in the POSTED list (0-based,
+/// contiguous) — the address the release route and the admission order use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FanoutMember {
     pub index: u32,
+    /// Its row number in the operator's preview (0-based), when the caller
+    /// sent one. Differs from `index` once rows were unticked before create:
+    /// the preview showed `#5`, and the strip must show `#5` too, while the
+    /// posted list — and so `index` — is renumbered from 0.
+    pub preview_index: Option<u32>,
     pub title: String,
     pub prompt: String,
     pub state: MemberState,
@@ -167,9 +173,10 @@ pub struct FanoutMember {
 
 impl FanoutMember {
     /// A freshly queued member.
-    pub fn queued(index: u32, title: String, prompt: String) -> Self {
+    pub fn queued(index: u32, preview_index: Option<u32>, title: String, prompt: String) -> Self {
         Self {
             index,
+            preview_index,
             title,
             prompt,
             state: MemberState::Queued,
@@ -188,6 +195,10 @@ impl FanoutMember {
 pub struct MemberInput {
     pub title: String,
     pub prompt: String,
+    /// The row's number in the preview it was ticked in. Optional; when any
+    /// member carries one, every member must, strictly ascending.
+    #[serde(default)]
+    pub preview_index: Option<u32>,
 }
 
 /// Validate a posted member list and build the queued members.
@@ -204,6 +215,7 @@ pub fn build_members(inputs: &[MemberInput]) -> Result<Vec<FanoutMember>, String
             inputs.len()
         ));
     }
+    check_preview_indices(inputs)?;
     inputs
         .iter()
         .enumerate()
@@ -235,11 +247,44 @@ pub fn build_members(inputs: &[MemberInput]) -> Result<Vec<FanoutMember>, String
             let index = u32::try_from(i).map_err(|_| format!("members[{i}]: index overflow"))?;
             Ok(FanoutMember::queued(
                 index,
+                m.preview_index,
                 title.to_string(),
                 m.prompt.clone(),
             ))
         })
         .collect()
+}
+
+/// Preview indices are all-or-none and strictly ascending: the posted list is
+/// the ticked preview rows in preview order, so anything else means the caller
+/// numbered rows that are not the ones it previewed — refused, never repaired.
+fn check_preview_indices(inputs: &[MemberInput]) -> Result<(), String> {
+    let carried = inputs.iter().filter(|m| m.preview_index.is_some()).count();
+    if carried == 0 {
+        return Ok(());
+    }
+    if carried != inputs.len() {
+        let i = inputs
+            .iter()
+            .position(|m| m.preview_index.is_none())
+            .unwrap_or(0);
+        return Err(format!(
+            "members[{i}].previewIndex: missing — when any member carries a preview index, \
+             every member must"
+        ));
+    }
+    let mut prev: Option<u32> = None;
+    for (i, m) in inputs.iter().enumerate() {
+        let p = m.preview_index.unwrap_or(0);
+        if prev.is_some_and(|q| p <= q) {
+            return Err(format!(
+                "members[{i}].previewIndex: {p} is not greater than the previous row's — \
+                 preview indices must be strictly ascending"
+            ));
+        }
+        prev = Some(p);
+    }
+    Ok(())
 }
 
 /// `requested` clamped to `[1, bound]`. A bound of 0 cannot occur
@@ -291,6 +336,9 @@ pub fn derived_run_state(members: &[FanoutMember]) -> RunState {
 #[serde(rename_all = "camelCase")]
 pub struct MemberView {
     pub index: u32,
+    /// The member's row number in the preview, when the creator sent one —
+    /// what the strip shows as `#n`. `null` for a run created without it.
+    pub preview_index: Option<u32>,
     pub title: String,
     pub prompt: String,
     pub state: MemberState,
@@ -335,6 +383,7 @@ impl RunView {
                 .iter()
                 .map(|m| MemberView {
                     index: m.index,
+                    preview_index: m.preview_index,
                     title: m.title.clone(),
                     prompt: m.prompt.clone(),
                     state: m.state,
@@ -357,7 +406,57 @@ mod tests {
         MemberInput {
             title: title.to_string(),
             prompt: prompt.to_string(),
+            preview_index: None,
         }
+    }
+
+    fn previewed(title: &str, preview_index: u32) -> MemberInput {
+        MemberInput {
+            preview_index: Some(preview_index),
+            ..input(title, "p")
+        }
+    }
+
+    #[test]
+    fn fanout_preview_index_is_kept_beside_the_renumbered_index() {
+        // Rows #1, #3 and #6 of the preview were ticked.
+        let members =
+            build_members(&[previewed("a", 0), previewed("b", 2), previewed("c", 5)]).unwrap();
+        let got: Vec<(u32, Option<u32>)> =
+            members.iter().map(|m| (m.index, m.preview_index)).collect();
+        assert_eq!(got, vec![(0, Some(0)), (1, Some(2)), (2, Some(5))]);
+        let run = FanoutRun {
+            id: Uuid::nil(),
+            tenant_id: None,
+            template_slug: None,
+            template_version: None,
+            max_concurrent: 1,
+            config_dir_policy: ConfigDirPolicy::BestHeadroom,
+            working_dir: "/w".to_string(),
+            created_at: Utc::now(),
+            state: RunState::Active,
+            owner_instance: "primary".to_string(),
+        };
+        let wire = serde_json::to_value(RunView::of(&run, &members)).unwrap();
+        assert_eq!(wire["members"][1]["index"], 1);
+        assert_eq!(wire["members"][1]["previewIndex"], 2);
+        // Without one it is null on the wire, and the input parses without it.
+        let plain = build_members(&[input("a", "p")]).unwrap();
+        let wire = serde_json::to_value(RunView::of(&run, &plain)).unwrap();
+        assert!(wire["members"][0]["previewIndex"].is_null());
+        let parsed: MemberInput =
+            serde_json::from_str(r#"{"title":"t","prompt":"p","previewIndex":4}"#).unwrap();
+        assert_eq!(parsed.preview_index, Some(4));
+    }
+
+    #[test]
+    fn fanout_preview_indices_are_all_or_none_and_strictly_ascending() {
+        let err = build_members(&[previewed("a", 0), input("b", "p")]).unwrap_err();
+        assert!(err.starts_with("members[1].previewIndex: missing"), "{err}");
+        let err = build_members(&[previewed("a", 3), previewed("b", 3)]).unwrap_err();
+        assert!(err.starts_with("members[1].previewIndex"), "{err}");
+        let err = build_members(&[previewed("a", 4), previewed("b", 1)]).unwrap_err();
+        assert!(err.contains("strictly ascending"), "{err}");
     }
 
     #[test]
@@ -379,7 +478,9 @@ mod tests {
         let long = "x".repeat(MAX_PROMPT_BYTES + 1);
         let err = build_members(&[input("a", &long)]).unwrap_err();
         assert!(err.contains("refused rather than truncated"), "{err}");
-        let many: Vec<MemberInput> = (0..=MAX_MEMBERS).map(|i| input("t", &i.to_string())).collect();
+        let many: Vec<MemberInput> = (0..=MAX_MEMBERS)
+            .map(|i| input("t", &i.to_string()))
+            .collect();
         assert!(build_members(&many).is_err());
     }
 

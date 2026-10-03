@@ -18,6 +18,15 @@
 //! * `POST /fanout/{id}/cancel` → `RunView` (queued members only)
 //! * `PATCH /fanout/{id}` ← `{maxConcurrent}` → `CapOutcome`
 //! * `POST /fanout/{id}/members/{index}/release` → `RunView`
+//!
+//! Until the dispatcher has loaded its ledger from PostgreSQL (the boot settle,
+//! or while PG is unreachable) EVERY route answers `503` with `code:
+//! "FANOUT_LEDGER_NOT_LOADED"` and the reason — never `200 []`, which would
+//! read as "no runs" while the ledger may hold active ones. `POST /fanout` is
+//! refused too: see `FanoutDispatcher::create` for the double-spawn it closes.
+//! A member's `index` is its position in the posted list; an optional
+//! `previewIndex` on each posted member is stored and echoed so the strip can
+//! show the preview's own row number.
 
 use std::sync::Arc;
 
@@ -46,8 +55,24 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
     (status, Json(api_error(message)))
 }
 
+/// The machine-readable code on a refusal served because the ledger is not
+/// loaded — the UI renders it as UNKNOWN, never as "no runs".
+pub const LEDGER_NOT_LOADED_CODE: &str = "FANOUT_LEDGER_NOT_LOADED";
+
+fn not_loaded(message: String) -> Refusal {
+    warn!("HTTP /fanout: {message}");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiResponse::<()>::error_with_code(
+            message,
+            LEDGER_NOT_LOADED_CODE,
+        )),
+    )
+}
+
 fn op_refusal(e: OpError) -> Refusal {
     match e {
+        OpError::NotLoaded(m) => not_loaded(m),
         OpError::NotFound(m) => refuse(StatusCode::NOT_FOUND, m),
         OpError::Conflict(m) => refuse(StatusCode::CONFLICT, m),
         OpError::Store(m) => refuse(
@@ -110,7 +135,9 @@ fn new_run(req: CreateFanoutRequest) -> Result<NewRun, String> {
     let working_dir = req.working_dir.trim().to_string();
     let path = std::path::Path::new(&working_dir);
     if !path.is_absolute() {
-        return Err(format!("workingDir: {working_dir:?} is not an absolute path"));
+        return Err(format!(
+            "workingDir: {working_dir:?} is not an absolute path"
+        ));
     }
     if !path.is_dir() {
         return Err(format!("workingDir: {working_dir} is not a directory"));
@@ -145,16 +172,15 @@ async fn create_handler(
 
 async fn list_handler(State(state): State<Arc<ApiState>>) -> Reply<Vec<RunView>> {
     let d = dispatcher(&state).ok_or_else(not_running)?;
-    Ok(Json(ApiResponse::success(d.list().as_ref().clone())))
+    let runs = d.list().map_err(not_loaded)?;
+    Ok(Json(ApiResponse::success(runs.as_ref().clone())))
 }
 
-async fn get_handler(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> Reply<RunView> {
+async fn get_handler(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Reply<RunView> {
     let d = dispatcher(&state).ok_or_else(not_running)?;
     let id = run_id(&id).map_err(bad_request)?;
     d.get(id)
+        .map_err(not_loaded)?
         .map(|v| Json(ApiResponse::success(v)))
         .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("no fan-out run {id}")))
 }
@@ -199,7 +225,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/fanout", get(list_handler).post(create_handler))
         .route("/fanout/{id}", get(get_handler).patch(patch_handler))
         .route("/fanout/{id}/cancel", post(cancel_handler))
-        .route("/fanout/{id}/members/{index}/release", post(release_handler))
+        .route(
+            "/fanout/{id}/members/{index}/release",
+            post(release_handler),
+        )
 }
 
 /// Every `(METHOD, path)` [`routes`] registers. Pinned against the source by
@@ -224,10 +253,17 @@ mod tests {
     #[test]
     fn fanout_route_entries_match_the_registered_routes() {
         let source = include_str!("fanout.rs");
-        let registered: std::collections::BTreeSet<String> = source
-            .lines()
-            .map(str::trim)
-            .filter_map(|l| l.strip_prefix(".route(\""))
+        // Only the `routes()` body, and tolerant of rustfmt wrapping a long
+        // `.route(` call so its path lands on the next line.
+        let body = source
+            .split("pub fn routes()")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn route_entries()").next())
+            .expect("routes() is in this file");
+        let registered: std::collections::BTreeSet<String> = body
+            .split(".route(")
+            .skip(1)
+            .filter_map(|rest| rest.trim_start().strip_prefix('"'))
             .filter_map(|rest| rest.split('"').next())
             .map(str::to_string)
             .collect();
@@ -235,7 +271,10 @@ mod tests {
             .iter()
             .map(|(_, path)| (*path).to_string())
             .collect();
-        assert_eq!(registered, declared, "routes() and route_entries() drifted apart");
+        assert_eq!(
+            registered, declared,
+            "routes() and route_entries() drifted apart"
+        );
         let scanned = crate::mcp::relay_path_policy::tests::registered_routes();
         for (method, path) in route_entries() {
             assert!(
@@ -266,7 +305,7 @@ mod tests {
         let req: CreateFanoutRequest = serde_json::from_str(&format!(
             r#"{{"tenantId":null,"templateSlug":"seed","templateVersion":3,"maxConcurrent":2,
                 "configDirPolicy":{{"kind":"bestHeadroom"}},"workingDir":{},
-                "members":[{{"title":"a","prompt":"p"}}]}}"#,
+                "members":[{{"title":"a","prompt":"p","previewIndex":4}}]}}"#,
             temp_dir_json()
         ))
         .unwrap();
@@ -275,11 +314,27 @@ mod tests {
         let run = new_run(req).unwrap();
         assert_eq!(run.requested_max_concurrent, 2);
         assert_eq!(run.tenant_id, None);
+        assert_eq!(
+            (run.members[0].index, run.members[0].preview_index),
+            (0, Some(4))
+        );
+    }
+
+    #[test]
+    fn fanout_not_loaded_is_a_typed_503() {
+        let (status, Json(body)) = op_refusal(OpError::NotLoaded("not loaded yet".to_string()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["code"], LEDGER_NOT_LOADED_CODE);
+        assert_eq!(wire["error"], "not loaded yet");
+        assert!(wire.get("data").is_none(), "never an empty list: {wire}");
     }
 
     #[test]
     fn fanout_create_refuses_a_bad_tenant_and_a_relative_working_dir() {
-        let base = r#""configDirPolicy":{"kind":"bestHeadroom"},"members":[{"title":"a","prompt":"p"}]"#;
+        let base =
+            r#""configDirPolicy":{"kind":"bestHeadroom"},"members":[{"title":"a","prompt":"p"}]"#;
         let req: CreateFanoutRequest =
             serde_json::from_str(&format!(r#"{{"workingDir":"rel/dir",{base}}}"#)).unwrap();
         assert!(new_run(req).unwrap_err().contains("not an absolute path"));
@@ -288,6 +343,8 @@ mod tests {
             temp_dir_json()
         ))
         .unwrap();
-        assert!(new_run(req).unwrap_err().starts_with("terminal:tenant_invalid:"));
+        assert!(new_run(req)
+            .unwrap_err()
+            .starts_with("terminal:tenant_invalid:"));
     }
 }

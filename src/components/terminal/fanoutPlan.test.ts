@@ -236,8 +236,8 @@ describe("buildCreateFanoutRequest", () => {
       configDirPolicy: { kind: "fixed", configDir: "/home/u/.claude-a" },
       workingDir: "/repo",
       members: [
-        { title: "a", prompt: "  first\nline " },
-        { title: "c", prompt: "third" },
+        { title: "a", prompt: "  first\nline ", previewIndex: 0 },
+        { title: "c", prompt: "third", previewIndex: 2 },
       ],
     });
   });

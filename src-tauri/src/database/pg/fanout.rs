@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS project.fanout_members ( \
     released_at       TIMESTAMPTZ, \
     PRIMARY KEY (run_id, idx) \
 ); \
+ALTER TABLE project.fanout_members ADD COLUMN IF NOT EXISTS preview_index INTEGER; \
 CREATE INDEX IF NOT EXISTS idx_fanout_runs_owner_state \
     ON project.fanout_runs (owner_instance, state);";
 
@@ -62,7 +63,7 @@ const RUN_COLUMNS: &str = "id, tenant_id, template_slug, template_version, max_c
      config_dir_policy, working_dir, created_at, state, owner_instance";
 
 const MEMBER_COLUMNS: &str = "run_id, idx, title, prompt, state, terminal_id, claude_session_id, \
-     reason, admitted_at, released_at";
+     reason, admitted_at, released_at, preview_index";
 
 fn col<'a, T: tokio_postgres::types::FromSql<'a>>(
     row: &'a Row,
@@ -101,10 +102,17 @@ fn run_from_row(row: &Row) -> Result<FanoutRun, String> {
 fn member_from_row(row: &Row) -> Result<(Uuid, FanoutMember), String> {
     let idx: i32 = col(row, 1, "idx")?;
     let state: String = col(row, 4, "state")?;
+    let preview_index: Option<i32> = col(row, 10, "preview_index")?;
     Ok((
         col(row, 0, "run_id")?,
         FanoutMember {
             index: u32::try_from(idx).map_err(|_| format!("fanout row: idx {idx} is negative"))?,
+            preview_index: preview_index
+                .map(|p| {
+                    u32::try_from(p)
+                        .map_err(|_| format!("fanout row: preview_index {p} is negative"))
+                })
+                .transpose()?,
             title: col(row, 2, "title")?,
             prompt: col(row, 3, "prompt")?,
             state: MemberState::parse(&state)
@@ -159,10 +167,14 @@ impl PgDb {
         .map_err(|e| crate::database::pg::pg_err("insert_fanout_run run", &e))?;
         for m in members {
             let idx = as_i32(m.index, "member index")?;
+            let preview_index = m
+                .preview_index
+                .map(|p| as_i32(p, "member preview index"))
+                .transpose()?;
             tx.execute(
                 &*format!(
                     "INSERT INTO project.fanout_members ({MEMBER_COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
                 ),
                 &[
                     &run.id,
@@ -175,6 +187,7 @@ impl PgDb {
                     &m.reason,
                     &m.admitted_at,
                     &m.released_at,
+                    &preview_index,
                 ],
             )
             .await
@@ -240,7 +253,10 @@ impl PgDb {
         if n == 1 {
             Ok(())
         } else {
-            Err(format!("update_fanout_member: no member {run_id}/{}", m.index))
+            Err(format!(
+                "update_fanout_member: no member {run_id}/{}",
+                m.index
+            ))
         }
     }
 
@@ -332,7 +348,8 @@ mod tests {
                 stmt.starts_with("CREATE SCHEMA IF NOT EXISTS")
                     || stmt.starts_with("CREATE TABLE IF NOT EXISTS")
                     || stmt.starts_with("CREATE INDEX IF NOT EXISTS")
-                    || (stmt.starts_with("ALTER TABLE") && stmt.contains("ADD COLUMN IF NOT EXISTS")),
+                    || (stmt.starts_with("ALTER TABLE")
+                        && stmt.contains("ADD COLUMN IF NOT EXISTS")),
                 "non-idempotent statement: {stmt}"
             );
         }

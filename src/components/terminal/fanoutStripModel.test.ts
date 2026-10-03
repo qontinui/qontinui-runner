@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { FanoutMemberView, FanoutRunView } from "./fanoutApi";
+import {
+  FANOUT_LEDGER_NOT_LOADED,
+  isFanoutRunList,
+  parseFanoutEnvelope,
+  type FanoutMemberView,
+  type FanoutRunView,
+} from "./fanoutApi";
 import {
   activeFanoutRuns,
   canReleaseMember,
@@ -9,6 +15,7 @@ import {
   capClampNote,
   fanoutRunSummary,
   fanoutStripVisible,
+  memberNumber,
   memberStateLabel,
   mergeRunUpdate,
   nextCap,
@@ -53,6 +60,31 @@ function run(members: FanoutMemberView[], overrides: Partial<FanoutRunView> = {}
 }
 
 describe("read state", () => {
+  it("a 503 FANOUT_LEDGER_NOT_LOADED is UNKNOWN with its reason, shown in the strip", () => {
+    const result = parseFanoutEnvelope(
+      503,
+      {
+        success: false,
+        error: "the fan-out ledger has not been loaded yet — its runs are UNKNOWN until then",
+        code: FANOUT_LEDGER_NOT_LOADED,
+      },
+      isFanoutRunList,
+      "GET /fanout",
+    );
+    const s = readStateFromResult(result);
+    expect(s).toEqual({
+      kind: "unknown",
+      status: 503,
+      error: "the fan-out ledger has not been loaded yet — its runs are UNKNOWN until then",
+      code: FANOUT_LEDGER_NOT_LOADED,
+    });
+    expect(fanoutStripVisible(s)).toBe(true);
+    if (s.kind !== "unknown") throw new Error("unreachable");
+    expect(unknownStripText(s.error)).toMatch(
+      /^fan-out UNKNOWN — the fan-out ledger has not been loaded yet/,
+    );
+  });
+
   it("a failed read is UNKNOWN with the error, never an empty list", () => {
     const s = readStateFromResult({ ok: false, status: 503, error: "dispatcher not running" });
     expect(s).toEqual({ kind: "unknown", status: 503, error: "dispatcher not running" });
@@ -195,5 +227,18 @@ describe("controls", () => {
     expect(
       capClampNote(4, { run: { maxConcurrent: 4 }, fanoutBound: 15, clampedFrom: null }),
     ).toBeNull();
+  });
+});
+
+describe("memberNumber", () => {
+  it("shows the preview's row number, not the renumbered posted position", () => {
+    // Preview rows #1, #3, #6 were ticked: the server holds them at 0, 1, 2.
+    expect(memberNumber({ index: 1, previewIndex: 2 })).toBe(3);
+    expect(memberNumber({ index: 2, previewIndex: 5 })).toBe(6);
+  });
+
+  it("falls back to the posted position when no preview index was echoed", () => {
+    expect(memberNumber({ index: 1, previewIndex: null })).toBe(2);
+    expect(memberNumber({ index: 4 })).toBe(5);
   });
 });

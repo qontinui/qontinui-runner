@@ -40,7 +40,14 @@ export interface FanoutMemberCounts {
 }
 
 export interface FanoutMemberView {
+  /** Position in the POSTED list (0-based) — what the release route addresses. */
   index: number;
+  /**
+   * The member's row in the preview it was created from (0-based), when the
+   * creator sent one. Differs from `index` once rows were unticked; absent from
+   * a runner build that predates it.
+   */
+  previewIndex?: number | null;
   title: string;
   prompt: string;
   state: FanoutMemberState;
@@ -78,6 +85,8 @@ export interface FanoutCapOutcome {
 export interface FanoutMemberInput {
   title: string;
   prompt: string;
+  /** The row's number in the preview (0-based); stored and echoed as `previewIndex`. */
+  previewIndex?: number;
 }
 
 /** `POST /fanout` body. The server never re-expands: these members run as-is. */
@@ -106,7 +115,18 @@ export type FanoutResult<T> =
       status: number | null;
       /** The server's own error text, or a description of what failed. */
       error: string;
+      /**
+       * The envelope's machine-readable `code`, when the server sent one —
+       * e.g. {@link FANOUT_LEDGER_NOT_LOADED}.
+       */
+      code?: string;
     };
+
+/**
+ * The `code` on a 503 served while the runner has not loaded its fan-out
+ * ledger yet (boot settle, or PostgreSQL unreachable). Its runs are UNKNOWN.
+ */
+export const FANOUT_LEDGER_NOT_LOADED = "FANOUT_LEDGER_NOT_LOADED";
 
 // ---------------------------------------------------------------------------
 // Pure envelope parsing
@@ -131,14 +151,16 @@ export function parseFanoutEnvelope<T>(
   what: string,
 ): FanoutResult<T> {
   const envelopeError = isRecord(body) && typeof body.error === "string" ? body.error : null;
+  const code = isRecord(body) && typeof body.code === "string" ? { code: body.code } : {};
   if (status < 200 || status >= 300) {
-    return { ok: false, status, error: envelopeError ?? `${what}: HTTP ${status}` };
+    return { ok: false, status, error: envelopeError ?? `${what}: HTTP ${status}`, ...code };
   }
   if (!isRecord(body) || body.success !== true) {
     return {
       ok: false,
       status,
       error: envelopeError ?? `${what}: response was not a success envelope`,
+      ...code,
     };
   }
   if (!("data" in body) || !validate(body.data)) {
