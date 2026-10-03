@@ -586,6 +586,11 @@ export interface UIBridgeRequestPayload {
   name?: string;
   /** Full request body for change tracking commands */
   body?: Record<string, unknown>;
+  /**
+   * `discover` filters. The Rust handler forwards the HTTP body whole, so any
+   * other SDK `FindRequest` field (`includeMedia`, `text`, `testId`, …) may
+   * ride along beside the six named here.
+   */
   options?: {
     root?: string;
     interactiveOnly?: boolean;
@@ -593,6 +598,7 @@ export interface UIBridgeRequestPayload {
     limit?: number;
     types?: string[];
     selector?: string;
+    [filter: string]: unknown;
   };
   /** Maximum token budget for AI snapshot pruning (0 = unlimited) */
   maxTokens?: number;
