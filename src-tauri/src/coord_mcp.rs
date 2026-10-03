@@ -1603,7 +1603,7 @@ pub(crate) fn runner_credential_refusal_body(
         "code": code,
         "since": since,
         "remedy": runner_credential_remedy(status.posture),
-        "error": status.posture.message(),
+        "error": status.reason(),
         "layer": ProxyFailureLayer::RunnerCredential.as_str(),
         "cause": code,
         "next_door": ProxyFailureLayer::RunnerCredential.next_door(),
@@ -23647,6 +23647,8 @@ mod spawn_tenant_credential_tests {
             since: 0,
             observed_at_unix: 0,
             attributable: true,
+            composed_reason: None,
+            pinned_tenant: false,
         };
 
         let b_path =
