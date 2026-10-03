@@ -1989,7 +1989,15 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
                 tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
             }
-            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
+            // Off the async worker: the reconcile holds file locks that may
+            // wait (bounded) on a peer process.
+            let reconcile_set = coord_set;
+            let reconciled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::reconcile_paired_bindings(&reconcile_set)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
+            match reconciled {
                 Ok(report) => {
                     if report.changed() {
                         info!(

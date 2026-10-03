@@ -300,7 +300,7 @@ fn keychain_enabled_env() -> bool {
 /// (plan `2026-08-29-qontinui-profile-device-pair-never-exits`, Phase 1). A
 /// few seconds is generous for what is otherwise a local D-Bus round-trip,
 /// not a network call.
-const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Tripped once any [`keyring_call_bounded`] call times out. `AuthManager` is
 /// shared with the runner's background device-JWT refresher
@@ -403,6 +403,7 @@ where
 /// Storage strategy:
 /// 1. Primary: Encrypted file storage (reliable on all platforms)
 /// 2. Fallback: OS keychain (for migration from existing installations)
+#[derive(Clone)]
 pub struct AuthManager {
     secure_storage: SecureStorage,
     service_name: String,
@@ -530,6 +531,7 @@ impl AuthManager {
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
+    #[track_caller]
     pub fn store_tokens(&self, access_token: &str, refresh_token: &str) -> Result<()> {
         // Store in encrypted file storage (primary)
         self.secure_storage
@@ -562,6 +564,7 @@ impl AuthManager {
     /// [`Self::store_tokens`] directly — plan
     /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
     /// D2.
+    #[track_caller]
     pub fn store_tokens_expecting(
         &self,
         access_token: &str,
@@ -603,6 +606,7 @@ impl AuthManager {
     /// opaque legacy bearer, or a JWT coord issued without one) has no key to
     /// be stored under and is skipped — which is precisely the residue that
     /// keeps the legacy slot alive.
+    #[track_caller]
     fn mirror_into_tenant_slot(&self, access_token: &str) {
         let Some(tenant) = jwt_tenant_claim(access_token) else {
             return;
@@ -621,6 +625,7 @@ impl AuthManager {
     /// only on the explicit pairing path (`pair::persist_pairing`) — never from
     /// the background device-JWT refresher, which uses [`Self::store_tokens`].
     /// See `SecureStorage::WriteMode` for why the distinction matters.
+    #[track_caller]
     pub fn store_tokens_fresh(&self, access_token: &str, refresh_token: &str) -> Result<()> {
         self.secure_storage
             .store_tokens_fresh(access_token, refresh_token)
@@ -853,6 +858,7 @@ impl AuthManager {
     /// # Errors
     ///
     /// Returns an error if clearing fails.
+    #[track_caller]
     pub fn clear_all_credentials(&self) -> Result<()> {
         // Clear from file storage
         if let Err(e) = self.secure_storage.clear_tokens() {
@@ -1410,6 +1416,7 @@ impl AuthManager {
     /// Store (or overwrite) the device JWT for one tenant binding
     /// (slot `device_jwt:<tenant_id>`). Never touches the legacy
     /// `access_token` slot.
+    #[track_caller]
     pub fn store_tenant_device_jwt(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
         self.secure_storage
             .store_tenant_device_jwt(tenant_id, jwt)
@@ -1422,6 +1429,7 @@ impl AuthManager {
     /// (`pair::persist_pairing`), so on an undecryptable `.enc` it heals the
     /// store for the rest of that pairing sequence. The background refresher's
     /// per-tenant write uses [`Self::store_tenant_device_jwt`].
+    #[track_caller]
     pub fn store_tenant_device_jwt_fresh(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
         self.secure_storage
             .store_tenant_device_jwt_fresh(tenant_id, jwt)
@@ -1436,10 +1444,23 @@ impl AuthManager {
 
     /// Remove one tenant's device-JWT slot. Idempotent; never touches the
     /// legacy `access_token` slot or any other tenant's slot.
+    #[track_caller]
     pub fn clear_tenant_device_jwt(&self, tenant_id: &Uuid) -> Result<()> {
         self.secure_storage
             .clear_tenant_device_jwt(tenant_id)
             .context("Failed to clear per-tenant device JWT from secure storage")
+    }
+
+    /// Remove each listed tenant's slot only if it still holds its observed
+    /// token, all under one store lock. Returns per tenant whether it was removed.
+    #[track_caller]
+    pub fn clear_tenant_device_jwts_if_unchanged(
+        &self,
+        expected: &[(Uuid, String)],
+    ) -> Result<Vec<(Uuid, bool)>> {
+        self.secure_storage
+            .clear_tenant_device_jwts_if_unchanged(expected)
+            .context("Failed to conditionally clear per-tenant device JWTs")
     }
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
