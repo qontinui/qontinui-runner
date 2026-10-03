@@ -211,6 +211,27 @@ pub fn user_chose_session(profile: &CliProfile, args: &[String]) -> bool {
         .map(|(flag, _)| flag)
         .chain(profile.session_choice_args.iter().map(String::as_str))
         .collect();
+    args_name_any(args, &tokens)
+}
+
+/// Whether `args` take up an EXISTING session of `profile` — a resuming id
+/// flag ([`id_flags`] with `true`) or a [`CliProfile::session_choice_args`]
+/// token (`--continue`, `resume`) — as opposed to starting a fresh one. A
+/// launch that does and then exits unsuccessfully failed to get that
+/// conversation back.
+pub fn resumes_existing_session(profile: &CliProfile, args: &[String]) -> bool {
+    let tokens: Vec<&str> = id_flags(profile)
+        .into_iter()
+        .filter(|(_, resumes)| *resumes)
+        .map(|(flag, _)| flag)
+        .chain(profile.session_choice_args.iter().map(String::as_str))
+        .collect();
+    args_name_any(args, &tokens)
+}
+
+/// Whether any of `args` is one of `tokens` — a whole argv entry compared
+/// case-insensitively, a `--long` token also matching its `--long=…` form.
+fn args_name_any(args: &[String], tokens: &[&str]) -> bool {
     args.iter().any(|arg| {
         let name = match arg.split_once('=') {
             Some((name, _)) if name.starts_with("--") => name,
@@ -220,9 +241,34 @@ pub fn user_chose_session(profile: &CliProfile, args: &[String]) -> bool {
     })
 }
 
-/// The argv that resumes `session_id` under `profile`, or `None` when the
-/// profile declares no by-id resume.
+/// Longest session id [`is_valid_session_id`] accepts.
+pub const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Whether `id` is safe to interpolate into a command line: 1 to
+/// [`MAX_SESSION_ID_LEN`] ASCII letters, digits, `-` and `_`, not starting
+/// with `-` (which a CLI would read as a flag). Every id a supported CLI mints
+/// (Claude's UUIDv4, Codex's UUIDv7) passes; anything carrying a shell
+/// metacharacter, whitespace or a quote does not. A resume line is typed into
+/// a shell (the PTY restore paths) or joined into a launch command string
+/// (the restore record), so an id from a record, a transcript or a request is
+/// never trusted to be inert.
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_ID_LEN
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The argv that resumes `session_id` under `profile`. `None` when the
+/// profile declares no by-id resume, or when `session_id` fails
+/// [`is_valid_session_id`] — an id that could not be typed safely is never
+/// spliced into a command.
 pub fn resume_argv(profile: &CliProfile, session_id: &str) -> Option<Vec<String>> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
     match &profile.resume {
         ResumeSpec::ByIdArgv { template } => Some(
             template
@@ -470,6 +516,58 @@ mod tests {
         no_resume.resume = ResumeSpec::Unknown;
         assert_eq!(resume_argv(&no_resume, "sess-1"), None);
         assert_eq!(restore_tier(&no_resume), RestoreTier::TerminalOnly);
+    }
+
+    /// A resume (or continue) takes up an existing session; a pin starts one.
+    #[test]
+    fn resumes_existing_session_tells_a_resume_from_a_pin() {
+        let p = profile_for("claude").unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for resuming in [
+            &["--resume", "abc"][..],
+            &["--resume=abc"],
+            &["-r", "abc"],
+            &["--continue"],
+        ] {
+            assert!(resumes_existing_session(p, &args(resuming)), "{resuming:?}");
+        }
+        for fresh in [&["--session-id", "abc"][..], &["-p", "hi"], &[]] {
+            assert!(!resumes_existing_session(p, &args(fresh)), "{fresh:?}");
+        }
+    }
+
+    /// A session id is spliced into a resume command only when it is in the
+    /// strict id charset: no shell metacharacter, quote, space or leading
+    /// dash reaches a command line.
+    #[test]
+    fn resume_argv_refuses_an_id_outside_the_strict_charset() {
+        let p = profile_for("claude").unwrap();
+        for ok in [
+            "0b7e2a3c-1d4f-4a5b-9c8d-7e6f5a4b3c2d",
+            "01a0ef49-1234-7abc-8def-0123456789ab",
+            "sess_1",
+        ] {
+            assert!(is_valid_session_id(ok), "{ok}");
+            assert!(resume_argv(p, ok).is_some(), "{ok}");
+        }
+        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        for bad in [
+            "",
+            "-rf",
+            "a b",
+            "x;rm -rf ~",
+            "$(id)",
+            "`id`",
+            "a'b",
+            "a\"b",
+            "a&b",
+            "a|b",
+            "a\nb",
+            too_long.as_str(),
+        ] {
+            assert!(!is_valid_session_id(bad), "{bad:?}");
+            assert_eq!(resume_argv(p, bad), None, "{bad:?}");
+        }
     }
 
     #[test]

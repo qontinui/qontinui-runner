@@ -1469,6 +1469,11 @@ fn record_session_open_into(
         }
     }
 
+    // The same proof ends the failures a REPLACEMENT pane took over: when the
+    // runner respawned a failed session into this terminal, its session
+    // starting here is the evidence the replacement works — never the spawn.
+    crate::session::failure_recovery::on_pty_session_confirmed(&req.terminal_id);
+
     // D1 name stamp at confirmation. The account is already durable (the
     // `record_pinned_session_open` above derives it from `config_dir`), but the
     // NAME the operator sees lives only in Claude Code's per-process registry,
