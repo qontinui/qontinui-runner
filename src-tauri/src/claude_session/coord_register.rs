@@ -2229,6 +2229,9 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         let finished_at = store.set_finished(csid, true, None).unwrap().finished_at;
@@ -2325,6 +2328,9 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         let coord_id = reg

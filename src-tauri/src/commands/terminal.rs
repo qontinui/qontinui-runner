@@ -384,6 +384,15 @@ pub async fn terminal_create(
                 // which fires once the session's identity is long past
                 // changing.
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
+                // A boot-restored gate continuation is re-registered in the
+                // continuation registry against THIS terminal (plan 2026-10-03
+                // D3), so its death must reach the same producer a backend
+                // spawn's does. A no-op for a terminal the registry does not
+                // hold — every ordinary operator tab.
+                let exited_terminal_id = info.id.clone();
+                // tauri's handle rather than `Handle::try_current()`: it is always
+                // available here, and the waiter thread that fires the hook has none.
+                let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
                 session.set_on_exit(Box::new(move |coord_id, exit_code| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
@@ -392,6 +401,10 @@ pub async fn terminal_create(
                             "terminal exit hook: coord session close failed"
                         );
                     }
+                    crate::agent_runtime::notify_continuation_terminal_exit(
+                        &exited_terminal_id,
+                        Some(&exit_rt_handle),
+                    );
                     // Trigger 4 (session_exit) — plan
                     // 2026-08-27-operator-touch-observation-runner-emitter,
                     // Phase B2 §2b/§2c.
@@ -1330,9 +1343,15 @@ pub fn terminal_session_record_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        gate_id: None,
+        gate_consuming_device_id: None,
+        gate_bound_boot_ms: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
+    // The verified-resume re-assert of a boot restore lands here: adopt a
+    // resumed gate continuation into this generation (plan 2026-10-03 D3).
+    adopt_restored_continuation(&store, &session_id);
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -2346,8 +2365,8 @@ pub(crate) fn create_terminal_session_backend(
                 // hook can tell `agent_runtime` a continuation slot just freed and
                 // a deferred (AtCap) continuation can be re-polled promptly. The
                 // notify is a no-op unless this terminal is a registered
-                // continuation session, so operator tabs (a different create path)
-                // never trigger a poll. The PTY waiter that fires this hook is a
+                // continuation session, so an ordinary operator tab never
+                // triggers a poll. The PTY waiter that fires this hook is a
                 // bare OS thread with no tokio runtime, so capture the current
                 // runtime handle HERE (this fn runs under tokio) for the poll to
                 // spawn on.
@@ -2414,8 +2433,10 @@ pub(crate) fn create_terminal_session_backend(
                 zone_index: hint_zone_index,
                 // Consumed earlier (env injection at spawn); not needed here.
                 inject_agent_git_identity: _,
-                // Consumed earlier (env injection at spawn); not needed here.
-                gate_identity: _,
+                // Injected into the PTY env at spawn, AND persisted on the
+                // durable record (plan 2026-10-03 D1) so a runner crash cannot
+                // strand the gate unreportable.
+                gate_identity,
                 // Consumed earlier (coord registration above).
                 coord_lineage: _,
                 // Consumed earlier (env injection at spawn); not needed here.
@@ -2438,6 +2459,7 @@ pub(crate) fn create_terminal_session_backend(
                     record_page_id,
                     record_zone_index,
                     crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                    gate_identity,
                 );
                 let verify_dirs: Vec<std::path::PathBuf> = config_dir
                     .iter()
@@ -2475,6 +2497,7 @@ pub(crate) fn create_terminal_session_backend(
                     title,
                     record_page_id,
                     record_zone_index,
+                    gate_identity,
                     SESSION_CAPTURE_POLL_INTERVAL,
                     SESSION_CAPTURE_TIMEOUT,
                 ));
@@ -2550,11 +2573,13 @@ async fn poll_and_record_session<F>(
     title: String,
     page_id: String,
     zone_index: i32,
+    gate: Option<GateIdentity>,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) where
     F: Fn() -> Option<String>,
 {
+    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(claude_session_id) = resolve() {
@@ -2596,6 +2621,9 @@ async fn poll_and_record_session<F>(
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                gate_id: gate_id.clone(),
+                gate_consuming_device_id: gate_consuming_device_id.clone(),
+                gate_bound_boot_ms,
             };
             store.record_open(record);
             info!(
@@ -2632,7 +2660,9 @@ pub(crate) fn record_pinned_session_open(
     page_id: String,
     zone_index: i32,
     provider: String,
+    gate: Option<GateIdentity>,
 ) {
+    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
     // it just placed `config_dir` into the PTY env — so derive the label +
     // wrapper from it rather than waiting on the live registry. It does NOT
@@ -2688,12 +2718,78 @@ pub(crate) fn record_pinned_session_open(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        gate_id,
+        gate_consuming_device_id,
+        gate_bound_boot_ms,
     });
     info!(
         terminal_id = %terminal_id,
         claude_session = %claude_session_id,
         "create_terminal_session_backend: pinned session durably recorded at spawn"
     );
+    // A writer carrying no gate (the session-open hook, the identity seam) may
+    // be re-recording a continuation RESUMED by a boot restore — adopt it into
+    // this process generation (plan 2026-10-03 D3). No-op otherwise.
+    if gate.is_none() {
+        adopt_restored_continuation(store, &claude_session_id);
+    }
+}
+
+/// The three durable gate fields for a record written by THIS process (plan
+/// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…` D1):
+/// the gate id, the CONSUMING device id, and this process's boot instant as
+/// the generation that bound them. All `None` for a non-gate spawn — which the
+/// sticky merge reads as "keep whatever is stored".
+fn gate_record_fields(gate: Option<GateIdentity>) -> (Option<String>, Option<String>, Option<i64>) {
+    match gate {
+        Some(g) => (
+            Some(g.gate_id.to_string()),
+            Some(g.consuming_device_id.to_string()),
+            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init()),
+        ),
+        None => (None, None, None),
+    }
+}
+
+/// D3 of plan `2026-10-03-…`: when the OPEN record for `claude_session_id`
+/// carries a gate bound by a PRIOR process generation, it is a continuation a
+/// boot restore just resumed. Re-stamp its generation to this boot and
+/// re-register its (new) terminal as a live continuation, so the PTY-exit /
+/// reaper producers cover its eventual death — and so the close observer's
+/// prior-generation report can never race them.
+///
+/// Called from the two re-record doors a restored session reaches: the
+/// provider's session-open hook ([`record_pinned_session_open`] with no gate)
+/// and the frontend's verified-resume re-assert
+/// ([`terminal_session_record_open`]). Idempotent: once adopted, the record is
+/// this generation's and later calls do nothing. Only a record THIS boot's
+/// restore pass marked is adopted (see
+/// [`SessionLifecycleStore::adopt_restored_gate`]). Returns what was adopted.
+pub(crate) fn adopt_restored_continuation(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
+    adopt_restored_continuation_at(
+        store,
+        claude_session_id,
+        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+    )
+}
+
+/// [`adopt_restored_continuation`] against an explicit boot instant (tests).
+pub(crate) fn adopt_restored_continuation_at(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    current_boot_ms: i64,
+) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
+    let (terminal_id, gate_id, consuming_device_id) =
+        store.adopt_restored_gate(claude_session_id, current_boot_ms)?;
+    crate::agent_runtime::register_restored_continuation(
+        terminal_id.clone(),
+        gate_id,
+        consuming_device_id,
+    );
+    Some((terminal_id, gate_id, consuming_device_id))
 }
 
 /// Verification arm for a pre-pinned session: poll `verify` (pinned
@@ -2884,6 +2980,9 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -3168,6 +3267,7 @@ mod tests {
             "My Continuation".to_string(),
             "default".to_string(),
             0,
+            None,
             Duration::from_millis(1),
             Duration::from_secs(5),
         )
@@ -3205,6 +3305,7 @@ mod tests {
             "Overflow Continuation".to_string(),
             "page-7".to_string(),
             4,
+            None,
             Duration::from_millis(1),
             Duration::from_secs(5),
         )
@@ -3216,6 +3317,44 @@ mod tests {
         assert_eq!(
             open[0].zone_index, 4,
             "caller-supplied zone (account-migration respawn) is durably recorded"
+        );
+    }
+
+    /// Review r1 item 4(ii): the transcript-resolved (non-pinned) continuation
+    /// path persists all three gate fields too.
+    #[tokio::test]
+    async fn poll_and_record_session_persists_the_gate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::now_v7(),
+            consuming_device_id: uuid::Uuid::now_v7(),
+        };
+        poll_and_record_session(
+            store.clone(),
+            || Some("resolved-gate-sess".to_string()),
+            "term-g".to_string(),
+            None,
+            "/work/dir".to_string(),
+            "Gate Continuation".to_string(),
+            "default".to_string(),
+            0,
+            Some(gate),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await;
+        let rec = store.get("resolved-gate-sess").expect("recorded");
+        assert_eq!(rec.gate_id, Some(gate.gate_id.to_string()));
+        assert_eq!(
+            rec.gate_consuming_device_id,
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(
+            rec.gate_bound_boot_ms,
+            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init())
         );
     }
 
@@ -3243,6 +3382,7 @@ mod tests {
             "Never Resolves".to_string(),
             "default".to_string(),
             0,
+            None,
             Duration::from_millis(1),
             Duration::from_millis(20),
         )
@@ -3272,6 +3412,50 @@ mod tests {
         // Hint absent → poll_and_record_session is never spawned (see
         // create_terminal_session_backend). The store therefore has no rows.
         assert!(store.open_records().is_empty());
+    }
+
+    /// Plan `2026-10-03-…` D1: the continuation spawn's gate identity reaches
+    /// the durable record (it used to be dropped at the hint destructure), with
+    /// this process's boot instant as its generation — and the session-open
+    /// hook's later gate-less re-record of the same csid does not blank it.
+    #[test]
+    fn pinned_record_carries_the_gate_and_a_gateless_hook_rewrite_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::now_v7(),
+            consuming_device_id: uuid::Uuid::now_v7(),
+        };
+        let csid = "22222222-2222-4222-8222-222222222222";
+        let record = |g: Option<GateIdentity>| {
+            record_pinned_session_open(
+                &store,
+                csid.to_string(),
+                "term-gate".to_string(),
+                None,
+                "/work".to_string(),
+                "Continuation".to_string(),
+                "default".to_string(),
+                0,
+                crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                g,
+            )
+        };
+        record(Some(gate));
+        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let check = |what: &str| {
+            let rec = store.get(csid).unwrap();
+            assert_eq!(rec.gate_id, Some(gate.gate_id.to_string()), "{what}");
+            assert_eq!(
+                rec.gate_consuming_device_id,
+                Some(gate.consuming_device_id.to_string()),
+                "{what}"
+            );
+            assert_eq!(rec.gate_bound_boot_ms, Some(boot), "{what}");
+        };
+        check("spawn record");
+        record(None); // the session-open hook's write
+        check("after the gate-less hook re-record");
     }
 
     /// Regression for the 2026-06-12 mis-bind incident: two transcripts in
@@ -3313,6 +3497,7 @@ mod tests {
             "default".to_string(),
             0,
             crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            None,
         );
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
