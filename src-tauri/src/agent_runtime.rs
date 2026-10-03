@@ -991,7 +991,7 @@ pub fn spawn_runtime() {
     info!("agent_runtime: starting for device_id={}", device_id);
     // Periodic backstop poll (always armed): drains a pending continuation /
     // unit dispatch even when every push-shaped trigger is missed — a lost WS
-    // frame while connected, a deferred (AtCap) continuation whose terminal
+    // frame while connected, a load-deferred continuation whose terminal
     // exit-hook trigger never fired, a slot freed between WS connects.
     // Spawned independently of the WS pump so it survives subscription flaps.
     spawn_continuation_backstop_poll(device_id);
@@ -1775,8 +1775,8 @@ fn spawn_run_task(payload: LaunchPayload) {
         }
         // Machine-load backstop (plan
         // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
-        // Phase 1c): the SAME thread-pressure + live-session-cap guard the
-        // gate-continuation path applies (`evaluate_load_guard`), so a flood of
+        // Phase 1c): the SAME memory + thread guard the gate-continuation path
+        // applies (`probe_for_spawn`, deferring on any tripped lane), so a flood of
         // coord launches cannot start more unattended sessions than the box can
         // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
         // path rewrite, account resolution and worktree materialization all
@@ -1790,26 +1790,18 @@ fn spawn_run_task(payload: LaunchPayload) {
         // reason beginning `deferred_load:`, which coord treats as RE-OFFERABLE:
         // it abandons the allocation and retires the dispatch dedup marker, so
         // the work is offered again on a later pass rather than latched failed.
-        //
-        // The admitted slot is an RAII guard: it is released when this task
-        // ends by ANY route, including a panic unwinding the future — a leaked
-        // slot would permanently shrink both the launch and continuation caps.
-        let slot = match admit_launch(
-            agent_id,
+        if let Err(reason) = admit_launch(
             &live_terminal_predicate(),
-            &crate::resource_guard::thread_pressure,
+            &crate::resource_guard::probe_for_spawn,
         ) {
-            Ok(slot) => slot,
-            Err(reason) => {
-                info!(
-                    "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
-                     machine load, NOT launched — {reason}"
-                );
-                drop(stop_registration);
-                report_launch_deferral(agent_id, &reason).await;
-                return;
-            }
-        };
+            info!(
+                "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
+                 machine load, NOT launched — {reason}"
+            );
+            drop(stop_registration);
+            report_launch_deferral(agent_id, &reason).await;
+            return;
+        }
         // Armed from admission on: `run_agent_subprocess` may register a proxy
         // nonce, a live agent token and daemons, and a panic inside it must not
         // leak them. See [`AgentRunTeardown`].
@@ -1817,16 +1809,13 @@ fn spawn_run_task(payload: LaunchPayload) {
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // The run task is fully done: per-agent teardown FIRST, then the slot,
-        // then the stop entry LAST — reverse declaration order, the order a
-        // panic drops them in too. The teardown is keyed by agent_id alone, so
-        // it must run while the stop entry still bars a re-delivery of this
-        // agent_id from registering; otherwise it could strip a newer run's
-        // token, nonces and daemons. Releasing the slot before the stop entry
-        // keeps `admit_launch`'s one-live-launch-per-agent_id debug_assert
-        // true: a re-delivery registers only once this run holds no slot.
+        // The run task is fully done: per-agent teardown FIRST, then the stop
+        // entry LAST — reverse declaration order, the order a panic drops them
+        // in too. The teardown is keyed by agent_id alone, so it must run while
+        // the stop entry still bars a re-delivery of this agent_id from
+        // registering; otherwise it could strip a newer run's token, nonces and
+        // daemons.
         drop(teardown);
-        drop(slot);
         drop(stop_registration);
     });
 }
@@ -2036,7 +2025,7 @@ enum SpawnDecision {
     SpawnDespiteClaimError { cause: String },
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
-    /// spawn; leave the row pending for the backstop poll, like `AtCap`.
+    /// spawn; leave the row pending for the backstop poll, like a load deferral.
     /// Produced only by [`apply_drain_to_claim`].
     DeferClaimErrorByDrain {
         cause: String,
@@ -2235,7 +2224,7 @@ fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
 /// purpose is the WS+poll double-delivery race: an id must stay claimed only
 /// while a dispatch is IN-FLIGHT or after the continuation was actually
 /// CONSUMED on coord (the consume claim POSTed). Every LOCAL skip that leaves
-/// the row pending on coord (AtCap, DuplicateAnchor, device-mismatch, an `Err`
+/// the row pending on coord (LoadPressure, DuplicateAnchor, device-mismatch, an `Err`
 /// before/around the consume claim) must release, or the skip is permanent for
 /// the process lifetime: the backstop poll re-lists the row every tick and the
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
@@ -2356,7 +2345,7 @@ enum ClaimOutcome {
     /// coord could not answer the claim AND autonomous spawns are paused by
     /// the device drain (drained, or the drain state unknown, which is what a
     /// coord outage becomes). The row is left PENDING for the backstop poll —
-    /// the `AtCap` shape, not a spawn and not a terminal skip. The log is
+    /// the load-deferral shape, not a spawn and not a terminal skip. The log is
     /// written here; the caller awaits `defer_continuation_unclaimed`, which
     /// posts the deferred stamp and releases the local claim, so this arm
     /// deliberately does NOT settle it. Carries the drain's OWN deferral class
@@ -2433,7 +2422,7 @@ fn settle_claim_decision(
             // Availability-over-consistency is suspended while autonomous
             // spawns are not allowed: a claim error during a drain (or an
             // unknown drain state, which is what a coord outage becomes) is a
-            // leave-pending deferral, the `AtCap` shape, not a spawn.
+            // leave-pending deferral, the load-deferral shape, not a spawn.
             warn!(
                 "agent_runtime: continuation claim error while autonomous spawns are \
                  paused — deferring, row left pending: {cause}; {reason} (gate_id={gate_id})"
@@ -2479,86 +2468,41 @@ fn settle_claim_decision(
 }
 
 // =============================================================================
-// Continuation-session registry (P3 anchor_key dedup + P4 concurrency cap)
+// Continuation-session registry (P3 anchor_key dedup) and unattended admission
 // =============================================================================
 
-/// Default cap on concurrently-live *continuation-spawned* terminal sessions.
+/// The env override that USED to set a fixed count cap on unattended sessions.
 ///
-/// **64.** Finite since Phase 1 of
-/// `2026-08-30-load-aware-spawn-admission-control`; it was `usize::MAX` until
-/// the 2026-08-29 wedge, and the reasoning behind that default is the thing the
-/// incident actually falsified.
+/// **Retired 2026-10-03** (plan
+/// `2026-10-03-retire-the-continuation-session-cap-and-let-the-queue-pre-check-read-both-resource-lanes`).
+/// Operator direction, verbatim: *"there shouldn't be a fixed session cap. the
+/// cap should have to do with the box's resources"*, and *"in the runner, spawns
+/// are blocked when the memory or threads are low so a cap may not be needed at
+/// all."* Admission of an unattended continuation or coord launch is decided by
+/// the two MEASURED lanes the PTY seam already enforces —
+/// [`crate::resource_guard::probe_for_spawn`]: free memory (commit on Windows,
+/// `MemAvailable` elsewhere) and the runner's thread count — and by nothing
+/// else. See [`evaluate_continuation_guard`] for why no count replaces it.
 ///
-/// ## Why the old `usize::MAX` was wrong
-///
-/// The retired doc argued the cap on the **UI-display** axis: "the Terminal UI
-/// scales to unlimited sessions via a 9-zone grid × many page tabs". That is
-/// true, and it is not the axis a spawn cap protects. A grid that can *render*
-/// 130 tabs says nothing about whether the box can *carry* 130 concurrent
-/// `CreateProcess` calls, and on 2026-08-29 it could not: ~130 continuation
-/// spawns landed on an already-loaded primary, the process reached **540 OS
-/// threads** against tokio's 512-slot blocking pool with 119 of them parked
-/// mid-`CreateProcess`, and the runner wedged. The one guard purpose-built to
-/// sit in that exact path was this cap, and it was infinite. A default reasoned
-/// on the wrong axis is indistinguishable from no guard at all.
-///
-/// ## Why 64, and why it is deliberately the WEAKER of the two limits
-///
-/// The wedge's own arithmetic gives the conversion: 540 threads at ~130 sessions
-/// against a 150-151-thread idle baseline is roughly **3 OS threads per
-/// continuation session**. So the shipped thread ceilings
-/// ([`crate::settings::SessionGuardSettings::warn_thread_count`] 256 /
-/// `critical_thread_count` 400) correspond to about **35** and **83** concurrent
-/// sessions. 64 sits between them — which means that in ordinary conditions the
-/// thread lane trips FIRST and this count never binds.
-///
-/// That is intended, not an oversight. The two limits are measuring different
-/// things and the honest one is the thread count: it is a live reading of the
-/// resource that actually ran out. This cap is the **backstop for the case the
-/// thread count cannot see** — sessions that are cheap in threads but expensive
-/// in something else the process does not spend a thread on: Postgres
-/// connections, coord-mcp JWT-mint round trips, and the per-`CreateProcess`
-/// kernel/csrss overhead that a parked thread understates. In that regime the
-/// thread lane reads calm while the machine is not, and a finite count is the
-/// only thing left holding the line.
-///
-/// It is therefore sized as a *ceiling on absurdity*, not as a tuned capacity
-/// number: at ~3 threads apiece, 64 sessions is ~192 threads of continuation
-/// load on top of the idle 150 — over the 256 warn ceiling, under the 400
-/// critical one. Nothing on this fleet has ever legitimately wanted more than 64
-/// concurrent continuations; the observed peak that broke the box was twice it.
-///
-/// ## It is a steady-state bound, NOT a semaphore
-///
-/// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
-/// [`register_continuation_session`] only runs after the coord consume-claim,
-/// the worktree acquire and `create_terminal_session_backend` have all
-/// completed — so every task dispatched in one `poll_pending_continuations`
-/// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
-/// number was chosen against, all 130 see `live.len() == 0` and this cap binds on
-/// none of them. It holds the line across successive polls, once the earlier
-/// dispatches have registered; it cannot hold it *within* one.
-///
-/// That is the same check-to-register window
-/// [`crate::settings::SessionGuardSettings::critical_thread_count`]'s doc
-/// already sizes 400 around ("a burst of concurrent admissions can each pass the
-/// ceiling and only then create their threads"), stated here too because a
-/// number documented as a concurrency limit and enforced as a steady-state one
-/// is exactly the kind of misreading that sent the 2026-08-29 investigation to
-/// the wrong constant. Closing the window would mean a real permit held from the
-/// guard through the spawn — a design change, and not this cap's job.
-///
-/// **The ANCHOR half of that permit has since shipped** as
-/// [`AnchorReservation`], taken inside this guard's own critical section, so a
-/// same-anchor twin can no longer pass within one burst. It deliberately does
-/// NOT count toward this cap: the COUNT stays the steady-state bound described
-/// above, while the ANCHOR is now held check-to-register. The paragraph above
-/// still describes the count.
-///
-/// `QONTINUI_CONTINUATION_SESSION_CAP` remains the operator override, unchanged
-/// and in both directions (a bigger number is as settable as a smaller one).
-/// Operator-opened sessions are never counted — they are never registered here.
-const DEFAULT_CONTINUATION_SESSION_CAP: usize = 64;
+/// The variable is still READ, once, so a box that sets it (spaceship set 9)
+/// says in its log that the override is dead instead of letting the operator
+/// believe it still holds. [`warn_if_retired_cap_env_set`].
+const RETIRED_CONTINUATION_SESSION_CAP_ENV: &str = "QONTINUI_CONTINUATION_SESSION_CAP";
+
+/// Log ONE `warn!` per process when the retired count-cap override is set.
+fn warn_if_retired_cap_env_set() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if let Ok(value) = std::env::var(RETIRED_CONTINUATION_SESSION_CAP_ENV) {
+            warn!(
+                "agent_runtime: {RETIRED_CONTINUATION_SESSION_CAP_ENV}={value} is set but RETIRED \
+                 and ignored — there is no fixed continuation session cap any more; unattended \
+                 spawns are admitted by the memory and thread lanes \
+                 (resource_guard::probe_for_spawn). Remove the variable."
+            );
+        }
+    });
+}
 
 /// One registered continuation-spawned session.
 #[derive(Debug, Clone)]
@@ -2594,7 +2538,7 @@ struct ContinuationSession {
 /// scan and its "then it is mine" reservation must be a single critical
 /// section, or two dispatches for one anchor can both scan an empty registry,
 /// both drop the lock, and both spawn — the burst window
-/// [`DEFAULT_CONTINUATION_SESSION_CAP`]'s doc describes. A second mutex for the
+/// [`evaluate_continuation_guard`]'s doc describes. A second mutex for the
 /// reservations would reintroduce exactly that gap between the two reads.
 #[derive(Debug, Default)]
 struct ContinuationRegistry {
@@ -2608,8 +2552,8 @@ struct ContinuationRegistry {
     /// [`Self::take_live_reserving_anchor`] (the migration lift) — and removed
     /// only by that entry's owner: its drop on every non-spawn
     /// exit, or [`AnchorReservation::handed_to_registry`] when the live entry
-    /// replaces it. Never counted toward P4 — the cap bounds RUNNING sessions,
-    /// and a reservation is not one.
+    /// replaces it. A reservation is not a running session and costs the machine
+    /// nothing the load lanes could read.
     ///
     /// **The account-migration hop holds its anchor here for the whole
     /// respawn.** The hop lifts a continuation off its terminal
@@ -2698,7 +2642,7 @@ impl ContinuationRegistry {
     /// of the respawn. Two paths do that: the permit's `Drop` on any non-spawn
     /// exit, and [`AnchorReservation::release`], the headless arm, which frees
     /// the anchor deliberately *after* a successful spawn because headless
-    /// sessions are outside P3/P4. What does NOT do it is a stranger settling
+    /// sessions are outside the P3 live registry. What does NOT do it is a stranger settling
     /// through [`AnchorReservation::handed_to_registry`]: that inserts a
     /// LIVE row for the anchor under the same lock that frees the pending
     /// entry, so P3's live scan still answers `DuplicateAnchor(Live)` and no
@@ -2803,22 +2747,12 @@ fn next_anchor_reservation_token() -> AnchorReservationToken {
 /// Process-wide registry of continuation-spawned terminal sessions, keyed by
 /// `terminal_id`. Distinct from [`dispatched_gate_ids`] (which dedupes a single
 /// `gate_id` delivered twice): this tracks LIVE sessions so a re-cleared gate
-/// (new `gate_id`, same `anchor_key`) is deduped (P3) and the live count is
-/// capped (P4) — and, beside them, the anchors reserved by dispatches still
+/// (new `gate_id`, same `anchor_key`) is deduped (P3) — and, beside them, the anchors reserved by dispatches still
 /// between the guard and the spawn (see [`ContinuationRegistry`]).
 fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
         std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
-}
-
-/// The configured continuation-session cap (env override, else the default).
-/// A non-numeric / empty env value falls back to the default.
-fn continuation_session_cap() -> usize {
-    std::env::var("QONTINUI_CONTINUATION_SESSION_CAP")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CONTINUATION_SESSION_CAP)
 }
 
 /// The `coord.gates` row this continuation may report a work outcome to, or
@@ -2950,83 +2884,123 @@ enum AnchorHolder {
     Reserved,
 }
 
-/// Outcome of the pre-spawn continuation guard (P3 + thread pressure + P4).
+/// Outcome of the pre-spawn continuation guard (P3 dedup + machine load).
 #[derive(Debug, PartialEq, Eq)]
 enum ContinuationGuard {
-    /// Clear to spawn — no live duplicate, machine not under thread pressure,
-    /// under cap.
+    /// Clear to spawn — no live duplicate, and neither resource lane tripped.
     Proceed,
     /// This `anchor_key` is already taken (P3): skip the spawn (re-cleared gate
     /// / duplicate). Carries WHO holds it — a live session, or a permit holder
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is out of THREADS, not out of slots: the spawn gate's thread
-    /// lane ([`crate::resource_guard::thread_pressure`]) returned something
-    /// other than `Proceed`. Defer the spawn.
+    /// The machine is short of a measured resource: the spawn seam's own
+    /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
+    /// memory lane and the thread lane, heavier wins) returned something other
+    /// than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
-    /// observation that produced it, so the log and the coord stamp can name the
-    /// REAL numbers — the thread count that was read and the ceiling it crossed.
-    ///
-    /// Deliberately NOT folded into [`ContinuationGuard::AtCap`]. A deferral
-    /// reported as "cap reached" when the cap was never reached is a lie in the
-    /// runner log, and the log is exactly what the next incident's forensics
-    /// reads: the 2026-08-29 investigation spent its time on the cap because the
-    /// cap is what the log talks about.
-    ThreadPressure {
-        /// `"warn"` or `"critical"` — which ceiling the reading crossed. Comes
+    /// observation that produced it, so the log and the coord stamp name the
+    /// REAL numbers — the reading, the limit it crossed, and (through the
+    /// observation's metric) WHICH lane: `thread_pressure:` for threads,
+    /// `commit_pressure:` for memory ([`load_pressure_stamp_reason`]).
+    LoadPressure {
+        /// `"warn"` or `"critical"` — which limit the reading crossed. Comes
         /// from [`crate::resource_guard::SpawnGate::tripped`], never re-derived
         /// here, so the word and the number can never disagree.
         severity: &'static str,
         observation: crate::resource_guard::GateObservation,
     },
-    /// At the concurrency cap (P4): skip the spawn. Carries the cap for the log.
-    AtCap(usize),
 }
 
-/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup),
-/// machine thread pressure, and P4 (concurrency cap). Pure over (`anchor_key`,
-/// `is_live`, the injected thread verdict, env cap) so it is unit-testable
-/// without a live `TerminalManager` and without a live thread reading.
+/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
+/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
+/// so it is unit-testable without a live `TerminalManager` and without a live
+/// reading.
 ///
-/// Order matters, and it is now three-deep:
+/// Order matters:
 ///
 /// 1. **Dedup first.** A duplicate of an already-running anchor is reported as a
-///    dedup (the honest reason) rather than "capped" or "loaded" — and it is
-///    also the one verdict that is true regardless of machine state: spawning it
-///    would be wrong on an idle box too.
+///    dedup (the honest reason) rather than "loaded" — and it is also the one
+///    verdict that is true regardless of machine state: spawning it would be
+///    wrong on an idle box too.
 ///
-///    **First in COST as well as in verdict**, which is why the thread verdict
+///    **First in COST as well as in verdict**, which is why the load verdict
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `thread_pressure()` as an
+///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
-///    an accounts load), landing at the exact instant the machine is
-///    thread-starved. The measured shape is 51 rows stranded for two days on
-///    2026-08-29, against a burst this plan sizes at ~130 — i.e. the guard
-///    amplifying the burst it exists to damp. Taken lazily, a deduped row pays
-///    nothing.
-/// 2. **Thread pressure next.** It goes AHEAD of the count cap because it is the
-///    real signal — a live reading of the resource that actually ran out on
-///    2026-08-29 — and because it is the earlier, cheaper catch: on this fleet
-///    it binds at roughly 35 concurrent sessions (warn) where the count cap
-///    binds at 64, so on the path to a wedge it is what fires. Reporting a
-///    thread-starved machine as "capped" would send the next investigation to
-///    the wrong constant, which is precisely what happened last time.
-/// 3. **The count cap last**, as the backstop for load the thread count cannot
-///    see (see [`DEFAULT_CONTINUATION_SESSION_CAP`]).
+///    a `GlobalMemoryStatusEx`), landing at the exact instant the machine is
+///    starved. Taken lazily, a deduped row pays nothing.
+/// 2. **Machine load next** — the heavier of the memory and thread lanes, the
+///    same composed verdict the PTY seam enforces. The pre-check used to read
+///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
+///    coord's consume claim, at the PTY seam, where it is a terminal
+///    `spawn_failed` that nothing re-delivers. Reading both lanes here makes
+///    memory pressure a deferral, like thread pressure always was.
 ///
-/// Operator sessions never enter the registry, so they never count.
+///    **Deferring at memory WARN is NEW, and deliberate.** The seam only refuses
+///    at CRITICAL, so a memory WARN reading used to spawn (with a toast). It now
+///    defers an unattended spawn, by operator direction (an unattended spawn
+///    defers at WARN, an operator's own spawn refuses only at CRITICAL — the same
+///    asymmetry the thread lane has always had). The cost, stated so it is
+///    watched rather than discovered: a box whose IDLE free memory sits under the
+///    warn floor defers every unattended spawn until memory frees; the memory
+///    lane has no at-rest re-basing like the thread lane's. That state is visible
+///    on `/health` `spawnAdmission.memory` and on coord as `commit_pressure:warn`
+///    deferral stamps.
+///
+/// Operator sessions never enter the registry and never reach this guard.
+///
+/// ## There is no count cap, by decision
+///
+/// A fixed count (`DEFAULT_CONTINUATION_SESSION_CAP` = 64, overridable by
+/// `QONTINUI_CONTINUATION_SESSION_CAP`) used to sit after the load lanes. It was
+/// retired on 2026-10-03 by operator direction (see
+/// [`RETIRED_CONTINUATION_SESSION_CAP_ENV`]): a number that says nothing about
+/// the box decided admission, and on spaceship (`=9`) it deferred gate `e46eb573`'s
+/// continuation five times between 16:10Z and 20:14Z on 2026-10-02 while the
+/// operator saw seven sessions (measured; dossier
+/// `gate-continuation-work-never-happens`).
+/// Its doc justified it as a backstop for costs the thread lane cannot see; each
+/// is bounded elsewhere, measured against `origin/main` when it was removed:
+///
+/// - **Postgres connections.** A continuation is an external `claude` process;
+///   it reaches Postgres only through runner HTTP handlers, which check out of
+///   the runner's pool, fixed at `max_size(8)` with 5 s timeouts
+///   (`database/pg/mod.rs`). More sessions queue on the pool; they open no
+///   connections.
+/// - **coord-mcp JWT mints.** Sessions do not mint. The loopback proxy forwards
+///   each request with the device credential from the shared refresher slot,
+///   re-minted per DEVICE on `REFRESH_CHECK_INTERVAL` (300 s,
+///   `mcp/device_jwt_refresher.rs`); a session's own nonce is local randomness.
+/// - **Each session's own `claude` process.** Its memory is what the memory lane
+///   reads (commit charge on Windows, `MemAvailable` elsewhere). The THREAD lane
+///   does not see it: it counts the RUNNER's own threads only (the Windows walk
+///   is system-wide in cost but filtered to this PID, `health_monitor`), so it
+///   sees a session's terminal reader/waiter threads, not the child's.
+/// - **Per-`CreateProcess` kernel / csrss overhead, and the OS task ceiling.**
+///   Bounded by NOTHING in steady state — not by the count either, which never
+///   measured them. A Linux runner's children also share its systemd unit's
+///   `pids.max` and `kernel.threads-max`, which no lane reads; the burst RATE is
+///   owned by plan
+///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+///   and a task-ceiling lane, if one is needed, by the resource-guard follow-ups.
+///   The count was never a semaphore either: every task of one poll read the
+///   same pre-burst count.
+///
+/// The ANCHOR half of a check-to-register permit does exist ([`AnchorReservation`],
+/// taken inside this guard's critical section), so a same-anchor twin cannot
+/// pass within one burst.
 ///
 /// ## Any non-`Proceed` verdict defers — deliberately more eager than `admit_spawn`
 ///
 /// [`crate::resource_guard::admit_spawn`] refuses an operator's own spawn only
 /// at [`crate::resource_guard::SpawnGate::Critical`]. This guard defers at
-/// `Warn` as well, and the asymmetry is the whole reason `thread_pressure()`
+/// `Warn` as well, and the asymmetry is the whole reason `probe_for_spawn()`
 /// hands back the verdict instead of a bool.
 ///
 /// The two callers pay completely different prices for being wrong. A gate
@@ -3044,9 +3018,10 @@ enum ContinuationGuard {
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
 ) -> (ContinuationGuard, AnchorReservation) {
-    // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3/P4
+    warn_if_retired_cap_env_set();
+    // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
     // The permit this evaluation takes, if it takes one, RETURNED OUT of the
@@ -3068,10 +3043,10 @@ fn evaluate_continuation_guard(
     //
     // Handed back to the caller only with a `Proceed`; every other exit drops
     // it — outside the lock — and dropping is what gives the anchor back.
-    let (live_count, reservation) = {
+    let reservation = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
-        let reservation = if let Some(anchor) = anchor_key {
+        if let Some(anchor) = anchor_key {
             // P3: a LIVE session already exists for this anchor_key → dedup.
             if let Some(existing) = registry
                 .live
@@ -3089,10 +3064,8 @@ fn evaluate_continuation_guard(
             // earlier and has not yet registered holds the anchor too.
             // Otherwise it is ours from here on — the reservation is taken
             // BEFORE the lock drops, so a second evaluation racing this one
-            // cannot also read the anchor as free. This is the "real permit
-            // held from the guard through the spawn" that
-            // `DEFAULT_CONTINUATION_SESSION_CAP`'s doc names as the fix for the
-            // burst window; `AnchorReservation` carries it from here.
+            // cannot also read the anchor as free. `AnchorReservation` carries
+            // it from here.
             match registry.pending_anchors.entry(anchor.to_string()) {
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return (
@@ -3115,43 +3088,25 @@ fn evaluate_continuation_guard(
             // nothing — a permit over no anchor, whose drop is a no-op
             // wherever it happens.
             AnchorReservation::none()
-        };
-        // `live` only: the reservation just taken (and any other) is not a
-        // running session and does not count toward the cap. Moved out with
-        // the count, so the guard below drops on an empty local.
-        (registry.live.len(), reservation)
+        }
     };
-    // The registry lock is RELEASED before the thread reading is taken. The
-    // reading is a synchronous OS-table read (and, in the live wrapper, a
-    // settings load), and holding a process-global mutex across it would park
+    // The registry lock is RELEASED before the load reading is taken. The
+    // reading is a synchronous OS read (and, in the live wrapper, a settings
+    // load), and holding a process-global mutex across it would park
     // `register_continuation_session` and every other guard behind one syscall.
-    // The count is read out above instead: it is a snapshot either way — see
-    // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
-    // and holding the lock longer would not make it one. The ANCHOR is no
-    // longer a snapshot, though: it is reserved above, so the load verdicts
-    // below must give it back when they refuse.
+    // The ANCHOR is reserved above, so the load verdict below must give it back
+    // when it refuses.
     //
-    // Admitted coord LAUNCHES count toward the same cap: both populations are
-    // unattended coord-dispatched sessions spending the same machine, and a cap
-    // that one of them can walk past is not a bound on the box. So do terminal
-    // continuations still inside their start window: they register only once
-    // their session has started (`run_continuation_terminal`), up to
-    // CONTINUATION_START_WINDOW per attempt after this guard said Proceed.
-    let live_count = live_count + admitted_launch_count() + starting_continuation_count();
-
-    // Thread pressure next, then the count cap — shared with the launch path
-    // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
-    // its chance to return, so a deduped row never pays for a thread snapshot.
-    let verdict = match evaluate_load_guard(live_count, thread_pressure) {
-        LoadGuard::Proceed => ContinuationGuard::Proceed,
-        LoadGuard::ThreadPressure {
+    // ANY tripped verdict defers (see the asymmetry argument above). An
+    // unreadable sensor produces `Proceed` inside `resource_guard` — UNKNOWN ⇒
+    // spawn, the fail-open doctrine this subsystem is built on — so a missing
+    // reading can never wedge the queue shut.
+    let verdict = match load_pressure().tripped() {
+        Some((severity, observation)) => ContinuationGuard::LoadPressure {
             severity,
-            observation,
-        } => ContinuationGuard::ThreadPressure {
-            severity,
-            observation,
+            observation: observation.clone(),
         },
-        LoadGuard::AtCap { cap, .. } => ContinuationGuard::AtCap(cap),
+        None => ContinuationGuard::Proceed,
     };
     // A load deferral leaves the row pending for re-delivery; the re-delivery
     // must find the anchor free, not reserved by this refused evaluation. Only
@@ -3163,102 +3118,6 @@ fn evaluate_continuation_guard(
         return (verdict, AnchorReservation::none());
     }
     (verdict, reservation)
-}
-
-/// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
-/// then the live-session count cap. Shared by the gate-continuation guard
-/// ([`evaluate_continuation_guard`], which runs its anchor dedup first) and the
-/// coord launch guard ([`admit_launch`]), so the two paths can never
-/// disagree about when the machine is too loaded to take another unattended
-/// session.
-#[derive(Debug, PartialEq, Eq)]
-enum LoadGuard {
-    /// Clear to spawn.
-    Proceed,
-    /// The thread lane tripped (warn or critical). See
-    /// [`ContinuationGuard::ThreadPressure`].
-    ThreadPressure {
-        severity: &'static str,
-        observation: crate::resource_guard::GateObservation,
-    },
-    /// The live-session count is at or over the cap.
-    AtCap {
-        /// The configured cap ([`continuation_session_cap`]).
-        cap: usize,
-        /// The live count that was compared against it.
-        live: usize,
-    },
-}
-
-/// The load guard proper: thread pressure first, then the count cap. Pure over
-/// (`live_count`, the injected thread verdict, env cap).
-///
-/// Thread pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
-/// argument on [`evaluate_continuation_guard`]). An unreadable thread sensor
-/// produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the fail-open
-/// doctrine this whole subsystem is built on — so a missing reading can never
-/// wedge the queue shut. The verdict is a closure so a caller that returns
-/// earlier (the continuation dedup arm) never pays for the reading.
-///
-/// A steady-state bound, not a semaphore — see
-/// [`DEFAULT_CONTINUATION_SESSION_CAP`].
-fn evaluate_load_guard(
-    live_count: usize,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> LoadGuard {
-    let verdict = thread_pressure();
-    if let Some((severity, observation)) = verdict.tripped() {
-        return LoadGuard::ThreadPressure {
-            severity,
-            observation: observation.clone(),
-        };
-    }
-
-    // P4: at the cap → refuse.
-    let cap = continuation_session_cap();
-    if live_count >= cap {
-        return LoadGuard::AtCap {
-            cap,
-            live: live_count,
-        };
-    }
-
-    LoadGuard::Proceed
-}
-
-/// Process-wide registry of coord LAUNCHES (`spawn_requested` payloads) that
-/// passed [`admit_launch`] and whose run task has not finished, keyed by
-/// `agent_id` and valued by the admitting slot's unique token. Distinct from
-/// [`agent_stops`], which is populated synchronously in the WS pump BEFORE the
-/// guard runs: counting that map would make every launch of a burst see the
-/// whole burst and refuse all of it. Only ADMITTED launches count.
-///
-/// The token is what makes a release exact: an [`AdmittedLaunchSlot`] removes
-/// the entry only while it still carries ITS token, so a release can never
-/// free a slot another run holds under the same `agent_id`.
-fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>> {
-    static LAUNCHES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>,
-    > = std::sync::OnceLock::new();
-    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Source of [`AdmittedLaunchSlot`] tokens; unique for the process lifetime.
-static NEXT_ADMITTED_LAUNCH_TOKEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-/// Count of admitted launches.
-fn admitted_launch_count() -> usize {
-    lock_recover(admitted_launches(), "admitted_launches").len()
-}
-
-/// Release the admitted slot `token` holds for `agent_id` — a no-op when the
-/// entry is absent or carries a different token (it is not this slot's).
-fn release_admitted_launch(agent_id: uuid::Uuid, token: u64) {
-    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
-    if launches.get(&agent_id) == Some(&token) {
-        launches.remove(&agent_id);
-    }
 }
 
 /// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
@@ -3279,84 +3138,46 @@ const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
 /// `<class>:<detail>` grammar this file's stamps follow (class = text before the
 /// first colon) still holds after coord strips the prefix:
 /// `deferred_load:thread_pressure:warn:300_over_256`,
-/// `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
-fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
-    let detail = match verdict {
-        LoadGuard::Proceed => return None,
-        LoadGuard::ThreadPressure {
-            severity,
-            observation,
-        } => thread_pressure_stamp_reason(severity, observation),
-        LoadGuard::AtCap { cap, live } => format!("at_cap:{live}_of_{cap}"),
-    };
-    Some(format!("{DEFERRED_LOAD_REASON_PREFIX}{detail}"))
-}
-
-/// RAII hold on an admitted launch's slot in [`admitted_launches`]. Dropping it
-/// releases the slot exactly once on every exit route, a panic unwinding the
-/// run task included — and only its OWN entry (matched by `token`).
-#[derive(Debug)]
-struct AdmittedLaunchSlot {
-    agent_id: uuid::Uuid,
-    token: u64,
-}
-
-impl Drop for AdmittedLaunchSlot {
-    fn drop(&mut self) {
-        release_admitted_launch(self.agent_id, self.token);
-    }
+/// `deferred_load:commit_pressure:warn:<free>_under_<floor>`.
+fn launch_deferral_reason(verdict: &crate::resource_guard::SpawnGate) -> Option<String> {
+    let (severity, observation) = verdict.tripped()?;
+    Some(format!(
+        "{DEFERRED_LOAD_REASON_PREFIX}{}",
+        load_pressure_stamp_reason(severity, observation)
+    ))
 }
 
 /// The launch admission decision `spawn_run_task` takes before
-/// `run_agent_subprocess`: prune dead continuations and take the thread reading
-/// FIRST, with no lock held — the reading is an OS-table read on a tokio
-/// worker, and taking it under a blocking std mutex would park every other
-/// admission and the continuation guard's count read behind it during exactly
-/// the burst this guard exists for. Then, under ONE hold of the
-/// [`admitted_launches`] lock: count every live unattended session
-/// (continuations plus admitted launches), apply the shared
-/// [`evaluate_load_guard`] over that count and the reading, and on `Proceed`
-/// insert this launch's slot. Count, cap and insert share the hold, so two
-/// launches racing for the last slot cannot both be admitted.
+/// `run_agent_subprocess`: prune dead continuations (the reaper is also the
+/// `work_unreported` reporter for a dead continuation, so every admission is a
+/// chance to report one promptly), then defer on ANY tripped verdict of the
+/// composed memory + thread probe — the same rule
+/// [`evaluate_continuation_guard`] applies, so the two unattended paths can
+/// never disagree about when the machine is too loaded.
 ///
-/// Lock order is `admitted_launches` then `continuation_sessions`; the
-/// continuation guard releases its registry lock before reading the launch
-/// count, so the two never invert.
+/// No count and no slot: an admitted launch is judged by what the machine has
+/// left, exactly as a continuation is (see [`evaluate_continuation_guard`] on
+/// why the count cap was retired). No duplicate arm: [`register_launch_stop`]
+/// is the launch path's duplicate gate. No anchor dedup: a launch payload has no
+/// anchor key.
 ///
-/// No duplicate arm: [`register_launch_stop`] is the launch path's duplicate
-/// gate, and its entry outlives this slot, so an agent_id reaching here never
-/// already holds one. No anchor dedup: a launch payload has no anchor key.
-///
-/// `Ok(slot)` admits (held until dropped); `Err(reason)` refuses with the
-/// `deferred_load:` reason to report, holding no slot.
+/// `Ok(())` admits; `Err(reason)` refuses with the `deferred_load:` reason to
+/// report.
 fn admit_launch(
-    agent_id: uuid::Uuid,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> Result<AdmittedLaunchSlot, String> {
+    load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> Result<(), String> {
+    warn_if_retired_cap_env_set();
     prune_dead_continuations(is_live);
-    let reading = thread_pressure();
-    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
-    debug_assert!(
-        !launches.contains_key(&agent_id),
-        "register_launch_stop admits one live launch per agent_id"
-    );
-    // `live` only: a pending anchor reservation is not a running session and
-    // never counts toward the cap (see `ContinuationRegistry`).
-    let continuations = lock_recover(continuation_sessions(), "continuation_sessions")
-        .live
-        .len();
-    let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
-    if let Some(reason) = launch_deferral_reason(&verdict) {
-        return Err(reason);
+    match launch_deferral_reason(&load_pressure()) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
     }
-    let token = NEXT_ADMITTED_LAUNCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    launches.insert(agent_id, token);
-    Ok(AdmittedLaunchSlot { agent_id, token })
 }
 
-/// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
-/// [`crate::resource_guard::thread_pressure`].
+/// [`evaluate_continuation_guard`] with the load verdict taken LIVE from
+/// [`crate::resource_guard::probe_for_spawn`] — the spawn seam's own composed
+/// memory + thread verdict.
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
@@ -3364,22 +3185,102 @@ fn admit_launch(
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
-/// The function itself is passed, NOT called: `&crate::resource_guard::thread_pressure`
+/// The function itself is passed, NOT called: `&crate::resource_guard::probe_for_spawn`
 /// coerces the `fn` item to the guard's `&dyn Fn() -> SpawnGate` parameter, so
 /// the reading happens inside the guard, after the dedup arm — the whole point
-/// of the lazy parameter. Writing `&thread_pressure()` here would restore the
+/// of the lazy parameter. Writing `&probe_for_spawn()` here would restore the
 /// eager evaluation and nothing would fail to compile.
 ///
-/// `thread_pressure()` short-circuits on a disabled session guard before touching
-/// the sensor, and the reading behind it is memoized for
-/// [`crate::health_monitor::THREAD_READING_TTL`] — so a machine owner who turned
-/// the guard off pays nothing here, and a burst that reaches the sensor pays for
-/// one snapshot between them.
+/// `probe_for_spawn()` short-circuits on a disabled session guard before touching
+/// either sensor, and the thread reading behind it is memoized for
+/// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
-    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::thread_pressure)
+    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::probe_for_spawn)
+}
+
+/// The `/health` `spawnAdmission` block: what unattended admission would decide
+/// RIGHT NOW, and from which readings — so "why was this continuation
+/// deferred?" is answerable from data on the box, not only from the stamp a
+/// deferral left on coord.
+///
+/// Read through [`crate::resource_guard::lane_verdicts`], the SAME read
+/// [`crate::resource_guard::probe_for_spawn`] gates on, so the route and the gate
+/// cannot compute different verdicts. It writes no shadowed-lane log, so a
+/// polled route costs nothing beyond the (memoized) readings.
+pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
+    let lanes = crate::resource_guard::lane_verdicts();
+    let live = lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .len();
+    spawn_admission_json(lanes.as_ref(), live)
+}
+
+/// The severity word of a lane verdict, `"proceed"` when nothing tripped.
+fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
+    gate.tripped()
+        .map(|(severity, _)| severity)
+        .unwrap_or("proceed")
+}
+
+/// PURE builder behind [`spawn_admission_health_json`].
+///
+/// `lanes: None` is a DISABLED session guard: no reading was taken, so every
+/// reading renders `null` and `enabled` says why — never a confident `0`
+/// [policy: `unknown-must-not-render-as-a-default`]. An unreadable sensor inside
+/// an enabled guard is `null` on its own field and `proceed` on its verdict,
+/// which is exactly the fail-open verdict the gate applies.
+fn spawn_admission_json(
+    lanes: Option<&crate::resource_guard::LaneVerdicts>,
+    live_continuations: usize,
+) -> serde_json::Value {
+    let Some(lanes) = lanes else {
+        return serde_json::json!({
+            "enabled": false,
+            "verdict": "proceed",
+            "deferStamp": null,
+            "memory": null,
+            "threads": null,
+            "liveContinuations": live_continuations,
+            "countCap": "retired",
+        });
+    };
+    let composed = crate::resource_guard::composed_verdict(lanes);
+    let defer_stamp = composed
+        .tripped()
+        .map(|(severity, observation)| load_pressure_stamp_reason(severity, observation));
+    serde_json::json!({
+        "enabled": true,
+        "verdict": verdict_word(&composed),
+        // The `continuation-deferred` reason the pre-check would stamp now.
+        "deferStamp": defer_stamp,
+        "memory": {
+            "lane": lanes.memory_lane,
+            "metric": crate::resource_guard::LaneMetric::FreeCommitBytes.wire_name(),
+            "freeCommitBytes": lanes.free_commit_bytes,
+            "freePhysBytes": lanes.free_phys_bytes,
+            "warnFloorBytes": lanes.warn_free_commit_bytes,
+            "criticalFloorBytes": lanes.critical_free_commit_bytes,
+            "verdict": verdict_word(&lanes.memory),
+        },
+        // The GRADED reading (raw minus the idle blocking pool) the lane
+        // judged, `null` only when the OS thread table could not be read —
+        // UNKNOWN, which fails open to `proceed` exactly as the gate does. The
+        // raw census is `threadCensus` on this same route.
+        "threads": {
+            "metric": crate::resource_guard::LaneMetric::ThreadCount.wire_name(),
+            "gradedThreads": lanes.threads.graded,
+            "warnCeiling": lanes.threads.warn_ceiling,
+            "criticalCeiling": lanes.threads.critical_ceiling,
+            "verdict": verdict_word(&lanes.threads.verdict),
+        },
+        // Registered continuation sessions (P3's population) — reported, never
+        // an admission input since the count cap was retired.
+        "liveContinuations": live_continuations,
+        "countCap": "retired",
+    })
 }
 
 /// Insert a live continuation row for a caller that holds NO reservation. The
@@ -3463,7 +3364,7 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
 /// give the permit back under ONE lock acquisition, so the anchor is never
 /// held by neither) and [`Self::release`] (the headless arm spawned; that path
 /// never registers, so the anchor goes back the moment the child exists —
-/// headless sessions are outside P3/P4).
+/// headless sessions are outside the P3 live registry).
 ///
 /// **`pub(crate)` for one reason only: to be CARRIED.** The account-migration
 /// hop takes a permit in [`take_continuation_registration`] and hands it to
@@ -3546,7 +3447,7 @@ impl Drop for AnchorReservation {
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
 /// it WAS a registered continuation session — kicks an immediate
-/// [`poll_pending_continuations`] so a previously-deferred (`AtCap`) continuation
+/// [`poll_pending_continuations`] so a previously-deferred (load-pressure) continuation
 /// drains promptly into the freed slot instead of waiting for an unrelated WS
 /// reconnect.
 ///
@@ -3589,7 +3490,7 @@ pub(crate) fn notify_continuation_terminal_exit(
          kicking capacity-freed pending-continuations poll"
     );
     // Two independent tasks, deliberately. The capacity-freed re-poll exists to
-    // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
+    // drain a load-deferred continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
     spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id);
@@ -3908,9 +3809,9 @@ fn continuation_backstop_poll_secs() -> u64 {
 /// polls coord for pending continuations and unit dispatches
 /// **unconditionally**.
 ///
-/// It used to poll only after at least one `AtCap` deferral this process
+/// It used to poll only after at least one load deferral this process
 /// lifetime (the deleted `at_cap_deferral_happened` arming flag) — but that
-/// gate meant a WS frame lost while connected, with no AtCap deferral and no
+/// gate meant a WS frame lost while connected, with no load deferral and no
 /// terminal exit, stranded a continuation until the next reconnect. The tick
 /// is two cheap authenticated GETs against coord; paying them every interval
 /// buys at-least-once delivery for the whole class.
@@ -4138,7 +4039,7 @@ async fn dispatch_gate_continuation(
             reason
         );
         // Stamp a NON-CONSUMING reason so coord can see WHY the row is sitting
-        // pending, exactly as the `at_cap` / `duplicate_anchor` guards do. The
+        // pending, exactly as the load-pressure / `duplicate_anchor` guards do. The
         // row stays pending and re-listable (no consume claim is taken), but
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
@@ -4747,7 +4648,7 @@ async fn post_spawn_outcome(
 
 /// Minimum interval between deferred-stamp posts for the SAME gate id. The
 /// backstop re-lists a deferred row every ~300s; without this limit a 2-day
-/// AtCap stall would post ~576 stamps per gate.
+/// load stall would post ~576 stamps per gate.
 const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Per-gate last-posted times for the deferred stamp (in-process rate limit).
@@ -4823,6 +4724,39 @@ fn thread_pressure_stamp_reason(
         "thread_pressure:{severity}:{}_over_{}",
         observation.observed, observation.limit
     )
+}
+
+/// The `reason` a memory-pressure deferral stamps:
+/// `commit_pressure:<severity>:<observed>_under_<limit>`, both in BYTES of free
+/// commit (`MemAvailable` off Windows). `_under_` rather than the thread stamp's
+/// `_over_`: free memory trips by falling BELOW its floor, and the stamp reads in
+/// the direction of the comparison.
+fn commit_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    format!(
+        "commit_pressure:{severity}:{}_under_{}",
+        observation.observed, observation.limit
+    )
+}
+
+/// The stamp for a load deferral, lane-correct: the thread lane keeps
+/// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
+/// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
+/// is read off the observation's METRIC, never re-derived from the severity.
+fn load_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    match observation.metric {
+        crate::resource_guard::LaneMetric::ThreadCount => {
+            thread_pressure_stamp_reason(severity, observation)
+        }
+        crate::resource_guard::LaneMetric::FreeCommitBytes => {
+            commit_pressure_stamp_reason(severity, observation)
+        }
+    }
 }
 
 /// When [`spawn_runtime`] started — the earliest instant a continuation can be
@@ -4958,11 +4892,6 @@ fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
     });
 }
 
-/// The `reason` a concurrency-cap deferral stamps.
-fn at_cap_stamp_reason(cap: usize) -> String {
-    format!("at_cap:{cap}")
-}
-
 /// The `reason` a coord-device-drain deferral stamps: `device_drain:drained` or
 /// `device_drain:unknown` (the `<class>:<detail>` grammar), so coord can tell a
 /// drained runner's pending rows from a registry refusal or a full cap.
@@ -5007,13 +4936,20 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// |---|---|---|
 /// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
-/// | `at_cap:<cap>` | the continuation concurrency cap | [`at_cap_stamp_reason`] |
+/// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
+/// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
 ///
-/// The first three follow `<class>:<detail>`; the fourth is delimited by `_` and
-/// predates the grammar — see [`spawn_authorization_stamp_reason`].
+/// All but the last follow `<class>:<detail>`; `spawn_authorization_` is
+/// delimited by `_` and predates the grammar — see
+/// [`spawn_authorization_stamp_reason`].
 ///
-/// This replaces the AtCap arm's old `report_spawn_failed` lifecycle post,
+/// **Retired:** `at_cap:<cap>`, the fixed count cap's stamp, is no longer
+/// written by this build (see [`RETIRED_CONTINUATION_SESSION_CAP_ENV`]). Older
+/// runner builds still write it until rebuilt, and historical rows carry it, so
+/// consumers keep reading it.
+///
+/// This replaces the old cap arm's `report_spawn_failed` lifecycle post,
 /// which polluted the agent-lifecycle channel with fake spawn failures for
 /// rows that were merely deferred. The stamp leaves the gate's continuation
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
@@ -5161,11 +5097,12 @@ fn first_line(msg: &str) -> String {
 /// It applies verbatim to the thread-pressure deferral, which is why that arm
 /// routes through here rather than growing its own tail.
 ///
-/// `reason` is the machine-matchable stamp string, built by one of the four
-/// constructors above [`post_continuation_deferred`] — never spelled inline.
-/// Three follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
-/// `thread_pressure:<severity>:<observed>_over_<limit>`, `at_cap:<cap>`) and one
-/// predates it (`spawn_authorization_<label>`). Callers log their own
+/// `reason` is the machine-matchable stamp string, built by one of the
+/// constructors in [`post_continuation_deferred`]'s table — never spelled
+/// inline. All follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
+/// `thread_pressure:<severity>:<observed>_over_<limit>`,
+/// `commit_pressure:<severity>:<observed>_under_<limit>`, `device_drain:<class>`)
+/// except `spawn_authorization_<label>`, which predates the grammar. Callers log their own
 /// human-readable line first, at the severity their verdict deserves.
 async fn defer_continuation_unclaimed(
     consume_target: ConsumeTarget,
@@ -5208,10 +5145,10 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 /// coord ack handshake selected by `consume_target`:
 ///
 /// 0. `target_device_id` sanity check.
-/// 1. Local guards (anchor_key dedup, machine thread pressure, concurrency cap)
+/// 1. Local guards (anchor_key dedup, then the memory and thread load lanes)
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
-///    (contract item 4), and so a machine already out of threads never pays a
-///    `git worktree add` before being told to wait.
+///    (contract item 4), and so a machine already short of memory or threads
+///    never pays a `git worktree add` before being told to wait.
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
@@ -5270,7 +5207,7 @@ async fn run_gate_continuation_inner(
         // Log-only, deliberately NO `continuation-deferred` stamp: that stamp is
         // rate-limited to one per gate per hour (`should_post_deferred_stamp`),
         // so a boot-minute stamp would mask the next real reason (a
-        // `thread_pressure:` or `at_cap:` deferral) for an hour. This condition
+        // `thread_pressure:` or `commit_pressure:` deferral) for an hour. This condition
         // clears in seconds and re-delivers itself. The legacy no-`gate_id`
         // path (`ConsumeTarget::None`) is excluded above: it has no re-delivery,
         // so a deferral there would be a silent drop.
@@ -5285,8 +5222,8 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-    // Step 1: the local guards (P3 anchor_key dedup + thread pressure + P4
-    // concurrency cap) BEFORE any coord claim or worktree acquire — a dispatch a
+    // Step 1: the local guards (P3 anchor_key dedup + the memory and thread
+    // load lanes) BEFORE any coord claim or worktree acquire — a dispatch a
     // local guard would reject must NOT burn a coord-side claim (contract item
     // 4), and must not leave a directory behind either: `resource_guard`'s
     // `precheck_spawn` gives the same argument for the same placement, since a
@@ -5297,13 +5234,12 @@ async fn run_gate_continuation_inner(
     // `gate_id` dedup (#450, the `dispatched_gate_ids` set, already applied in
     // the dispatcher) collapses a SAME gate delivered twice; this catches the
     // residual cases it can't — a re-cleared gate (new `gate_id`, same
-    // `anchor_key`), a machine out of OS threads, and the count cap. The first
-    // and last are evaluated against sessions that are STILL running; liveness
-    // is tested against the `TerminalManager`, and with no Tauri runtime the
-    // registry is empty so those two lanes are a no-op (the unit-test /
-    // headless-only context). The thread lane needs no registry at all — it
-    // reads the process — so it is the one guard here that still has an opinion
-    // in a headless context.
+    // `anchor_key`), and a machine short of memory or OS threads. The dedup is
+    // evaluated against sessions that are STILL running; liveness is tested
+    // against the `TerminalManager`, and with no Tauri runtime the registry is
+    // empty so that lane is a no-op (the unit-test / headless-only context). The
+    // load lanes need no registry at all — they read the machine and the
+    // process — so they still have an opinion in a headless context.
     //
     // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
     // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
@@ -5362,16 +5298,16 @@ async fn run_gate_continuation_inner(
             .await;
             return Ok(());
         }
-        ContinuationGuard::ThreadPressure {
+        ContinuationGuard::LoadPressure {
             severity,
             observation,
         } => {
-            // The machine is out of THREADS, not out of slots. The deferred
+            // The machine is short of memory or threads. The deferred
             // continuation stays pending on coord and the periodic backstop poll
             // (`spawn_continuation_backstop_poll`, always armed) re-fetches it
             // within one interval — plus the capacity-freed exit hook fires the
             // moment a live continuation's PTY exits, which is also the moment
-            // its ~3 threads go back to the pool. So this deferral self-heals on
+            // its memory and threads go back. So this deferral self-heals on
             // exactly the event that relieves the pressure.
             //
             // Both the WARN and the CRITICAL verdict land here, unlike
@@ -5380,35 +5316,20 @@ async fn run_gate_continuation_inner(
             // gets back-pressured a band earlier than a human's own terminal.
             warn!(
                 "agent_runtime: gate-continuation deferred under machine load: {} \
-                 — re-delivered when threads free up (anchor_key={:?})",
+                 — re-delivered when the resource frees up (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
             );
-            // The stamp reason names the REAL numbers, in the same
-            // `<class>:<detail>` shape as `at_cap:` / `duplicate_anchor:` so
-            // coord-side grouping still works:
-            // `thread_pressure:warn:300_over_256` (256/400 are the shipped
-            // ceilings, so a warn stamp can only ever name 256; a reading past
-            // 400 stamps `critical` and names 400).
+            // The stamp reason names the lane and the REAL numbers, in the
+            // `<class>:<detail>` shape coord-side grouping keys on:
+            // `thread_pressure:warn:300_over_256` or
+            // `commit_pressure:warn:<free>_under_<floor>`.
             defer_continuation_unclaimed(
                 consume_target,
                 device_id,
-                thread_pressure_stamp_reason(severity, &observation),
+                load_pressure_stamp_reason(severity, &observation),
             )
             .await;
-            return Ok(());
-        }
-        ContinuationGuard::AtCap(cap) => {
-            // The deferred continuation stays pending on coord; the periodic
-            // backstop poll (`spawn_continuation_backstop_poll`, always armed)
-            // re-fetches it within one interval even if the capacity-freed
-            // exit-hook trigger is missed — no per-process arming flag needed.
-            warn!(
-                "agent_runtime: gate-continuation refused: deferred: continuation cap ({cap}) \
-                 reached — re-delivered when a slot frees (anchor_key={:?})",
-                payload.anchor_key
-            );
-            defer_continuation_unclaimed(consume_target, device_id, at_cap_stamp_reason(cap)).await;
             return Ok(());
         }
     }
@@ -5427,7 +5348,7 @@ async fn run_gate_continuation_inner(
     // Both read the same TTL cache, so the second check costs no round-trip.
     // On refusal: release the in-process claim and post NO lifecycle
     // spawn-failure — an authorization refusal is a standing decision, not a
-    // spawn fault, and the `at_cap` precedent above is explicit that fake
+    // spawn fault, and the load-deferral precedent above is explicit that fake
     // spawn failures pollute the lifecycle channel.
     let authz = crate::agent_authorization::authorize_spawn(
         None,
@@ -5437,7 +5358,7 @@ async fn run_gate_continuation_inner(
     .await;
     if let Some(class) = authz.drain_class() {
         // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
-        // the same leave-pending deferral as `AtCap` — the backstop poll
+        // the same leave-pending deferral as a load deferral — the backstop poll
         // re-delivers the row once the drain lifts.
         warn!(
             "agent_runtime: gate-continuation deferred: {} (anchor_key={:?})",
@@ -5956,12 +5877,6 @@ async fn run_continuation_terminal(
     // once.
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
-    // Count this continuation toward the P4 cap for the whole start window:
-    // it is not in the live registry until its verdict, and a burst of
-    // dispatches must not all read the same low live count while theirs are
-    // still starting. Released when this fn returns (a started session is by
-    // then registered, so the overlap only ever over-counts).
-    let _starting = StartingContinuationSlot::acquire();
     loop {
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
@@ -6216,7 +6131,7 @@ async fn run_continuation_terminal(
             }
             ContinuationStart::Started { pty_alive } => {
                 // Register in the live continuation-session registry so P3 (dedup by
-                // anchor_key) and P4 (concurrency cap) see this session as live until
+                // anchor_key) sees this session as live until
                 // its PTY exits (reaped lazily by the guard's liveness prune).
                 // `reportable_gate` (not `payload.gate_id`) so the PTY-exit fallback
                 // never posts an outcome against a work-unit `dispatch_id`.
@@ -6256,35 +6171,6 @@ async fn run_continuation_terminal(
                 return Ok(exited.then_some(terminal_id));
             }
         }
-    }
-}
-
-/// Process-wide count of terminal continuations inside their start window —
-/// counted toward the P4 cap beside the live registry (see
-/// [`StartingContinuationSlot`]).
-static STARTING_CONTINUATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Number of terminal continuations currently inside their start window.
-fn starting_continuation_count() -> usize {
-    STARTING_CONTINUATIONS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// RAII hold on one [`STARTING_CONTINUATIONS`] slot: taken before the first
-/// PTY of a continuation is created, released on every return of
-/// [`run_continuation_terminal`] (and on panic, by drop).
-struct StartingContinuationSlot;
-
-impl StartingContinuationSlot {
-    fn acquire() -> Self {
-        STARTING_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for StartingContinuationSlot {
-    fn drop(&mut self) {
-        STARTING_CONTINUATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -7419,7 +7305,7 @@ async fn run_continuation_headless(
     workdir: &str,
     initial_prompt: &str,
     // The anchor reservation the guard left behind. This path never registers
-    // in the continuation registry (headless sessions are outside P3/P4), so
+    // in the continuation registry (headless sessions are outside the P3 live registry), so
     // it is released the moment the child exists; a spawn `Err` drops it.
     reservation: AnchorReservation,
 ) -> anyhow::Result<()> {
@@ -7452,7 +7338,7 @@ async fn run_continuation_headless(
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
             // same-anchor dispatch would read `DuplicateAnchor` for its whole
-            // lifetime (headless sessions are not P3/P4 population).
+            // lifetime (headless sessions are not P3 live-registry population).
             reservation.release();
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
@@ -13241,7 +13127,7 @@ mod tests {
 
     /// THE delivery-stall regression: claim → release → claim must succeed
     /// again. Before `release_gate_dispatch` existed, nothing ever removed an
-    /// id from the dedupe set, so a locally-skipped (AtCap/DuplicateAnchor)
+    /// id from the dedupe set, so a locally-skipped (LoadPressure/DuplicateAnchor)
     /// continuation was dropped at the dedupe check on EVERY subsequent
     /// re-delivery for the process lifetime.
     #[test]
@@ -13477,45 +13363,43 @@ mod tests {
     }
 
     /// End-to-end sequencing of the incident fix at the unit level: a gate id
-    /// claimed by the dispatcher, then rejected AtCap by the guard, is
-    /// RELEASED — so when a slot frees, the next delivery of the SAME gate id
-    /// passes both the dedupe claim and the guard. (Before the fix, step 4's
-    /// claim returned false forever: the primary's 9 boot-drained slots +
-    /// `QONTINUI_CONTINUATION_SESSION_CAP=9` stranded 51 continuations.)
+    /// claimed by the dispatcher, then deferred under load by the guard, is
+    /// RELEASED — so when the pressure clears, the next delivery of the SAME
+    /// gate id passes both the dedupe claim and the guard. (Before the release
+    /// existed, the claim returned false forever: the primary's 9 boot-drained
+    /// slots plus the since-retired count cap of 9 stranded 51 continuations.)
     #[test]
-    fn atcap_release_lets_same_gate_redispatch_after_slot_frees() {
+    fn load_deferral_release_lets_same_gate_redispatch_when_pressure_clears() {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
         let gate = uuid::Uuid::now_v7();
-
-        // Delivery 1: dispatcher claims the id, guard says AtCap (cap full).
-        register_continuation_session("busy-slot".into(), Some("other-anchor".into()), None);
         let live_all = |_id: &str| true;
+
+        // Delivery 1: dispatcher claims the id, guard defers under memory load.
         assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
-        assert_eq!(
-            guard_verdict(Some("new-anchor"), &live_all, &calm),
-            ContinuationGuard::AtCap(1)
-        );
-        // …the AtCap arm releases the in-process claim (the critical fix).
+        assert!(matches!(
+            guard_verdict(Some("new-anchor"), &live_all, &|| commit_verdict(
+                WARN_BAND_FREE
+            )),
+            ContinuationGuard::LoadPressure { .. }
+        ));
+        // …the load arm releases the in-process claim (the critical fix).
         release_gate_dispatch(gate);
 
-        // A slot frees (the busy session exits) and the backstop re-lists the
-        // row: the SAME gate id must now claim AND pass the guard.
-        let busy_dead = |id: &str| id != "busy-slot";
+        // Memory frees and the backstop re-lists the row: the SAME gate id must
+        // now claim AND pass the guard.
         assert!(
             claim_gate_dispatch(gate),
             "re-delivery after the release claims the id again"
         );
         assert_eq!(
-            guard_verdict(Some("new-anchor"), &busy_dead, &calm),
+            guard_verdict(Some("new-anchor"), &live_all, &calm),
             ContinuationGuard::Proceed,
-            "freed slot → the deferred continuation finally dispatches"
+            "pressure cleared → the deferred continuation finally dispatches"
         );
 
         release_gate_dispatch(gate);
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -13710,7 +13594,7 @@ mod tests {
     }
 
     // =========================================================================
-    // P3 (anchor_key dedup) + P4 (concurrency cap): continuation guard
+    // P3 (anchor_key dedup) + machine load: continuation and launch guards
     // =========================================================================
 
     /// Reset the process-wide continuation registry between guard tests (it is a
@@ -13725,14 +13609,9 @@ mod tests {
         *continuation_sessions()
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = ContinuationRegistry::default();
-        // Admitted launches share the cap, so they are part of the same reset.
-        admitted_launches()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
     }
 
-    const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
+    const CAP_ENV_KEYS: &[&str] = &[RETIRED_CONTINUATION_SESSION_CAP_ENV];
 
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
@@ -13740,14 +13619,11 @@ mod tests {
     #[test]
     fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
-        let agent = uuid::Uuid::now_v7();
 
-        let reason = match admit_launch(agent, &live_all, &|| thread_verdict(Some(300))) {
+        let reason = match admit_launch(&live_all, &|| thread_verdict(Some(300))) {
             Err(reason) => reason,
             other => panic!("300 threads must defer a launch, got {other:?}"),
         };
@@ -13757,47 +13633,34 @@ mod tests {
             !reason.contains(char::is_whitespace),
             "the wire reason carries no whitespace"
         );
-        assert_eq!(
-            admitted_launch_count(),
-            0,
-            "a refused launch must not hold a slot"
-        );
     }
 
-    /// Phase 1c: `admit_launch` — the decision `spawn_run_task` takes before
-    /// `run_agent_subprocess` — refuses with the `deferred_load:` reason and
-    /// holds no slot, and an admitted slot is released when dropped, a panic
-    /// unwinding past it included.
+    /// `admit_launch` — the decision `spawn_run_task` takes before
+    /// `run_agent_subprocess` — defers on the MEMORY lane exactly as on the
+    /// thread lane, with a lane-correct `deferred_load:` reason, and admits a
+    /// calm machine. Before 2026-10-03 the launch pre-check read threads only, so
+    /// a memory WARN reading launched and a CRITICAL one was refused later, at
+    /// the spawn seam, instead of being re-offered.
     #[test]
-    fn admit_launch_refusal_holds_no_slot_and_admitted_slot_releases_on_panic() {
+    fn admit_launch_defers_on_the_memory_lane_and_admits_a_calm_machine() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
-        let refused = admit_launch(uuid::Uuid::now_v7(), &live_all, &|| {
-            thread_verdict(Some(540))
-        });
         assert_eq!(
-            refused.err(),
+            admit_launch(&live_all, &|| thread_verdict(Some(540))).err(),
             Some("deferred_load:thread_pressure:critical:540_over_400".to_string())
         );
-        assert_eq!(admitted_launch_count(), 0);
-
-        let agent = uuid::Uuid::now_v7();
-        let result = std::panic::catch_unwind(|| {
-            let _slot = admit_launch(agent, &live_all, &calm).expect("calm machine admits");
-            assert_eq!(admitted_launch_count(), 1, "the admitted slot is held");
-            panic!("simulated run-task panic");
-        });
-        assert!(result.is_err());
+        let warn_floor = crate::settings::SessionGuardSettings::default().warn_free_commit_bytes;
         assert_eq!(
-            admitted_launch_count(),
-            0,
-            "a panic must not leak the admitted slot"
+            admit_launch(&live_all, &|| commit_verdict(WARN_BAND_FREE)).err(),
+            Some(format!(
+                "deferred_load:commit_pressure:warn:{WARN_BAND_FREE}_under_{warn_floor}"
+            )),
+            "a memory-starved machine defers a launch, naming the lane, reading and floor"
         );
+        assert_eq!(admit_launch(&live_all, &calm), Ok(()));
     }
 
     /// The deferral report retries only undelivered attempts, boundedly.
@@ -13820,43 +13683,37 @@ mod tests {
         );
     }
 
-    /// Phase 1c: the count lane binds launches — continuations and admitted
-    /// launches both count, and a released slot re-admits.
+    /// The fixed count cap is GONE (operator direction 2026-10-03): with
+    /// hundreds of live continuations registered and calm lanes, a new
+    /// continuation and a coord launch are both admitted — and the retired
+    /// `QONTINUI_CONTINUATION_SESSION_CAP` override, set to 1, changes nothing.
+    /// Restore a count anywhere in the admission path and this fails.
     #[test]
-    fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
+    fn no_count_cap_binds_unattended_admission() {
         let _env_lock = env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        std::env::set_var(RETIRED_CONTINUATION_SESSION_CAP_ENV, "1");
         let live_all = |_id: &str| true;
 
-        register_continuation_session("cont-1".into(), Some("anchor-1".into()), None);
-        let first = uuid::Uuid::now_v7();
-        let first_slot = admit_launch(first, &live_all, &calm).expect("1 live of cap 2 admits");
-        assert_eq!(launch_deferral_reason(&LoadGuard::Proceed), None);
-
-        let second = uuid::Uuid::now_v7();
+        for i in 0..500 {
+            register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
+        }
         assert_eq!(
-            admit_launch(second, &live_all, &calm).err(),
-            Some("deferred_load:at_cap:2_of_2".to_string())
+            guard_verdict(Some("a-new"), &live_all, &calm),
+            ContinuationGuard::Proceed,
+            "500 live continuations on a calm machine must not defer on count"
         );
         assert_eq!(
-            launch_deferral_reason(&LoadGuard::AtCap { cap: 2, live: 2 }).as_deref(),
-            Some("deferred_load:at_cap:2_of_2")
+            admit_launch(&live_all, &calm),
+            Ok(()),
+            "nor may a coord launch"
         );
-
-        // The admitted launch also binds the CONTINUATION guard (shared cap).
         assert_eq!(
-            guard_verdict(Some("anchor-2"), &live_all, &calm),
-            ContinuationGuard::AtCap(2)
+            launch_deferral_reason(&crate::resource_guard::SpawnGate::Proceed),
+            None
         );
-
-        drop(first_slot);
-        let second_slot = admit_launch(second, &live_all, &calm)
-            .expect("a released slot re-admits the deferred launch");
-        drop(second_slot);
-        assert_eq!(admitted_launch_count(), 0);
         clear_continuation_registry();
     }
 
@@ -14022,42 +13879,6 @@ mod tests {
         );
     }
 
-    /// Round-2 review: a slot's release removes only its OWN entry — a stale
-    /// slot for the same `agent_id` cannot free a newer run's slot — and the
-    /// count returns to 0.
-    #[test]
-    fn admitted_launch_releases_stay_balanced_and_token_exact() {
-        let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
-        let live_all = |_id: &str| true;
-        let agent = uuid::Uuid::now_v7();
-
-        let slot = admit_launch(agent, &live_all, &calm).expect("admits");
-        assert_eq!(admitted_launch_count(), 1);
-        let stale_token = slot.token;
-        drop(slot);
-        assert_eq!(admitted_launch_count(), 0);
-
-        // A later run under the same id is not freed by a stale release.
-        let newer = admit_launch(agent, &live_all, &calm).expect("re-admits");
-        assert_ne!(newer.token, stale_token);
-        drop(AdmittedLaunchSlot {
-            agent_id: agent,
-            token: stale_token,
-        });
-        assert_eq!(
-            admitted_launch_count(),
-            1,
-            "a stale slot's release must not remove the newer run's entry"
-        );
-        drop(newer);
-        assert_eq!(admitted_launch_count(), 0);
-        clear_continuation_registry();
-    }
-
     /// The prefix is a wire value coord matches on; pin its exact spelling.
     #[test]
     fn deferred_load_prefix_is_the_coord_wire_value() {
@@ -14068,9 +13889,9 @@ mod tests {
     /// `env_lock()`: a panicking guard test must not cascade-poison the rest.
     static CONT_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// A thread verdict that says nothing: the machine has headroom, or the
+    /// A load verdict that says nothing: the machine has headroom, or the
     /// sensor had no opinion. The default for every guard test that is about the
-    /// dedup / cap lanes rather than about load — passing it keeps those tests
+    /// dedup lane rather than about load — passing it keeps those tests
     /// measuring exactly what they measured before the thread lane existed.
     ///
     /// Passed as `&calm`, not `&calm()`: the guard takes the verdict as a
@@ -14088,9 +13909,9 @@ mod tests {
     fn guard_verdict(
         anchor_key: Option<&str>,
         is_live: &dyn Fn(&str) -> bool,
-        thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+        load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, thread_pressure).0
+        evaluate_continuation_guard(anchor_key, is_live, load_pressure).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -14110,6 +13931,24 @@ mod tests {
     fn thread_verdict(reading: Option<usize>) -> crate::resource_guard::SpawnGate {
         crate::resource_guard::evaluate_threads(
             reading,
+            &crate::settings::SessionGuardSettings::default(),
+        )
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Free commit inside the shipped WARN band (under the 3 GiB warn floor,
+    /// above the 1.5 GiB critical one).
+    const WARN_BAND_FREE: u64 = 2 * GIB;
+
+    /// The REAL memory-lane verdict for an injected free-commit reading, folded
+    /// through the pure evaluator the live path uses
+    /// ([`crate::resource_guard::evaluate`]) against the SHIPPED floors
+    /// (3 GiB warn / 1.5 GiB critical) — the memory twin of [`thread_verdict`].
+    fn commit_verdict(free_commit_bytes: u64) -> crate::resource_guard::SpawnGate {
+        crate::resource_guard::evaluate(
+            "host",
+            Some(free_commit_bytes),
             &crate::settings::SessionGuardSettings::default(),
         )
     }
@@ -14139,7 +13978,6 @@ mod tests {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         // Raise the cap out of the way so this test isolates the dedup path.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
 
         // No session yet → proceed, then register it as live.
         let live_all = |_id: &str| true;
@@ -14178,7 +14016,6 @@ mod tests {
             .live
             .contains_key("term-tid-1"));
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -14220,7 +14057,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let (verdict, _held) =
@@ -14261,7 +14097,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#1";
 
@@ -14341,7 +14176,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#7";
         let gate = uuid::Uuid::now_v7();
@@ -14362,7 +14196,7 @@ mod tests {
 
         // A same-anchor dispatch arrives inside the window. It no longer finds
         // the anchor free: specifically `Reserved`, not merely "not Proceed"
-        // (AtCap and ThreadPressure are refusals too and would prove nothing
+        // (LoadPressure verdicts are refusals too and would prove nothing
         // about the anchor).
         assert_eq!(
             guard_verdict(Some(anchor), &live_all, &calm),
@@ -14442,7 +14276,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#19";
         let gate = uuid::Uuid::now_v7();
@@ -14466,7 +14299,7 @@ mod tests {
         assert_eq!(carried.gate_id, Some(gate));
 
         // 2. A same-anchor continuation dispatched inside the window is
-        //    REFUSED — specifically `Reserved`. `AtCap` / `ThreadPressure` are
+        //    REFUSED — specifically `Reserved`. `LoadPressure` verdicts are
         //    refusals too and would satisfy a weaker assertion while proving
         //    nothing about the anchor.
         assert_eq!(
@@ -14506,7 +14339,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "unit:u19:phase-err";
         let gate = uuid::Uuid::now_v7();
@@ -14562,7 +14394,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let anchor = "claim:pr:qontinui/x#20";
         let gate = uuid::Uuid::now_v7();
 
@@ -14621,7 +14452,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
@@ -14655,95 +14485,44 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// A load verdict (`ThreadPressure` / `AtCap`) leaves NO reservation
-    /// behind: the row is deferred for re-delivery, and the re-delivery must
-    /// read the load verdict again — not `DuplicateAnchor` against a refused
-    /// evaluation's own leftover.
+    /// A load verdict (either lane) leaves NO reservation behind: the row is
+    /// deferred for re-delivery, and the re-delivery must read the load verdict
+    /// again — not `DuplicateAnchor` against a refused evaluation's own
+    /// leftover.
     #[test]
     fn load_verdicts_leave_no_reservation_behind() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        // AtCap: cap 1, one live session, a new anchor twice.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        register_continuation_session("t-busy".into(), Some("a-busy".into()), None);
-        // The permit is BOUND, never taken through `guard_verdict`. That
-        // wrapper is `evaluate_continuation_guard(..).0`, so the tuple
-        // temporary's `.1` is dropped at the end of the wrapper's own tail
-        // expression — the WRAPPER releases the anchor before this test can
-        // look at it, and the assertion below would then pass even with the
-        // production release deleted. Bound here, the registry is read with the
-        // permit still alive, which is exactly the state
-        // `run_gate_continuation_inner`'s AtCap arm is in while it awaits
-        // `defer_continuation_unclaimed`'s network POST.
-        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
-        assert_eq!(verdict, ContinuationGuard::AtCap(1));
-        assert!(
-            !anchor_is_reserved("a-capped"),
-            "an AtCap verdict must remove the reservation it took under the lock"
-        );
-        drop(held);
-        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
-        assert_eq!(
-            verdict,
-            ContinuationGuard::AtCap(1),
-            "the re-delivery must see the cap again, not its own leftover reservation"
-        );
-        drop(held);
-
-        // ThreadPressure: cap out of the way, a loaded reading twice.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
-        for _ in 0..2 {
-            // Bound for the same reason as the AtCap half above.
-            let (verdict, held) = evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
-                thread_verdict(Some(540))
-            });
-            assert!(
-                matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
-                "a loaded machine must defer on every evaluation, got {verdict:?}"
-            );
-            assert!(
-                !anchor_is_reserved("a-loaded"),
-                "a ThreadPressure verdict must remove the reservation it took under the lock"
-            );
-            drop(held);
+        let thread_loaded = || thread_verdict(Some(540));
+        let memory_loaded = || commit_verdict(WARN_BAND_FREE);
+        let lanes: [(&str, &dyn Fn() -> crate::resource_guard::SpawnGate); 2] =
+            [("a-threads", &thread_loaded), ("a-memory", &memory_loaded)];
+        for (anchor, loaded) in lanes {
+            for _ in 0..2 {
+                // The permit is BOUND, never taken through `guard_verdict`. That
+                // wrapper is `evaluate_continuation_guard(..).0`, so the tuple
+                // temporary's `.1` is dropped at the end of the wrapper's own
+                // tail expression — the WRAPPER releases the anchor before this
+                // test can look at it, and the assertion below would then pass
+                // even with the production release deleted. Bound here, the
+                // registry is read with the permit still alive, which is exactly
+                // the state `run_gate_continuation_inner`'s load arm is in while
+                // it awaits `defer_continuation_unclaimed`'s network POST.
+                let (verdict, held) = evaluate_continuation_guard(Some(anchor), &live_all, loaded);
+                assert!(
+                    matches!(verdict, ContinuationGuard::LoadPressure { .. }),
+                    "a loaded machine must defer on every evaluation, got {verdict:?}"
+                );
+                assert!(
+                    !anchor_is_reserved(anchor),
+                    "a LoadPressure verdict must remove the reservation it took under the lock"
+                );
+                drop(held);
+            }
         }
-
-        clear_continuation_registry();
-    }
-
-    /// The reservation is not a running session and must not count toward P4
-    /// — for the continuation guard's `live_count` and for the launch guard
-    /// that shares the cap. With cap 2, one live session and one reservation,
-    /// a second anchor and a coord launch both still proceed.
-    #[test]
-    fn anchor_reservation_does_not_count_toward_the_cap() {
-        let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
-        let live_all = |_id: &str| true;
-
-        register_continuation_session("t-live".into(), Some("a-live".into()), None);
-        // Bound, not dropped: this test is about what a HELD reservation costs.
-        let (verdict, _held) = evaluate_continuation_guard(Some("a-reserved"), &live_all, &calm);
-        assert_eq!(verdict, ContinuationGuard::Proceed);
-        assert!(anchor_is_reserved("a-reserved"));
-        // 1 live + 1 reserved, cap 2: if the reservation counted this would be
-        // AtCap(2).
-        assert_eq!(
-            guard_verdict(Some("a-next"), &live_all, &calm),
-            ContinuationGuard::Proceed,
-            "a reservation must not consume a cap slot"
-        );
-        assert!(
-            admit_launch(uuid::Uuid::now_v7(), &live_all, &calm).is_ok(),
-            "the launch guard shares the cap and must not count reservations either"
-        );
 
         clear_continuation_registry();
     }
@@ -14755,7 +14534,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         register_continuation_session("tid-a".into(), None, None);
@@ -14766,158 +14544,6 @@ mod tests {
             ContinuationGuard::Proceed
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// P4: at the configured cap, a fresh dispatch is refused (`AtCap`). Below
-    /// the cap it proceeds. Dead sessions are pruned before counting, so they
-    /// don't consume cap slots. Env override is honored.
-    #[test]
-    fn continuation_cap_refuses_at_limit() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
-        let live_all = |_id: &str| true;
-
-        // 0 live, cap 2 → proceed.
-        assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &calm),
-            ContinuationGuard::Proceed
-        );
-        register_continuation_session("t1".into(), Some("a1".into()), None);
-        register_continuation_session("t2".into(), Some("a2".into()), None);
-
-        // 2 live, cap 2 → AtCap (a NEW anchor, so not a dedup).
-        assert_eq!(
-            guard_verdict(Some("a3"), &live_all, &calm),
-            ContinuationGuard::AtCap(2)
-        );
-
-        // One session dies → pruned → back under cap → proceed.
-        let t1_dead = |id: &str| id != "t1";
-        assert_eq!(
-            guard_verdict(Some("a3"), &t1_dead, &calm),
-            ContinuationGuard::Proceed
-        );
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// P3 before P4: a duplicate of an already-LIVE anchor is reported as a
-    /// dedup even when the registry is at the cap — the honest reason is "this
-    /// is already running", not "capped".
-    #[test]
-    fn dedup_takes_precedence_over_cap() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        let live_all = |_id: &str| true;
-
-        register_continuation_session("t1".into(), Some("anchor-dup".into()), None);
-        // At cap (1) AND the anchor matches a live session → dedup wins.
-        assert_eq!(
-            guard_verdict(Some("anchor-dup"), &live_all, &calm),
-            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t1".to_string()))
-        );
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// The cap reads `QONTINUI_CONTINUATION_SESSION_CAP`, falling back to the
-    /// default for an unset / non-numeric value — and the operator override wins
-    /// in BOTH directions over a default that is now finite.
-    ///
-    /// The two default assertions here used to compare `continuation_session_cap()`
-    /// against `DEFAULT_CONTINUATION_SESSION_CAP`, which is a tautology: it
-    /// passed identically when the default was `usize::MAX` and it would pass if
-    /// the default were 0. They now pin the two properties that actually matter
-    /// — the default is FINITE (the whole point of Phase 1 of
-    /// `2026-08-30-load-aware-spawn-admission-control`), and an explicit env
-    /// value displaces it in either direction.
-    #[test]
-    fn continuation_session_cap_env_parsing() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("QONTINUI_CONTINUATION_SESSION_CAP").ok();
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        let default_cap = continuation_session_cap();
-        assert_eq!(default_cap, DEFAULT_CONTINUATION_SESSION_CAP);
-        assert!(
-            default_cap < usize::MAX,
-            "the unset default must be FINITE — an infinite cap is the guard that \
-             failed to fire on 2026-08-29"
-        );
-        assert_eq!(
-            default_cap, 64,
-            "the shipped default is 64; see DEFAULT_CONTINUATION_SESSION_CAP for why"
-        );
-
-        // Override DOWN (an operator throttling a small box)…
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "7");
-        assert_eq!(continuation_session_cap(), 7);
-        // …and UP, past the default: the override is not a ceiling-only knob.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "200");
-        assert_eq!(continuation_session_cap(), 200);
-
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "not-a-number");
-        assert_eq!(
-            continuation_session_cap(),
-            DEFAULT_CONTINUATION_SESSION_CAP,
-            "garbage falls back to the default, not to unbounded"
-        );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", v),
-            None => std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP"),
-        }
-    }
-
-    /// REGRESSION (the 2026-08-29 wedge, count lane): the DEFAULT cap — no env
-    /// override at all — refuses. This test is the inverse of the one it
-    /// replaces (`unbounded_default_cap_never_refuses_on_count`, which asserted
-    /// `continuation_session_cap() == usize::MAX` and that 50 live sessions
-    /// still proceed); that assertion encoded the very default the incident
-    /// falsified, so it is deleted rather than adjusted.
-    ///
-    /// Fill the registry to exactly the default cap and confirm the NEXT
-    /// dispatch is `AtCap` with the default in the payload. Deleting the finite
-    /// default fails this test.
-    #[test]
-    fn default_cap_is_finite_and_refuses_at_the_limit() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        let cap = continuation_session_cap();
-        assert!(cap < usize::MAX, "the default cap must be finite");
-
-        let live_all = |_id: &str| true;
-        // One under the cap → still Proceed: the cap must not fire early.
-        for i in 0..cap - 1 {
-            register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
-        }
-        assert_eq!(
-            guard_verdict(Some("a-new"), &live_all, &calm),
-            ContinuationGuard::Proceed,
-            "cap-1 live sessions is under the cap"
-        );
-
-        // At the cap → the next one is refused, naming the default. One anchor
-        // per evaluation, so this test does not depend on `guard_verdict`
-        // dropping the permit it never binds (see its doc).
-        register_continuation_session(format!("t{}", cap - 1), Some("a-last".into()), None);
-        assert_eq!(
-            guard_verdict(Some("a-new-2"), &live_all, &calm),
-            ContinuationGuard::AtCap(cap),
-            "at {cap} live sessions the {n}th continuation is refused on count alone",
-            n = cap + 1
-        );
         clear_continuation_registry();
     }
 
@@ -14938,7 +14564,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         // One anchor per evaluation, so this test does not depend on
@@ -14963,7 +14588,7 @@ mod tests {
 
         // WARN band (257..=400): defer, naming the warn ceiling.
         match guard_verdict(Some("a3"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -14981,7 +14606,7 @@ mod tests {
         // ceiling. The guard does not escalate past deferral — there is nothing
         // heavier for a queued row than leaving it queued.
         match guard_verdict(Some("a4"), &live_all, &|| thread_verdict(Some(540))) {
-            ContinuationGuard::ThreadPressure {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -14992,7 +14617,6 @@ mod tests {
             other => panic!("540 threads must defer at critical severity, got {other:?}"),
         }
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15016,14 +14640,13 @@ mod tests {
         clear_continuation_registry();
         // Cap and dedup both deliberately out of the way: nothing but the thread
         // reading can produce a non-Proceed verdict here.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let loaded = guard_verdict(Some("wedge-anchor"), &live_all, &|| {
             thread_verdict(Some(540))
         });
         assert!(
-            matches!(loaded, ContinuationGuard::ThreadPressure { .. }),
+            matches!(loaded, ContinuationGuard::LoadPressure { .. }),
             "a 540-thread machine must NOT admit another continuation; got {loaded:?}"
         );
         assert_ne!(
@@ -15042,7 +14665,6 @@ mod tests {
             "the deferral self-heals on the reading alone — no arming flag, no reset"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15057,7 +14679,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
@@ -15067,7 +14688,6 @@ mod tests {
             "a live duplicate is a dedup, not a load deferral"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15077,9 +14697,9 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::thread_pressure`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load and — on Windows
-    /// — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
+    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
+    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of
     /// N duplicate-anchor rows took N system-wide thread snapshots on a machine
@@ -15095,7 +14715,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let readings = std::sync::atomic::AtomicUsize::new(0);
@@ -15123,7 +14742,7 @@ mod tests {
         // or the assertion above would pass on a guard that never reads threads.
         assert!(matches!(
             guard_verdict(Some("some-other-anchor"), &live_all, &counted),
-            ContinuationGuard::ThreadPressure { .. }
+            ContinuationGuard::LoadPressure { .. }
         ));
         assert_eq!(
             readings.load(std::sync::atomic::Ordering::SeqCst),
@@ -15131,47 +14750,6 @@ mod tests {
             "a row that reaches the thread lane takes exactly one reading"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// Ordering, step 2 before step 3: when BOTH the thread lane and the count
-    /// cap would fire, the verdict names THREADS.
-    ///
-    /// Thread count is the live reading of the resource that actually ran out;
-    /// the count cap is a static backstop. Reporting a thread-starved machine as
-    /// `AtCap` would send the next investigation to the wrong constant — which
-    /// is precisely what happened on 2026-08-29, when the cap was the thing
-    /// everyone looked at and threads were the thing that broke.
-    #[test]
-    fn thread_pressure_trips_ahead_of_the_count_cap() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        // Cap 1 with 1 live session: the count lane WOULD say AtCap(1).
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        register_continuation_session("t1".into(), Some("other-anchor".into()), None);
-        let live_all = |_id: &str| true;
-
-        // Sanity: with no thread pressure this is unambiguously AtCap.
-        assert_eq!(
-            guard_verdict(Some("a-new"), &live_all, &calm),
-            ContinuationGuard::AtCap(1)
-        );
-
-        // Add thread pressure and the honest, earlier signal wins.
-        match guard_verdict(Some("a-new"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
-                severity,
-                observation,
-            } => {
-                assert_eq!(severity, "warn");
-                assert_eq!(observation.observed, 300);
-            }
-            other => panic!("threads must outrank the count cap, got {other:?}"),
-        }
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15190,7 +14768,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         assert_eq!(
@@ -15204,7 +14781,6 @@ mod tests {
             "UNKNOWN must never defer — fail open"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15572,23 +15148,6 @@ mod tests {
         assert_eq!(last_output_line("\r\n  \n"), None);
     }
 
-    /// A continuation inside its start window counts toward the P4 cap until
-    /// its run returns, however it returns.
-    #[test]
-    fn starting_continuation_slot_counts_while_held() {
-        // The slots feed the P4 cap count every guard test reads, so hold the
-        // same lock they do or a parallel cap test sees +2.
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before = starting_continuation_count();
-        let a = StartingContinuationSlot::acquire();
-        let b = StartingContinuationSlot::acquire();
-        assert!(starting_continuation_count() >= before + 2);
-        drop(a);
-        drop(b);
-        // Other tests never take a slot, so the count is back where it was.
-        assert_eq!(starting_continuation_count(), before);
-    }
-
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
     /// `dispatch_id` and has NO `coord.gates` row, so every producer must be
     /// gated on `gate_id.is_some() && dispatch_id.is_none()`. A single fn owns
@@ -15946,7 +15505,7 @@ mod tests {
     ///
     /// (Replaces `at_cap_deferral_arms_backstop_flag`: the AtCap arming
     /// predicate was deleted with the gate — a WS frame lost while connected,
-    /// with no AtCap deferral this process lifetime and no terminal exit,
+    /// with no load deferral this process lifetime and no terminal exit,
     /// stranded a continuation until the next reconnect. The loop body now
     /// polls unconditionally on every tick; there is no arming state left to
     /// test.)
@@ -15981,7 +15540,169 @@ mod tests {
         );
     }
 
-    /// The deferred-stamp `reason` vocabulary, on the four constructors that
+    /// The two LIVE unattended pre-checks read the composed memory + thread probe
+    /// (`resource_guard::probe_for_spawn`), never the thread lane alone. The unit
+    /// tests above inject the verdict, so they cannot see which function the
+    /// production wiring passes; this pins that wiring. Before 2026-10-03 both
+    /// sites passed `thread_pressure`, so memory pressure reached no pre-check: a
+    /// WARN reading spawned anyway, and a CRITICAL one surfaced only as a
+    /// terminal `spawn_failed` at the PTY seam.
+    #[test]
+    fn the_live_pre_checks_read_both_resource_lanes() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let body_of = |signature: &str| -> &str {
+            let (_, rest) = prod
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+        };
+        for (site, body) in [
+            (
+                "evaluate_continuation_guard_live",
+                body_of("fn evaluate_continuation_guard_live("),
+            ),
+            ("spawn_run_task", body_of("fn spawn_run_task(")),
+        ] {
+            assert!(
+                body.contains("crate::resource_guard::probe_for_spawn"),
+                "{site} must pass the composed memory + thread probe"
+            );
+            assert!(
+                !body.contains("crate::resource_guard::thread_pressure"),
+                "{site} must not fall back to the thread lane alone"
+            );
+        }
+    }
+
+    /// `/health` `spawnAdmission`: each lane's verdict, reading and limit, the
+    /// composed verdict, and the stamp the pre-check would write — built from
+    /// the same `LaneVerdicts` the gate composes. A disabled guard renders its
+    /// readings `null`, never `0`.
+    #[test]
+    fn spawn_admission_json_names_each_lane_and_the_stamp_it_would_write() {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let lanes = |memory, graded: usize, threads| crate::resource_guard::LaneVerdicts {
+            memory_lane: "host",
+            free_commit_bytes: Some(WARN_BAND_FREE),
+            free_phys_bytes: None,
+            warn_free_commit_bytes: floors.warn_free_commit_bytes,
+            critical_free_commit_bytes: floors.critical_free_commit_bytes,
+            memory,
+            threads: crate::resource_guard::ThreadLane {
+                graded: Some(graded),
+                warn_ceiling: 256,
+                critical_ceiling: 400,
+                verdict: threads,
+            },
+        };
+
+        // Memory tripped, threads calm: the composed verdict and the stamp are
+        // the memory lane's.
+        let v = spawn_admission_json(Some(&lanes(commit_verdict(WARN_BAND_FREE), 200, calm())), 7);
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["verdict"], "warn");
+        assert_eq!(
+            v["deferStamp"],
+            format!(
+                "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                floors.warn_free_commit_bytes
+            )
+        );
+        assert_eq!(v["memory"]["freeCommitBytes"], WARN_BAND_FREE);
+        assert_eq!(v["memory"]["freePhysBytes"], serde_json::Value::Null);
+        assert_eq!(v["memory"]["warnFloorBytes"], floors.warn_free_commit_bytes);
+        assert_eq!(v["memory"]["verdict"], "warn");
+        assert_eq!(v["threads"]["verdict"], "proceed");
+        // The graded reading is reported whether or not the lane tripped.
+        assert_eq!(v["threads"]["gradedThreads"], 200);
+        assert_eq!(v["threads"]["warnCeiling"], 256);
+        assert_eq!(v["threads"]["criticalCeiling"], 400);
+        assert_eq!(v["liveContinuations"], 7);
+        assert_eq!(v["countCap"], "retired");
+
+        // Threads critical outranks memory warn — the heavier lane is reported,
+        // exactly as `probe_for_spawn` composes it.
+        let v = spawn_admission_json(
+            Some(&lanes(
+                commit_verdict(WARN_BAND_FREE),
+                540,
+                thread_verdict(Some(540)),
+            )),
+            0,
+        );
+        assert_eq!(v["verdict"], "critical");
+        assert_eq!(v["deferStamp"], "thread_pressure:critical:540_over_400");
+        assert_eq!(v["threads"]["verdict"], "critical");
+        assert_eq!(v["threads"]["gradedThreads"], 540);
+
+        // Calm: no stamp.
+        let v = spawn_admission_json(Some(&lanes(calm(), 200, calm())), 0);
+        assert_eq!(v["verdict"], "proceed");
+        assert_eq!(v["deferStamp"], serde_json::Value::Null);
+
+        // Disabled guard: nothing was read, so nothing is reported as a number.
+        let v = spawn_admission_json(None, 3);
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["memory"], serde_json::Value::Null);
+        assert_eq!(v["threads"], serde_json::Value::Null);
+        assert_eq!(v["liveContinuations"], 3);
+    }
+
+    /// A continuation offered while free memory is under its WARN floor — or its
+    /// CRITICAL floor — is DEFERRED by the pre-check, naming the memory lane.
+    /// Before 2026-10-03 the pre-check read threads only: the WARN row spawned
+    /// (the seam admits WARN), and the CRITICAL row was claimed and then died
+    /// `spawn_failed` at the PTY seam on the same memory reading.
+    #[test]
+    fn memory_pressure_defers_a_continuation_at_the_pre_check() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let floors = crate::settings::SessionGuardSettings::default();
+
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(WARN_BAND_FREE)) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "warn");
+                assert_eq!(observation.observed, WARN_BAND_FREE);
+                assert_eq!(observation.limit, floors.warn_free_commit_bytes);
+                assert_eq!(
+                    load_pressure_stamp_reason(severity, &observation),
+                    format!(
+                        "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                        floors.warn_free_commit_bytes
+                    )
+                );
+            }
+            other => panic!("2 GiB free must defer at warn, got {other:?}"),
+        }
+        // CRITICAL band (under 1.5 GiB): still a deferral, naming the critical
+        // floor — the reading that used to die `spawn_failed` after the claim.
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(GIB)) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "critical");
+                assert_eq!(observation.limit, floors.critical_free_commit_bytes);
+            }
+            other => panic!("1 GiB free must defer at critical, got {other:?}"),
+        }
+        // Plenty of memory: proceeds.
+        assert_eq!(
+            guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(64 * GIB)),
+            ContinuationGuard::Proceed
+        );
+        clear_continuation_registry();
+    }
+
+    /// The deferred-stamp `reason` vocabulary, on the constructors that
     /// actually produce it.
     ///
     /// ## What this replaced, and why
@@ -16051,10 +15772,31 @@ mod tests {
             "thread_pressure:critical:540_over_400"
         );
 
-        // 3. The concurrency cap — the successor to the deleted test's subject.
-        //    It names the cap, which is what the operator has to act on.
-        assert_eq!(at_cap_stamp_reason(64), "at_cap:64");
-        assert_eq!(at_cap_stamp_reason(4), "at_cap:4");
+        // 3. Memory pressure: class, severity, and the REAL numbers in bytes,
+        //    `_under_` because free memory trips by falling BELOW its floor.
+        //    Built from a real `evaluate` verdict against the shipped floors.
+        let floors = crate::settings::SessionGuardSettings::default();
+        let memory = commit_verdict(WARN_BAND_FREE);
+        let (mem_severity, mem_observation) = memory
+            .tripped()
+            .expect("2 GiB free is in the warn band (3 GiB warn, 1.5 GiB critical)");
+        assert_eq!(
+            commit_pressure_stamp_reason(mem_severity, mem_observation),
+            format!(
+                "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                floors.warn_free_commit_bytes
+            )
+        );
+        // `load_pressure_stamp_reason` routes on the METRIC, so each lane keeps
+        // its own class — the thread stamp is byte-identical to before.
+        assert_eq!(
+            load_pressure_stamp_reason(severity, observation),
+            thread_pressure_stamp_reason(severity, observation)
+        );
+        assert_eq!(
+            load_pressure_stamp_reason(mem_severity, mem_observation),
+            commit_pressure_stamp_reason(mem_severity, mem_observation)
+        );
 
         // 4. The registry refusal — the ONE class delimited by `_`, pinned as it
         //    is so that "fixing" it to a colon is a failing test rather than a
@@ -16075,7 +15817,7 @@ mod tests {
             duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
             duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
             thread_pressure_stamp_reason(severity, observation),
-            at_cap_stamp_reason(64),
+            commit_pressure_stamp_reason(mem_severity, mem_observation),
         ] {
             let (class, detail) = reason
                 .split_once(':')
