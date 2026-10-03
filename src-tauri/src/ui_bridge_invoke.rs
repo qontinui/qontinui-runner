@@ -615,6 +615,52 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // ---- New Project create flow (plan
+    // 2026-09-22-new-project-initiation-pr-f-doctor-step-and-funnel-telemetry
+    // Phase 2) ----
+    //
+    // `create_new_project` (`crate::commands::new_project`) has NO frontend
+    // caller on `origin/main` -- the runner UI that hosts it is the parent
+    // plan's unlanded Phase 4 -- so before this entry it was reachable only by
+    // a hand-issued `__TAURI_INTERNALS__.invoke` through
+    // `POST /ui-bridge/control/page/evaluate`. That door is dead on every
+    // CSP-enforcing build: `tauri.conf.json`'s `script-src 'self'` refuses the
+    // evaluator's `new Function` ("Refused to evaluate a string as JavaScript
+    // because 'unsafe-eval' ..."), measured on a Linux temp runner 2026-10-03.
+    // So the funnel telemetry this command emits had no verification path.
+    //
+    // This is a WIDENING of the HTTP-reachable surface, not a reduction: on a
+    // CSP-enforcing build `page/evaluate` cannot reach this command at all, so
+    // unlike `get_coord_device_token` (which restored a capability consumers
+    // already had) it makes something reachable that was not. Its effects
+    // leave the box: a directory under a caller-chosen `location`, a GitHub
+    // repo under the operator's identity, and an optional enrollment in the
+    // Qontinui GitHub Apps. It is justified by SUBSUMPTION: the same loopback,
+    // origin-guarded caller can already spawn a PTY and run arbitrary commands
+    // (and so `gh repo create`) through `POST /ui-bridge/tauri/invoke` ->
+    // `terminal_create` (`mcp/tauri_proxy.rs`, gated there by the coord drain
+    // gate and `admit_spawn_tenant`). The cloud relay cannot reach either door
+    // (`relay_path_policy.rs` leaves the whole `/ui-bridge/invoke/*` family
+    // off its allowlist).
+    //
+    // `Dispatch::Frontend` because the command takes Tauri-managed state and
+    // an `AppHandle` it emits progress events through; the generic frontend
+    // `invoke()` supplies both. The consequence is that a headless
+    // (`QONTINUI_SERVER_MODE`) runner answers 503 `SERVER_MODE_NO_WEBVIEW`:
+    // this door works on a windowed runner only. Step failures come back as
+    // `ok: false` in the result, never as an invoke error, so read `ok` /
+    // `failedStep` rather than `success`.
+    ProxyableCommand {
+        name: "create_new_project",
+        dispatch: Dispatch::Frontend,
+        description: "Create a new project end-to-end (scaffold, git init, optional GitHub repo + push + Qontinui enrollment), emitting `new-project://progress` per step and the new_project_* funnel workflow events. Args: {\"req\": {name, location, owner?, private?, template, enroll?, resumeFrom?}} -- `owner` null/absent = local-only (create_remote, push and enroll are skipped). Never an invoke error for a step failure: the result carries `ok: false` plus `failedStep`, a typed `error` and a `resumeToken` (keys absent, not null, on success). Long-running when it reaches GitHub -- pass `?timeoutMs=`. A 504 does NOT cancel the run: the webview keeps executing and may still create the remote repo, so after a 504 read the target's state (or retry with `resumeFrom`) rather than re-invoking blind. Windowed runners only (headless answers 503 SERVER_MODE_NO_WEBVIEW).",
+        args_schema: r#"{"type":"object","required":["req"],"properties":{"req":{"type":"object","required":["name","location","template"],"properties":{"name":{"type":"string"},"location":{"type":"string"},"owner":{"type":["string","null"]},"private":{"type":"boolean"},"template":{"type":"string"},"enroll":{"type":"boolean"},"resumeFrom":{"type":["string","null"]}}}}}"#,
+        response_schema: r#"{"type":"object","required":["ok","projectPath","completedSteps","warnings"],"properties":{"ok":{"type":"boolean"},"projectPath":{"type":"string"},"repo":{"type":["object","null"]},"completedSteps":{"type":"array","items":{"type":"string"}},"failedStep":{"type":["string","null"]},"error":{"type":["object","null"]},"resumeToken":{"type":["string","null"]},"warnings":{"type":"array","items":{"type":"string"}}}}"#,
+        // Required `req` arg, and a real invocation creates a directory and
+        // may create a GitHub repository -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -860,6 +906,25 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Plan `2026-09-22-new-project-initiation-pr-f-doctor-step-and-funnel-telemetry`
+    /// Phase 2: the create flow has no UI caller and `page/evaluate` is
+    /// CSP-refused, so the eval-free invoke proxy is its automation door on a
+    /// windowed runner.
+    /// It must round-trip through the frontend (it needs an `AppHandle` and
+    /// managed state) and must never be boot-probed (it has side effects).
+    #[test]
+    fn is_allowlisted_recognizes_create_new_project() {
+        assert!(is_allowlisted("create_new_project"));
+        let entry = UI_BRIDGE_COMMANDS
+            .iter()
+            .find(|c| c.name == "create_new_project")
+            .unwrap();
+        assert_eq!(entry.dispatch, Dispatch::Frontend);
+        assert!(!entry.probe_with_empty_args);
+        let args: serde_json::Value = serde_json::from_str(entry.args_schema).unwrap();
+        assert_eq!(args["required"], serde_json::json!(["req"]));
     }
 
     #[test]
