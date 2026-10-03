@@ -2531,7 +2531,7 @@ fn settle_claim_decision(
 /// ## It is a steady-state bound, NOT a semaphore
 ///
 /// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
-/// [`register_continuation_session_with_device`] only runs after the coord consume-claim,
+/// the dispatch path's registration ([`AnchorReservation::handed_to_registry`]) only runs after the coord consume-claim,
 /// the worktree acquire and `create_terminal_session_backend` have all
 /// completed — so every task dispatched in one `poll_pending_continuations`
 /// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
@@ -2935,7 +2935,7 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     //   * the hook is installed only inside the `Ok(coord_id)` arm of the
     //     terminal's coord registration, so a best-effort registration failure
     //     leaves a continuation with no exit hook at all;
-    //   * `register_continuation_session_with_device` runs AFTER the PTY is already
+    //   * registration (`handed_to_registry` on dispatch, `register_continuation_session_with_device` on restore/migration) runs AFTER the PTY is already
     //     executing, so a session that dies instantly exits before it is
     //     registered and its hook finds nothing to deregister.
     // Both end as an entry whose terminal is no longer live — exactly what this
@@ -14523,7 +14523,7 @@ mod tests {
     /// is pinned here against a FOREIGN entry planted directly: the re-pin
     /// settles its own permit and leaves the stranger's alone. Making
     /// [`ContinuationRegistry::release_owned`] unconditional fails this test.
-    /// (The by-key steal through [`register_continuation_session`] is the
+    /// (The by-key steal through [`register_continuation_session_with_device`] is the
     /// other route, covered by
     /// `migration_lift_does_not_displace_a_foreign_reservation`, which is the
     /// test that takes the permit-less arm.)
@@ -14746,7 +14746,7 @@ mod tests {
     /// [`CarriedContinuation`] and not from the (empty) permit. Routing that
     /// branch through `handed_to_registry` instead fails the second assertion
     /// with `anchor_key: None`; re-adding `pending_anchors.remove(anchor)` to
-    /// [`register_continuation_session`] — the settle path this arm takes —
+    /// [`register_continuation_session_with_device`] — the settle path this arm takes —
     /// fails the third.
     #[test]
     fn migration_lift_does_not_displace_a_foreign_reservation() {
