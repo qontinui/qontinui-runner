@@ -49,25 +49,44 @@ to stop one session. Instead:
    tell the user to close its tab first; restoring files under a session that
    is still writing them is how a rewind gets clobbered.
 2. `POST /sessions/<task_run_id>/finish` with `{"reason": "rewind-session:
-   reverted and replayed"}` — metadata only, never touches the process. A
-   rebuilt runner then stops offering the failed session for resume, and on a
-   FIRST finish the mark is also queued to coord by the finish outbox (it
-   leaves the box). **Only on a first finish.** `set_finished`
-   (`src-tauri/src/session/session_lifecycle_store.rs`, verified at the
-   runner's `origin/main` `4ad6d7350`) writes `rec.finish_synced = false`
-   inside `if rec.finished_at.is_none()` alone; the reason-overwrite branch
-   that runs below it (`if let Some(r) = non_empty(reason)`) leaves the flag
-   untouched. So on an already-finished, already-SYNCED session the `200`
-   this step correctly predicts rewrites `finish_reason` **locally only** and
-   never re-queues it — coord keeps the earlier reason. Do not report that
-   second-finish reason as having reached coord.
-   `404` means the session has NO lifecycle record — `record_open` runs only
+   reverted and replayed"}`. This is metadata only and never touches the
+   process. It is the same path-addressed door `/finish-session` Part B Step 1
+   uses, and its answer is read the same way: from the BODY, not the status
+   line. A rebuilt runner then stops offering the failed session for resume.
+   Whether coord was told is decided by `changed` first, then by the field it
+   points at. Do not infer it from `session.finishSynced` alone on a fresh mark,
+   because that flag is false both for a mark still in flight and for one that
+   will never be sent. Only a runner build predating Phase 1 omits
+   `session.finishSynced`; treat an absent `session.finishSynced` as false.
+   - `changed: "marker"` with `coord.queued: true`: the mark is new and the
+     coord write is queued to `coord.coordSessionId`. Report both.
+   - `changed: "marker"` with `coord.queued: false`: the resume set is
+     corrected and coord is **not** told. Quote `coord.reason`
+     (`no_coord_session`, `outbox_write_failed` or `no_forwarder`) and
+     say so in those words.
+   - `changed: "reason_only"`: the session was already finished, and only its
+     `finish_reason` was rewritten. This call always sends a reason, so a second
+     rewind of the same session lands here. `coord.queued: false`
+     (`not_requeued`) is not a verdict here. `session.finishSynced` says whether
+     coord has the mark (absent means no). The rewind reason never reaches
+     coord from this door on either arm: on a mark not yet synced
+     `coord.queued: true` means the finished MARKER was re-queued, not the
+     reason (the runner's finished row carries no reason text). Do not report
+     the rewind reason as having reached coord.
+   - A `200` with **no `coord` key**: the running runner build predates plan
+     `2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-is-disowned-by-both-closeout-commands`
+     Phase 1. Coord's half is UNKNOWN on it. That build tells coord only for
+     AI-plane sessions the registrar indexed, and says nothing about which.
+     Report it UNKNOWN, not synced.
+
+   The route is keyed by the runner's lifecycle-record id, the harness session
+   id. It matches `<task_run_id>` only where the two ids coincide.
+   `404` means the session has NO lifecycle record. `record_open` runs only
    for terminal-plane tabs and Conductor workers, so an SDK session spawned
-   through `POST /sessions/spawn` never has one — and the marker simply does
-   not apply; report it `n/a`. A `200` on a session that was already
-   finished OVERWRITES its `finish_reason` (the store answers 404 for a
-   re-finish only when no reason is supplied, and this call always supplies
-   one).
+   through `POST /sessions/spawn` never has one. Report it `n/a` only when the
+   id you sent is known to be that session's harness id. When it was a
+   `task_run_id` that may differ from it, the `404` is UNKNOWN, not proof the
+   session is untracked. Say so.
 
 ### 3. Restore files via the runner endpoint
 
