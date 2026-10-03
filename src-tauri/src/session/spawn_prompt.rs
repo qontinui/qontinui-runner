@@ -2016,6 +2016,16 @@ mod script_tests {
             // heredoc is not judged at all.
             "cat > notes.md <<'EOF'\nthe cleanup step runs rm $x later\nrm $x\nEOF",
             "printf 'nothing to delete here'",
+            // A separator or an escaped newline INSIDE quotes is data, not a
+            // command start: quoted segments are blanked before matching.
+            "git commit -m \"fix; rm $x\"",
+            "printf 'a\\nrm $x'",
+            "printf 'a\nrm $x'",
+            // `${NAME:?}` aborts on an empty value — the guarded idiom the
+            // reason itself recommends — bare or quoted.
+            "rm -f ${x:?}",
+            "rm -f ${x:?x is unset}",
+            "rm -f \"${x:?}\"",
         ] {
             for pretty in [false, true] {
                 let out = run_bash_guard(&pre_tool_use_payload("Bash", command, pretty), &[]);
@@ -2035,6 +2045,12 @@ mod script_tests {
             ("ls || rm $x", Some("$x")),
             ("if true; then rm $x; fi", Some("$x")),
             ("rm -f a.txt $(ls *.tmp)", None),
+            ("rm $((1 + 2))", None),
+            // `${x:-default}` still collapses when the default is empty-ish;
+            // only the `:?` form refuses an empty value.
+            ("rm -f ${x:-/tmp/y}", Some("$x")),
+            // A quoted segment BEFORE the real command start does not hide it.
+            ("echo \"it's; done\"; rm $x", Some("$x")),
         ] {
             let reason = guard_deny_reason(&run_bash_guard(
                 &pre_tool_use_payload("Bash", command, false),
@@ -2043,9 +2059,42 @@ mod script_tests {
             match names {
                 Some(var) => assert!(reason.contains(var), "{command:?}: {reason}"),
                 None => assert!(
-                    reason.contains("a command substitution"),
+                    reason.contains("a $(...) expansion"),
                     "{command:?}: {reason}"
                 ),
+            }
+        }
+    }
+
+    /// The rules see the COMMAND value only — never `description` or any other
+    /// field. Both reproductions from the review of a47330cd: a safe command
+    /// whose description mentions an unquoted `rm $x` drew a deny.
+    #[test]
+    fn the_bash_guard_never_judges_the_description() {
+        for (command, description) in [
+            ("rm -f \"$tmp\"", "Delete the temp file (rm $tmp)"),
+            ("echo hi", "note; rm $x"),
+            ("echo hi", "\"command\": \"rm -f $x\""),
+        ] {
+            for pretty in [false, true] {
+                let v = serde_json::json!({
+                    "session_id": SESSION_ID,
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    // `description` FIRST, so a whole-payload match would see it
+                    // before the command.
+                    "tool_input": {"description": description, "command": command},
+                });
+                let payload = if pretty {
+                    serde_json::to_string_pretty(&v).unwrap()
+                } else {
+                    v.to_string()
+                };
+                let out = run_bash_guard(&payload, &[]);
+                assert!(
+                    out.is_empty(),
+                    "{command:?} / {description:?} must draw no output: {out}"
+                );
             }
         }
     }

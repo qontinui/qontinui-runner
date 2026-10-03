@@ -1368,10 +1368,13 @@ pub(crate) fn fleet_policy_dial_reading(
              plan-capture writes are held"
         },
         dial.command_safety_rewrite_level,
-        ambiguous(
-            dial.command_safety_rewrite_level,
-            dial.command_safety_rewrite_default
-        ),
+        // NOT `ambiguous()`: this cache carries an answered bit, so the
+        // default-vs-answer question is settled by the clause beside it.
+        if dial.command_safety_rewrite_level == dial.command_safety_rewrite_default {
+            " [= domain default]"
+        } else {
+            ""
+        },
         if dial.command_safety_rewrite_guard_active {
             "registered in new carriers"
         } else {
@@ -1853,12 +1856,19 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
     // Layer 12 — resolved through the writer's OWN path helper, and STATTED
     // rather than materialized: see `claude_settings_carrier_reading` on why a
     // diagnostic must not write the file it is describing.
-    let hook_variant = crate::session::claude_hook::CarrierVariant::resolve();
+    // ONE dial read feeds both the carrier variant and the dial row, so the
+    // two rows cannot describe different polls.
+    let dial = crate::mcp::fleet_policy_poller::dial_snapshot();
+    let hook_variant = crate::session::claude_hook::CarrierVariant {
+        stop: crate::session::claude_hook::StopHookRegistration::from_env(),
+        bash_guard: crate::session::claude_hook::GuardRegistration::from_active(
+            dial.command_safety_rewrite_guard_active,
+        ),
+    };
     let hook_path = crate::session::claude_hook::settings_path(
         &crate::session::claude_hook::session_restore_dir(),
         hook_variant,
     );
-    let dial = crate::mcp::fleet_policy_poller::dial_snapshot();
     let hook_exists = hook_path.is_file();
     let hook_env = std::env::var(crate::session::claude_hook::CLAUDE_SETTINGS_ENV).ok();
 
@@ -3311,9 +3321,8 @@ mod tests {
         // carriers, and whether coord answered.
         assert!(
             value.contains(
-                "command_safety_rewrite=on [= resting default: EITHER the fleet says so OR no \
-                 poll has ever succeeded — this cache cannot tell them apart] (guard registered \
-                 in new carriers; coord has answered)"
+                "command_safety_rewrite=on [= domain default] (guard registered in new carriers; \
+                 coord has answered)"
             ),
             "got {value}"
         );
@@ -3414,7 +3423,7 @@ mod tests {
                 stop: StopHookRegistration::Registered,
                 bash_guard: GuardRegistration::Registered,
             },
-            Path::new("C:/hooks/claude_hook_settings.json"),
+            Path::new("C:/hooks/claude_hook_settings.v2.json"),
             true,
             None,
             "on",
@@ -3425,7 +3434,7 @@ mod tests {
             panic!("the runner app always resolves layer 12");
         };
         assert!(
-            value.contains("C:/hooks/claude_hook_settings.json"),
+            value.contains("C:/hooks/claude_hook_settings.v2.json"),
             "got {value}"
         );
         assert!(value.contains("on disk: true"), "got {value}");
@@ -3466,7 +3475,7 @@ mod tests {
                 stop: StopHookRegistration::Omitted,
                 bash_guard: GuardRegistration::Omitted,
             },
-            Path::new("C:/hooks/claude_hook_settings-nostop-noguard.json"),
+            Path::new("C:/hooks/claude_hook_settings.v2-nostop-noguard.json"),
             false,
             None,
             "off",
@@ -3477,7 +3486,7 @@ mod tests {
             panic!("layer 12 is never withheld");
         };
         assert!(
-            value.contains("claude_hook_settings-nostop-noguard.json"),
+            value.contains("claude_hook_settings.v2-nostop-noguard.json"),
             "got {value}"
         );
         assert!(value.contains("on disk: false"), "got {value}");
@@ -3572,7 +3581,7 @@ mod tests {
                 stop: StopHookRegistration::Registered,
                 bash_guard: GuardRegistration::Registered,
             },
-            Path::new("C:/hooks/claude_hook_settings.json"),
+            Path::new("C:/hooks/claude_hook_settings.v2.json"),
             true,
             Some(jwt),
             "on",

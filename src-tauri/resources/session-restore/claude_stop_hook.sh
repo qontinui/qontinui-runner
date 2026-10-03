@@ -8,7 +8,7 @@
 #
 # THIS hook's REGISTRATION is gated on the continuation flag, so — alone among
 # the bundled scripts — its carriers are fixed: it is only ever registered in
-# `claude_hook_settings.json` or `claude_hook_settings-noguard.json` (the
+# `claude_hook_settings.v2.json` or `claude_hook_settings.v2-noguard.json` (the
 # ARMED variants; the second is the one a tenant that turned the command-safety
 # guard off gets). A dark variant (any name carrying `-nostop`) carries no
 # `Stop` key at all, which is what stops Claude spawning a `bash` for this

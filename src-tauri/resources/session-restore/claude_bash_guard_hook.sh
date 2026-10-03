@@ -35,11 +35,15 @@
 #     all for a command with no `rm` in it.
 #
 # NO JSON PARSER, ON PURPOSE. A `PreToolUse` payload nests `tool_input`, which
-# every interpreter-free JSON rung in the sibling hooks declines. So the rules
-# match the RAW payload, i.e. the JSON-ESCAPED command text: a `"` in the
-# command appears as `\"`, a backslash as `\\`, a newline as `\n`. A rule that
-# fails to match is a false negative, which costs exactly what today costs
-# (one prompt); a false positive costs the agent one rewrite turn.
+# every interpreter-free JSON rung in the sibling hooks declines. Instead one
+# builtin regex lifts the `command` STRING VALUE out of the payload — still
+# JSON-ESCAPED: a `"` in the command appears as `\"`, a backslash as `\\`, a
+# newline as `\n` — and the rules see that and nothing else, so text in
+# `description` (or any other field) can never draw a deny. Before the rules
+# run, every shell-QUOTED segment of it is blanked: a separator, a `\n` or an
+# `rm` inside `"..."` or `'...'` is data, not a command start. A rule that fails
+# to match is a false negative, which costs exactly what today costs (one
+# prompt); a false positive costs the agent one rewrite turn.
 set -u
 
 # ── The rule table ───────────────────────────────────────────────────────────
@@ -54,13 +58,14 @@ set -u
 #                            quantifiers, and no escape INSIDE a bracket
 #                            expression (a `\` inside `[...]` is a literal
 #                            backslash, which is what the rows below rely on).
-#                            The row's LAST capture group, when non-empty, is
-#                            the variable the command expands; it is used in
-#                            the reason only if it is a plain shell name.
+#                            Matched against the quote-blanked command text,
+#                            not the payload, so `^` is the command's start.
+#                            The first `$name` / `${name` in the matched text
+#                            is the variable named in the reason.
 #   rule_message[i]          the reason, ALREADY JSON-escaped (it is printed
 #                            into the envelope verbatim). Constant and
-#                            generic: `@VAR@` becomes `$<name>` (or "a command
-#                            substitution"), `@NAME@` becomes `<name>` (or
+#                            generic: `@VAR@` becomes `$<name>` (or "a $(...)
+#                            expansion"), `@NAME@` becomes `<name>` (or
 #                            `NAME`). It must never mention a variable the
 #                            agent's command does not have — a probe saw an
 #                            agent refuse a rewrite whose reason did.
@@ -75,22 +80,25 @@ set -u
 # ROW 0 — `rm` on a path built from an UNQUOTED variable expansion.
 #   Matches `rm` (any flags, any earlier operands) at COMMAND-START position —
 #   the start of the command string, or right after `;` `&` `|` `(` `{`, an
-#   escaped newline, or ` then` / ` do` / ` else` — whose operand contains an
-#   unquoted `$name`, `${name` or `$(` on the same line before any quote,
-#   backslash, separator, redirect, `#` or `)`.
+#   escaped newline, or ` then` / ` do` / ` else`, all OUTSIDE quotes — whose
+#   operand contains an unquoted `$name`, `${name` or `$(` on the same line
+#   before any separator, redirect, `#` or `)`.
 #   Boundary decisions, each pinned by a test:
 #     - `echo rm $x` does not match (rm is an argument, not a command).
 #     - `rm -f "$f"` does NOT match. Phase 0 proved the built-in prompt only
-#       for the UNQUOTED form; a quoted variable stops the operand scan at
-#       `\"`. Narrow by design (plan D2): a missed quoted case costs one
-#       prompt, as today.
+#       for the UNQUOTED form, and quoted segments are blanked before matching.
+#       Narrow by design (plan D2): a missed quoted case costs one prompt, as
+#       today. The same blanking makes `git commit -m "fix; rm $x"` and
+#       `printf 'a\nrm $x'` non-matches.
+#     - `rm -f ${x:?}` does NOT match: `${name:?…}` aborts on an empty value,
+#       and it is the very rewrite the reason recommends.
 #     - `rm -f /tmp/$x` matches: the path still collapses when `$x` is empty.
 #     - A command carrying a heredoc (`<<`) is not judged at all — the hook
 #       cannot tell heredoc prose from command text without parsing — so
 #       `rm $x` written inside a heredoc never draws a deny.
 #     - `rm -f "/literal/path"` and `rm -rf build/` carry no expansion.
 rule_pattern=(
-  '("command": ?"|;|&|\||\(|\{|\\n| then| do| else) *rm +[^;&|<>$'"'"'#)\]*\$(\{?([A-Za-z_][A-Za-z0-9_]*)|\()'
+  '(^|;|&|\||\(|\{|\\n| then| do| else) *rm +[^;&|<>$'"'"'#)\]*\$(\{[A-Za-z_][A-Za-z0-9_]*([^:A-Za-z0-9_]|:[^?]|$)|[A-Za-z_]|\()'
 )
 rule_message=(
   'Not run: this command passes rm a path built from @VAR@, and Claude Code stops that for operator approval (\"Dangerous rm operation on possibly-empty variable path\") because an empty value collapses the path toward the filesystem root. Rewrite the command so no approval is needed, then run it again. Best: drop the rm if it only cleans up something the command does not need. Otherwise write to a literal path or one made by mktemp, or refuse an empty value before deleting: rm -f \"${@NAME@:?}\" or [ -n \"$@NAME@\" ] && rm -f \"$@NAME@\".'
@@ -112,21 +120,46 @@ case "$payload" in
   *) exit 0 ;;
 esac
 
+# The `command` string value, still JSON-escaped: a run of non-quote,
+# non-backslash characters or `\<any>` escapes up to the first unescaped `"`.
+# A `"command"` key inside another field's TEXT is spelled `\"command\"` in the
+# payload, so it cannot match here. No command value ⇒ nothing to judge.
+cmd_re='"command": ?"(([^"\]|\\.)*)"'
+[[ $payload =~ $cmd_re ]] || exit 0
+cmd="${BASH_REMATCH[1]}"
+
 # Heredoc: not judged (see ROW 0).
-case "$payload" in
+case "$cmd" in
   *'<<'*) exit 0 ;;
 esac
 
+# Blank every shell-quoted segment, double-quoted first (a `'` inside "..." is
+# data), then single-quoted. In the JSON-escaped text a shell `"` is `\"`, a
+# shell backslash is `\\`, so a double-quoted segment is `\"`, then tokens that
+# are a plain character, a JSON escape other than `\"` / `\\`, or a shell
+# backslash followed by any one token, then `\"`. Each pass removes at least
+# two characters, so both loops terminate. An unbalanced quote is simply left
+# in place (the rules then see more text, never less).
+dq_re='\\"([^\]|\\[^"\]|\\\\([^\]|\\.))*\\"'
+while [[ $cmd =~ $dq_re ]]; do
+  cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"
+done
+sq_re="'[^']*'"
+while [[ $cmd =~ $sq_re ]]; do
+  cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"
+done
+
+name_re='\$\{?([A-Za-z_][A-Za-z0-9_]*)'
 i=0
 while [ "$i" -lt "${#rule_pattern[@]}" ]; do
   re="${rule_pattern[$i]}"
-  if [[ $payload =~ $re ]]; then
-    name="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
-    name_re='^[A-Za-z_][A-Za-z0-9_]*$'
-    if [[ -n $name && $name =~ $name_re ]]; then
+  if [[ $cmd =~ $re ]]; then
+    matched="${BASH_REMATCH[0]}"
+    if [[ $matched =~ $name_re ]]; then
+      name="${BASH_REMATCH[1]}"
       var="\$$name"
     else
-      var="a command substitution"
+      var="a \$(...) expansion"
       name="NAME"
     fi
     msg="${rule_message[$i]}"

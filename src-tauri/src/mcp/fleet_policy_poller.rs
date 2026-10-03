@@ -925,6 +925,19 @@ fn next_command_safety_rewrite_level(outcome: &PollOutcome) -> Option<CommandSaf
     }
 }
 
+/// Apply one poll outcome to the cache: the level write [`next_command_safety_rewrite_level`]
+/// implies (if any), and the answered flag on an authoritative (2xx) answer
+/// only. What the poll loop calls — factored out so the loop's cache effect is
+/// tested, not just the pure mapping beneath it.
+fn apply_command_safety_rewrite_outcome(outcome: &PollOutcome) {
+    if let Some(level) = next_command_safety_rewrite_level(outcome) {
+        set_command_safety_rewrite_level(level);
+    }
+    if matches!(outcome, PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow) {
+        set_command_safety_rewrite_answered(true);
+    }
+}
+
 /// One poll of the [`COMMAND_SAFETY_REWRITE_DOMAIN`] cache.
 async fn poll_command_safety_rewrite_once() -> PollOutcome {
     match fetch_fleet_policy(COMMAND_SAFETY_REWRITE_DOMAIN).await {
@@ -1253,6 +1266,8 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
     let wsl = fleet_session_floors(Lane::Wsl.as_str());
     let threads = fleet_session_floors(Lane::Threads.as_str());
     let cache = briefing_snapshot();
+    // ONE read, so the level and the guard bit cannot disagree across a poll.
+    let command_safety = effective_command_safety_rewrite_level();
 
     FleetPolicyDial {
         poll_interval_ms: POLL_INTERVAL.as_millis(),
@@ -1268,10 +1283,9 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
         plan_capture_answered: plan_capture_answered(),
-        command_safety_rewrite_level: effective_command_safety_rewrite_level().as_str(),
+        command_safety_rewrite_level: command_safety.as_str(),
         command_safety_rewrite_default: COMMAND_SAFETY_REWRITE_DEFAULT.as_str(),
-        command_safety_rewrite_guard_active: effective_command_safety_rewrite_level()
-            .guard_active(),
+        command_safety_rewrite_guard_active: command_safety.guard_active(),
         command_safety_rewrite_answered: command_safety_rewrite_answered(),
         briefings: BRIEFING_NAMES
             .iter()
@@ -2677,15 +2691,7 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // Read at SPAWN by `claude_hook::materialize`, so a flip reaches
         // terminals and agent sessions started after it, never running ones.
         let command_safety_outcome = poll_command_safety_rewrite_once().await;
-        if let Some(level) = next_command_safety_rewrite_level(&command_safety_outcome) {
-            set_command_safety_rewrite_level(level);
-        }
-        if matches!(
-            command_safety_outcome,
-            PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow
-        ) {
-            set_command_safety_rewrite_answered(true);
-        }
+        apply_command_safety_rewrite_outcome(&command_safety_outcome);
         let command_safety_key = plan_capture_log_key(&command_safety_outcome);
         if is_new_outcome(last_logged_command_safety.as_ref(), &command_safety_key) {
             let level = effective_command_safety_rewrite_level();
@@ -4447,5 +4453,38 @@ mod tests {
         let d = dial_snapshot();
         assert_eq!(d.command_safety_rewrite_level, "unrecognised");
         assert!(d.command_safety_rewrite_guard_active);
+    }
+
+    /// The loop's cache effect, through the SHIPPING apply step: a 2xx (row or
+    /// no-row) writes and marks answered; a kept failure, a skip and a reset
+    /// touch neither the level nor the flag.
+    #[test]
+    fn applying_a_command_safety_outcome_sets_answered_only_on_a_2xx() {
+        use CommandSafetyRewriteLevel::{Off, On};
+        let pin = pin_command_safety_rewrite_for_test();
+
+        for outcome in [
+            PollOutcome::Kept("request: dns".into()),
+            PollOutcome::SkippedNoJwt,
+            PollOutcome::ResetOff(404),
+        ] {
+            apply_command_safety_rewrite_outcome(&outcome);
+            assert_eq!(effective_command_safety_rewrite_level(), On, "{outcome:?}");
+            assert!(!command_safety_rewrite_answered(), "{outcome:?}");
+        }
+
+        apply_command_safety_rewrite_outcome(&PollOutcome::Updated("off".into()));
+        assert_eq!(effective_command_safety_rewrite_level(), Off);
+        assert!(command_safety_rewrite_answered());
+
+        // Last-good: a later failure keeps the explicit `off` AND the flag.
+        apply_command_safety_rewrite_outcome(&PollOutcome::Kept("timeout".into()));
+        assert_eq!(effective_command_safety_rewrite_level(), Off);
+        assert!(command_safety_rewrite_answered());
+
+        pin.set_unanswered();
+        apply_command_safety_rewrite_outcome(&PollOutcome::UpdatedNoRow);
+        assert_eq!(effective_command_safety_rewrite_level(), On);
+        assert!(command_safety_rewrite_answered());
     }
 }

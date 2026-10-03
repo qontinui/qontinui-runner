@@ -29,7 +29,7 @@
 //!     not start it for a command with no `rm`; REGISTRATION gated on the
 //!     tenant's `command_safety_rewrite` fleet-policy dial
 //!     ([`GuardRegistration`]), default on.
-//!   * the `--settings` carrier — `claude_hook_settings[-nostop][-noguard].json`,
+//!   * the `--settings` carrier — `claude_hook_settings.v2[-nostop][-noguard].json`,
 //!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...],
 //!     "PreToolUse": [...] }, "permissions": { "allow": [...] } }`, each
 //!     `command` pointing at the corresponding materialized script.
@@ -44,7 +44,7 @@
 //!
 //! **Which carrier name exists on a given box is a posture-dependent fact**, so
 //! nothing outside this module should name one: in the DEFAULT posture (Stop
-//! dark, guard on) `claude_hook_settings.json` is a file that is NOT written.
+//! dark, guard on) `claude_hook_settings.v2.json` is a file that is NOT written.
 //! The bundled scripts' own headers therefore say "the runner-owned
 //! `--settings` carrier" rather than a filename — pinned by
 //! `tests::only_the_stop_script_may_name_a_carrier_file`.
@@ -184,7 +184,16 @@ const BASH_GUARD_HOOK_SCRIPT_NAME: &str = "claude_bash_guard_hook.sh";
 /// make that impossible by construction rather than narrowing the race — the
 /// same reason `coord_mcp.rs` keys its `--mcp-config` filename per
 /// workdir+terminal.
-const HOOK_SETTINGS_STEM: &str = "claude_hook_settings";
+///
+/// **The `.v2` is a template generation, and it is load-bearing.** The name
+/// keys the cache by EXISTENCE only ([`cached_materialization`]), and a runner
+/// build that predates the `PreToolUse` guard writes the old
+/// `claude_hook_settings[-nostop].json` with no `PreToolUse` key. Had this build
+/// kept those names, a box running both builds could hand a new-build session
+/// the old build's guard-less file while the config report said the guard was
+/// registered. Bump the generation whenever the template gains a key a
+/// same-named file from an older build would lack.
+const HOOK_SETTINGS_STEM: &str = "claude_hook_settings.v2";
 /// Name suffix of a carrier with no `Stop` key ([`StopHookRegistration::Omitted`]).
 const NOSTOP_SUFFIX: &str = "-nostop";
 /// Name suffix of a carrier with no `PreToolUse` key ([`GuardRegistration::Omitted`]).
@@ -266,7 +275,13 @@ impl GuardRegistration {
     pub(crate) fn from_level(
         level: crate::mcp::fleet_policy_poller::CommandSafetyRewriteLevel,
     ) -> Self {
-        if level.guard_active() {
+        Self::from_active(level.guard_active())
+    }
+
+    /// From an already-resolved "is the guard active" bit — for a caller that
+    /// holds a dial snapshot and must not read the cache a second time.
+    pub(crate) fn from_active(active: bool) -> Self {
+        if active {
             GuardRegistration::Registered
         } else {
             GuardRegistration::Omitted
@@ -621,7 +636,10 @@ fn resolve_commands(
                 if matched.next().is_some() {
                     return None;
                 }
-                let resolved = command.replace(placeholder, &script.display().to_string());
+                let resolved = command.replace(
+                    placeholder,
+                    &single_quoted_body(&script.display().to_string()),
+                );
                 obj.insert("command".to_string(), serde_json::Value::String(resolved));
             }
         }
@@ -637,6 +655,17 @@ struct ScriptPaths<'a> {
     precompact: &'a Path,
     policy: &'a Path,
     bash_guard: &'a Path,
+}
+
+/// `raw` made safe to sit BETWEEN the single quotes every template command wraps
+/// its placeholder in (`bash '@@…@@'`): each `'` becomes `'\''` (close the
+/// quote, an escaped quote, reopen). Without it a home directory containing a
+/// `'` produced `bash '/home/o'brien/…'`, which the shell rejects with exit 2 —
+/// and for a `PreToolUse` hook exit 2 BLOCKS the tool call, so every matching
+/// Bash call would fail closed. Every other byte is literal inside single
+/// quotes, Windows backslashes included.
+fn single_quoted_body(raw: &str) -> String {
+    raw.replace('\'', "'\\''")
 }
 
 /// Pure: template + resolved script paths + variant → settings JSON.
@@ -852,7 +881,7 @@ mod tests {
     /// exec'd, not shell-parsed).
     #[test]
     fn settings_args_pair_a_resolved_carrier_path() {
-        let carrier = r"C:\Users\x\.qontinui\runner\session-restore\claude_hook_settings.json";
+        let carrier = r"C:\Users\x\.qontinui\runner\session-restore\claude_hook_settings.v2.json";
         let args = settings_args_from(Some(PathBuf::from(carrier)));
         assert_eq!(args, vec!["--settings".to_string(), carrier.to_string()]);
     }
@@ -1299,7 +1328,7 @@ mod tests {
         let dark = materialize(dark_dir.path()).unwrap();
         assert_eq!(
             dark.file_name().unwrap().to_string_lossy(),
-            "claude_hook_settings-nostop.json",
+            "claude_hook_settings.v2-nostop.json",
             "the DEFAULT posture (Stop dark, dial unanswered ⇒ guard on) delivers the no-Stop \
              file, guard included"
         );
@@ -1313,7 +1342,7 @@ mod tests {
         let armed = materialize(armed_dir.path()).unwrap();
         assert_eq!(
             armed.file_name().unwrap().to_string_lossy(),
-            "claude_hook_settings.json",
+            "claude_hook_settings.v2.json",
             "an armed flag delivers the Stop-registering settings file"
         );
     }
@@ -1348,7 +1377,7 @@ mod tests {
         let p = materialize(tmp.path()).unwrap();
         assert_eq!(
             p.file_name().unwrap().to_string_lossy(),
-            "claude_hook_settings-nostop-noguard.json"
+            "claude_hook_settings.v2-nostop-noguard.json"
         );
         assert!(!has_guard(&p), "dial off ⇒ carrier has NO PreToolUse key");
 
@@ -1356,7 +1385,7 @@ mod tests {
         let p = materialize(tmp.path()).unwrap();
         assert_eq!(
             p.file_name().unwrap().to_string_lossy(),
-            "claude_hook_settings-nostop.json",
+            "claude_hook_settings.v2-nostop.json",
             "a flip back yields the guarded variant for the next spawn"
         );
         assert!(has_guard(&p));
@@ -1373,10 +1402,10 @@ mod tests {
         assert_eq!(
             names,
             [
-                "claude_hook_settings.json",
-                "claude_hook_settings-noguard.json",
-                "claude_hook_settings-nostop.json",
-                "claude_hook_settings-nostop-noguard.json",
+                "claude_hook_settings.v2.json",
+                "claude_hook_settings.v2-noguard.json",
+                "claude_hook_settings.v2-nostop.json",
+                "claude_hook_settings.v2-nostop-noguard.json",
             ]
         );
         assert_eq!(
@@ -1944,7 +1973,7 @@ mod tests {
     ///
     /// Splitting the carrier into variant-named files made "the settings file"
     /// a posture-dependent fact: in the DEFAULT posture (Stop dark, guard on)
-    /// the file called `claude_hook_settings.json` is precisely one that is
+    /// the file called `claude_hook_settings.v2.json` is precisely one that is
     /// never written. So a script header naming a carrier is not merely
     /// imprecise — it sends an operator debugging "why did my SessionStart hook
     /// not run?" to `stat` a path that may be absent by design, which reads as
@@ -1998,5 +2027,74 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn single_quoted_body_escapes_only_the_single_quote() {
+        assert_eq!(single_quoted_body("/home/a/x.sh"), "/home/a/x.sh");
+        assert_eq!(
+            single_quoted_body("/home/o'brien/x.sh"),
+            r"/home/o'\''brien/x.sh"
+        );
+        assert_eq!(single_quoted_body(r"C:\Users\x\h.sh"), r"C:\Users\x\h.sh");
+    }
+
+    /// A `'` in the runner's own path must not turn the guard into a
+    /// fail-CLOSED hook: materialize into such a dir, take the `PreToolUse`
+    /// command exactly as delivered, and RUN it the way Claude Code does
+    /// (`sh -c <command>`) on a matching payload — it must exit 0 with the deny
+    /// envelope, not exit 2 on a shell syntax error.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_quote_in_the_hook_dir_still_yields_a_runnable_command() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("o'brien");
+        let settings = materialize_with(&base, guarded(StopHookRegistration::Registered)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let cmd = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(cmd.contains(r"o'\''brien"), "{cmd}");
+
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -f $f", "description": "x"},
+        })
+        .to_string();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "the delivered command must run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\"permissionDecision\":\"deny\""),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        // The siblings share the substitution: each command names its script
+        // through the same quoting.
+        let session = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(session.contains(r"o'\''brien"), "{session}");
     }
 }
