@@ -6,11 +6,13 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  baseLabel,
   changedCountLabel,
   countChanged,
   diffHunks,
   diffStat,
   noDiffReason,
+  normalizeChange,
   orderChanges,
   shortPath,
   type FileChangesRead,
@@ -31,6 +33,9 @@ function change(partial: Partial<SessionFileChange>): SessionFileChange {
     truncated: false,
     takenAt: null,
     detail: null,
+    beforeSource: "snapshot",
+    baseKind: null,
+    baseSha: null,
     ...partial,
   };
 }
@@ -68,9 +73,9 @@ describe("diffHunks", () => {
 
 describe("noDiffReason", () => {
   it("names UNKNOWN for an unreadable side, with the backend's detail", () => {
-    expect(noDiffReason(change({ status: "unreadable", detail: "current file unreadable: EIO" }))).toBe(
-      "UNKNOWN — current file unreadable: EIO",
-    );
+    expect(
+      noDiffReason(change({ status: "unreadable", detail: "current file unreadable: EIO" })),
+    ).toBe("UNKNOWN — current file unreadable: EIO");
     expect(noDiffReason(change({ status: "unreadable" }))).toContain("UNKNOWN");
   });
 
@@ -119,7 +124,12 @@ describe("ordering and counting", () => {
       change({ filePath: "/x.ts", status: "unreadable" }),
       change({ filePath: "/c.ts", status: "created" }),
     ];
-    expect(orderChanges(files).map((c) => c.filePath)).toEqual(["/x.ts", "/m.ts", "/c.ts", "/u.ts"]);
+    expect(orderChanges(files).map((c) => c.filePath)).toEqual([
+      "/x.ts",
+      "/m.ts",
+      "/c.ts",
+      "/u.ts",
+    ]);
     expect(countChanged(files)).toBe(3);
     // Input untouched.
     expect(files[0].filePath).toBe("/u.ts");
@@ -138,6 +148,8 @@ describe("changedCountLabel", () => {
     files,
     filesTruncated: false,
     omittedFiles: 0,
+    baseKind: null,
+    baseSha: null,
     readAtMs: 0,
   });
   const two = response([
@@ -183,5 +195,77 @@ describe("changedCountLabel", () => {
     });
     expect(failedFirst.text).toBe("?");
     expect(failedFirst.title).toContain("boom");
+  });
+});
+
+describe("beforeSource", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("diffs a git-base modification like a snapshot one", () => {
+    const hunks = diffHunks(
+      change({
+        beforeSource: "git_base",
+        baseKind: "merge_base",
+        baseSha: SHA,
+        before: "a\nb\n",
+        after: "a\nc\n",
+      }),
+    );
+    expect(hunks).not.toBeNull();
+    expect(diffStat(hunks)).toEqual({ additions: 1, deletions: 1 });
+  });
+
+  it("never renders a row with no before side as a creation", () => {
+    const row = change({ status: "created", beforeSource: "none", after: "whole file\n" });
+    expect(diffHunks(row)).toBeNull();
+    expect(noDiffReason(row)).toBe(
+      "UNKNOWN — no pre-edit snapshot and no git base to diff against",
+    );
+  });
+
+  it("names the backend's reason for an unreadable none-source row", () => {
+    expect(
+      noDiffReason(
+        change({
+          status: "unreadable",
+          beforeSource: "none",
+          detail: "no pre-edit snapshot and no git base: not in an openable git repository",
+        }),
+      ),
+    ).toBe("UNKNOWN — no pre-edit snapshot and no git base: not in an openable git repository");
+  });
+
+  it("says WHICH base an unchanged git-base row matches", () => {
+    expect(
+      noDiffReason(
+        change({ status: "unchanged", beforeSource: "git_base", baseKind: "head", baseSha: SHA }),
+      ),
+    ).toBe("identical to HEAD 012345678 — committed work not shown");
+    expect(noDiffReason(change({ status: "unchanged" }))).toBe(
+      "identical to the pre-edit snapshot",
+    );
+  });
+
+  it("labels every base rung, flagging that HEAD hides committed work", () => {
+    expect(baseLabel("parent_sha", SHA)).toBe("the allocation base 012345678");
+    expect(baseLabel("merge_base", SHA)).toBe("the merge-base with the default branch 012345678");
+    expect(baseLabel("head", null)).toBe("HEAD — committed work not shown");
+  });
+
+  it("reads a pre-beforeSource runner's rows honestly", () => {
+    const legacy = (partial: Partial<SessionFileChange>) => {
+      const { beforeSource: _s, baseKind: _k, baseSha: _h, ...rest } = change(partial);
+      return normalizeChange(rest);
+    };
+    // A snapshot row is identified by its snapshot timestamp.
+    expect(legacy({ takenAt: "2026-09-15T00:00:00Z" }).beforeSource).toBe("snapshot");
+    // Its snapshot-less rows were `created` WITHOUT a check — so UNKNOWN.
+    const unchecked = legacy({ status: "created", after: "x\n" });
+    expect(unchecked.beforeSource).toBe("none");
+    expect(unchecked.baseKind).toBeNull();
+    expect(diffHunks(unchecked)).toBeNull();
+    // A current runner's row passes through untouched.
+    const current = change({ beforeSource: "git_base", baseKind: "head", baseSha: SHA });
+    expect(normalizeChange(current)).toEqual(current);
   });
 });

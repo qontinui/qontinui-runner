@@ -33,7 +33,10 @@ import type { FileChangesRead, SessionFileChangesResponse } from "./workerFileCh
 
 describe("describeWorkerState", () => {
   it("is UNKNOWN until a read settles, and UNKNOWN when it failed — whatever the state value", () => {
-    expect(describeWorkerState("ready", "pending")).toEqual({ label: "attaching…", tone: "unknown" });
+    expect(describeWorkerState("ready", "pending")).toEqual({
+      label: "attaching…",
+      tone: "unknown",
+    });
     expect(describeWorkerState("closed", "failed")).toEqual({ label: "UNKNOWN", tone: "unknown" });
     expect(describeWorkerState("processing", "failed").tone).toBe("unknown");
   });
@@ -130,9 +133,9 @@ describe("settleQueuedOnTransition", () => {
   it("treats error and not_found as ends too, and settles from any live state", () => {
     for (const end of ["closed", "error", "not_found"] as const) {
       for (const from of ["processing", "ready", "interrupting"] as const) {
-        expect(
-          settleQueuedOnTransition([queued], from, end).map((e) => e.delivery),
-        ).toEqual(["undelivered"]);
+        expect(settleQueuedOnTransition([queued], from, end).map((e) => e.delivery)).toEqual([
+          "undelivered",
+        ]);
       }
     }
   });
@@ -383,7 +386,11 @@ describe("the direct-send arm", () => {
 describe("WorkerStateBadge", () => {
   it("renders UNKNOWN (with the error as title) when the read failed", () => {
     const html = renderToStaticMarkup(
-      <WorkerStateBadge state="closed" readStatus="failed" lastReadError="state read failed: boom" />,
+      <WorkerStateBadge
+        state="closed"
+        readStatus="failed"
+        lastReadError="state read failed: boom"
+      />,
     );
     expect(html).toContain("UNKNOWN");
     expect(html).toContain('data-worker-state="unknown"');
@@ -428,6 +435,8 @@ const okResponse = (
   files,
   filesTruncated: false,
   omittedFiles: 0,
+  baseKind: null,
+  baseSha: null,
   readAtMs: 0,
   ...extra,
 });
@@ -449,7 +458,9 @@ describe("shouldFetchChanges", () => {
   });
 
   it("reads again when a refresh fell due while hidden, or the worker changed", () => {
-    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1", stale: true })).toBe(true);
+    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1", stale: true })).toBe(
+      true,
+    );
     expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "other" })).toBe(true);
   });
 });
@@ -480,6 +491,9 @@ describe("FileChangesPanel", () => {
         truncated: false,
         takenAt: null,
         detail: null,
+        beforeSource: "snapshot",
+        baseKind: null,
+        baseSha: null,
       },
     ]);
     const read: FileChangesRead = { status: "error", error: "boom", atMs: 0, previous };
@@ -506,6 +520,9 @@ describe("FileChangesPanel", () => {
             truncated: false,
             takenAt: null,
             detail: null,
+            beforeSource: "snapshot",
+            baseKind: null,
+            baseSha: null,
           },
         ],
         { filesTruncated: true, omittedFiles: 12 },
@@ -540,6 +557,9 @@ describe("FileChangesPanel", () => {
           truncated: false,
           takenAt: null,
           detail: "pre-edit snapshot blob is missing on disk",
+          beforeSource: "snapshot",
+          baseKind: null,
+          baseSha: null,
         },
         {
           filePath: "/repo/c.ts",
@@ -553,6 +573,9 @@ describe("FileChangesPanel", () => {
           truncated: false,
           takenAt: null,
           detail: null,
+          beforeSource: "git_base",
+          baseKind: "head",
+          baseSha: "abc",
         },
       ]),
     };

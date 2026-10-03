@@ -4103,6 +4103,16 @@ impl TerminalSession {
         }
     }
 
+    /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
+    /// parked `IsolatedEditContext` holds; empty for a shared-checkout session.
+    pub fn allocation_bases(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.allocation_bases()))
+            .unwrap_or_default()
+    }
+
     /// Take the parked `IsolatedEditContext` back OFF this session, leaving
     /// the slot empty so a later `close()` releases nothing.
     ///
