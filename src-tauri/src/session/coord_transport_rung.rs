@@ -367,6 +367,7 @@ const READ_TOOLS: &[&str] = &[
     "coord_diff_impact",
     "coord_inbox",
     "coord_layering_triage",
+    "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_search",
     "coord_merge_order",
@@ -941,6 +942,16 @@ mod tests {
         assert_eq!(
             operation_for_call("tools/call", Some("coord_can")),
             OPERATION_READ
+        );
+        // The by-id memory read-back is an exact read, while its write
+        // siblings (`coord_memory_record` / `_supersede`) stay writes.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_memory_get")),
+            OPERATION_READ
+        );
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_memory_record")),
+            OPERATION_WRITE
         );
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
         assert_eq!(
