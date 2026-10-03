@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ListTree, RefreshCw, TerminalSquare } from "lucide-react";
 
 import {
+  ABSENT_REPROBE_DELAY_MS,
   installOsFor,
   launchEntry,
+  shouldReprobeAbsent,
   structuredLaunchOffer,
+  structuredLaunchTitle,
   type CliAvailability,
   type LaunchMenuProfile,
 } from "./providerLaunchMenu";
@@ -18,7 +21,8 @@ import {
  * from this file; the row verdicts are `providerLaunchMenu.ts`'s. A row's
  * main button is the default, a PTY session; a provider whose structured lane
  * the runner implements also gets an explicit "structured" choice (plan Phase
- * 9) — a stream-json session that asks before each tool call. This menu is an
+ * 9) — a stream-json session in which a tool call the CLI's own permission
+ * rules do not already allow asks through a permission card. This menu is an
  * interactive surface, which is the only place a structured (prompting) launch
  * is offered: one with nobody watching would stall on its first request.
  *
@@ -37,6 +41,8 @@ export function ProviderLaunchMenu({
   /** Probe verdict per id: absent key = in flight, `null` = the probe could not run. */
   const [availability, setAvailability] = useState<Record<string, CliAvailability | null>>({});
   const [probeErrors, setProbeErrors] = useState<Record<string, string>>({});
+  /** The pending one-shot re-probes of ABSENT CLIs, cleared on re-check and unmount. */
+  const reprobeTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const os = installOsFor(navigator.platform);
 
   const probeAll = useCallback(async (): Promise<void> => {
@@ -51,29 +57,41 @@ export function ProviderLaunchMenu({
     }
     setAvailability({});
     setProbeErrors({});
-    await Promise.all(
-      roster.map(async (profile) => {
-        try {
-          const verdict = await invoke<CliAvailability>("cli_profile_availability", {
-            id: profile.id,
-          });
-          setAvailability((prev) => ({ ...prev, [profile.id]: verdict }));
-        } catch (e) {
-          setAvailability((prev) => ({ ...prev, [profile.id]: null }));
-          setProbeErrors((prev) => ({
-            ...prev,
-            [profile.id]: e instanceof Error ? e.message : String(e),
-          }));
-        }
-      }),
-    );
+    for (const t of reprobeTimers.current) clearTimeout(t);
+    reprobeTimers.current = [];
+    const probe = async (profile: LaunchMenuProfile, attempt: number): Promise<void> => {
+      let verdict: CliAvailability | null;
+      try {
+        verdict = await invoke<CliAvailability>("cli_profile_availability", { id: profile.id });
+        setAvailability((prev) => ({ ...prev, [profile.id]: verdict }));
+      } catch (e) {
+        verdict = null;
+        setAvailability((prev) => ({ ...prev, [profile.id]: null }));
+        setProbeErrors((prev) => ({
+          ...prev,
+          [profile.id]: e instanceof Error ? e.message : String(e),
+        }));
+      }
+      // A CLI auto-update can take its binary off PATH for a moment: an
+      // ABSENT verdict gets exactly one more look shortly after.
+      if (shouldReprobeAbsent(verdict, attempt)) {
+        reprobeTimers.current.push(
+          setTimeout(() => void probe(profile, attempt + 1), ABSENT_REPROBE_DELAY_MS),
+        );
+      }
+    };
+    await Promise.all(roster.map((profile) => probe(profile, 0)));
   }, []);
 
   // First probe from a timer callback, never synchronously in the effect body
   // (react-hooks/set-state-in-effect) — the same shape as `StewardControl`.
   useEffect(() => {
     const first = setTimeout(() => void probeAll(), 0);
-    return () => clearTimeout(first);
+    const timers = reprobeTimers;
+    return () => {
+      clearTimeout(first);
+      for (const t of timers.current) clearTimeout(t);
+    };
   }, [probeAll]);
 
   if (profiles === null) {
@@ -142,7 +160,7 @@ export function ProviderLaunchMenu({
                 disabled={!entry.enabled}
                 onClick={() => onLaunchStructured(entry.id)}
                 className="shrink-0 inline-flex items-center gap-0.5 rounded border border-[#2a2d3d] px-1 py-px text-[10px] text-[#7aa2f7] hover:bg-[#2a2d3d] disabled:opacity-50"
-                title={`Open a structured ${entry.label} session that asks before each tool call`}
+                title={structuredLaunchTitle(entry.label)}
               >
                 <ListTree className="w-3 h-3" />
                 structured

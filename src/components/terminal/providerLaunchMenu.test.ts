@@ -8,6 +8,9 @@ import { describe, expect, it } from "vitest";
 
 import served from "../../../src-tauri/tests/fixtures/cli_screens/served_profiles.json";
 import {
+  shouldReprobeAbsent,
+  structuredLaunchCwd,
+  structuredLaunchTitle,
   installOsFor,
   launchEntry,
   structuredLaunchOffer,
@@ -109,5 +112,31 @@ describe("structuredLaunchOffer (Phase 9)", () => {
     expect(structuredLaunchOffer({ ...claude(), typedPermission: "unknown" }).offered).toBe(false);
     expect(structuredLaunchOffer({ ...claude(), permissionPromptArgs: [] }).offered).toBe(false);
     expect(structuredLaunchOffer({ id: "x", displayName: "X" }).offered).toBe(false);
+  });
+});
+
+describe("absent re-probe and structured wording", () => {
+  it("re-probes an ABSENT verdict exactly once, and nothing else", () => {
+    const absent = { id: "codex", available: false };
+    expect(shouldReprobeAbsent(absent, 0)).toBe(true);
+    expect(shouldReprobeAbsent(absent, 1)).toBe(false);
+    expect(shouldReprobeAbsent({ id: "codex", available: true }, 0)).toBe(false);
+    expect(shouldReprobeAbsent({ id: "codex", available: null }, 0)).toBe(false);
+    expect(shouldReprobeAbsent(null, 0)).toBe(false);
+  });
+
+  it("never claims a structured session asks before EVERY tool call", () => {
+    const title = structuredLaunchTitle("Claude Code");
+    expect(title).not.toMatch(/each tool call|every tool call/);
+    expect(title).toContain("permission rules");
+  });
+});
+
+describe("structuredLaunchCwd", () => {
+  it("starts in the focused terminal's cwd, else leaves it to the runner's home default", () => {
+    const tabs = [{ id: "t-1", workingDir: "/w/repo" }, { id: "t-2" }];
+    expect(structuredLaunchCwd(tabs, { 0: "t-1", 1: "t-2" }, 0)).toBe("/w/repo");
+    expect(structuredLaunchCwd(tabs, { 0: "t-1", 1: "t-2" }, 1)).toBeNull();
+    expect(structuredLaunchCwd(tabs, { 0: "t-1" }, 3)).toBeNull();
   });
 });
