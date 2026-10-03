@@ -1006,7 +1006,10 @@ mod tests {
         };
         let id = super::carried_gate_identity_for(&carried, Some(local)).expect("identity");
         assert_eq!(id.gate_id, gate);
-        assert_eq!(id.consuming_device_id, claimer, "the stored claimer, never this boot's id");
+        assert_eq!(
+            id.consuming_device_id, claimer,
+            "the stored claimer, never this boot's id"
+        );
         let fresh = CarriedContinuation {
             anchor_key: None,
             gate_id: Some(gate),
