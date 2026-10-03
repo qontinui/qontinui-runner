@@ -2531,7 +2531,7 @@ fn settle_claim_decision(
 /// ## It is a steady-state bound, NOT a semaphore
 ///
 /// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
-/// [`register_continuation_session`] only runs after the coord consume-claim,
+/// [`register_continuation_session_with_device`] only runs after the coord consume-claim,
 /// the worktree acquire and `create_terminal_session_backend` have all
 /// completed — so every task dispatched in one `poll_pending_continuations`
 /// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
@@ -2660,7 +2660,7 @@ struct ContinuationRegistry {
 impl ContinuationRegistry {
     /// Insert the LIVE entry for `terminal_id` — the one place a
     /// [`ContinuationSession`] is built, shared by the two registration paths
-    /// ([`register_continuation_session`] and
+    /// ([`register_continuation_session_with_device`] and
     /// [`AnchorReservation::handed_to_registry`]) so they cannot drift.
     fn insert_live(
         &mut self,
@@ -2704,7 +2704,7 @@ impl ContinuationRegistry {
     /// does not rule out reaching this arm from a pre-existing
     /// two-live-sessions-on-one-anchor state, which is exactly the state this
     /// method exists to stop being created, and which
-    /// [`register_continuation_session`] can still re-create because it
+    /// [`register_continuation_session_with_device`] can still re-create because it
     /// inserts a `live` row without consulting `pending_anchors`. Either way
     /// this registry must never let one
     /// caller displace another's token. The foreign entry is left exactly as
@@ -2763,7 +2763,7 @@ impl ContinuationRegistry {
                          leaving that reservation intact and carrying no permit across the hop. \
                          The dispatch path cannot produce this (P3's live scan precedes its \
                          reservation arm), so look instead for a live row inserted past \
-                         pending_anchors — register_continuation_session does that — or for two \
+                         pending_anchors — register_continuation_session_with_device does that — or for two \
                          overlapping lifts on one anchor"
                     );
                     AnchorReservation::none()
@@ -2935,7 +2935,7 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     //   * the hook is installed only inside the `Ok(coord_id)` arm of the
     //     terminal's coord registration, so a best-effort registration failure
     //     leaves a continuation with no exit hook at all;
-    //   * `register_continuation_session` runs AFTER the PTY is already
+    //   * `register_continuation_session_with_device` runs AFTER the PTY is already
     //     executing, so a session that dies instantly exits before it is
     //     registered and its hook finds nothing to deregister.
     // Both end as an entry whose terminal is no longer live — exactly what this
@@ -3158,7 +3158,7 @@ fn evaluate_continuation_guard(
     // The registry lock is RELEASED before the thread reading is taken. The
     // reading is a synchronous OS-table read (and, in the live wrapper, a
     // settings load), and holding a process-global mutex across it would park
-    // `register_continuation_session` and every other guard behind one syscall.
+    // `register_continuation_session_with_device` and every other guard behind one syscall.
     // The count is read out above instead: it is a snapshot either way — see
     // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
     // and holding the lock longer would not make it one. The ANCHOR is no
@@ -3447,7 +3447,7 @@ fn register_continuation_session(
     register_continuation_session_with_device(terminal_id, anchor_key, gate_id, None);
 }
 
-/// [`register_continuation_session`] carrying the continuation's CONSUMING
+/// The production registration path (the test-only `register_continuation_session` wraps it), carrying the continuation's CONSUMING
 /// device id — for a continuation whose claimer may not be this boot's local
 /// device (a boot-restored one, plan `2026-10-03-…` D3, and the account
 /// migration's re-pin of such a session). Same registry rules otherwise.
@@ -3905,7 +3905,7 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
     // `lock_recover`, not a bare `.lock()` + `unwrap_or(None)`: a poisoned lock
     // must not silently leak the cap slot AND permanently disable the
     // work-outcome fallback for every later continuation. The other two writers
-    // ([`register_continuation_session`], [`prune_dead_continuations`]) already
+    // ([`register_continuation_session_with_device`], [`prune_dead_continuations`]) already
     // recover; this one was the odd one out.
     lock_recover(continuation_sessions(), "continuation_sessions")
         .live
@@ -4002,7 +4002,7 @@ pub(crate) fn take_continuation_registration(
 ///   releases the pending entry under one lock. The anchor it carries is by
 ///   construction the one the lift took off this terminal, so the inserted key
 ///   equals `carried.anchor_key`;
-/// - the permit holds nothing ⇒ [`register_continuation_session`] with
+/// - the permit holds nothing ⇒ [`register_continuation_session_with_device`] with
 ///   `carried.anchor_key`.
 ///
 /// No THIRD settle path is added: both arms already existed, and
