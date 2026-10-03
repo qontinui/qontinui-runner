@@ -2147,8 +2147,10 @@ mod tests {
     /// a plain filename is refused.
     #[test]
     fn write_session_name_records_trailer_file_in_override_dir() {
-        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // The ONE shared env lock (a module-local mutex excludes nothing that
+        // holds it), declared BEFORE the restore so the restore runs under it.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SESSION_NAMES_DIR"]);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("QONTINUI_SESSION_NAMES_DIR", tmp.path());
         let id = "AAAA1111-2222-3333-4444-555555555555";
@@ -2166,6 +2168,5 @@ mod tests {
         );
         assert!(write_session_name("../evil", "x").is_err());
         assert!(write_session_name("", "x").is_err());
-        std::env::remove_var("QONTINUI_SESSION_NAMES_DIR");
     }
 }
