@@ -1584,8 +1584,24 @@ CREATE TABLE coord.agent_sessions (
     label text,
     closed_at timestamp with time zone,
     derived_name text,
-    search_text text
+    search_text text,
+    context_tokens integer,
+    last_turn_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN agent_sessions.context_tokens; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_sessions.context_tokens IS 'Context size in tokens at the end of the last turn (input + cache_creation + cache_read of the last assistant usage). Written by the coord session-context route, fed by the qontinui-claude-config Stop hook session-context-report.sh. Read by the coord continuation-delivery decision choose_delivery (plan 2026-10-02-a-red-or-conflicting-pr-cannot-trigger-a-gate-continuation-and-delivery-ignores-context-cost). NULL = the hook never reported; read as UNKNOWN, never as small.';
+
+
+--
+-- Name: COLUMN agent_sessions.last_turn_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.agent_sessions.last_turn_at IS 'When the last turn ended, as reported with context_tokens. Written by the coord session-context route, fed by the qontinui-claude-config Stop hook session-context-report.sh. Read by the coord continuation-delivery decision choose_delivery to judge whether the prompt cache is still warm (plan 2026-10-02-a-red-or-conflicting-pr-cannot-trigger-a-gate-continuation-and-delivery-ignores-context-cost). NULL = the hook never reported; read as UNKNOWN, never as warm.';
 
 
 --
