@@ -261,6 +261,12 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // whose conversation leaves the machine. Authorized on the coord-mcp proxy
     // nonce in the handler; no browser caller has any business here.
     "POST /sessions/transcript-bind",
+    // The operator's review of that same content: hunk read marks and notes
+    // whose excerpts quote it (local source content again), and the send /
+    // insert routes, which TYPE the composed review prompt into a live PTY or
+    // task-run session — the same capability as `POST /terminals/{id}/write`.
+    "GET /sessions/{id}/review",
+    "/sessions/{id}/review/*",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",

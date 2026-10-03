@@ -1462,6 +1462,16 @@ async fn tail_session(
                 }
             }
 
+            // ── Review-note confirmation ───────────────────────────────────
+            //
+            // An operator prompt carrying a `[review <8-hex>]` marker is the
+            // evidence that a review send ARRIVED: its notes move `submitted →
+            // confirmed`. Per line, so a tail parked on idle and revived on the
+            // next write sees the same lines a continuous one would. A no-op
+            // (one substring test) for every line without the marker.
+            crate::mcp::session_review::observe_transcript_line(&app_handle, pg.as_ref(), line)
+                .await;
+
             // ── Commit ↔ session lineage push-report (Population path 2) ──
             //
             // Detect `git push` Bash tool_use blocks on this line and, for
