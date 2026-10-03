@@ -54,7 +54,12 @@ pub async fn cli_profile_availability(id: String) -> Result<CliAvailability, Str
         .ok_or_else(|| format!("the {id:?} profile names no program"))?;
     tokio::task::spawn_blocking(move || probe(&id, &program))
         .await
-        .map_err(|e| format!("availability probe for profile {:?} did not complete: {e}", profile.id))
+        .map_err(|e| {
+            format!(
+                "availability probe for profile {:?} did not complete: {e}",
+                profile.id
+            )
+        })
 }
 
 /// Locate `program` on the runner's `PATH`, then run its `--version`.
@@ -153,7 +158,15 @@ fn classify(
         ProbeOutcome::Degraded(reason) => {
             let why = match reason {
                 DegradeReason::Status => "exited non-zero".to_string(),
-                DegradeReason::SpawnError => "could not be started".to_string(),
+                // The child ran, but its own launch of a subprocess failed for
+                // want of commit: not the CLI's answer, so UNKNOWN like the rest.
+                DegradeReason::CommitExhaustionSuspected { os_code } => {
+                    format!("could not run (commit exhaustion suspected, os error {os_code})")
+                }
+                DegradeReason::SpawnError(failure) => match failure.exhaustion {
+                    Some(kind) => format!("could not be started ({} exhausted)", kind.as_str()),
+                    None => "could not be started".to_string(),
+                },
                 DegradeReason::TimedOut { .. } => {
                     format!("did not answer within {}s", PROBE_TIMEOUT.as_secs())
                 }
@@ -186,7 +199,9 @@ mod tests {
             "codex",
             "codex",
             Some(Path::new("/usr/bin/codex")),
-            Some(ProbeOutcome::Captured(b"\n codex-cli 0.159.1 \nmore\n".to_vec())),
+            Some(ProbeOutcome::Captured(
+                b"\n codex-cli 0.159.1 \nmore\n".to_vec(),
+            )),
         );
         assert_eq!(v.available, Some(true));
         assert_eq!(v.version.as_deref(), Some("codex-cli 0.159.1"));
@@ -198,7 +213,10 @@ mod tests {
     fn a_failed_probe_is_unknown_not_absent() {
         for reason in [
             DegradeReason::Status,
-            DegradeReason::SpawnError,
+            DegradeReason::CommitExhaustionSuspected { os_code: 1455 },
+            DegradeReason::SpawnError(
+                qontinui_runner_lib::util::resource_exhaustion::SpawnFailure::NOT_ATTEMPTED,
+            ),
             DegradeReason::TimedOut {
                 pid: 1,
                 reaped: true,
@@ -236,10 +254,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn probe_runs_a_real_program_and_reports_a_missing_one_absent() {
-        assert_eq!(
-            probe("x", "qontinui-no-such-cli-zz").available,
-            Some(false)
-        );
+        assert_eq!(probe("x", "qontinui-no-such-cli-zz").available, Some(false));
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fakecli");
         std::fs::write(&script, "#!/bin/sh\necho 'fakecli 1.2.3'\n").unwrap();
