@@ -170,6 +170,14 @@
       "reason": "pinned-session-never-appeared detection (\"claude likely failed to start\"); spawn_failed/resume evidence for the Phase 7 classifier"
     },
     {
+      "file": "src-tauri/src/commands/terminal.rs",
+      "item": "terminal_probe_claude",
+      "pattern": "ident:is_claude",
+      "count": 3,
+      "class": "B",
+      "reason": "live-claude probe before a resume write (main f950aaad8): the pane's claude pid census on the wire (claudePids); stays code behind the behaviour trait with the graceful-exit census, keyed by the pane's profile when the resume path is"
+    },
+    {
       "file": "src-tauri/src/install_effects_producer/intercept/shim_materializer.rs",
       "item": "IDENTITY_TOOLS",
       "pattern": "lit:claude",
@@ -252,14 +260,6 @@
     {
       "file": "src-tauri/src/session/reconcile.rs",
       "item": "bind_record",
-      "pattern": "DEFAULT_PROVIDER",
-      "count": 1,
-      "class": "M",
-      "reason": "stamps DEFAULT_PROVIDER whatever was launched; takes the provider from the launch / profile_for_program (Phase 5-6)"
-    },
-    {
-      "file": "src-tauri/src/session/reconcile.rs",
-      "item": "disk_only_record",
       "pattern": "DEFAULT_PROVIDER",
       "count": 1,
       "class": "M",
