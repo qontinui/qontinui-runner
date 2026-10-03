@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TerminalTab } from "./useTerminalManager";
 import {
   applyFailureNotice,
+  forgetClosedTabs,
   resumeReports,
+  retainLiveTabFailures,
   SESSION_FAILURE_EVENT,
   setTerminalFailures,
   type FailuresByTerminal,
@@ -30,12 +32,15 @@ export function useSessionFailures(tabs: TerminalTab[]): FailuresByTerminal {
   const [failures, setFailures] = useState<FailuresByTerminal>({});
   const loaded = useRef(new Set<string>());
   const reportedResume = useRef(new Set<string>());
+  const liveTabs = useRef<TerminalTab[]>(tabs);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
     void listen<SessionFailureNotice>(SESSION_FAILURE_EVENT, (event) => {
-      setFailures((prev) => applyFailureNotice(prev, event.payload));
+      setFailures((prev) =>
+        retainLiveTabFailures(applyFailureNotice(prev, event.payload), liveTabs.current),
+      );
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -47,6 +52,14 @@ export function useSessionFailures(tabs: TerminalTab[]): FailuresByTerminal {
   }, []);
 
   useEffect(() => {
+    // A closed tab's bookkeeping goes with it: these sets and the failures
+    // map would otherwise grow with every tab the page ever had. (The map is
+    // pruned on its next write, below and in the listener; a tab reopened
+    // later re-reads its failures because `loaded` forgot it.)
+    liveTabs.current = tabs;
+    forgetClosedTabs(loaded.current, tabs);
+    forgetClosedTabs(reportedResume.current, tabs);
+
     for (const tab of tabs) {
       if (loaded.current.has(tab.id)) continue;
       loaded.current.add(tab.id);
@@ -55,7 +68,10 @@ export function useSessionFailures(tabs: TerminalTab[]): FailuresByTerminal {
           // A notice that arrived first is newer than this read; merge rather
           // than overwrite.
           setFailures((prev) =>
-            prev[tab.id] ? prev : setTerminalFailures(prev, tab.id, list ?? []),
+            retainLiveTabFailures(
+              prev[tab.id] ? prev : setTerminalFailures(prev, tab.id, list ?? []),
+              liveTabs.current,
+            ),
           );
         })
         .catch((err) => {
@@ -90,7 +106,8 @@ export function useSessionFailures(tabs: TerminalTab[]): FailuresByTerminal {
     }
   }, [tabs]);
 
-  return failures;
+  // Only this page's live tabs, whatever the map still holds.
+  return useMemo(() => retainLiveTabFailures(failures, tabs), [failures, tabs]);
 }
 
 /** Operator acknowledgement of one failure. */

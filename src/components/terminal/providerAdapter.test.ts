@@ -197,12 +197,34 @@ describe("ptyResumeLine", () => {
     );
     expect(
       d.ptyResumeLine(id, { configDir: "/h/.claude-x", isWindows: false, autoApprove: false }),
-    ).toBe(`CLAUDE_CONFIG_DIR="/h/.claude-x" claude --teammate-mode in-process --resume ${id}`);
+    ).toBe(`CLAUDE_CONFIG_DIR='/h/.claude-x' claude --teammate-mode in-process --resume ${id}`);
     expect(
       d.ptyResumeLine(id, { configDir: "C:\\c\\.claude-x", isWindows: true, autoApprove: false }),
     ).toBe(
-      `$env:CLAUDE_CONFIG_DIR="C:\\c\\.claude-x"; claude --teammate-mode in-process --resume ${id}`,
+      `$env:CLAUDE_CONFIG_DIR='C:\\c\\.claude-x'; claude --teammate-mode in-process --resume ${id}`,
     );
+  });
+
+  it("quotes the account dir as one literal word — nothing in it is expanded or executed", () => {
+    const d = descriptorFromProfile(claudeProfile());
+    const hostile = `/h/it's $(id) \`whoami\`"x`;
+    expect(d.ptyResumeLine(id, { configDir: hostile, isWindows: false, autoApprove: false })).toBe(
+      `CLAUDE_CONFIG_DIR='/h/it'\\''s $(id) \`whoami\`"x' claude --teammate-mode in-process --resume ${id}`,
+    );
+    expect(
+      d.ptyResumeLine(id, { configDir: "C:\\it's $env:X", isWindows: true, autoApprove: false }),
+    ).toBe(
+      `$env:CLAUDE_CONFIG_DIR='C:\\it''s $env:X'; claude --teammate-mode in-process --resume ${id}`,
+    );
+  });
+
+  it("refuses to splice a session id outside the strict charset into a command", () => {
+    const d = descriptorFromProfile(claudeProfile());
+    for (const bad of ["", "-rf", "a b", "x;rm -rf ~", "$(id)", "a'b", "a\nb", "a".repeat(129)]) {
+      expect(d.resumeCommand(bad)).toBeNull();
+      expect(d.ptyResumeLine(bad, { isWindows: false, autoApprove: true })).toBeNull();
+    }
+    expect(d.resumeCommand(id)).not.toBeNull();
   });
 
   it("types nothing for a profile that declares no resume by id", () => {
@@ -245,7 +267,7 @@ describe("the served Codex profile (Phase 6)", () => {
         isWindows: false,
         autoApprove: true,
       }),
-    ).toBe(`CODEX_HOME="/h/.codex-work" codex resume ${v7} --dangerously-bypass-approvals-and-sandbox`);
+    ).toBe(`CODEX_HOME='/h/.codex-work' codex resume ${v7} --dangerously-bypass-approvals-and-sandbox`);
     const claudeLine = providerDescriptorFor("claude")?.ptyResumeLine("sess", {
       isWindows: false,
       autoApprove: true,

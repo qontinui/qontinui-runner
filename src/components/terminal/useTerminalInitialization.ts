@@ -12,7 +12,7 @@ import {
   type ResumeOutcome,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
-import { loadCliProfiles, providerDescriptorFor } from "./providerAdapter";
+import { loadCliProfiles, providerDescriptorFor, shellEnvAssignment } from "./providerAdapter";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
@@ -196,9 +196,7 @@ export function buildResumeCmd(
   if (env.length === 0) return `${base}\r`;
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  return `${env.map(([k, v]) => shellEnvAssignment(k, v, isWindows)).join("")}${base}\r`;
 }
 
 /**
