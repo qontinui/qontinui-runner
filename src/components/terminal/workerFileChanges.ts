@@ -3,10 +3,14 @@
  *
  * The source of truth is the runner's `GET /sessions/{id}/file-changes`
  * route (`src-tauri/src/mcp/snapshots.rs`): for every file the session
- * touched it returns the PRE-EDIT snapshot text (`capture_pre_edit_snapshot`,
- * taken the first time the session edited that path, whatever tool did the
- * editing) and the file's CURRENT text. The diff is computed here with jsdiff
- * so the wire carries plain text and the backend stays a reader.
+ * touched it returns a "before" text and the file's CURRENT text. The before
+ * side is the PRE-EDIT snapshot (`capture_pre_edit_snapshot`, taken the first
+ * time the session edited that path, whatever tool did the editing) when one
+ * exists, and otherwise the path's blob at a resolved git base — every path a
+ * PTY-hosted session touches is in that second case. `beforeSource` says
+ * which, and `none` means no before side could be established. The diff is
+ * computed here with jsdiff so the wire carries plain text and the backend
+ * stays a reader.
  *
  * Everything in this module is pure except `fetchSessionFileChanges`, so the
  * pairing and rendering decisions are unit-testable without a runner.
@@ -14,6 +18,21 @@
 
 import * as Diff from "diff";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+
+/**
+ * Where a change's "before" side came from (`BeforeSource` in
+ * `mcp/snapshots.rs`). `none` is UNKNOWN: no snapshot and no git base, so the
+ * row can never honestly be shown as a creation.
+ */
+export type BeforeSource = "snapshot" | "git_base" | "none";
+
+/**
+ * Which base a `git_base` before side was read from (`BaseKind` in
+ * `mcp/snapshots.rs`): the coord allocation's recorded `parent_sha`, the
+ * merge-base with origin's default branch, or `HEAD` — under which anything
+ * the session already committed is not shown.
+ */
+export type BaseKind = "parent_sha" | "merge_base" | "head";
 
 /** Mirrors `SessionFileChange` in `mcp/snapshots.rs` (camelCase on the wire). */
 export interface SessionFileChange {
@@ -28,6 +47,11 @@ export interface SessionFileChange {
   truncated: boolean;
   takenAt: string | null;
   detail: string | null;
+  beforeSource: BeforeSource;
+  /** Set only when `beforeSource` is `git_base`. */
+  baseKind: BaseKind | null;
+  /** Set only when `beforeSource` is `git_base`. */
+  baseSha: string | null;
 }
 
 export interface SessionFileChangesResponse {
@@ -42,6 +66,13 @@ export interface SessionFileChangesResponse {
   filesTruncated: boolean;
   /** How many paths that cap dropped (`0` when none were). */
   omittedFiles: number;
+  /**
+   * The base every `git_base` row shares; `null` when no row is `git_base` or
+   * the rows span repositories with different bases (each row then carries
+   * its own).
+   */
+  baseKind: BaseKind | null;
+  baseSha: string | null;
   readAtMs: number;
 }
 
@@ -72,13 +103,46 @@ export async function fetchSessionFileChanges(
   const omittedFiles = typeof json.omittedFiles === "number" ? json.omittedFiles : 0;
   return {
     sessionId: json.sessionId ?? taskRunId,
-    files: json.files,
+    files: json.files.map(normalizeChange),
     // A backend that predates the cap sends neither field; `false` / `0` is
     // then the truth for it — it never cut anything.
     filesTruncated: json.filesTruncated === true || omittedFiles > 0,
     omittedFiles,
+    baseKind: json.baseKind ?? null,
+    baseSha: json.baseSha ?? null,
     readAtMs: typeof json.readAtMs === "number" ? json.readAtMs : Date.now(),
   };
+}
+
+/**
+ * A row from a runner that predates `beforeSource`. Its snapshot rows say so
+ * through `takenAt`; every other row was a snapshot-less path that runner
+ * reported as `created` without checking — so its source is `none`, which
+ * `diffHunks` refuses to render as a creation.
+ */
+export function normalizeChange(
+  change: Omit<SessionFileChange, "beforeSource" | "baseKind" | "baseSha"> &
+    Partial<Pick<SessionFileChange, "beforeSource" | "baseKind" | "baseSha">>,
+): SessionFileChange {
+  return {
+    ...change,
+    beforeSource: change.beforeSource ?? (change.takenAt !== null ? "snapshot" : "none"),
+    baseKind: change.baseKind ?? null,
+    baseSha: change.baseSha ?? null,
+  };
+}
+
+/** A short name for the base a `git_base` row was diffed against. */
+export function baseLabel(kind: BaseKind, sha: string | null): string {
+  const short = sha ? ` ${sha.slice(0, 9)}` : "";
+  switch (kind) {
+    case "parent_sha":
+      return `the allocation base${short}`;
+    case "merge_base":
+      return `the merge-base with the default branch${short}`;
+    case "head":
+      return `HEAD${short} — committed work not shown`;
+  }
 }
 
 export type DiffLineKind = "add" | "del" | "ctx";
@@ -98,13 +162,16 @@ export const DIFF_CONTEXT_LINES = 3;
 
 /**
  * Unified-diff hunks for a change, or `null` when there is nothing honest to
- * diff (`binary`, `unreadable`, an over-cap side, or `unchanged`). A
- * `created` file diffs from empty; a `deleted` one diffs to empty.
+ * diff (`binary`, `unreadable`, an over-cap side, `unchanged`, or a row with
+ * no established before side). A `created` file diffs from empty; a `deleted`
+ * one diffs to empty.
  */
 export function diffHunks(change: SessionFileChange): DiffHunk[] | null {
   if (change.status === "binary" || change.status === "unreadable" || change.truncated) {
     return null;
   }
+  // Diffing from empty would assert a creation nothing established.
+  if (change.beforeSource === "none") return null;
   if (change.status === "unchanged") return null;
   const before = change.before ?? "";
   const after = change.after ?? "";
@@ -155,9 +222,14 @@ export function noDiffReason(change: SessionFileChange): string | null {
     case "binary":
       return "binary content — no text diff";
     case "unchanged":
-      return "identical to the pre-edit snapshot";
+      return change.beforeSource === "git_base" && change.baseKind
+        ? `identical to ${baseLabel(change.baseKind, change.baseSha)}`
+        : "identical to the pre-edit snapshot";
     default:
       break;
+  }
+  if (change.beforeSource === "none") {
+    return "UNKNOWN — no pre-edit snapshot and no git base to diff against";
   }
   if (change.truncated) {
     const sizes = [change.beforeBytes, change.afterBytes]

@@ -21,6 +21,13 @@
 //! third bounds their PRODUCT, which is the number that actually reaches the
 //! allocator.
 //!
+//! A touched path with NO pre-edit snapshot — every path a PTY-hosted `claude`
+//! touches, since only the stream-json dispatcher captures snapshots — takes
+//! its "before" side from git instead: the path's blob at a resolved base
+//! commit, read in-process by [`BaseBlobs`]. Each entry says which source its
+//! "before" came from (`beforeSource`), and a git base that cannot be resolved
+//! is reported as `unreadable` rather than letting the path read as `created`.
+//!
 //! `POST /sessions/<id>/rewind` performs the actual restore: for each
 //! pre-edit snapshot, verify the on-disk blob's sha256 matches the
 //! recorded `blob_sha256`, then copy the blob over the original
@@ -33,8 +40,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -86,17 +94,359 @@ pub const FILE_CHANGE_MAX_FILES: usize = 400;
 /// Buffer size for the streaming digest of an over-cap side.
 const SHA_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Largest git base blob [`BaseBlobs`] will load to digest.
+///
+/// A blob at or under the per-side cap is held as text like any other side. A
+/// blob OVER it is loaded only to compute its sha256 and then dropped — libgit2
+/// offers no streaming read for a packed object, so the digest needs the whole
+/// blob for an instant. The blob's size is read from the object header FIRST,
+/// and a git object is immutable, so this decision cannot be raced the way a
+/// stat on a working-tree file can. Above this ceiling the side is reported
+/// `unreadable` with its size in `detail` rather than pulled into a tier-0
+/// process.
+pub const BASE_BLOB_DIGEST_CEILING_BYTES: usize = 32 * 1024 * 1024;
+
+/// Where an entry's "before" side came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeforeSource {
+    /// The session's own pre-edit snapshot (`capture_pre_edit_snapshot`).
+    Snapshot,
+    /// The path's blob at a resolved git base commit — see [`BaseKind`].
+    GitBase,
+    /// No "before" side could be established; the entry is `unreadable` and
+    /// `detail` names why. Never rendered as a creation.
+    None,
+}
+
+/// Which rung of the base resolution a `git_base` "before" side came from.
+///
+/// First match wins: the session's coord-allocated worktree's recorded
+/// `parent_sha`; else, in a linked worktree that is not on the default branch,
+/// `merge-base(HEAD, origin/<default>)`; else `HEAD`. The first two exist
+/// because committing clears a session's touched set, so a `HEAD` base would
+/// empty the review the moment the session commits — and `head` says so to
+/// the reader rather than hiding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseKind {
+    ParentSha,
+    MergeBase,
+    Head,
+}
+
+/// The commit a git-base "before" side was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBase {
+    pub kind: BaseKind,
+    pub sha: String,
+}
+
+/// One path's blob at a resolved base, bounded like any other side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseBlob {
+    /// The base tree POSITIVELY has no entry at this path — the only evidence
+    /// that licenses `created`.
+    Absent,
+    /// The blob, at or under the cap it was asked for.
+    Text(Vec<u8>),
+    /// Over the cap: size and sha256 only, never kept.
+    Oversize { bytes: usize, sha256: String },
+}
+
+/// The git-base source for a snapshot-less path's "before" side, narrow enough
+/// that a test can supply an in-memory one.
+pub trait BaseProbe {
+    /// The blob of `path` at its repository's resolved base, bounded at `cap`
+    /// exactly as [`FileProbe::read_capped`] is, together with which base it
+    /// came from. `Err` names why no base could be established for this path —
+    /// not a repository, an unopenable one, an unresolvable base, an
+    /// unreadable blob — and the entry is then `unreadable`, never `created`.
+    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), String>;
+}
+
+/// One repository's resolved base, opened once per report.
+struct RepoBase {
+    repo: git2::Repository,
+    tree: git2::Oid,
+    base: ResolvedBase,
+}
+
+/// The real [`BaseProbe`]: blobs read in-process with `git2`.
+///
+/// The base tree is resolved ONCE per distinct repository per report and every
+/// path in that repository is then a `tree.get_path(rel)` — the
+/// `agent_worktree::fs_observer` pattern — so a report's git cost is one repo
+/// open and one base resolution per repository, not one process per path.
+pub struct BaseBlobs {
+    /// Canonical worktree path → the `parent_sha` coord recorded when it
+    /// allocated that worktree, for every allocation a live session holds.
+    allocated: HashMap<PathBuf, String>,
+    /// Canonical directory → the canonical workdir of the repository holding
+    /// it, so a directory is discovered once however many paths share it.
+    workdir_for_dir: HashMap<PathBuf, Result<PathBuf, String>>,
+    /// Canonical workdir → its resolved base.
+    bases: HashMap<PathBuf, Result<RepoBase, String>>,
+}
+
+impl BaseBlobs {
+    /// `allocated` pairs each coord-allocated worktree a live session holds
+    /// with its recorded `parent_sha`; paths need not be canonical.
+    pub fn new(allocated: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
+        Self {
+            allocated: allocated
+                .into_iter()
+                .map(|(path, sha)| (std::fs::canonicalize(&path).unwrap_or(path), sha))
+                .collect(),
+            workdir_for_dir: HashMap::new(),
+            bases: HashMap::new(),
+        }
+    }
+
+    /// How many repositories this reader has resolved a base for. One per
+    /// distinct repository, however many paths it was asked about.
+    #[cfg(test)]
+    pub(crate) fn resolved_repositories(&self) -> usize {
+        self.bases.len()
+    }
+
+    /// The canonical workdir holding `path`, and `path` relative to it as a
+    /// `/`-separated string (the form libgit2's tree lookups take).
+    fn locate(&mut self, path: &str) -> Result<(PathBuf, String), String> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return Err(format!("touched path is not absolute: {}", path.display()));
+        }
+        // The file — and its directory — may be gone (a session that deleted
+        // them), so discovery starts from the nearest directory that exists.
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d.is_dir() {
+                break;
+            }
+            dir = d.parent();
+        }
+        let dir = dir.ok_or_else(|| format!("no existing ancestor of {}", path.display()))?;
+        let rest = path
+            .strip_prefix(dir)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let canon_dir = std::fs::canonicalize(dir)
+            .map_err(|e| format!("canonicalize {}: {e}", dir.display()))?;
+
+        let workdir = self
+            .workdir_for_dir
+            .entry(canon_dir.clone())
+            .or_insert_with(|| discover_workdir(&canon_dir))
+            .clone()?;
+        let rel = canon_dir
+            .join(rest)
+            .strip_prefix(&workdir)
+            .map_err(|_| {
+                format!(
+                    "{} is outside its repository's workdir {}",
+                    path.display(),
+                    workdir.display()
+                )
+            })?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        Ok((workdir, rel))
+    }
+
+    fn base_for(&mut self, workdir: &Path) -> Result<&RepoBase, String> {
+        if !self.bases.contains_key(workdir) {
+            let resolved = open_repo_base(workdir, self.allocated.get(workdir).map(String::as_str));
+            self.bases.insert(workdir.to_path_buf(), resolved);
+        }
+        match self.bases.get(workdir) {
+            Some(Ok(base)) => Ok(base),
+            Some(Err(why)) => Err(why.clone()),
+            None => Err(format!("no base recorded for {}", workdir.display())),
+        }
+    }
+}
+
+impl BaseProbe for BaseBlobs {
+    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), String> {
+        let (workdir, rel) = self.locate(path)?;
+        let rb = self.base_for(&workdir)?;
+        let tree = rb
+            .repo
+            .find_tree(rb.tree)
+            .map_err(|e| format!("base tree {}: {e}", rb.base.sha))?;
+        let entry = match tree.get_path(Path::new(&rel)) {
+            Ok(entry) => entry,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                return Ok((rb.base.clone(), BaseBlob::Absent))
+            }
+            Err(e) => return Err(format!("look up {rel} at base {}: {e}", rb.base.sha)),
+        };
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return Err(format!(
+                "{rel} is not a file at base {} (a directory or submodule there)",
+                rb.base.sha
+            ));
+        }
+        // A symlink's blob is its target string, while the current side is
+        // read THROUGH the link — comparing the two would invent a change.
+        if entry.filemode() == 0o120_000 {
+            return Err(format!("{rel} is a symlink at base {}", rb.base.sha));
+        }
+        let odb = rb.repo.odb().map_err(|e| format!("open object db: {e}"))?;
+        let (size, _) = odb
+            .read_header(entry.id())
+            .map_err(|e| format!("read base blob header for {rel}: {e}"))?;
+        if size > BASE_BLOB_DIGEST_CEILING_BYTES {
+            return Err(format!(
+                "base blob for {rel} is {size} bytes, above the {BASE_BLOB_DIGEST_CEILING_BYTES}-byte ceiling this route loads to digest"
+            ));
+        }
+        let blob = rb
+            .repo
+            .find_blob(entry.id())
+            .map_err(|e| format!("read base blob for {rel}: {e}"))?;
+        let content = blob.content();
+        let side = if content.len() <= cap {
+            BaseBlob::Text(content.to_vec())
+        } else {
+            BaseBlob::Oversize {
+                bytes: content.len(),
+                sha256: sha256_hex(content),
+            }
+        };
+        Ok((rb.base.clone(), side))
+    }
+}
+
+/// The canonical workdir of the repository holding `dir`.
+fn discover_workdir(dir: &Path) -> Result<PathBuf, String> {
+    let repo = git2::Repository::discover(dir)
+        .map_err(|e| format!("not in an openable git repository ({}): {e}", dir.display()))?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| format!("{} is in a bare repository", dir.display()))?;
+    std::fs::canonicalize(workdir).map_err(|e| format!("canonicalize {}: {e}", workdir.display()))
+}
+
+/// Open `workdir` and resolve its base by Decision 1's three rungs.
+fn open_repo_base(workdir: &Path, allocated_parent_sha: Option<&str>) -> Result<RepoBase, String> {
+    let repo = git2::Repository::open(workdir)
+        .map_err(|e| format!("open repository {}: {e}", workdir.display()))?;
+    let (tree, base) = resolve_base(&repo, allocated_parent_sha)?;
+    Ok(RepoBase { repo, tree, base })
+}
+
+/// Rung 1: the allocation's recorded `parent_sha`. Rung 2: a linked worktree
+/// not on the default branch → `merge-base(HEAD, origin/<default>)`. Rung 3:
+/// `HEAD`.
+fn resolve_base(
+    repo: &git2::Repository,
+    allocated_parent_sha: Option<&str>,
+) -> Result<(git2::Oid, ResolvedBase), String> {
+    if let Some(sha) = allocated_parent_sha {
+        // Resolved exactly as the Ξ_FS observer resolves its own pre-images.
+        match crate::agent_worktree::fs_observer::commit_tree(repo, sha) {
+            Ok(tree) => {
+                return Ok((
+                    tree.id(),
+                    ResolvedBase {
+                        kind: BaseKind::ParentSha,
+                        sha: sha.to_string(),
+                    },
+                ))
+            }
+            // Honest to fall through: the rung that answers is named in
+            // `baseKind`, so a reader is never told this was the allocation base.
+            Err(e) => warn!("file-changes: allocated parent_sha unusable, falling back: {e}"),
+        }
+    }
+
+    let head = repo
+        .head()
+        .map_err(|e| format!("HEAD does not resolve: {e}"))?;
+    let head_commit = head
+        .peel_to_commit()
+        .map_err(|e| format!("HEAD is not a commit: {e}"))?;
+
+    if repo.is_worktree() {
+        let default = default_remote_branch(repo);
+        let on_default = matches!(
+            (&default, head.is_branch().then(|| head.shorthand()).flatten()),
+            (Some((name, _)), Some(branch)) if name == branch
+        );
+        if !on_default {
+            // A HEAD base here would hide everything the session committed,
+            // so an unresolvable default is UNKNOWN — never a quiet `HEAD`.
+            let (name, tip) = default.ok_or_else(|| {
+                "linked worktree off the default branch, and origin's default branch does not resolve"
+                    .to_string()
+            })?;
+            let mb = repo
+                .merge_base(head_commit.id(), tip)
+                .map_err(|e| format!("merge-base(HEAD, origin/{name}): {e}"))?;
+            let tree = repo
+                .find_commit(mb)
+                .and_then(|c| c.tree())
+                .map_err(|e| format!("tree of merge-base {mb}: {e}"))?;
+            return Ok((
+                tree.id(),
+                ResolvedBase {
+                    kind: BaseKind::MergeBase,
+                    sha: mb.to_string(),
+                },
+            ));
+        }
+    }
+
+    let tree = head_commit
+        .tree()
+        .map_err(|e| format!("tree of HEAD: {e}"))?;
+    Ok((
+        tree.id(),
+        ResolvedBase {
+            kind: BaseKind::Head,
+            sha: head_commit.id().to_string(),
+        },
+    ))
+}
+
+/// origin's default branch as `(name, tip)`: `refs/remotes/origin/HEAD`'s
+/// target when it is set, else `origin/main`, else `origin/master`.
+fn default_remote_branch(repo: &git2::Repository) -> Option<(String, git2::Oid)> {
+    const PREFIX: &str = "refs/remotes/origin/";
+    let symbolic = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|r| r.symbolic_target().map(str::to_string));
+    let candidates = symbolic
+        .into_iter()
+        .chain(["main", "master"].map(|b| format!("{PREFIX}{b}")));
+    for refname in candidates {
+        if let (Some(name), Ok(oid)) = (refname.strip_prefix(PREFIX), repo.refname_to_id(&refname))
+        {
+            return Some((name.to_string(), oid));
+        }
+    }
+    None
+}
+
 /// One file a session touched, paired with what it looked like BEFORE the
 /// session's first edit and what it looks like NOW.
 ///
-/// `status` is one of:
-/// - `modified` — snapshot and current text differ;
+/// The "before" side is the session's pre-edit snapshot when one exists, and
+/// otherwise the path's blob at a resolved git base (`before_source` says
+/// which). `status` is one of:
+/// - `modified` — the before and current text differ;
 /// - `unchanged` — same sha on both sides;
-/// - `deleted` — a snapshot exists but the file is gone;
-/// - `created` — the session touched a path that had no pre-edit snapshot
-///   (the file did not exist when it was first edited) and exists now;
+/// - `deleted` — a before side exists but the file is gone;
+/// - `created` — the git base POSITIVELY lacks the path and it exists now
+///   (asserted on no weaker evidence: a path whose base could not be read is
+///   `unreadable`, never `created`);
 /// - `binary` — at least one side is not valid UTF-8;
-/// - `unreadable` — a side could not be read; `detail` names why.
+/// - `unreadable` — a side could not be read, or no before side could be
+///   established; `detail` names why.
 ///
 /// Both text sides are `None` whenever they cannot honestly be diffed
 /// (`binary`, `unreadable`, or a side over [`FILE_CHANGE_TEXT_CAP_BYTES`]).
@@ -112,9 +462,16 @@ pub struct SessionFileChange {
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
     pub truncated: bool,
-    /// `taken_at` of the pre-edit snapshot; `None` for a `created` entry.
+    /// `taken_at` of the pre-edit snapshot; `None` unless `before_source` is
+    /// `snapshot`.
     pub taken_at: Option<String>,
     pub detail: Option<String>,
+    /// Where the "before" side came from.
+    pub before_source: BeforeSource,
+    /// The base rung a `git_base` before side was read from; `None` otherwise.
+    pub base_kind: Option<BaseKind>,
+    /// The commit a `git_base` before side was read from; `None` otherwise.
+    pub base_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +485,13 @@ pub struct SessionFileChangesResponse {
     pub files_truncated: bool,
     /// How many candidate paths were dropped by that cap (`0` when none were).
     pub omitted_files: usize,
+    /// The base rung every `git_base` entry was read from, when they all share
+    /// ONE base. `None` when no entry is `git_base`, or when the session's
+    /// paths span repositories with different bases — each entry then carries
+    /// its own `baseKind` / `baseSha`.
+    pub base_kind: Option<BaseKind>,
+    /// The commit paired with [`Self::base_kind`].
+    pub base_sha: Option<String>,
     /// Epoch millis the report was assembled, so a reader can label its age.
     pub read_at_ms: i64,
 }
@@ -359,6 +723,73 @@ pub struct AssembledFileChanges {
     pub omitted_files: usize,
 }
 
+impl AssembledFileChanges {
+    /// The one base every `git_base` entry shares, or `None` when there is no
+    /// such entry or they disagree. See [`SessionFileChangesResponse::base_kind`].
+    pub fn shared_base(&self) -> Option<ResolvedBase> {
+        let mut bases = self
+            .files
+            .iter()
+            .filter_map(|c| match (c.base_kind, &c.base_sha) {
+                (Some(kind), Some(sha)) => Some(ResolvedBase {
+                    kind,
+                    sha: sha.clone(),
+                }),
+                _ => None,
+            });
+        let first = bases.next()?;
+        bases.all(|b| b == first).then_some(first)
+    }
+}
+
+/// Where the "before" side of one candidate was established from.
+enum BeforeOrigin<'a> {
+    Snapshot {
+        taken_at: &'a str,
+        recorded_sha: &'a str,
+    },
+    GitBase(ResolvedBase),
+}
+
+impl BaseBlob {
+    /// This blob as a [`Side`], recording the cap its read was handed so the
+    /// truncation attribution works exactly as it does for a disk read.
+    fn into_side(self, handed_cap: usize) -> Side {
+        match self {
+            BaseBlob::Absent => Side::Missing,
+            BaseBlob::Text(bytes) => Side::Text(bytes),
+            BaseBlob::Oversize { bytes, sha256 } => Side::Oversize {
+                bytes,
+                sha256,
+                handed_cap,
+            },
+        }
+    }
+}
+
+/// The entry for a snapshot-less path that exists now but whose git base could
+/// not be established. `unreadable`, with the reason — the one thing it must
+/// not be is `created`, which is what this path read as before the git base
+/// existed.
+fn no_base_entry(file_path: &str, why: &str) -> SessionFileChange {
+    SessionFileChange {
+        file_path: file_path.to_string(),
+        status: "unreadable".to_string(),
+        before: None,
+        after: None,
+        before_bytes: None,
+        after_bytes: None,
+        before_sha256: None,
+        after_sha256: None,
+        truncated: false,
+        taken_at: None,
+        detail: Some(format!("no pre-edit snapshot and no git base: {why}")),
+        before_source: BeforeSource::None,
+        base_kind: None,
+        base_sha: None,
+    }
+}
+
 /// Build the change list for a session from its snapshot rows and touched
 /// paths. Pure over `files` so the pairing/status logic is unit-testable
 /// without a filesystem.
@@ -366,9 +797,17 @@ pub struct AssembledFileChanges {
 /// - The FIRST `captured_before` snapshot per path is the "before" side
 ///   (the same rule `rewind_session_handler` applies); later rows are
 ///   ignored.
-/// - A touched path with no snapshot is reported as `created` when it
-///   exists now, and omitted when it does not (nothing to show on either
-///   side — the session never left a file there).
+/// - A touched path with no snapshot takes its "before" side from `base`
+///   (the path's blob at a resolved git base). It is `created` only when the
+///   base positively lacks the path, `deleted` when the base has it and the
+///   file is gone, and omitted when neither the base nor the disk has it
+///   (the session never left a file there). When no base can be established
+///   it is `unreadable` with the reason — or omitted, if it does not exist
+///   now either, since nothing then positively says there was ever a file.
+/// - A base side is read under the same per-side cap and spends the same
+///   aggregate budget as a snapshot side. Presence at the base is decided by
+///   the tree lookup, not by the bytes, so a spent budget truncates a base
+///   side's TEXT but never turns a modification into a creation.
 /// - Order: snapshot rows in `taken_at` order, then snapshot-less touched
 ///   paths in touch order.
 /// - At most `max_files` CANDIDATE paths are examined, in that order. The
@@ -386,6 +825,7 @@ pub fn assemble_file_changes(
     snapshots: &[SnapshotRow],
     touched: &[String],
     files: &dyn FileProbe,
+    base: &mut dyn BaseProbe,
     max_files: usize,
     total_text_budget: usize,
 ) -> AssembledFileChanges {
@@ -409,44 +849,51 @@ pub fn assemble_file_changes(
     let mut out: Vec<SessionFileChange> = Vec::with_capacity(candidates.len());
     let mut budget = TextBudget::new(total_text_budget);
     for (path, snapshot) in candidates {
-        let (before, after) = match snapshot {
-            Some(snap) => {
-                // Sequential caps, not one cap used twice: the second side's
-                // bound already accounts for what the first side took, so a
-                // single pair can never hold 2× the remaining budget.
-                let before = read_side(files, &snap.snapshot_blob_path, budget.cap());
-                budget.spend(before.buffered_len());
-                let after = read_side(files, path, budget.cap());
-                budget.spend(after.buffered_len());
-                (before, after)
-            }
+        let (origin, before) = match snapshot {
+            Some(snap) => (
+                BeforeOrigin::Snapshot {
+                    taken_at: &snap.taken_at,
+                    recorded_sha: &snap.blob_sha256,
+                },
+                read_side(files, &snap.snapshot_blob_path, budget.cap()),
+            ),
             None => {
-                let after = read_side(files, path, budget.cap());
-                if matches!(after, Side::Missing) {
-                    continue;
+                let cap = budget.cap();
+                match base.base_blob(path, cap) {
+                    Ok((resolved, blob)) => (BeforeOrigin::GitBase(resolved), blob.into_side(cap)),
+                    Err(why) => {
+                        // A one-byte probe: all this needs is whether the path
+                        // exists now, not its contents.
+                        match files.read_capped(path, 0) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            _ => out.push(no_base_entry(path, &why)),
+                        }
+                        continue;
+                    }
                 }
-                budget.spend(after.buffered_len());
-                (Side::Missing, after)
             }
         };
+        // Sequential caps, not one cap used twice: the second side's bound
+        // already accounts for what the first side took, so a single pair can
+        // never hold 2× the remaining budget.
+        budget.spend(before.buffered_len());
+        let after = read_side(files, path, budget.cap());
+        budget.spend(after.buffered_len());
+        if matches!(origin, BeforeOrigin::GitBase(_))
+            && matches!(before, Side::Missing)
+            && matches!(after, Side::Missing)
+        {
+            // Neither the base nor the disk has it: the session never left a
+            // file there. Nothing was buffered, so nothing to refund.
+            continue;
+        }
         let spent = before.buffered_len() + after.buffered_len();
         // Sampled from the budget's STARTING total, not its remainder, so it is
         // the same value for every entry — the per-side `handed_cap` recorded
         // at each read is what varies, and comparing the two is what decides
         // which bound refused a side.
         let unspent_cap = budget.unspent_cap();
-        let change = match snapshot {
-            Some(snap) => pair_sides(
-                path,
-                Some(snap.taken_at.clone()),
-                Some(snap.blob_sha256.as_str()),
-                before,
-                after,
-                true,
-                unspent_cap,
-            ),
-            None => pair_sides(path, None, None, before, after, false, unspent_cap),
-        };
+        let change = pair_sides(path, origin, before, after, unspent_cap);
         // Bytes read but not kept (a binary side, or one discarded because its
         // partner was oversize) were resident for this iteration only — they
         // are not in `out`, so they do not count against the report's budget.
@@ -465,11 +912,9 @@ pub fn assemble_file_changes(
 /// Pair the two sides into one reported entry.
 fn pair_sides(
     file_path: &str,
-    taken_at: Option<String>,
-    recorded_before_sha: Option<&str>,
+    origin: BeforeOrigin<'_>,
     before: Side,
     after: Side,
-    had_snapshot: bool,
     unspent_cap: usize,
 ) -> SessionFileChange {
     let mut change = SessionFileChange {
@@ -482,9 +927,28 @@ fn pair_sides(
         before_sha256: None,
         after_sha256: None,
         truncated: false,
-        taken_at,
+        taken_at: None,
         detail: None,
+        before_source: BeforeSource::Snapshot,
+        base_kind: None,
+        base_sha: None,
     };
+    let recorded_before_sha = match origin {
+        BeforeOrigin::Snapshot {
+            taken_at,
+            recorded_sha,
+        } => {
+            change.taken_at = Some(taken_at.to_string());
+            Some(recorded_sha)
+        }
+        BeforeOrigin::GitBase(resolved) => {
+            change.before_source = BeforeSource::GitBase;
+            change.base_kind = Some(resolved.kind);
+            change.base_sha = Some(resolved.sha);
+            None
+        }
+    };
+    let had_snapshot = recorded_before_sha.is_some();
 
     let before = match classify(before) {
         SideOutcome::Failed(why) => {
@@ -531,6 +995,9 @@ fn pair_sides(
 
     change.status = match (&before, &after) {
         (Some(_), None) => "deleted",
+        // `before` is `None` only for a git base that POSITIVELY lacks the
+        // path: a snapshot with no blob returned above, and a path with no
+        // resolvable base never reaches `pair_sides` (`no_base_entry`).
         (None, Some(_)) => "created",
         (Some(_), Some(_)) if change.before_sha256 == change.after_sha256 => "unchanged",
         (Some(_), Some(_)) => "modified",
@@ -607,12 +1074,15 @@ async fn file_changes_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Disk reads are blocking; keep them off the async executor.
+    let allocated = live_allocation_bases(&state);
+
+    // Disk and git reads are blocking; keep them off the async executor.
     let assembled = tokio::task::spawn_blocking(move || {
         assemble_file_changes(
             &snapshots,
             &touched,
             &DiskFiles,
+            &mut BaseBlobs::new(allocated),
             FILE_CHANGE_MAX_FILES,
             FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES,
         )
@@ -632,13 +1102,43 @@ async fn file_changes_handler(
         );
     }
 
+    let shared_base = assembled.shared_base();
     Ok(Json(SessionFileChangesResponse {
         session_id,
         files: assembled.files,
         files_truncated: assembled.omitted_files > 0,
         omitted_files: assembled.omitted_files,
+        base_kind: shared_base.as_ref().map(|b| b.kind),
+        base_sha: shared_base.map(|b| b.sha),
         read_at_ms: chrono::Utc::now().timestamp_millis(),
     }))
+}
+
+/// `(worktree_path, parent_sha)` for every coord-allocated worktree a live
+/// session holds — PTY terminals and stream-json sessions alike — so a
+/// touched path inside one reads its "before" side from the allocation base
+/// (rung 1 of [`resolve_base`]).
+///
+/// Keyed by worktree rather than by the requested session id: an allocated
+/// worktree belongs to exactly one agent, and the route's id (a `claude`
+/// session id for a PTY tab, a task-run id for a worker) is not the key either
+/// session type parks its context under. A session that has ended no longer
+/// holds its allocation, and its paths fall to the next rung — which
+/// `baseKind` names.
+fn live_allocation_bases(state: &ApiState) -> Vec<(PathBuf, String)> {
+    use tauri::Manager;
+    let terminals = crate::mcp::terminals::get_terminal_manager(state)
+        .sessions_snapshot()
+        .into_iter()
+        .flat_map(|(_, session)| session.allocation_bases());
+    let claude_sessions = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+        .map(|sm| sm.active_claude_sessions())
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(_, session)| session.allocation_bases());
+    terminals.chain(claude_sessions).collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -920,6 +1420,59 @@ mod file_changes_tests {
         }
     }
 
+    /// In-memory git base: `blobs` are the paths the base HAS, every other
+    /// path is positively absent, and `unavailable` paths have no resolvable
+    /// base at all. Records every cap it is handed.
+    struct FakeBase {
+        blobs: HashMap<String, Vec<u8>>,
+        unavailable: HashMap<String, String>,
+        handed_caps: Vec<usize>,
+    }
+
+    impl FakeBase {
+        fn empty() -> Self {
+            Self::with(&[])
+        }
+        fn with(blobs: &[(&str, &[u8])]) -> Self {
+            Self {
+                blobs: blobs
+                    .iter()
+                    .map(|(p, b)| (p.to_string(), b.to_vec()))
+                    .collect(),
+                unavailable: HashMap::new(),
+                handed_caps: Vec::new(),
+            }
+        }
+        fn base() -> ResolvedBase {
+            ResolvedBase {
+                kind: BaseKind::Head,
+                sha: "b".repeat(40),
+            }
+        }
+    }
+
+    impl BaseProbe for FakeBase {
+        fn base_blob(
+            &mut self,
+            path: &str,
+            cap: usize,
+        ) -> Result<(ResolvedBase, BaseBlob), String> {
+            self.handed_caps.push(cap);
+            if let Some(why) = self.unavailable.get(path) {
+                return Err(why.clone());
+            }
+            let blob = match self.blobs.get(path) {
+                None => BaseBlob::Absent,
+                Some(b) if b.len() <= cap => BaseBlob::Text(b.clone()),
+                Some(b) => BaseBlob::Oversize {
+                    bytes: b.len(),
+                    sha256: sha256_hex(b),
+                },
+            };
+            Ok((Self::base(), blob))
+        }
+    }
+
     fn fs(entries: &[(&str, &[u8])]) -> FakeFs {
         FakeFs::new(entries)
     }
@@ -935,7 +1488,14 @@ mod file_changes_tests {
         touched: &[String],
         files: &dyn FileProbe,
     ) -> AssembledFileChanges {
-        assemble_file_changes(snapshots, touched, files, NO_FILE_CAP, NO_TEXT_BUDGET)
+        assemble_file_changes(
+            snapshots,
+            touched,
+            files,
+            &mut FakeBase::empty(),
+            NO_FILE_CAP,
+            NO_TEXT_BUDGET,
+        )
     }
 
     #[test]
@@ -1141,7 +1701,14 @@ mod file_changes_tests {
         let read = fs(&borrowed);
         let touched: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
 
-        let assembled = assemble_file_changes(&[], &touched, &read, 3, NO_TEXT_BUDGET);
+        let assembled = assemble_file_changes(
+            &[],
+            &touched,
+            &read,
+            &mut FakeBase::empty(),
+            3,
+            NO_TEXT_BUDGET,
+        );
         assert_eq!(assembled.files.len(), 3);
         assert_eq!(assembled.omitted_files, 7);
         // Order is preserved: the cut is a suffix, not an arbitrary subset.
@@ -1151,7 +1718,14 @@ mod file_changes_tests {
         assert_eq!(read.fully_buffered().len(), 3);
 
         // Under the bound, nothing is reported as omitted.
-        let all = assemble_file_changes(&[], &touched, &fs(&borrowed), 10, NO_TEXT_BUDGET);
+        let all = assemble_file_changes(
+            &[],
+            &touched,
+            &fs(&borrowed),
+            &mut FakeBase::empty(),
+            10,
+            NO_TEXT_BUDGET,
+        );
         assert_eq!(all.files.len(), 10);
         assert_eq!(all.omitted_files, 0);
     }
@@ -1178,7 +1752,14 @@ mod file_changes_tests {
         let read = fs(&borrowed);
         let touched: Vec<String> = bodies.iter().map(|(p, _)| p.clone()).collect();
 
-        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 4 * 1024);
+        let assembled = assemble_file_changes(
+            &[],
+            &touched,
+            &read,
+            &mut FakeBase::empty(),
+            NO_FILE_CAP,
+            4 * 1024,
+        );
 
         // Nothing was dropped: the file-count bound is a different bound.
         assert_eq!(assembled.files.len(), 20);
@@ -1233,7 +1814,14 @@ mod file_changes_tests {
         let read = fs(&borrowed);
         let touched: Vec<String> = bodies.iter().map(|(p, _)| p.clone()).collect();
 
-        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 2048);
+        let assembled = assemble_file_changes(
+            &[],
+            &touched,
+            &read,
+            &mut FakeBase::empty(),
+            NO_FILE_CAP,
+            2048,
+        );
 
         // Two files fit; the remaining four were probed to their (zero) cap and
         // no further, so only two whole bodies were ever resident.
@@ -1262,6 +1850,7 @@ mod file_changes_tests {
             &[snap("/src/x", "/blob/x", &sha_before, true)],
             &[],
             &read,
+            &mut FakeBase::empty(),
             NO_FILE_CAP,
             300 * 1024, // wide open at the top of the loop, spent by the before side
         )
@@ -1291,6 +1880,7 @@ mod file_changes_tests {
             &[snap("/src/h", "/blob/h", &sha_huge, true)],
             &[],
             &read,
+            &mut FakeBase::empty(),
             NO_FILE_CAP,
             4 * 1024,
         )
@@ -1342,6 +1932,7 @@ mod file_changes_tests {
             &[],
             &["/src/shrinks".to_string()],
             &probe,
+            &mut FakeBase::empty(),
             NO_FILE_CAP,
             NO_TEXT_BUDGET,
         )
@@ -1481,7 +2072,14 @@ mod file_changes_tests {
 
         // 1200 bytes: enough for ONE 1 KiB body. The binary one is read first
         // and discarded, so the text one must still fit.
-        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 1200);
+        let assembled = assemble_file_changes(
+            &[],
+            &touched,
+            &read,
+            &mut FakeBase::empty(),
+            NO_FILE_CAP,
+            1200,
+        );
         assert_eq!(assembled.files[0].status, "binary");
         assert_eq!(assembled.files[0].after, None);
         assert_eq!(assembled.files[1].status, "created");
@@ -1509,5 +2107,427 @@ mod file_changes_tests {
         let out = assemble(&snaps, &["/src/x".to_string()], &read).files;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].before.as_deref(), Some("first\n"));
+    }
+
+    // ── git-base "before" side (snapshot-less paths) ─────────────────────────
+
+    /// A snapshot-less path the base HAS is a modification against the base,
+    /// and one the base has but the disk no longer does is a deletion — the
+    /// two cases that used to read `created` and vanish respectively.
+    #[test]
+    fn a_snapshot_less_path_diffs_against_the_git_base() {
+        let read = fs(&[("/src/m.rs", b"new\n"), ("/src/c.rs", b"fresh\n")]);
+        let mut base = FakeBase::with(&[("/src/m.rs", b"old\n"), ("/src/d.rs", b"gone\n")]);
+        let touched = [
+            "/src/m.rs".to_string(),
+            "/src/d.rs".to_string(),
+            "/src/c.rs".to_string(),
+            "/src/never.rs".to_string(),
+        ];
+        let out =
+            assemble_file_changes(&[], &touched, &read, &mut base, NO_FILE_CAP, NO_TEXT_BUDGET);
+        let by_path: HashMap<_, _> = out
+            .files
+            .iter()
+            .map(|c| (c.file_path.as_str(), c))
+            .collect();
+
+        let m = by_path["/src/m.rs"];
+        assert_eq!(m.status, "modified");
+        assert_eq!(m.before_source, BeforeSource::GitBase);
+        assert_eq!(m.base_kind, Some(BaseKind::Head));
+        assert_eq!(m.base_sha.as_deref(), Some(FakeBase::base().sha.as_str()));
+        assert_eq!(m.before.as_deref(), Some("old\n"));
+        assert_eq!(m.after.as_deref(), Some("new\n"));
+        assert_eq!(m.taken_at, None);
+
+        assert_eq!(by_path["/src/d.rs"].status, "deleted");
+        assert_eq!(by_path["/src/d.rs"].before.as_deref(), Some("gone\n"));
+        // Positively absent at the base: the one case that is `created`.
+        assert_eq!(by_path["/src/c.rs"].status, "created");
+        assert_eq!(by_path["/src/c.rs"].before_source, BeforeSource::GitBase);
+        // On neither side: not a change.
+        assert!(!by_path.contains_key("/src/never.rs"));
+        assert_eq!(out.shared_base(), Some(FakeBase::base()));
+    }
+
+    /// No resolvable base is UNKNOWN, never a creation. A path that does not
+    /// exist now either is omitted: nothing positively says it ever did.
+    #[test]
+    fn a_path_with_no_git_base_is_unreadable_never_created() {
+        let read = fs(&[("/src/x.rs", b"now\n")]);
+        let mut base = FakeBase::empty();
+        base.unavailable.insert(
+            "/src/x.rs".to_string(),
+            "not in an openable git repository".to_string(),
+        );
+        base.unavailable.insert(
+            "/src/gone.rs".to_string(),
+            "not in an openable git repository".to_string(),
+        );
+        let touched = ["/src/x.rs".to_string(), "/src/gone.rs".to_string()];
+        let out =
+            assemble_file_changes(&[], &touched, &read, &mut base, NO_FILE_CAP, NO_TEXT_BUDGET);
+
+        assert_eq!(out.files.len(), 1, "{:?}", out.files);
+        let x = &out.files[0];
+        assert_eq!(x.status, "unreadable");
+        assert_eq!(x.before_source, BeforeSource::None);
+        assert_eq!(x.base_kind, None);
+        assert_eq!((x.before.as_deref(), x.after.as_deref()), (None, None));
+        assert!(
+            x.detail
+                .as_deref()
+                .unwrap()
+                .contains("openable git repository"),
+            "{:?}",
+            x.detail
+        );
+        assert_eq!(out.shared_base(), None);
+    }
+
+    /// A snapshot still wins over the git base, and says so.
+    #[test]
+    fn a_snapshot_is_preferred_over_the_git_base() {
+        let snap_text = b"snapshot\n";
+        let read = fs(&[("/blob/s", snap_text), ("/src/s.rs", b"now\n")]);
+        let mut base = FakeBase::with(&[("/src/s.rs", b"base\n")]);
+        let out = assemble_file_changes(
+            &[snap("/src/s.rs", "/blob/s", &sha256_hex(snap_text), true)],
+            &["/src/s.rs".to_string()],
+            &read,
+            &mut base,
+            NO_FILE_CAP,
+            NO_TEXT_BUDGET,
+        );
+        assert_eq!(out.files[0].before_source, BeforeSource::Snapshot);
+        assert_eq!(out.files[0].before.as_deref(), Some("snapshot\n"));
+        assert_eq!(out.files[0].base_kind, None);
+        assert!(
+            base.handed_caps.is_empty(),
+            "the base was consulted for a snapshotted path"
+        );
+        assert_eq!(out.shared_base(), None);
+    }
+
+    /// Base reads spend the SAME aggregate budget as every other side: the cap
+    /// handed to the base shrinks as the report fills, the held text stays
+    /// inside the budget, and an entry past it is truncated with the budget
+    /// named — still `modified`, because presence at the base is decided by
+    /// the tree lookup, not by the bytes.
+    #[test]
+    fn base_reads_are_counted_in_the_text_budget() {
+        let paths: Vec<String> = (0..4).map(|i| format!("/src/b{i}")).collect();
+        let before = vec![b'o'; 1024];
+        let after = vec![b'n'; 1024];
+        let disk: Vec<(&str, &[u8])> = paths
+            .iter()
+            .map(|p| (p.as_str(), after.as_slice()))
+            .collect();
+        let base_blobs: Vec<(&str, &[u8])> = paths
+            .iter()
+            .map(|p| (p.as_str(), before.as_slice()))
+            .collect();
+        let read = fs(&disk);
+        let mut base = FakeBase::with(&base_blobs);
+
+        let out = assemble_file_changes(&[], &paths, &read, &mut base, NO_FILE_CAP, 3 * 1024);
+
+        let held: usize = out
+            .files
+            .iter()
+            .map(|c| {
+                c.before.as_ref().map_or(0, |s| s.len()) + c.after.as_ref().map_or(0, |s| s.len())
+            })
+            .sum();
+        assert!(
+            held <= 3 * 1024,
+            "held {held} bytes against a 3072-byte budget"
+        );
+        // The first pair fit whole (1 KiB + 1 KiB), so the second base read was
+        // handed only what was left.
+        assert_eq!(base.handed_caps[0], 3 * 1024);
+        assert_eq!(base.handed_caps[1], 1024);
+        assert!(base.handed_caps.windows(2).all(|w| w[1] <= w[0]));
+        let last = &out.files[3];
+        assert!(last.truncated);
+        assert_eq!(last.status, "modified");
+        assert_eq!(last.before_source, BeforeSource::GitBase);
+        assert_eq!(last.before_bytes, Some(1024));
+        assert!(
+            last.detail.as_deref().unwrap().contains("budget"),
+            "{:?}",
+            last.detail
+        );
+    }
+
+    /// A base blob over the per-side cap is described by size and digest and
+    /// never kept — the same honesty as an over-cap snapshot.
+    #[test]
+    fn an_over_cap_base_blob_is_reported_by_size_not_text() {
+        let big = vec![b'g'; FILE_CHANGE_TEXT_CAP_BYTES + 1];
+        let read = fs(&[("/src/big", b"small now")]);
+        let mut base = FakeBase::with(&[("/src/big", &big)]);
+        let out = assemble_file_changes(
+            &[],
+            &["/src/big".to_string()],
+            &read,
+            &mut base,
+            NO_FILE_CAP,
+            NO_TEXT_BUDGET,
+        );
+        let c = &out.files[0];
+        assert_eq!(c.status, "modified");
+        assert!(c.truncated);
+        assert_eq!(c.before, None);
+        assert_eq!(c.before_bytes, Some(big.len()));
+        assert_eq!(c.before_sha256.as_deref(), Some(sha256_hex(&big).as_str()));
+        assert_eq!(
+            c.detail, None,
+            "a genuinely over-cap base blob blamed the budget"
+        );
+    }
+
+    // ── BaseBlobs against real repositories ──────────────────────────────────
+
+    fn sig() -> git2::Signature<'static> {
+        git2::Signature::now("t", "t@example.invalid").expect("signature")
+    }
+
+    /// A repository whose initial branch is `main`.
+    fn init_repo(dir: &Path) -> git2::Repository {
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("main");
+        git2::Repository::init_opts(dir, &opts).expect("init")
+    }
+
+    fn write(root: &Path, rel: &str, body: &[u8]) -> String {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&path, body).expect("write");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Stage everything in the workdir and commit it onto HEAD.
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .expect("add_all");
+        index.write().expect("index write");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write_tree"))
+            .expect("tree");
+        let parents: Vec<git2::Commit<'_>> = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .into_iter()
+            .collect();
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig(), &sig(), msg, &tree, &parent_refs)
+            .expect("commit")
+    }
+
+    fn assemble_real(touched: &[String], base: &mut BaseBlobs) -> AssembledFileChanges {
+        assemble_file_changes(
+            &[],
+            touched,
+            &DiskFiles,
+            base,
+            FILE_CHANGE_MAX_FILES,
+            FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES,
+        )
+    }
+
+    #[test]
+    fn base_blobs_report_a_modified_file_against_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        let path = write(dir.path(), "src/a.txt", b"one\n");
+        let head = commit_all(&repo, "c1");
+        write(dir.path(), "src/a.txt", b"two\n");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.status, "modified", "{c:?}");
+        assert_eq!(c.before_source, BeforeSource::GitBase);
+        assert_eq!(c.base_kind, Some(BaseKind::Head));
+        assert_eq!(c.base_sha.as_deref(), Some(head.to_string().as_str()));
+        assert_eq!(c.before.as_deref(), Some("one\n"));
+        assert_eq!(c.after.as_deref(), Some("two\n"));
+    }
+
+    #[test]
+    fn base_blobs_report_a_created_file_only_when_the_base_lacks_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        let tracked = write(dir.path(), "kept.txt", b"same\n");
+        commit_all(&repo, "c1");
+        let fresh = write(dir.path(), "new/fresh.txt", b"hello\n");
+
+        let out = assemble_real(&[tracked, fresh], &mut BaseBlobs::new([]));
+        assert_eq!(out.files[0].status, "unchanged");
+        assert_eq!(out.files[0].before_source, BeforeSource::GitBase);
+        assert_eq!(out.files[1].status, "created");
+        assert_eq!(out.files[1].before_source, BeforeSource::GitBase);
+        assert_eq!(out.files[1].before, None);
+        assert_eq!(out.files[1].after.as_deref(), Some("hello\n"));
+    }
+
+    /// A `.git` that points nowhere is a repository git cannot open: the path
+    /// is `unreadable` with the reason — it is not a creation.
+    #[test]
+    fn an_unopenable_repository_is_unreadable_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".git"),
+            format!("gitdir: {}\n", dir.path().join("does-not-exist").display()),
+        )
+        .expect("write .git");
+        let path = write(dir.path(), "x.txt", b"content\n");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.status, "unreadable", "{c:?}");
+        assert_eq!(c.before_source, BeforeSource::None);
+        assert!(c.detail.is_some());
+        assert_eq!(out.shared_base(), None);
+    }
+
+    /// A linked worktree on an agent branch: main at C1 (`origin/main` too),
+    /// the allocation recorded at C2, the session committed C3 and has
+    /// uncommitted work on disk. Rung 1 (the recorded `parent_sha`) beats
+    /// rung 2 (merge-base), and without an allocation rung 2 answers — never
+    /// `HEAD`, which would hide the committed C3 work.
+    #[test]
+    fn the_allocated_parent_sha_is_preferred_over_the_merge_base() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let main_dir = root.path().join("main");
+        std::fs::create_dir_all(&main_dir).expect("mkdir");
+        let repo = init_repo(&main_dir);
+        write(&main_dir, "f.txt", b"v1\n");
+        let c1 = commit_all(&repo, "c1");
+        repo.reference("refs/remotes/origin/main", c1, true, "test")
+            .expect("origin/main");
+        let branch = repo
+            .branch("agent/x", &repo.find_commit(c1).expect("c1"), false)
+            .expect("branch");
+
+        let wt_dir = root.path().join("wt");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(branch.get()));
+        repo.worktree("wt", &wt_dir, Some(&opts))
+            .expect("worktree add");
+        let wt = git2::Repository::open(&wt_dir).expect("open worktree");
+        write(&wt_dir, "f.txt", b"v2\n");
+        let c2 = commit_all(&wt, "c2");
+        write(&wt_dir, "f.txt", b"v3\n");
+        commit_all(&wt, "c3");
+        let path = write(&wt_dir, "f.txt", b"v4\n");
+
+        let mut allocated = BaseBlobs::new([(wt_dir.clone(), c2.to_string())]);
+        let out = assemble_real(std::slice::from_ref(&path), &mut allocated);
+        let c = &out.files[0];
+        assert_eq!(c.base_kind, Some(BaseKind::ParentSha), "{c:?}");
+        assert_eq!(c.base_sha.as_deref(), Some(c2.to_string().as_str()));
+        assert_eq!(c.before.as_deref(), Some("v2\n"));
+        assert_eq!(c.status, "modified");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.base_kind, Some(BaseKind::MergeBase), "{c:?}");
+        assert_eq!(c.base_sha.as_deref(), Some(c1.to_string().as_str()));
+        assert_eq!(c.before.as_deref(), Some("v1\n"));
+    }
+
+    /// Off the default branch in a linked worktree with no resolvable
+    /// `origin/<default>`, a `HEAD` base would silently hide committed work —
+    /// so the answer is UNKNOWN, not `HEAD`.
+    #[test]
+    fn a_linked_worktree_with_no_resolvable_default_is_unreadable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let main_dir = root.path().join("main");
+        std::fs::create_dir_all(&main_dir).expect("mkdir");
+        let repo = init_repo(&main_dir);
+        write(&main_dir, "f.txt", b"v1\n");
+        let c1 = commit_all(&repo, "c1");
+        let branch = repo
+            .branch("agent/y", &repo.find_commit(c1).expect("c1"), false)
+            .expect("branch");
+        let wt_dir = root.path().join("wt");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(branch.get()));
+        repo.worktree("wt", &wt_dir, Some(&opts))
+            .expect("worktree add");
+        let path = write(&wt_dir, "f.txt", b"v2\n");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.status, "unreadable", "{c:?}");
+        assert_eq!(c.before_source, BeforeSource::None);
+        assert!(
+            c.detail.as_deref().unwrap().contains("default branch"),
+            "{:?}",
+            c.detail
+        );
+    }
+
+    /// The falsifier: a 50-path session in one repository resolves its base
+    /// ONCE, reports every path against it, and stays inside the route's
+    /// existing text budget.
+    #[test]
+    fn a_fifty_path_session_resolves_one_base_inside_the_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        let paths: Vec<String> = (0..50)
+            .map(|i| write(dir.path(), &format!("src/f{i:02}.txt"), b"line\n"))
+            .collect();
+        commit_all(&repo, "c1");
+        for p in &paths {
+            std::fs::write(p, b"line\nmore\n").expect("rewrite");
+        }
+
+        let mut base = BaseBlobs::new([]);
+        let out = assemble_real(&paths, &mut base);
+        assert_eq!(out.files.len(), 50);
+        assert!(out
+            .files
+            .iter()
+            .all(|c| c.status == "modified" && c.before_source == BeforeSource::GitBase));
+        assert_eq!(base.resolved_repositories(), 1);
+        let held: usize = out
+            .files
+            .iter()
+            .map(|c| {
+                c.before.as_ref().map_or(0, |s| s.len()) + c.after.as_ref().map_or(0, |s| s.len())
+            })
+            .sum();
+        assert!(held <= FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES);
+        assert_eq!(out.shared_base().map(|b| b.kind), Some(BaseKind::Head));
+    }
+
+    /// The wire shape the frontend mirrors (`workerFileChanges.ts`).
+    #[test]
+    fn the_new_fields_serialise_in_the_routes_wire_vocabulary() {
+        let mut c = no_base_entry("/x", "why");
+        let v = serde_json::to_value(&c).expect("json");
+        assert_eq!(v["beforeSource"], "none");
+        assert!(v["baseKind"].is_null());
+        c.before_source = BeforeSource::GitBase;
+        c.base_kind = Some(BaseKind::MergeBase);
+        let v = serde_json::to_value(&c).expect("json");
+        assert_eq!(v["beforeSource"], "git_base");
+        assert_eq!(v["baseKind"], "merge_base");
+        assert_eq!(
+            serde_json::to_value(BaseKind::ParentSha).expect("json"),
+            "parent_sha"
+        );
+        assert_eq!(
+            serde_json::to_value(BeforeSource::Snapshot).expect("json"),
+            "snapshot"
+        );
     }
 }
