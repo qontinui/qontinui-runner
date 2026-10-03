@@ -1,12 +1,27 @@
 /**
- * `WorkerSessionCell` — the grid cell for a Conductor worker.
+ * `StructuredSessionCell` — the grid cell for a structured (stream-json)
+ * session: a Conductor worker, or a structured session the operator launched
+ * from the Terminal page's launch menu (plan
+ * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+ * Design decision 3 + Phase 9). One cell kind per lane, labelled with what it
+ * hosts (`kind`): "Worker" or "Structured".
  *
  * A worker spawned by `/orchestrate` (`dispatch_subtask` in
- * `orchestration_loop/ai_session_executor.rs`) is an in-process stream-json
- * `ClaudeSession` registered in the Rust `SessionManager`. It has NO terminal
- * process: `TerminalInstance` would attach to nothing and render a silent
- * pane that looks like a terminal with nothing to say. This cell renders what
- * the worker actually is —
+ * `orchestration_loop/ai_session_executor.rs`) and a structured launch
+ * (`create_structured_session`, `commands/structured_session.rs`) are both an
+ * in-process stream-json `ClaudeSession` registered in the Rust
+ * `SessionManager`. Neither has a terminal process: `TerminalInstance` would
+ * attach to nothing and render a silent pane that looks like a terminal with
+ * nothing to say. This cell renders what the session actually is —
+ *
+ * - **Permission card** (Phase 9): a structured launch runs in `Prompt` mode,
+ *   so each tool call the CLI wants to make arrives as a typed request
+ *   (`session-permission-request`, read at mount through
+ *   `session_pending_permissions`). The card shows the tool and its arguments
+ *   and answers through `respond_session_permission`: Allow, Deny, or Deny &
+ *   interrupt. An unanswered request is denied by the runner at its deadline
+ *   (fail closed), and the card says so. A worker runs in bypass mode and never
+ *   raises one.
  *
  * - **Conversation**: the transcript so far (`get_ai_output`) plus the
  *   in-flight tail, subscribed through `useAiSession` (`ai-output` /
@@ -41,7 +56,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Square } from "lucide-react";
+import { Send, ShieldAlert, Square } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { cn } from "@/lib/utils";
 import {
@@ -483,18 +500,333 @@ export function ConversationView({
 
 // ── Data hooks ────────────────────────────────────────────────────────────────
 
+// ── Permission requests (Phase 9) ─────────────────────────────────────────────
+
+/** `session-permission-request` payload (Rust `PermissionRequestNotice`). */
+export interface PermissionRequest {
+  sessionId: string;
+  requestId: string;
+  toolName: string;
+  displayName?: string | null;
+  description?: string | null;
+  toolUseId?: string | null;
+  input: unknown;
+  suggestions: unknown[];
+  requestedAt: string;
+  expiresAt: string;
+  timeoutSecs: number;
+}
+
+/** `session-permission-resolved` payload (Rust `PermissionResolvedNotice`). */
+export interface PermissionResolved {
+  sessionId: string;
+  requestId: string;
+  toolName: string;
+  outcome: "allowed" | "denied" | "timed_out" | "session_ended";
+  message?: string | null;
+  interrupt: boolean;
+}
+
+export type PermissionAnswer = "allow" | "deny" | "deny_interrupt";
+
+/** The most of a tool's arguments the card renders. */
+export const PERMISSION_INPUT_MAX_CHARS = 4000;
+
+/** Pretty-printed tool arguments, bounded. Pure. */
+export function formatToolInput(
+  input: unknown,
+  maxChars: number = PERMISSION_INPUT_MAX_CHARS,
+): { text: string; truncatedChars: number } {
+  let text: string;
+  try {
+    text = JSON.stringify(input, null, 2) ?? String(input);
+  } catch {
+    text = String(input);
+  }
+  if (text.length <= maxChars) return { text, truncatedChars: 0 };
+  return { text: text.slice(0, maxChars), truncatedChars: text.length - maxChars };
+}
+
+/** Add a request (idempotent by id), oldest first. Pure. */
+export function addPermissionRequest(
+  list: readonly PermissionRequest[],
+  req: PermissionRequest,
+): readonly PermissionRequest[] {
+  if (list.some((r) => r.requestId === req.requestId)) return list;
+  return [...list, req].sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
+}
+
+/** Drop a resolved request. Returns the SAME array when it was not listed. Pure. */
+export function removePermissionRequest(
+  list: readonly PermissionRequest[],
+  requestId: string,
+): readonly PermissionRequest[] {
+  return list.some((r) => r.requestId === requestId)
+    ? list.filter((r) => r.requestId !== requestId)
+    : list;
+}
+
+/** What the card says about how the last request ended. Pure. */
+export function resolvedLabel(r: PermissionResolved): string {
+  switch (r.outcome) {
+    case "allowed":
+      return `Allowed ${r.toolName}.`;
+    case "denied":
+      return r.interrupt
+        ? `Denied ${r.toolName} and interrupted the turn.`
+        : `Denied ${r.toolName}.`;
+    case "timed_out":
+      return `No decision in time — the runner denied ${r.toolName} (fail closed).`;
+    case "session_ended":
+      return `The session ended before ${r.toolName} was answered.`;
+  }
+}
+
+/** The arguments `respond_session_permission` takes for an answer. Pure. */
+export function respondArgs(
+  sessionId: string,
+  requestId: string,
+  answer: PermissionAnswer,
+): { sessionId: string; requestId: string; decision: "allow" | "deny"; interrupt: boolean } {
+  return {
+    sessionId,
+    requestId,
+    decision: answer === "allow" ? "allow" : "deny",
+    interrupt: answer === "deny_interrupt",
+  };
+}
+
+function formatDeadline(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleTimeString();
+}
+
+/**
+ * One parked permission request: the tool, its arguments, and the three
+ * answers. `busy` disables the buttons while an answer is in flight; `error`
+ * is the last answer's failure, shown rather than swallowed.
+ */
+export function PermissionCard({
+  request,
+  onAnswer,
+  busy,
+  error,
+}: {
+  request: PermissionRequest;
+  onAnswer: (answer: PermissionAnswer) => void;
+  busy: boolean;
+  error: string | null;
+}) {
+  const { text, truncatedChars } = formatToolInput(request.input);
+  const tool = request.displayName || request.toolName;
+  return (
+    <div
+      className="mx-2 my-1.5 rounded border border-amber-500/40 bg-amber-500/5 p-2 text-[11px]"
+      data-permission-request={request.requestId}
+      data-ui-bridge-id={`structured-session.permission-card.${request.requestId}`}
+    >
+      <div className="flex items-center gap-1.5 text-amber-200">
+        <ShieldAlert className="h-3.5 w-3.5" />
+        <span className="font-medium">Permission requested: {tool}</span>
+        {request.description && (
+          <span className="truncate text-[10px] text-amber-200/70" title={request.description}>
+            — {request.description}
+          </span>
+        )}
+      </div>
+      <pre
+        className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-black/30 p-1.5 font-mono text-[10px] text-[#a9b1d6]"
+        data-permission-input
+      >
+        {text}
+      </pre>
+      {truncatedChars > 0 && (
+        <div className="text-[10px] text-zinc-500" data-permission-input-truncated>
+          {truncatedChars} more characters not shown
+        </div>
+      )}
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onAnswer("allow")}
+          className="rounded border border-emerald-500/40 px-2 py-px text-[10px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40"
+          data-permission-answer="allow"
+        >
+          Allow
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onAnswer("deny")}
+          className="rounded border border-red-500/40 px-2 py-px text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+          data-permission-answer="deny"
+        >
+          Deny
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onAnswer("deny_interrupt")}
+          className="rounded border border-red-500/40 px-2 py-px text-[10px] text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+          data-permission-answer="deny_interrupt"
+          title="Deny this call and stop the current turn"
+        >
+          Deny &amp; interrupt
+        </button>
+        <span className="ml-auto text-[10px] text-zinc-500" title={request.expiresAt}>
+          denied automatically at {formatDeadline(request.expiresAt)}
+        </span>
+      </div>
+      {error && (
+        <div className="mt-1 text-[10px] text-red-300" data-permission-error>
+          The answer was not delivered: {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** How the pending set was read at mount. */
+export type PermissionReadStatus = "pending" | "ok" | "failed";
+
+/**
+ * Session `sessionId`'s parked permission requests: read once at mount (a
+ * request raised before this cell subscribed is still on screen), then kept by
+ * the request/resolved events. A failed read is reported, never rendered as
+ * "nothing pending".
+ */
+function useSessionPermissions(sessionId: string) {
+  const [requests, setRequests] = useState<readonly PermissionRequest[]>([]);
+  const [readStatus, setReadStatus] = useState<PermissionReadStatus>("pending");
+  const [readError, setReadError] = useState<string | null>(null);
+  const [lastResolved, setLastResolved] = useState<PermissionResolved | null>(null);
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [answerError, setAnswerError] = useState<{ id: string; error: string } | null>(null);
+  /**
+   * Requests known to be over — resolved by an event or answered here. The
+   * mount read can return a snapshot taken before a resolution that was
+   * delivered first; filtering through this set keeps that stale snapshot from
+   * bringing back a card whose buttons can no longer do anything.
+   */
+  const resolvedIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const keep = (fn: () => void) => {
+      if (disposed) fn();
+      else unlisteners.push(fn);
+    };
+    // A new session: nothing from the previous one carries over. Reset from
+    // a microtask, never synchronously in the effect body
+    // (react-hooks/set-state-in-effect).
+    resolvedIdsRef.current = new Set();
+    void Promise.resolve().then(() => {
+      if (disposed) return;
+      setRequests([]);
+      setLastResolved(null);
+      setReadStatus("pending");
+      setReadError(null);
+      setBusyIds(new Set());
+      setAnswerError(null);
+    });
+    const admit = (list: readonly PermissionRequest[], req: PermissionRequest) =>
+      resolvedIdsRef.current.has(req.requestId) ? list : addPermissionRequest(list, req);
+    void listen<PermissionRequest>("session-permission-request", (event) => {
+      if (event.payload.sessionId !== sessionId) return;
+      setRequests((list) => admit(list, event.payload));
+    }).then(keep);
+    void listen<PermissionResolved>("session-permission-resolved", (event) => {
+      if (event.payload.sessionId !== sessionId) return;
+      resolvedIdsRef.current.add(event.payload.requestId);
+      setRequests((list) => removePermissionRequest(list, event.payload.requestId));
+      setLastResolved(event.payload);
+    }).then(keep);
+    invoke<PermissionRequest[]>("session_pending_permissions", { sessionId })
+      .then((pending) => {
+        if (disposed) return;
+        setRequests((list) => pending.reduce(admit, list));
+        setReadStatus("ok");
+      })
+      .catch((e: unknown) => {
+        if (disposed) return;
+        setReadStatus("failed");
+        setReadError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      disposed = true;
+      for (const fn of unlisteners) fn();
+    };
+  }, [sessionId]);
+
+  const answer = useCallback(
+    async (requestId: string, choice: PermissionAnswer) => {
+      setBusyIds((ids) => new Set(ids).add(requestId));
+      setAnswerError(null);
+      try {
+        await invoke("respond_session_permission", respondArgs(sessionId, requestId, choice));
+        // The resolved event removes the card; remove it here too so a missed
+        // event cannot leave live-looking buttons for an answered request.
+        resolvedIdsRef.current.add(requestId);
+        setRequests((list) => removePermissionRequest(list, requestId));
+      } catch (e) {
+        setAnswerError({ id: requestId, error: e instanceof Error ? e.message : String(e) });
+      } finally {
+        setBusyIds((ids) => {
+          const next = new Set(ids);
+          next.delete(requestId);
+          return next;
+        });
+      }
+    },
+    [sessionId],
+  );
+
+  return { requests, readStatus, readError, lastResolved, busyIds, answerError, answer };
+}
+
+/** The structured-session kinds the cell labels. */
+export type StructuredSessionKind = "worker" | "structured";
+
+/** Header label and steering wording per kind. Pure. */
+export function kindCopy(kind: StructuredSessionKind): {
+  label: string;
+  steerQueued: string;
+  steerNow: string;
+} {
+  return kind === "worker"
+    ? {
+        label: "Worker",
+        steerQueued: "Steer the worker — queued until its current turn ends",
+        steerNow: "Steer the worker — sent immediately",
+      }
+    : {
+        label: "Structured",
+        steerQueued: "Message the session — queued until its current turn ends",
+        steerNow: "Message the session — sent immediately",
+      };
+}
+
 // ── The cell ──────────────────────────────────────────────────────────────────
 
-export interface WorkerSessionCellProps {
+export interface StructuredSessionCellProps {
   tab: TerminalTab;
-  /** The worker's task run id (`tab.taskRunId`), passed explicitly so the type says it is present. */
+  /** The session's task run id (`tab.taskRunId`), passed explicitly so the type says it is present. */
   taskRunId: string;
   visible: boolean;
+  /**
+   * What the cell hosts — a Conductor worker (bypass, never asks) or an
+   * operator's structured launch (asks before each tool). Labels the header
+   * and the steering input; the permission card renders for either whenever a
+   * request is parked.
+   */
+  kind: StructuredSessionKind;
 }
 
 type CellPane = "conversation" | "changes";
 
-export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCellProps) {
+export function StructuredSessionCell({ tab, taskRunId, visible, kind }: StructuredSessionCellProps) {
   const session = useAiSession({ attachTo: taskRunId });
   // Changes + review store, visible-gated: a hidden cell reads nothing.
   const review = useSessionReview(taskRunId, { visible, sessionState: session.sessionState });
@@ -502,6 +834,8 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   const refreshChanges = review.refreshChanges;
   const { hunkReview, error: reviewError } = useHunkReviewBinding(review);
   const reviewTarget = useMemo<ReviewTarget>(() => ({ taskRunId }), [taskRunId]);
+  const permissions = useSessionPermissions(taskRunId);
+  const copy = kindCopy(kind);
   const [pane, setPane] = useState<CellPane>("conversation");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -602,14 +936,17 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   return (
     <div
       className="flex h-full w-full min-h-0 flex-col bg-[#1a1b26] text-[#a9b1d6]"
-      data-page-element="worker-session-cell"
+      data-page-element="structured-session-cell"
       data-task-run-id={taskRunId}
       data-visible={visible ? "true" : "false"}
     >
       {/* Header: identity + state */}
       <div className="flex items-center gap-2 border-b border-[#2a2d3d] bg-[#13141f] px-2 py-1">
-        <span className="text-[10px] font-medium uppercase tracking-wide text-[#7aa2f7]">
-          Worker
+        <span
+          className="text-[10px] font-medium uppercase tracking-wide text-[#7aa2f7]"
+          data-session-kind={kind}
+        >
+          {copy.label}
         </span>
         <span className="truncate text-[11px] text-[#a9b1d6]" title={taskRunId}>
           <TabTitle tab={tab} />
@@ -640,6 +977,35 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
           ))}
         </div>
       </div>
+
+      {/* Permission requests (Phase 9): parked tool calls waiting on the operator. */}
+      {permissions.requests.map((req) => (
+        <PermissionCard
+          key={req.requestId}
+          request={req}
+          busy={permissions.busyIds.has(req.requestId)}
+          error={permissions.answerError?.id === req.requestId ? permissions.answerError.error : null}
+          onAnswer={(choice) => void permissions.answer(req.requestId, choice)}
+        />
+      ))}
+      {permissions.requests.length === 0 && permissions.lastResolved && (
+        <div
+          className="border-b border-[#2a2d3d] px-2 py-0.5 text-[10px] text-zinc-400"
+          data-permission-last-resolved={permissions.lastResolved.outcome}
+        >
+          {resolvedLabel(permissions.lastResolved)}
+        </div>
+      )}
+      {kind === "structured" && permissions.readStatus === "failed" && (
+        <div
+          className="border-b border-[#2a2d3d] px-2 py-0.5 text-[10px] text-fuchsia-300"
+          data-permission-read-failed
+        >
+          UNKNOWN — pending permission requests could not be read
+          {permissions.readError ? `: ${permissions.readError}` : ""}. New requests still appear
+          here as they arrive.
+        </div>
+      )}
 
       {/* Body */}
       {pane === "conversation" ? (
@@ -682,11 +1048,7 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
               }
             }}
             rows={1}
-            placeholder={
-              isProcessing
-                ? "Steer the worker — queued until its current turn ends"
-                : "Steer the worker — sent immediately"
-            }
+            placeholder={isProcessing ? copy.steerQueued : copy.steerNow}
             className="min-h-[26px] flex-1 resize-none rounded border border-[#2a2d3d] bg-[#1a1b26] px-2 py-1 text-xs text-[#a9b1d6] placeholder:text-zinc-600 focus:border-[#7aa2f7] focus:outline-none"
             data-steering-input
           />
@@ -695,7 +1057,7 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
               type="button"
               onClick={() => void session.interrupt()}
               className="inline-flex h-[26px] items-center gap-1 rounded border border-red-500/30 px-2 text-[10px] text-red-300 hover:bg-red-500/10"
-              title="Interrupt the worker's current turn"
+              title="Interrupt the session's current turn"
             >
               <Square className="h-3 w-3" />
               stop
@@ -717,4 +1079,4 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   );
 }
 
-export default WorkerSessionCell;
+export default StructuredSessionCell;

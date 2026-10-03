@@ -11,10 +11,14 @@
  * - UNKNOWN (the binary was found but its probe failed, or the probe itself
  *   could not run) → launchable, and labelled UNKNOWN rather than guessed.
  *
- * Every entry launches a PTY-hosted session: the menu types the CLI's command
- * into a terminal. It never offers a structured lane — a profile may declare
- * one as a fact about its CLI (Codex `codex app-server`), but the runner
- * implements none outside Claude's stream-json workers.
+ * Every entry's DEFAULT launch is a PTY-hosted session: the menu types the
+ * CLI's command into a terminal. A second, explicit per-launch choice — a
+ * structured session (plan Phase 9) — is offered only for a profile whose
+ * structured lane is one the RUNNER implements (Claude stream-json; Codex's
+ * `codex app-server` is declared by its profile but not spoken by the runner),
+ * whose typed permission requests are verified, and which names the arguments
+ * that route them to the runner ({@link structuredLaunchOffer}). A structured
+ * session asks before each tool call through a permission card.
  *
  * Kept free of React and Tauri so the runner's node-environment vitest can
  * cover it (`providerLaunchMenu.test.ts`).
@@ -25,6 +29,43 @@ export interface LaunchMenuProfile {
   id: string;
   displayName: string;
   install?: { linux?: string; macos?: string; windows?: string };
+  /** The CLI's structured protocol (`{ kind: "claude_stream_json" }`, …). */
+  structuredLane?: { kind: string };
+  /** `"supported" | "unsupported" | "unknown"` (absent reads as unknown). */
+  typedPermission?: string;
+  /** The arguments that route permission requests to the runner. */
+  permissionPromptArgs?: string[];
+}
+
+/** The structured lanes the RUNNER speaks. Codex's app-server is follow-up A. */
+export const RUNNER_IMPLEMENTED_STRUCTURED_LANES: readonly string[] = ["claude_stream_json"];
+
+/** Whether a profile gets the "structured session" launch choice, and why not. */
+export type StructuredLaunchOffer = { offered: true } | { offered: false; reason: string };
+
+/**
+ * The structured-launch verdict for one profile. Pure. Mirrors the runner's
+ * own refusal (`structured_launch_profile`, `commands/structured_session.rs`),
+ * which stays the authority — this only decides whether to show the button.
+ */
+export function structuredLaunchOffer(profile: LaunchMenuProfile): StructuredLaunchOffer {
+  const lane = profile.structuredLane?.kind ?? "unknown";
+  if (!RUNNER_IMPLEMENTED_STRUCTURED_LANES.includes(lane)) {
+    return {
+      offered: false,
+      reason: `no structured lane this runner implements (${lane})`,
+    };
+  }
+  if (profile.typedPermission !== "supported") {
+    return {
+      offered: false,
+      reason: `typed permission requests are ${profile.typedPermission ?? "unknown"}`,
+    };
+  }
+  if (!profile.permissionPromptArgs || profile.permissionPromptArgs.length === 0) {
+    return { offered: false, reason: "no argument routes permission requests to the runner" };
+  }
+  return { offered: true };
 }
 
 /** Wire shape of `cli_profile_availability` (Rust `CliAvailability`). */

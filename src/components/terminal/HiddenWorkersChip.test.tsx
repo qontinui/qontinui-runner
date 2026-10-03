@@ -3,7 +3,7 @@
  * worker cell REVERSIBLE.
  *
  * The runner's vitest config is `environment: "node"` with no React Testing
- * Library, so (as `UnzonedChip` / `WorkerSessionCell` do) the label contract is
+ * Library, so (as `UnzonedChip` / `StructuredSessionCell` do) the label contract is
  * locked on its pure helper and the markup with `renderToStaticMarkup`.
  */
 

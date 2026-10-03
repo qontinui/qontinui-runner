@@ -8,7 +8,7 @@
 //!
 //! `GET /sessions/<id>/file-changes` pairs every file the session touched
 //! with its pre-edit snapshot text and the file's CURRENT text, so a reader
-//! (the Terminal grid's `WorkerSessionCell`) can render a true
+//! (the Terminal grid's `StructuredSessionCell`) can render a true
 //! snapshot-vs-now diff whatever tool made the edit. The diff itself is
 //! computed client-side; this route only reads and reports, and it reports a
 //! read failure per file rather than dropping the file. It is BOUNDED on three

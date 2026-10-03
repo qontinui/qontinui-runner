@@ -14,6 +14,7 @@ pub mod coord_register;
 pub mod dispatcher;
 pub mod federation;
 pub mod manager;
+pub mod permission; // Typed permission requests: the by-subtype control-request answerer (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 9)
 pub mod resume;
 pub mod runner;
 pub mod session;

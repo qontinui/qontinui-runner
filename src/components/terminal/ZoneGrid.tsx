@@ -29,7 +29,7 @@ import {
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
 import { TabTitle, useDisplayTitleResolver } from "./displayTitle";
-import { WorkerSessionCell } from "./WorkerSessionCell";
+import { StructuredSessionCell } from "./StructuredSessionCell";
 import { SuggestionChip } from "./suggestions";
 import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
@@ -266,7 +266,7 @@ function ZoneGridInner({
    *
    * There is no worker-tab case to skip here. A Conductor worker's tab is
    * `sessionBacked` and both mount sites below render it through
-   * `WorkerSessionCell`, never `TerminalInstance` — and `onTitleChange` is
+   * `StructuredSessionCell`, never `TerminalInstance` — and `onTitleChange` is
    * passed to `TerminalInstance` alone. A worker emits no OSC 0/2 at all
    * (it is an in-process stream-json session, not a pty), so the `Worker N`
    * pin is enforced by the mount split, not by a test in this callback. The
@@ -879,10 +879,11 @@ function ZoneGridInner({
               {zoneTab.type === "plan" && zoneTab.planFilePath ? (
                 <PlanViewer filePath={zoneTab.planFilePath} visible={isVisible} />
               ) : zoneTab.sessionBacked && zoneTab.taskRunId ? (
-                <WorkerSessionCell
+                <StructuredSessionCell
                   tab={zoneTab}
                   taskRunId={zoneTab.taskRunId}
                   visible={isVisible}
+                  kind={zoneTab.promptsForPermission ? "structured" : "worker"}
                 />
               ) : (
                 <TerminalInstance
@@ -1848,7 +1849,12 @@ function ZoneCellInner({
                   keeps the dual-mount race impossible (exactly-one-or-zero owner
                   per tab) that would otherwise evict UI Bridge registrations. */}
               {shouldMountInstance && tab.sessionBacked && tab.taskRunId && (
-                <WorkerSessionCell tab={tab} taskRunId={tab.taskRunId} visible={!showCompactCard} />
+                <StructuredSessionCell
+                  tab={tab}
+                  taskRunId={tab.taskRunId}
+                  visible={!showCompactCard}
+                  kind={tab.promptsForPermission ? "structured" : "worker"}
+                />
               )}
               {shouldMountInstance && !tab.sessionBacked && instanceHandlers && (
                 <TerminalInstance

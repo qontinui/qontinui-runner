@@ -506,6 +506,14 @@
       "reason": "launch-menu action text names claude; menu lists served profiles (Phase 6)"
     },
     {
+      "file": "src/components/terminal/types.ts",
+      "item": "TerminalSessionRecord",
+      "pattern": "bypassPermissions",
+      "count": 1,
+      "class": "B",
+      "reason": "mirror of the lifecycle record's provider-neutral permission posture (Rust bypass_permissions), not a CLI flag spelling; false marks a Phase 9 prompting structured launch"
+    },
+    {
       "file": "src/components/terminal/useSessionInfo.ts",
       "item": "SessionLifecycleInfo",
       "pattern": "bypassPermissions",
@@ -696,6 +704,14 @@
       "count": 1,
       "class": "S",
       "reason": "per-tab auto-approve mark whose only consumer is the screen-scraped needs-input detector (sessionStateDetector) - sibling plan's state"
+    },
+    {
+      "file": "src/components/terminal/useTerminalManager.ts",
+      "item": "workerTabFromRecord",
+      "pattern": "bypassPermissions",
+      "count": 2,
+      "class": "B",
+      "reason": "reads the record's provider-neutral permission posture to label a Phase 9 prompting structured session; no CLI flag spelling"
     },
     {
       "file": "src/components/terminal/zoneProfileStorage.ts",

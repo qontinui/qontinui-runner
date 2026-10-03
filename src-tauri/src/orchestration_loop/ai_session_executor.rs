@@ -669,6 +669,8 @@ pub async fn dispatch_subtask(
             None, // tool_policy
             Some(&cli_session_ctx),
             None, // agent_log_emitter — orchestration path, no coord agent_logs
+            // Autonomous / chat spawn: never prompts (plan 2026-09-20 Phase 9).
+            crate::session::launch_spec::PermissionMode::BypassPermissions,
         )?;
         let session = Arc::new(session);
 

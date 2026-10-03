@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
@@ -1333,6 +1334,57 @@ function TerminalPageInner({
     void launchAiSessions(1, provider, configDir);
   };
 
+  /**
+   * The launch menu's explicit "structured" choice (plan
+   * `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+   * Phase 9): a stream-json session in `Prompt` mode, whose tool calls arrive
+   * as permission cards in its `StructuredSessionCell`. The runner opens it
+   * and records it (`create_structured_session`); the page adopts the record
+   * through the same door a Conductor worker uses, into the first empty zone.
+   */
+  const handleLaunchStructured = async (provider: string): Promise<void> => {
+    const emptyZone = zoneLayout.layout.zones.findIndex((_, idx) => !zoneLayout.assignments[idx]);
+    let resp: CommandResponse;
+    try {
+      resp = await invoke<CommandResponse>("create_structured_session", {
+        provider,
+        pageId,
+        zoneIndex: Math.max(emptyZone, 0),
+        workingDir: null,
+        title: null,
+      });
+    } catch (e) {
+      workflowGen.setNotification({
+        message: `Structured session failed to start: ${e instanceof Error ? e.message : String(e)}`,
+        type: "error",
+      });
+      return;
+    }
+    const record = (resp.data as { record?: TerminalSessionRecord } | undefined)?.record;
+    if (!resp.success || !record) {
+      workflowGen.setNotification({
+        message: resp.message ?? "Structured session failed to start",
+        type: "error",
+      });
+      return;
+    }
+    const tabId = adoptWorkerTab(record);
+    if (!tabId) {
+      // No cell ⇒ nobody can answer its permission requests: close it rather
+      // than leave a prompting session stalling unseen.
+      void invoke("close_ai_session", { taskRunId: record.taskRunId }).catch(() => {});
+      workflowGen.setNotification({
+        message: "Structured session started but could not be shown, so it was closed",
+        type: "error",
+      });
+      return;
+    }
+    if (emptyZone >= 0) {
+      zoneLayout.assignTabToZone(emptyZone, tabId);
+      zoneLayout.setFocusedZone(emptyZone);
+    }
+  };
+
   // Phase 1b — register the Terminal-page command set. Sources the spawn
   // closures above; reads everything else (tabs, zoneLayout, sessionStates,
   // closeTerminal, transitionEffects.handleRestartInZone, terminalRefs)
@@ -1619,6 +1671,7 @@ function TerminalPageInner({
               sessionLockStates={sessionLockStates}
               onResumePastSession={handleResumePastSession}
               onLaunchProvider={handleLaunchProvider}
+              onLaunchStructured={(provider) => void handleLaunchStructured(provider)}
             />
           )}
 
