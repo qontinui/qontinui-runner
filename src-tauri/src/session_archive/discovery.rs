@@ -177,9 +177,10 @@ pub fn discover_account_homes_from_env(configured: &[String]) -> Vec<AccountHome
 /// loader: a missing or corrupt roster must degrade to the directory scan
 /// rather than abort a backfill.
 pub fn roster_config_dirs() -> Vec<String> {
-    let Some(path) =
-        dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("claude-accounts.json"))
-    else {
+    let Some(path) = crate::ambient::runner_platform_config_root(
+        "session_archive::discovery::roster_config_dirs",
+    )
+    .map(|d| d.join("com.qontinui.runner").join("claude-accounts.json")) else {
         return Vec::new();
     };
     let Ok(text) = std::fs::read_to_string(&path) else {

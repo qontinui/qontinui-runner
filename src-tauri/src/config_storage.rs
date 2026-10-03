@@ -107,11 +107,13 @@ impl ConfigStorage {
     /// Scoped per-runner for secondary instances so themed runners don't
     /// share their config library with the primary.
     pub fn new() -> Result<Self, ConfigStorageError> {
-        let base = dirs::config_dir()
-            .ok_or_else(|| {
-                ConfigStorageError::InvalidPath("Could not determine config directory".to_string())
-            })?
-            .join("com.qontinui.runner");
+        let base = qontinui_runner_lib::ambient::runner_platform_config_root(
+            "config_storage::ConfigStorage::new",
+        )
+        .ok_or_else(|| {
+            ConfigStorageError::InvalidPath("Could not determine config directory".to_string())
+        })?
+        .join("com.qontinui.runner");
         let config_dir = crate::instance::scope_path(&base).join("configs");
 
         // Create directory if it doesn't exist
@@ -603,5 +605,28 @@ mod tests {
         let content = fs::read_to_string(&export_path).unwrap();
         let config: QontinuiConfig = serde_json::from_str(&content).unwrap();
         assert_eq!(config.metadata.name, "Test Config");
+    }
+}
+
+/// A test process never resolves the operator's real
+/// `<config>/com.qontinui.runner`: this path roots at
+/// `ambient::runner_platform_config_root`, which in a test harness is the
+/// hermetic deflected root. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 4.
+#[cfg(test)]
+mod config_root_deflection_tests {
+    use super::*;
+
+    #[test]
+    fn config_library_is_deflected_in_a_test_process() {
+        let root = qontinui_runner_lib::ambient::deflected_config_root();
+        let path = ConfigStorage::new().expect("constructs").base_path;
+        assert!(
+            path.starts_with(&root),
+            "{} must resolve under the deflected root {} in a test process",
+            path.display(),
+            root.display()
+        );
     }
 }

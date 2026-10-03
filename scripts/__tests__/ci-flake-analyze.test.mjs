@@ -28,6 +28,8 @@ import {
   isRustTestJob,
   tallyFailingTests,
   evaluateProceedCriterion,
+  lastBinaryHasSummary,
+  redactSecrets,
 } from "../ci-flake-analyze.mjs";
 
 // ---------------------------------------------------------------------------
@@ -583,4 +585,73 @@ test("unparsed buckets downgrade a negative to ambiguous, never to a clean NOT M
   assert.equal(r.met, false);
   assert.equal(r.ambiguous, true);
   assert.equal(r.verdict, "MET-AMBIGUOUSLY (not met over what could be read)");
+});
+
+// ---------------------------------------------------------------------------
+// lastBinaryHasSummary — a run that died mid-way ends without `test result:`
+// ---------------------------------------------------------------------------
+
+test("lastBinaryHasSummary: true only when the LAST announced binary printed its summary line", () => {
+  const L = (t) => t.split("\n").map(normalizeLogLine);
+  assert.equal(lastBinaryHasSummary(L("running 1 test\ntest a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+  assert.equal(lastBinaryHasSummary(L("running 2 tests\ntest a ... FAILED\ntest b ... ok")), false, "failures printed, no summary: died mid-way");
+  assert.equal(lastBinaryHasSummary(L("")), false);
+  // Two binaries: the first complete, the second cut off → false.
+  const two = [
+    "     Running `/t/deps/one-0123456789ab`",
+    "running 1 test",
+    "test a ... ok",
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "     Running `/t/deps/two-0123456789ab`",
+    "running 3 tests",
+    "test b ... FAILED",
+  ].join("\n");
+  assert.equal(lastBinaryHasSummary(L(two)), false);
+  // …and true once the second prints its own.
+  assert.equal(lastBinaryHasSummary(L(two + "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+  // With GitHub timestamps and ANSI, the same answer.
+  assert.equal(lastBinaryHasSummary(L("2026-09-21T12:00:00.0000000Z \u001b[0mtest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")), true);
+});
+
+test("redactSecrets: JWTs, Bearer, GitHub tokens and any token/secret/password/jwt/api_key key in env, Debug, JSON or query shape; idempotent", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+  const input = `Authorization: Bearer ${jwt}; also ${jwt} raw; token=abc123 Secret=x password=hunter2`;
+  const out = redactSecrets(input);
+  assert.doesNotMatch(out, /eyJ/);
+  assert.doesNotMatch(out, /abc123|hunter2/);
+  assert.match(out, /Bearer \[redacted\]/);
+  assert.match(out, /token=\[redacted\] Secret=\[redacted\] password=\[redacted\]/);
+
+  // The shapes a Rust panic actually prints. `\b` never fired between `_`
+  // and `T` in `GITHUB_TOKEN`, and a Debug field or a JSON member uses `:`.
+  const shapes = redactSecrets(
+    [
+      `Config { runner_token: "qr_live_abcdef123456", name: "x" }`,
+      `{"token": "abc123", "api_key": "sk-live-9999", "n": 1}`,
+      `GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 api_key=sk-abc-123 pat=github_pat_11AAA_bbb`,
+      `coord_jwt=eyJaaaaaaaaaaaaaaaa.b.c device_secret:  s3cr3t`,
+    ].join("\n"),
+  );
+  for (const leak of ["qr_live", "abc123", "sk-live", "ghp_", "sk-abc", "github_pat_11AAA", "eyJ", "s3cr3t"]) {
+    assert.doesNotMatch(shapes, new RegExp(leak), `leaked ${leak} in:\n${shapes}`);
+  }
+  assert.match(shapes, /runner_token=\[redacted\], name: "x"/, "the key survives, the value does not, the rest is untouched");
+  assert.match(shapes, /"token"=\[redacted\], "api_key"=\[redacted\], "n": 1/);
+  assert.match(shapes, /GITHUB_TOKEN=\[redacted\] api_key=\[redacted\]/);
+  assert.match(shapes, /device_secret=\[redacted\]/);
+
+  // A name that merely CONTAINS one of the words is redacted too — over-redaction
+  // is the safe side of a public issue.
+  assert.equal(redactSecrets("not_a_token=fine"), "not_a_token=[redacted]");
+
+  assert.equal(redactSecrets(out), out, "idempotent");
+  assert.equal(redactSecrets(shapes), shapes, "idempotent over every shape");
+  assert.equal(redactSecrets("assertion `left == right` failed\n  left: 2\n right: 1"), "assertion `left == right` failed\n  left: 2\n right: 1");
+  assert.equal(redactSecrets("token_count: 3, timeout_ms: 20"), "token_count=[redacted], timeout_ms: 20", "a `token_count` field is redacted (contains `token`); `timeout_ms` is not");
+  assert.equal(redactSecrets("TokenKind::Secret and SecretString::expose_secret"), "TokenKind::Secret and SecretString::expose_secret", "a Rust path separator is not a key/value separator");
+  assert.equal(redactSecrets('{"token": "a b c", "n": 1}'), '{"token"=[redacted], "n": 1}', "a quoted value with whitespace is consumed whole");
+  assert.equal(redactSecrets('{"token": "a \\"b\\" c", "n": 1}'), '{"token"=[redacted], "n": 1}', "an escaped quote inside the value is not its closing quote");
+  assert.equal(redactSecrets(redactSecrets('{"token": "a \\"b\\" c", "n": 1}')), '{"token"=[redacted], "n": 1}', "idempotent over the escaped-quote shape");
+  assert.equal(redactSecrets("password=hun ter2"), "password=[redacted] ter2", "an unquoted value ends at whitespace (the tail is not the secret)");
+  assert.equal(redactSecrets(null), "");
 });

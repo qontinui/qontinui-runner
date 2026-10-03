@@ -56,6 +56,22 @@ fn pids_of(line: &str) -> (u32, u32) {
     }
 }
 
+/// This file links `qontinui_runner_lib` as a separate crate, without
+/// `cfg(test)`, so the only thing keeping a config-dir or settings writer it
+/// reaches off the operator's real files is `canary_armed()`'s `deps/`
+/// detection. Pin that it armed here (`config_dir_scan_guard` requires it of
+/// every integration test that calls into the lib).
+#[cfg(debug_assertions)]
+#[test]
+fn pty_holder_spike_ambient_canary_arms_itself_in_this_test_binary() {
+    assert!(
+        qontinui_runner_lib::ambient::test_support::canary_armed(),
+        "the ambient canary must arm itself in this integration test binary; if \
+         this fails, `canary_armed()`'s deps/ detection no longer recognises it and \
+         every lib writer it reaches is unguarded"
+    );
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;

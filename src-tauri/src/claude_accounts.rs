@@ -93,8 +93,12 @@ fn accounts_path_under(config_root: &Path) -> PathBuf {
 /// deliberately ignored (unlike `settings::get_settings_path`), so every
 /// instance on the machine resolves the SAME file. Mirrors the unscoped
 /// `session_file_path` resolver for `active_instances.json`.
+///
+/// In a TEST HARNESS the root is `ambient::deflected_config_root()` instead
+/// (see [`platform_config_root`]).
 pub fn claude_accounts_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| accounts_path_under(&d))
+    platform_config_root("claude_accounts::claude_accounts_file_path")
+        .map(|d| accounts_path_under(&d))
 }
 
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
@@ -102,7 +106,24 @@ pub fn claude_accounts_file_path() -> Option<PathBuf> {
 /// running the migration has to probe the primary's file, not its own
 /// instance-scoped copy.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    platform_config_root("claude_accounts::unscoped_settings_path")
+        .map(|d| d.join("com.qontinui.runner").join("settings.json"))
+}
+
+/// The platform config root both paths above hang off: `dirs::config_dir()`,
+/// except in a test harness, where it is the hermetic
+/// `ambient::deflected_config_root()`.
+///
+/// This module ignores `QONTINUI_CONFIG_DIR` by design, so a fixture's env
+/// never redirected it: every test that reached [`load_with_migration`] (all of
+/// `load_settings_full`) read the operator's real roster, and on a box in the
+/// pre-migration state its one-shot seed WROTE the real
+/// `claude-accounts.json`. On Linux only `XDG_CONFIG_HOME` moved it; on
+/// Windows nothing could. Plan
+/// `2026-09-23-runner-unit-tests-overwrite-the-operators-live-settings-json`,
+/// Phase 2.
+fn platform_config_root(source: &str) -> Option<PathBuf> {
+    qontinui_runner_lib::ambient::runner_platform_config_root(source)
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`
@@ -325,14 +346,23 @@ mod tests {
         );
     }
 
-    /// The canonical path must come straight from `dirs::config_dir()` —
-    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver never reads env, so
-    /// this asserts equality with the dirs-derived path without mutating
-    /// process env (env-mutation would race other tests' `load_settings`).
+    /// The canonical path comes from the platform config root —
+    /// `QONTINUI_CONFIG_DIR` plays no part — and in THIS process (a test
+    /// harness) that root is the hermetic deflected one, never
+    /// `dirs::config_dir()`, which would be the operator's real roster.
     #[test]
     fn canonical_path_ignores_qontinui_config_dir() {
-        let expected = dirs::config_dir().map(|d| accounts_path_under(&d));
+        let expected = Some(accounts_path_under(
+            &qontinui_runner_lib::ambient::deflected_config_root(),
+        ));
         assert_eq!(claude_accounts_file_path(), expected);
+        if let Some(real) = dirs::config_dir() {
+            assert_ne!(
+                claude_accounts_file_path(),
+                Some(accounts_path_under(&real)),
+                "a test process must never resolve the real claude-accounts.json"
+            );
+        }
         if let Some(p) = claude_accounts_file_path() {
             assert!(
                 !p.to_string_lossy().contains("instances"),
