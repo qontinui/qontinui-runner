@@ -215,13 +215,42 @@ export function formatSince(since: number): string {
   });
 }
 
-const CREDENTIAL_DARK_TITLES: Record<string, string> = {
+/**
+ * Every cause the runner can emit on the `autonomy-credential-dark` event or
+ * the posture snapshot: the Cognito cause, each non-answering posture, and each
+ * `dark` cause (`DarkCause::as_str` in `device_jwt_refresher.rs`). A cause
+ * added to this union without a title fails to compile, because the titles
+ * `Record` is typed over it. The union itself mirrors the Rust wire strings BY
+ * HAND; the Rust test `the_banner_union_names_every_cause_the_runner_emits`
+ * reads this file and fails when a cause the runner emits is missing here.
+ */
+export type CredentialDarkCause =
+  | "cognito_hard"
+  | "expired"
+  | "unrefreshable"
+  | "absent"
+  | "upstream_401"
+  | "no_default_binding";
+
+const CREDENTIAL_DARK_TITLES: Record<CredentialDarkCause, string> = {
   cognito_hard: "Autonomous sessions paused",
   expired: "Coord credential expired",
   unrefreshable: "Coord credential expired — automatic refresh failed",
   absent: "This runner has no coord credential",
   upstream_401: "Coord is rejecting this runner's credential",
+  // Plan 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3:
+  // a valid per-tenant credential IS held; what is missing is the default
+  // binding (paired_user.json) that points at it. Rendering this as `absent`
+  // was the 2026-09-28 misreport.
+  no_default_binding: "Coord credential present, but no default binding points at it",
 };
+
+/** Title for a cause, or `null` for one this build does not know. */
+function credentialDarkTitle(cause: string): string | null {
+  return Object.prototype.hasOwnProperty.call(CREDENTIAL_DARK_TITLES, cause)
+    ? CREDENTIAL_DARK_TITLES[cause as CredentialDarkCause]
+    : null;
+}
 
 const CREDENTIAL_DARK_CTA_LABELS: Record<CredentialDarkCta, string> = {
   sign_in: "Sign in",
@@ -342,7 +371,7 @@ export function credentialDarkPresentation(
   signal: CredentialDarkSignal,
   formatTime: (since: number) => string = formatSince,
 ): CredentialDarkPresentation {
-  const title = CREDENTIAL_DARK_TITLES[signal.cause] ?? "Coord credential problem";
+  const title = credentialDarkTitle(signal.cause) ?? "Coord credential problem";
   const prefix =
     typeof signal.since === "number" && Number.isFinite(signal.since)
       ? `Since ${formatTime(signal.since)} — `

@@ -194,39 +194,153 @@ pub(crate) struct LocalBindingSet {
     /// Every locally-held binding (deduped; always contains
     /// `default_tenant`).
     pub(crate) tenant_ids: Vec<uuid::Uuid>,
+    /// Which source answered — it decides which credential a request made on
+    /// the strength of this set can present ([`Self::bearer_scope`]).
+    pub(crate) source: BindingSource,
 }
 
-/// Resolve the device's binding set for coord-side requests
-/// (`POST /coord/devices/register`). Returns the first hit:
+/// Where [`resolve_binding_set`] found the binding set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingSource {
+    /// `paired_user.json`.
+    PairedUserFile,
+    /// The legacy `access_token` slot's `tenant_id` claim.
+    LegacySlotClaim,
+    /// The per-tenant `device_jwt:<tenant>` slots' own claims — the
+    /// last-resort source when the file is gone and the legacy slot is dead.
+    TenantSlotClaims,
+}
+
+impl LocalBindingSet {
+    /// The credential scope a device-level request resolved from this set
+    /// presents. `Device` (the legacy slot) everywhere it can answer; when the
+    /// set came from the per-tenant slots the legacy slot is by construction
+    /// dead or empty, so `Device` would send the request unauthenticated —
+    /// `Owned(default)` presents the default's own usable slot instead.
+    pub(crate) fn bearer_scope(&self) -> crate::auth::TenantScope {
+        match self.source {
+            BindingSource::TenantSlotClaims => crate::auth::TenantScope::Owned(self.default_tenant),
+            BindingSource::PairedUserFile | BindingSource::LegacySlotClaim => {
+                crate::auth::TenantScope::Device
+            }
+        }
+    }
+}
+
+/// Resolve the device's binding set for coord-side requests. Returns the
+/// first hit:
 ///
 /// 1. `paired_user.json` — the v2-migrated binding set (legacy files
 ///    yield their one synthesized entry); the default is
 ///    `default_tenant_id`/`tenant_id`.
-/// 2. JWT-claim fallback — decode `tenant_id` from the cached
-///    device-token JWT via
-///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]; the set
-///    is that single tenant. (The pre-8a opportunistic disk backfill is
-///    gone — the register response's `tenant_ids` reconciliation is the
-///    file's healer now, and per-tick resolution works without the
-///    write-back.)
-/// 3. `None` — no source has a usable tenant. Callers must skip the
-///    request (coord rejects with `400 tenant_id_required`).
+/// 2. The legacy `access_token` JWT's `tenant_id` claim
+///    ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]) — a usable
+///    token's first, a present-but-dead one's otherwise (the historical
+///    branch); the set is that single tenant. (The pre-8a opportunistic disk
+///    backfill is gone — the register response's `tenant_ids`
+///    reconciliation is the file's healer now, and per-tick resolution works
+///    without the write-back.)
+/// 3. `None` — no source has a tenant. Callers must skip the request.
+///
+/// Deliberately NO per-tenant-slot branch: every [`resolve_tenant_id`]
+/// caller (slot leases and spawns, session attribution, coord registration)
+/// stamps the answer on a write, and an arbitrary slot tenant — possibly one
+/// coord has unbound — is the wrong thing to stamp (review round 2,
+/// MEDIUM 2). The register heartbeat alone has that fallback:
+/// [`resolve_heartbeat_binding_set`].
 pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
-    // Branch 1 — paired_user.json (v2-migrated view)
-    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
-        if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
-            let mut tenant_ids = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
-            if !tenant_ids.contains(&default_tenant) {
-                tenant_ids.insert(0, default_tenant);
-            }
-            return Some(LocalBindingSet {
-                default_tenant,
-                tenant_ids,
-            });
+    resolve_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_binding_set`] over injected sources. Takes the SAME source set
+/// the heartbeat does and deliberately never reads `slots`, `bound` or
+/// `active` — so a test handing it panicking slot sources pins that the
+/// non-heartbeat path cannot regain the slot fallback (review round 3).
+pub(crate) fn resolve_binding_set_with(src: &BindingSources<'_>) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || None)
+}
+
+/// The register heartbeat's binding set: [`resolve_binding_set`]'s sources,
+/// then — after a usable legacy claim and before a dead one — the per-tenant
+/// slots' own claims ([`heartbeat_slot_fallback`]). Plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// review finding 1: with the file gone and the legacy slot dead, the
+/// heartbeat was never sent, so `coord_bound_tenants.json` was never
+/// re-stamped, the bound set aged to UNKNOWN, and the heal's Guard 1 refused
+/// forever. The heartbeat presents the chosen default's own slot JWT
+/// ([`LocalBindingSet::bearer_scope`]), the same tenant it sends as
+/// `tenant_id`.
+pub(crate) fn resolve_heartbeat_binding_set() -> Option<LocalBindingSet> {
+    resolve_heartbeat_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_heartbeat_binding_set`] over injected sources: the slot
+/// candidates, coord's bound set and the active tenant are read only when
+/// the file and a usable legacy claim both missed, and are fed to
+/// [`heartbeat_slot_fallback`].
+pub(crate) fn resolve_heartbeat_binding_set_with(
+    src: &BindingSources<'_>,
+) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || {
+        let candidates = (src.slots)()?;
+        heartbeat_slot_fallback(candidates, &(src.bound)(), (src.active)())
+    })
+}
+
+/// Every source the two binding-set resolvers read, injectable so their
+/// WIRING — which sources each consults, and what the heartbeat hands its
+/// fallback — is testable without a credential store (review round 3).
+/// [`BindingSources::production`] is the real set.
+pub(crate) struct BindingSources<'a> {
+    /// Branch 1: `paired_user.json`'s default + binding set.
+    pub(crate) file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    /// Branch 2: the legacy slot's claim tenant and whether it is USABLE.
+    pub(crate) legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    /// Heartbeat only: tenants whose per-tenant slot holds a usable,
+    /// self-naming JWT.
+    pub(crate) slots: &'a dyn Fn() -> Option<Vec<uuid::Uuid>>,
+    /// Heartbeat only: coord's recorded bound set.
+    pub(crate) bound: &'a dyn Fn() -> qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    /// Heartbeat only: `machine.json`'s `active_tenant_id`.
+    pub(crate) active: &'a dyn Fn() -> Option<uuid::Uuid>,
+}
+
+impl BindingSources<'static> {
+    /// The real sources.
+    pub(crate) fn production() -> Self {
+        Self {
+            file: &read_file_binding_source,
+            legacy: &read_legacy_binding_source,
+            slots: &read_slot_claim_candidates,
+            bound: &qontinui_runner_lib::pair::coord_bound_tenants,
+            active: &read_active_tenant,
         }
     }
+}
 
-    // Branch 2 — cached device-token JWT (the legacy/default slot)
+/// Heartbeat source: the per-tenant slots' usable, self-naming tenants.
+fn read_slot_claim_candidates() -> Option<Vec<uuid::Uuid>> {
+    qontinui_runner_lib::pair::usable_slot_claim_tenants().map(|(_, candidates)| candidates)
+}
+
+/// Heartbeat source: `machine.json`'s `active_tenant_id`.
+fn read_active_tenant() -> Option<uuid::Uuid> {
+    qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid()
+}
+
+/// Branch 1 source: `paired_user.json`'s default + binding set.
+fn read_file_binding_source() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    let s = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()?;
+    let default_tenant = uuid::Uuid::parse_str(s.trim()).ok()?;
+    Some((
+        default_tenant,
+        qontinui_runner_lib::pair::read_paired_binding_tenant_ids(),
+    ))
+}
+
+/// Branch 2 source: the legacy slot's claim tenant, and whether its token is
+/// USABLE.
+fn read_legacy_binding_source() -> Option<(uuid::Uuid, bool)> {
     let token = crate::auth::AuthManager::new()
         .get_access_token()
         .ok()
@@ -235,11 +349,77 @@ pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
         return None;
     }
     let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
-    let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
-    Some(LocalBindingSet {
-        default_tenant: parsed,
-        tenant_ids: vec![parsed],
-    })
+    let tenant = uuid::Uuid::parse_str(claim.trim()).ok()?;
+    Some((tenant, crate::auth::slot_jwt_is_usable(&token)))
+}
+
+/// The heartbeat's per-tenant-slot fallback over its inputs: `candidates`
+/// are the tenants whose slot holds a usable, self-naming JWT.
+///
+/// - When coord's recorded bound set is `Known`, only candidates in it
+///   survive — a slot for a tenant coord unbound is never heartbeated as.
+///   When it is `Unknown`, every candidate is allowed: the heartbeat is the
+///   very thing that re-stamps the set, so filtering on an unknown set would
+///   rebuild the lockout this fallback ends.
+/// - The default is `machine.json`'s `active_tenant_id` when it is among the
+///   survivors, else the greatest id (deterministic).
+///
+/// `None` when no candidate survives.
+pub(crate) fn heartbeat_slot_fallback(
+    mut candidates: Vec<uuid::Uuid>,
+    bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    active_tenant: Option<uuid::Uuid>,
+) -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    if let qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(set) = bound {
+        candidates.retain(|t| set.contains(t));
+    }
+    candidates.sort();
+    candidates.dedup();
+    let default = active_tenant
+        .filter(|a| candidates.contains(a))
+        .or_else(|| candidates.last().copied())?;
+    Some((default, candidates))
+}
+
+/// Pure-over-injected-sources core of [`resolve_binding_set`] and
+/// [`resolve_heartbeat_binding_set`], so the branch order is testable
+/// without a credential store. `file` is branch 1; `legacy` yields the
+/// legacy slot's claim tenant and whether that token is USABLE; `slots` is
+/// the heartbeat-only per-tenant-slot fallback (`|| None` everywhere else),
+/// consulted after a usable legacy claim and before a dead one. Each source
+/// is read only when every earlier branch missed.
+pub(crate) fn choose_binding_set(
+    file: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    legacy: impl FnOnce() -> Option<(uuid::Uuid, bool)>,
+    slots: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+) -> Option<LocalBindingSet> {
+    if let Some((default_tenant, mut tenant_ids)) = file() {
+        if !tenant_ids.contains(&default_tenant) {
+            tenant_ids.insert(0, default_tenant);
+        }
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::PairedUserFile,
+        });
+    }
+    let legacy = legacy();
+    let single = |t: uuid::Uuid| LocalBindingSet {
+        default_tenant: t,
+        tenant_ids: vec![t],
+        source: BindingSource::LegacySlotClaim,
+    };
+    if let Some((t, true)) = legacy {
+        return Some(single(t));
+    }
+    if let Some((default_tenant, tenant_ids)) = slots() {
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::TenantSlotClaims,
+        });
+    }
+    legacy.map(|(t, _)| single(t))
 }
 
 /// Single-tenant convenience over [`resolve_binding_set`]: the DEFAULT
@@ -1696,8 +1876,8 @@ struct HeartbeatPayload {
     claude_code_available: bool,
     /// REQUIRED by coord's `post_device_register` handler — absence
     /// produces `400 tenant_id_required` (see qontinui-coord
-    /// `routes_phase3.rs:257-269`). Resolved via [`resolve_binding_set`]
-    /// (the DEFAULT binding) before the payload is constructed; if
+    /// `routes_phase3.rs:257-269`). Resolved via
+    /// [`resolve_heartbeat_binding_set`] (the DEFAULT binding) before the payload is constructed; if
     /// `None` there, the heartbeat is skipped rather than 400-spamming
     /// coord. Phase 2 of the default-tenant-propagation plan.
     tenant_id: uuid::Uuid,
@@ -1868,7 +2048,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         }
     };
 
-    let bindings = match resolve_binding_set() {
+    let bindings = match resolve_heartbeat_binding_set() {
         Some(b) => b,
         None => {
             warn_tenant_id_unresolvable_once();
@@ -1880,6 +2060,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             });
         }
     };
+    let bearer_scope = bindings.bearer_scope();
 
     let claude_code_available = claude_code_probe();
 
@@ -1955,8 +2136,12 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
-    // coord-tenant-scope(device): device registration -- the payload already carries tenant_id = bindings.default_tenant and tenant_ids (:1374-1388); the default binding IS the right answer here.
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
+    // The bearer follows the binding set's source (`LocalBindingSet::bearer_scope`):
+    // the default binding's legacy slot normally, and the default tenant's OWN
+    // per-tenant slot when the set came from those slots — the legacy slot is
+    // dead then, and an unauthenticated register is what let the bound set age
+    // to UNKNOWN (plan 2026-09-29-vanished-paired-user-json-…, review finding 1).
+    let resp = crate::auth::attach_device_auth_for(client.post(&url).json(&payload), bearer_scope)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
@@ -1982,6 +2167,13 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
+            // The PREVIOUS echo, read before this one is recorded: a binding
+            // drop needs both to omit the tenant (`drop_confirmed_coord_set`),
+            // so one transient or short echo cannot destroy a binding and its
+            // credential slot (plan
+            // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential,
+            // Phase 4).
+            let prior_echo = qontinui_runner_lib::pair::coord_bound_tenants();
             // Record coord's COUNT before reconciling: the plan adapter asks
             // "is this device bound to more than one tenant?", which the
             // slot-backed binding file cannot answer (plan
@@ -1989,21 +2181,42 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
                 tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
             }
-            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
-                Ok(report) => {
-                    if report.changed() {
-                        info!(
-                            "fleet::heartbeat: reconciled bindings against coord \
-                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                            report.dropped, report.dropped_slots, report.default_repointed
-                        );
+            match qontinui_runner_lib::pair::drop_confirmed_coord_set(&coord_set, &prior_echo) {
+                None => tracing::debug!(
+                    "fleet::heartbeat: no previous tenant_ids echo on record — deferring \
+                     binding reconciliation one heartbeat so a drop is confirmed twice"
+                ),
+                Some(confirmed) => {
+                    // Blocking: it takes the paired_user.json write lock and
+                    // reads/writes the credential store, so it runs on the
+                    // blocking pool, never on this async worker (review
+                    // round 2, LOW).
+                    let reconciled = spawn_blocking_tracked(move || {
+                        qontinui_runner_lib::pair::reconcile_paired_bindings(&confirmed)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("binding reconcile task panicked: {e}")));
+                    match reconciled {
+                        Ok(report) => {
+                            if report.changed() {
+                                info!(
+                                    "fleet::heartbeat: reconciled bindings against coord \
+                                     (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+                                    report.dropped, report.dropped_slots, report.default_repointed
+                                );
+                            }
+                            // Only tenants THIS echo names: one held over from
+                            // the previous echo is being unbound, not a gap.
+                            for (t, slot) in report.coord_only {
+                                if coord_set.contains(&t) {
+                                    warn_coord_only_binding_once(t, slot);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
+                        }
                     }
-                    for (t, slot) in report.coord_only {
-                        warn_coord_only_binding_once(t, slot);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
             }
         } else if let Some(resp_tenant) = response_tenant_id(&body) {
@@ -8775,6 +8988,273 @@ mod tests {",
             skill_parity_record_path_from(None, None),
             None,
             "no state dir and no ~/.qontinui is None, which the caller warns about"
+        );
+    }
+}
+
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
+/// review finding 1: with `paired_user.json` gone AND the legacy slot dead,
+/// the heartbeat must still resolve a binding set — from the per-tenant slots
+/// — and present that slot's credential, so it keeps re-stamping
+/// `coord_bound_tenants.json` and the heal's Guard 1 never locks out.
+#[cfg(test)]
+mod binding_set_resolution_tests {
+    use super::*;
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn the_file_wins_and_presents_the_default_slot() {
+        let set = choose_binding_set(
+            || Some((t(1), vec![t(2)])),
+            || panic!("the legacy slot is not read when the file answers"),
+            || panic!("the per-tenant slots are not read when the file answers"),
+        )
+        .expect("file");
+        assert_eq!(set.default_tenant, t(1));
+        assert_eq!(set.tenant_ids, vec![t(1), t(2)]);
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    #[test]
+    fn a_usable_legacy_slot_answers_before_the_per_tenant_slots() {
+        let set = choose_binding_set(
+            || None,
+            || Some((t(3), true)),
+            || panic!("slots are not read when a usable legacy JWT answers"),
+        )
+        .expect("legacy");
+        assert_eq!(set.tenant_ids, vec![t(3)]);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    /// THE lockout shape: no file, legacy slot empty or dead, a usable
+    /// per-tenant slot. The heartbeat is sent, under that slot's credential.
+    #[test]
+    fn no_file_and_a_dead_or_empty_legacy_slot_fall_back_to_the_per_tenant_slots() {
+        for legacy in [None, Some((t(9), false))] {
+            let set = choose_binding_set(|| None, || legacy, || Some((t(5), vec![t(4), t(5)])))
+                .expect("the heartbeat must still resolve a binding set");
+            assert_eq!(set.default_tenant, t(5));
+            assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+            assert_eq!(set.source, BindingSource::TenantSlotClaims);
+            // Device would present the dead/empty legacy slot, i.e. nothing.
+            assert_eq!(
+                set.bearer_scope(),
+                crate::auth::TenantScope::Owned(t(5)),
+                "{legacy:?}"
+            );
+        }
+    }
+
+    /// Injected sources: `file` and `legacy` as given; the three heartbeat
+    /// sources PANIC, so any resolver that reads them fails the test.
+    fn sources_without_slots<'a>(
+        file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+        legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    ) -> BindingSources<'a> {
+        BindingSources {
+            file,
+            legacy,
+            slots: &|| panic!("the per-tenant slots must not be read"),
+            bound: &|| panic!("coord's bound set must not be read"),
+            active: &|| panic!("machine.json's active tenant must not be read"),
+        }
+    }
+
+    /// Review round 2, MEDIUM 2 + round 3: the per-tenant-slot fallback is
+    /// the heartbeat's ALONE, pinned through `resolve_binding_set`'s own
+    /// wiring (`resolve_binding_set_with`, which `resolve_binding_set` calls
+    /// with the real sources) rather than through `choose_binding_set` with a
+    /// hand-written `|| None` — so re-adding the slot fallback there fails
+    /// this test. It is handed panicking slot / bound / active sources: with
+    /// no file and an empty legacy slot it answers `None` without touching
+    /// them, and a dead legacy slot still yields its claim (the historical
+    /// behaviour).
+    #[test]
+    fn the_non_heartbeat_path_never_falls_back_to_the_per_tenant_slots() {
+        assert!(resolve_binding_set_with(&sources_without_slots(&|| None, &|| None)).is_none());
+        let dead =
+            resolve_binding_set_with(&sources_without_slots(&|| None, &|| Some((t(7), false))))
+                .expect("a dead legacy claim still names its tenant");
+        assert_eq!(dead.default_tenant, t(7));
+        assert_eq!(dead.source, BindingSource::LegacySlotClaim);
+        // Given the SAME no-file / no-legacy shape and usable slots, the
+        // heartbeat resolver does read them — the counter proves the source
+        // is wired there and only there.
+        let slot_reads = std::cell::Cell::new(0u32);
+        let slots = || {
+            slot_reads.set(slot_reads.get() + 1);
+            Some(vec![t(4), t(5)])
+        };
+        let src = BindingSources {
+            file: &|| None,
+            legacy: &|| None,
+            slots: &slots,
+            bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("never recorded"),
+            active: &|| None,
+        };
+        assert!(resolve_binding_set_with(&src).is_none());
+        assert_eq!(
+            slot_reads.get(),
+            0,
+            "resolve_binding_set_with read the slots"
+        );
+        let hb = resolve_heartbeat_binding_set_with(&src)
+            .expect("the heartbeat resolves from the slots");
+        assert_eq!(slot_reads.get(), 1);
+        assert_eq!(hb.default_tenant, t(5));
+        assert_eq!(hb.source, BindingSource::TenantSlotClaims);
+        assert_eq!(hb.bearer_scope(), crate::auth::TenantScope::Owned(t(5)));
+    }
+
+    /// Review round 3: `resolve_heartbeat_binding_set_with` feeds the bound
+    /// set and the active tenant into the slot fallback — a Known set
+    /// excludes an unbound slot tenant (even the greatest id, even the
+    /// active one), the active tenant is preferred when it survives, and the
+    /// file or a usable legacy claim still answers first without any
+    /// heartbeat source being read.
+    #[test]
+    fn the_heartbeat_resolver_feeds_bound_and_active_into_the_slot_fallback() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        let resolve = |bound: Vec<uuid::Uuid>, active: Option<uuid::Uuid>| {
+            let bound_fn = move || B::Known(bound.clone());
+            let active_fn = move || active;
+            resolve_heartbeat_binding_set_with(&BindingSources {
+                file: &|| None,
+                legacy: &|| Some((t(9), false)),
+                slots: &|| Some(vec![t(4), t(5), t(6)]),
+                bound: &bound_fn,
+                active: &active_fn,
+            })
+        };
+        // Unbound 6 (the greatest id) is excluded; greatest bound wins.
+        let set = resolve(vec![t(4), t(5)], None).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+        assert_eq!(set.source, BindingSource::TenantSlotClaims);
+        // The active tenant is preferred over the greatest id…
+        let set = resolve(vec![t(4), t(5)], Some(t(4))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(4));
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Owned(t(4)));
+        // …but never when coord does not list it as bound.
+        let set = resolve(vec![t(4), t(5)], Some(t(6))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        // A Known set listing none of the slots: the dead legacy claim.
+        let set = resolve(vec![t(1)], None).expect("legacy claim");
+        assert_eq!(set.default_tenant, t(9));
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        // The file answers first; the heartbeat sources are never read.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(
+            &|| Some((t(1), vec![t(1)])),
+            &|| panic!("the legacy slot is not read when the file answers"),
+        ))
+        .expect("file");
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        // So does a usable legacy claim.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(&|| None, &|| {
+            Some((t(3), true))
+        }))
+        .expect("legacy");
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+    }
+
+    /// The heartbeat's slot fallback drops tenants coord's KNOWN set does not
+    /// list; an UNKNOWN set allows every candidate (the heartbeat is what
+    /// re-stamps it — filtering there would rebuild the lockout); a Known set
+    /// that lists none of them yields `None`.
+    #[test]
+    fn the_heartbeat_slot_fallback_is_filtered_by_a_known_bound_set() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5), t(6)], &B::Known(vec![t(4)]), None),
+            Some((t(4), vec![t(4)])),
+            "unbound 5 and 6 (greater ids) must not be chosen"
+        );
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(6), t(4)], &B::Unknown("stale"), None),
+            Some((t(6), vec![t(4), t(6)]))
+        );
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(5)], &B::Known(vec![t(4)]), None),
+            None
+        );
+    }
+
+    /// `machine.json`'s `active_tenant_id` is the default when it survives
+    /// the filter; otherwise the greatest id — never an active tenant that
+    /// holds no usable slot or that coord unbound.
+    #[test]
+    fn the_heartbeat_slot_fallback_prefers_the_active_tenant() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(4))),
+            Some((t(4), vec![t(4), t(5)]))
+        );
+        // Active tenant holds no usable slot: greatest id.
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(9))),
+            Some((t(5), vec![t(4), t(5)]))
+        );
+        // Active tenant is outside coord's known set: filtered, not chosen.
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Known(vec![t(5)]), Some(t(4))),
+            Some((t(5), vec![t(5)]))
+        );
+        // The bearer scope follows the chosen default.
+        let set = choose_binding_set(
+            || None,
+            || Some((t(9), false)),
+            || heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(4))),
+        )
+        .expect("slot-backed");
+        assert_eq!(set.default_tenant, t(4));
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Owned(t(4)));
+    }
+
+    #[test]
+    fn a_dead_legacy_claim_is_the_last_resort_and_nothing_is_none() {
+        let set =
+            choose_binding_set(|| None, || Some((t(7), false)), || None).expect("dead legacy");
+        assert_eq!(set.tenant_ids, vec![t(7)]);
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        assert!(choose_binding_set(|| None, || None, || None).is_none());
+    }
+
+    /// End to end over a real store: the slot-backed scope resolves to the
+    /// slot's own JWT, so the register is authenticated rather than anonymous.
+    #[test]
+    fn the_slot_backed_scope_presents_the_slots_jwt_while_device_presents_nothing() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.path().join("t.enc"))
+            .expect("storage");
+        let am = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let tenant = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let payload = format!(
+            r#"{{"sub":"device:d","tenant_id":"{tenant}","user_id":"22222222-2222-4222-8222-222222222222","exp":{}}}"#,
+            chrono::Utc::now().timestamp() + 3600
+        );
+        let jwt = format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"none"}"#),
+            enc(payload.as_bytes())
+        );
+        am.store_tenant_device_jwt(&tenant, &jwt).expect("slot");
+        let set = choose_binding_set(|| None, || None, || Some((tenant, vec![tenant])))
+            .expect("slot-backed set");
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, set.bearer_scope(), None, 1).as_deref(),
+            Some(jwt.as_str())
+        );
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, crate::auth::TenantScope::Device, None, 1),
+            None,
+            "the legacy slot is empty: Device would send the heartbeat anonymously"
         );
     }
 }

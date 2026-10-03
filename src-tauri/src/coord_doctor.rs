@@ -831,7 +831,11 @@ fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
         {
             let auth_ref = crate::auth::AuthManager::new();
             Check::new(s_paired.name, s_paired.fix, move || {
-                let paired = crate::pair::read_paired_user_id_from_disk().is_some();
+                // THE heal's predicate (`!device_is_paired`), so this check's
+                // "missing / blank / unparseable" wording describes exactly the
+                // states `pair::heal_vanished_paired_user` acts on.
+                let heal_cause = crate::pair::paired_user_heal_cause();
+                let paired = matches!(heal_cause, Ok(None));
                 let bearer = auth_ref
                     .get_access_token()
                     .ok()
@@ -842,7 +846,13 @@ fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
                         true,
                         "paired_user.json present and a bearer is stored".into(),
                     ),
-                    (false, _) => (false, "paired_user.json missing — runner not paired".into()),
+                    (false, _) => (
+                        false,
+                        paired_user_missing_detail(
+                            &heal_cause,
+                            &crate::pair::held_credential_census(),
+                        ),
+                    ),
                     (true, false) => (
                         false,
                         "paired but access-token slot is empty — sign in".into(),
@@ -930,6 +940,58 @@ fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
     ];
 
     checks
+}
+
+/// The `paired_signed_in` detail when `paired_user.json` names no binding.
+///
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// Phase 3: "missing" alone read as *"this runner was never paired"* on a box
+/// that still held a valid per-tenant credential — the 2026-09-28 shape. The
+/// census tells the two apart, and the (b) text names the file's state, the
+/// self-heal that should have rebuilt it, and where its refusal is recorded.
+/// `cause` is the heal's own predicate ([`crate::pair::paired_user_heal_cause`]:
+/// `absent`, `blank` or `unparseable`), so the wording is reachable for
+/// exactly the states the heal acts on. Read-only: the doctor reports the
+/// heal, it never runs it.
+fn paired_user_missing_detail(
+    cause: &Result<Option<&'static str>, String>,
+    census: &Result<crate::pair::HeldCredentialCensus, String>,
+) -> String {
+    let state = match cause {
+        Ok(Some("absent")) => "paired_user.json is missing".to_string(),
+        Ok(Some(c)) => format!("paired_user.json is present but {c} (names no binding)"),
+        Ok(None) => "paired_user.json names a binding".to_string(),
+        Err(e) => format!("paired_user.json could not be read ({e})"),
+    };
+    match census {
+        Ok(c) if !c.usable_tenant_slots.is_empty() => {
+            let tenants: Vec<String> = c
+                .usable_tenant_slots
+                .iter()
+                .map(uuid::Uuid::to_string)
+                .collect();
+            format!(
+                "{state}, but {} VALID per-tenant coord credential(s) exist ({}) with no \
+                 default binding pointing at them. The runner's device-JWT refresher \
+                 self-heals the file from those slots every tick \
+                 (pair::heal_vanished_paired_user, guarded by coord's bound-tenant set in \
+                 coord_bound_tenants.json); if this persists, the heal REFUSED — the runner log \
+                 line `paired_user.json heal refused: <why>` and /health \
+                 coordCredential.detail name the guard (including when those slots belong \
+                 only to tenants coord no longer binds). Sign in to re-pair.",
+                tenants.len(),
+                tenants.join(", ")
+            )
+        }
+        Ok(_) => format!(
+            "{state} — runner not paired, and no valid per-tenant device-JWT slot exists for \
+             the self-heal to rebuild it from"
+        ),
+        Err(e) => format!(
+            "{state} — and whether a valid per-tenant credential exists to heal it from is \
+             UNKNOWN: {e}"
+        ),
+    }
 }
 
 /// Check 9 — this process did not inherit Claude Code's process-topology
@@ -2679,6 +2741,68 @@ mod tests {
     }
     fn advisory_red(name: &'static str) -> Check<'static> {
         Check::advisory(name, "fix-it", || (false, "advisory red".into()))
+    }
+
+    /// Plan 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3:
+    /// a missing `paired_user.json` beside a VALID slot must not read as
+    /// "never paired" — it names the file, the heal and where its refusal is.
+    #[test]
+    fn paired_user_missing_detail_tells_a_held_slot_from_no_credential() {
+        let t = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let absent: Result<Option<&'static str>, String> = Ok(Some("absent"));
+        let held = paired_user_missing_detail(
+            &absent,
+            &Ok(crate::pair::HeldCredentialCensus {
+                usable_tenant_slots: vec![t],
+                legacy_slot_usable: false,
+            }),
+        );
+        for needle in [
+            "paired_user.json",
+            "heal_vanished_paired_user",
+            "heal refused",
+            "coordCredential.detail",
+            &t.to_string(),
+        ] {
+            assert!(held.contains(needle), "missing {needle:?} in: {held}");
+        }
+        assert!(!held.contains("not paired"), "{held}");
+
+        let none = paired_user_missing_detail(
+            &absent,
+            &Ok(crate::pair::HeldCredentialCensus {
+                usable_tenant_slots: vec![],
+                legacy_slot_usable: true,
+            }),
+        );
+        assert!(none.contains("runner not paired"), "{none}");
+
+        let unknown = paired_user_missing_detail(&absent, &Err("store locked".to_string()));
+        assert!(
+            unknown.contains("UNKNOWN") && unknown.contains("store locked"),
+            "{unknown}"
+        );
+        assert!(held.contains("paired_user.json is missing"), "{held}");
+    }
+
+    /// Review finding 6: the "(or blank/unparseable)" states are REACHABLE —
+    /// the check uses the heal's own predicate, so a present file that names
+    /// no binding is reported as such, not as "present and paired".
+    #[test]
+    fn paired_user_missing_detail_names_a_blank_or_unparseable_file() {
+        let census = Ok(crate::pair::HeldCredentialCensus {
+            usable_tenant_slots: vec![],
+            legacy_slot_usable: false,
+        });
+        for c in ["blank", "unparseable"] {
+            let d = paired_user_missing_detail(&Ok(Some(c)), &census);
+            assert!(d.contains(&format!("present but {c}")), "{d}");
+        }
+        let unreadable = paired_user_missing_detail(&Err("EACCES".into()), &census);
+        assert!(
+            unreadable.contains("could not be read (EACCES)"),
+            "{unreadable}"
+        );
     }
 
     // Advisory tier (plan 2026-07-28-runner-transcript-persistence-env-leak).
