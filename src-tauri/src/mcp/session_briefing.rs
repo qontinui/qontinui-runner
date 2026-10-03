@@ -416,7 +416,7 @@ pub(crate) fn validate_body(body: &str) -> Result<(), String> {
 /// single spawn, so an unkeyed `warn!` here would be one line per session.
 static LOGGED_REJECTIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-fn log_rejection_once(name: &str, version: i64, reason: &str) {
+pub(crate) fn log_rejection_once(name: &str, version: i64, reason: &str) {
     let key = format!("v{version}: {reason}");
     let Ok(mut seen) = LOGGED_REJECTIONS
         .get_or_init(|| Mutex::new(HashMap::new()))

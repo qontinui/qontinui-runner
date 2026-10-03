@@ -174,7 +174,12 @@ pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -
 /// fleet-neutral one is published to them; rendering it beside
 /// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] would give a session two
 /// conflicting recipes, one of them ungated.
-const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &["/runner/restart", "USE THE SUPERVISOR API"];
+const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &[
+    "/runner/restart",
+    "USE THE SUPERVISOR API",
+    "/runner/stop",
+    "signal-restart",
+];
 
 /// Refuse a served body with the legacy supervisor shape: the builtin renders
 /// instead, named as [`session_briefing::Provenance::BuiltinRejected`] with the
@@ -199,10 +204,12 @@ fn reject_legacy_supervisor_body(
     else {
         return served;
     };
-    warn!(
+    // Once per (version, reason), like the guard's own refusals: this runs on
+    // every render, and a tenant may hold the legacy body for a long time.
+    crate::mcp::session_briefing::log_rejection_once(
+        crate::mcp::fleet_policy_poller::BRIEFING_AI_SESSION_RULES,
         version,
-        marker = %marker,
-        "ai_session: served ai-session-rules carries the legacy supervisor recipe; rendering the builtin"
+        &format!("legacy supervisor recipe (`{marker}`)"),
     );
     RenderedBlock {
         text: builtin.to_string(),
@@ -3482,6 +3489,55 @@ mod tests {
         )));
     }
 
+    /// The other legacy marker is refused too, not only `USE THE SUPERVISOR API`.
+    #[test]
+    fn a_legacy_runner_restart_body_falls_back_to_the_builtin_on_the_up_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. Ask for POST /runner/restart.",
+                7,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: builtin-fallback (rejected coord v7)]")
+        );
+    }
+
+    /// The fleet-neutral seed itself, served by coord, is ACCEPTED on the up
+    /// arm: the legacy markers must never match the current template, or every
+    /// tenant's correct body would be refused without anyone noticing.
+    #[test]
+    fn the_neutral_template_served_by_coord_is_accepted_on_the_up_arm() {
+        for m in LEGACY_SUPERVISOR_BODY_MARKERS {
+            assert!(
+                !AI_SESSION_RULES_TEMPLATE.contains(m),
+                "the template carries legacy marker {m:?}"
+            );
+        }
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(AI_SESSION_RULES_TEMPLATE, 10, BriefingProvenance::Coord),
+        );
+        let base = "http://127.0.0.1:9876";
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: coord session_briefing/ai-session-rules v10]"),
+            "{}",
+            up.text
+        );
+        assert!(up.text.ends_with(&supervisor_restart_recipe(
+            &crate::api_config::get_supervisor_url(),
+            base
+        )));
+    }
+
     /// Lockstep pin with coord's seed of `session_briefing/ai-session-rules`:
     /// coord's seed body must hash to this same value. A coord-side pin of the
     /// digest does not exist yet; adding one is a follow-up.
@@ -3588,7 +3644,7 @@ mod tests {
             joined.ends_with("\n\nUSER PROMPT"),
             "the prompt must start its own paragraph: {joined:?}"
         );
-        assert!(!joined.contains("changes.USER PROMPT"));
+        assert!(!joined.contains("---USER PROMPT"));
     }
 
     /// The prohibition an edit may not delete. Losing it is not a wording
