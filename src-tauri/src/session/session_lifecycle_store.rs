@@ -8580,11 +8580,17 @@ mod gate_continuation_tests {
         let mut unit = gate_row(boot - 1);
         unit.gate_id = None;
         unit.gate_consuming_device_id = None;
-        assert_eq!(runner_restart_unreported_report(&closed(unit, "no-terminal"), boot), None);
+        assert_eq!(
+            runner_restart_unreported_report(&closed(unit, "no-terminal"), boot),
+            None
+        );
         // Half an identity, or no generation stamp: UNKNOWN, never a post.
         let mut half = gate_row(boot - 1);
         half.gate_consuming_device_id = None;
-        assert_eq!(runner_restart_unreported_report(&closed(half, "no-terminal"), boot), None);
+        assert_eq!(
+            runner_restart_unreported_report(&closed(half, "no-terminal"), boot),
+            None
+        );
         let mut unstamped = gate_row(boot - 1);
         unstamped.gate_bound_boot_ms = None;
         assert_eq!(
@@ -8592,7 +8598,10 @@ mod gate_continuation_tests {
             None
         );
         // Still open.
-        assert_eq!(runner_restart_unreported_report(&gate_row(boot - 1), boot), None);
+        assert_eq!(
+            runner_restart_unreported_report(&gate_row(boot - 1), boot),
+            None
+        );
     }
 
     // (e)
@@ -8628,7 +8637,9 @@ mod gate_continuation_tests {
         assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
         // This boot's restore pass marks it.
         s.mark_restore_pending(&csid);
-        let adopted = s.adopt_restored_gate(&csid, 200).expect("prior generation adopts");
+        let adopted = s
+            .adopt_restored_gate(&csid, 200)
+            .expect("prior generation adopts");
         assert_eq!(adopted.0, old_row().terminal_id);
         assert_eq!(adopted.1.to_string(), GATE);
         assert_eq!(adopted.2.map(|d| d.to_string()).as_deref(), Some(DEVICE));
@@ -8649,7 +8660,10 @@ mod gate_continuation_tests {
     // (g)
     #[test]
     fn non_restorable_close_reasons_exclude_poll_dead() {
-        assert_eq!(NON_RESTORABLE_CLOSE_REASONS, &["no-terminal", "never-started"]);
+        assert_eq!(
+            NON_RESTORABLE_CLOSE_REASONS,
+            &["no-terminal", "never-started"]
+        );
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }

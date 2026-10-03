@@ -2830,8 +2830,7 @@ fn next_anchor_reservation_token() -> AnchorReservationToken {
 /// here reset it wholesale, so a test in another module registering into it
 /// must hold this too.
 #[cfg(test)]
-pub(crate) static CONTINUATION_REGISTRY_TEST_LOCK: std::sync::Mutex<()> =
-    std::sync::Mutex::new(());
+pub(crate) static CONTINUATION_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
@@ -4039,11 +4038,7 @@ pub(crate) fn restore_continuation_registration(
         );
     }
     if reservation.held.is_some() {
-        reservation.handed_to_registry(
-            terminal_id,
-            carried.gate_id,
-            carried.consuming_device_id,
-        );
+        reservation.handed_to_registry(terminal_id, carried.gate_id, carried.consuming_device_id);
     } else {
         // A permit over nothing: its drop is a no-op, and the anchor the
         // session actually had lives on `carried`.
@@ -16028,7 +16023,10 @@ mod tests {
         let this_boot = 2_000;
         let adopted =
             crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_boot);
-        assert_eq!(adopted, Some(("term-restored".to_string(), gate, Some(device))));
+        assert_eq!(
+            adopted,
+            Some(("term-restored".to_string(), gate, Some(device)))
+        );
         assert_eq!(
             registered_continuation_gate("term-restored"),
             Some((Some(gate), Some(device))),
@@ -16053,7 +16051,9 @@ mod tests {
     /// registers nothing.
     #[test]
     fn reopened_gate_record_without_a_restore_marker_is_not_adopted() {
-        use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         let dir = tempfile::tempdir().unwrap();
