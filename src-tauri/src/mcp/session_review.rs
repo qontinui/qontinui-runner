@@ -59,7 +59,8 @@
 //! liveness AFTER that write and settles in-line ([`PromptDoor::target_live`]).
 //! And a runner restart drops every exit hook on the floor — so
 //! [`start_stranded_note_sweep`] settles, once at boot, every `submitted` note
-//! whose target no live terminal or task run holds.
+//! a previous process of this same runner instance sent ([`NoteSender`]) whose
+//! target no live terminal or task run holds.
 //!
 //! Every mutation emits `session-review-changed` `{ "sessionId": … }` so the
 //! page refreshes.
@@ -257,6 +258,47 @@ pub struct ReviewNote {
     pub submitted_at: Option<String>,
     pub confirmed_at: Option<String>,
     pub target: Option<NoteTarget>,
+    /// Which runner process sent it. Server-side bookkeeping for the boot
+    /// sweep, not part of the wire shape: `None` until the note is submitted,
+    /// and for rows submitted before the stamp existed.
+    #[serde(skip)]
+    pub sender: Option<NoteSender>,
+}
+
+/// The runner process that submitted a note: its instance name
+/// ([`crate::orchestration_loop::loop_engine::run_owner_instance`] — the
+/// `QONTINUI_INSTANCE_NAME`, or `primary`) and a UUID minted once per process.
+///
+/// Several runners can share one PG cluster — a temp or named runner attaches
+/// to the primary's embedded cluster (`database::embedded_pg`), and
+/// external-arm runners share one `database_url` — so "not live in THIS
+/// process" says nothing about a note another runner sent. The boot sweep
+/// settles only notes a PREVIOUS life of this same instance sent
+/// ([`NoteSender::is_previous_life_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteSender {
+    pub instance: String,
+    pub boot_id: String,
+}
+
+/// This process's boot id: minted on first use, constant for its lifetime.
+static BOOT_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+impl NoteSender {
+    /// The stamp this process puts on every note it submits.
+    pub fn this_process() -> Self {
+        NoteSender {
+            instance: crate::orchestration_loop::loop_engine::run_owner_instance(),
+            boot_id: BOOT_ID.clone(),
+        }
+    }
+
+    /// True when `self` was sent by an earlier process of `current`'s
+    /// instance: same instance name, different boot id. Another instance's
+    /// notes, and this process's own, are never a previous life.
+    pub fn is_previous_life_of(&self, current: &NoteSender) -> bool {
+        self.instance == current.instance && self.boot_id != current.boot_id
+    }
 }
 
 /// One hunk the operator has read.
@@ -289,6 +331,7 @@ pub enum NoteEvent {
         marker: String,
         at: String,
         target: NoteTarget,
+        sender: NoteSender,
     },
     Confirm {
         marker: String,
@@ -345,7 +388,12 @@ pub fn transition(note: &ReviewNote, event: NoteEvent) -> Result<ReviewNote, Ref
         NoteEvent::Detach => next.state = NoteState::Pending,
         NoteEvent::Discard => next.state = NoteState::Discarded,
         NoteEvent::Edit { body } => next.body = body,
-        NoteEvent::Submit { marker, at, target } => {
+        NoteEvent::Submit {
+            marker,
+            at,
+            target,
+            sender,
+        } => {
             if !is_marker(&marker) {
                 return Err(refuse(format!(
                     "\"{marker}\" is not an 8-hex review marker"
@@ -355,6 +403,7 @@ pub fn transition(note: &ReviewNote, event: NoteEvent) -> Result<ReviewNote, Ref
             next.marker = Some(marker);
             next.submitted_at = Some(at);
             next.target = Some(target);
+            next.sender = Some(sender);
         }
         NoteEvent::Confirm { marker, at } => {
             // Confirmation is evidence the prompt THIS note went out in
@@ -909,6 +958,7 @@ pub async fn create_note(
         submitted_at: None,
         confirmed_at: None,
         target: None,
+        sender: None,
     };
     store.insert_note(&note).await.map_err(ApiError::internal)?;
     Ok(note)
@@ -1115,6 +1165,7 @@ pub async fn send(
     // Every edge is validated BEFORE the write, so a send either delivers with
     // all of its notes legal or delivers nothing.
     let at = now_iso();
+    let sender = NoteSender::this_process();
     let mut submitted = Vec::with_capacity(notes.len());
     for note in &notes {
         let next = transition(
@@ -1123,6 +1174,7 @@ pub async fn send(
                 marker: marker.clone(),
                 at: at.clone(),
                 target: req.target.clone(),
+                sender: sender.clone(),
             },
         )
         .map_err(|r| ApiError::refused(&note.id, r))?;
@@ -1304,15 +1356,29 @@ pub async fn settle_target_exit(
     Ok(changed)
 }
 
-/// `submitted → unknown` for every `submitted` note whose target `is_live`
-/// says is gone — the boot sweep's body, over the store and a liveness seam.
-/// Returns the sessions whose notes changed.
+/// `submitted → unknown` for every `submitted` note a previous life of `me`
+/// sent whose target `is_live` says is gone — the boot sweep's body, over the
+/// store, this process's stamp and a liveness seam. Returns the sessions whose
+/// notes changed.
+///
+/// Only a previous life's notes: another instance sharing the PG cluster may
+/// still be delivering into its own live targets, this process's own notes
+/// have live exit hooks, and an unstamped (pre-stamp) row cannot be
+/// attributed to anyone — all three are left alone.
 pub async fn settle_stranded(
     store: &dyn ReviewStore,
+    me: &NoteSender,
     is_live: &(dyn Fn(&NoteTarget) -> bool + Send + Sync),
 ) -> Result<BTreeSet<String>, String> {
     let mut changed = BTreeSet::new();
     for note in store.submitted_notes().await? {
+        if !note
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.is_previous_life_of(me))
+        {
+            continue;
+        }
         // A `submitted` note always records its target; one that somehow does
         // not has nowhere it could still arrive.
         if note.target.as_ref().is_some_and(is_live) {
@@ -1407,8 +1473,15 @@ const STRANDED_SWEEP_DELAY: Duration = Duration::from_secs(15);
 /// Attempts before the boot sweep gives up (the store never came up).
 const STRANDED_SWEEP_ATTEMPTS: u32 = 8;
 
-/// The boot sweep: once, settle every `submitted` note whose target is not
-/// live in THIS process to `unknown`.
+/// The boot sweep: once, settle to `unknown` every `submitted` note that a
+/// previous process of THIS runner instance sent and whose target is not live
+/// in this process.
+///
+/// Scoped by the note's [`NoteSender`] stamp because several runners can
+/// share one PG cluster: a temp runner booting must not settle the notes the
+/// primary is still delivering. Notes another instance sent are that
+/// instance's own sweep's, and unstamped rows (submitted before the stamp
+/// existed) are left alone.
 ///
 /// A runner restart loses every exit hook a note was waiting on: the terminal
 /// it was sent into, and the stream-json worker, died with the old process,
@@ -1431,7 +1504,7 @@ pub fn start_stranded_note_sweep(app: tauri::AppHandle) {
             };
             let probe = app.clone();
             let is_live = move |target: &NoteTarget| target_is_live(&probe, target);
-            match settle_stranded(&*pg, &is_live).await {
+            match settle_stranded(&*pg, &NoteSender::this_process(), &is_live).await {
                 Ok(sessions) => {
                     info!(
                         sessions = sessions.len(),
@@ -1898,6 +1971,7 @@ mod tests {
             submitted_at: None,
             confirmed_at: None,
             target: None,
+            sender: None,
         }
     }
 
@@ -1913,6 +1987,7 @@ mod tests {
                 marker: MARKER.to_string(),
                 at: now_iso(),
                 target: terminal(),
+                sender: NoteSender::this_process(),
             },
             NoteEventKind::Confirm => NoteEvent::Confirm {
                 marker: MARKER.to_string(),
@@ -1989,6 +2064,7 @@ mod tests {
             marker: "ABCDEF12".to_string(),
             at: now_iso(),
             target: terminal(),
+            sender: NoteSender::this_process(),
         };
         assert!(transition(&note_in(NoteState::Attached), bad).is_err());
         let foreign = NoteEvent::Confirm {
@@ -2674,8 +2750,9 @@ mod tests {
         assert_eq!(out.notes[0].state, NoteState::Confirmed);
     }
 
-    /// The boot sweep settles exactly the `submitted` notes whose target is
-    /// not live, and leaves every other note alone.
+    /// The boot sweep settles exactly the `submitted` notes a previous life of
+    /// this instance sent to a target that is gone, and leaves every other
+    /// note alone.
     #[tokio::test]
     async fn session_review_boot_sweep_settles_only_dead_targets() {
         let store = MemoryStore::default();
@@ -2708,14 +2785,92 @@ mod tests {
             .await
             .expect("send");
         }
+        // The next life of this same instance.
+        let next_life = NoteSender {
+            boot_id: "next-boot".to_string(),
+            ..NoteSender::this_process()
+        };
         let is_live = |t: &NoteTarget| t.id() == "new-term";
-        let changed = settle_stranded(&store, &is_live).await.unwrap();
+        let changed = settle_stranded(&store, &next_life, &is_live).await.unwrap();
         assert_eq!(changed, BTreeSet::from([SESSION.to_string()]));
         assert_eq!(store.note(&dead.id).state, NoteState::Unknown);
         assert_eq!(store.note(&live.id).state, NoteState::Submitted);
         assert_eq!(store.note(&untouched.id).state, NoteState::Attached);
         // Idempotent.
-        assert!(settle_stranded(&store, &is_live).await.unwrap().is_empty());
+        assert!(settle_stranded(&store, &next_life, &is_live)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Several runners share one PG cluster: a sweep settles only notes a
+    /// previous life of ITS OWN instance sent. Another instance's notes, this
+    /// process's own, and unstamped (pre-stamp) rows stay `submitted` even
+    /// when their target is not live here.
+    #[tokio::test]
+    async fn session_review_boot_sweep_leaves_other_senders_alone() {
+        let me = NoteSender {
+            instance: "temp-runner-1".to_string(),
+            boot_id: "boot-now".to_string(),
+        };
+        let stamped = |id: &str, sender: Option<NoteSender>| ReviewNote {
+            id: id.to_string(),
+            state: NoteState::Submitted,
+            submitted_at: Some(now_iso()),
+            target: Some(NoteTarget::TerminalId(format!("term-{id}"))),
+            sender,
+            ..note_in(NoteState::Submitted)
+        };
+        let store = MemoryStore::default();
+        for note in [
+            stamped(
+                "other-instance",
+                Some(NoteSender {
+                    instance: "primary".to_string(),
+                    boot_id: "boot-before".to_string(),
+                }),
+            ),
+            stamped(
+                "previous-life",
+                Some(NoteSender {
+                    instance: me.instance.clone(),
+                    boot_id: "boot-before".to_string(),
+                }),
+            ),
+            stamped("this-boot", Some(me.clone())),
+            stamped("unstamped", None),
+        ] {
+            store.insert_note(&note).await.unwrap();
+        }
+        let nothing_live = |_: &NoteTarget| false;
+        let changed = settle_stranded(&store, &me, &nothing_live).await.unwrap();
+        assert_eq!(changed, BTreeSet::from([SESSION.to_string()]));
+        assert_eq!(store.note("previous-life").state, NoteState::Unknown);
+        for id in ["other-instance", "this-boot", "unstamped"] {
+            assert_eq!(store.note(id).state, NoteState::Submitted, "{id}");
+        }
+    }
+
+    /// A send stamps every note it submits with this process's sender.
+    #[tokio::test]
+    async fn session_review_send_stamps_the_sending_process() {
+        let store = MemoryStore::default();
+        let note = attached_note(&store, SESSION).await;
+        assert_eq!(note.sender, None);
+        send(
+            &store,
+            &ScriptedDoor::ok(),
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&note.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect("send");
+        assert_eq!(
+            store.note(&note.id).sender,
+            Some(NoteSender::this_process())
+        );
     }
 
     #[test]

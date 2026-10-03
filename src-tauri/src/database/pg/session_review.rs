@@ -36,7 +36,7 @@ use tracing::info;
 
 use super::PgDb;
 use crate::mcp::session_review::{
-    HunkRef, NoteState, NoteTarget, ReadHunk, ReviewNote, ReviewStore,
+    HunkRef, NoteSender, NoteState, NoteTarget, ReadHunk, ReviewNote, ReviewStore,
 };
 
 /// How long review rows are kept: the snapshot retention, for the reason in
@@ -57,6 +57,12 @@ pub const REVIEW_RETENTION_DAYS: i32 = super::session_file_snapshots::SNAPSHOT_R
 /// the target index serves every terminal exit and the boot sweep, which only
 /// ever look at `submitted` rows. The marker index replaced a `submitted`-only
 /// one, dropped here so a provisioned database does not keep both.
+///
+/// `sender_instance` / `sender_boot_id` stamp the runner process that
+/// submitted a note ([`NoteSender`]), so the boot sweep on a PG cluster shared
+/// by several runners settles only its own previous life's notes. Added with
+/// `ADD COLUMN IF NOT EXISTS` so a table provisioned before them gains them;
+/// rows submitted before then keep NULL and are never swept.
 pub const SESSION_REVIEW_DDL: &str = "\
 CREATE SCHEMA IF NOT EXISTS project; \
 CREATE TABLE IF NOT EXISTS project.session_review_hunks ( \
@@ -83,6 +89,8 @@ CREATE TABLE IF NOT EXISTS project.session_review_notes ( \
     target_kind  TEXT, \
     target_id    TEXT \
 ); \
+ALTER TABLE project.session_review_notes ADD COLUMN IF NOT EXISTS sender_instance TEXT; \
+ALTER TABLE project.session_review_notes ADD COLUMN IF NOT EXISTS sender_boot_id TEXT; \
 CREATE INDEX IF NOT EXISTS idx_session_review_notes_session \
     ON project.session_review_notes (session_id, created_at); \
 DROP INDEX IF EXISTS project.idx_session_review_notes_submitted_marker; \
@@ -92,7 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_session_review_notes_submitted_target \
     ON project.session_review_notes (target_kind, target_id) WHERE state = 'submitted';";
 
 const NOTE_COLUMNS: &str = "id, session_id, file_path, hunk_key, hunk_header, excerpt, body, \
-     state, marker, created_at, submitted_at, confirmed_at, target_kind, target_id";
+     state, marker, created_at, submitted_at, confirmed_at, target_kind, target_id, \
+     sender_instance, sender_boot_id";
 
 fn iso(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -128,6 +137,12 @@ fn note_from_row(r: &tokio_postgres::Row) -> Result<ReviewNote, String> {
         })?),
         _ => None,
     };
+    let sender_instance: Option<String> = col(r, "sender_instance")?;
+    let sender_boot_id: Option<String> = col(r, "sender_boot_id")?;
+    let sender = match (sender_instance, sender_boot_id) {
+        (Some(instance), Some(boot_id)) => Some(NoteSender { instance, boot_id }),
+        _ => None,
+    };
     Ok(ReviewNote {
         id: col(r, "id")?,
         session_id: col(r, "session_id")?,
@@ -142,6 +157,7 @@ fn note_from_row(r: &tokio_postgres::Row) -> Result<ReviewNote, String> {
         submitted_at: col::<Option<DateTime<Utc>>>(r, "submitted_at")?.map(iso),
         confirmed_at: col::<Option<DateTime<Utc>>>(r, "confirmed_at")?.map(iso),
         target,
+        sender,
     })
 }
 
@@ -311,12 +327,15 @@ impl ReviewStore for PgDb {
         let confirmed_at = parse_opt_iso("confirmedAt", note.confirmed_at.as_deref())?;
         let target_kind = note.target.as_ref().map(NoteTarget::kind);
         let target_id = note.target.as_ref().map(NoteTarget::id);
+        let sender_instance = note.sender.as_ref().map(|s| s.instance.as_str());
+        let sender_boot_id = note.sender.as_ref().map(|s| s.boot_id.as_str());
         let conn = self.review_conn().await?;
         let updated = conn
             .execute(
                 "UPDATE project.session_review_notes \
                  SET body = $3, state = $4, marker = $5, submitted_at = $6, \
-                     confirmed_at = $7, target_kind = $8, target_id = $9 \
+                     confirmed_at = $7, target_kind = $8, target_id = $9, \
+                     sender_instance = $10, sender_boot_id = $11 \
                  WHERE id = $1 AND state = $2",
                 &[
                     &note.id,
@@ -328,6 +347,8 @@ impl ReviewStore for PgDb {
                     &confirmed_at,
                     &target_kind,
                     &target_id,
+                    &sender_instance,
+                    &sender_boot_id,
                 ],
             )
             .await
