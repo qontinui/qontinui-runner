@@ -966,6 +966,57 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
 
+    /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
+    /// manager. `bind_coord_session` must fire the observer with the
+    /// terminal's PINNED harness id (not its terminal id), and
+    /// `coord_session_id_for_pinned` must resolve that pinned id — never the
+    /// terminal id — to the bound row.
+    #[test]
+    fn bind_coord_session_fires_the_observer_with_the_pinned_id() {
+        use std::sync::{Arc, Mutex};
+        let tm = TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-1", session.clone());
+        let seen: Arc<Mutex<Vec<(String, String, uuid::Uuid)>>> = Default::default();
+        {
+            let seen = seen.clone();
+            tm.attach_coord_bind_observer(move |pinned, terminal, coord| {
+                seen.lock()
+                    .unwrap()
+                    .push((pinned.to_string(), terminal.to_string(), coord));
+            });
+        }
+        assert_eq!(
+            tm.coord_session_id_for_pinned("test-pinned-session"),
+            None,
+            "no row before the bind"
+        );
+
+        let coord = uuid::Uuid::new_v4();
+        tm.bind_coord_session(&session, coord);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                "test-pinned-session".to_string(),
+                session.id().to_string(),
+                coord
+            )],
+            "the observer sees every bind, keyed by the pinned harness id"
+        );
+        assert_eq!(
+            tm.coord_session_id_for_pinned("test-pinned-session"),
+            Some(coord)
+        );
+        assert_eq!(
+            tm.coord_session_id_for_pinned(session.id()),
+            None,
+            "the terminal id is not a harness id and never resolves"
+        );
+    }
+
     /// The production rule behind `coord_session_id_for_pinned`: a live
     /// terminal pinned to the id, and only one that has a coord row.
     #[test]

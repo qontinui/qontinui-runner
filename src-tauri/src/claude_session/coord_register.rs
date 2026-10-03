@@ -1226,22 +1226,26 @@ impl AiCoordRegistrar {
         let Some(store) = self.inner.lifecycle_store.get() else {
             return Vec::new();
         };
-        store
-            .unsynced_finished_records()
-            .into_iter()
-            .filter(|rec| {
-                self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), bound)
-                    == Some(target)
-            })
-            .map(|rec| {
-                info!(
-                    "ai_coord_register: session {} has an unsynced finished mark resolving \
-                     to coord session {} — delivering the owed write",
-                    rec.claude_session_id, target
-                );
-                self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
-            })
-            .collect()
+        // Serialized against `set_finished` (an unmark cannot interleave
+        // between this read and the enqueue): see
+        // `SessionLifecycleStore::with_unsynced_finished_records`.
+        store.with_unsynced_finished_records(|records| {
+            records
+                .into_iter()
+                .filter(|rec| {
+                    self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), bound)
+                        == Some(target)
+                })
+                .map(|rec| {
+                    info!(
+                        "ai_coord_register: session {} has an unsynced finished mark resolving \
+                         to coord session {} — delivering the owed write",
+                        rec.claude_session_id, target
+                    );
+                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                })
+                .collect()
+        })
     }
 
     /// Tell coord an operator UNMARKED this session's finished marker, so
