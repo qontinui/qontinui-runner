@@ -157,12 +157,16 @@ Both endpoints flip the same underlying `activeTab` state. Differences:
 | -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------- |
 | Tab id location                  | JSON body `{ "tab": "..." }`                        | URL path segment                                              |
 | Transport                        | `page/evaluate` dispatching a JS `CustomEvent`      | Native Tauri event                                            |
-| Return                           | Waits ~100ms, reads `[data-page-id]` and returns it | Returns 200 immediately (fire-and-forget)                     |
+| Return                           | Waits ~100ms, returns `pageId` (outer wrapper), `activePageId` (deepest visible `data-page-id` inside the page wrapper) and `pageIdChain` | Returns 200 immediately (fire-and-forget)                     |
 | Works when webview is slow/stuck | Less reliable (needs JS eval round-trip)            | More reliable (no eval required)                              |
 | Settings sub-tab support         | Main-tab only; sub-tab stays on default             | Sub-tab propagates via `TabContent` → `<Settings defaultTab>` |
 
 Prefer `/activate-tab/` for automation; prefer `/page/set-tab` when you
-need the post-switch `pageId` readback in a single round-trip.
+need the post-switch page-id readback (`pageId` / `activePageId` /
+`pageIdChain`) in a single round-trip.
+`activePageId` skips hidden views (unmounted or `display:none`, i.e. a zero
+rect) and equals `pageId` when the page publishes no nested id — Settings
+sub-tabs carry none, so it cannot tell you which Settings sub-tab is showing.
 
 ### Request
 
