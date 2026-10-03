@@ -133,6 +133,24 @@
 //!   read carries no tenant answer, which is exactly the no-information case
 //!   the default exists for.
 //!
+//! For the command-safety rewrite level (`command_safety_rewrite`, plan
+//! `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`) the
+//! posture is the MIRROR of the interception mode's, because this dial's safe
+//! side is ON — the guard it gates only ever turns a would-be operator prompt
+//! into a rewrite:
+//!
+//! - Before the FIRST successful poll ⇒ **`on`** (the domain default).
+//! - An authoritative no-row answer ⇒ **`on`**, whatever level rode along — so
+//!   a coord that has not yet declared the domain's default cannot switch it
+//!   off.
+//! - An explicit `off` row ⇒ **`off`**; explicit `on` ⇒ **`on`**; any other
+//!   explicit level ⇒ **`unrecognised`**, which behaves as on.
+//! - A poll ERROR, a **401** and a **404** keep LAST-GOOD (none of them is a
+//!   statement about the tenant). Unpaired ⇒ SKIPPED, cache untouched.
+//! - A poisoned lock reads **`on`**.
+//! - Read at SPAWN by `session::claude_hook::materialize`, so a flip reaches
+//!   terminals and sessions started after it only.
+//!
 //! For the session-briefing documents, the SAME posture with the compiled-in
 //! **builtin** playing the safe role — it is the text the runner injected
 //! before this cache existed, so falling back to it cannot make the runner do
@@ -222,6 +240,19 @@ const CONTROLS_DOMAIN: &str = "fleet_resources";
 /// session at spawn time, and a session is not repo-scoped, so a `repo` band
 /// would have no resolvable `scope_key` at the moment the decision is made.
 const PLAN_CAPTURE_DOMAIN: &str = "plan_capture";
+
+/// The fleet-policy domain carrying the **command-safety rewrite** dial (plan
+/// `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`, D5):
+/// whether the runner's `--settings` carrier registers the `PreToolUse` `Bash`
+/// guard that turns Claude Code's built-in command-safety prompts into
+/// rewrites. Levels `on` | `off`, tenant band only, ON by default.
+///
+/// Data, not schema, exactly like [`PLAN_CAPTURE_DOMAIN`]. Until coord declares
+/// this domain's `on` default in its `domain_default_level`, a no-row read may
+/// come back carrying coord's generic `off` level — which is why the no-row arm
+/// here resolves to the RUNNER's default ([`next_command_safety_rewrite_level`])
+/// rather than to whatever level string rode along.
+const COMMAND_SAFETY_REWRITE_DOMAIN: &str = "command_safety_rewrite";
 
 /// The fail-safe default: every read before the first success, and every
 /// reset on a 404/401/auth-required, collapses to this. NEVER `gate`.
@@ -749,6 +780,212 @@ fn plan_capture_log_key(outcome: &PollOutcome) -> String {
 }
 
 // ===========================================================================
+// Process-global cache #5 — the tenant-wide command-safety rewrite dial
+// ===========================================================================
+
+/// The resolved `command_safety_rewrite` level (plan
+/// `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`, D6).
+///
+/// Three values, two behaviours. The SAFE side of this dial is the guard
+/// ACTIVE — the guard only ever converts a would-be operator prompt into a
+/// rewrite — so the posture is the mirror of `plan_capture`'s: only an explicit,
+/// recognised `off` turns it off. A level this runner cannot identify (free text
+/// in a hand-written row) reads as on and is REPORTED as `unrecognised`, so the
+/// config report can say the tenant wrote something the runner did not
+/// understand rather than pretending it read `on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandSafetyRewriteLevel {
+    /// Explicit `on`, the no-row default, or no answer yet.
+    On,
+    /// Explicit `off` — the only way to remove the guard from the carrier.
+    Off,
+    /// An explicit level that is neither `on` nor `off`. Behaves as [`Self::On`].
+    Unrecognised,
+}
+
+impl CommandSafetyRewriteLevel {
+    /// Wire/report word. `unrecognised` is a REPORT word only; coord never
+    /// sends it, and [`Self::parse`] maps it back to itself so the cache's
+    /// round trip through [`PollOutcome::Updated`] is lossless.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CommandSafetyRewriteLevel::On => "on",
+            CommandSafetyRewriteLevel::Off => "off",
+            CommandSafetyRewriteLevel::Unrecognised => "unrecognised",
+        }
+    }
+
+    /// Normalize coord's `effective_level` (trimmed, case-insensitive). PURE.
+    /// Absent, empty and every unknown word are [`Self::Unrecognised`] — which
+    /// keeps the guard on.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+            .as_str()
+        {
+            "on" => CommandSafetyRewriteLevel::On,
+            "off" => CommandSafetyRewriteLevel::Off,
+            _ => CommandSafetyRewriteLevel::Unrecognised,
+        }
+    }
+
+    /// Whether the carrier registers the `PreToolUse` `Bash` guard.
+    pub(crate) fn guard_active(self) -> bool {
+        !matches!(self, CommandSafetyRewriteLevel::Off)
+    }
+}
+
+/// The domain default: what the cache holds before any answer, on an
+/// authoritative no-row answer, and behind a poisoned lock.
+const COMMAND_SAFETY_REWRITE_DEFAULT: CommandSafetyRewriteLevel = CommandSafetyRewriteLevel::On;
+
+/// The cached level. `std::sync::RwLock::new` is `const`, so no `OnceLock`.
+static COMMAND_SAFETY_REWRITE_LEVEL: RwLock<CommandSafetyRewriteLevel> =
+    RwLock::new(COMMAND_SAFETY_REWRITE_DEFAULT);
+
+/// Whether coord has given THIS process an authoritative (2xx) answer for the
+/// domain. Never reset: later failures keep last-good.
+static COMMAND_SAFETY_REWRITE_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// The resolved level right now. SYNCHRONOUS + lock-only: it is read on the
+/// spawn path ([`crate::session::claude_hook::materialize`]). A poisoned lock
+/// reads the default, `on` — no information is exactly the case the default is
+/// for, and on is the safe side.
+pub(crate) fn effective_command_safety_rewrite_level() -> CommandSafetyRewriteLevel {
+    read_command_safety_rewrite_level(&COMMAND_SAFETY_REWRITE_LEVEL)
+}
+
+/// The body of [`effective_command_safety_rewrite_level`] over any lock, so a
+/// test can drive the poison arm through the shipping expression.
+fn read_command_safety_rewrite_level(
+    cache: &RwLock<CommandSafetyRewriteLevel>,
+) -> CommandSafetyRewriteLevel {
+    cache
+        .read()
+        .map(|g| *g)
+        .unwrap_or(COMMAND_SAFETY_REWRITE_DEFAULT)
+}
+
+/// See [`COMMAND_SAFETY_REWRITE_ANSWERED`]. Lock-free.
+pub(crate) fn command_safety_rewrite_answered() -> bool {
+    COMMAND_SAFETY_REWRITE_ANSWERED.load(Ordering::Acquire)
+}
+
+fn set_command_safety_rewrite_level(level: CommandSafetyRewriteLevel) {
+    if let Ok(mut g) = COMMAND_SAFETY_REWRITE_LEVEL.write() {
+        *g = level;
+    }
+}
+
+fn set_command_safety_rewrite_answered(answered: bool) {
+    COMMAND_SAFETY_REWRITE_ANSWERED.store(answered, Ordering::Release);
+}
+
+/// Classify a 2xx `command_safety_rewrite` body. PURE.
+///
+/// `resolved_scope == "none"` is coord's authoritative no-row answer ⇒
+/// [`PollOutcome::UpdatedNoRow`], which resolves to the RUNNER's default `on`
+/// whatever level rode along — so a coord that has not yet declared this
+/// domain's default (and would answer its generic `off`) cannot switch the
+/// guard off for a tenant that never asked. Any other 2xx carries the parsed
+/// level's word.
+fn command_safety_rewrite_outcome_for_body(body: &FleetPolicyResponse) -> PollOutcome {
+    if body.resolved_scope.as_deref().map(str::trim) == Some(RESOLVED_SCOPE_NONE) {
+        return PollOutcome::UpdatedNoRow;
+    }
+    PollOutcome::Updated(
+        CommandSafetyRewriteLevel::parse(body.effective_level.as_deref())
+            .as_str()
+            .to_string(),
+    )
+}
+
+/// Map a fetch failure onto this domain's outcome. PURE. Same rule as
+/// [`plan_capture_outcome_for_error`]: a 401 or 404 says nothing about the
+/// tenant's policy, so it KEEPS last-good rather than resetting — an explicit
+/// `off` must not flip back on because a token expired.
+fn command_safety_rewrite_outcome_for_error(err: FetchError) -> PollOutcome {
+    match err {
+        FetchError::AuthOrAbsent(status) => PollOutcome::Kept(format!(
+            "coord answered {status} — not a statement about the tenant's \
+             {COMMAND_SAFETY_REWRITE_DOMAIN} policy, keeping last-good"
+        )),
+        other => level_outcome_for_error(other),
+    }
+}
+
+/// The WRITE, if any, that `outcome` implies for the cache. PURE — the
+/// fail-safe contract itself. `None` ⇒ no write at all (last-good kept).
+fn next_command_safety_rewrite_level(outcome: &PollOutcome) -> Option<CommandSafetyRewriteLevel> {
+    match outcome {
+        PollOutcome::Updated(level) => Some(CommandSafetyRewriteLevel::parse(Some(level))),
+        PollOutcome::UpdatedNoRow => Some(COMMAND_SAFETY_REWRITE_DEFAULT),
+        PollOutcome::ResetOff(_) | PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
+    }
+}
+
+/// Apply one poll outcome to the cache: the level write [`next_command_safety_rewrite_level`]
+/// implies (if any), and the answered flag on an authoritative (2xx) answer
+/// only. What the poll loop calls — factored out so the loop's cache effect is
+/// tested, not just the pure mapping beneath it.
+fn apply_command_safety_rewrite_outcome(outcome: &PollOutcome) {
+    if let Some(level) = next_command_safety_rewrite_level(outcome) {
+        set_command_safety_rewrite_level(level);
+    }
+    if matches!(outcome, PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow) {
+        set_command_safety_rewrite_answered(true);
+    }
+}
+
+/// One poll of the [`COMMAND_SAFETY_REWRITE_DOMAIN`] cache.
+async fn poll_command_safety_rewrite_once() -> PollOutcome {
+    match fetch_fleet_policy(COMMAND_SAFETY_REWRITE_DOMAIN).await {
+        Ok(body) => command_safety_rewrite_outcome_for_body(&body),
+        Err(e) => command_safety_rewrite_outcome_for_error(e),
+    }
+}
+
+/// Test-only RAII pin over the command-safety rewrite cache. Serializes every
+/// test that pins it (the cache is process-global and read by
+/// `claude_hook::materialize`) and restores the default — `on`, unanswered — on
+/// drop, including a panicking drop.
+#[cfg(test)]
+pub(crate) struct CommandSafetyRewritePin(std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl CommandSafetyRewritePin {
+    /// Pin `level` as an AUTHORITATIVE answer.
+    pub(crate) fn set(&self, level: CommandSafetyRewriteLevel) {
+        set_command_safety_rewrite_level(level);
+        set_command_safety_rewrite_answered(true);
+    }
+
+    /// Back to "coord has not answered" with the default level.
+    pub(crate) fn set_unanswered(&self) {
+        set_command_safety_rewrite_level(COMMAND_SAFETY_REWRITE_DEFAULT);
+        set_command_safety_rewrite_answered(false);
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommandSafetyRewritePin {
+    fn drop(&mut self) {
+        set_command_safety_rewrite_level(COMMAND_SAFETY_REWRITE_DEFAULT);
+        set_command_safety_rewrite_answered(false);
+    }
+}
+
+/// Acquire the pin, starting from the unanswered default.
+#[cfg(test)]
+pub(crate) fn pin_command_safety_rewrite_for_test() -> CommandSafetyRewritePin {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let pin = CommandSafetyRewritePin(LOCK.lock().unwrap_or_else(|p| p.into_inner()));
+    pin.set_unanswered();
+    pin
+}
+
+// ===========================================================================
 // Process-global cache #4 — the operator-editable session-briefing documents
 // ===========================================================================
 
@@ -931,11 +1168,11 @@ pub(crate) struct BriefingDial {
 ///
 /// # The freshness asymmetry this type exists to make visible
 ///
-/// Four process-global caches sit behind ONE poll loop, and they do NOT agree
+/// Five process-global caches sit behind ONE poll loop, and they do NOT agree
 /// about what they can tell you:
 ///
-/// - Caches 1-3 (interception mode, session floors, plan-capture level) are a
-///   bare `RwLock<T>`. They hold a VALUE and nothing else — no stamp, no
+/// - Caches 1-3 and 5 (interception mode, session floors, plan-capture level,
+///   command-safety rewrite level) are a bare `RwLock<T>`. They hold a VALUE and nothing else — no stamp, no
 ///   generation counter. So "when did this last change?" is genuinely
 ///   unanswerable from here, and [`caches_expose_refresh_time`](Self::caches_expose_refresh_time)
 ///   says `false` rather than letting a consumer substitute the read time. A
@@ -990,6 +1227,17 @@ pub(crate) struct FleetPolicyDial {
     /// means the level is the unconfirmed default and the write paths are
     /// held — so a never-answered runner is distinguishable from an armed one.
     pub(crate) plan_capture_answered: bool,
+    /// Cache 5 — the RESOLVED `command_safety_rewrite` level (`on` | `off` |
+    /// `unrecognised`; only `off` removes the carrier's `PreToolUse` guard).
+    pub(crate) command_safety_rewrite_level: &'static str,
+    /// Cache 5's resting value — the domain default (`on`).
+    pub(crate) command_safety_rewrite_default: &'static str,
+    /// Whether the guard is registered in carriers materialized now.
+    pub(crate) command_safety_rewrite_guard_active: bool,
+    /// Whether coord has answered this process's `command_safety_rewrite` poll.
+    /// `false` ⇒ the level is the unconfirmed default (or a restored last-good
+    /// is impossible — this cache is not persisted).
+    pub(crate) command_safety_rewrite_answered: bool,
     /// Cache 4 — one entry per name in [`BRIEFING_NAMES`], always all three
     /// (an absent document is `present: false`, never a missing entry).
     pub(crate) briefings: Vec<BriefingDial>,
@@ -1018,6 +1266,8 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
     let wsl = fleet_session_floors(Lane::Wsl.as_str());
     let threads = fleet_session_floors(Lane::Threads.as_str());
     let cache = briefing_snapshot();
+    // ONE read, so the level and the guard bit cannot disagree across a poll.
+    let command_safety = effective_command_safety_rewrite_level();
 
     FleetPolicyDial {
         poll_interval_ms: POLL_INTERVAL.as_millis(),
@@ -1033,6 +1283,10 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
         plan_capture_answered: plan_capture_answered(),
+        command_safety_rewrite_level: command_safety.as_str(),
+        command_safety_rewrite_default: COMMAND_SAFETY_REWRITE_DEFAULT.as_str(),
+        command_safety_rewrite_guard_active: command_safety.guard_active(),
+        command_safety_rewrite_answered: command_safety_rewrite_answered(),
         briefings: BRIEFING_NAMES
             .iter()
             .map(|name| match cache.get(*name) {
@@ -2213,8 +2467,10 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         info!(
             "fleet_policy_poller: coord lacks fleet_policy capability — not polling; \
              interception stays {DEFAULT_MODE}, plan capture stays at its default \
-             {PLAN_CAPTURE_DEFAULT_LEVEL} for the session prompt, and plan-capture writes stay \
-             held (no authoritative answer)"
+             {PLAN_CAPTURE_DEFAULT_LEVEL} for the session prompt, plan-capture writes stay \
+             held (no authoritative answer), and the command-safety guard stays at its \
+             default {}",
+            COMMAND_SAFETY_REWRITE_DEFAULT.as_str()
         );
         // Park until shutdown (every cache keeps its default).
         let _ = shutdown_rx.changed().await;
@@ -2223,7 +2479,8 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     }
 
     info!(
-        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN}, \
+        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN},\
+         {COMMAND_SAFETY_REWRITE_DOMAIN}, \
          interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, session floors unset; domain \
          default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until \
          coord answers)",
@@ -2242,6 +2499,8 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // A KEY, not an outcome — see `plan_capture_log_key` for why the whole
     // value is the wrong thing to compare for this domain.
     let mut last_logged_plan_capture: Option<String> = None;
+    // Keyed like plan capture — a `Kept` error string varies tick to tick.
+    let mut last_logged_command_safety: Option<String> = None;
     // One key PER DOCUMENT: the three session-briefing documents fail
     // independently (coord can serve one and 404 another), so a shared marker
     // would suppress one document's transition because another's was logged.
@@ -2425,6 +2684,49 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                 }
             }
             last_logged_plan_capture = Some(plan_capture_key);
+        }
+
+        // Fifth cache: the command-safety rewrite dial. Its own cache, its own
+        // transition log — no domain's failure may withhold another's answer.
+        // Read at SPAWN by `claude_hook::materialize`, so a flip reaches
+        // terminals and agent sessions started after it, never running ones.
+        let command_safety_outcome = poll_command_safety_rewrite_once().await;
+        apply_command_safety_rewrite_outcome(&command_safety_outcome);
+        let command_safety_key = plan_capture_log_key(&command_safety_outcome);
+        if is_new_outcome(last_logged_command_safety.as_ref(), &command_safety_key) {
+            let level = effective_command_safety_rewrite_level();
+            match &command_safety_outcome {
+                PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow => info!(
+                    "fleet_policy_poller: {COMMAND_SAFETY_REWRITE_DOMAIN} = {} ({}) — new \
+                     sessions' carrier {} the PreToolUse Bash guard",
+                    level.as_str(),
+                    if matches!(command_safety_outcome, PollOutcome::UpdatedNoRow) {
+                        "no row: domain default"
+                    } else {
+                        "explicit row"
+                    },
+                    if level.guard_active() {
+                        "registers"
+                    } else {
+                        "omits"
+                    }
+                ),
+                PollOutcome::SkippedNoJwt => info!(
+                    "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
+                     {COMMAND_SAFETY_REWRITE_DOMAIN} poll, level stays {}",
+                    level.as_str()
+                ),
+                PollOutcome::ResetOff(_) | PollOutcome::Kept(_) => warn!(
+                    "fleet_policy_poller: {COMMAND_SAFETY_REWRITE_DOMAIN} not answered ({}) — \
+                     keeping last-good level {}",
+                    match &command_safety_outcome {
+                        PollOutcome::Kept(e) => e.clone(),
+                        other => format!("{other:?}"),
+                    },
+                    level.as_str()
+                ),
+            }
+            last_logged_command_safety = Some(command_safety_key);
         }
 
         // Fourth cache: the three operator-editable session-briefing documents.
@@ -4013,5 +4315,176 @@ mod tests {
         // A restored document is `cached` by default — it has NOT been checked
         // against coord in this process.
         assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+
+    // =======================================================================
+    // Command-safety rewrite (2026-10-03-runner-sessions-stop-on-builtin-
+    // command-safety-prompts, Phase 3)
+    // =======================================================================
+
+    #[test]
+    fn command_safety_rewrite_domain_and_default_are_pinned() {
+        // Opaque TEXT on coord's side: a typo is a permanent no-row read, so
+        // the dial could never be turned off. State it.
+        assert_eq!(COMMAND_SAFETY_REWRITE_DOMAIN, "command_safety_rewrite");
+        assert_eq!(
+            COMMAND_SAFETY_REWRITE_DEFAULT,
+            CommandSafetyRewriteLevel::On
+        );
+        assert!(COMMAND_SAFETY_REWRITE_DEFAULT.guard_active());
+    }
+
+    #[test]
+    fn only_an_explicit_off_turns_the_command_safety_guard_off() {
+        use CommandSafetyRewriteLevel::{Off, On, Unrecognised};
+        assert_eq!(CommandSafetyRewriteLevel::parse(Some("on")), On);
+        assert_eq!(CommandSafetyRewriteLevel::parse(Some(" ON ")), On);
+        assert_eq!(CommandSafetyRewriteLevel::parse(Some("off")), Off);
+        assert_eq!(CommandSafetyRewriteLevel::parse(Some(" Off")), Off);
+        for raw in [Some("banana"), Some("record"), Some(""), Some("  "), None] {
+            let level = CommandSafetyRewriteLevel::parse(raw);
+            assert_eq!(level, Unrecognised, "{raw:?}");
+            assert!(
+                level.guard_active(),
+                "{raw:?}: an unidentifiable level keeps the guard ON (D6)"
+            );
+        }
+        assert!(!Off.guard_active());
+        assert!(On.guard_active());
+        // The report word round-trips through the cache's string carrier.
+        for level in [On, Off, Unrecognised] {
+            assert_eq!(
+                CommandSafetyRewriteLevel::parse(Some(level.as_str())),
+                level
+            );
+        }
+    }
+
+    /// Every arm of the fail-safe contract, through the SHIPPING classifiers
+    /// and the SHIPPING transition.
+    #[test]
+    fn command_safety_rewrite_answers_map_onto_the_cache_per_d6() {
+        use CommandSafetyRewriteLevel::{Off, On, Unrecognised};
+        let decode = |raw: &str| serde_json::from_str::<FleetPolicyResponse>(raw).unwrap();
+        let next = |raw: &str| {
+            next_command_safety_rewrite_level(&command_safety_rewrite_outcome_for_body(&decode(
+                raw,
+            )))
+        };
+
+        // No row ⇒ the RUNNER's default `on`, whatever level rides along —
+        // the arm that keeps the guard on against a coord that has not yet
+        // declared this domain and answers its generic `off`.
+        assert_eq!(
+            next(r#"{"effective_level":"off","resolved_scope":"none"}"#),
+            Some(On)
+        );
+        assert_eq!(
+            next(r#"{"effective_level":"on","resolved_scope":"none"}"#),
+            Some(On)
+        );
+        // Explicit rows are what they say.
+        assert_eq!(
+            next(r#"{"effective_level":"off","resolved_scope":"tenant"}"#),
+            Some(Off)
+        );
+        assert_eq!(
+            next(r#"{"effective_level":"on","resolved_scope":"tenant"}"#),
+            Some(On)
+        );
+        // An unrecognised explicit level: on, reported as such.
+        assert_eq!(
+            next(r#"{"effective_level":"maybe","resolved_scope":"tenant"}"#),
+            Some(Unrecognised)
+        );
+
+        // No tenant answer ⇒ NO write: 401, 404, network, unpaired.
+        for err in [
+            FetchError::AuthOrAbsent(401),
+            FetchError::AuthOrAbsent(404),
+            FetchError::Failed("request: dns".into()),
+            FetchError::NoJwt,
+        ] {
+            let outcome = command_safety_rewrite_outcome_for_error(err);
+            assert_eq!(
+                next_command_safety_rewrite_level(&outcome),
+                None,
+                "{outcome:?} must keep last-good"
+            );
+        }
+    }
+
+    #[test]
+    fn a_poisoned_command_safety_rewrite_lock_reads_on() {
+        let lock = RwLock::new(CommandSafetyRewriteLevel::Off);
+        assert_eq!(
+            read_command_safety_rewrite_level(&lock),
+            CommandSafetyRewriteLevel::Off
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(lock.is_poisoned());
+        assert_eq!(
+            read_command_safety_rewrite_level(&lock),
+            CommandSafetyRewriteLevel::On
+        );
+    }
+
+    /// The pin and the snapshot agree, and the snapshot reports answered-ness
+    /// beside the level.
+    #[test]
+    fn the_dial_snapshot_reports_the_resolved_command_safety_level_and_answer() {
+        let pin = pin_command_safety_rewrite_for_test();
+        let d = dial_snapshot();
+        assert_eq!(d.command_safety_rewrite_level, "on");
+        assert_eq!(d.command_safety_rewrite_default, "on");
+        assert!(d.command_safety_rewrite_guard_active);
+        assert!(!d.command_safety_rewrite_answered, "cold start: unanswered");
+
+        pin.set(CommandSafetyRewriteLevel::Off);
+        let d = dial_snapshot();
+        assert_eq!(d.command_safety_rewrite_level, "off");
+        assert!(!d.command_safety_rewrite_guard_active);
+        assert!(d.command_safety_rewrite_answered);
+
+        pin.set(CommandSafetyRewriteLevel::Unrecognised);
+        let d = dial_snapshot();
+        assert_eq!(d.command_safety_rewrite_level, "unrecognised");
+        assert!(d.command_safety_rewrite_guard_active);
+    }
+
+    /// The loop's cache effect, through the SHIPPING apply step: a 2xx (row or
+    /// no-row) writes and marks answered; a kept failure, a skip and a reset
+    /// touch neither the level nor the flag.
+    #[test]
+    fn applying_a_command_safety_outcome_sets_answered_only_on_a_2xx() {
+        use CommandSafetyRewriteLevel::{Off, On};
+        let pin = pin_command_safety_rewrite_for_test();
+
+        for outcome in [
+            PollOutcome::Kept("request: dns".into()),
+            PollOutcome::SkippedNoJwt,
+            PollOutcome::ResetOff(404),
+        ] {
+            apply_command_safety_rewrite_outcome(&outcome);
+            assert_eq!(effective_command_safety_rewrite_level(), On, "{outcome:?}");
+            assert!(!command_safety_rewrite_answered(), "{outcome:?}");
+        }
+
+        apply_command_safety_rewrite_outcome(&PollOutcome::Updated("off".into()));
+        assert_eq!(effective_command_safety_rewrite_level(), Off);
+        assert!(command_safety_rewrite_answered());
+
+        // Last-good: a later failure keeps the explicit `off` AND the flag.
+        apply_command_safety_rewrite_outcome(&PollOutcome::Kept("timeout".into()));
+        assert_eq!(effective_command_safety_rewrite_level(), Off);
+        assert!(command_safety_rewrite_answered());
+
+        pin.set_unanswered();
+        apply_command_safety_rewrite_outcome(&PollOutcome::UpdatedNoRow);
+        assert_eq!(effective_command_safety_rewrite_level(), On);
+        assert!(command_safety_rewrite_answered());
     }
 }

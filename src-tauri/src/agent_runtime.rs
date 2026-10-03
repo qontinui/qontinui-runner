@@ -10865,7 +10865,7 @@ mod tests {
             )),
             vec![
                 "--settings".to_string(),
-                "C:/hooks/claude_hook_settings.json".to_string(),
+                "C:/hooks/claude_hook_settings.v2.json".to_string(),
             ],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
@@ -10880,7 +10880,7 @@ mod tests {
         assert!(flag < term, "--settings must precede the terminator");
         assert_eq!(
             cmd.get(flag + 1).map(String::as_str),
-            Some("C:/hooks/claude_hook_settings.json"),
+            Some("C:/hooks/claude_hook_settings.v2.json"),
             "the settings path must immediately follow its flag"
         );
     }
