@@ -134,6 +134,29 @@ export function recordBelongsToRestore(
   return classifyRestoreAction(rec) === "auto-resume";
 }
 
+/** The gate a resumed continuation reports to (from its durable record). */
+export interface ResumeGateIdentity {
+  gateId?: string;
+  gateConsumingDeviceId?: string;
+}
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * `QONTINUI_GATE_ID` / `QONTINUI_GATE_DEVICE_ID` for a resumed continuation —
+ * BOTH or neither (coord accepts neither half alone), and only when both are
+ * well-formed UUIDs, since they are interpolated into a shell command.
+ */
+export function resumeGateEnv(gate: ResumeGateIdentity | undefined): Array<[string, string]> {
+  const gateId = gate?.gateId?.trim();
+  const deviceId = gate?.gateConsumingDeviceId?.trim();
+  if (!gateId || !deviceId || !UUID_RE.test(gateId) || !UUID_RE.test(deviceId)) return [];
+  return [
+    ["QONTINUI_GATE_ID", gateId],
+    ["QONTINUI_GATE_DEVICE_ID", deviceId],
+  ];
+}
+
 /**
  * Build a `claude --resume <id>` command, optionally prefixed with
  * CLAUDE_CONFIG_DIR and (under the default full-resume policy) with the CLI's
@@ -169,6 +192,7 @@ export function buildResumeCmd(
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
+  gate?: ResumeGateIdentity,
 ): string {
   // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
   // ["gemini","--resume",id]. The descriptor owns the program + flags so the
@@ -185,6 +209,11 @@ export function buildResumeCmd(
     env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
     env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
   }
+  // A resumed gate continuation must still be able to report its own work
+  // outcome, so its gate identity rides the typed resume exactly as it rode
+  // the original spawn's env. Only well-formed UUIDs are interpolated into the
+  // shell command.
+  env.push(...resumeGateEnv(gate));
   if (env.length === 0) return `${base}\r`;
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
@@ -213,6 +242,8 @@ export async function runVerifiedResume(params: {
   configDir?: string;
   /** Provider owning the session — selects the adapter resume + handshake. */
   provider?: string;
+  /** Gate identity of a resumed continuation — re-injected into the resume. */
+  gate?: ResumeGateIdentity;
   updateTab: (
     id: string,
     updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
@@ -236,12 +267,13 @@ export async function runVerifiedResume(params: {
     claudeSessionId,
     configDir,
     provider,
+    gate,
     updateTab,
     recordOpen,
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider, gate);
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -961,6 +993,8 @@ export function useTerminalInitialization({
       claudeConfigDir?: string;
       /** Which provider owns this session — drives the adapter resume. */
       provider?: string;
+      /** Gate identity of a continuation record — re-injected on resume. */
+      gate?: ResumeGateIdentity;
       /** Deferred registry re-assert — applied only on VERIFIED resume. */
       recordOpen?: SessionOpenArgs;
     }> = [];
@@ -1287,6 +1321,9 @@ export function useTerminalInitialization({
               // Provider drives the adapter-supplied resume command + handshake
               // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
               provider: rec.provider,
+              // A gate continuation's identity, so the resumed session can
+              // still report its work outcome (plan 2026-10-03 D3).
+              gate: { gateId: rec.gateId, gateConsumingDeviceId: rec.gateConsumingDeviceId },
               // Deferred re-assert payload: applied by `runVerifiedResume`
               // on VERIFIED handshake only. No `origin` — the backend
               // preserves the existing (authoritative) origin on unasserted writes.
@@ -1420,6 +1457,7 @@ export function useTerminalInitialization({
                     claudeSessionId: restore.claudeSessionId,
                     configDir: restore.claudeConfigDir,
                     provider: restore.provider,
+                    gate: restore.gate,
                     updateTab,
                     recordOpen: restore.recordOpen,
                     // The pane was created as a plain shell just above, so no

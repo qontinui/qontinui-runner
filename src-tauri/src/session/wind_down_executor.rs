@@ -2159,6 +2159,9 @@ mod tests {
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());

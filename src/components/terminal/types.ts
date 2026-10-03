@@ -41,6 +41,14 @@ export interface TerminalSessionRecord {
    * `adoptWorkerTab`).
    */
   taskRunId?: string;
+  /**
+   * The `coord.gates` row this session continues (`QONTINUI_GATE_ID`), and the
+   * device that CLAIMED it (`QONTINUI_GATE_DEVICE_ID`). Present only on a gate
+   * continuation's record. A boot restore re-injects both into the typed resume
+   * so the resumed session can still report its own work outcome.
+   */
+  gateId?: string;
+  gateConsumingDeviceId?: string;
   /** Epoch ms the session was first recorded open. */
   openedAt: number;
   /** Epoch ms the record was last refreshed. */
