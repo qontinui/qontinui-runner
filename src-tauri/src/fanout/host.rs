@@ -51,6 +51,9 @@ impl FanoutHost for TauriFanoutHost {
     }
 
     async fn fanout_bound(&self) -> u32 {
+        // The registry resolves per DEVICE, not per tenant: there is no tenant
+        // argument to scope it by, so this is this runner's bound for every
+        // run it holds, whatever tenant each run was admitted under.
         crate::agent_authorization::current_fanout_bound(None).await
     }
 
@@ -99,33 +102,105 @@ impl FanoutHost for TauriFanoutHost {
     }
 
     fn liveness(&self, claude_session_id: &str, terminal_id: Option<&str>) -> Liveness {
-        let store = self
+        let store = match self
             .app
             .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-            .map(|s| s.inner().clone());
-        let record = store.as_ref().and_then(|s| s.get(claude_session_id));
-        if record.as_ref().is_some_and(|r| r.finished_at.is_some()) {
-            return Liveness::Finished;
-        }
-        let Some(manager) = self
+        {
+            // An unmanaged store is not "no record": nothing can be concluded.
+            None => StoreRead::Unreadable,
+            Some(s) => match s.get_checked(claude_session_id) {
+                Err(e) => {
+                    warn!(session = %claude_session_id, error = %e,
+                        "fanout: lifecycle store unreadable — liveness UNKNOWN");
+                    StoreRead::Unreadable
+                }
+                Ok(None) => StoreRead::Absent,
+                Ok(Some(r)) => StoreRead::Record(RecordFacts {
+                    finished: r.finished_at.is_some(),
+                    open: r.state == "open" && r.closed_at.is_none(),
+                    terminal_id: r.terminal_id,
+                }),
+            },
+        };
+        let manager = self
             .app
             .try_state::<Arc<crate::terminal::TerminalManager>>()
-            .map(|s| s.inner().clone())
-        else {
-            return Liveness::Unknown;
-        };
-        // The lifecycle record follows a session across a restore rebind; the
-        // member's own terminal id is the fallback when there is no record.
-        let candidates = record
-            .map(|r| r.terminal_id)
-            .into_iter()
-            .chain(terminal_id.map(str::to_string));
-        for tid in candidates {
-            if manager.get(&tid).is_some_and(|s| s.is_alive()) {
-                return Liveness::Live { terminal_id: tid };
-            }
+            .map(|s| s.inner().clone());
+        classify_liveness(
+            store,
+            manager
+                .as_ref()
+                .map(|m| move |tid: &str| -> Option<bool> { m.get(tid).map(|s| s.is_alive()) }),
+            terminal_id,
+        )
+    }
+}
+
+/// What the lifecycle store says about one session.
+pub(crate) enum StoreRead {
+    /// Poisoned lock, or no store in this process: nothing can be concluded.
+    Unreadable,
+    /// The store answered and holds no record of the session.
+    Absent,
+    Record(RecordFacts),
+}
+
+/// The lifecycle-record fields liveness reads.
+pub(crate) struct RecordFacts {
+    pub finished: bool,
+    /// `state == "open"` and not closed.
+    pub open: bool,
+    /// The terminal the record says hosts the session (follows a restore rebind).
+    pub terminal_id: String,
+}
+
+/// Liveness from the lifecycle record and the terminal manager. Pure, so every
+/// arm is tested without a Tauri app.
+///
+/// `probe(tid)` is `Some(alive)` for a terminal the manager holds and `None`
+/// for one it does not; `probe` itself is `None` when no manager is managed.
+///
+/// The arm that matters is the open record with NO terminal answering for it:
+/// a session mid-respawn, or one session restore has not rebound yet, reads
+/// exactly like that for a while — so it is [`Liveness::Unconfirmed`] (the
+/// dispatcher holds the slot for a grace window), never an exit. A terminal
+/// that IS present and dead, or a closed record, is a real exit.
+pub(crate) fn classify_liveness<P: Fn(&str) -> Option<bool>>(
+    store: StoreRead,
+    probe: Option<P>,
+    member_terminal: Option<&str>,
+) -> Liveness {
+    let record = match store {
+        StoreRead::Unreadable => return Liveness::Unknown,
+        StoreRead::Absent => None,
+        StoreRead::Record(r) => Some(r),
+    };
+    if record.as_ref().is_some_and(|r| r.finished) {
+        return Liveness::Finished;
+    }
+    let Some(probe) = probe else {
+        return Liveness::Unknown;
+    };
+    // The lifecycle record follows a session across a restore rebind; the
+    // member's own terminal id is the fallback.
+    let candidates = record
+        .as_ref()
+        .map(|r| r.terminal_id.clone())
+        .into_iter()
+        .chain(member_terminal.map(str::to_string));
+    let mut a_terminal_answered = false;
+    for tid in candidates {
+        match probe(&tid) {
+            Some(true) => return Liveness::Live { terminal_id: tid },
+            Some(false) => a_terminal_answered = true,
+            None => {}
         }
-        Liveness::Exited
+    }
+    match record {
+        Some(r) if r.open && !a_terminal_answered => Liveness::Unconfirmed,
+        Some(_) => Liveness::Exited,
+        None if a_terminal_answered => Liveness::Exited,
+        None => Liveness::Unrecorded,
     }
 }
 
@@ -134,16 +209,22 @@ impl FanoutHost for TauriFanoutHost {
 /// recipe ([`crate::agent_runtime::build_continuation_claude_command`]), so the
 /// prompt is in the session from its first byte: no idle-scrape, no timer.
 ///
+/// Every check that can refuse — the resource floor, the managed state, the
+/// account — runs BEFORE `acquire_for_terminal` allocates a worktree. A refusal
+/// the spawn seam itself returns after the allocation (the trust gate, the
+/// seam's own resource gate) hands the allocation back
+/// ([`crate::agent_worktree::isolated_edit::AllocationHandback`]): the
+/// dispatcher retries a refused member, and each retry would otherwise mint one
+/// more orphaned worktree and ledger row.
+///
 /// Returns the terminal id, or the refusal text (a `resource_guard:critical:`
 /// prefix for a resource refusal, the seam's own text otherwise).
 async fn spawn_member_terminal(
     app: &tauri::AppHandle,
     req: &MemberSpawnRequest,
 ) -> Result<String, String> {
-    // UNATTENDED spawn — respect the critical floor, and refuse BEFORE the
-    // worktree allocation below, which a refusal would otherwise leak (the
-    // `terminal_create` early-out, same reasoning). A refusal is not a failure:
-    // the member goes back to the queue and the next tick asks again.
+    // UNATTENDED spawn — respect the critical floor. A refusal is not a
+    // failure: the member goes back to the queue and is retried with backoff.
     crate::resource_guard::precheck_spawn("fan-out member", false)?;
 
     let terminal_manager = app
@@ -154,21 +235,6 @@ async fn spawn_member_terminal(
         .try_state::<Arc<crate::session::SessionRegistry>>()
         .map(|s| s.inner().clone())
         .ok_or_else(|| "SessionRegistry state not managed".to_string())?;
-
-    // Members that edit one repo must not share a checkout: the same
-    // `working_dir → intent_repo` derivation `terminal_create` uses routes each
-    // one through its own isolated worktree when worktree mode is on.
-    let intent_repo =
-        crate::commands::terminal::effective_intent_repo(None, Some(&req.working_dir));
-    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
-        intent_repo.as_deref(),
-        &req.title,
-        Some(req.working_dir.clone()),
-        None,
-        req.tenant_id,
-    )
-    .await;
-    let working_dir = working_dir.unwrap_or_else(|| req.working_dir.clone());
 
     // The ABSOLUTE binary: this argv is the PTY child's program (direct exec, no
     // shell), and a bare `claude` resolves to the extensionless identity shim.
@@ -195,6 +261,75 @@ async fn spawn_member_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
+    crate::claude_session::trust_gate::warm_dial().await;
+
+    // Members that edit one repo must not share a checkout: the same
+    // `working_dir → intent_repo` derivation `terminal_create` uses routes each
+    // one through its own isolated worktree when worktree mode is on.
+    let intent_repo =
+        crate::commands::terminal::effective_intent_repo(None, Some(&req.working_dir));
+    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
+        intent_repo.as_deref(),
+        &req.title,
+        Some(req.working_dir.clone()),
+        None,
+        req.tenant_id,
+    )
+    .await;
+    let working_dir = working_dir.unwrap_or_else(|| req.working_dir.clone());
+    let handback = isolated_ctx.as_ref().map(|ctx| ctx.handback());
+
+    let result = launch_member(
+        app,
+        req,
+        LaunchInputs {
+            terminal_manager,
+            session_registry,
+            claude_bin,
+            selected_config_dir,
+            launch_cfg,
+            intent_repo,
+            working_dir,
+            isolated_ctx,
+        },
+    );
+    if let (Err(why), Some(handback)) = (&result, handback) {
+        // The seam refused before a PTY child existed (its only error path),
+        // so nothing ever ran in the worktree: hand it back now.
+        handback.abandon(why).await;
+    }
+    result
+}
+
+/// Everything [`launch_member`] needs that [`spawn_member_terminal`] resolved.
+struct LaunchInputs {
+    terminal_manager: Arc<crate::terminal::TerminalManager>,
+    session_registry: Arc<crate::session::SessionRegistry>,
+    claude_bin: String,
+    selected_config_dir: Option<String>,
+    launch_cfg: crate::claude_session::launch_spec::LaunchConfig,
+    intent_repo: Option<String>,
+    working_dir: String,
+    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+}
+
+/// Build the member's argv and hand it to the shared spawn seam. Its only
+/// error is the seam's own refusal, which happens before a PTY child exists.
+fn launch_member(
+    app: &tauri::AppHandle,
+    req: &MemberSpawnRequest,
+    inputs: LaunchInputs,
+) -> Result<String, String> {
+    let LaunchInputs {
+        terminal_manager,
+        session_registry,
+        claude_bin,
+        selected_config_dir,
+        launch_cfg,
+        intent_repo,
+        working_dir,
+        isolated_ctx,
+    } = inputs;
 
     // An isolated worktree is the member's own, so it gets the coord-mcp
     // config and the fleet commands the gate-continuation path writes into
@@ -267,8 +402,6 @@ async fn spawn_member_terminal(
         policy_delivery,
     };
 
-    crate::claude_session::trust_gate::warm_dial().await;
-
     crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -301,5 +434,88 @@ impl FanoutEvents for TauriFanoutEvents {
         if let Err(e) = self.app.emit(FANOUT_CHANGED_EVENT, run) {
             warn!(run_id = %run.id, error = %e, "fanout: failed to emit {FANOUT_CHANGED_EVENT}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn record(open: bool, finished: bool, tid: &str) -> StoreRead {
+        StoreRead::Record(RecordFacts {
+            finished,
+            open,
+            terminal_id: tid.to_string(),
+        })
+    }
+
+    /// `terminals`: tid → alive. A tid absent from the map is not held.
+    fn classify(store: StoreRead, terminals: &[(&str, bool)], member: Option<&str>) -> Liveness {
+        let map: HashMap<String, bool> = terminals
+            .iter()
+            .map(|(t, a)| ((*t).to_string(), *a))
+            .collect();
+        classify_liveness(store, Some(|tid: &str| map.get(tid).copied()), member)
+    }
+
+    #[test]
+    fn fanout_an_open_record_with_no_terminal_answering_is_unconfirmed_not_exited() {
+        // Mid-respawn, or session restore has not rebound it yet.
+        assert_eq!(
+            classify(record(true, false, "t-old"), &[], Some("t-old")),
+            Liveness::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn fanout_a_poisoned_or_absent_store_is_unknown() {
+        assert_eq!(
+            classify(StoreRead::Unreadable, &[("t1", false)], Some("t1")),
+            Liveness::Unknown
+        );
+        let no_manager: Option<fn(&str) -> Option<bool>> = None;
+        assert_eq!(
+            classify_liveness(record(true, false, "t1"), no_manager, Some("t1")),
+            Liveness::Unknown
+        );
+    }
+
+    #[test]
+    fn fanout_real_exits_and_live_rebinds_are_still_read() {
+        // A rebound session is live under the record's NEW terminal.
+        assert_eq!(
+            classify(
+                record(true, false, "t-new"),
+                &[("t-new", true)],
+                Some("t-old")
+            ),
+            Liveness::Live {
+                terminal_id: "t-new".to_string()
+            }
+        );
+        // A terminal present and dead is an exit, open record or not.
+        assert_eq!(
+            classify(record(true, false, "t1"), &[("t1", false)], Some("t1")),
+            Liveness::Exited
+        );
+        // A closed record is an exit.
+        assert_eq!(
+            classify(record(false, false, "t1"), &[], Some("t1")),
+            Liveness::Exited
+        );
+        assert_eq!(
+            classify(record(true, true, "t1"), &[("t1", true)], Some("t1")),
+            Liveness::Finished
+        );
+    }
+
+    #[test]
+    fn fanout_no_record_and_no_terminal_is_unrecorded() {
+        assert_eq!(classify(StoreRead::Absent, &[], None), Liveness::Unrecorded);
+        assert_eq!(
+            classify(StoreRead::Absent, &[("t1", false)], Some("t1")),
+            Liveness::Exited
+        );
     }
 }

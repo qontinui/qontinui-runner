@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { FanoutCapOutcome, FanoutRunView } from "./fanoutApi";
 import {
+  alreadyCreatedReason,
   buildCreateFanoutRequest,
   collisionProbeLabel,
   defaultTitleTemplate,
@@ -10,10 +11,13 @@ import {
   isAbsolutePath,
   judgeFanoutCreate,
   planPreview,
+  probeKey,
+  promptsToProbe,
   rowIsBlocked,
+  runWithConcurrency,
   sharedCwdWarning,
 } from "./fanoutPlan";
-import { MAX_PROMPT_BYTES, type FanoutRow } from "./promptMatrix";
+import { MAX_PROMPT_ARGV_COST, type FanoutRow } from "./promptMatrix";
 import type { PromptParameter } from "./promptLibraryApi";
 import type { ConflictReport } from "./useSessionManager";
 
@@ -186,7 +190,7 @@ describe("fanoutGate", () => {
 
   it("refuses a row over the UTF-8 byte bound that UTF-16 .length would pass", () => {
     const rows = okPreview("platform:iOS;lang:swift", { feature: "é".repeat(13_000) });
-    expect(rows[0].prompt.length).toBeLessThan(MAX_PROMPT_BYTES);
+    expect(rows[0].prompt.length).toBeLessThan(MAX_PROMPT_ARGV_COST);
     expect(fanoutGate({ ...base, rows, ticked: ALL(1) }).canCreate).toBe(false);
   });
 });
@@ -286,7 +290,7 @@ describe("judgeFanoutCreate", () => {
   it("surfaces the server's clamp", () => {
     const v = judgeFanoutCreate(1, outcome(1, 40, 15));
     expect(v.ok && v.clampNote).toBe(
-      "Max concurrent clamped from 40 to 15 (this tenant's fan-out bound is 15)",
+      "Max concurrent clamped from 40 to 15 (this runner's fan-out bound is 15)",
     );
   });
 });
@@ -333,5 +337,57 @@ describe("collisionProbeLabel", () => {
     expect(collisionProbeLabel({ kind: "ok", report: report(0, "Offline") }).text).toBe(
       "none (regex only)",
     );
+  });
+});
+
+describe("alreadyCreatedReason", () => {
+  it("blocks a body created earlier even after edits away and back", () => {
+    const created = new Map([["body-A", "0123456789abcdef"]]);
+    // Un-tick a row (body-B), then re-tick it (body-A again).
+    expect(alreadyCreatedReason(created, "body-B")).toBeNull();
+    expect(alreadyCreatedReason(created, "body-A")).toMatch(
+      /^This exact fan-out was already created \(run 01234567\)/,
+    );
+  });
+});
+
+describe("collision probes", () => {
+  it("probes only prompts with no answer and none in flight", () => {
+    const answered = { [probeKey("/w", "a")]: { kind: "ok" } };
+    const inFlight = new Set([probeKey("/w", "b")]);
+    expect(promptsToProbe(["a", "b", "c"], "/w", answered, inFlight)).toEqual(["c"]);
+    // Another directory is another probe.
+    expect(promptsToProbe(["a"], "/other", answered, inFlight)).toEqual(["a"]);
+  });
+
+  it("runs at most `limit` at once and every item once", async () => {
+    let live = 0;
+    let peak = 0;
+    const seen: number[] = [];
+    await runWithConcurrency([1, 2, 3, 4, 5, 6, 7, 8, 9], 4, async (n) => {
+      live++;
+      peak = Math.max(peak, live);
+      await new Promise((r) => setTimeout(r, 1));
+      seen.push(n);
+      live--;
+    });
+    expect(peak).toBe(4);
+    expect(seen.sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  it("starts nothing more once aborted", async () => {
+    const controller = new AbortController();
+    const started: number[] = [];
+    await runWithConcurrency(
+      [1, 2, 3, 4, 5, 6],
+      2,
+      async (n) => {
+        started.push(n);
+        if (n === 2) controller.abort();
+        await Promise.resolve();
+      },
+      controller.signal,
+    );
+    expect(started).toEqual([1, 2]);
   });
 });

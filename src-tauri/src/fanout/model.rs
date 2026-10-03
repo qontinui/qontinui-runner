@@ -13,12 +13,28 @@ use uuid::Uuid;
 /// caller that skipped the preview.
 pub const MAX_MEMBERS: usize = 64;
 
-/// Longest rendered prompt, in bytes, a member may carry. The prompt rides the
-/// spawn argv as one positional argument, and the OS command-line limit
-/// (~32 KiB on Windows, shared with every other flag) is the real ceiling; this
-/// leaves room for the flags. A longer prompt is refused at create, never
-/// truncated.
-pub const MAX_PROMPT_BYTES: usize = 24 * 1024;
+/// Largest [`prompt_argv_cost`] a member's prompt may have. The prompt rides
+/// the spawn argv as one positional argument, and the OS command-line limit
+/// (32,767 UTF-16 units on Windows, shared with every other flag) is the real
+/// ceiling; this leaves room for the flags. A costlier prompt is refused at
+/// create, never truncated. The preview (`promptMatrix.ts`) enforces the same
+/// bound with the same measure.
+pub const MAX_PROMPT_ARGV_COST: usize = 24 * 1024;
+
+/// The worst-case length the prompt can occupy on a Windows command line,
+/// computed identically on every platform so the preview and the server agree.
+///
+/// `CreateProcessW` takes ONE string, so each argv element is quoted the MSVC
+/// way: wrapped in `"…"`, every `"` escaped as `\"`, and a run of backslashes
+/// doubled when a quote or the closing quote follows it. Counting every quote
+/// and every backslash once more is therefore an upper bound on the escaped length, and
+/// UTF-8 bytes bound UTF-16 units from above. A prompt of 24 KiB of quotes —
+/// 24 KiB of bytes, but 48 KiB once escaped — no longer passes a byte bound and
+/// then fails at spawn.
+pub fn prompt_argv_cost(prompt: &str) -> usize {
+    let escapes = prompt.bytes().filter(|b| *b == b'"' || *b == b'\\').count();
+    prompt.len() + escapes + 2
+}
 
 /// Longest member title, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
@@ -42,6 +58,14 @@ pub mod reason {
     pub const STORE_UNAVAILABLE: &str = "store_unavailable";
     /// An operator cancelled the queued member.
     pub const CANCELLED: &str = "cancelled";
+    /// The member was admitted but the runner restarted before its spawn was
+    /// recorded, and no session record exists for it: it may never have run.
+    pub const SPAWN_UNCONFIRMED: &str = "spawn_unconfirmed";
+    /// Loaded at runner start from a run idle for longer than the staleness
+    /// bound (a torn-down temp runner's run, picked up by a later runner
+    /// reusing its instance name): its waiting members are cancelled rather
+    /// than admitted days after anyone asked for them.
+    pub const STALE_AFTER_RESTART: &str = "stale_after_restart";
 }
 
 /// A member's place in the queue.
@@ -232,11 +256,11 @@ pub fn build_members(inputs: &[MemberInput]) -> Result<Vec<FanoutMember>, String
             if m.prompt.trim().is_empty() {
                 return Err(format!("members[{i}].prompt: empty"));
             }
-            if m.prompt.len() > MAX_PROMPT_BYTES {
+            let cost = prompt_argv_cost(&m.prompt);
+            if cost > MAX_PROMPT_ARGV_COST {
                 return Err(format!(
-                    "members[{i}].prompt: {} bytes exceeds the argv bound of {MAX_PROMPT_BYTES} \
-                     bytes — refused rather than truncated",
-                    m.prompt.len()
+                    "members[{i}].prompt: its escaped argv length is {cost}, over the bound of \
+                     {MAX_PROMPT_ARGV_COST} — refused rather than truncated"
                 ));
             }
             if m.prompt.contains('\0') {
@@ -347,6 +371,11 @@ pub struct MemberView {
     pub reason: Option<String>,
     pub admitted_at: Option<String>,
     pub released_at: Option<String>,
+    /// Consecutive refusals for the same reason class (0 when not refused).
+    pub refusals: u32,
+    /// When a refused member next returns to the queue (backoff), if it is
+    /// waiting on one.
+    pub next_retry_at: Option<String>,
 }
 
 /// Wire shape of one run.
@@ -392,6 +421,8 @@ impl RunView {
                     reason: m.reason.clone(),
                     admitted_at: m.admitted_at.map(|t| t.to_rfc3339()),
                     released_at: m.released_at.map(|t| t.to_rfc3339()),
+                    refusals: 0,
+                    next_retry_at: None,
                 })
                 .collect(),
         }
@@ -475,13 +506,33 @@ mod tests {
         assert!(err.starts_with("members[1].prompt"), "{err}");
         let err = build_members(&[input("", "p")]).unwrap_err();
         assert!(err.starts_with("members[0].title"), "{err}");
-        let long = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let long = "x".repeat(MAX_PROMPT_ARGV_COST);
         let err = build_members(&[input("a", &long)]).unwrap_err();
         assert!(err.contains("refused rather than truncated"), "{err}");
         let many: Vec<MemberInput> = (0..=MAX_MEMBERS)
             .map(|i| input("t", &i.to_string()))
             .collect();
         assert!(build_members(&many).is_err());
+    }
+
+    /// The bound is on the Windows-escaped length, and the measure is pinned to
+    /// the same numbers `promptMatrix.test.ts` pins for the preview.
+    #[test]
+    fn fanout_prompt_bound_counts_windows_quoting() {
+        assert_eq!(prompt_argv_cost("abc"), 5);
+        assert_eq!(prompt_argv_cost(r#"say "hi" \ there"#), 16 + 3 + 2);
+        assert_eq!(prompt_argv_cost("é"), 2 + 2);
+        // At the bound: accepted.
+        let at = "x".repeat(MAX_PROMPT_ARGV_COST - 2);
+        assert!(build_members(&[input("a", &at)]).is_ok());
+        // A quote-heavy prompt well under the byte bound is refused: escaped,
+        // it would not fit the command line.
+        let quotes = "\"".repeat(MAX_PROMPT_ARGV_COST / 2);
+        assert!(quotes.len() < MAX_PROMPT_ARGV_COST);
+        let err = build_members(&[input("a", &quotes)]).unwrap_err();
+        assert!(err.contains("escaped argv length"), "{err}");
+        // Worst case still fits Windows' 32,767-unit command line with room.
+        const { assert!(MAX_PROMPT_ARGV_COST < 32_767) };
     }
 
     #[test]

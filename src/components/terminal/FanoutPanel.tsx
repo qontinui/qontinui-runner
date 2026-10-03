@@ -9,7 +9,7 @@
  * the per-member collision probe, and posts.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, Layers, Loader2 } from "lucide-react";
 
 import { resolvePort } from "@/lib/runner-api";
@@ -17,6 +17,8 @@ import { resolvePort } from "@/lib/runner-api";
 import { createFanoutRun, type ConfigDirPolicy } from "./fanoutApi";
 import {
   FANOUT_DEFAULT_MAX_CONCURRENT,
+  PROBE_CONCURRENCY,
+  alreadyCreatedReason,
   buildCreateFanoutRequest,
   collisionProbeLabel,
   defaultTitleTemplate,
@@ -24,9 +26,12 @@ import {
   fanoutGate,
   judgeFanoutCreate,
   planPreview,
+  probeKey,
+  promptsToProbe,
   rowErrorLabel,
   rowIsBlocked,
   rowWarningLabel,
+  runWithConcurrency,
   sharedCwdWarning,
   type CollisionProbeState,
   type FanoutCreateVerdict,
@@ -58,10 +63,6 @@ export interface FanoutModalContext {
 /** Debounce before the per-member collision probes fire. */
 const PROBE_DEBOUNCE_MS = 600;
 
-function probeKey(cwd: string, prompt: string): string {
-  return `${cwd}\u0000${prompt}`;
-}
-
 const inputClass =
   "w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2.5 py-1.5 text-[12px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors";
 
@@ -91,10 +92,20 @@ export function FanoutPanel({
   });
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [probes, setProbes] = useState<Record<string, CollisionProbeState>>({});
+  /** Answered probes, readable by the probe effect without re-running it. */
+  const probesRef = useRef(probes);
+  useEffect(() => {
+    probesRef.current = probes;
+  }, [probes]);
+  /** Probe keys with a request in flight. */
+  const inFlightRef = useRef<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
   const [verdict, setVerdict] = useState<FanoutCreateVerdict | null>(null);
-  /** The request body `verdict` was made for (see `requestKey`). */
-  const [verdictKey, setVerdictKey] = useState<string | null>(null);
+  /**
+   * Every request body this modal created, → its run id. Never cleared by an
+   * edit: reverting to a created body must not enable a second create.
+   */
+  const [createdRuns, setCreatedRuns] = useState<ReadonlyMap<string, string>>(new Map());
 
   // A changed default dir (the page resolved its home dir late) seeds the
   // field only while the operator has not typed into it.
@@ -151,8 +162,10 @@ export function FanoutPanel({
     tenantId: context.tenantId,
   });
   const requestKey = JSON.stringify(request);
-  /** Create stays disabled only for the exact body that was already created. */
-  const created = verdict?.ok === true && verdictKey === requestKey;
+  /** Create stays disabled for any body this modal already created. */
+  const createdReason = alreadyCreatedReason(createdRuns, requestKey);
+  const created = createdReason !== null;
+  const blockedReason = gate.reason ?? createdReason;
   const isolationWarning = sharedCwdWarning(gate.tickedCount, workingDir);
 
   // Per-member collision probe — the LaunchMenu probe, once per ticked member.
@@ -170,40 +183,44 @@ export function FanoutPanel({
   const probeListKey = JSON.stringify(probeList);
 
   useEffect(() => {
-    const prompts = JSON.parse(probeListKey) as string[];
-    if (prompts.length === 0) return;
+    const wanted = JSON.parse(probeListKey) as string[];
+    if (wanted.length === 0) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
+      // Only prompts with no answer and no request in flight: an edit that
+      // leaves most rows as they were re-probes none of them.
+      const prompts = promptsToProbe(wanted, cwd, probesRef.current, inFlightRef.current);
       const port = resolvePort();
-      for (const prompt of prompts) {
+      const probeOne = async (prompt: string) => {
         const key = probeKey(cwd, prompt);
-        void fetch(buildProbeUrl(port), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: buildProbeBody(prompt, cwd),
-          signal: controller.signal,
-        })
-          .then(async (resp) => {
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const report = (await resp.json()) as ConflictReport;
-            if (!Array.isArray(report?.predicted_collisions)) {
-              throw new Error("unexpected probe response shape");
-            }
-            return { kind: "ok", report } as const;
-          })
-          .catch((err: unknown) => {
-            if (controller.signal.aborted) return null;
-            return {
-              kind: "unknown",
-              error: err instanceof Error ? err.message : String(err),
-            } as const;
-          })
-          .then((result) => {
-            if (result && !controller.signal.aborted) {
-              setProbes((prev) => ({ ...prev, [key]: result }));
-            }
+        inFlightRef.current.add(key);
+        let result: CollisionProbeState | null;
+        try {
+          const resp = await fetch(buildProbeUrl(port), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: buildProbeBody(prompt, cwd),
+            signal: controller.signal,
           });
-      }
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const report = (await resp.json()) as ConflictReport;
+          if (!Array.isArray(report?.predicted_collisions)) {
+            throw new Error("unexpected probe response shape");
+          }
+          result = { kind: "ok", report };
+        } catch (err: unknown) {
+          result = controller.signal.aborted
+            ? null
+            : { kind: "unknown", error: err instanceof Error ? err.message : String(err) };
+        } finally {
+          inFlightRef.current.delete(key);
+        }
+        if (result && !controller.signal.aborted) {
+          const settled = result;
+          setProbes((prev) => ({ ...prev, [key]: settled }));
+        }
+      };
+      void runWithConcurrency(prompts, PROBE_CONCURRENCY, probeOne, controller.signal);
     }, PROBE_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
@@ -243,8 +260,11 @@ export function FanoutPanel({
               result.status !== null ? `HTTP ${result.status}: ${result.error}` : result.error,
           };
       setVerdict(v);
-      setVerdictKey(key);
-      if (v.ok) context.onCreated?.(v.runId);
+      if (v.ok) {
+        const runId = v.runId;
+        setCreatedRuns((prev) => new Map(prev).set(key, runId));
+        context.onCreated?.(runId);
+      }
     } finally {
       setCreating(false);
     }
@@ -462,7 +482,7 @@ export function FanoutPanel({
           data-ui-bridge-id="terminal.fanout-create"
           onClick={() => void handleCreate()}
           disabled={!gate.canCreate || creating || created}
-          title={gate.reason ?? `Queue ${gate.tickedCount} sessions, ${maxConcurrent} at a time`}
+          title={blockedReason ?? `Queue ${gate.tickedCount} sessions, ${maxConcurrent} at a time`}
           className="flex items-center justify-center gap-2 px-4 py-2 bg-[#7aa2f7] hover:bg-[#6a92e7] disabled:bg-[#2a2d3d] disabled:text-[#565f89] text-[#1a1b26] text-sm font-medium rounded transition-colors"
         >
           {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Layers className="w-4 h-4" />}
@@ -470,12 +490,12 @@ export function FanoutPanel({
             ? "Created"
             : `Create ${gate.tickedCount} session${gate.tickedCount === 1 ? "" : "s"}`}
         </button>
-        {!gate.canCreate && gate.reason && (
+        {blockedReason && (
           <span
             data-ui-bridge-id="terminal.fanout-create-blocked"
             className="text-[10px] text-[#565f89]"
           >
-            {gate.reason}
+            {blockedReason}
           </span>
         )}
       </div>

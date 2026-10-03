@@ -29,20 +29,18 @@ import {
 export const DEFAULT_MAX_MEMBERS = 24;
 
 /**
- * Upper bound on one rendered prompt, in UTF-8 BYTES.
+ * Upper bound on one rendered prompt's {@link promptArgvCost}.
  *
  * Phase 6 passes the prompt to `claude` as a positional argv element. Windows
  * caps a whole command line at 32,767 UTF-16 characters (`CreateProcessW`),
  * and that budget is shared with the executable path, `--session-id`,
- * `--settings` and every other flag, plus quoting/escaping growth. The runner
- * enforces exactly this bound at `POST /fanout` (`fanout/model.rs`
- * `MAX_PROMPT_BYTES = 24 * 1024`, measured as Rust `str::len`, i.e. UTF-8
- * bytes), so the preview measures the same unit: a JS `.length` (UTF-16 code
- * units) under-counts any non-ASCII prompt and would let the preview pass a
- * prompt the server then refuses. A prompt over this bound is a typed row
- * error, never a truncation.
+ * `--settings` and every other flag. The runner enforces exactly this bound,
+ * with exactly this measure, at `POST /fanout` (`fanout/model.rs`
+ * `MAX_PROMPT_ARGV_COST` / `prompt_argv_cost`), so a row the preview passes is
+ * a row the server accepts. A prompt over it is a typed row error, never a
+ * truncation.
  */
-export const MAX_PROMPT_BYTES = 24 * 1024;
+export const MAX_PROMPT_ARGV_COST = 24 * 1024;
 
 /**
  * Hard ceiling on members the runner accepts in one run (`fanout/model.rs`
@@ -55,9 +53,30 @@ export const MAX_TITLE_CHARS = 200;
 
 const utf8 = new TextEncoder();
 
-/** UTF-8 byte length of `text` — the unit the runner's prompt bound counts. */
+/** UTF-8 byte length of `text`. */
 export function utf8ByteLength(text: string): number {
   return utf8.encode(text).length;
+}
+
+/**
+ * The worst-case length `text` occupies on a Windows command line, computed
+ * the same way on every platform and the same way the runner computes it
+ * (`fanout/model.rs` `prompt_argv_cost`).
+ *
+ * Each argv element is quoted the MSVC way: wrapped in quotes, every `"`
+ * escaped with a backslash, and a run of backslashes doubled where a quote
+ * follows it. Counting every `"` and every backslash once more bounds the
+ * escaped length from above, and UTF-8 bytes bound UTF-16 units from above —
+ * so neither a quote-heavy prompt nor a non-ASCII one can pass the preview
+ * and then fail at spawn.
+ */
+export function promptArgvCost(text: string): number {
+  let escapes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x22 || c === 0x5c) escapes++;
+  }
+  return utf8ByteLength(text) + escapes + 2;
 }
 
 /**
@@ -125,8 +144,8 @@ export type MatrixExpandResult =
  * row the preview passes is a row `POST /fanout` accepts.
  */
 export type FanoutRowError =
-  /** The rendered prompt exceeds `MAX_PROMPT_BYTES` UTF-8 bytes (argv-unsafe). */
-  | { kind: "prompt_too_long"; bytes: number; max: number }
+  /** The rendered prompt's escaped argv length exceeds `MAX_PROMPT_ARGV_COST`. */
+  | { kind: "prompt_too_long"; cost: number; max: number }
   /** The rendered prompt is blank. */
   | { kind: "empty_prompt" }
   /** The rendered prompt contains a NUL, which no argv element can carry. */
@@ -313,8 +332,8 @@ function hasValue(values: PromptParamValues, name: string): boolean {
  *
  * When there is more than one member and the body references no matrix axis
  * (or every rendered prompt comes out identical anyway), every row carries an
- * `identical_prompts` warning. A prompt longer than `maxPromptBytes` UTF-8
- * bytes is a `prompt_too_long` row error; a blank prompt, a NUL in the prompt,
+ * `identical_prompts` warning. A prompt whose {@link promptArgvCost} exceeds
+ * `maxPromptCost` is a `prompt_too_long` row error; a blank prompt, a NUL in the prompt,
  * a blank title and an over-long title are row errors too, matching the
  * runner's `POST /fanout` validation.
  */
@@ -323,7 +342,7 @@ export function planFanout(
   fixedValues: PromptParamValues,
   members: readonly MatrixMember[],
   titleTemplate: string,
-  maxPromptBytes: number = MAX_PROMPT_BYTES,
+  maxPromptCost: number = MAX_PROMPT_ARGV_COST,
 ): FanoutRow[] {
   const parameters: readonly PromptParameter[] = template.parameters ?? [];
   const declared = new Set(parameters.map((p) => p.name));
@@ -346,9 +365,9 @@ export function planFanout(
     }
 
     const errors: FanoutRowError[] = [];
-    const bytes = utf8ByteLength(prompt);
-    if (bytes > maxPromptBytes) {
-      errors.push({ kind: "prompt_too_long", bytes, max: maxPromptBytes });
+    const cost = promptArgvCost(prompt);
+    if (cost > maxPromptCost) {
+      errors.push({ kind: "prompt_too_long", cost, max: maxPromptCost });
     }
     if (serverTrim(prompt).length === 0) errors.push({ kind: "empty_prompt" });
     if (prompt.includes("\0")) errors.push({ kind: "prompt_contains_nul" });

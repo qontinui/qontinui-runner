@@ -27,7 +27,12 @@ import {
   type FanoutResult,
   type FanoutRunView,
 } from "./fanoutApi";
-import { mergeRunUpdate, readStateFromResult, type FanoutReadState } from "./fanoutStripModel";
+import {
+  createFreshnessGate,
+  mergeRunUpdate,
+  readStateFromResult,
+  type FanoutReadState,
+} from "./fanoutStripModel";
 
 const logger = createLogger("FanoutRuns");
 
@@ -45,6 +50,16 @@ export interface FanoutRunsApi {
 export function useFanoutRuns(): FanoutRunsApi {
   const [state, setState] = useState<FanoutReadState>({ kind: "loading" });
   const mountedRef = useRef(true);
+  const gateRef = useRef(createFreshnessGate());
+
+  /** Merge one changed run; stamp the state only when it actually changed. */
+  const applyRunUpdate = useCallback((run: FanoutRunView) => {
+    setState((prev) => {
+      const next = mergeRunUpdate(prev, run);
+      if (next !== prev) gateRef.current.markApplied();
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -54,8 +69,12 @@ export function useFanoutRuns(): FanoutRunsApi {
   }, []);
 
   const refresh = useCallback(async () => {
+    const stamp = gateRef.current.begin();
     const result = await listFanoutRuns();
-    if (mountedRef.current) setState(readStateFromResult(result));
+    if (!mountedRef.current) return;
+    // Read before a change the state already shows: newer state wins.
+    if (!gateRef.current.acceptPoll(stamp)) return;
+    setState(readStateFromResult(result));
   }, []);
 
   // Fallback poll (also the initial read).
@@ -74,8 +93,7 @@ export function useFanoutRuns(): FanoutRunsApi {
         logger.warn("fanout-changed: payload had an unexpected shape; waiting for the poll");
         return;
       }
-      const run = event.payload;
-      setState((prev) => mergeRunUpdate(prev, run));
+      applyRunUpdate(event.payload);
     })
       .then((fn) => {
         if (cancelled) {
@@ -91,15 +109,15 @@ export function useFanoutRuns(): FanoutRunsApi {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [applyRunUpdate]);
 
-  const applyRun = useCallback(<T>(result: FanoutResult<T>, pick: (data: T) => FanoutRunView) => {
-    if (result.ok && mountedRef.current) {
-      const run = pick(result.data);
-      setState((prev) => mergeRunUpdate(prev, run));
-    }
-    return result;
-  }, []);
+  const applyRun = useCallback(
+    <T>(result: FanoutResult<T>, pick: (data: T) => FanoutRunView) => {
+      if (result.ok && mountedRef.current) applyRunUpdate(pick(result.data));
+      return result;
+    },
+    [applyRunUpdate],
+  );
 
   const cancelQueued = useCallback(
     async (runId: string) => applyRun(await cancelFanoutQueued(runId), (r) => r),

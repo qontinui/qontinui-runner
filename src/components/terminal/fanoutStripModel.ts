@@ -11,7 +11,12 @@
  * of the latter, exactly as the runner's `POST /fanout/{id}/cancel` does.
  */
 
-import type { FanoutMemberView, FanoutResult, FanoutRunView } from "./fanoutApi";
+import {
+  FANOUT_LEDGER_NOT_LOADED,
+  type FanoutMemberView,
+  type FanoutResult,
+  type FanoutRunView,
+} from "./fanoutApi";
 
 // ---------------------------------------------------------------------------
 // Read state
@@ -22,9 +27,17 @@ export type FanoutReadState =
   /** No read has completed yet. */
   | { kind: "loading" }
   /**
+   * The runner answered 503 `FANOUT_LEDGER_NOT_LOADED`: its boot settle has
+   * not run the first ledger load yet. Its runs are not known YET — expected
+   * for the first ~45 s after a start, and nothing has failed — so this is a
+   * quiet state that never forces the strip visible on its own.
+   */
+  | { kind: "settling"; reason: string }
+  /**
    * The last read failed: the scheduler's state is UNKNOWN, not empty. This
-   * includes a runner that answered 503 `FANOUT_LEDGER_NOT_LOADED` (its ledger
-   * is not loaded yet) — `code` carries that word when the server sent one.
+   * includes a runner whose ledger load FAILED (503
+   * `FANOUT_LEDGER_LOAD_FAILED`, PostgreSQL unreadable) — `code` carries the
+   * server's word when it sent one.
    */
   | { kind: "unknown"; error: string; status: number | null; code?: string }
   | { kind: "ok"; runs: FanoutRunView[] };
@@ -32,6 +45,7 @@ export type FanoutReadState =
 /** Fold a `GET /fanout` result into the read state. */
 export function readStateFromResult(result: FanoutResult<FanoutRunView[]>): FanoutReadState {
   if (result.ok) return { kind: "ok", runs: result.data };
+  if (result.code === FANOUT_LEDGER_NOT_LOADED) return { kind: "settling", reason: result.error };
   return {
     kind: "unknown",
     error: result.error,
@@ -61,14 +75,49 @@ export function activeFanoutRuns(runs: readonly FanoutRunView[]): FanoutRunView[
 }
 
 /**
- * Whether the strip renders anything. Nothing while the first read is in
- * flight or when there are no active runs; ALWAYS when the read failed, so an
- * unreadable route is visible as UNKNOWN rather than as an absent strip.
+ * Whether the fan-out state, on its own, makes the strip show. Not while the
+ * first read is in flight, not during the runner's boot settle (`settling`),
+ * and not with no active runs; ALWAYS when the read failed, so an unreadable
+ * route is visible as UNKNOWN rather than as an absent strip.
  */
 export function fanoutStripVisible(state: FanoutReadState): boolean {
-  if (state.kind === "loading") return false;
+  if (state.kind === "loading" || state.kind === "settling") return false;
   if (state.kind === "unknown") return true;
   return activeFanoutRuns(state.runs).length > 0;
+}
+
+/**
+ * Orders the two sources of the run list — the poll and the per-run events
+ * (and mutation answers) — so a slow poll cannot overwrite newer state.
+ *
+ * Every poll takes a stamp when it STARTS; every applied event or mutation
+ * marks the state with a fresh stamp. A poll's answer is applied only when it
+ * started after everything already applied — otherwise it was read before a
+ * change the state already shows, and is dropped (the next poll is newer).
+ */
+export interface FreshnessGate {
+  /** Stamp a poll as it starts. */
+  begin(): number;
+  /** Whether a poll that started at `stamp` may be applied now; marks it applied if so. */
+  acceptPoll(stamp: number): boolean;
+  /** Record that an event or mutation answer was applied. */
+  markApplied(): void;
+}
+
+export function createFreshnessGate(): FreshnessGate {
+  let clock = 0;
+  let applied = 0;
+  return {
+    begin: () => ++clock,
+    acceptPoll: (stamp) => {
+      if (stamp <= applied) return false;
+      applied = stamp;
+      return true;
+    },
+    markApplied: () => {
+      applied = ++clock;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +134,8 @@ const REASON_LABELS: Record<string, string> = {
   fanout_bound_occupied: "fan-out bound full",
   store_unavailable: "ledger unavailable",
   cancelled: "cancelled",
+  spawn_unconfirmed: "spawn unconfirmed (runner restarted)",
+  stale_after_restart: "stale after restart",
 };
 
 const MAX_REASON_CHARS = 60;
@@ -162,10 +213,43 @@ export function memberNumber(m: Pick<FanoutMemberView, "index" | "previewIndex">
   return (m.previewIndex ?? m.index) + 1;
 }
 
-/** One member row's state text: the state, plus its reason in operator words. */
-export function memberStateLabel(m: FanoutMemberView): string {
-  const r = reasonLabel(m.reason);
-  return r ? `${m.state} (${r})` : m.state;
+/** `45s`, `12m`, `3h`, `2d` — the coarsest unit that is at least 1. */
+function shortDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/**
+ * When a refused member returns to the queue: `retry in 40s`, `retrying` once
+ * its backoff has elapsed, `null` when it is not waiting on one.
+ */
+export function retryLabel(m: FanoutMemberView, nowMs: number): string | null {
+  if (m.state !== "refused" || !m.nextRetryAt) return null;
+  const at = Date.parse(m.nextRetryAt);
+  if (Number.isNaN(at)) return null;
+  const wait = at - nowMs;
+  const n = m.refusals && m.refusals > 1 ? ` (refusal ${m.refusals})` : "";
+  return wait > 0 ? `retry in ${shortDuration(wait)}${n}` : `retrying${n}`;
+}
+
+/** One member row's state text: the state, its reason in operator words, and any retry. */
+export function memberStateLabel(m: FanoutMemberView, nowMs: number = Date.now()): string {
+  const parts = [reasonLabel(m.reason), retryLabel(m, nowMs)].filter(
+    (p): p is string => p !== null,
+  );
+  return parts.length > 0 ? `${m.state} (${parts.join(" · ")})` : m.state;
+}
+
+/** How long ago a run was created: `started 3h ago`. `null` for an unparseable stamp. */
+export function runAgeLabel(run: Pick<FanoutRunView, "createdAt">, nowMs: number): string | null {
+  const at = Date.parse(run.createdAt);
+  if (Number.isNaN(at)) return null;
+  return `started ${shortDuration(nowMs - at)} ago`;
 }
 
 // ---------------------------------------------------------------------------

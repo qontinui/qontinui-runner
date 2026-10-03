@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import type { PromptParameter } from "./promptLibraryApi";
 import {
   DEFAULT_MAX_MEMBERS,
-  MAX_PROMPT_BYTES,
+  MAX_PROMPT_ARGV_COST,
   MAX_TITLE_CHARS,
+  promptArgvCost,
   SERVER_MAX_MEMBERS,
   serverTrim,
   utf8ByteLength,
@@ -261,37 +262,51 @@ describe("planFanout", () => {
   });
 
   it("is a typed row error when a rendered prompt exceeds the argv bound", () => {
-    const long = "x".repeat(MAX_PROMPT_BYTES);
+    const long = "x".repeat(MAX_PROMPT_ARGV_COST);
     const rows = planFanout(
       { body: "{{blob}}{{platform}}", parameters: [] },
       { blob: long },
       members,
       "{{platform}}",
     );
+    // 3 platform chars + the 2 wrapping quotes.
     expect(rows[0].errors).toEqual([
-      { kind: "prompt_too_long", bytes: MAX_PROMPT_BYTES + 3, max: MAX_PROMPT_BYTES },
+      { kind: "prompt_too_long", cost: MAX_PROMPT_ARGV_COST + 5, max: MAX_PROMPT_ARGV_COST },
     ]);
     // Not truncated.
-    expect(rows[0].prompt.length).toBe(MAX_PROMPT_BYTES + 3);
+    expect(rows[0].prompt.length).toBe(MAX_PROMPT_ARGV_COST + 3);
   });
 
   it("measures the prompt bound in UTF-8 bytes, not UTF-16 units", () => {
     // "é" is 1 UTF-16 unit but 2 UTF-8 bytes: 13,000 of them is 13,000
-    // `.length` (under the bound) yet 26,000 bytes (over it) — the server
-    // counts bytes, so the preview must too.
+    // `.length` (under the bound) yet 26,000 bytes (over it).
     const accented = "é".repeat(13_000);
-    expect(accented.length).toBeLessThan(MAX_PROMPT_BYTES);
+    expect(accented.length).toBeLessThan(MAX_PROMPT_ARGV_COST);
     expect(utf8ByteLength(accented)).toBe(26_000);
     const rows = planFanout({ body: "{{blob}}", parameters: [] }, { blob: accented }, [{}], "t");
     expect(rows[0].errors).toEqual([
-      { kind: "prompt_too_long", bytes: 26_000, max: MAX_PROMPT_BYTES },
+      { kind: "prompt_too_long", cost: 26_002, max: MAX_PROMPT_ARGV_COST },
     ]);
   });
 
-  it("accepts a prompt exactly at the byte bound", () => {
+  it("counts Windows quoting, so a quote-heavy prompt cannot pass the preview and fail at spawn", () => {
+    // The same numbers `fanout/model.rs` pins for `prompt_argv_cost`.
+    expect(promptArgvCost("abc")).toBe(5);
+    expect(promptArgvCost('say "hi" \\ there')).toBe(16 + 3 + 2);
+    expect(promptArgvCost("é")).toBe(4);
+    // 12,288 quotes: 12 KiB of bytes, 24 KiB + 2 once escaped.
+    const quotes = '"'.repeat(MAX_PROMPT_ARGV_COST / 2);
+    expect(utf8ByteLength(quotes)).toBeLessThan(MAX_PROMPT_ARGV_COST);
+    const rows = planFanout({ body: "{{blob}}", parameters: [] }, { blob: quotes }, [{}], "t");
+    expect(rows[0].errors).toEqual([
+      { kind: "prompt_too_long", cost: MAX_PROMPT_ARGV_COST + 2, max: MAX_PROMPT_ARGV_COST },
+    ]);
+  });
+
+  it("accepts a prompt exactly at the bound", () => {
     const rows = planFanout(
       { body: "{{blob}}", parameters: [] },
-      { blob: "x".repeat(MAX_PROMPT_BYTES) },
+      { blob: "x".repeat(MAX_PROMPT_ARGV_COST - 2) },
       [{}],
       "t",
     );
@@ -299,7 +314,7 @@ describe("planFanout", () => {
   });
 
   it("keeps the argv bound below Windows' 32 KiB command-line limit", () => {
-    expect(MAX_PROMPT_BYTES).toBeLessThan(32_767);
+    expect(MAX_PROMPT_ARGV_COST).toBeLessThan(32_767);
   });
 
   it("keeps the preview member ceiling within the server's", () => {

@@ -7,7 +7,9 @@
  * (low memory)` — expandable to its member list with Cancel-queued,
  * Release-slot and cap ± controls. When the scheduler route cannot be read the
  * strip says UNKNOWN with the error rather than rendering nothing, because
- * "no pill" would read as "no runs". Every count and label comes from
+ * "no pill" would read as "no runs". During the runner's boot settle (its
+ * ledger not loaded YET) it shows a quiet "loading" mark that never makes the
+ * strip appear on its own. Every count and label comes from
  * `fanoutStripModel.ts`.
  *
  * The data hook is owned by `StatusStrip` (so its auto-hide gate can see
@@ -37,9 +39,11 @@ import {
   memberNumber,
   memberStateLabel,
   nextCap,
+  runAgeLabel,
   unknownStripText,
 } from "./fanoutStripModel";
 import type { FanoutRunsApi } from "./useFanoutRuns";
+import { useNow1Hz } from "./useNow1Hz";
 
 const STATE_COLOR: Record<string, string> = {
   queued: "#e0af68",
@@ -51,6 +55,18 @@ const STATE_COLOR: Record<string, string> = {
 
 export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
   const { state } = api;
+  if (state.kind === "settling") {
+    return (
+      <span
+        data-ui-bridge-id="terminal.fanout-strip"
+        data-fanout-state="settling"
+        className="px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
+        title={state.reason}
+      >
+        fan-out loading…
+      </span>
+    );
+  }
   if (!fanoutStripVisible(state)) return null;
 
   if (state.kind === "unknown") {
@@ -98,6 +114,8 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ text: string; error: boolean } | null>(null);
   const ref = useRef<HTMLSpanElement>(null);
+  /** Ticks the run's age and each refused member's retry countdown. */
+  const now = useNow1Hz();
 
   useEffect(() => {
     if (!open) return;
@@ -143,6 +161,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
 
   const cancellable = cancellableCount(run);
   const summary = fanoutRunSummary(run);
+  const age = runAgeLabel(run, now);
 
   return (
     <span
@@ -156,11 +175,18 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
         data-ui-bridge-id="terminal.fanout-strip-toggle"
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap text-[#bb9af7] hover:bg-white/5 transition-colors"
-        title={`${summary} — max ${run.maxConcurrent} at once, in ${run.workingDir}. Click for members.`}
+        title={`${summary} — max ${run.maxConcurrent} at once, in ${run.workingDir}${
+          age ? `, ${age}` : ""
+        }. Click for members.`}
         aria-expanded={open}
       >
         <Layers className="w-2.5 h-2.5" />
         <span>{summary}</span>
+        {age && (
+          <span data-ui-bridge-id="terminal.fanout-strip-age" className="text-[#565f89]">
+            · {age}
+          </span>
+        )}
         {open ? <ChevronDown className="w-2.5 h-2.5" /> : <ChevronRight className="w-2.5 h-2.5" />}
       </button>
       {open && (
@@ -197,7 +223,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
               disabled={busy}
               onClick={() => changeCap(1)}
               className="p-0.5 rounded text-[#a9b1d6] hover:bg-white/5 disabled:opacity-40"
-              title="Raise max concurrent (clamped to the tenant's fan-out bound)"
+              title="Raise max concurrent (clamped to this runner's fan-out bound)"
             >
               <Plus className="w-3 h-3" />
             </button>
@@ -233,9 +259,9 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
                 <span
                   className="shrink-0 text-[10px] truncate max-w-[150px]"
                   style={{ color: STATE_COLOR[m.state] ?? "#a9b1d6" }}
-                  title={m.reason ?? m.state}
+                  title={memberStateLabel(m, now)}
                 >
-                  {memberStateLabel(m)}
+                  {memberStateLabel(m, now)}
                 </span>
                 {canReleaseMember(m) && (
                   <button

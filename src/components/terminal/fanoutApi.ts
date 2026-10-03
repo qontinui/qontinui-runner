@@ -57,6 +57,10 @@ export interface FanoutMemberView {
   reason: string | null;
   admittedAt: string | null;
   releasedAt: string | null;
+  /** Consecutive refusals of the same kind (absent from older runner builds). */
+  refusals?: number;
+  /** When a refused member next returns to the queue (its backoff), if waiting on one. */
+  nextRetryAt?: string | null;
 }
 
 export interface FanoutRunView {
@@ -76,7 +80,10 @@ export interface FanoutRunView {
 /** A create or PATCH result: the run, and how its cap relates to the bound. */
 export interface FanoutCapOutcome {
   run: FanoutRunView;
-  /** The tenant's `parallel_fanout` bound the cap was clamped against. */
+  /**
+   * This runner's `parallel_fanout` bound the cap was clamped against. It
+   * resolves per device (the runner's registry row), not per tenant.
+   */
   fanoutBound: number;
   /** What the caller asked for, when the clamp changed it. */
   clampedFrom: number | null;
@@ -124,9 +131,16 @@ export type FanoutResult<T> =
 
 /**
  * The `code` on a 503 served while the runner has not loaded its fan-out
- * ledger yet (boot settle, or PostgreSQL unreachable). Its runs are UNKNOWN.
+ * ledger YET — the boot settle, before the first load ran. Expected and
+ * transient: its runs are not known yet, and nothing has failed.
  */
 export const FANOUT_LEDGER_NOT_LOADED = "FANOUT_LEDGER_NOT_LOADED";
+
+/**
+ * The `code` on a 503 served once a ledger load was attempted and FAILED
+ * (PostgreSQL unreadable). Its runs are UNKNOWN.
+ */
+export const FANOUT_LEDGER_LOAD_FAILED = "FANOUT_LEDGER_LOAD_FAILED";
 
 // ---------------------------------------------------------------------------
 // Pure envelope parsing

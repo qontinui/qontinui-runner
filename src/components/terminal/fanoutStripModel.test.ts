@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FANOUT_LEDGER_LOAD_FAILED,
   FANOUT_LEDGER_NOT_LOADED,
   isFanoutRunList,
   parseFanoutEnvelope,
@@ -13,6 +14,7 @@ import {
   cancellableCount,
   cancelledNote,
   capClampNote,
+  createFreshnessGate,
   fanoutRunSummary,
   fanoutStripVisible,
   memberNumber,
@@ -21,6 +23,8 @@ import {
   nextCap,
   readStateFromResult,
   reasonLabel,
+  retryLabel,
+  runAgeLabel,
   runName,
   summarizeReasons,
   unknownStripText,
@@ -60,7 +64,7 @@ function run(members: FanoutMemberView[], overrides: Partial<FanoutRunView> = {}
 }
 
 describe("read state", () => {
-  it("a 503 FANOUT_LEDGER_NOT_LOADED is UNKNOWN with its reason, shown in the strip", () => {
+  it("a 503 FANOUT_LEDGER_NOT_LOADED (the boot settle) is a quiet state that never forces the strip", () => {
     const result = parseFanoutEnvelope(
       503,
       {
@@ -73,16 +77,33 @@ describe("read state", () => {
     );
     const s = readStateFromResult(result);
     expect(s).toEqual({
+      kind: "settling",
+      reason: "the fan-out ledger has not been loaded yet — its runs are UNKNOWN until then",
+    });
+    expect(fanoutStripVisible(s)).toBe(false);
+  });
+
+  it("a 503 FANOUT_LEDGER_LOAD_FAILED (PG unreadable) is UNKNOWN, shown in the strip", () => {
+    const result = parseFanoutEnvelope(
+      503,
+      {
+        success: false,
+        error: "the fan-out ledger could not be loaded from PostgreSQL (connection refused)",
+        code: FANOUT_LEDGER_LOAD_FAILED,
+      },
+      isFanoutRunList,
+      "GET /fanout",
+    );
+    const s = readStateFromResult(result);
+    expect(s).toEqual({
       kind: "unknown",
       status: 503,
-      error: "the fan-out ledger has not been loaded yet — its runs are UNKNOWN until then",
-      code: FANOUT_LEDGER_NOT_LOADED,
+      error: "the fan-out ledger could not be loaded from PostgreSQL (connection refused)",
+      code: FANOUT_LEDGER_LOAD_FAILED,
     });
     expect(fanoutStripVisible(s)).toBe(true);
     if (s.kind !== "unknown") throw new Error("unreachable");
-    expect(unknownStripText(s.error)).toMatch(
-      /^fan-out UNKNOWN — the fan-out ledger has not been loaded yet/,
-    );
+    expect(unknownStripText(s.error)).toMatch(/^fan-out UNKNOWN — the fan-out ledger could not/);
   });
 
   it("a failed read is UNKNOWN with the error, never an empty list", () => {
@@ -240,5 +261,64 @@ describe("memberNumber", () => {
   it("falls back to the posted position when no preview index was echoed", () => {
     expect(memberNumber({ index: 1, previewIndex: null })).toBe(2);
     expect(memberNumber({ index: 4 })).toBe(5);
+  });
+});
+
+describe("freshness gate", () => {
+  it("drops a poll that started before an event the state already shows", () => {
+    const g = createFreshnessGate();
+    const slow = g.begin();
+    g.markApplied(); // an event lands while the poll is in flight
+    expect(g.acceptPoll(slow)).toBe(false);
+    // A poll started after it is applied.
+    const fresh = g.begin();
+    expect(g.acceptPoll(fresh)).toBe(true);
+  });
+
+  it("drops an older poll that answers after a newer one", () => {
+    const g = createFreshnessGate();
+    const a = g.begin();
+    const b = g.begin();
+    expect(g.acceptPoll(b)).toBe(true);
+    expect(g.acceptPoll(a)).toBe(false);
+  });
+
+  it("applies polls in order when nothing else happened", () => {
+    const g = createFreshnessGate();
+    expect(g.acceptPoll(g.begin())).toBe(true);
+    expect(g.acceptPoll(g.begin())).toBe(true);
+  });
+});
+
+describe("backoff and age labels", () => {
+  const now = Date.parse("2026-10-03T12:00:00Z");
+
+  it("says when a refused member returns to the queue", () => {
+    const m = {
+      ...member(0, "refused", "resource_guard:critical: low memory"),
+      refusals: 3,
+      nextRetryAt: "2026-10-03T12:00:40Z",
+    };
+    expect(retryLabel(m, now)).toBe("retry in 40s (refusal 3)");
+    expect(memberStateLabel(m, now)).toBe(
+      "refused (resource_guard:critical: low memory · retry in 40s (refusal 3))",
+    );
+    expect(retryLabel({ ...m, nextRetryAt: "2026-10-03T11:59:00Z" }, now)).toBe(
+      "retrying (refusal 3)",
+    );
+    expect(retryLabel({ ...m, refusals: 1 }, now)).toBe("retry in 40s");
+    expect(retryLabel({ ...m, state: "queued" }, now)).toBeNull();
+  });
+
+  it("names the new release reasons", () => {
+    expect(reasonLabel("spawn_unconfirmed")).toBe("spawn unconfirmed (runner restarted)");
+    expect(reasonLabel("stale_after_restart")).toBe("stale after restart");
+  });
+
+  it("shows how old a run is", () => {
+    expect(runAgeLabel({ createdAt: "2026-10-03T11:59:15Z" }, now)).toBe("started 45s ago");
+    expect(runAgeLabel({ createdAt: "2026-10-03T09:00:00Z" }, now)).toBe("started 3h ago");
+    expect(runAgeLabel({ createdAt: "2026-09-29T12:00:00Z" }, now)).toBe("started 4d ago");
+    expect(runAgeLabel({ createdAt: "not a date" }, now)).toBeNull();
   });
 });

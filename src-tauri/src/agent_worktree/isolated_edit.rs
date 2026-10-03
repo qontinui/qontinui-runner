@@ -338,6 +338,125 @@ impl IsolatedEditContext {
     pub(crate) fn session_id(&self) -> Option<uuid::Uuid> {
         self.active_claims.first().and_then(|c| c.agent_session_id)
     }
+
+    /// What it takes to hand this context's allocation back if the spawn it
+    /// was acquired for never starts a session. Captured BEFORE the context is
+    /// moved into the spawn seam, which consumes it either way.
+    pub(crate) fn handback(&self) -> AllocationHandback {
+        AllocationHandback {
+            coord_http_base: self.coord_http_base.clone(),
+            device_id: self.device_id,
+            worktrees: self
+                .worktrees
+                .iter()
+                .map(|w| (w.worktree_path.clone(), w.branch.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// The hand-back of an allocation whose session never started (plan
+/// `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`,
+/// review fix 1).
+///
+/// Dropping an [`IsolatedEditContext`] releases its coord CLAIMS but leaves
+/// the materialized worktree on disk and its `coord.agent_worktrees` row
+/// `allocated` — correct for a session that ran (the reclaim engine judges
+/// its work), and a leak for one that never started: an autonomous spawner
+/// that retries a refusal would mint one orphaned allocation per attempt.
+/// [`Self::abandon`] removes each worktree this allocation created and posts
+/// `worktree-done {branch, abandoned: true}` for it — coord's own retire door,
+/// the one `allocate-worktree.sh --done --abandon` uses.
+#[derive(Debug, Clone)]
+pub(crate) struct AllocationHandback {
+    coord_http_base: String,
+    device_id: uuid::Uuid,
+    /// `(worktree_path, branch)` per materialized repo.
+    worktrees: Vec<(PathBuf, String)>,
+}
+
+impl AllocationHandback {
+    /// Remove every worktree this allocation created and retire its ledger
+    /// row(s). Best-effort and logged: a failure leaves the worktree to the
+    /// reclaim engine, exactly where a dropped context leaves it today.
+    ///
+    /// Only call this when NO session ever ran in the worktree — the caller's
+    /// spawn returned an error before a PTY child existed.
+    pub(crate) async fn abandon(self, why: &str) {
+        let targets = abandon_targets(&self.worktrees, |p| {
+            super::canonical_paths::allocated_worktree_for_path(p)
+                .is_some_and(|root| super::canonical_paths::paths_equal(&root, p))
+        });
+        for path in targets.paths {
+            let shown = path.display().to_string();
+            match tokio::task::spawn_blocking(move || super::reclaim::remove_worktree(&path)).await
+            {
+                Ok(Ok(())) => info!(worktree = %shown, why = %why,
+                    "isolated_edit: abandoned an unused worktree — removed"),
+                Ok(Err(e)) => warn!(worktree = %shown, error = %e,
+                    "isolated_edit: could not remove an unused worktree — left for reclaim"),
+                Err(e) => warn!(worktree = %shown, error = %e,
+                    "isolated_edit: worktree removal task failed — left for reclaim"),
+            }
+        }
+        let Some(client) = crate::coord_http::coord_client() else {
+            warn!("isolated_edit: no shared coord client — allocation left for reclaim");
+            return;
+        };
+        for branch in targets.branches {
+            let url = format!(
+                "{}/coord/worktree-done/{}",
+                self.coord_http_base.trim_end_matches('/'),
+                self.device_id
+            );
+            let body = serde_json::json!({ "branch": branch, "abandoned": true });
+            match client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    let text = r.text().await.unwrap_or_default();
+                    info!(branch = %branch, status, response = %text, why = %why,
+                        "isolated_edit: worktree-done {{abandoned}} posted for an unused allocation");
+                }
+                Err(e) => warn!(branch = %branch, error = %e,
+                    "isolated_edit: worktree-done {{abandoned}} not delivered — left for reclaim"),
+            }
+        }
+    }
+}
+
+/// Which of an allocation's worktrees [`AllocationHandback::abandon`] may
+/// touch. Pure, so the guard is testable without a disk or coord.
+#[derive(Debug, Default, PartialEq)]
+struct AbandonTargets {
+    paths: Vec<PathBuf>,
+    branches: Vec<String>,
+}
+
+/// Only a worktree that IS an agent allocation root on a reserved `agent/`
+/// branch: a `shared_branch` row points at the canonical checkout on a real
+/// branch, and `worktree-done` matches by branch across the whole device, so
+/// handing that back could reach another session's row.
+fn abandon_targets(
+    worktrees: &[(PathBuf, String)],
+    is_allocation_root: impl Fn(&Path) -> bool,
+) -> AbandonTargets {
+    let mut out = AbandonTargets::default();
+    for (path, branch) in worktrees {
+        if !branch.starts_with("agent/") || !is_allocation_root(path) {
+            continue;
+        }
+        out.paths.push(path.clone());
+        if !out.branches.contains(branch) {
+            out.branches.push(branch.clone());
+        }
+    }
+    out
 }
 
 /// Inputs for [`acquire`]. `repos` are bare slugs (e.g.
@@ -1337,6 +1456,35 @@ impl IsolatedEditContext {
 
 #[cfg(test)]
 mod tests {
+    /// An unused allocation is handed back only where it is provably this
+    /// allocation's own: an allocation root on a reserved `agent/` branch. A
+    /// `shared_branch` row (the canonical checkout, on a real branch) is never
+    /// removed or retired, and siblings sharing one branch retire it once.
+    #[test]
+    fn handback_touches_only_allocation_roots_on_agent_branches() {
+        use std::path::{Path, PathBuf};
+        let wt = |p: &str, b: &str| (PathBuf::from(p), b.to_string());
+        let worktrees = vec![
+            wt("/ws/agent-worktrees/a1/qontinui-runner", "agent/m-a1"),
+            wt("/ws/agent-worktrees/a1/qontinui-schemas", "agent/m-a1"),
+            wt("/ws/qontinui-web", "feat/shared"),
+            wt("/ws/agent-worktrees/a1/not-a-root/sub", "agent/m-a1"),
+        ];
+        let is_root = |p: &Path| p.starts_with("/ws/agent-worktrees") && !p.ends_with("sub");
+        let got = super::abandon_targets(&worktrees, is_root);
+        assert_eq!(
+            got.paths,
+            vec![
+                PathBuf::from("/ws/agent-worktrees/a1/qontinui-runner"),
+                PathBuf::from("/ws/agent-worktrees/a1/qontinui-schemas"),
+            ]
+        );
+        assert_eq!(got.branches, vec!["agent/m-a1".to_string()]);
+        // A root on a non-agent branch is still refused.
+        let odd = vec![wt("/ws/agent-worktrees/a2/qontinui-runner", "main")];
+        assert_eq!(super::abandon_targets(&odd, |_| true), Default::default());
+    }
+
     /// Plan `2026-09-23-conductor-e2e-phase1-defects` Phase 1 regression: the
     /// worker path's typed `wait` must not change the terminal policy. An
     /// operator's shell still opens in its own cwd on `wait`, on any other
