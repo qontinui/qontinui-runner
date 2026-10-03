@@ -1018,7 +1018,12 @@ pub(crate) async fn try_refresh_once(
     // slot. The refresh-token slot stays empty (device-JWT lifecycle is
     // owned by coord, not by an OAuth refresh chain). Guarded by the
     // tenant we just asked pair-cli to mint for — see `RefreshOutcome::TenantMismatch`.
-    match auth_manager.store_tokens_expecting(&resp.token, "", Some(tenant_id)) {
+    let token_for_store = resp.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", Some(tenant_id))
+    })
+    .await
+    {
         Ok(()) => {
             // M1: a NEW credential is in the slot — and, via the mirror, in
             // its tenant's slot — so every rejection coord recorded against
@@ -1176,7 +1181,12 @@ pub(crate) async fn try_device_self_refresh(
     // request against `current`, so a re-mint for any other tenant is a coord
     // bug or a stale slot, never a legitimate answer to THIS request.
     let expected_tenant = crate::auth::jwt_tenant_claim(&current);
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -2235,6 +2245,181 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
         .clone()
 }
 
+/// Recompute the binding-gap report from disk NOW and publish it — for an
+/// explicit pairing that just wrote slots, so the cell (and every reader of
+/// it: the doctor, `get_binding_gaps`) stops naming the tenants it healed
+/// without waiting for the next refresher pass. Blocking: reads the slot
+/// store and three small files.
+pub(crate) fn republish_binding_gaps_now(
+    auth_manager: &crate::auth::AuthManager,
+) -> BindingGapReport {
+    let report = binding_gaps_from(&read_sweep_inputs(auth_manager));
+    publish_binding_gaps(report.clone());
+    report
+}
+
+/// One tenant's credential state, as the Settings card and the banner render
+/// it (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`,
+/// D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantCredentialState {
+    /// This box holds a credential for the tenant (a slot, or the default
+    /// binding served by the legacy slot) and the published report does not
+    /// name it as a gap.
+    Connected,
+    /// The published, MEASURED report names it: bound per coord, no credential.
+    NoCredential,
+    /// Nothing established — the report is UNKNOWN, or it and the current
+    /// read disagree. Never rendered as connected.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BindingGapRow {
+    pub tenant_id: String,
+    /// No local source of tenant names exists yet; the UI falls back to a
+    /// short id. Carried so a later name source needs no wire change.
+    pub display_name: Option<String>,
+    pub state: TenantCredentialState,
+}
+
+/// What `get_binding_gaps` serves: the published cell, expanded to one row
+/// per tenant in `coord_bound_tenants ∪ slots ∪ default`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BindingGapView {
+    /// `measured` or `unknown` — the report's own arm.
+    pub status: &'static str,
+    /// Why the answer is UNKNOWN; `None` when measured.
+    pub reason: Option<String>,
+    /// Sorted by tenant id.
+    pub rows: Vec<BindingGapRow>,
+}
+
+/// Pure: expand the published `report` into rows over the tenants the CURRENT
+/// reads name.
+///
+/// The gap answer is the report's — that is the single source the plan's D3
+/// names — and the current reads only supply the row UNIVERSE. Where the two
+/// cannot both be trusted the row is `unknown`, never `connected`:
+///
+/// * the report is UNKNOWN, or the current reads cannot establish what a
+///   report needs (a stale or unreadable `coord_bound_tenants.json`, an
+///   unreadable slot store, an unreadable default binding) → every row is
+///   unknown;
+/// * a tenant the report does not name as a gap but which this box holds no
+///   credential for (coord bound it after the report was published) → unknown;
+/// * a tenant the report names as a gap that the current bound set no longer
+///   contains (coord unbound it since) → unknown;
+/// * a tenant this box holds a credential for that coord does not bind →
+///   unknown, never connected.
+pub(crate) fn binding_gap_view(
+    report: &BindingGapReport,
+    bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    default_binding: crate::auth::BindingTenantRead,
+) -> BindingGapView {
+    let mut universe: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+    if let qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(ids) = bound {
+        universe.extend(ids.iter().copied());
+    }
+    let mut covered: std::collections::HashSet<uuid::Uuid> = Default::default();
+    if let Some(slots) = tenant_slots {
+        universe.extend(slots.iter().copied());
+        covered.extend(slots.iter().copied());
+    }
+    if let crate::auth::BindingTenantRead::Bound(t) = default_binding {
+        universe.insert(t);
+        covered.insert(t);
+    }
+
+    // UNKNOWN when the published report is, OR when the CURRENT reads could
+    // not establish what a report needs — an unreadable/stale sidecar, an
+    // unreadable slot store (`None`), an unreadable default binding. The
+    // current reads are judged by `resolve_binding_gaps` itself, so the
+    // reasons are the report's own words, not a second copy of them.
+    let unknown_reason = match report {
+        BindingGapReport::Unknown(why) => Some(why.clone()),
+        BindingGapReport::Gaps(_) => {
+            match resolve_binding_gaps(tenant_slots, default_binding, bound) {
+                BindingGapReport::Unknown(why) => Some(why),
+                BindingGapReport::Gaps(_) => None,
+            }
+        }
+    };
+    let row = |t: &uuid::Uuid, state| BindingGapRow {
+        tenant_id: t.to_string(),
+        display_name: None,
+        state,
+    };
+    if let Some(reason) = unknown_reason {
+        return BindingGapView {
+            status: "unknown",
+            reason: Some(reason),
+            rows: universe
+                .iter()
+                .map(|t| row(t, TenantCredentialState::Unknown))
+                .collect(),
+        };
+    }
+    let BindingGapReport::Gaps(gaps) = report else {
+        unreachable!("the Unknown arm returned above")
+    };
+    let gaps: std::collections::HashSet<uuid::Uuid> = gaps
+        .iter()
+        .filter_map(|g| uuid::Uuid::parse_str(g).ok())
+        .collect();
+    let bound_now: std::collections::HashSet<uuid::Uuid> = match bound {
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(ids) => {
+            ids.iter().copied().collect()
+        }
+        qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown(_) => {
+            unreachable!("the Unknown arm returned above")
+        }
+    };
+    universe.extend(gaps.iter().copied());
+    BindingGapView {
+        status: "measured",
+        reason: None,
+        rows: universe
+            .iter()
+            .map(|t| {
+                // A gap is only a gap while coord still binds the tenant: one
+                // the published report names but the CURRENT bound set no
+                // longer does (unbound since) is unknown — never offered for
+                // pairing, which would re-create a binding coord removed.
+                let state = if gaps.contains(t) && bound_now.contains(t) {
+                    TenantCredentialState::NoCredential
+                } else if gaps.contains(t) {
+                    TenantCredentialState::Unknown
+                } else if covered.contains(t) && bound_now.contains(t) {
+                    // Connected = a credential here AND coord still binds it.
+                    // A slot for a tenant coord no longer binds is not a
+                    // working workspace; it renders unknown, and so is never
+                    // re-paired (that would re-create the binding).
+                    TenantCredentialState::Connected
+                } else {
+                    TenantCredentialState::Unknown
+                };
+                row(t, state)
+            })
+            .collect(),
+    }
+}
+
+/// Production read for `get_binding_gaps`: the published cell over this box's
+/// current reads. Blocking.
+pub(crate) fn current_binding_gap_view(auth_manager: &crate::auth::AuthManager) -> BindingGapView {
+    let inputs = read_sweep_inputs(auth_manager);
+    binding_gap_view(
+        &binding_gaps(),
+        &inputs.coord_bound_tenants,
+        inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
+        inputs.default_binding,
+    )
+}
+
 // ===========================================================================
 // ASKING FOR A BOUND TENANT'S SLOT — D3 (plan
 // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`,
@@ -2298,9 +2483,8 @@ pub(crate) const BINDING_GAP_ASK_REASON: &str = "no headless path can seed this 
 /// through coord's `record_pairing`, which makes the paired tenant this
 /// device's home (`coord.devices.tenant_id`), and qontinui-web rotates the
 /// device's single machine key to it.
-pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
-     device's home tenant in coord and rotates its machine key to it — that is how \
-     pairing works until coord offers a per-binding seed door";
+pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "the terminal pair also makes this tenant \
+     the device's home tenant in coord — \"Connect all my workspaces\" does not";
 
 /// One tenant's state within the CURRENT lapse — the record that makes
 /// "exactly once" survive a restart, and the ask the UI reads back.
@@ -3808,6 +3992,19 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
     .to_string()
 }
 
+/// Run one blocking credential-store write OFF the async worker: every store
+/// mutation takes the cross-process store lock, which may wait up to 10 s under
+/// contention (plan `2026-09-30-runner-says-connected-…` D4).
+async fn store_write_off_runtime<R: Send + 'static>(
+    auth_manager: &crate::auth::AuthManager,
+    write: impl FnOnce(&crate::auth::AuthManager) -> anyhow::Result<R> + Send + 'static,
+) -> anyhow::Result<R> {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || write(&mgr))
+        .await
+        .map_err(|e| anyhow::anyhow!("credential-store write task failed: {e}"))?
+}
+
 /// Clear one dead per-tenant slot and try to re-derive a working credential
 /// for it — the EXIT from Phase 2's two absorbing states.
 ///
@@ -3849,7 +4046,10 @@ async fn clear_and_rederive_tenant_slot(
     evidence: &str,
 ) -> TenantSlotOutcome {
     use std::sync::atomic::Ordering;
-    if let Err(e) = auth_manager.clear_tenant_device_jwt(tenant) {
+    let t = *tenant;
+    if let Err(e) =
+        store_write_off_runtime(auth_manager, move |m| m.clear_tenant_device_jwt(&t)).await
+    {
         warn!(
             "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
              as-is ({evidence})"
@@ -3868,8 +4068,10 @@ async fn clear_and_rederive_tenant_slot(
     crate::coord_mcp::log_device_jwt_slot_clear(tenant, cause.as_str(), evidence);
     warn!(
         "device_jwt_refresher: CLEARED tenant {tenant} device-JWT slot \
-         (cause={}, evidence: {evidence}) — attempting device-machine-key re-derive",
-        cause.as_str()
+         (cause={}, evidence: {evidence}, caller=refresher::clear_and_rederive_tenant_slot {}) \
+         — attempting device-machine-key re-derive",
+        cause.as_str(),
+        crate::secure_storage::process_attribution()
     );
 
     if web_base.trim().is_empty() {
@@ -3893,12 +4095,13 @@ async fn clear_and_rederive_tenant_slot(
             rederived: false,
         };
     };
-    match auth_manager.store_tenant_device_jwt(tenant, &jwt) {
+    let jwt_len = jwt.len();
+    match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &jwt)).await
+    {
         Ok(()) => {
             info!(
                 "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
-                 device-machine-key exchange (len={})",
-                jwt.len()
+                 device-machine-key exchange (len={jwt_len})"
             );
             // M1 — see [`reset_upstream_rejections_for`]. This is the arm that
             // LATCHED: re-derive succeeds, rung 1 says `live`, and the next
@@ -4164,7 +4367,10 @@ pub(crate) async fn refresh_tenant_slots(
             outcomes.push((tenant, o));
             continue;
         }
-        match auth_manager.store_tenant_device_jwt(&tenant, &body.token) {
+        let (t, token) = (tenant, body.token.clone());
+        match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &token))
+            .await
+        {
             Ok(()) => {
                 info!(
                     "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",
@@ -4368,7 +4574,12 @@ pub(crate) async fn try_device_machine_key_exchange(
     // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
     // the doc comment above for why a mismatch here is exactly the incident
     // this exchange path was found to bypass.
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -9035,11 +9246,35 @@ mod tenant_slot_refresh_tests {
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
     fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
-        for (file, item) in [
-            ("src/commands/auth.rs", "async fn finalize_signed_in("),
+        // `(file, fn, the call that persists, the calls that may retire)`.
+        // The two web-integration doors retire through their shared
+        // `finish_explicit_pairing`, which is itself held to the rule below.
+        const RETIRE: &str = "retire_rejection_streaks_after_pairing(";
+        const SHARED: &str = "finish_explicit_pairing(";
+        for (file, item, persist_needle, retire_needles) in [
+            (
+                "src/commands/auth.rs",
+                "async fn finalize_signed_in(",
+                "persist_pairing(",
+                &[RETIRE][..],
+            ),
             (
                 "src/commands/web_integration.rs",
                 "pub async fn redeem_pair_code(",
+                "persist_pairing(",
+                &[RETIRE, SHARED][..],
+            ),
+            (
+                "src/commands/web_integration.rs",
+                "async fn run_pair_all_tenants<",
+                "persist_collected_pairings(",
+                &[RETIRE, SHARED][..],
+            ),
+            (
+                "src/commands/web_integration.rs",
+                "async fn finish_explicit_pairing(",
+                "",
+                &[RETIRE][..],
             ),
         ] {
             // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
@@ -9069,10 +9304,12 @@ mod tenant_slot_refresh_tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let persisted = body
-                .find("persist_pairing(")
+                .find(persist_needle)
                 .unwrap_or_else(|| panic!("{item} persists a pairing"));
-            let retired = body
-                .find("retire_rejection_streaks_after_pairing(")
+            let retired = retire_needles
+                .iter()
+                .filter_map(|n| body.find(n))
+                .min()
                 .unwrap_or_else(|| {
                     panic!(
                         "{item} in {file} must retire the old credential's rejection \
@@ -9081,7 +9318,7 @@ mod tenant_slot_refresh_tests {
                     )
                 });
             assert!(
-                retired > persisted,
+                retired >= persisted,
                 "{item}: the retirement must come AFTER persist_pairing succeeds"
             );
         }
@@ -10993,5 +11230,248 @@ mod device_machine_key_exchange_tests {
             None,
             "the foreign tenant's slot must not be seeded either"
         );
+    }
+}
+
+/// Plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// Phase 4 gate: the `get_binding_gaps` rows never render an UNKNOWN as
+/// `connected`.
+#[cfg(test)]
+mod binding_gap_view_tests {
+    use super::*;
+    use qontinui_runner_lib::pair::{coord_bound_tenants_at, CoordBoundTenantsRead};
+
+    fn tenant(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    fn states(view: &BindingGapView) -> Vec<(String, TenantCredentialState)> {
+        view.rows
+            .iter()
+            .map(|r| (r.tenant_id.clone(), r.state))
+            .collect()
+    }
+
+    fn write_sidecar(
+        dir: &std::path::Path,
+        ids: &[uuid::Uuid],
+        observed_at: i64,
+    ) -> std::path::PathBuf {
+        let path = dir.join("coord_bound_tenants.json");
+        let body = serde_json::json!({
+            "tenant_ids": ids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "observed_at": observed_at,
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        path
+    }
+
+    /// A measured report renders per-tenant truth: the home served by the
+    /// legacy slot and a slotted tenant are connected, the gap is not.
+    #[test]
+    fn measured_report_renders_connected_and_no_credential() {
+        let (home, slotted, gap) = (tenant(1), tenant(2), tenant(3));
+        let bound = CoordBoundTenantsRead::Known(vec![home, slotted, gap]);
+        let slots = [slotted];
+        let report = resolve_binding_gaps(
+            Some(&slots),
+            crate::auth::BindingTenantRead::Bound(home),
+            &bound,
+        );
+        let view = binding_gap_view(
+            &report,
+            &bound,
+            Some(&slots),
+            crate::auth::BindingTenantRead::Bound(home),
+        );
+        assert_eq!(view.status, "measured");
+        assert_eq!(view.reason, None);
+        assert_eq!(
+            states(&view),
+            vec![
+                (home.to_string(), TenantCredentialState::Connected),
+                (slotted.to_string(), TenantCredentialState::Connected),
+                (gap.to_string(), TenantCredentialState::NoCredential),
+            ]
+        );
+    }
+
+    /// THE gate: a STALE sidecar is UNKNOWN, and every row — including a
+    /// tenant this box holds a slot for — renders unknown, never connected.
+    #[test]
+    fn a_stale_sidecar_serves_unknown_never_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let (slotted, gap) = (tenant(2), tenant(3));
+        let path = write_sidecar(
+            dir.path(),
+            &[slotted, gap],
+            now - qontinui_runner_lib::pair::COORD_BOUND_TENANTS_MAX_AGE_SECS - 60,
+        );
+        let bound = coord_bound_tenants_at(&path, now);
+        assert!(
+            matches!(bound, CoordBoundTenantsRead::Unknown(_)),
+            "{bound:?}"
+        );
+
+        let slots = [slotted];
+        let report = resolve_binding_gaps(
+            Some(&slots),
+            crate::auth::BindingTenantRead::Unbound,
+            &bound,
+        );
+        let view = binding_gap_view(
+            &report,
+            &bound,
+            Some(&slots),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        assert_eq!(view.status, "unknown");
+        assert!(view.reason.is_some());
+        assert!(!view.rows.is_empty(), "the slotted tenant is still listed");
+        assert!(
+            view.rows
+                .iter()
+                .all(|r| r.state == TenantCredentialState::Unknown),
+            "{view:?}"
+        );
+    }
+
+    /// An unreadable (malformed) or absent sidecar: same answer.
+    #[test]
+    fn an_unreadable_or_absent_sidecar_serves_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let absent = coord_bound_tenants_at(&dir.path().join("coord_bound_tenants.json"), now);
+        let path = dir.path().join("malformed.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let malformed = coord_bound_tenants_at(&path, now);
+        for bound in [absent, malformed] {
+            let report = resolve_binding_gaps(
+                Some(&[tenant(9)]),
+                crate::auth::BindingTenantRead::Bound(tenant(8)),
+                &bound,
+            );
+            let view = binding_gap_view(
+                &report,
+                &bound,
+                Some(&[tenant(9)]),
+                crate::auth::BindingTenantRead::Bound(tenant(8)),
+            );
+            assert_eq!(view.status, "unknown");
+            assert!(view
+                .rows
+                .iter()
+                .all(|r| r.state == TenantCredentialState::Unknown));
+        }
+    }
+
+    /// The published cell and the current read disagree the other way: the
+    /// cell predates the sidecar (the process-start UNKNOWN), while the sidecar
+    /// is fresh now. Still unknown — the gap answer is the cell's.
+    #[test]
+    fn an_unknown_cell_over_a_fresh_sidecar_is_still_unknown() {
+        let bound = CoordBoundTenantsRead::Known(vec![tenant(1)]);
+        let view = binding_gap_view(
+            &BindingGapReport::Unknown("no pass yet".to_string()),
+            &bound,
+            Some(&[tenant(1)]),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        assert_eq!(view.status, "unknown");
+        assert_eq!(view.rows[0].state, TenantCredentialState::Unknown);
+    }
+
+    /// A tenant coord bound AFTER the cell was published has no credential and
+    /// is not in the cell's gaps: it must not read as connected.
+    #[test]
+    fn a_tenant_bound_after_the_report_is_unknown_not_connected() {
+        let late = tenant(4);
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![]),
+            &CoordBoundTenantsRead::Known(vec![late]),
+            Some(&[]),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        assert_eq!(view.status, "measured");
+        assert_eq!(
+            states(&view),
+            vec![(late.to_string(), TenantCredentialState::Unknown)]
+        );
+    }
+
+    /// A gap coord has since UNBOUND is not offered for pairing.
+    #[test]
+    fn a_gap_no_longer_bound_is_unknown_not_no_credential() {
+        let gone = tenant(5);
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![gone.to_string()]),
+            &CoordBoundTenantsRead::Known(vec![]),
+            Some(&[]),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        assert_eq!(
+            states(&view),
+            vec![(gone.to_string(), TenantCredentialState::Unknown)]
+        );
+    }
+
+    /// An unreadable slot store or default binding NOW makes the view unknown
+    /// even over a measured report — no row may read as connected.
+    #[test]
+    fn an_unreadable_store_or_default_now_is_unknown_over_a_measured_report() {
+        let (home, other) = (tenant(1), tenant(2));
+        let bound = CoordBoundTenantsRead::Known(vec![home, other]);
+        let report = BindingGapReport::Gaps(vec![other.to_string()]);
+        for (slots, default) in [
+            (None, crate::auth::BindingTenantRead::Bound(home)),
+            (Some(&[][..]), crate::auth::BindingTenantRead::Unknown),
+        ] {
+            let view = binding_gap_view(&report, &bound, slots, default);
+            assert_eq!(view.status, "unknown");
+            assert!(view.reason.is_some());
+            assert!(
+                view.rows
+                    .iter()
+                    .all(|r| r.state != TenantCredentialState::Connected),
+                "{view:?}"
+            );
+        }
+    }
+
+    /// A slot (or default) for a tenant coord does not bind is not connected.
+    #[test]
+    fn a_covered_but_unbound_tenant_is_unknown_not_connected() {
+        let (bound, unbound_slot, unbound_default) = (tenant(1), tenant(6), tenant(7));
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![]),
+            &CoordBoundTenantsRead::Known(vec![bound]),
+            Some(&[bound, unbound_slot]),
+            crate::auth::BindingTenantRead::Bound(unbound_default),
+        );
+        assert_eq!(
+            states(&view),
+            vec![
+                (bound.to_string(), TenantCredentialState::Connected),
+                (unbound_slot.to_string(), TenantCredentialState::Unknown),
+                (unbound_default.to_string(), TenantCredentialState::Unknown),
+            ]
+        );
+    }
+
+    /// The wire shape the frontend parses.
+    #[test]
+    fn view_serializes_snake_case() {
+        let view = binding_gap_view(
+            &BindingGapReport::Gaps(vec![tenant(3).to_string()]),
+            &CoordBoundTenantsRead::Known(vec![tenant(3)]),
+            Some(&[]),
+            crate::auth::BindingTenantRead::Unbound,
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["status"], "measured");
+        assert_eq!(json["rows"][0]["state"], "no_credential");
+        assert!(json["rows"][0]["display_name"].is_null());
     }
 }

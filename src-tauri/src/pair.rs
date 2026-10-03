@@ -644,6 +644,11 @@ pub struct BindingReconcileReport {
     /// re-pointed (`Some(tenant)`) or cleared entirely (`None` — no
     /// bindings remain).
     pub default_repointed: Option<Option<uuid::Uuid>>,
+    /// Tenants missing from this echo that were KEPT (binding and slot), each
+    /// with its current consecutive-omission count. A count of 0 means the
+    /// drop was due but the slot had changed since the decision, so it was
+    /// spared. Observability only — never part of [`Self::changed`].
+    pub held: Vec<(uuid::Uuid, u32)>,
 }
 
 impl BindingReconcileReport {
@@ -709,6 +714,11 @@ struct CoordBoundTenantsFile {
     tenant_ids: Vec<String>,
     /// Unix seconds when a register echo last carried this set.
     observed_at: i64,
+    /// Coord's HOME tenant for this device (`coord.devices.tenant_id`, the
+    /// register echo's singular `tenant_id`), when the echo carried one. Read
+    /// only by [`coord_home_tenant`]; absent in files written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_tenant_id: Option<String>,
 }
 
 /// Past this age a recorded set is UNKNOWN, not evidence: coord may have
@@ -730,17 +740,33 @@ pub fn coord_bound_tenants_path() -> Option<PathBuf> {
 /// Record coord's echoed binding set (heartbeat-only writer). Returns whether
 /// the file was written. Best-effort for the caller: an `Err` means the count
 /// stays whatever the previous record (or its absence) says.
-pub fn record_coord_bound_tenants(coord_set: &[uuid::Uuid]) -> Result<bool, String> {
+/// `home` is the echo's singular `tenant_id` (coord's home pointer), recorded
+/// beside the set for [`coord_home_tenant`].
+pub fn record_coord_bound_tenants(
+    coord_set: &[uuid::Uuid],
+    home: Option<uuid::Uuid>,
+) -> Result<bool, String> {
     let path =
         coord_bound_tenants_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
-    record_coord_bound_tenants_at(&path, coord_set, chrono::Utc::now().timestamp())
+    record_coord_bound_tenants_with_home_at(&path, coord_set, home, chrono::Utc::now().timestamp())
 }
 
+#[cfg(test)]
 pub(crate) fn record_coord_bound_tenants_at(
     path: &std::path::Path,
     coord_set: &[uuid::Uuid],
     now_unix: i64,
 ) -> Result<bool, String> {
+    record_coord_bound_tenants_with_home_at(path, coord_set, None, now_unix)
+}
+
+pub(crate) fn record_coord_bound_tenants_with_home_at(
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    home: Option<uuid::Uuid>,
+    now_unix: i64,
+) -> Result<bool, String> {
+    let home = home.map(|h| h.to_string());
     let mut ids: Vec<String> = coord_set.iter().map(|t| t.to_string()).collect();
     ids.sort();
     ids.dedup();
@@ -749,7 +775,10 @@ pub(crate) fn record_coord_bound_tenants_at(
         .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok())
     {
         let age = now_unix - existing.observed_at;
-        if existing.tenant_ids == ids && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age) {
+        if existing.tenant_ids == ids
+            && existing.home_tenant_id == home
+            && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age)
+        {
             return Ok(false);
         }
     }
@@ -759,6 +788,7 @@ pub(crate) fn record_coord_bound_tenants_at(
     let body = serde_json::to_vec_pretty(&CoordBoundTenantsFile {
         tenant_ids: ids,
         observed_at: now_unix,
+        home_tenant_id: home,
     })
     .map_err(|e| format!("serialize coord_bound_tenants.json: {e}"))?;
     // Its own tmp name: never the `json.tmp` `write_paired_user_file` uses.
@@ -851,6 +881,25 @@ pub fn coord_bound_tenants_for_ask() -> CoordBoundTenantsRead {
     )
 }
 
+/// Coord's HOME tenant for this device, as the last register echo reported
+/// it — or `None` when that is not established: no sidecar, one too stale to
+/// act on ([`BINDING_GAP_ASK_MAX_AGE_SECS`]), an echo that carried no home, or
+/// a home that is not in the recorded bound set.
+pub fn coord_home_tenant() -> Option<uuid::Uuid> {
+    coord_home_tenant_at(&coord_bound_tenants_path()?, chrono::Utc::now().timestamp())
+}
+
+pub fn coord_home_tenant_at(path: &std::path::Path, now_unix: i64) -> Option<uuid::Uuid> {
+    let CoordBoundTenantsRead::Known(bound) =
+        coord_bound_tenants_at_within(path, now_unix, BINDING_GAP_ASK_MAX_AGE_SECS)
+    else {
+        return None;
+    };
+    let file: CoordBoundTenantsFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let home = uuid::Uuid::parse_str(file.home_tenant_id?.trim()).ok()?;
+    bound.contains(&home).then_some(home)
+}
+
 /// [`coord_bound_tenants_at`] with an explicit freshness bound, so a reader
 /// that ACTS can demand a fresher record than one that only reports.
 pub fn coord_bound_tenants_at_within(
@@ -926,7 +975,9 @@ pub fn coord_bound_tenants_at_within(
 /// - **Drop**: local binding entries whose tenant is NOT in `coord_set`
 ///   are removed, and their `device_jwt:<tenant>` slots cleared (coord
 ///   Phase 3's refresh gate would 403 them anyway). Orphan slots with no
-///   binding entry are cleared by the same rule.
+///   binding entry are cleared by the same rule. Only after the tenant has
+///   been missing from [`RECONCILE_DROP_AFTER_OMISSIONS`] CONSECUTIVE echoes
+///   (tracked in `coord_omission_streaks.json`); a single omission is held.
 /// - **Flag**: tenants in `coord_set` the runner holds no USABLE credential
 ///   for are reported (`coord_only`, with each one's slot state) — never
 ///   fabricated locally; pair, or let the refresher re-derive, to heal.
@@ -955,6 +1006,170 @@ pub fn reconcile_paired_bindings(
     reconcile_paired_bindings_with(&mgr, &path, coord_set)
 }
 
+/// How many CONSECUTIVE reconciles must omit a tenant from coord's echoed set
+/// before its binding is dropped and its slot cleared. One omitted echo used to
+/// delete a live credential outright (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// D4); a single bad echo is now held, not acted on.
+pub const RECONCILE_DROP_AFTER_OMISSIONS: u32 = 2;
+
+/// An omission counts toward the streak only this long after the previously
+/// COUNTED one. Every runner on a box shares the streak file (it sits beside the
+/// shared `paired_user.json`), so without this a primary and an instance runner
+/// heartbeating through the same coord glitch would each add one within seconds
+/// and turn ONE bad echo into two "consecutive" omissions. Below the 30 s
+/// heartbeat cadence, so a single runner's consecutive heartbeats still count.
+pub const RECONCILE_OMISSION_MIN_SPACING_SECS: i64 = 20;
+
+/// One tenant's run of consecutive omissions from coord's echoed set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreak {
+    consecutive: u32,
+    /// Unix seconds of the first omission in this run (forensics: logged on drop).
+    first_omitted_at: i64,
+    /// Unix seconds of the most recent omission that was COUNTED.
+    #[serde(default)]
+    last_counted_at: i64,
+}
+
+/// `coord_omission_streaks.json`, beside `paired_user.json`: tenant id → streak.
+/// Written by the reconcile (advance) and by `persist_pairing_with` (reset on a
+/// fresh pairing). Both do so only while holding the binding-reconcile lock
+/// ([`lock_binding_reconcile`]), which serializes them across threads and
+/// processes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OmissionStreaksFile {
+    #[serde(default)]
+    tenants: std::collections::BTreeMap<String, OmissionStreak>,
+}
+
+fn omission_streaks_path(paired_user: &std::path::Path) -> PathBuf {
+    paired_user.with_file_name("coord_omission_streaks.json")
+}
+
+/// The cross-process lock (`coord_omission_streaks.json.lock`) held for a whole
+/// reconcile pass AND a whole `persist_pairing_with`, so a pairing can never
+/// land between a reconcile's decision and its clears, and the streak file is
+/// never read-modify-written by two writers at once.
+fn lock_binding_reconcile(
+    paired_user: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<crate::secure_storage::FileLockGuard, String> {
+    let lock = crate::secure_storage::lock_path_for(&omission_streaks_path(paired_user));
+    crate::secure_storage::lock_file_exclusive_within(&lock, timeout).map_err(|e| format!("{e:#}"))
+}
+
+/// How long a reconcile waits for the reconcile lock. A reconcile that cannot
+/// get it just tries again next heartbeat.
+const RECONCILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `persist_pairing_with` waits for the reconcile lock. It runs AFTER
+/// coord already minted the credential, so failing here discards a good token:
+/// the budget must sit clearly above a reconcile's worst-case hold: three
+/// store-lock waits (the one batched conditional clear, then the default
+/// re-point's `store_tokens` — its legacy write and its `mirror_into_tenant_slot`
+/// write — 10 s each), one bounded keychain call (3 s), plus file I/O (~33 s).
+pub(crate) const PAIRING_RECONCILE_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
+// Test hook run after a reconcile has decided what to drop and read the slots
+// it will clear, and before it clears them.
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECONCILE_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn read_omission_streaks(path: &std::path::Path) -> OmissionStreaksFile {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic write under a temp name unique per process AND per call (callers hold
+/// the reconcile lock, but a unique name costs nothing and survives a lock bug).
+fn write_omission_streaks(path: &std::path::Path, file: &OmissionStreaksFile) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let written = serde_json::to_vec_pretty(file)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            let tmp =
+                path.with_extension(format!("json.omission.{}.{seq}.tmp", std::process::id()));
+            std::fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        });
+    if let Err(e) = written {
+        tracing::warn!("reconcile: could not persist {}: {e}", path.display());
+    }
+}
+
+/// Advance the streaks for this pass and return the tenants that have now been
+/// omitted [`RECONCILE_DROP_AFTER_OMISSIONS`] times in a row, each with the
+/// unix second its run began (their records are consumed). Every tenant NOT
+/// omitted this pass has its streak reset. An omission closer than
+/// [`RECONCILE_OMISSION_MIN_SPACING_SECS`] to the last counted one is not
+/// counted; a NEGATIVE gap (the clock moved back) does count, and restamps.
+/// An unreadable sidecar reads as empty, and a consumed streak whose clear then
+/// fails restarts at one — both only DELAY a drop, never cause one.
+/// Returns `(due, held)`: due tenants with the unix second their run began, and
+/// held tenants with their current count. Caller holds the reconcile lock.
+#[allow(clippy::type_complexity)]
+fn advance_omission_streaks(
+    paired_user: &std::path::Path,
+    omitted: &[uuid::Uuid],
+    now_unix: i64,
+) -> (Vec<(uuid::Uuid, i64)>, Vec<(uuid::Uuid, u32)>) {
+    let path = omission_streaks_path(paired_user);
+    let before = read_omission_streaks(&path);
+    let mut after = OmissionStreaksFile::default();
+    let mut due = Vec::new();
+    let mut held = Vec::new();
+    for t in omitted {
+        let key = t.to_string();
+        let streak = match before.tenants.get(&key) {
+            Some(prev)
+                if (0..RECONCILE_OMISSION_MIN_SPACING_SECS)
+                    .contains(&(now_unix - prev.last_counted_at)) =>
+            {
+                prev.clone()
+            }
+            Some(prev) => OmissionStreak {
+                consecutive: prev.consecutive.saturating_add(1),
+                first_omitted_at: prev.first_omitted_at,
+                last_counted_at: now_unix,
+            },
+            None => OmissionStreak {
+                consecutive: 1,
+                first_omitted_at: now_unix,
+                last_counted_at: now_unix,
+            },
+        };
+        if streak.consecutive >= RECONCILE_DROP_AFTER_OMISSIONS {
+            due.push((*t, streak.first_omitted_at));
+        } else {
+            held.push((*t, streak.consecutive));
+            after.tenants.insert(key, streak);
+        }
+    }
+    if after != before {
+        write_omission_streaks(&path, &after);
+    }
+    (due, held)
+}
+
+/// A fresh pairing proves the binding is wanted: forget any omission streak the
+/// tenant had, so a coord echo that lags the pair by one heartbeat cannot drop
+/// the credential just minted. Best-effort. Caller holds the reconcile lock.
+fn reset_omission_streak(paired_user: &std::path::Path, tenant: &uuid::Uuid) {
+    let path = omission_streaks_path(paired_user);
+    let mut file = read_omission_streaks(&path);
+    if file.tenants.remove(&tenant.to_string()).is_some() {
+        write_omission_streaks(&path, &file);
+    }
+}
+
 /// Parameterized core of [`reconcile_paired_bindings`] — explicit
 /// `AuthManager` + file path so the unit tests run hermetically against
 /// a temp store, never the operator's real credentials.
@@ -963,6 +1178,20 @@ pub(crate) fn reconcile_paired_bindings_with(
     path: &std::path::Path,
     coord_set: &[uuid::Uuid],
 ) -> Result<BindingReconcileReport, String> {
+    reconcile_paired_bindings_at(mgr, path, coord_set, chrono::Utc::now().timestamp())
+}
+
+/// [`reconcile_paired_bindings_with`] at an explicit clock, so the omission
+/// streak's spacing rule is testable.
+pub(crate) fn reconcile_paired_bindings_at(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
+) -> Result<BindingReconcileReport, String> {
+    // One pass is one critical section: decide, then clear, with no pairing
+    // able to interleave (persist_pairing_with takes the same lock).
+    let _reconcile_lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
     let mut report = BindingReconcileReport::default();
 
     let bytes = match std::fs::read(path) {
@@ -986,22 +1215,119 @@ pub(crate) fn reconcile_paired_bindings_with(
     let pf: PairedUserFile =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
 
+    // Hysteresis: a tenant (binding or orphan slot) missing from this echo is
+    // dropped only once it has been missing from RECONCILE_DROP_AFTER_OMISSIONS
+    // consecutive echoes; until then it is held exactly as if coord had echoed it.
+    let bindings = pf.effective_bindings();
+    let mut omitted: Vec<uuid::Uuid> = bindings
+        .iter()
+        .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
+        .chain(mgr.list_tenant_device_jwt_tenants())
+        .filter(|t| !coord_set.contains(t))
+        .collect();
+    omitted.sort();
+    omitted.dedup();
+    let (due_runs, held) = advance_omission_streaks(path, &omitted, now_unix);
+    report.held = held;
+    let due: Vec<uuid::Uuid> = due_runs.iter().map(|(t, _)| *t).collect();
+    let run_began = |t: &uuid::Uuid| {
+        due_runs
+            .iter()
+            .find(|(d, _)| d == t)
+            .map(|(_, since)| *since)
+            .unwrap_or_default()
+    };
+    for t in omitted.iter().filter(|t| !due.contains(t)) {
+        tracing::info!(
+            "reconcile: tenant {t} is missing from coord's echoed set {coord_set:?} — HOLDING its \
+             binding and slot until {RECONCILE_DROP_AFTER_OMISSIONS} consecutive echoes omit it"
+        );
+    }
+    // The exact token each due tenant's slot held when the drop was decided.
+    // Clears are conditional on it, so a slot rewritten since (a refresher
+    // re-mint) is spared rather than deleted. A slot whose read FAILED is
+    // UNKNOWN: its tenant is held, never dropped on an unread slot.
+    let mut observed: Vec<(uuid::Uuid, String)> = Vec::new();
+    let mut unreadable: Vec<uuid::Uuid> = Vec::new();
+    for t in &due {
+        match mgr.get_tenant_device_jwt(t) {
+            Ok(Some(tok)) => observed.push((*t, tok)),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "reconcile: tenant {t} was due to drop but its slot could not be read \
+                     ({e:#}) — HOLDING it (unknown); this echo was {coord_set:?}"
+                );
+                unreadable.push(*t);
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_RECONCILE_DECISION.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    // ALL conditional clears under ONE store-lock acquisition, so this pass
+    // holds the reconcile lock for at most one store wait here.
+    let cleared: Result<std::collections::HashMap<uuid::Uuid, bool>, String> = mgr
+        .clear_tenant_device_jwts_if_unchanged(&observed)
+        .map(|v| v.into_iter().collect())
+        .map_err(|e| format!("{e:#}"));
+    if let Err(e) = &cleared {
+        tracing::warn!(
+            "reconcile: conditional slot clear failed ({e}) — HOLDING every due tenant this pass"
+        );
+    }
+    /// What became of one due tenant's slot.
+    enum SlotFate {
+        /// Cleared, or there was no slot to clear: the drop may proceed.
+        Gone,
+        /// Changed since the decision, unreadable, or the clear failed: hold.
+        Held,
+    }
+    let fate = |t: &uuid::Uuid| -> SlotFate {
+        if unreadable.contains(t) {
+            return SlotFate::Held;
+        }
+        match &cleared {
+            Err(_) => SlotFate::Held,
+            Ok(map) => match map.get(t) {
+                Some(true) | None => SlotFate::Gone,
+                Some(false) => SlotFate::Held,
+            },
+        }
+    };
+    let keeps = |t: &uuid::Uuid| coord_set.contains(t) || !due.contains(t);
+
     // Partition the (migrated) binding set by coord membership. Entries
     // with malformed tenant_id can never match coord and carry no slot —
     // dropped as junk (logged, not reported).
     let mut kept: Vec<PairedBinding> = Vec::new();
     let mut dropped_malformed = false;
-    for b in pf.effective_bindings() {
+    for b in bindings {
         match uuid::Uuid::parse_str(b.tenant_id.trim()) {
-            Ok(t) if coord_set.contains(&t) => kept.push(b),
-            Ok(t) => {
-                report.dropped.push(t);
-                // Designed home of slot deletion: coord no longer has the
-                // binding, so its credential is dead weight. Best-effort.
-                if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                    tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
+            Ok(t) if keeps(&t) => kept.push(b),
+            Ok(t) => match fate(&t) {
+                SlotFate::Held => {
+                    tracing::warn!(
+                        "reconcile: tenant {t} was due to drop but its slot changed since the \
+                         decision or could not be read/cleared — KEEPING binding and slot; \
+                         this echo was {coord_set:?}"
+                    );
+                    report.held.push((t, 0));
+                    kept.push(b);
                 }
-            }
+                SlotFate::Gone => {
+                    // Designed home of slot deletion: coord no longer has the
+                    // binding, so its credential is dead weight.
+                    tracing::warn!(
+                        "reconcile: DROPPED binding and cleared slot for tenant {t} — omitted \
+                         from {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since \
+                         unix {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped.push(t);
+                }
+            },
             Err(_) => {
                 tracing::warn!(
                     "reconcile: dropping paired_user.json binding with malformed tenant_id {:?}",
@@ -1013,17 +1339,33 @@ pub(crate) fn reconcile_paired_bindings_with(
     }
 
     // Orphan slots (credential without a binding entry) that coord's set
-    // doesn't contain either — same authority statement, same fate.
+    // doesn't contain either — same authority statement, same fate. Only
+    // slots OBSERVED (or unreadable) at decision time: a slot that appeared
+    // since is not one this pass decided about.
     let kept_tenants: Vec<uuid::Uuid> = kept
         .iter()
         .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
         .collect();
-    for t in mgr.list_tenant_device_jwt_tenants() {
-        if !coord_set.contains(&t) && !report.dropped.contains(&t) {
-            if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
-                tracing::debug!("reconcile: clear orphan slot {t} failed: {e}");
-            } else {
-                report.dropped_slots.push(t);
+    let mut orphans: Vec<uuid::Uuid> = observed
+        .iter()
+        .map(|(t, _)| *t)
+        .chain(unreadable.iter().copied())
+        .collect();
+    orphans.sort();
+    orphans.dedup();
+    for t in orphans {
+        if !keeps(&t) && !report.dropped.contains(&t) && !kept_tenants.contains(&t) {
+            match fate(&t) {
+                SlotFate::Gone => {
+                    tracing::warn!(
+                        "reconcile: cleared ORPHAN slot for tenant {t} — omitted from \
+                         {RECONCILE_DROP_AFTER_OMISSIONS} consecutive coord echoes since unix \
+                         {}; this echo was {coord_set:?}",
+                        run_began(&t)
+                    );
+                    report.dropped_slots.push(t);
+                }
+                SlotFate::Held => report.held.push((t, 0)),
             }
         }
     }
@@ -1519,30 +1861,160 @@ pub fn pair_with_pair_code(
 }
 
 // ============================================================================
-// Pair: browser (--browser, default)
+// Pair: browser (--browser, default) and the multi-tenant COLLECT flow
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize)]
+/// Query string of the loopback `/auth/runner-token-callback` redirect.
+///
+/// Every field but `state` is optional on the WIRE because the two browser
+/// flows deliver different things. The single-tenant flow
+/// ([`pair_via_browser`]) receives the device JWT in `?token=`. The
+/// multi-tenant flow ([`pair_via_browser_multi`]) receives only `state`,
+/// `token_id` and `collect=1`: its tokens are fetched from coord's
+/// `pair-collect` with a verifier only this process holds, and never travel
+/// through a URL (plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`,
+/// D1 "Delivery"). Which fields are REQUIRED is decided by [`parse_callback`]
+/// per [`CallbackMode`], not by serde, so a malformed redirect gets a readable
+/// page rather than a bare 400.
+#[derive(Clone, Deserialize)]
 pub(crate) struct CallbackQuery {
     pub state: String,
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default)]
     pub token_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CallbackCapture {
-    pub token: String,
+    /// `1` on the collect flow's redirect. Informational: see
+    /// [`CallbackMode::Collect`] for why it is not required.
+    #[serde(default)]
     #[allow(dead_code)]
-    pub token_id: Option<String>,
+    pub collect: Option<String>,
+    /// Set by the web page when the sign-in itself failed (collect flow). The
+    /// runner surfaces it instead of calling `pair-collect`.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_description: Option<String>,
 }
 
-/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
-/// `POST /coord/devices/pair-start` to register the flow and obtain a
-/// coord-minted state nonce + redirect URL, opens the browser, waits for
-/// the user's click + redirect which delivers the device-token JWT
-/// directly via the callback query params (coord's `pair-complete` is
-/// called by the web frontend, not the runner).
+/// Which delivery the loopback callback expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackMode {
+    /// Single-tenant: the redirect carries the device JWT in `?token=`.
+    Token,
+    /// Multi-tenant: the redirect only signals that coord's `pair-complete`
+    /// ran. Any `token` on it is IGNORED — the collect flow's credentials come
+    /// from `pair-collect` alone, so a token in the URL is never trusted or
+    /// stored. `collect=1` is not required either: an un-upgraded web page
+    /// redirects with the first tenant's `?token=` and no `collect`, and the
+    /// flow must still collect every tenant rather than fail.
+    Collect,
+}
+
+/// What the loopback callback captured.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CallbackCapture {
+    Token {
+        token: String,
+        token_id: Option<String>,
+    },
+    Collect {
+        token_id: Option<String>,
+    },
+    /// The collect-flow redirect reported a failed sign-in (`?error=`).
+    CollectError {
+        error: String,
+        description: Option<String>,
+    },
+}
+
+/// Redacts the token: a capture must be loggable without leaking a credential.
+impl std::fmt::Debug for CallbackCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token { token_id, .. } => f
+                .debug_struct("Token")
+                .field("token", &"<redacted>")
+                .field("token_id", token_id)
+                .finish(),
+            Self::Collect { token_id } => f
+                .debug_struct("Collect")
+                .field("token_id", token_id)
+                .finish(),
+            Self::CollectError { error, description } => f
+                .debug_struct("CollectError")
+                .field("error", error)
+                .field("description", description)
+                .finish(),
+        }
+    }
+}
+
+/// Why a callback was refused. Each maps to its own browser page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackRefusal {
+    StateMismatch,
+    MissingToken,
+}
+
+fn non_blank(v: &Option<String>) -> Option<String> {
+    v.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Pure: decide what one callback request delivered. See [`CallbackMode`].
+pub(crate) fn parse_callback(
+    q: &CallbackQuery,
+    expected_state: &str,
+    mode: CallbackMode,
+) -> Result<CallbackCapture, CallbackRefusal> {
+    if q.state != expected_state {
+        return Err(CallbackRefusal::StateMismatch);
+    }
+    let token_id = non_blank(&q.token_id);
+    match mode {
+        CallbackMode::Token => match non_blank(&q.token) {
+            Some(token) => Ok(CallbackCapture::Token { token, token_id }),
+            None => Err(CallbackRefusal::MissingToken),
+        },
+        CallbackMode::Collect => match non_blank(&q.error) {
+            Some(error) => Ok(CallbackCapture::CollectError {
+                error,
+                description: non_blank(&q.error_description),
+            }),
+            None => Ok(CallbackCapture::Collect { token_id }),
+        },
+    }
+}
+
+fn callback_page(outcome: &Result<CallbackCapture, CallbackRefusal>) -> String {
+    match outcome {
+        // The collect flow has NOT got its credentials yet — `pair-collect`
+        // runs after this page, and can still fail or skip every tenant — so
+        // the page must not claim the runner is paired.
+        Ok(CallbackCapture::Collect { .. }) => "<h1>&#10003; Sign-in complete</h1>\
+                  <p>Return to the runner to finish connecting your workspaces.</p>\
+                  <script>setTimeout(()=>window.close(),2000);</script>"
+            .to_string(),
+        Ok(CallbackCapture::CollectError { .. }) => "<h1>Sign-in failed</h1>\
+                  <p>Return to the runner — it shows what went wrong and lets you try \
+                  again.</p>"
+            .to_string(),
+        Ok(CallbackCapture::Token { .. }) => "<h1>&#10003; Runner paired</h1>\
+                  <p>You can close this tab and return to the runner.</p>\
+                  <script>setTimeout(()=>window.close(),2000);</script>"
+            .to_string(),
+        Err(CallbackRefusal::StateMismatch) => "<h1>State mismatch</h1><p>The callback state did \
+             not match the pending flow. Restart the pairing.</p>"
+            .to_string(),
+        Err(CallbackRefusal::MissingToken) => "<h1>Pairing incomplete</h1><p>The browser \
+             returned no credential for this runner. Restart the pairing.</p>"
+            .to_string(),
+    }
+}
+
 /// Body of the anonymous `POST /coord/devices/pair-start` that opens the
 /// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
 /// device and refuses a `pair-complete` for any other (`device_mismatch`,
@@ -1566,10 +2038,126 @@ fn pair_start_request_body(
     })
 }
 
-pub fn pair_via_browser(
+/// The multi-tenant twin of [`pair_start_request_body`]: `tenant_ids` INSTEAD
+/// of `tenant_id` (coord refuses a body carrying both), the optional
+/// `home_tenant_id` only when the caller names one — coord never moves the
+/// device's home pointer otherwise — and the `collect_challenge` that makes
+/// the per-tenant tokens collectable only by the holder of the verifier.
+fn pair_start_multi_request_body(
+    device_id: &str,
+    callback_url: &str,
+    device_hostname: &str,
+    web_pair_url: &str,
+    tenant_ids: &[uuid::Uuid],
+    home_tenant_id: Option<uuid::Uuid>,
+    collect_challenge: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "callback_url":      callback_url,
+        "device_hostname":   device_hostname,
+        "device_name":       device_hostname,
+        "web_pair_url":      web_pair_url,
+        "tenant_ids":        tenant_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        "device_id":         device_id,
+        "collect_challenge": collect_challenge,
+    });
+    if let Some(home) = home_tenant_id {
+        body["home_tenant_id"] = serde_json::Value::String(home.to_string());
+    }
+    body
+}
+
+/// The most tenants one `pair-start` may name (coord's own bound).
+pub const PAIR_MULTI_MAX_TENANTS: usize = 32;
+
+/// A fresh collect verifier: 32 CSPRNG bytes, base64url without padding
+/// (43 chars). Held in memory for the length of one flow and never logged,
+/// persisted or put in a URL.
+pub(crate) fn generate_collect_verifier() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `collect_challenge = base64url-no-pad(SHA-256(verifier))` — the PKCE S256
+/// derivation, reused from [`crate::cognito::code_challenge_s256`] so the two
+/// cannot drift.
+pub(crate) fn collect_challenge_for(verifier: &str) -> String {
+    crate::cognito::code_challenge_s256(verifier)
+}
+
+/// The resolved ends of one browser round-trip, handed to the caller's
+/// `pair-start` body builder.
+struct BrowserPairEnds<'a> {
+    device_id: &'a str,
+    callback_url: &'a str,
+    hostname: &'a str,
+    web_pair_url: &'a str,
+}
+
+/// What a caller of a browser round-trip can observe and control. The CLI
+/// passes [`Default`] (nothing); the in-app `pair_all_tenants` command shows
+/// the connect URL when the browser could not be launched, and cancels.
+#[derive(Default, Clone, Copy)]
+pub struct BrowserPairHooks<'a> {
+    /// Called once with the URL the browser should open, and whether the
+    /// automatic launch succeeded.
+    pub on_connect_url: Option<&'a (dyn Fn(&str, bool) + Sync)>,
+    /// Checked after `pair-start` answers, again just before the browser is
+    /// launched, and by the wait loop every 200 ms; once set the flow ends
+    /// with `Err("cancelled")` (without launching the browser, if it is not
+    /// open yet) and the loopback server shuts down.
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// THE ARBITER of capture vs cancel: called the moment the wait loop sees
+    /// the browser callback, BEFORE the server shutdown. `true` = this capture
+    /// won and the flow proceeds; `false` = a cancel already won, and the flow
+    /// ends with `Err("cancelled")` even though the browser called back. The
+    /// caller makes the decision atomically against its own cancel path.
+    pub claim_capture: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+impl BrowserPairHooks<'_> {
+    fn cancel_requested(&self) -> bool {
+        self.cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// Pure: settle a wait-loop outcome against the capture arbiter
+/// ([`BrowserPairHooks::claim_capture`]). A capture the arbiter refuses is a
+/// cancel.
+fn settle_capture(
+    hooks: &BrowserPairHooks<'_>,
+    outcome: Result<CallbackCapture, String>,
+) -> Result<CallbackCapture, String> {
+    match outcome {
+        Ok(capture) => match hooks.claim_capture {
+            Some(claim) if !claim() => Err("cancelled".to_string()),
+            _ => Ok(capture),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// What one completed browser round-trip produced.
+struct BrowserRoundTrip {
+    device_id: String,
+    state: String,
+    capture: CallbackCapture,
+}
+
+/// The browser round-trip BOTH flows share: bind a loopback callback, register
+/// the flow with coord's anonymous `pair-start` (body built by the caller),
+/// open the browser, and wait up to 5 minutes for the redirect that
+/// [`parse_callback`] accepts under `mode`.
+fn browser_pair_round_trip(
     coord_base: &str,
-    tenant_id: uuid::Uuid,
-) -> Result<PairCompleteResponse, String> {
+    mode: CallbackMode,
+    hooks: &BrowserPairHooks<'_>,
+    build_pair_start_body: impl FnOnce(&BrowserPairEnds<'_>) -> serde_json::Value,
+) -> Result<BrowserRoundTrip, String> {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1612,13 +2200,12 @@ pub fn pair_via_browser(
     // obtain a coord-minted state nonce + redirect URL.
     let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
-    let pair_start_body = pair_start_request_body(
-        &device_id,
-        &callback_url,
-        &hostname_now,
-        &web_pair_url,
-        tenant_id,
-    );
+    let pair_start_body = build_pair_start_body(&BrowserPairEnds {
+        device_id: &device_id,
+        callback_url: &callback_url,
+        hostname: &hostname_now,
+        web_pair_url: &web_pair_url,
+    });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1647,6 +2234,10 @@ pub fn pair_via_browser(
         .map_err(|e| format!("decode pair-start response failed: {e}"))?;
 
     let state_nonce = pair_start_resp.state;
+    // Cancelled while pair-start was in flight: stop before any browser opens.
+    if hooks.cancel_requested() {
+        return Err("cancelled".to_string());
+    }
 
     // Append device_id to the coord-provided redirect_url so the web
     // page can forward it to pair-complete.
@@ -1667,10 +2258,25 @@ pub fn pair_via_browser(
     let received_clone = received.clone();
     let state_expected = state_nonce.clone();
 
+    // ONE shutdown signal, shared by the route (a capture landed) and this
+    // thread (timeout, cancel, or the capture seen by the poll loop), so the
+    // loopback server stops — and releases its port — as soon as the flow is
+    // over instead of lingering for its full 5 minutes.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    type ShutdownSlot = Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+    let shutdown: ShutdownSlot = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let shutdown_for_route = shutdown.clone();
+    let signal_shutdown = |tx: &ShutdownSlot| {
+        if let Some(tx) = tx.lock().expect("mutex").take() {
+            let _ = tx.send(());
+        }
+    };
+
     // Spawn a current-thread tokio runtime + axum server on a worker
-    // thread. This is a self-contained loopback callback server for the
-    // CLI pair flow — it depends on no Tauri-side state (ApiState/AppState),
-    // so it runs independently of the runner's main HTTP server.
+    // thread. This is a self-contained loopback callback server — it depends
+    // on no Tauri-side state (ApiState/AppState), so it runs independently of
+    // the runner's main HTTP server and serves the CLI and the in-app
+    // `pair_all_tenants` command alike.
     let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
     let server_handle = std::thread::spawn(move || -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1687,82 +2293,139 @@ pub fn pair_via_browser(
                 get(move |Query(q): Query<CallbackQuery>| {
                     let state_for_route = state_for_route.clone();
                     let received_for_route = received_for_route.clone();
+                    let shutdown_for_route = shutdown_for_route.clone();
                     async move {
-                        if q.state != state_for_route {
-                            return Html(
-                                "<h1>State mismatch</h1><p>The callback state did \
-                                 not match the pending flow. Restart the pairing.</p>"
-                                    .to_string(),
-                            );
+                        let outcome = parse_callback(&q, &state_for_route, mode);
+                        if let Ok(capture) = &outcome {
+                            *received_for_route.lock().expect("mutex") = Some(capture.clone());
+                            signal_shutdown(&shutdown_for_route);
                         }
-                        *received_for_route.lock().expect("mutex") = Some(CallbackCapture {
-                            token: q.token.clone(),
-                            token_id: q.token_id.clone(),
-                        });
-                        Html(
-                            "<h1>&#10003; Runner paired</h1>\
-                             <p>You can close this tab.</p>\
-                             <script>setTimeout(()=>window.close(),2000);</script>"
-                                .to_string(),
-                        )
+                        Html(callback_page(&outcome))
                     }
                 }),
             );
             let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
                 .map_err(|e| format!("tokio listener wrap failed: {e}"))?;
-            // Run until our flag flips, with a 5-minute hard timeout.
-            let serve = axum::serve(tokio_listener, app);
-            let timeout = tokio::time::sleep(Duration::from_secs(300));
-            tokio::pin!(timeout);
-            tokio::select! {
-                res = serve => {
-                    res.map_err(|e| format!("axum serve failed: {e}"))?;
+            // Serve until the shutdown signal (capture, cancel, or the caller's
+            // own deadline) or a 5-minute backstop. Graceful: the page already
+            // being answered is delivered, THEN the listener is dropped.
+            let serve = axum::serve(tokio_listener, app).with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = shutdown_rx => {}
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
                 }
-                _ = &mut timeout => {
-                    return Err("pair: timed out after 5 minutes waiting for browser callback".to_string());
-                }
-            }
+            });
+            let result = serve.await.map_err(|e| format!("axum serve failed: {e}"));
             let _ = server_done_tx.send(());
-            Ok(())
+            result
         })
     });
 
-    println!(
-        "opening browser to {} (callback {})",
-        connect_url, callback_url
-    );
-    if let Err(e) = open::that(&connect_url) {
-        eprintln!(
-            "warning: failed to open browser ({}). Open this URL manually:\n  {}",
-            e, connect_url
+    let mut server_finished = false;
+    // Last chance before the browser opens: a cancel that landed during the
+    // server spawn ends the flow here, with no browser launched.
+    let outcome = if hooks.cancel_requested() {
+        Err("cancelled".to_string())
+    } else {
+        println!(
+            "opening browser to {} (callback {})",
+            connect_url, callback_url
         );
-    }
-
-    // Poll the received slot up to 5 minutes. The axum runtime is on a
-    // background thread; we just block here until we see the slot fill
-    // or the server-done signal arrives.
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
-    let capture = loop {
-        if let Some(c) = received.lock().expect("mutex").clone() {
-            break c;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("pair: timed out after 5 minutes waiting for browser callback".to_string());
-        }
-        // Cheap polling cadence; the axum task wakes on its own.
-        std::thread::sleep(Duration::from_millis(200));
-        // Drain the server-done channel in case axum exited early.
-        if let Ok(()) = server_done_rx.try_recv() {
-            // Server stopped without filling the slot — re-check once.
-            if let Some(c) = received.lock().expect("mutex").clone() {
-                break c;
+        let launched = match open::that(&connect_url) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to open browser ({}). Open this URL manually:\n  {}",
+                    e, connect_url
+                );
+                false
             }
-            return Err("pair: callback server stopped before capturing token".to_string());
+        };
+        if let Some(on_connect_url) = hooks.on_connect_url {
+            on_connect_url(&connect_url, launched);
+        }
+
+        // Poll the received slot up to 5 minutes. The axum runtime is on a
+        // background thread; we just block here until we see the slot fill, the
+        // caller cancels, or the server-done signal arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            if let Some(c) = received.lock().expect("mutex").clone() {
+                break Ok(c);
+            }
+            if hooks.cancel_requested() {
+                break Err("cancelled".to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(
+                    "pair: timed out after 5 minutes waiting for browser callback".to_string(),
+                );
+            }
+            // Cheap polling cadence; the axum task wakes on its own.
+            std::thread::sleep(Duration::from_millis(200));
+            // Drain the server-done channel in case axum exited early.
+            if let Ok(()) = server_done_rx.try_recv() {
+                server_finished = true;
+                // Server stopped without filling the slot — re-check once.
+                if let Some(c) = received.lock().expect("mutex").clone() {
+                    break Ok(c);
+                }
+                break Err("pair: callback server stopped before capturing token".to_string());
+            }
         }
     };
-    // Best-effort join — we don't fail the operation if the server thread
-    // is still running; it'll time out on its own.
-    drop(server_handle);
+    // Decide capture vs cancel NOW — before the shutdown and the bounded join
+    // below — so a cancel arriving during that join cannot claim a flow whose
+    // callback already landed (and vice versa).
+    let outcome = settle_capture(hooks, outcome);
+    // Stop the loopback server on EVERY exit (capture, cancel, timeout) and
+    // wait — BOUNDED — for it to release the port. A graceful shutdown with no
+    // open connection returns at once; a browser holding a keep-alive
+    // connection open must not hold the flow, so after 5 s the thread is
+    // detached (it ends on its own 5-minute backstop).
+    signal_shutdown(&shutdown);
+    if server_finished || server_done_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+        if let Ok(Err(e)) = server_handle.join() {
+            tracing::debug!("pair: loopback callback server ended with: {e}");
+        }
+    } else {
+        tracing::debug!("pair: loopback callback server still draining after 5 s — detached");
+        drop(server_handle);
+    }
+    let capture = outcome?;
+
+    Ok(BrowserRoundTrip {
+        device_id,
+        state: state_nonce,
+        capture,
+    })
+}
+
+/// Browser-mediated single-tenant pair. See [`browser_pair_round_trip`] for
+/// the loopback mechanics; the redirect delivers the device-token JWT directly
+/// via `?token=` (coord's `pair-complete` is called by the web frontend, not
+/// the runner).
+pub fn pair_via_browser(
+    coord_base: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
+    let trip = browser_pair_round_trip(
+        coord_base,
+        CallbackMode::Token,
+        &BrowserPairHooks::default(),
+        |ends| {
+            pair_start_request_body(
+                ends.device_id,
+                ends.callback_url,
+                ends.hostname,
+                ends.web_pair_url,
+                tenant_id,
+            )
+        },
+    )?;
+    let CallbackCapture::Token { token, token_id } = trip.capture else {
+        return Err("pair: the browser callback delivered no token".to_string());
+    };
 
     // The JWT is already in the callback redirect — coord's pair-complete
     // was called by the web frontend (step 4 of the browser-pair flow),
@@ -1770,20 +2433,17 @@ pub fn pair_via_browser(
     // param. No second HTTP call to coord is needed; we build the
     // PairCompleteResponse directly from the captured token.
     //
-    // `capture.token` = device-token JWT (coord-issued).
-    // `capture.token_id` = device_id forwarded by the web redirect.
+    // `token` = device-token JWT (coord-issued).
+    // `token_id` = device_id forwarded by the web redirect.
     // `user_id` is decoded from the JWT payload (best-effort; persist
     //  path re-validates).
-    let user_id = tenant_id_from_jwt_claim(&capture.token, "user_id")
-        .or_else(|| tenant_id_from_jwt_claim(&capture.token, "sub"))
+    let user_id = tenant_id_from_jwt_claim(&token, "user_id")
+        .or_else(|| tenant_id_from_jwt_claim(&token, "sub"))
         .unwrap_or_default();
-    let resp_device_id = capture
-        .token_id
-        .clone()
-        .unwrap_or_else(|| device_id.clone());
+    let resp_device_id = token_id.unwrap_or_else(|| trip.device_id.clone());
 
     Ok(PairCompleteResponse {
-        token: capture.token,
+        token,
         user_id,
         device_id: Some(resp_device_id),
         jti: None,
@@ -1793,6 +2453,339 @@ pub fn pair_via_browser(
         // is minted server-side and arrives via the pair-cli response path.
         device_machine_key: None,
     })
+}
+
+/// One tenant's row in coord's `pair-collect` answer.
+#[derive(Clone, Deserialize)]
+pub struct PairCollectResult {
+    pub tenant_id: String,
+    /// `minted` or `skipped`.
+    pub status: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub expires_at: Option<serde_json::Value>,
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+}
+
+/// Redacts the token.
+impl std::fmt::Debug for PairCollectResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairCollectResult")
+            .field("tenant_id", &self.tenant_id)
+            .field("status", &self.status)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_id", &self.token_id)
+            .field("skipped_reason", &self.skipped_reason)
+            .finish()
+    }
+}
+
+/// Coord's `POST /coord/devices/pair-collect` answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairCollectResponse {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub results: Vec<PairCollectResult>,
+}
+
+fn pair_collect_request_body(state: &str, device_id: &str, verifier: &str) -> serde_json::Value {
+    serde_json::json!({
+        "state":            state,
+        "device_id":        device_id,
+        "collect_verifier": verifier,
+    })
+}
+
+/// Collect the per-tenant tokens coord's `pair-complete` stored against
+/// `state`. Single-use on coord's side.
+fn pair_collect(
+    coord_base: &str,
+    state: &str,
+    device_id: &str,
+    verifier: &str,
+) -> Result<PairCollectResponse, String> {
+    let url = format!("{}/coord/devices/pair-collect", coord_base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    // coord-auth-exempt(bootstrap): `POST /coord/devices/pair-collect` is the
+    // second half of the anonymous pair-start flow — it is how this device
+    // RECEIVES the credentials the attended browser sign-in minted, so it
+    // cannot require one. Possession of the state nonce plus the verifier whose
+    // SHA-256 was registered at pair-start IS the credential.
+    let resp = client
+        .post(&url)
+        .json(&pair_collect_request_body(state, device_id, verifier))
+        .send()
+        .map_err(|e| format!("POST {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        let what = match status.as_u16() {
+            404 => "the pairing flow is unknown or expired — start again",
+            409 => "these credentials were already collected — start again",
+            403 => "coord refused the collect verifier",
+            _ => "collect failed",
+        };
+        return Err(format!("POST {url} -> HTTP {status}: {what}: {body_text}"));
+    }
+    resp.json()
+        .map_err(|e| format!("decode pair-collect response failed: {e}"))
+}
+
+/// Order-preserving de-duplication of a tenant selection.
+fn dedup_tenants(tenant_ids: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    tenant_ids
+        .iter()
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .collect()
+}
+
+/// Attended multi-tenant pair: ONE browser sign-in, one device JWT per
+/// requested tenant the signed-in user is a member of.
+///
+/// The home tenant (`coord.devices.tenant_id`) moves only when
+/// `home_tenant_id` is named; this flow never goes through qontinui-web's
+/// `pair-cli`, so the device machine key is not rotated either. Tokens are not
+/// delivered by the redirect: coord stores them against the flow and this
+/// function collects them with a verifier whose challenge it registered at
+/// `pair-start`, so a token never appears in a URL.
+///
+/// Returns coord's per-tenant answer UNPERSISTED — see
+/// [`persist_collected_pairings`].
+pub fn pair_via_browser_multi(
+    coord_base: &str,
+    tenant_ids: &[uuid::Uuid],
+    home_tenant_id: Option<uuid::Uuid>,
+    hooks: &BrowserPairHooks<'_>,
+) -> Result<PairCollectResponse, String> {
+    let tenant_ids = dedup_tenants(tenant_ids);
+    if tenant_ids.is_empty() {
+        return Err("pair: no tenant selected".to_string());
+    }
+    if tenant_ids.len() > PAIR_MULTI_MAX_TENANTS {
+        return Err(format!(
+            "pair: {} tenants selected, at most {PAIR_MULTI_MAX_TENANTS} per sign-in",
+            tenant_ids.len()
+        ));
+    }
+    if let Some(home) = home_tenant_id {
+        if !tenant_ids.contains(&home) {
+            return Err(format!(
+                "pair: home tenant {home} is not among the selected tenants"
+            ));
+        }
+    }
+    let verifier = generate_collect_verifier();
+    let challenge = collect_challenge_for(&verifier);
+    let trip = browser_pair_round_trip(coord_base, CallbackMode::Collect, hooks, |ends| {
+        pair_start_multi_request_body(
+            ends.device_id,
+            ends.callback_url,
+            ends.hostname,
+            ends.web_pair_url,
+            &tenant_ids,
+            home_tenant_id,
+            &challenge,
+        )
+    })?;
+    // The web page reported a failed sign-in: say so, and do not spend the
+    // single-use collect on a flow that minted nothing.
+    if let CallbackCapture::CollectError { error, description } = &trip.capture {
+        return Err(match description {
+            Some(d) => format!("the browser sign-in failed: {error} ({d})"),
+            None => format!("the browser sign-in failed: {error}"),
+        });
+    }
+    pair_collect(coord_base, &trip.state, &trip.device_id, &verifier)
+}
+
+/// The `pair-start` inputs the in-app "Connect all my workspaces" command
+/// sends: the de-duplicated selection, and NEVER a home tenant — coord moves
+/// `coord.devices.tenant_id` only when one is named, and this action must not.
+/// Pure, so the "no home repoint" property is unit-tested on the body it
+/// produces.
+pub fn connect_all_start_inputs(
+    tenant_ids: &[uuid::Uuid],
+) -> (Vec<uuid::Uuid>, Option<uuid::Uuid>) {
+    (dedup_tenants(tenant_ids), None)
+}
+
+/// Where one requested tenant ended up after a multi-tenant pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantPairStatus {
+    /// Coord minted a token and it is persisted in this tenant's slot.
+    Connected,
+    /// Coord declined this tenant (e.g. `not_a_member`); nothing was written.
+    Skipped,
+    /// Coord minted a token but this box could not persist it.
+    Failed,
+}
+
+/// One requested tenant's outcome — the row `pair_all_tenants` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TenantPairOutcome {
+    pub tenant_id: String,
+    pub status: TenantPairStatus,
+    /// Why the tenant was skipped or failed. `None` when connected.
+    pub skipped_reason: Option<String>,
+}
+
+/// Persist every minted token of a multi-tenant pair through
+/// [`persist_pairing`]'s additive writer: each token lands in ITS tenant's
+/// slot and bindings are appended. Returns one outcome per REQUESTED tenant,
+/// in request order.
+///
+/// # The default binding
+///
+/// An ESTABLISHED local default is never moved — [`persist_pairing_with`]
+/// keeps it. Only when this device has NO default yet does the first tenant
+/// persisted become it, so the persist ORDER decides, and it is chosen rather
+/// than left to whatever order the selection arrived in:
+///
+/// 1. `preferred_default` first, when it was minted — the caller passes coord's
+///    HOME tenant for this device ([`coord_home_tenant`]), so the local default
+///    agrees with the home pointer the pairing deliberately did not move;
+/// 2. otherwise the remaining minted tenants in REQUEST order — the caller's
+///    order, which is deterministic and is never re-sorted here.
+///
+/// A token whose `tenant_id` claim is not the row's tenant is refused
+/// (`Failed: token tenant mismatch`) and written nowhere: it would otherwise
+/// land in another tenant's slot.
+pub fn persist_collected_pairings(
+    resp: &PairCollectResponse,
+    requested: &[uuid::Uuid],
+    device_id: &str,
+    preferred_default: Option<uuid::Uuid>,
+) -> Result<Vec<TenantPairOutcome>, String> {
+    use crate::auth::AuthManager;
+    let mgr = AuthManager::new();
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let outcomes =
+        persist_collected_pairings_with(&mgr, &path, resp, requested, device_id, preferred_default);
+    if outcomes
+        .iter()
+        .any(|o| o.status == TenantPairStatus::Connected)
+    {
+        // Same best-effort device_id record `persist_pairing` makes.
+        if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
+            if let Err(e) = storage.store_device_id_fresh(device_id) {
+                tracing::debug!("store_device_id non-fatal: {e}");
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Parameterized core of [`persist_collected_pairings`], for hermetic tests.
+pub(crate) fn persist_collected_pairings_with(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    resp: &PairCollectResponse,
+    requested: &[uuid::Uuid],
+    device_id: &str,
+    preferred_default: Option<uuid::Uuid>,
+) -> Vec<TenantPairOutcome> {
+    let requested = dedup_tenants(requested);
+    // Persist order: the preferred default first, then request order.
+    let mut order: Vec<uuid::Uuid> = Vec::with_capacity(requested.len());
+    if let Some(p) = preferred_default.filter(|p| requested.contains(p)) {
+        order.push(p);
+    }
+    order.extend(
+        requested
+            .iter()
+            .copied()
+            .filter(|t| Some(*t) != preferred_default),
+    );
+
+    let mut by_tenant: std::collections::HashMap<uuid::Uuid, TenantPairOutcome> = order
+        .iter()
+        .map(|t| (*t, persist_one_collected(mgr, path, resp, t, device_id)))
+        .collect();
+    requested
+        .iter()
+        .filter_map(|t| by_tenant.remove(t))
+        .collect()
+}
+
+/// One requested tenant of [`persist_collected_pairings_with`].
+fn persist_one_collected(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    resp: &PairCollectResponse,
+    tenant: &uuid::Uuid,
+    device_id: &str,
+) -> TenantPairOutcome {
+    let outcome = |status, reason: Option<String>| TenantPairOutcome {
+        tenant_id: tenant.to_string(),
+        status,
+        skipped_reason: reason,
+    };
+    let Some(row) = resp
+        .results
+        .iter()
+        .find(|r| uuid::Uuid::parse_str(r.tenant_id.trim()).ok() == Some(*tenant))
+    else {
+        return outcome(
+            TenantPairStatus::Skipped,
+            Some("not_returned_by_coord".to_string()),
+        );
+    };
+    match row.status.as_str() {
+        "minted" => {
+            let Some(token) = non_blank(&row.token) else {
+                return outcome(
+                    TenantPairStatus::Failed,
+                    Some("coord reported minted but returned no token".to_string()),
+                );
+            };
+            // The slot is chosen by the ROW's tenant; the token must be for it.
+            let claimed = tenant_id_from_oauth_claim(&token)
+                .and_then(|c| uuid::Uuid::parse_str(c.trim()).ok());
+            if claimed != Some(*tenant) {
+                return outcome(
+                    TenantPairStatus::Failed,
+                    Some("token tenant mismatch".to_string()),
+                );
+            }
+            let user_id = tenant_id_from_jwt_claim(&token, "user_id")
+                .or_else(|| tenant_id_from_jwt_claim(&token, "sub"))
+                .unwrap_or_default();
+            let pair = PairCompleteResponse {
+                token,
+                user_id,
+                device_id: Some(device_id.to_string()),
+                jti: non_blank(&row.token_id),
+                exp: None,
+                tenant_id: Some(tenant.to_string()),
+                device_machine_key: None,
+            };
+            match persist_pairing_with(mgr, path, &pair, *tenant) {
+                Ok(()) => outcome(TenantPairStatus::Connected, None),
+                Err(e) => outcome(TenantPairStatus::Failed, Some(e)),
+            }
+        }
+        "skipped" => outcome(
+            TenantPairStatus::Skipped,
+            Some(non_blank(&row.skipped_reason).unwrap_or_else(|| "unspecified".into())),
+        ),
+        other => outcome(
+            TenantPairStatus::Failed,
+            Some(format!("coord returned an unrecognised status `{other}`")),
+        ),
+    }
 }
 
 // ============================================================================
@@ -1881,8 +2874,13 @@ pub(crate) fn persist_pairing_with(
     // methods). This is the FIRST write of the sequence, so on an undecryptable
     // `.enc` it heals the store and every write below then merges over the
     // now-readable store. See `SecureStorage::WriteMode`.
+    // Serialize with the heartbeat reconcile for the whole pairing, so a
+    // reconcile can neither decide against a half-written pairing nor clear the
+    // slot this pairing is about to write.
+    let _reconcile_lock = lock_binding_reconcile(path, PAIRING_RECONCILE_LOCK_WAIT)?;
     mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
+    reset_omission_streak(path, &tenant_id);
 
     // 2. Load + migrate the existing file (missing → fresh; unparseable
     //    → start over, same clobber posture the pre-8a writer had).
@@ -3021,8 +4019,15 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp(&ja), ta()).unwrap();
         persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
 
-        // Coord says: A still bound, B gone, C newly bound elsewhere.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tc()]).expect("reconcile");
+        // Coord says: A still bound, B gone, C newly bound elsewhere. The
+        // first omission is held (hysteresis); the second acts.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0).expect("reconcile");
+        assert!(
+            held.dropped.is_empty(),
+            "one omission must not drop: {held:?}"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tc()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![tb()]);
         assert_eq!(
@@ -3058,8 +4063,14 @@ mod tests {
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
         assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
 
-        // Coord dropped A (the default); B survives.
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[tb()]).expect("reconcile");
+        // Coord dropped A (the default); B survives. Held once, then acted on.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0).expect("reconcile");
+        assert_eq!(
+            held.default_repointed, None,
+            "one omission must not re-point"
+        );
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[tb()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(Some(tb())));
@@ -3089,7 +4100,9 @@ mod tests {
         let path = dir.join("paired_user.json");
         persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[]).expect("reconcile");
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[], T0).expect("reconcile");
+        assert!(!held.changed(), "one empty echo must not drop: {held:?}");
+        let report = reconcile_paired_bindings_at(&mgr, &path, &[], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped, vec![ta()]);
         assert_eq!(report.default_repointed, Some(None), "default cleared");
@@ -3130,6 +4143,206 @@ mod tests {
             std::fs::read(&path).unwrap(),
             before,
             "steady state must not rewrite the file"
+        );
+    }
+
+    /// Reconcile clock for the hysteresis tests; successive heartbeats are 30 s apart.
+    const T0: i64 = 1_790_000_000;
+
+    /// Two omissions closer together than RECONCILE_OMISSION_MIN_SPACING_SECS
+    /// (e.g. a primary and an instance runner heartbeating through the same coord
+    /// glitch against the SHARED streak file) count once, so nothing is dropped.
+    #[test]
+    fn reconcile_omissions_closer_than_the_spacing_count_once() {
+        let dir = temp_dir_for("reconcile_spacing");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 5).expect("r2");
+        assert!(!r1.changed() && !r2.changed(), "{r1:?} {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+        // A properly spaced second omission does drop.
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r3");
+        assert_eq!(r3.dropped, vec![tb()]);
+    }
+
+    /// MAJOR 1: a slot rewritten AFTER the reconcile decided to drop its
+    /// tenant (here by the test hook, standing in for a refresher re-mint) is
+    /// spared — the clear is conditional on the token observed at decision —
+    /// and the binding is kept and reported as held.
+    #[test]
+    fn reconcile_spares_a_slot_rewritten_after_the_decision() {
+        let dir = temp_dir_for("reconcile_toctou");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+
+        let fresh = live_jwt("b-remint");
+        let (m2, f2) = (mgr.clone(), fresh.clone());
+        AFTER_RECONCILE_DECISION.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                m2.store_tenant_device_jwt(&tb(), &f2).unwrap();
+            }))
+        });
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(r2.dropped.is_empty(), "{r2:?}");
+        assert_eq!(r2.held, vec![(tb(), 0)]);
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), Some(fresh));
+        assert_eq!(read_file(&path).bindings.len(), 2);
+    }
+
+    /// A pairing that lands WHILE a reconcile holds the reconcile lock waits for
+    /// it and succeeds (it runs after coord already minted, so failing would
+    /// discard a good credential), and both effects survive.
+    #[test]
+    fn a_pairing_concurrent_with_a_reconcile_succeeds() {
+        assert!(
+            PAIRING_RECONCILE_LOCK_WAIT
+                > 3 * crate::secure_storage::STORE_LOCK_TIMEOUT
+                    + crate::auth::KEYCHAIN_CALL_TIMEOUT,
+            "the pairing budget must exceed a reconcile's worst-case hold"
+        );
+        let dir = temp_dir_for("reconcile_concurrent_pair");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+
+        let (in_hook_tx, in_hook_rx) = std::sync::mpsc::channel::<()>();
+        let (m, p) = (mgr.clone(), path.clone());
+        let reconciler = std::thread::spawn(move || {
+            AFTER_RECONCILE_DECISION.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    in_hook_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }))
+            });
+            reconcile_paired_bindings_at(&m, &p, &[ta()], T0 + 30).expect("r2")
+        });
+        // The reconcile is mid-pass and holds the lock; pair tenant C now.
+        in_hook_rx.recv().unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("c")), tc())
+            .expect("a pairing must wait out a reconcile, not fail");
+        let r2 = reconciler.join().unwrap();
+        assert_eq!(r2.dropped, vec![tb()]);
+        let tenants: Vec<String> = read_file(&path)
+            .bindings
+            .into_iter()
+            .map(|b| b.tenant_id)
+            .collect();
+        assert!(tenants.contains(&T_C.to_string()), "{tenants:?}");
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
+    }
+
+    /// S8: a negative gap (the clock moved back) counts as an omission and
+    /// restamps, rather than freezing the streak until the clock catches up.
+    #[test]
+    fn reconcile_a_backwards_clock_still_counts_the_omission() {
+        let dir = temp_dir_for("reconcile_clock_back");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 1000).expect("r1");
+        assert_eq!(r1.held, vec![(tb(), 1)]);
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r2");
+        assert_eq!(r2.dropped, vec![tb()]);
+    }
+
+    /// Re-pairing a tenant forgets its omission streak: an echo lagging the
+    /// pair by one heartbeat must not drop the credential just minted.
+    #[test]
+    fn repairing_a_tenant_resets_its_omission_streak() {
+        let dir = temp_dir_for("reconcile_repair_resets");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("r1");
+        assert!(!r1.changed(), "{r1:?}");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b2")), tb()).unwrap();
+        let r2 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "re-pair must reset the streak: {r2:?}");
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_some());
+    }
+
+    /// D4 hysteresis: ONE echo omitting a tenant keeps its binding and slot;
+    /// the tenant reappearing resets the streak (so a later single omission is
+    /// held again); TWO consecutive omissions drop the binding and clear the
+    /// slot. Orphan slots follow the same rule.
+    #[test]
+    fn reconcile_requires_two_consecutive_omissions_and_reappearance_resets() {
+        let dir = temp_dir_for("reconcile_hysteresis");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        // An orphan slot (no binding entry) for C.
+        mgr.store_tenant_device_jwt(&tc(), &live_jwt("c")).unwrap();
+        let slot_b = mgr.get_tenant_device_jwt(&tb()).unwrap();
+        assert!(slot_b.is_some());
+
+        // 1st omission of B and C: held.
+        let r1 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(!r1.changed(), "one omission must not drop: {r1:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_some());
+        assert_eq!(read_file(&path).bindings.len(), 2);
+
+        // B and C reappear: streaks reset.
+        let r2 =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta(), tb(), tc()], T0 + 30).expect("r2");
+        assert!(!r2.changed(), "{r2:?}");
+
+        // Omitted once again after the reset: still held (count restarted at 1).
+        let r3 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 60).expect("r3");
+        assert!(!r3.changed(), "a reset streak must restart at one: {r3:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&tb()).unwrap(), slot_b);
+
+        // Second CONSECUTIVE omission: dropped and cleared.
+        let r4 = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 90).expect("r4");
+        assert_eq!(r4.dropped, vec![tb()]);
+        assert_eq!(r4.dropped_slots, vec![tc()]);
+        assert!(mgr.get_tenant_device_jwt(&tb()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_some());
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1);
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+    }
+
+    /// Gate of Phase 1: pairing tenant A leaves tenant B's slot BYTE-IDENTICAL
+    /// — through the Fresh (explicit-acquisition) write path `persist_pairing`
+    /// uses — on a readable store.
+    #[test]
+    fn pairing_one_tenant_leaves_another_tenants_slot_byte_identical() {
+        let dir = temp_dir_for("pair_leaves_sibling_slot");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        let jb = live_jwt("b");
+        persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
+        let before = mgr.get_tenant_device_jwt(&tb()).unwrap().expect("B slot");
+        assert_eq!(before, jb);
+
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a2")), ta()).unwrap();
+
+        let after = mgr
+            .get_tenant_device_jwt(&tb())
+            .unwrap()
+            .expect("B slot survives");
+        assert_eq!(
+            after.as_bytes(),
+            before.as_bytes(),
+            "B's slot must be byte-identical"
         );
     }
 
@@ -3398,7 +4611,11 @@ mod tests {
         // Orphan slot for C: no binding entry, and coord doesn't have C.
         mgr.store_tenant_device_jwt(&tc(), "jwt.c.orphan").unwrap();
 
-        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
+        // First omission is held (D4 hysteresis); the second clears.
+        let held = reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0).expect("reconcile");
+        assert!(held.dropped_slots.is_empty(), "{held:?}");
+        let report =
+            reconcile_paired_bindings_at(&mgr, &path, &[ta()], T0 + 30).expect("reconcile");
 
         assert_eq!(report.dropped_slots, vec![tc()]);
         assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
@@ -5912,5 +7129,765 @@ mod supersede_is_never_pure_loss_tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(superseded_siblings(&tmp.path().join("paired_user.json")).is_empty());
         assert!(superseded_siblings(Path::new("/nonexistent/dir/paired_user.json")).is_empty());
+    }
+}
+
+/// Plan
+/// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// Phase 3 — the attended multi-tenant COLLECT flow: its challenge
+/// derivation, its callback parsing, the collect call, and the additive
+/// persistence of N tokens.
+#[cfg(test)]
+mod pair_multi_collect_tests {
+    use super::*;
+
+    const T_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const T_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const T_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const USER: &str = "22222222-2222-4222-8222-222222222222";
+    const DEVICE: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn t(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).unwrap()
+    }
+
+    fn test_mgr(dir: &std::path::Path) -> crate::auth::AuthManager {
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
+            .expect("test storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    fn query(state: &str, token: Option<&str>, collect: Option<&str>) -> CallbackQuery {
+        CallbackQuery {
+            state: state.to_string(),
+            token: token.map(str::to_string),
+            token_id: Some(DEVICE.to_string()),
+            collect: collect.map(str::to_string),
+            error: None,
+            error_description: None,
+        }
+    }
+
+    /// A JWT-shaped token whose payload carries `tenant_id` (what the
+    /// persistence's claim check reads) and a distinguishing `tag`.
+    fn tok(tenant: &str, tag: &str) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let p = URL_SAFE_NO_PAD.encode(
+            format!(r#"{{"tenant_id":"{tenant}","user_id":"{USER}","tag":"{tag}"}}"#).as_bytes(),
+        );
+        format!("{h}.{p}.sig")
+    }
+
+    fn minted(tenant: &str, token: &str) -> PairCollectResult {
+        PairCollectResult {
+            tenant_id: tenant.to_string(),
+            status: "minted".to_string(),
+            token: Some(tok(tenant, token)),
+            token_id: Some(format!("jti-{tenant}")),
+            expires_at: None,
+            skipped_reason: None,
+        }
+    }
+
+    fn skipped(tenant: &str, reason: &str) -> PairCollectResult {
+        PairCollectResult {
+            tenant_id: tenant.to_string(),
+            status: "skipped".to_string(),
+            token: None,
+            token_id: None,
+            expires_at: None,
+            skipped_reason: Some(reason.to_string()),
+        }
+    }
+
+    #[test]
+    fn collect_challenge_is_the_s256_of_the_verifier() {
+        // RFC 7636 Appendix B test vector.
+        assert_eq!(
+            collect_challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn collect_verifier_is_32_random_bytes_base64url_and_its_challenge_43_chars() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let v = generate_collect_verifier();
+        assert_eq!(v.len(), 43, "32 bytes base64url-no-pad is 43 chars");
+        assert_eq!(URL_SAFE_NO_PAD.decode(&v).expect("base64url").len(), 32);
+        assert_ne!(v, generate_collect_verifier(), "verifiers must not repeat");
+        let c = collect_challenge_for(&v);
+        assert_eq!(c.len(), 43, "coord requires a 43-char challenge");
+        assert!(!c.contains('=') && !c.contains('+') && !c.contains('/'));
+    }
+
+    #[test]
+    fn collect_mode_accepts_a_redirect_with_no_token() {
+        let got = parse_callback(&query("s1", None, Some("1")), "s1", CallbackMode::Collect);
+        assert_eq!(
+            got,
+            Ok(CallbackCapture::Collect {
+                token_id: Some(DEVICE.to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn collect_mode_ignores_a_token_in_the_url() {
+        // An un-upgraded web page still appends the first tenant's `?token=`.
+        // The collect flow must neither need it nor keep it.
+        for collect in [Some("1"), None] {
+            let got = parse_callback(
+                &query("s1", Some("jwt.from.url"), collect),
+                "s1",
+                CallbackMode::Collect,
+            )
+            .expect("accepted");
+            assert!(
+                matches!(got, CallbackCapture::Collect { .. }),
+                "collect mode must not capture a URL token: {got:?}"
+            );
+            assert!(!format!("{got:?}").contains("jwt.from.url"));
+        }
+    }
+
+    #[test]
+    fn a_state_mismatch_is_refused_in_both_modes() {
+        for mode in [CallbackMode::Collect, CallbackMode::Token] {
+            assert_eq!(
+                parse_callback(&query("other", Some("jwt"), Some("1")), "s1", mode),
+                Err(CallbackRefusal::StateMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn token_mode_still_requires_the_token() {
+        assert_eq!(
+            parse_callback(&query("s1", None, Some("1")), "s1", CallbackMode::Token),
+            Err(CallbackRefusal::MissingToken)
+        );
+        assert_eq!(
+            parse_callback(&query("s1", Some("  "), None), "s1", CallbackMode::Token),
+            Err(CallbackRefusal::MissingToken)
+        );
+        let got = parse_callback(&query("s1", Some("jwt.x"), None), "s1", CallbackMode::Token)
+            .expect("token delivered");
+        assert_eq!(
+            got,
+            CallbackCapture::Token {
+                token: "jwt.x".to_string(),
+                token_id: Some(DEVICE.to_string())
+            }
+        );
+        assert!(
+            !format!("{got:?}").contains("jwt.x"),
+            "Debug must redact the token"
+        );
+    }
+
+    #[test]
+    fn multi_pair_start_body_sends_tenant_ids_and_the_challenge_never_tenant_id() {
+        let body = pair_start_multi_request_body(
+            DEVICE,
+            "http://127.0.0.1:1/auth/runner-token-callback",
+            "spaceship",
+            "https://web.test/connect-runner",
+            &[t(T_A), t(T_B)],
+            None,
+            "chal",
+        );
+        assert_eq!(body["tenant_ids"], serde_json::json!([T_A, T_B]));
+        assert_eq!(body["collect_challenge"], "chal");
+        assert_eq!(body["device_id"], DEVICE);
+        assert!(
+            body.get("tenant_id").is_none(),
+            "coord refuses a body carrying both tenant_id and tenant_ids"
+        );
+        assert!(
+            body.get("home_tenant_id").is_none(),
+            "no home repoint unless one is explicitly named"
+        );
+        let with_home =
+            pair_start_multi_request_body(DEVICE, "cb", "h", "w", &[t(T_A)], Some(t(T_A)), "chal");
+        assert_eq!(with_home["home_tenant_id"], T_A);
+    }
+
+    /// The capture arbiter: a capture the caller refuses (a cancel won) ends
+    /// the flow cancelled; one it accepts, or no arbiter, proceeds.
+    #[test]
+    fn settle_capture_honours_the_arbiter() {
+        let cap = || Ok(CallbackCapture::Collect { token_id: None });
+        let refuse = || false;
+        let accept = || true;
+        let refused = BrowserPairHooks {
+            claim_capture: Some(&refuse),
+            ..Default::default()
+        };
+        let accepted = BrowserPairHooks {
+            claim_capture: Some(&accept),
+            ..Default::default()
+        };
+        assert_eq!(
+            settle_capture(&refused, cap()),
+            Err("cancelled".to_string())
+        );
+        assert!(settle_capture(&accepted, cap()).is_ok());
+        assert!(settle_capture(&BrowserPairHooks::default(), cap()).is_ok());
+        // A non-capture outcome is never sent to the arbiter.
+        assert_eq!(
+            settle_capture(&refused, Err("timed out".to_string())),
+            Err("timed out".to_string())
+        );
+    }
+
+    /// The in-app "Connect all my workspaces" never names a home tenant, so the
+    /// body coord receives cannot move `coord.devices.tenant_id`.
+    #[test]
+    fn connect_all_start_inputs_never_name_a_home_tenant() {
+        let (ids, home) = connect_all_start_inputs(&[t(T_B), t(T_A), t(T_B)]);
+        assert_eq!(ids, vec![t(T_B), t(T_A)], "deduplicated, order kept");
+        assert_eq!(home, None);
+        let body = pair_start_multi_request_body(DEVICE, "cb", "h", "w", &ids, home, "chal");
+        assert!(body.get("home_tenant_id").is_none());
+        assert!(body.get("tenant_id").is_none());
+    }
+
+    #[test]
+    fn multi_pair_refuses_a_bad_selection_before_any_network_call() {
+        // An unroutable base: reaching the network would error differently.
+        let base = "http://127.0.0.1:9";
+        assert!(
+            pair_via_browser_multi(base, &[], None, &BrowserPairHooks::default())
+                .unwrap_err()
+                .contains("no tenant")
+        );
+        let many: Vec<uuid::Uuid> = (0..=PAIR_MULTI_MAX_TENANTS)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        assert!(
+            pair_via_browser_multi(base, &many, None, &BrowserPairHooks::default())
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert!(pair_via_browser_multi(
+            base,
+            &[t(T_A)],
+            Some(t(T_B)),
+            &BrowserPairHooks::default()
+        )
+        .unwrap_err()
+        .contains("home tenant"));
+    }
+
+    #[test]
+    fn collect_body_carries_state_device_and_verifier() {
+        let body = pair_collect_request_body("s1", DEVICE, "verifier");
+        assert_eq!(
+            body,
+            serde_json::json!({"state": "s1", "device_id": DEVICE, "collect_verifier": "verifier"})
+        );
+    }
+
+    #[test]
+    fn collect_response_decodes_both_row_shapes() {
+        let raw = serde_json::json!({
+            "device_id": DEVICE,
+            "results": [
+                {"tenant_id": T_A, "status": "minted", "token": "jwt.a", "token_id": "j1", "expires_at": 1_900_000_000},
+                {"tenant_id": T_B, "status": "skipped", "skipped_reason": "not_a_member"}
+            ]
+        });
+        let resp: PairCollectResponse = serde_json::from_value(raw).expect("decode");
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].token.as_deref(), Some("jwt.a"));
+        assert_eq!(
+            resp.results[1].skipped_reason.as_deref(),
+            Some("not_a_member")
+        );
+        assert!(
+            !format!("{resp:?}").contains("jwt.a"),
+            "Debug must redact tokens"
+        );
+    }
+
+    /// Phase 3 gate: persisting N tokens leaves the default binding and the
+    /// legacy `access_token` slot untouched, and appends N bindings.
+    #[test]
+    fn persisting_n_tokens_appends_n_bindings_and_leaves_the_default_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+
+        // The established home: tenant A, paired earlier.
+        let home = PairCompleteResponse {
+            token: "jwt.a.home".to_string(),
+            user_id: USER.to_string(),
+            device_id: None,
+            jti: None,
+            exp: None,
+            tenant_id: None,
+            device_machine_key: None,
+        };
+        persist_pairing_with(&mgr, &path, &home, t(T_A)).expect("seed home");
+        let legacy_before = mgr.get_access_token().unwrap();
+
+        let resp = PairCollectResponse {
+            device_id: Some(DEVICE.to_string()),
+            results: vec![minted(T_B, "jwt.b"), minted(T_C, "jwt.c")],
+        };
+        let outcomes =
+            persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_B), t(T_C)], DEVICE, None);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == TenantPairStatus::Connected),
+            "{outcomes:?}"
+        );
+
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.bindings.len(),
+            3,
+            "two bindings appended to the home one"
+        );
+        assert_eq!(
+            pf.default_tenant_id.as_deref(),
+            Some(T_A),
+            "default untouched"
+        );
+        assert_eq!(
+            pf.tenant_id.as_deref(),
+            Some(T_A),
+            "legacy mirror untouched"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            legacy_before,
+            "legacy access_token slot untouched"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_A)).unwrap().as_deref(),
+            Some("jwt.a.home"),
+            "the home tenant's slot is byte-identical"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_B)).unwrap().as_deref(),
+            Some(tok(T_B, "jwt.b").as_str())
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t(T_C)).unwrap().as_deref(),
+            Some(tok(T_C, "jwt.c").as_str())
+        );
+    }
+
+    #[test]
+    fn on_a_fresh_device_the_first_minted_tenant_becomes_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                skipped(T_A, "not_a_member"),
+                minted(T_B, "jwt.b"),
+                minted(T_C, "jwt.c"),
+            ],
+        };
+        persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &resp,
+            &[t(T_A), t(T_B), t(T_C)],
+            DEVICE,
+            None,
+        );
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pf.bindings.len(), 2);
+        assert_eq!(
+            pf.default_tenant_id.as_deref(),
+            Some(T_B),
+            "no preferred home: the first minted tenant in REQUEST order"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), tok(T_B, "jwt.b"));
+    }
+
+    /// On a device with no local default, coord's home tenant becomes the
+    /// default even when it is not first in the request (and never by UUID
+    /// order) — while rows still come back in request order.
+    #[test]
+    fn on_a_fresh_device_coords_home_tenant_becomes_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                minted(T_A, "jwt.a"),
+                minted(T_B, "jwt.b"),
+                minted(T_C, "jwt.c"),
+            ],
+        };
+        let outcomes = persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &resp,
+            &[t(T_A), t(T_B), t(T_C)],
+            DEVICE,
+            Some(t(T_C)),
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|o| o.tenant_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![T_A, T_B, T_C]
+        );
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pf.bindings.len(), 3);
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_C));
+        assert_eq!(mgr.get_access_token().unwrap(), tok(T_C, "jwt.c"));
+    }
+
+    /// A preferred home that was not minted (skipped) does not block the
+    /// fallback, and an ESTABLISHED default ignores the preference entirely.
+    #[test]
+    fn the_home_preference_never_moves_an_established_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![minted(T_A, "jwt.a")],
+        };
+        persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_A)], DEVICE, None);
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![minted(T_B, "jwt.b"), skipped(T_C, "not_a_member")],
+        };
+        persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &resp,
+            &[t(T_B), t(T_C)],
+            DEVICE,
+            Some(t(T_B)),
+        );
+        let pf: PairedUserFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
+    }
+
+    /// Phase 3 gate (D4): every slot write of a pair-all runs under the
+    /// cross-process store lock, so a refresher-style write for ANOTHER tenant
+    /// survives a pair-all persistence of N tenants, and all N survive it.
+    ///
+    /// Deterministic, not a timing race: the "refresher" (its own thread and
+    /// its own `SecureStorage` handle on the same `.enc`) is PARKED inside its
+    /// read-modify-write right after its load
+    /// ([`crate::secure_storage::park_next_rmw_after_load`]). The pair-all then
+    /// runs. With the store lock it blocks behind the parked writer, which is
+    /// released after a bounded 3 s wait (inside the store lock's 10 s
+    /// budget), and every slot survives. With
+    /// `QONTINUI_TEST_DISABLE_STORE_LOCK=1` the pair-all completes while the
+    /// refresher still holds its stale load, the refresher's save then drops
+    /// the pair-all's slots, and this test FAILS — the mutation check that it
+    /// tests the lock.
+    #[test]
+    fn a_concurrent_refresher_write_for_another_tenant_survives_a_pair_all() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const T_D: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let dir = tempfile::tempdir().unwrap();
+        let enc = dir.path().join("tokens.enc");
+        let mgr = test_mgr(dir.path());
+        // Seed tenant D as the established DEFAULT, so the pair-all below
+        // writes only per-tenant slots (a default write would also try the OS
+        // keychain, whose bounded ~3 s call on a headless box would make the
+        // interleaving depend on that timeout).
+        let seed = PairCompleteResponse {
+            token: "jwt.d.0".to_string(),
+            user_id: USER.to_string(),
+            device_id: None,
+            jti: None,
+            exp: None,
+            tenant_id: None,
+            device_machine_key: None,
+        };
+        persist_pairing_with(&mgr, &dir.path().join("paired_user.json"), &seed, t(T_D)).unwrap();
+
+        let (loaded_tx, loaded_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let refresher = {
+            let enc = enc.clone();
+            std::thread::spawn(move || {
+                let other = crate::auth::AuthManager::with_storage(
+                    crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
+                );
+                crate::secure_storage::park_next_rmw_after_load(move || {
+                    loaded_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                other.store_tenant_device_jwt(&t(T_D), "jwt.d.1").unwrap();
+            })
+        };
+        // The refresher has loaded (and, with locking on, holds the lock).
+        loaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let pair_all = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mgr = test_mgr(&dir);
+                let resp = PairCollectResponse {
+                    device_id: None,
+                    results: vec![
+                        minted(T_A, "jwt.a"),
+                        minted(T_B, "jwt.b"),
+                        minted(T_C, "jwt.c"),
+                    ],
+                };
+                let outcomes = persist_collected_pairings_with(
+                    &mgr,
+                    &dir.join("paired_user.json"),
+                    &resp,
+                    &[t(T_A), t(T_B), t(T_C)],
+                    DEVICE,
+                    None,
+                );
+                let _ = done_tx.send(());
+                outcomes
+            })
+        };
+        // Without the lock the pair-all finishes (in milliseconds) while the
+        // refresher is parked; with it, it is blocked behind the refresher, so
+        // this wait runs out and the refresher is released.
+        let _ = done_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        refresher.join().unwrap();
+        let outcomes = pair_all.join().unwrap();
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.status == TenantPairStatus::Connected),
+            "{outcomes:?}"
+        );
+        let reader = crate::auth::AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(enc).unwrap(),
+        );
+        for (tenant, tag) in [(T_A, "jwt.a"), (T_B, "jwt.b"), (T_C, "jwt.c")] {
+            assert_eq!(
+                reader.get_tenant_device_jwt(&t(tenant)).unwrap(),
+                Some(tok(tenant, tag)),
+                "pair-all slot {tenant} lost to the concurrent refresher write"
+            );
+        }
+        assert_eq!(
+            reader.get_tenant_device_jwt(&t(T_D)).unwrap().as_deref(),
+            Some("jwt.d.1"),
+            "the concurrent refresher write was lost"
+        );
+    }
+
+    /// A token minted for another tenant is never written into this row's slot.
+    #[test]
+    fn a_token_for_another_tenant_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                PairCollectResult {
+                    token: Some(tok(T_C, "wrong")),
+                    ..minted(T_B, "x")
+                },
+                PairCollectResult {
+                    token: Some("opaque-no-claims".to_string()),
+                    ..minted(T_A, "x")
+                },
+            ],
+        };
+        let outcomes =
+            persist_collected_pairings_with(&mgr, &path, &resp, &[t(T_B), t(T_A)], DEVICE, None);
+        for o in &outcomes {
+            assert_eq!(o.status, TenantPairStatus::Failed);
+            assert_eq!(o.skipped_reason.as_deref(), Some("token tenant mismatch"));
+        }
+        assert!(!path.exists());
+        assert_eq!(mgr.get_tenant_device_jwt(&t(T_B)).unwrap(), None);
+    }
+
+    /// The register echo's home is recorded beside the bound set and read back
+    /// only when it is fresh and among the bound tenants.
+    #[test]
+    fn coord_home_tenant_reads_the_recorded_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coord_bound_tenants.json");
+        let now = 1_900_000_000;
+        assert_eq!(coord_home_tenant_at(&path, now), None, "absent sidecar");
+        record_coord_bound_tenants_with_home_at(&path, &[t(T_A), t(T_B)], Some(t(T_B)), now)
+            .unwrap();
+        assert_eq!(coord_home_tenant_at(&path, now + 10), Some(t(T_B)));
+        assert_eq!(
+            coord_home_tenant_at(&path, now + BINDING_GAP_ASK_MAX_AGE_SECS + 10),
+            None,
+            "too stale to act on"
+        );
+        record_coord_bound_tenants_with_home_at(&path, &[t(T_A)], Some(t(T_B)), now).unwrap();
+        assert_eq!(
+            coord_home_tenant_at(&path, now),
+            None,
+            "home not in the bound set"
+        );
+        record_coord_bound_tenants_with_home_at(&path, &[t(T_A)], None, now).unwrap();
+        assert_eq!(
+            coord_home_tenant_at(&path, now),
+            None,
+            "echo carried no home"
+        );
+    }
+
+    /// A collect-mode redirect that reports a failed sign-in is surfaced, not
+    /// treated as completion.
+    #[test]
+    fn collect_mode_surfaces_a_browser_error() {
+        let mut q = query("s1", None, Some("1"));
+        q.error = Some("access_denied".to_string());
+        q.error_description = Some("user cancelled".to_string());
+        assert_eq!(
+            parse_callback(&q, "s1", CallbackMode::Collect),
+            Ok(CallbackCapture::CollectError {
+                error: "access_denied".to_string(),
+                description: Some("user cancelled".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn skipped_unrequested_and_missing_tenants_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_mgr(dir.path());
+        let path = dir.path().join("paired_user.json");
+
+        let resp = PairCollectResponse {
+            device_id: None,
+            results: vec![
+                skipped(T_A, "not_a_member"),
+                // Coord answered for a tenant nobody asked for: ignored.
+                minted(T_C, "jwt.c.unrequested"),
+                PairCollectResult {
+                    token: None,
+                    ..minted(T_B, "x")
+                },
+            ],
+        };
+        let outcomes = persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &resp,
+            &[t(T_A), t(T_B), t(T_A)],
+            DEVICE,
+            None,
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                TenantPairOutcome {
+                    tenant_id: T_A.to_string(),
+                    status: TenantPairStatus::Skipped,
+                    skipped_reason: Some("not_a_member".to_string()),
+                },
+                TenantPairOutcome {
+                    tenant_id: T_B.to_string(),
+                    status: TenantPairStatus::Failed,
+                    skipped_reason: Some("coord reported minted but returned no token".to_string()),
+                },
+            ],
+            "one row per REQUESTED tenant, deduplicated, in request order"
+        );
+        assert!(!path.exists(), "nothing minted, so no binding was written");
+        assert_eq!(mgr.get_tenant_device_jwt(&t(T_C)).unwrap(), None);
+
+        let none_back = persist_collected_pairings_with(
+            &mgr,
+            &path,
+            &PairCollectResponse {
+                device_id: None,
+                results: vec![],
+            },
+            &[t(T_B)],
+            DEVICE,
+            None,
+        );
+        assert_eq!(
+            none_back[0].skipped_reason.as_deref(),
+            Some("not_returned_by_coord")
+        );
+    }
+
+    /// `pair_collect` against a mock coord: the body it sends, and a 409
+    /// mapped to a readable error.
+    #[test]
+    fn pair_collect_posts_the_verifier_and_maps_errors() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(200u16));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (seen2, status2) = (seen.clone(), status.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                use axum::{http::StatusCode, routing::post, Json, Router};
+                let app = Router::new().route(
+                    "/coord/devices/pair-collect",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let seen = seen2.clone();
+                        let status = status2.clone();
+                        async move {
+                            *seen.lock().unwrap() = Some(body);
+                            let code = *status.lock().unwrap();
+                            let body = if code == 200 {
+                                serde_json::json!({"device_id": DEVICE, "results": [
+                                    {"tenant_id": T_A, "status": "minted", "token": "jwt.a",
+                                     "token_id": "j", "expires_at": 1}]})
+                                .to_string()
+                            } else {
+                                r#"{"error":"already_collected"}"#.to_string()
+                            };
+                            (StatusCode::from_u16(code).unwrap(), body)
+                        }
+                    }),
+                );
+                let l = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(l, app)
+                    .with_graceful_shutdown(async {
+                        let _ = rx.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        let resp = pair_collect(&base, "s1", DEVICE, "the-verifier").expect("collect");
+        assert_eq!(resp.results[0].token.as_deref(), Some("jwt.a"));
+        assert_eq!(
+            seen.lock().unwrap().clone().unwrap(),
+            serde_json::json!({"state": "s1", "device_id": DEVICE, "collect_verifier": "the-verifier"})
+        );
+
+        *status.lock().unwrap() = 409;
+        let err = pair_collect(&base, "s1", DEVICE, "the-verifier").unwrap_err();
+        assert!(err.contains("already collected"), "{err}");
+
+        let _ = tx.send(());
+        server.join().unwrap();
     }
 }

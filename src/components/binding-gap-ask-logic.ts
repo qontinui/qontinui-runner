@@ -57,19 +57,288 @@ export function normalizeBindingGapAsks(raw: unknown): BindingGapAsk[] | null {
   return asks;
 }
 
-/**
- * The asks still to show, after the operator's per-session dismissals. A
- * dismissal is keyed on tenant AND lapse (`firstSeen`), so a NEW lapse for the
- * same tenant is shown again.
- */
-export function visibleBindingGapAsks(
-  asks: BindingGapAsk[] | null,
-  dismissed: ReadonlySet<string>,
-): BindingGapAsk[] {
-  if (asks === null) return [];
-  return asks.filter((a) => !dismissed.has(dismissKey(a)));
-}
-
 export function dismissKey(ask: BindingGapAsk): string {
   return `${ask.tenantId}@${ask.firstSeen ?? "unknown"}`;
+}
+
+// ---------------------------------------------------------------------------
+// The per-tenant view — plan
+// `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`,
+// D2/D3. ONE source for the banner's gap list and the Settings card's
+// "Workspaces" rows, so the two cannot disagree. The ask records above
+// contribute only the per-account dismissal key and the terminal fallback.
+// ---------------------------------------------------------------------------
+
+/** Tauri command serving the published binding-gap cell as per-tenant rows. */
+export const GET_BINDING_GAPS_CMD = "get_binding_gaps";
+
+/** Tauri command running the attended "Connect all my workspaces" flow. */
+export const PAIR_ALL_TENANTS_CMD = "pair_all_tenants";
+
+export type TenantCredentialState = "connected" | "no_credential" | "unknown";
+
+export interface BindingGapRow {
+  tenantId: string;
+  displayName: string | null;
+  state: TenantCredentialState;
+}
+
+export interface BindingGapView {
+  /** `unknown` means NOTHING was established — every row is then unknown. */
+  status: "measured" | "unknown";
+  reason: string | null;
+  rows: BindingGapRow[];
+}
+
+const STATES: readonly TenantCredentialState[] = ["connected", "no_credential", "unknown"];
+
+/**
+ * Coerce `get_binding_gaps`' answer. Returns `null` when the command is absent
+ * or answered nothing usable — UNKNOWN, never "no gaps".
+ *
+ * Fails toward `unknown`: an unrecognised status makes the whole view unknown,
+ * an unrecognised row state makes that row unknown, and an unknown view forces
+ * EVERY row unknown even if a row claims `connected` — a status signal must not
+ * render an unmeasured tenant as healthy.
+ */
+export function normalizeBindingGapView(raw: unknown): BindingGapView | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  if (!Array.isArray(o.rows)) return null;
+  const status = o.status === "measured" ? "measured" : "unknown";
+  const rows: BindingGapRow[] = [];
+  for (const item of o.rows) {
+    if (item === null || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    const tenantId = str(r.tenant_id);
+    if (tenantId === null) continue;
+    const claimed = STATES.find((s) => s === r.state) ?? "unknown";
+    rows.push({
+      tenantId,
+      displayName: str(r.display_name),
+      state: status === "measured" ? claimed : "unknown",
+    });
+  }
+  return {
+    status,
+    reason: str(o.reason) ?? (status === "unknown" ? "the runner did not say why" : null),
+    rows,
+  };
+}
+
+/** Operator-facing words for a row's state. */
+export function credentialStateLabel(state: TenantCredentialState): string {
+  switch (state) {
+    case "connected":
+      return "connected";
+    case "no_credential":
+      return "no credential";
+    case "unknown":
+      return "unknown";
+  }
+}
+
+/**
+ * Rows "Connect all my workspaces" pairs: ONLY `no_credential` rows of a
+ * MEASURED view. An `unknown` row is never offered — it cannot be told apart
+ * from a workspace coord has since unbound, and pairing that would re-create
+ * the binding. An unknown view offers nothing; the card shows its reason.
+ */
+export function rowsNeedingConnect(view: BindingGapView | null): BindingGapRow[] {
+  if (view === null || view.status !== "measured") return [];
+  return view.rows.filter((r) => r.state === "no_credential");
+}
+
+/** The display label for a tenant: its name from the view when known, else null. */
+export function displayNameFor(view: BindingGapView | null, tenantId: string): string | null {
+  return view?.rows.find((r) => r.tenantId === tenantId)?.displayName ?? null;
+}
+
+/** True only on a MEASURED view with no gap — the banner's auto-dismiss test. */
+export function gapsCleared(view: BindingGapView | null): boolean {
+  return (
+    view !== null &&
+    view.status === "measured" &&
+    !view.rows.some((r) => r.state === "no_credential")
+  );
+}
+
+/** One tenant the combined banner offers to connect. */
+export interface BindingGapBannerEntry {
+  tenantId: string;
+  displayName: string | null;
+  /** Per-account, per-lapse dismissal key (from the ask record when present). */
+  key: string;
+  /** The terminal fallback. */
+  command: string;
+  /** What the terminal path also does (home pointer). */
+  caveat: string | null;
+}
+
+/**
+ * The banner's entries: the view's `no_credential` rows — never re-derived —
+ * minus this session's dismissals.
+ *
+ * `asks` is the ask-record read. Its role here is narrow: `null` (no signed-in
+ * account to ask on behalf of, or UNKNOWN) shows no banner, exactly as the
+ * ask path always has, and a recorded ask supplies the lapse for the dismissal
+ * key plus the terminal command. An UNKNOWN view shows no banner either — the
+ * Settings card is where unknown is said.
+ */
+export function bannerGapEntries(
+  view: BindingGapView | null,
+  asks: BindingGapAsk[] | null,
+  dismissed: ReadonlySet<string>,
+): BindingGapBannerEntry[] {
+  if (view === null || view.status !== "measured" || asks === null) return [];
+  return view.rows
+    .filter((r) => r.state === "no_credential")
+    .map((r) => {
+      const ask = asks.find((a) => a.tenantId === r.tenantId);
+      return {
+        tenantId: r.tenantId,
+        displayName: r.displayName,
+        key: `${r.tenantId}@${ask?.firstSeen ?? "unrecorded"}`,
+        command: ask?.command ?? `qontinui_profile device pair --tenant-id ${r.tenantId}`,
+        caveat: ask?.caveat ?? null,
+      };
+    })
+    .filter((e) => !dismissed.has(e.key));
+}
+
+export type TenantPairStatus = "connected" | "skipped" | "failed";
+
+export interface TenantPairResult {
+  tenantId: string;
+  status: TenantPairStatus;
+  skippedReason: string | null;
+}
+
+/** Coerce `pair_all_tenants`' `{results}`; `null` when it is not that shape. */
+export function normalizePairAllResults(raw: unknown): TenantPairResult[] | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const results = (raw as Record<string, unknown>).results;
+  if (!Array.isArray(results)) return null;
+  const out: TenantPairResult[] = [];
+  for (const item of results) {
+    if (item === null || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    const tenantId = str(r.tenant_id);
+    if (tenantId === null) continue;
+    const status: TenantPairStatus =
+      r.status === "connected" || r.status === "skipped" ? r.status : "failed";
+    out.push({ tenantId, status, skippedReason: str(r.skipped_reason) });
+  }
+  return out;
+}
+
+/** Operator-facing words for one pair result. */
+export function pairResultLabel(r: TenantPairResult): string {
+  switch (r.status) {
+    case "connected":
+      return "connected";
+    case "skipped":
+      return r.skippedReason === "not_a_member"
+        ? "skipped — you are not a member of this workspace"
+        : `skipped${r.skippedReason ? ` — ${r.skippedReason}` : ""}`;
+    case "failed":
+      return `failed${r.skippedReason ? ` — ${r.skippedReason}` : ""}`;
+  }
+}
+
+/** Event the runner emits for the ONE in-flight `pair_all_tenants` flow. */
+export const PAIR_ALL_PROGRESS_EVENT = "pair-all-tenants-progress";
+
+/** Tauri command ending the in-flight flow. */
+export const CANCEL_PAIR_ALL_TENANTS_CMD = "cancel_pair_all_tenants";
+
+export type PairAllProgress =
+  | { phase: "waiting" }
+  | { phase: "browser"; connectUrl: string; launched: boolean }
+  | { phase: "collecting" }
+  | { phase: "done"; results: TenantPairResult[] }
+  | { phase: "error"; error: string }
+  | { phase: "cancelled" };
+
+/** Coerce one progress event payload; `null` when it is not one. */
+export function normalizePairAllProgress(raw: unknown): PairAllProgress | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  switch (o.phase) {
+    case "waiting":
+      return { phase: "waiting" };
+    case "browser": {
+      const connectUrl = str(o.connect_url);
+      return connectUrl === null
+        ? null
+        : { phase: "browser", connectUrl, launched: o.launched === true };
+    }
+    case "collecting":
+      return { phase: "collecting" };
+    case "done":
+      return { phase: "done", results: normalizePairAllResults(o) ?? [] };
+    case "error":
+      return { phase: "error", error: str(o.error) ?? "unknown error" };
+    case "cancelled":
+      return { phase: "cancelled" };
+    default:
+      return null;
+  }
+}
+
+/** Tauri command: where the in-flight flow is (pull half of the event). */
+export const GET_PAIR_ALL_STATUS_CMD = "get_pair_all_status";
+
+export interface PairAllStatus {
+  inFlight: boolean;
+  /** `waiting` and `browser` are cancellable; `cancelling` and `collecting` are not. */
+  phase: "idle" | "waiting" | "browser" | "cancelling" | "collecting";
+  connectUrl: string | null;
+  launched: boolean;
+}
+
+/** Coerce `get_pair_all_status`; `null` when it is not that shape. */
+export function normalizePairAllStatus(raw: unknown): PairAllStatus | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.in_flight !== "boolean") return null;
+  const phase =
+    o.phase === "waiting" ||
+    o.phase === "browser" ||
+    o.phase === "cancelling" ||
+    o.phase === "collecting"
+      ? o.phase
+      : "idle";
+  return {
+    inFlight: o.in_flight,
+    phase: o.in_flight ? phase : "idle",
+    connectUrl: str(o.connect_url),
+    launched: o.launched === true,
+  };
+}
+
+/** True when the runner refused a second flow because one is already running. */
+export function isAlreadyInProgress(error: string): boolean {
+  return error.includes("already in progress");
+}
+
+/**
+ * Orders a status PULL against the progress EVENTS. Every event bumps the
+ * sequence; a pull captures it before invoking and applies its answer only if
+ * no event arrived meanwhile — so a read taken mid-flow can never overwrite a
+ * `done` / `error` / `cancelled` the event stream delivered after it.
+ */
+export function createProgressSequence(): {
+  bump: () => void;
+  capture: () => number;
+  isCurrent: (captured: number) => boolean;
+} {
+  let seq = 0;
+  return {
+    bump: () => {
+      seq += 1;
+    },
+    capture: () => seq,
+    isCurrent: (captured) => captured === seq,
+  };
 }

@@ -1986,10 +1986,21 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             // "is this device bound to more than one tenant?", which the
             // slot-backed binding file cannot answer (plan
             // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device).
-            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
+            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(
+                &coord_set,
+                response_tenant_id(&body),
+            ) {
                 tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
             }
-            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
+            // Off the async worker: the reconcile holds file locks that may
+            // wait (bounded) on a peer process.
+            let reconcile_set = coord_set;
+            let reconciled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::reconcile_paired_bindings(&reconcile_set)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
+            match reconciled {
                 Ok(report) => {
                     if report.changed() {
                         info!(
