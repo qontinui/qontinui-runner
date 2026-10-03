@@ -3653,6 +3653,17 @@ pub fn get_terminal_agent_states(
     Ok(crate::terminal::agent_state::read_all(&terminal_manager))
 }
 
+/// Every live pane's session metrics — context usage and account headroom
+/// (`[{ terminalId, metrics }]`, `metrics` exactly as
+/// `terminal::agent_metrics::SessionMetrics` serializes). Changes are pushed
+/// as the `terminal-agent-metrics` event; this is the initial read.
+#[tauri::command]
+pub fn get_terminal_agent_metrics(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<Vec<crate::terminal::agent_metrics::TerminalAgentMetrics>, String> {
+    Ok(crate::terminal::agent_metrics::read_all(&terminal_manager))
+}
+
 /// The webview offers its OWN fallback detectors to the runner's reducer, so
 /// the merge happens in one place. `source` is `"regex"` (with `state` one of
 /// `working | approval_shaped | question_shaped | completed | error | idle`)

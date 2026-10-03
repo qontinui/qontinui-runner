@@ -9,6 +9,7 @@
 //! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
 
 pub mod account_migration;
+pub mod agent_metrics;
 pub mod agent_state;
 pub mod agent_status_sideband;
 pub mod auto_response;
@@ -20,6 +21,7 @@ pub mod coord_warn;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;
+pub mod headroom;
 pub mod interceptor;
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)

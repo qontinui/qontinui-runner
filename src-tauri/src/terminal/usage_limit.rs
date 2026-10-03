@@ -118,6 +118,30 @@ fn should_fire(
     Some(pattern)
 }
 
+/// An event-sourced hint (a hook `StopFailure{error: rate_limit}`, plan
+/// `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+/// Phase 8): the same reactive path as a screen match, sharing its
+/// per-terminal debounce so a hook and a painted banner for one limit probe
+/// once. Returns whether a hint was spawned.
+pub fn fire_event_hint(terminal_id: String, label: &'static str) -> bool {
+    let fire = {
+        let mut guard = FIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let last_fired = guard
+            .get_or_insert_with(HashMap::new)
+            .entry(terminal_id.clone())
+            .or_insert(None);
+        should_fire(Some(label), last_fired, Instant::now(), HINT_DEBOUNCE).is_some()
+    };
+    if fire {
+        info!(terminal_id = %terminal_id, label, "usage-limit hint from a hook event");
+        tauri::async_runtime::spawn(super::account_migration::handle_usage_limit_hint(
+            terminal_id,
+            label,
+        ));
+    }
+    fire
+}
+
 // ── Grid scanner ─────────────────────────────────────────────────────────────
 
 /// One scan pass over every live terminal: read its rendered screen, and for
