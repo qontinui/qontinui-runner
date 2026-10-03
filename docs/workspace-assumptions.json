@@ -366,11 +366,11 @@
     {
       "class": "machine_path",
       "file": "src/session_archive/discovery.rs",
-      "symbol": "discover_account_homes_from_env",
-      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\")),",
+      "symbol": "claude_root_for",
+      "excerpt": "Some(PathBuf::from(\"C:\\\\claude\"))",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+      "note": "The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1)."
     },
     {
       "class": "machine_path",

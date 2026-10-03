@@ -76,7 +76,11 @@
 //!   `RUNNER_MSG_SURFACE_REPEAT_SECS` (default 1800 s), so a 10 s poll does
 //!   not spam. A `blocking` message ([`posts_to_coord`]) is also reported to
 //!   coord via a fail-open `delivery-blocked` POST: past the 60 s threshold
-//!   for `target_not_live`, past the repeat window for `pty_never_idle` (a busy
+//!   for `target_not_live` and `no_pusher` (a recipient the runner's own
+//!   session census sees live on this device with no runner — this one or any
+//!   other — as its host or process ancestor — plan
+//!   `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+//!   Phase 4), past the repeat window for `pty_never_idle` (a busy
 //!   live recipient) — evidence for the
 //!   stall-watchdog supervisor, never a change to delivery behavior. Gated
 //!   (default ON) by `RUNNER_DELIVERY_SURFACING_ENABLED`.
@@ -315,7 +319,7 @@ fn surface_repeat() -> Duration {
 }
 
 /// Why a message could not be delivered — the typed `reason` the surfacing
-/// POST carries (coord validates the two values) and the key of the
+/// POST carries (coord validates the values) and the key of the
 /// `push_miss` counter on `/health`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockReason {
@@ -325,17 +329,31 @@ enum BlockReason {
     TargetNotLive,
     /// Fix 3: the target PTY keeps failing the idle gate, deferring injection.
     PtyNeverIdle,
+    /// The target IS a live Claude process on this device — the runner's own
+    /// session census ([`crate::session::census`]) saw its registry row with a
+    /// live pid — but the runner does not host it (a tmux pane launched from an
+    /// account shortcut), so no push primitive here can reach it. Distinct
+    /// from `target_not_live` because the remedy differs: the recipient is
+    /// alive and only a `coord_inbox` pull will deliver. Plan
+    /// `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+    /// Phase 4.
+    NoPusher,
 }
 
 impl BlockReason {
     /// Every reason, for rendering the counter family with no series absent.
-    const ALL: [BlockReason; 2] = [BlockReason::TargetNotLive, BlockReason::PtyNeverIdle];
+    const ALL: [BlockReason; 3] = [
+        BlockReason::TargetNotLive,
+        BlockReason::PtyNeverIdle,
+        BlockReason::NoPusher,
+    ];
 
     /// The wire value for the POST body's `reason` field.
     fn as_str(self) -> &'static str {
         match self {
             BlockReason::TargetNotLive => "target_not_live",
             BlockReason::PtyNeverIdle => "pty_never_idle",
+            BlockReason::NoPusher => "no_pusher",
         }
     }
 }
@@ -420,7 +438,7 @@ fn record_push_ok(arm: DeliveredArm) {
 ///
 /// ```json
 /// { "push_ok": n,
-///   "push_miss": { "target_not_live": n, "pty_never_idle": n },
+///   "push_miss": { "target_not_live": n, "pty_never_idle": n, "no_pusher": n },
 ///   "delivered_arm": { "sdk": n, "terminal": n } }
 /// ```
 ///
@@ -581,7 +599,8 @@ impl SurfacingTracker {
         // threshold: nothing on this device can deliver it.
         let post_threshold = match reason {
             BlockReason::PtyNeverIdle => threshold.max(repeat),
-            BlockReason::TargetNotLive => threshold,
+            // Nothing on this device can push either — same short threshold.
+            BlockReason::TargetNotLive | BlockReason::NoPusher => threshold,
         };
         let surface_since = if should_surface(
             entry.first_seen,
@@ -604,6 +623,11 @@ impl SurfacingTracker {
             surface_since,
             next_log_in,
         }
+    }
+
+    /// Has `message_id` been noted blocked for `reason`?
+    fn has(&self, message_id: &str, reason: BlockReason) -> bool {
+        self.entries.contains_key(&(message_id.to_string(), reason))
     }
 
     /// A successful delivery clears every tracking entry for the message.
@@ -1071,6 +1095,57 @@ fn resolve_target(
     None
 }
 
+/// Does the runner host `session_id` — would [`resolve_target`] route a
+/// message to it right now? The ONE "live local session the runner hosts"
+/// predicate, shared with the session census's `runner_hosted` column so the
+/// census and the poller can never disagree about what this device can push to.
+pub(crate) fn runner_hosts(
+    session_manager: &crate::claude_session::SessionManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    lifecycle_store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    session_id: &str,
+) -> bool {
+    resolve_target(session_manager, registrar, lifecycle_store, session_id).is_some()
+}
+
+/// The reason to report for a target [`resolve_target`] could not route,
+/// given what the runner's own session census says about it.
+///
+/// Only [`LocalVerdict::LiveUnhosted`] — a live Claude process on this device
+/// with NO runner (this one or any other) as host or ancestor — yields
+/// `no_pusher`. A session under another runner is that runner's to push; an
+/// absent, stale or unreadable census is UNKNOWN; neither is upgraded to
+/// `no_pusher`, both keep the pre-census `target_not_live`.
+///
+/// Sticky per message, but ONLY through an `Unknown` verdict: once
+/// `no_pusher` has been reported for a message (`already_no_pusher`), a census
+/// that later goes stale or unreadable keeps it `no_pusher` rather than
+/// flipping it to `target_not_live`. A FRESH `NotLive` (the session exited) or
+/// `LiveUnderARunner` (a runner now hosts it) is evidence, and wins.
+///
+/// [`LocalVerdict::LiveUnhosted`]: crate::session::census::LocalVerdict::LiveUnhosted
+fn unhosted_reason(
+    verdict: crate::session::census::LocalVerdict,
+    already_no_pusher: bool,
+) -> (BlockReason, &'static str) {
+    use crate::session::census::LocalVerdict;
+    let sticky = already_no_pusher && verdict == LocalVerdict::Unknown;
+    if sticky || verdict == LocalVerdict::LiveUnhosted {
+        (
+            BlockReason::NoPusher,
+            "live on this device (session census) and hosted by no runner — no push primitive \
+             reaches it; delivered only by the recipient's coord_inbox pull",
+        )
+    } else if verdict == LocalVerdict::LiveUnderARunner {
+        (
+            BlockReason::TargetNotLive,
+            "live under another runner on this device (session census); not hosted by this runner",
+        )
+    } else {
+        (BlockReason::TargetNotLive, "no live session on this device")
+    }
+}
+
 /// The envelope's tag name, matched case-insensitively by
 /// [`reminder_close_tag_end`].
 const REMINDER_TAG_NAME: &[u8] = b"system-reminder";
@@ -1486,21 +1561,17 @@ async fn deliver_once(
             &lifecycle_store,
             to_session,
         ) else {
-            // Not live on this device. Leave pending — delivered on its next
-            // open (its spawn preamble pulls coord_inbox), or by another
-            // device hosting it. Reported for every priority: counter, one
-            // info line per window, and past the threshold the surfacing POST
-            // (fix 2; once per repeat window, fail-open).
-            surface_blocked_delivery(
-                &ctx,
-                tracker,
-                msg,
-                to_session,
-                BlockReason::TargetNotLive,
-                "no live session on this device",
-                now,
-            )
-            .await;
+            // Not runner-hosted. Leave pending — delivered on its next open
+            // (its spawn preamble pulls coord_inbox), by another device hosting
+            // it, or by the recipient's own pull. Reported for every priority:
+            // counter, one info line per window, and past the threshold the
+            // surfacing POST (fix 2; once per repeat window, fail-open). Which
+            // reason is the census's call: see `unhosted_reason`.
+            let (reason, detail) = unhosted_reason(
+                crate::session::census::local_verdict(to_session, now),
+                tracker.has(&msg.message_id, BlockReason::NoPusher),
+            );
+            surface_blocked_delivery(&ctx, tracker, msg, to_session, reason, detail, now).await;
             continue;
         };
 
@@ -2216,9 +2287,100 @@ mod tests {
     }
 
     #[test]
+    fn only_a_live_session_with_no_runner_reports_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnhosted, false).0,
+            BlockReason::NoPusher
+        );
+        // Live under ANOTHER runner on the device: that runner pushes it.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnderARunner, false).0,
+            BlockReason::TargetNotLive
+        );
+        assert_eq!(
+            unhosted_reason(LocalVerdict::NotLive, false).0,
+            BlockReason::TargetNotLive
+        );
+        // No fresh census is UNKNOWN — never upgraded to no_pusher.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::Unknown, false).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_fresh_not_live_verdict_beats_a_sticky_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        // already_no_pusher = true, but the session has since exited.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::NotLive, true).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_fresh_live_under_a_runner_verdict_beats_a_sticky_no_pusher() {
+        use crate::session::census::LocalVerdict;
+        // already_no_pusher = true, but a runner now hosts the session.
+        assert_eq!(
+            unhosted_reason(LocalVerdict::LiveUnderARunner, true).0,
+            BlockReason::TargetNotLive
+        );
+    }
+
+    #[test]
+    fn a_message_once_no_pusher_never_also_reports_target_not_live() {
+        use crate::session::census::LocalVerdict;
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let (thresh, repeat) = (Duration::from_secs(60), Duration::from_secs(1800));
+        let (r1, _) = unhosted_reason(
+            LocalVerdict::LiveUnhosted,
+            t.has("m", BlockReason::NoPusher),
+        );
+        assert_eq!(r1, BlockReason::NoPusher);
+        t.note_blocked("m", r1, t0, thresh, repeat, true);
+        // The census later goes stale (Unknown): still no_pusher for "m".
+        let (r2, _) = unhosted_reason(LocalVerdict::Unknown, t.has("m", BlockReason::NoPusher));
+        assert_eq!(r2, BlockReason::NoPusher);
+        // A different message is unaffected.
+        let (r3, _) = unhosted_reason(LocalVerdict::Unknown, t.has("n", BlockReason::NoPusher));
+        assert_eq!(r3, BlockReason::TargetNotLive);
+    }
+
+    #[test]
+    fn no_pusher_is_a_rendered_push_miss_series_and_posts_on_the_short_threshold() {
+        let snap = health_snapshot();
+        assert!(snap["push_miss"].get("no_pusher").is_some());
+        // Like target_not_live (and unlike pty_never_idle) the first POST
+        // waits only the threshold: nothing on this device can push it.
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let thresh = Duration::from_secs(60);
+        let repeat = Duration::from_secs(1800);
+        assert!(t
+            .note_blocked("m", BlockReason::NoPusher, t0, thresh, repeat, true)
+            .surface_since
+            .is_none());
+        assert!(t
+            .note_blocked(
+                "m",
+                BlockReason::NoPusher,
+                t0 + thresh + Duration::from_secs(1),
+                thresh,
+                repeat,
+                true
+            )
+            .surface_since
+            .is_some());
+    }
+
+    #[test]
     fn block_reason_wire_values() {
         // Pins the coord route contract (`POST .../delivery-blocked` body).
         assert_eq!(BlockReason::TargetNotLive.as_str(), "target_not_live");
+        assert_eq!(BlockReason::NoPusher.as_str(), "no_pusher");
         assert_eq!(BlockReason::PtyNeverIdle.as_str(), "pty_never_idle");
     }
 
@@ -2585,7 +2747,7 @@ mod tests {
         assert_eq!(keys(&snap), ["delivered_arm", "push_miss", "push_ok"]);
         assert_eq!(
             keys(&snap["push_miss"]),
-            ["pty_never_idle", "target_not_live"]
+            ["no_pusher", "pty_never_idle", "target_not_live"]
         );
         assert_eq!(keys(&snap["delivered_arm"]), ["sdk", "terminal"]);
 

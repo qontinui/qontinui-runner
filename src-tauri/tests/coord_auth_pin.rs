@@ -213,6 +213,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
     ("pair.rs", "not-coord", 2),
+    // The session census's whole-device snapshot POST (plan
+    // `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+    // Phase 2). It presents the paired-device JWT it resolved itself via
+    // `device_bearer_scoped(TenantScope::Device)` and returns before the POST
+    // when there is none: coord's ingest 403s any other credential, so the
+    // fail-soft defaulting helper (which would send anonymously) is wrong here.
+    ("session/census.rs", "device-jwt-required", 1),
     ("session_bus.rs", "device-jwt-required", 1),
     ("session_bus.rs", "not-coord", 1),
     ("terminal/context_watcher.rs", "not-coord", 1),
