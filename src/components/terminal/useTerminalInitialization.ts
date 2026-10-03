@@ -206,7 +206,8 @@ export function buildResumeCmd(
  * handshake actually appeared (Phase 3, issue #548): on first failure the
  * same command is retyped once; on persistent failure the tab is parked in an
  * explicit `resumeFailed` state (operator-clickable retry via
- * `ResumeFailedBanner`) and the durable restore-pending marker is left SET so
+ * `SessionFailureBanner`, which renders it as a `resume_failed` session
+ * failure) and the durable restore-pending marker is left SET so
  * the backend liveness poll keeps protecting the `open` record. Only a
  * verified handshake clears the marker and the reconnecting affordance.
  *

@@ -38,18 +38,62 @@ const SHIM_BASH: &str = include_str!("../../../resources/intercept/shim.bash");
 #[cfg(target_os = "windows")]
 const SHIM_CMD: &str = include_str!("../../../resources/intercept/shim.cmd");
 
-/// Always-on session-restore IDENTITY shim template (bash / Git-Bash / Unix).
-/// Wraps `claude`/`gemini` to append `--session-id $QONTINUI_PINNED_SESSION_ID`.
+/// Always-on session-restore IDENTITY shim template (bash / Git-Bash / Unix)
+/// for a CLI whose profile PINS its session id: appends
+/// `<pin flag> $QONTINUI_PINNED_SESSION_ID`.
 const IDENTITY_SHIM_BASH: &str = include_str!("../../../resources/intercept/identity_shim.bash");
 /// Always-on identity shim template (`.cmd` Windows cmd/PowerShell shadow).
 #[cfg(target_os = "windows")]
 const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
+/// Always-on identity shim template (bash) for a CLI whose profile READS ITS
+/// ID BACK (Codex): it never touches argv and only signals the runner to start
+/// the read-back capture (`/control/session-open` with no session id).
+const READ_BACK_SHIM_BASH: &str =
+    include_str!("../../../resources/intercept/codex_identity_shim.bash");
+/// The read-back identity shim template (`.cmd`).
+#[cfg(target_os = "windows")]
+const READ_BACK_SHIM_CMD: &str =
+    include_str!("../../../resources/intercept/codex_identity_shim.cmd");
 
 /// The always-on identity tool family (plan §3b). These shims are ALWAYS
 /// materialized for every terminal regardless of the install-intercept master
 /// flag, so the out-of-box session-restore guarantee never rides a default-dark
-/// flag. `claude` is provider #1, `gemini` #2.
-pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
+/// flag. Each is a CLI profile's program (`qontinui_runner_lib::cli_profile`),
+/// and the profile's identity picks its template ([`identity_bash_template`]):
+/// `claude` pins, `codex` reads back. `gemini` was sunset.
+pub const IDENTITY_TOOLS: &[&str] = &["claude", "codex"];
+
+/// Whether `tool`'s CLI profile reads its session id back rather than taking a
+/// pinned one. A tool with no profile is treated as pinning — the template it
+/// has always had.
+fn reads_id_back(tool: &str) -> bool {
+    qontinui_runner_lib::cli_profile::profile_for_program(tool).is_some_and(|p| {
+        matches!(
+            p.identity,
+            qontinui_types::cli_session::IdentitySource::ReadBack { .. }
+        )
+    })
+}
+
+/// The bash template for `tool`'s identity shim: the read-back signal-only
+/// wrapper for a read-back profile, else the pinning wrapper.
+fn identity_bash_template(tool: &str) -> &'static str {
+    if reads_id_back(tool) {
+        READ_BACK_SHIM_BASH
+    } else {
+        IDENTITY_SHIM_BASH
+    }
+}
+
+/// The `.cmd` template for `tool`'s identity shim; see [`identity_bash_template`].
+#[cfg(target_os = "windows")]
+fn identity_cmd_template(tool: &str) -> &'static str {
+    if reads_id_back(tool) {
+        READ_BACK_SHIM_CMD
+    } else {
+        IDENTITY_SHIM_CMD
+    }
+}
 
 /// Filename prefix for the CONTENT-ADDRESSED identity shim dir
 /// (`qontinui-identity-<build-tag>`, see [`identity_build_tag`]). Distinct from
@@ -460,8 +504,12 @@ fn identity_build_tag() -> &'static str {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         // Template + tool-set identity.
         IDENTITY_SHIM_BASH.hash(&mut h);
+        READ_BACK_SHIM_BASH.hash(&mut h);
         #[cfg(target_os = "windows")]
-        IDENTITY_SHIM_CMD.hash(&mut h);
+        {
+            IDENTITY_SHIM_CMD.hash(&mut h);
+            READ_BACK_SHIM_CMD.hash(&mut h);
+        }
         IDENTITY_TOOLS.hash(&mut h);
         SESSION_CLI_BIN.hash(&mut h);
         // Runner build identity + every binary copied into the dir.
@@ -1322,10 +1370,10 @@ fn render_identity(body: &str, tool: &str, shim_dir: &Path) -> String {
         .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy())
 }
 
-/// Test-only accessor for [`render_identity`].
+/// Test-only accessor for [`render_identity`] over `tool`'s bash template.
 #[cfg(test)]
 pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
-    render_identity(IDENTITY_SHIM_BASH, tool, shim_dir)
+    render_identity(identity_bash_template(tool), tool, shim_dir)
 }
 
 /// Write the platform-appropriate identity shim file(s) for `tool`
@@ -1346,19 +1394,27 @@ pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
 /// incorrect."). The `.cmd` is kept ONLY as a fail-open fallback: if the stub
 /// copy fails (builds without the sidecar, dev setups) behavior degrades to
 /// exactly today's `.cmd` path, logged at debug.
+///
+/// A read-back tool gets no exe stub: the stub recognises only profiles that
+/// pin (`bin/qontinui_shim.rs` `detect_identity_tool`), so as `codex.exe` it
+/// would reach its unknown-name passthrough. Its `.cmd` shadows npm's
+/// `codex.cmd`.
 fn write_identity_shims_for(dir: &Path, tool: &str) -> std::io::Result<()> {
-    let bash = render_identity(IDENTITY_SHIM_BASH, tool, dir);
+    let bash = render_identity(identity_bash_template(tool), tool, dir);
     let extensionless = dir.join(tool);
     std::fs::write(&extensionless, bash.as_bytes())?;
     set_executable(&extensionless)?;
 
     #[cfg(target_os = "windows")]
     {
-        let cmd_body = render_identity(IDENTITY_SHIM_CMD, tool, dir);
+        let cmd_body = render_identity(identity_cmd_template(tool), tool, dir);
         std::fs::write(dir.join(format!("{tool}.cmd")), cmd_body.as_bytes())?;
         // The native exe stub (best-effort, fail-open): the stub detects the
-        // identity tool from argv[0], so the one binary serves claude + gemini.
-        copy_exe_stub(dir, tool);
+        // identity tool from argv[0], so the one binary serves every pinning
+        // profile.
+        if !reads_id_back(tool) {
+            copy_exe_stub(dir, tool);
+        }
     }
 
     Ok(())
@@ -1910,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_identity_writes_claude_and_gemini_always() {
+    fn materialize_identity_writes_every_identity_tool_always() {
         // The identity family is materialized with NO master-flag gate — it is
         // the out-of-box session-restore guarantee.
         let tmp = tempfile::tempdir().unwrap();
@@ -1927,18 +1983,25 @@ mod tests {
             assert!(f.exists(), "extensionless {tool} identity shim must exist");
             let body = std::fs::read_to_string(&f).unwrap();
             assert!(body.contains(&format!("TOOL=\"{tool}\"")));
-            // The shim pins the runner-injected session id and respects the
-            // recursion guard.
-            assert!(body.contains("QONTINUI_PINNED_SESSION_ID"));
-            assert!(body.contains("--session-id"));
+            // Every identity shim respects the recursion guard and signals the
+            // runner over the control route.
             assert!(body.contains("QONTINUI_INSTALL_INTERCEPT_GUARD"));
-            // It confirms via the new control route.
             assert!(body.contains("/control/session-open"));
+            if reads_id_back(tool) {
+                // A read-back CLI has no id flag: appending one would break
+                // it, and there is no pinned id to read.
+                assert!(!body.contains("--session-id"), "{tool}");
+                assert!(!body.contains("QONTINUI_PINNED_SESSION_ID"), "{tool}");
+            } else {
+                assert!(body.contains("QONTINUI_PINNED_SESSION_ID"), "{tool}");
+                assert!(body.contains("--session-id"), "{tool}");
+            }
             #[cfg(target_os = "windows")]
-            assert!(
-                dir.join(format!("{tool}.cmd")).exists(),
-                "{tool}.cmd identity shim must exist on Windows"
-            );
+            {
+                let cmd_body = std::fs::read_to_string(dir.join(format!("{tool}.cmd")))
+                    .expect("the .cmd identity shim exists on Windows");
+                assert_eq!(cmd_body.contains("--session-id"), !reads_id_back(tool), "{tool}");
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1960,6 +2023,27 @@ mod tests {
         assert!(!out.contains("@@SHIM_DIR@@"));
         assert!(out.contains("TOOL=\"claude\""));
         assert!(out.contains("/tmp/qontinui-identity-x"));
+    }
+
+    /// The template follows the tool's CLI profile: Claude pins, Codex reads
+    /// back. Every tool in the family has a profile, so none falls back by
+    /// accident.
+    #[test]
+    fn identity_templates_follow_the_profile_identity() {
+        for tool in IDENTITY_TOOLS {
+            assert!(
+                qontinui_runner_lib::cli_profile::profile_for_program(tool).is_some(),
+                "{tool} has no CLI profile"
+            );
+        }
+        assert!(!reads_id_back("claude"));
+        assert!(reads_id_back("codex"));
+        let dir = Path::new("/tmp/qontinui-identity-x");
+        let codex = render_identity_for_test("codex", dir);
+        assert!(codex.contains("TOOL=\"codex\""));
+        assert!(!codex.contains("@@TOOL@@") && !codex.contains("@@SHIM_DIR@@"));
+        assert!(codex.contains("CODEX_HOME"), "reports a user-set CODEX_HOME");
+        assert!(codex.contains("pwd -W"), "posts the cwd in the CLI's own frame");
     }
 
     /// Q5(a). The identity dir is SHARED across every terminal of this runner
@@ -2353,7 +2437,8 @@ mod tests {
         let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
         for tool in IDENTITY_TOOLS {
             let exe = dir.join(format!("{tool}.exe"));
-            assert!(exe.is_file(), "{tool}.exe must be materialized");
+            // Only a pinning tool gets the stub (it cannot serve a read-back one).
+            assert_eq!(exe.is_file(), !reads_id_back(tool), "{tool}.exe");
             // The .cmd fallback is STILL written alongside (fail-open ladder).
             assert!(dir.join(format!("{tool}.cmd")).is_file());
             assert!(dir.join(tool).is_file());

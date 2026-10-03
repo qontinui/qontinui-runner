@@ -54,6 +54,28 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+/// The structured lane's [`crate::session::failure_recovery::StructuredRestart`]:
+/// everything [`ClaudeSession::restart_in_place`] needs, captured by the
+/// waiter thread when the child exits.
+struct StructuredLaneRestart {
+    app: tauri::AppHandle,
+    session_id: String,
+    session_ctx: Option<AiSessionContext>,
+    working_dir: String,
+}
+
+impl crate::session::failure_recovery::StructuredRestart for StructuredLaneRestart {
+    fn restart(&self, rotate_account: bool) -> Result<(), String> {
+        ClaudeSession::restart_in_place(
+            &self.app,
+            &self.session_id,
+            self.session_ctx.as_ref(),
+            &self.working_dir,
+            rotate_account,
+        )
+    }
+}
+
 /// Internal error type for `build_replay_from_history`.
 ///
 /// Distinguishes "no history found" (`Ok(None)`) from "PG isn't available"
@@ -342,19 +364,19 @@ impl ClaudeSession {
         // The operator's global template + per-account command layer in here;
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
-        let spec = crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+        let spec = crate::session::launch_spec::LaunchSpec {
+            permission: crate::session::launch_spec::PermissionMode::BypassPermissions,
             session_id: session_id_pin,
             resume_id: resume_id_pin,
             model: model_override.map(|m| m.to_string()),
             extra_required,
             ..Default::default()
         };
-        let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        let launch_cfg = crate::session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
         let (program, cli_args) =
-            crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
+            crate::session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
         let mut cmd = crate::process_helpers::no_window(&program);
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
@@ -726,10 +748,16 @@ impl ClaudeSession {
         // stdout reader so each line streams to coord. `None` when the gate is
         // OFF (the common case); the reader then never touches it.
         let agent_log_emitter_for_stdout = agent_log_emitter.clone();
+        // The dispatcher's per-process frame ledger is keyed by the session id
+        // the waiter's exit report uses, so an errored turn and the exit that
+        // follows it are one failure (plan 2026-09-20-ai-session-handling-is-
+        // claude-shaped, Phase 8).
+        let frame_ledger_key = session_id.to_string();
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
             let mut line_buffer = String::new();
+            let mut frame_ledger = dispatcher::FrameLedger::new(frame_ledger_key);
 
             let mut finding_parser = if finding_ctx_for_stdout.is_some() {
                 Some(FindingParser::new())
@@ -785,6 +813,7 @@ impl ClaudeSession {
                                 &persisted_len_for_stdout,
                                 fallback_id_for_stdout.as_deref(),
                                 worktree_id_for_stdout.as_deref(),
+                                &mut frame_ledger,
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -1190,6 +1219,10 @@ impl ClaudeSession {
         thread::spawn(move || {
             // Wait for the child process to exit
             Self::wait_for_child(child, &session_id_for_waiter);
+            // A deliberate `close()` (or a worktree promotion) force-closes the
+            // state before the child goes; an exit nobody asked for leaves it
+            // open. Only the latter is a failure to recover from.
+            let closed_deliberately = state_for_waiter.get() == SessionState::Closed;
 
             // Remove PID from tracker
             if let Some(ref tracker) = pid_tracker_for_waiter {
@@ -1223,48 +1256,17 @@ impl ClaudeSession {
                 }
             }
 
-            // Check if the exit was due to rate-limiting
             let stderr_output = shared_stderr_for_waiter
                 .lock()
                 .ok()
                 .map(|s| s.clone())
                 .unwrap_or_default();
 
-            let is_rate_limited = crate::ai_provider::retry::is_rate_limit_error(&stderr_output);
-
-            if is_rate_limited {
-                warn!(
-                    "Session {} exited due to rate-limit, attempting auto-restart on another account",
-                    session_id_for_waiter
-                );
-
-                // Emit a user-visible notification
-                if let Some(ref ctx) = session_ctx_for_waiter {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(
-                            &app_handle_for_waiter,
-                            "Rate limit reached. Switching account and restarting session...",
-                            "status",
-                            None,
-                            Some(ctx),
-                        );
-                    }));
-                }
-
-                // Attempt auto-restart on another account
-                Self::auto_restart_on_rate_limit(
-                    &app_handle_for_waiter,
-                    &session_id_for_waiter,
-                    session_ctx_for_waiter.as_ref(),
-                    &working_dir_for_waiter,
-                );
-            }
-
             // Transition to Closed
             state_for_waiter.force_close();
             info!(
-                "Session {} process exited, state -> Closed (rate_limited={})",
-                session_id_for_waiter, is_rate_limited
+                "Session {} process exited, state -> Closed (deliberate={})",
+                session_id_for_waiter, closed_deliberately
             );
 
             // Review notes sent into this worker are never confirmed from a
@@ -1278,10 +1280,65 @@ impl ClaudeSession {
             );
 
             // Phase 1b — terminal coord agent_logs milestone + final flush.
-            // No-op unless the emitter was built (gate ON). Done last so the
-            // `session_closed` row reflects the real process-exit moment.
+            // No-op unless the emitter was built (gate ON). Done before any
+            // recovery so the `session_closed` row reflects the real
+            // process-exit moment.
             if let Some(emitter) = agent_log_emitter_for_waiter.as_ref() {
                 emitter.close();
+            }
+
+            // The exit's stderr is a failure SIGNAL, not a decision: the
+            // classifier names the kind and the one recovery table acts on it
+            // (plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 7).
+            // A quota or budget exhaustion migrates the account through
+            // `restart_in_place(rotate = true)` — this lane's arm of the
+            // `migrate_account` policy; a rate limit or an overload restarts
+            // on the SAME account after a bounded backoff. Runs on this
+            // dedicated waiter thread, which is free to wait out that backoff.
+            if !closed_deliberately {
+                let restart = Arc::new(StructuredLaneRestart {
+                    app: app_handle_for_waiter.clone(),
+                    session_id: session_id_for_waiter.clone(),
+                    session_ctx: session_ctx_for_waiter.clone(),
+                    working_dir: working_dir_for_waiter.clone(),
+                });
+                // Say what is happening in the session's own output, as the
+                // pre-taxonomy path did, before any recovery runs.
+                let announce = |f: &qontinui_types::cli_session::SessionFailure| {
+                    if let Some(ref ctx) = session_ctx_for_waiter {
+                        let text = match &f.details {
+                            Some(d) => format!("{}. {}", f.title, d),
+                            None => f.title.clone(),
+                        };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            emit_ai_output(&app_handle_for_waiter, &text, "status", None, Some(ctx));
+                        }));
+                    }
+                };
+                let signal = crate::session::failure::FailureSignal::Stderr(stderr_output);
+                let provider = qontinui_runner_lib::cli_profile::claude::ID;
+                if let Some(preview) = crate::session::failure::classify_for(
+                    &signal,
+                    provider,
+                    qontinui_runner_lib::cli_profile::profile_for(provider),
+                ) {
+                    warn!(
+                        session_id = %session_id_for_waiter,
+                        kind = ?preview.kind,
+                        policy = ?preview.recovery_policy,
+                        "stream-json session exited with a classified failure"
+                    );
+                    announce(&preview);
+                }
+                crate::session::failure_recovery::report(
+                    crate::session::failure_recovery::RecoveryTarget::Structured {
+                        session_id: session_id_for_waiter.clone(),
+                        restart,
+                    },
+                    provider,
+                    None,
+                    signal,
+                );
             }
         });
 
@@ -1760,7 +1817,7 @@ impl ClaudeSession {
 
     /// Read this session's task output log from PG and build a replay prompt.
     ///
-    /// Shared by `auto_restart_on_rate_limit` (account rotation) and
+    /// Shared by `restart_in_place` (failure recovery) and
     /// `promote_to_worktree` (worktree promotion) — both kill-and-respawn the
     /// CLI process and need to give the new instance the prior conversation.
     ///
@@ -1966,146 +2023,138 @@ impl ClaudeSession {
         Ok(info)
     }
 
-    /// Auto-restart the session on another account after a rate-limit exit.
+    /// Restart an exited session in place, under the same id, replaying its
+    /// conversation from the DB output log — the structured lane's recovery
+    /// mechanism, driven by `session::failure_recovery`'s table.
     ///
-    /// Reads conversation history from the DB output_log, rotates the account,
-    /// spawns a new ClaudeSession with a replay prompt, and re-registers it
-    /// in the SessionManager.
-    fn auto_restart_on_rate_limit(
+    /// With `rotate_account` it first moves the runner to another account:
+    /// that is the `migrate_account` policy's structured-lane arm (quota or
+    /// budget exhausted). Without it the account stays: the
+    /// `backoff_then_retry` and `resume_same_id` arms, because no account
+    /// switch fixes a rate limit, an overload or a lost process.
+    ///
+    /// Reads conversation history from the DB output_log, spawns a new
+    /// ClaudeSession with a replay prompt, and re-registers it in the
+    /// SessionManager.
+    fn restart_in_place(
         app_handle: &tauri::AppHandle,
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
         working_dir: &str,
-    ) {
+        rotate_account: bool,
+    ) -> Result<(), String> {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account
-        if !rotate_account_on_rate_limit() {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
-            );
-            return;
+        // 1. Rotate to another account, when the failure is the account's.
+        if rotate_account && !rotate_account_on_rate_limit() {
+            return Err("no alternative account available for restart".to_string());
         }
 
         let (resolved_config_dir, _config_dir_source) =
             get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli);
-        let new_config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
-        let label = std::path::Path::new(&new_config_dir)
+        let config_dir = resolved_config_dir.unwrap_or_else(|| "unknown".to_string());
+        let label = std::path::Path::new(&config_dir)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(&new_config_dir);
+            .unwrap_or(&config_dir)
+            .to_string();
         info!(
-            "Session {}: restarting on account '{}' after rate-limit",
-            session_id, label
+            "Session {}: restarting in place on account '{}' (rotated={})",
+            session_id, label, rotate_account
         );
 
         // 2. Read conversation history from DB
         let conversation_context = match Self::build_replay_from_history(session_id, session_ctx) {
             Ok(replay) => replay,
             Err(BuildReplayErr::NoPg) => {
-                warn!("No PG connection for reading conversation history");
-                return;
+                return Err("no PG connection for reading conversation history".to_string());
             }
         };
 
         // 3. Spawn new session
-        let sm = match app_handle.try_state::<Arc<crate::claude_session::manager::SessionManager>>()
-        {
-            Some(sm) => sm.inner().clone(),
-            None => {
-                warn!("SessionManager not available for auto-restart");
-                return;
-            }
-        };
+        let sm = app_handle
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .ok_or("SessionManager not available for restart")?
+            .inner()
+            .clone();
 
-        // Clone session_ctx for the new session
-        let new_session_ctx = session_ctx.cloned();
-
-        match Self::spawn(
+        let new_session = match Self::spawn(
             working_dir,
             session_id,
             app_handle,
-            new_session_ctx,
+            session_ctx.cloned(),
             None, // finding_ctx
             None, // progress_ctx
             None, // pid_tracker
             None, // model_override
-            None, // worktree (rate-limit restart preserves the original cwd)
-            None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
+            None, // worktree (an in-place restart preserves the original cwd)
+            None, // tool_policy (an in-place restart preserves the original policy-less spawn)
             None, // cli_session_ctx — in-process restart does its own replay; no --resume
             // agent_log_emitter — this associated fn has no `self` handle to the
-            // emitter; a rate-limit restart is a fresh process and the prior
-            // waiter already emitted `session_closed`. No-op here.
+            // emitter; a restart is a fresh process and the prior waiter
+            // already emitted `session_closed`. No-op here.
             None,
         ) {
-            Ok(new_session) => {
-                let new_session = Arc::new(new_session);
-
-                // Send replay prompt if we have conversation context
-                if let Some(ref replay_prompt) = conversation_context {
-                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
-                        warn!("Failed to send replay prompt: {}", e);
-                    }
-                }
-
-                // Remove old session and re-register under the same ID
-                sm.remove(session_id);
-                if let Err(e) = sm.register(session_id, new_session.clone()) {
-                    warn!("Failed to re-register session after restart: {}", e);
-                    return;
-                }
-
-                // Emit state event so frontend knows the session is back
-                crate::commands::ai_session::emit_session_state_ex(
-                    app_handle,
-                    session_id,
-                    session_id,
-                    new_session.state(),
-                    true, // resumed flag
-                );
-
-                // Notify user
-                if let Some(ctx) = session_ctx {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(
-                            app_handle,
-                            &format!(
-                                "Session restarted on account '{}'. Conversation context restored.",
-                                label
-                            ),
-                            "status",
-                            None,
-                            Some(ctx),
-                        );
-                    }));
-                }
-
-                info!(
-                    "Session {} successfully restarted on account '{}'",
-                    session_id, label
-                );
-            }
+            Ok(s) => Arc::new(s),
             Err(e) => {
-                warn!(
-                    "Failed to restart session {} on new account: {}",
-                    session_id, e
-                );
-                // Notify user of failure
                 if let Some(ctx) = session_ctx {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         emit_ai_output(
                             app_handle,
-                            &format!("Failed to restart session on new account: {}", e),
+                            &format!("Failed to restart session: {}", e),
                             "error",
                             None,
                             Some(ctx),
                         );
                     }));
                 }
+                return Err(format!("restart spawn failed: {e}"));
+            }
+        };
+
+        // Send replay prompt if we have conversation context
+        if let Some(ref replay_prompt) = conversation_context {
+            if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
+                warn!("Failed to send replay prompt: {}", e);
             }
         }
+
+        // Remove old session and re-register under the same ID
+        sm.remove(session_id);
+        sm.register(session_id, new_session.clone())
+            .map_err(|e| format!("failed to re-register session after restart: {e}"))?;
+
+        // Emit state event so frontend knows the session is back
+        crate::commands::ai_session::emit_session_state_ex(
+            app_handle,
+            session_id,
+            session_id,
+            new_session.state(),
+            true, // resumed flag
+        );
+
+        // Notify user
+        if let Some(ctx) = session_ctx {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(
+                    app_handle,
+                    &format!(
+                        "Session restarted on account '{}'. Conversation context restored.",
+                        label
+                    ),
+                    "status",
+                    None,
+                    Some(ctx),
+                );
+            }));
+        }
+
+        info!(
+            "Session {} successfully restarted on account '{}'",
+            session_id, label
+        );
+        Ok(())
     }
 
     /// The final env mutations applied to the bidirectional stream-json child
@@ -2140,6 +2189,14 @@ impl ClaudeSession {
             );
             cmd.env("CLAUDE_CONFIG_DIR", config_dir);
         }
+
+        // Ask the CLI to report its own turn state. Without this env var
+        // Claude Code (2.1.285, Phase 2 probe Q2) sends no
+        // `system:session_state_changed` frame, and the dispatcher falls back
+        // to ending the turn on `result`; with it, `idle` (sent after
+        // `result`) ends the turn and `requires_action` marks a pending
+        // decision.
+        cmd.env(crate::claude_protocol::SESSION_STATE_EVENTS_ENV, "1");
 
         // Full non-interactive git credential posture — this seam spawns a
         // `claude` that can run `git push`, so without it a credential prompt
@@ -2246,6 +2303,14 @@ mod tests {
                 |(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/tmp/claude-config")
             ),
             "the resolved account pin must still be applied"
+        );
+        // Plan 2026-09-20-ai-session-handling-is-claude-shaped, Phase 8: the
+        // CLI reports its own turn state only when asked (probe Q2), and the
+        // credential scrub that runs after must not strip the request.
+        assert!(
+            envs.iter().any(|(k, v)| k == crate::claude_protocol::SESSION_STATE_EVENTS_ENV
+                && v.as_deref() == Some("1")),
+            "the structured lane must ask the CLI for session_state_changed frames"
         );
     }
 

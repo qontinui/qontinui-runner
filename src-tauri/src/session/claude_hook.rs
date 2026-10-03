@@ -268,7 +268,7 @@ pub fn session_restore_dir() -> PathBuf {
 /// Materialize the bundled Claude SessionStart hook + its `--settings` file into
 /// `base_dir` (prod: [`session_restore_dir`]; tests: a tempdir), substituting
 /// the hook-script absolute path into the settings, and return the absolute path
-/// of the settings file (for `claude --settings <path>` / [`DeliverySpec`]).
+/// of the settings file (for `claude --settings <path>`).
 ///
 /// Idempotent + fail-open: any IO failure logs at warn and returns `None`, so a
 /// launch that can't write the hook simply omits `--settings` (identity still

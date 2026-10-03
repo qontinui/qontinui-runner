@@ -93,7 +93,8 @@ export interface TerminalTab {
    * True when a boot-restore typed `claude --resume` into this tab but the
    * Claude UI handshake never appeared (after one retry) — the pane is most
    * likely still a bare shell. Surfaced as an explicit operator-clickable
-   * "resume failed — retry" affordance (`ResumeFailedBanner`); cleared when a
+   * "resume failed — retry" affordance (reported to the runner as a
+   * `resume_failed` session failure, rendered by `SessionFailureBanner`); cleared when a
    * retry verifies. While set, the durable record keeps its backend
    * restore-pending marker so the liveness poll can't flip it `poll-dead`.
    */
@@ -109,7 +110,7 @@ export interface TerminalTab {
    * (backstop-guessed) origin — the guess isn't strong enough to act on, so it
    * is treated the same as no match found: do nothing beyond an honest
    * restore. No resume is typed and NO confirm banner is shown; instead the
-   * `ResumeFailedBanner`'s informational "fresh conversation" note surfaces it
+   * `RestoreTerminalOnlyNote`'s informational "fresh conversation" note surfaces it
    * so the user is never misled into thinking the conversation came back.
    * Cleared once the user dismisses the note or the tab is otherwise used.
    */

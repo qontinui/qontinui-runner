@@ -4533,7 +4533,7 @@ impl AgentLivenessTally {
 /// ## The two probes, and what each can actually prove
 ///
 /// 1. **Survivor probe (class-level, a true OS signal).**
-///    `claude_pids_in_inclusive_subtree(census.pid, …)` rooted at the PREVIOUS
+///    `ai_cli_pids_in_inclusive_subtree(census.pid, …)` rooted at the PREVIOUS
 ///    runner's pid. On Windows an orphan keeps its now-dangling
 ///    `ParentProcessId`, so a claude child that outlived the runner is still
 ///    reachable from that root. Survivors are filtered to processes created no
@@ -4562,7 +4562,7 @@ fn classify_agent_binding_liveness(
     boot_unix_millis: i64,
 ) -> AgentLivenessTally {
     use crate::process_capture::process_tree::{
-        claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree,
+        ai_cli_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree,
     };
 
     let n = census.entries.len();
@@ -4622,7 +4622,7 @@ fn classify_agent_binding_liveness(
     let boot_cutoff_unix = boot_unix_millis
         .saturating_add(crate::process_capture::process_tree::PID_REUSE_SKEW_MS)
         / 1000;
-    let survivors: Vec<u32> = claude_pids_in_inclusive_subtree(census.pid, snapshot)
+    let survivors: Vec<u32> = ai_cli_pids_in_inclusive_subtree(census.pid, snapshot)
         .into_iter()
         // An unresolvable creation time (`0` — a WMI / `/proc` miss) passes on
         // purpose: counting it as a survivor pushes bindings toward `unknown`

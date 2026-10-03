@@ -24,7 +24,7 @@ import {
  * title — the silent-respawn the plan forbids. So the saved identity is
  * listed, one click each, with the outcome shown inline.
  *
- * Lives in the same top-right advisory column as `ResumeFailedBanner`.
+ * Lives in the same top-right advisory column as `SessionFailureBanner`.
  */
 export function RemoteRestoreBanner() {
   const { tabs, pageId, setActiveId } = useTerminalSession();

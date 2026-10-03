@@ -53,7 +53,7 @@ use qontinui_runner_lib::looping_agent::turn_ending::{
 };
 
 use crate::terminal::transcript::{
-    find_claude_config_dirs, parse_assistant_record, read_tail_bytes, session_transcript_path,
+    find_transcript_config_dirs, parse_assistant_record, read_tail_bytes, session_transcript_path,
 };
 
 /// How much of the transcript tail to read when classifying a turn ending.
@@ -300,13 +300,15 @@ pub fn append_shadow_record(journal_path: &str, record: &ShadowRecord) {
 /// `session_transcript_path` needs `(config_dir, project_path, session_id)`, but
 /// the looping-agent registry records only the pinned `claude_session_id`. The
 /// session id is unique, so sweep every Claude config dir on this machine
-/// (`find_claude_config_dirs` is MACHINE-scoped — it enumerates every account's
+/// (`find_transcript_config_dirs` is MACHINE-scoped — it enumerates every account's
 /// tree, not just this session's) and look for `<session_id>.jsonl` under any
 /// `projects/<encoded>/`. Returns the config dir, the encoded project directory
 /// name, and the transcript path.
 pub fn resolve_transcript(session_id: &str) -> Option<(PathBuf, String)> {
     let file = format!("{session_id}.jsonl");
-    for config_dir in find_claude_config_dirs() {
+    for config_dir in
+        find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)
+    {
         let projects = config_dir.join("projects");
         let Ok(entries) = std::fs::read_dir(&projects) else {
             continue;

@@ -77,7 +77,8 @@ import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
-import { type ZoneSessionInfo } from "../zoneProfileStorage";
+import { type ZoneSessionInfo, ZONE_SESSION_PROVIDER } from "../zoneProfileStorage";
+import { loadCliProfiles, providerDescriptorFor } from "../providerAdapter";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
@@ -341,14 +342,18 @@ const PageSessionScope = memo(function PageSessionScope({
     if (!sessions || sessions.length === 0) return;
 
     const isWindows = navigator.platform.startsWith("Win");
+    // The resume line comes from the provider's served CLI profile — program,
+    // resume flag, account env var, PTY-only args — never a copy held here.
+    // Autonomous (the profile's auto-approve flags, as clg/clh/clp launch) so a
+    // re-attached session doesn't stall on a permission prompt. `null` when
+    // the runner serves no resumable profile for the provider.
     const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      // Autonomous resume (matches clg/clh/clp) so a re-attached session
-      // doesn't stall on a permission prompt.
-      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-      if (!configDir) return `${base}\r`;
-      return isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
+      const line = providerDescriptorFor(ZONE_SESSION_PROVIDER)?.ptyResumeLine(sessionId, {
+        configDir,
+        isWindows,
+        autoApprove: true,
+      });
+      return line == null ? null : `${line}\r`;
     };
 
     // Process only sessions whose zone now has an assignment; leave the
@@ -382,6 +387,8 @@ const PageSessionScope = memo(function PageSessionScope({
       // layout/tabs are untouched, and the operator can still resume any of
       // them by hand (single-id operator-clicked resume paths stay ungated
       // by design: the click is the intent).
+      // Profiles first: until they load, no provider has a resume line.
+      await loadCliProfiles();
       const liveIds = await fetchLiveClaudeSessionIds();
       for (const { s, tabId } of toResume) {
         const decision = decideColdResume(liveIds, s.claudeSessionId);
@@ -391,6 +398,14 @@ const PageSessionScope = memo(function PageSessionScope({
               (decision === "skip-alive"
                 ? "a live Claude process already hosts this id (typing --resume would fork it)"
                 : "live-session registry unreadable — failing closed toward not-respawning"),
+          );
+          continue;
+        }
+        const resumeCmd = buildResumeCmd(s.claudeSessionId, s.claudeConfigDir);
+        if (resumeCmd === null) {
+          console.warn(
+            `[TerminalSession] profile resume SKIPPED for session ${s.claudeSessionId}: the runner ` +
+              `serves no resumable CLI profile for provider "${ZONE_SESSION_PROVIDER}"`,
           );
           continue;
         }
@@ -449,17 +464,12 @@ const PageSessionScope = memo(function PageSessionScope({
             ),
           )
           .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
-        writeWhenReady(
-          terminalRefs.current,
-          tabId,
-          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
-          {
-            onTimeout: (id) =>
-              console.warn(
-                `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
-              ),
-          },
-        );
+        writeWhenReady(terminalRefs.current, tabId, resumeCmd, {
+          onTimeout: (id) =>
+            console.warn(
+              `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
+            ),
+        });
       }
     })();
   }, [zoneLayout.assignments, updateTab, tabs, pageId]);

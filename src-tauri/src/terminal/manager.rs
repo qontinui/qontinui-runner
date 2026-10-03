@@ -942,29 +942,24 @@ impl TerminalManager {
     }
 }
 
-/// Whether a spawn command line implies a Claude session running with tool
+/// Whether a spawn command line implies an AI-CLI session running with tool
 /// permissions bypassed — i.e. one that can never legitimately stall on a
 /// tool-approval prompt.
 ///
-/// True iff the argv contains either:
-/// - `--dangerously-skip-permissions` (the runner-spawned gate-continuation
-///   form, `agent_runtime.rs`), or
-/// - `--permission-mode bypassPermissions` (the operator-resume form). The two
-///   tokens may be a single joined arg (`--permission-mode=bypassPermissions`)
-///   or two adjacent args (`--permission-mode`, `bypassPermissions`); both are
-///   handled. The whole command is joined and substring-matched so a flag
-///   embedded inside a shell wrapper string (e.g.
-///   `CLAUDE_CONFIG_DIR=… claude --permission-mode bypassPermissions`) is still
-///   caught.
+/// True iff the argv, joined with spaces, carries one of any CLI profile's
+/// auto-approve `detect` spellings
+/// ([`qontinui_runner_lib::cli_profile::command_implies_auto_approve`]) — for
+/// Claude Code the runner-spawned gate-continuation form
+/// (`--dangerously-skip-permissions`, `agent_runtime.rs`) and the
+/// operator-resume form (`--permission-mode bypassPermissions`, as one joined
+/// arg or two adjacent ones). Joining is what catches a flag embedded inside a
+/// shell wrapper string (`CLAUDE_CONFIG_DIR=… claude --permission-mode …`).
 ///
 /// `pub(crate)` so the typed-input resume sniff
-/// ([`super::claude_resume_sniff`], #548 Phase 2) reuses the SAME matcher —
+/// ([`super::typed_resume_sniff`], #548 Phase 2) reuses the SAME matcher —
 /// one definition of "bypass-implying command" for spawn-argv and typed paths.
 pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
-    let joined = argv.join(" ");
-    joined.contains("--dangerously-skip-permissions")
-        || joined.contains("--permission-mode bypassPermissions")
-        || joined.contains("--permission-mode=bypassPermissions")
+    qontinui_runner_lib::cli_profile::command_implies_auto_approve(argv)
 }
 
 #[cfg(test)]
@@ -1290,32 +1285,6 @@ mod tests {
             "claude",
             "echo bypassPermissions is a mode",
         ])));
-    }
-
-    /// This matcher keeps its own copy of the spellings the Claude profile
-    /// declares (`cli_profile::claude` `auto_approve`). Pin the two together:
-    /// every declared detect token, and the declared launch flags themselves,
-    /// read as bypass here.
-    #[test]
-    fn matcher_agrees_with_the_claude_profile_auto_approve() {
-        use qontinui_types::cli_session::AutoApprove;
-        let profile = qontinui_runner_lib::cli_profile::profile_for("claude").unwrap();
-        let AutoApprove::Flags {
-            argv: flags,
-            detect,
-        } = &profile.auto_approve
-        else {
-            panic!("the Claude profile declares auto-approve flags");
-        };
-        for token in detect {
-            assert!(
-                command_implies_bypass_permissions(&argv(&["claude", token])),
-                "{token:?}"
-            );
-        }
-        let mut launch = argv(&["claude"]);
-        launch.extend(flags.iter().cloned());
-        assert!(command_implies_bypass_permissions(&launch));
     }
 }
 

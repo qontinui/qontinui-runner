@@ -1028,6 +1028,21 @@ pub async fn list_cli_profiles_handler(
     Json(ApiResponse::success(qontinui_runner_lib::cli_profile::all()))
 }
 
+/// `GET /terminals/{id}/failures` — the session failures currently active for
+/// terminal `id` (plan
+/// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+/// Phase 7), so a headless consumer does not depend on having been subscribed
+/// to the `session-failure` event. An empty list means none is active — the
+/// store holds every failure the runner has recorded and not yet seen cleared
+/// by evidence. Read-only; carries the same data the event does.
+pub async fn get_failures_handler(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<Vec<qontinui_types::cli_session::SessionFailure>>> {
+    Json(ApiResponse::success(
+        crate::session::failure_recovery::active(&id),
+    ))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -1062,6 +1077,8 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(get_coord_session_handler),
         )
         .route("/terminals/{id}/submit-prompt", post(submit_prompt_handler))
+        // Active session failures (Phase 7 of the CLI-profile plan).
+        .route("/terminals/{id}/failures", get(get_failures_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
         // Move a terminal onto a different page (axum 0.8 `{id}` brace syntax).
         .route("/terminals/{id}/move", post(move_terminal_handler))
@@ -1089,6 +1106,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/terminals/{id}/output"),
         ("GET", "/terminals/{id}/coord-session"),
         ("POST", "/terminals/{id}/submit-prompt"),
+        ("GET", "/terminals/{id}/failures"),
         ("POST", "/terminals/{id}/resize"),
         ("POST", "/terminals/{id}/move"),
         ("GET", "/terminals/{id}/ws"),

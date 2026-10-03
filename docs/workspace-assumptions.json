@@ -388,6 +388,14 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/cli_profile/mod.rs",
+      "symbol": "program_stem",
+      "excerpt": "for suffix in [\".exe\", \".cmd\", \".bat\", \".ps1\"] {",
+      "count": 1,
+      "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/commands/saved_projects.rs",
       "symbol": "is_drive_rooted",
       "excerpt": "cfg(windows)-only fn `is_drive_rooted` has no cfg(not(windows)) sibling in this file",
@@ -927,14 +935,6 @@
       "file": "src/step_executor/legacy_steps.rs",
       "symbol": "StepExecutor::execute_shell_command_step",
       "excerpt": "let mut c = crate::process_helpers::tokio_no_window(\"powershell\");",
-      "count": 1,
-      "disposition": "unreviewed"
-    },
-    {
-      "class": "os_bound_tooling",
-      "file": "src/terminal/claude_resume_sniff.rs",
-      "symbol": "is_claude_program",
-      "excerpt": "matches!(base, \"claude\" | \"claude.exe\" | \"claude.cmd\" | \"claude.ps1\")",
       "count": 1,
       "disposition": "unreviewed"
     },

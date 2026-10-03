@@ -3,7 +3,7 @@
  *
  * The flag-composition logic (default-template append, `{sessionId}`
  * substitution, blank→built-in fallback, per-account verbatim precedence) now
- * lives in Rust (`claude_session/launch_spec.rs`) and is covered by its unit
+ * lives in Rust (`session/launch_spec.rs`) and is covered by its unit
  * tests. Here we only assert the wrapper invokes the tauri command with the
  * passed args and maps the `{ command, pinnedSessionId }` response through.
  */
@@ -30,12 +30,14 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
     });
 
     const result = await buildAiLaunchCommand({
+      provider: "claude",
       configDir: "/h/.claude-x",
       isWindows: false,
       sessionId: "abc",
     });
 
     expect(invokeMock).toHaveBeenCalledWith("build_ai_launch_command", {
+      provider: "claude",
       configDir: "/h/.claude-x",
       sessionId: "abc",
       isWindows: false,
@@ -53,6 +55,7 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
     });
 
     const result = await buildAiLaunchCommand({
+      provider: "claude",
       configDir: "C:\\claude\\.claude-hotmail",
       isWindows: true,
       sessionId: "abc",
@@ -61,10 +64,34 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
     expect(result).toEqual({ command: "clh", pinnedSessionId: null });
   });
 
+  it("passes a read-back provider with no account and maps its null pin through", async () => {
+    // Codex mints its own session id: the Rust builder reports no pin, and the
+    // runner's read-back capture stamps the tab later.
+    invokeMock.mockResolvedValue({
+      success: true,
+      data: { command: "codex --dangerously-bypass-approvals-and-sandbox", pinnedSessionId: null },
+    });
+
+    const result = await buildAiLaunchCommand({
+      provider: "codex",
+      configDir: null,
+      isWindows: false,
+      sessionId: "abc",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("build_ai_launch_command", {
+      provider: "codex",
+      configDir: null,
+      sessionId: "abc",
+      isWindows: false,
+    });
+    expect(result.pinnedSessionId).toBeNull();
+  });
+
   it("throws when the command returns no data", async () => {
     invokeMock.mockResolvedValue({ success: false, message: "boom" });
     await expect(
-      buildAiLaunchCommand({ configDir: "/x", isWindows: false, sessionId: "abc" }),
+      buildAiLaunchCommand({ provider: "claude", configDir: "/x", isWindows: false, sessionId: "abc" }),
     ).rejects.toThrow("boom");
   });
 });
@@ -79,7 +106,12 @@ describe("buildAiLaunchCommand (thin tauri wrapper)", () => {
 describe("buildAiLaunchCommandForTab (orphan cleanup on a failed build)", () => {
   beforeEach(() => invokeMock.mockReset());
 
-  const params = { configDir: "C:/claude/.claude-work", isWindows: true, sessionId: "abc" };
+  const params = {
+    provider: "claude",
+    configDir: "C:/claude/.claude-work",
+    isWindows: true,
+    sessionId: "abc",
+  };
 
   it("returns the built command and touches neither handler on success", async () => {
     invokeMock.mockResolvedValueOnce({
@@ -110,9 +142,10 @@ describe("buildAiLaunchCommandForTab (orphan cleanup on a failed build)", () => 
 
     expect(result).toBeNull();
     expect(disposeTab).toHaveBeenCalledWith("tab-1");
-    // The operator must be told WHICH account failed and WHY — a bare "launch
-    // failed" is what made this path expensive to diagnose.
+    // The operator must be told WHICH CLI and account failed and WHY — a bare
+    // "launch failed" is what made this path expensive to diagnose.
     const [message] = notify.mock.calls[0] as [string];
+    expect(message).toContain("claude");
     expect(message).toContain("C:/claude/.claude-work");
     expect(message).toContain("launch spec unreadable");
     expect(consoleError).toHaveBeenCalled();

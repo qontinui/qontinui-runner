@@ -15,7 +15,7 @@
 //! the §1 traffic light has no rows to read for the dominant UX path.
 //!
 //! Reuses existing infrastructure:
-//!   - `terminal::transcript::find_claude_config_dirs()` for config dirs.
+//!   - `terminal::transcript::find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE)` for config dirs.
 //!   - `terminal::transcript::list_sessions()` for startup discovery.
 //!   - `terminal::transcript::is_workflow_session_marker()` for the
 //!     workflow-vs-interactive filter.
@@ -38,8 +38,8 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 use tracing::{debug, info, warn};
 
 use super::transcript::{
-    find_claude_config_dirs, is_workflow_session_marker, list_sessions, parse_line_for_agent_log,
-    parse_line_for_touched_files, AgentLogObs,
+    find_transcript_config_dirs, is_workflow_session_marker, list_sessions,
+    parse_line_for_agent_log, parse_line_for_touched_files, AgentLogObs,
 };
 use crate::claude_session::coord_register::{AgentLogEmitter, AiCoordRegistrar};
 use crate::session::session_transcript_tailer::SessionTranscriptTailer;
@@ -544,7 +544,8 @@ async fn run_orchestrator(
     tailer: Option<Arc<SessionTranscriptTailer>>,
     cfg: TailConfig,
 ) -> Result<(), String> {
-    let config_dirs = find_claude_config_dirs();
+    let config_dirs =
+        find_transcript_config_dirs(&qontinui_runner_lib::cli_profile::claude::PROFILE);
     if config_dirs.is_empty() {
         info!("transcript_watcher: no Claude config dirs found; nothing to watch");
         return Ok(());
@@ -670,14 +671,19 @@ async fn run_orchestrator(
             "transcript_watcher: no workspace paths tracked yet; transcript-absence check skipped"
         );
     } else if transcripts_on_disk == 0 {
+        let account_env = qontinui_runner_lib::cli_profile::account_env_var(
+            &qontinui_runner_lib::cli_profile::claude::PROFILE,
+        )
+        .unwrap_or("<no account env var>");
         warn!(
             config_dirs = %searched.join(", "),
             workspace_paths = %workspace_paths.join(", "),
+            account_env,
             "transcript_watcher: ZERO Claude transcripts found for any watched workspace path. \
              project.session_touched_files will not populate for PTY tabs, so cross-session file \
              conflict detection is blind for them. Verify the config dirs listed here are the \
-             ones the CLI actually writes to (CLAUDE_CONFIG_DIR is set per account) BEFORE \
-             concluding that transcript persistence is off."
+             ones the CLI actually writes to (the `account_env` variable is set per account) \
+             BEFORE concluding that transcript persistence is off."
         );
     } else {
         info!(

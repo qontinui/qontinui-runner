@@ -276,6 +276,7 @@ _No hits._
 | `src/ci_node/executor.rs` | `spawn_step_child` | `let mut shim = build_step_command("cmd.exe", &argv);` | 1 | unreviewed |
 | `src/ci_node/services.rs` | `reap_blocking` | `spawn("cmd.exe", &shim_argv)` | 1 | unreviewed |
 | `src/ci_node/tools.rs` | `run_capture_env` | `let mut shim = build("cmd.exe", &argv_ref, path_dir, envs);` | 1 | unreviewed |
+| `src/cli_profile/mod.rs` | `program_stem` | `for suffix in [".exe", ".cmd", ".bat", ".ps1"] {` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `is_drive_rooted` | `cfg(windows)-only fn 'is_drive_rooted' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `resolve_subst_once` | `cfg(windows)-only fn 'resolve_subst_once' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/commands/saved_projects.rs` | `rewrite_msys_root` | `cfg(windows)-only fn 'rewrite_msys_root' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -344,7 +345,6 @@ _No hits._
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_check_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `"powershell"` | 1 | unreviewed |
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
-| `src/terminal/claude_resume_sniff.rs` | `is_claude_program` | `matches!(base, "claude" \| "claude.exe" \| "claude.cmd" \| "claude.ps1")` | 1 | unreviewed |
 | `src/terminal/session.rs` | `TerminalSession::assign_to_job_object` | `cfg(windows)-only fn 'assign_to_job_object' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/ui_thread_probe.rs` | `resolve_own_main_window` | `cfg(windows)-only fn 'resolve_own_main_window' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `attach_process_failed` | `cfg(windows)-only fn 'attach_process_failed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

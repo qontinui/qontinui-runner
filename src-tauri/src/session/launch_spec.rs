@@ -1,22 +1,38 @@
-//! Shared Claude-launch-command builder (#548/#779 seam, Phase 1).
+//! Shared AI-CLI launch-command builder (#548/#779 seam, Phase 1; made
+//! profile-driven and moved out of `claude_session/` by plan
+//! `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+//! Phase 6).
 //!
-//! One flag model, two renderers. The runner spawns `claude` two ways and both
-//! must be driven from a single source of truth so the operator's optional
+//! One flag model, two renderers. The runner launches an AI CLI two ways and
+//! both must be driven from a single source of truth so the operator's optional
 //! launch flags (and, critically, the caller's non-negotiable *required* flags)
 //! can never drift between them:
 //!
 //! - **Modality A — argv vector** ([`render_argv`]): a `Vec<String>` handed to a
-//!   child `Command` / terminal backend (see `session.rs`, `runner.rs`,
-//!   `agent_runtime.rs`). The head is the resolved `claude` binary path; the
-//!   caller sets `CLAUDE_CONFIG_DIR` on the child env itself, so argv never
+//!   child `Command` / terminal backend (see `claude_session/session.rs`,
+//!   `runner.rs`, `agent_runtime.rs`). The head is the resolved binary path; the
+//!   caller sets the account variable on the child env itself, so argv never
 //!   carries the env prefix.
 //! - **Modality B — PTY-typed shell command** ([`render_pty_command`]): a shell
 //!   string typed into a pseudo-terminal (see `aiLaunchCommand.ts`). The head is
-//!   a bare `claude` (PATH/shim resolves it) and the string is prefixed with the
-//!   `CLAUDE_CONFIG_DIR` assignment.
+//!   the bare program (PATH/shim resolves it) and the string is prefixed with
+//!   the account variable's assignment.
 //!
 //! Both share [`compose_flags`] so the composed flag set is identical by
 //! construction — the parity the tests pin.
+//!
+//! ## Every CLI fact comes from the profile
+//!
+//! [`LaunchSpec::provider`] is a [`CliProfile`], and the renderers read the
+//! program, the account variable, the id flags, the auto-approve flags and the
+//! PTY-only args from it — Claude by default, Codex when asked. A profile whose
+//! identity is read back (Codex) has no pin flag, so a requested pin renders as
+//! nothing; a profile whose resume id is positional (`codex resume <id>`) puts
+//! the resume subcommand right after the program.
+//!
+//! The operator's launch templates ([`LaunchConfig`]) are CLAUDE settings
+//! (`claude_default_launch_command`, `claude_account_launch_commands`, keyed by
+//! Claude config dir), so they apply to a Claude launch only.
 //!
 //! ## Precedence (load-bearing)
 //!
@@ -28,6 +44,9 @@
 
 use std::collections::HashSet;
 
+use qontinui_runner_lib::cli_profile::{self, claude};
+use qontinui_types::cli_session::{AutoApprove, CliProfile, ResumeSpec};
+
 /// `{sessionId}` placeholder an operator may embed in a launch template; when
 /// present the pinned id is substituted in place instead of a flag being
 /// appended (mirrors the #779 frontend behavior in `aiLaunchCommand.ts`).
@@ -35,17 +54,24 @@ const SESSION_ID_PLACEHOLDER: &str = "{sessionId}";
 
 /// Caller-authoritative permission posture. Always wins over any permission flag
 /// found in an operator template. Defaults to `BypassPermissions` — every
-/// current spawn site is autonomous and must never stall on a prompt.
+/// current spawn site is autonomous and must never stall on a prompt. Both
+/// spellings come from the profile's [`AutoApprove::Flags`]; a profile that
+/// declares none renders no permission flag at all ([`permission_flags`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
-    /// `--permission-mode bypassPermissions` (interactive/stream-json sites).
+    /// The profile's `auto_approve.argv` (Claude `--permission-mode
+    /// bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox`)
+    /// — interactive/stream-json sites.
     #[default]
     BypassPermissions,
-    /// `--dangerously-skip-permissions` (autonomous `agent_runtime` sites).
+    /// The profile's first `auto_approve.detect` spelling, its single-flag
+    /// skip-everything form (Claude `--dangerously-skip-permissions`) — the
+    /// autonomous `agent_runtime` sites.
     DangerouslySkip,
 }
 
-/// Operator-configured optional launch templates, resolved for one account.
+/// Operator-configured optional launch templates, resolved for one Claude
+/// account. Consulted only for a Claude launch — see the module docs.
 ///
 /// Populated either directly (tests, explicit callers) or via
 /// [`LaunchConfig::from_settings`] which reads the live settings for a given
@@ -83,17 +109,24 @@ impl LaunchConfig {
 
 /// The caller's REQUIRED launch parameters — the non-negotiable half of the
 /// composition. Everything here wins over the operator template.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LaunchSpec {
-    /// `CLAUDE_CONFIG_DIR`. Used as the PTY env prefix; argv callers set the env
-    /// on the child `Command` themselves. `None` ⇒ no prefix.
+    /// The CLI being launched. Every CLI-specific spelling the renderers emit
+    /// is read from it. Defaults to Claude.
+    pub provider: &'static CliProfile,
+    /// The account dir, set through the profile's account variable
+    /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Used as the PTY env prefix; argv
+    /// callers set the env on the child `Command` themselves. `None` ⇒ no
+    /// prefix.
     pub config_dir: Option<String>,
     /// Caller-authoritative permission mode. Always applied; never overridden by
     /// the template. Defaults to `BypassPermissions`.
     pub permission: PermissionMode,
-    /// New-pin id ⇒ `--session-id <id>`. Ignored when `resume_id` is set.
+    /// New-pin id ⇒ `<pin flag> <id>` (Claude `--session-id`). Renders nothing
+    /// for a profile that reads its id back. Ignored when `resume_id` is set.
     pub session_id: Option<String>,
-    /// Resume id ⇒ `--resume <id>`. Takes precedence over `session_id`.
+    /// Resume id ⇒ the profile's resume (`--resume <id>`, or the positional
+    /// `resume <id>` subcommand). Takes precedence over `session_id`.
     pub resume_id: Option<String>,
     /// Caller-provided model ⇒ `--model <m>`; subsumes model overrides and any
     /// failover sniff. When set, drops any `--model` from the template.
@@ -101,7 +134,8 @@ pub struct LaunchSpec {
     /// Display name ⇒ `--name <v>` (shown in the prompt box, `/resume` picker and
     /// terminal title). Passed through [`sanitize_session_name`]; a name that
     /// sanitises to nothing is omitted. When set, drops any `--name` / `-n` (and
-    /// attached `--name=…`) from the template.
+    /// attached `--name=…`) from the template. Claude only: ignored for a
+    /// profile with no `--name` flag.
     pub name: Option<String>,
     /// Other non-negotiable trailing args, verbatim and in order — carries the
     /// `--append-system-prompt <s>`, `--add-dir <d>`, and the trailing
@@ -132,6 +166,33 @@ pub fn sanitize_session_name(raw: &str) -> Option<String> {
     }
 }
 
+impl Default for LaunchSpec {
+    fn default() -> Self {
+        Self {
+            provider: &claude::PROFILE,
+            config_dir: None,
+            permission: PermissionMode::default(),
+            session_id: None,
+            resume_id: None,
+            model: None,
+            name: None,
+            extra_required: Vec::new(),
+        }
+    }
+}
+
+impl LaunchSpec {
+    /// Whether this spec pins its session id on the argv — the profile has a
+    /// pin flag, `session_id` is set, and no resume overrides it. A caller that
+    /// must report the pinned id (`build_ai_launch_command`) asks this rather
+    /// than guessing from the provider.
+    pub fn pins_session_id(&self) -> bool {
+        self.resume_id.is_none()
+            && self.session_id.is_some()
+            && cli_profile::pin_flag(self.provider).is_some()
+    }
+}
+
 /// A parsed template flag and the value tokens that follow it (arity inferred:
 /// a value is any following token that does not itself start with `-`). A bare
 /// positional token is stored with an empty `values` list.
@@ -140,13 +201,45 @@ struct FlagUnit {
     values: Vec<String>,
 }
 
-/// Render the argv vector: `[claude_bin, <composed flags…>]`. No env prefix and
-/// no shell wrapper — both are the caller's concern.
-pub fn render_argv(spec: &LaunchSpec, cfg: &LaunchConfig, claude_bin: &str) -> Vec<String> {
+/// Render the argv vector: `[bin, <resume subcommand…>, <composed flags…>]`.
+/// No env prefix and no shell wrapper — both are the caller's concern. `bin`
+/// is the resolved binary of `spec.provider`.
+pub fn render_argv(spec: &LaunchSpec, cfg: &LaunchConfig, bin: &str) -> Vec<String> {
     let mut argv = Vec::with_capacity(1 + spec.extra_required.len() + 6);
-    argv.push(claude_bin.to_string());
+    argv.push(bin.to_string());
+    argv.extend(positional_resume(spec));
     argv.extend(compose_flags(spec, cfg));
     argv
+}
+
+/// The program `spec.provider` is launched as — the first of its profile's
+/// programs, which is a bare name PATH (or an identity shim) resolves.
+fn program(spec: &LaunchSpec) -> &str {
+    spec.provider
+        .programs
+        .first()
+        .map_or(spec.provider.id.as_str(), String::as_str)
+}
+
+/// The resume tokens that follow the program when the profile takes the
+/// resume id POSITIONALLY (`codex resume <id>`): the template after its
+/// program, with the id substituted. Empty when there is no resume, or when
+/// the id rides a flag ([`compose_flags`] emits that one).
+fn positional_resume(spec: &LaunchSpec) -> Vec<String> {
+    let Some(id) = &spec.resume_id else {
+        return Vec::new();
+    };
+    if cli_profile::resume_flag(spec.provider).is_some() {
+        return Vec::new();
+    }
+    match &spec.provider.resume {
+        ResumeSpec::ByIdArgv { template } => template
+            .iter()
+            .skip(1)
+            .map(|arg| arg.replace(cli_profile::ID_PLACEHOLDER, id))
+            .collect(),
+        ResumeSpec::None | ResumeSpec::Unknown => Vec::new(),
+    }
 }
 
 /// Render the `(program, args)` pair for a DIRECT (non-PTY) `claude` spawn,
@@ -189,7 +282,13 @@ pub fn render_argv(spec: &LaunchSpec, cfg: &LaunchConfig, claude_bin: &str) -> V
 /// far more expensively than a `PATH` walk; `mcp/sessions.rs` and the
 /// `runner.rs` inline path both go through `spawn_blocking` and are fine.
 /// Fixing those two is a separate change, not a consequence of this one.
+///
+/// The binary resolvers are Claude's (`QONTINUI_CLAUDE_BIN`, the shim-skipping
+/// PATH walk): the direct spawn serves the structured lane, which the runner
+/// implements for Claude alone. Another profile's spec renders its bare
+/// program, left to the OS to resolve.
 pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String, Vec<String>) {
+    let is_claude = spec.provider.id == claude::ID;
     #[cfg(target_os = "windows")]
     {
         // `claude_bin_path()` (not the literal `"claude"`) so a
@@ -198,17 +297,22 @@ pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String
         // The full `resolve_claude_bin()` is deliberately NOT used here: cmd.exe
         // does its own `.cmd`/PATHEXT resolution, which is the entire reason
         // this arm exists.
+        let bin = if is_claude {
+            crate::agent_runtime::claude_bin_path()
+        } else {
+            program(spec).to_string()
+        };
         let mut args = vec!["/c".to_string()];
-        args.extend(render_argv(
-            spec,
-            cfg,
-            &crate::agent_runtime::claude_bin_path(),
-        ));
+        args.extend(render_argv(spec, cfg, &bin));
         ("cmd.exe".to_string(), args)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let bin = crate::agent_runtime::resolve_claude_bin();
+        let bin = if is_claude {
+            crate::agent_runtime::resolve_claude_bin()
+        } else {
+            program(spec).to_string()
+        };
         let argv = render_argv(spec, cfg, &bin);
         // `render_argv` always pushes the head first, so this never panics —
         // `argv_head_is_claude_bin` is the test that keeps it true.
@@ -221,28 +325,58 @@ pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String
 
 /// Render the PTY-typed shell command string.
 ///
-/// If the per-account override is an opaque alias (not a recognizable `claude …`
-/// invocation), it is returned verbatim — the runner cannot introspect it, so it
-/// applies no pin/permission/env (the #779 escape hatch). Otherwise the composed
-/// flags are joined onto a bare `claude` head and prefixed with the
-/// `CLAUDE_CONFIG_DIR` assignment (omitted when `config_dir` is `None`).
+/// If the per-account override is an opaque alias (not a recognizable command
+/// of the launched CLI), it is returned verbatim — the runner cannot introspect
+/// it, so it applies no pin/permission/env (the #779 escape hatch). Otherwise
+/// the profile's program, its positional resume (if any), its PTY-only args
+/// ([`pty_only_args`]) and the composed flags are joined and prefixed with the
+/// profile's account-variable assignment (omitted when `config_dir` is `None`
+/// or the profile isolates accounts some other way).
 pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: bool) -> String {
-    if let Some(alias) = pty_verbatim_alias(cfg) {
+    if let Some(alias) = pty_verbatim_alias(spec, cfg) {
         return alias;
     }
 
     let flags = compose_flags(spec, cfg);
-    let mut parts = Vec::with_capacity(flags.len() + 1);
-    parts.push("claude".to_string());
-    for flag in &flags {
-        parts.push(shell_quote(flag, is_windows));
+    let pty_args = pty_only_args(spec, &flags);
+    let resume = positional_resume(spec);
+    let mut parts = Vec::with_capacity(resume.len() + pty_args.len() + flags.len() + 1);
+    parts.push(program(spec).to_string());
+    for token in resume.iter().chain(&pty_args).chain(&flags) {
+        parts.push(shell_quote(token, is_windows));
     }
     let body = parts.join(" ");
 
-    match &spec.config_dir {
-        Some(dir) if is_windows => format!("$env:CLAUDE_CONFIG_DIR=\"{}\"; {}", dir, body),
-        Some(dir) => format!("CLAUDE_CONFIG_DIR=\"{}\" {}", dir, body),
-        None => body,
+    match (&spec.config_dir, cli_profile::account_env_var(spec.provider)) {
+        (Some(dir), Some(var)) if is_windows => format!("$env:{var}=\"{dir}\"; {body}"),
+        (Some(dir), Some(var)) => format!("{var}=\"{dir}\" {body}"),
+        _ => body,
+    }
+}
+
+/// The launched profile's [`pty_args`] for a PTY-typed launch, placed right
+/// after the head — ahead of any `--` that ends option parsing — unless `flags`
+/// already set the first of them (an operator template choosing its own
+/// `--teammate-mode` keeps it). Only the TUI launch gets them: the argv
+/// renderer also serves the stream-json lane, which has no terminal to split.
+/// The profile records the CLI version they were verified against; a CLI that
+/// dropped a hidden flag refuses the launch loudly rather than misbehaving.
+///
+/// [`pty_args`]: qontinui_types::cli_session::CliProfile::pty_args
+fn pty_only_args(spec: &LaunchSpec, flags: &[String]) -> Vec<String> {
+    let args = &spec.provider.pty_args;
+    let Some(name) = args.first() else {
+        return Vec::new();
+    };
+    let already_set = flags.iter().take_while(|f| f.as_str() != "--").any(|f| {
+        f == name
+            || f.strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.starts_with('='))
+    });
+    if already_set {
+        Vec::new()
+    } else {
+        args.clone()
     }
 }
 
@@ -250,30 +384,32 @@ pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: boo
 /// composed flag set can never diverge between argv and PTY.
 ///
 /// Order: `[permission] [model] [session] [other template flags…] [extra_required…]`.
-/// Precedence per flag: spec field > per-account claude template > global
-/// template > CLI default.
+/// Precedence per flag: spec field > per-account template > global template >
+/// CLI default.
 fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let profile = spec.provider;
 
     // 1. Permission — caller-authoritative, always applied.
-    match spec.permission {
-        PermissionMode::BypassPermissions => {
-            out.push("--permission-mode".to_string());
-            out.push("bypassPermissions".to_string());
-        }
-        PermissionMode::DangerouslySkip => {
-            out.push("--dangerously-skip-permissions".to_string());
-        }
-    }
+    out.extend(permission_flags(profile, spec.permission));
 
-    // Resolve the claude template to layer in (per-account claude command wins
-    // over the global default; an opaque account alias falls through to the
-    // global default for the argv/compose path).
-    let template = claude_template(cfg);
+    // Resolve the template to layer in (per-account command wins over the
+    // global default; an opaque account alias falls through to the global
+    // default for the argv/compose path).
+    let template = launch_template(spec, cfg);
+    let permission_names = permission_flag_names(profile);
+    let id_flag_names: Vec<&str> = cli_profile::id_flags(profile)
+        .into_iter()
+        .map(|(flag, _)| flag)
+        .collect();
     let pin = spec.resume_id.as_deref().or(spec.session_id.as_deref());
     let provided = provided_flag_names(&spec.extra_required);
     let caller_owns_append_prompt = provides_append_prompt_flag(&spec.extra_required);
-    let name = spec.name.as_deref().and_then(sanitize_session_name);
+    // `--name` is a Claude Code flag; no other profile declares one, so a
+    // display name is dropped rather than handed to a CLI that would refuse it.
+    let name = (profile.id == claude::ID)
+        .then(|| spec.name.as_deref().and_then(sanitize_session_name))
+        .flatten();
 
     let mut template_model: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
@@ -284,14 +420,14 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
         session_via_placeholder = had_placeholder;
         let substituted = t.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or(""));
         let tokens = shell_tokenize(&substituted);
-        // Drop the `claude` head token (guaranteed present — `claude_template`
-        // only returns recognizable claude commands).
+        // Drop the program head token (guaranteed present — `launch_template`
+        // only returns recognizable commands of the launched CLI).
         let body = tokens.get(1..).unwrap_or(&[]);
         for unit in parse_units(body) {
             match unit.name.as_str() {
                 // Permission is spec-owned: drop any template permission flag so
                 // it can never override the caller.
-                "--permission-mode" | "--dangerously-skip-permissions" => {}
+                name if permission_names.contains(&name) => {}
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
                 // Name is spec-owned when the caller supplies one: drop the
@@ -301,7 +437,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Session flags: when the operator positioned the id via the
                 // `{sessionId}` placeholder, keep the flag in place; otherwise the
                 // spec owns session and we drop the template's.
-                "--session-id" | "--resume" => {
+                name if id_flag_names.contains(&name) => {
                     if had_placeholder {
                         other_units.push(unit);
                     }
@@ -344,13 +480,19 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     }
 
     // 3. Session — appended only when the template did not position it via
-    //    placeholder. resume takes precedence over session-id.
+    //    placeholder. resume takes precedence over session-id. A positional
+    //    resume is not a flag: the renderers emit it after the program
+    //    ([`positional_resume`]). A profile with no pin flag pins nothing.
     if !session_via_placeholder {
         if let Some(resume) = &spec.resume_id {
-            out.push("--resume".to_string());
-            out.push(resume.clone());
-        } else if let Some(session) = &spec.session_id {
-            out.push("--session-id".to_string());
+            if let Some(flag) = cli_profile::resume_flag(profile) {
+                out.push(flag.to_string());
+                out.push(resume.clone());
+            }
+        } else if let (Some(session), Some(flag)) =
+            (&spec.session_id, cli_profile::pin_flag(profile))
+        {
+            out.push(flag.to_string());
             out.push(session.clone());
         }
     }
@@ -375,19 +517,28 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     out
 }
 
-/// The claude template to parse for flag composition, honoring precedence:
-/// a per-account *claude* command wins; an opaque account alias is skipped
-/// (handled verbatim for PTY, ignored for argv) and the global default is used.
-fn claude_template(cfg: &LaunchConfig) -> Option<String> {
+/// The launch config that applies to `spec`: the Claude account templates
+/// apply to a Claude launch only (module docs); any other CLI is launched
+/// without operator templates.
+fn applicable_config<'a>(spec: &LaunchSpec, cfg: &'a LaunchConfig) -> Option<&'a LaunchConfig> {
+    (spec.provider.id == claude::ID).then_some(cfg)
+}
+
+/// The template to parse for flag composition, honoring precedence: a
+/// per-account command of the launched CLI wins; an opaque account alias is
+/// skipped (handled verbatim for PTY, ignored for argv) and the global default
+/// is used.
+fn launch_template(spec: &LaunchSpec, cfg: &LaunchConfig) -> Option<String> {
+    let cfg = applicable_config(spec, cfg)?;
     if let Some(acct) = &cfg.account_command {
-        if is_claude_command(acct) {
+        if is_command_of(acct, spec.provider) {
             return Some(acct.clone());
         }
         // Opaque alias → fall through to the global default for compose.
     }
     if let Some(def) = &cfg.default_template {
         let trimmed = def.trim();
-        if !trimmed.is_empty() && is_claude_command(trimmed) {
+        if !trimmed.is_empty() && is_command_of(trimmed, spec.provider) {
             return Some(trimmed.to_string());
         }
     }
@@ -395,26 +546,54 @@ fn claude_template(cfg: &LaunchConfig) -> Option<String> {
 }
 
 /// The per-account override when it is an opaque alias (PTY returns it verbatim).
-fn pty_verbatim_alias(cfg: &LaunchConfig) -> Option<String> {
-    cfg.account_command
+fn pty_verbatim_alias(spec: &LaunchSpec, cfg: &LaunchConfig) -> Option<String> {
+    applicable_config(spec, cfg)?
+        .account_command
         .as_ref()
-        .filter(|a| !is_claude_command(a))
+        .filter(|a| !is_command_of(a, spec.provider))
         .cloned()
 }
 
-/// Whether `s` is a recognizable `claude …` invocation (vs. an opaque alias).
-/// Matches on the head token's basename, case-insensitively, `.exe`-stripped.
-fn is_claude_command(s: &str) -> bool {
-    let tokens = shell_tokenize(s.trim());
-    let Some(first) = tokens.first() else {
-        return false;
+/// Whether `s` is a recognizable invocation of `profile`'s CLI (vs. an opaque
+/// alias): its head token is one of the profile's programs
+/// ([`cli_profile::profile_for_program`] — basename, case-insensitive, a
+/// Windows launcher suffix tolerated).
+fn is_command_of(s: &str, profile: &CliProfile) -> bool {
+    shell_tokenize(s.trim())
+        .first()
+        .and_then(|head| cli_profile::profile_for_program(head))
+        .is_some_and(|p| p.id == profile.id)
+}
+
+/// The caller-authoritative permission flags for `mode` under `profile`
+/// ([`PermissionMode`]). Empty when the profile declares no auto-approval.
+fn permission_flags(profile: &CliProfile, mode: PermissionMode) -> Vec<String> {
+    let AutoApprove::Flags { argv, detect } = &profile.auto_approve else {
+        return Vec::new();
     };
-    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-    let base = base
-        .strip_suffix(".exe")
-        .or_else(|| base.strip_suffix(".EXE"))
-        .unwrap_or(base);
-    base.eq_ignore_ascii_case("claude")
+    match mode {
+        PermissionMode::BypassPermissions => argv.clone(),
+        PermissionMode::DangerouslySkip => detect
+            .first()
+            .map(|spelling| shell_tokenize(spelling))
+            .unwrap_or_else(|| argv.clone()),
+    }
+}
+
+/// Every flag NAME `profile` spells auto-approval with — the first token of
+/// its auto-approve argv and of each detect spelling, cut at `=`. A template
+/// flag with one of these names is dropped: permission is caller-owned.
+fn permission_flag_names(profile: &CliProfile) -> Vec<&str> {
+    let AutoApprove::Flags { argv, detect } = &profile.auto_approve else {
+        return Vec::new();
+    };
+    argv.first()
+        .map(String::as_str)
+        .into_iter()
+        .chain(detect.iter().filter_map(|d| d.split_whitespace().next()))
+        .map(|token| token.split_once('=').map_or(token, |(name, _)| name))
+        .filter(|name| name.starts_with('-'))
+        .collect()
 }
 
 /// Claude Code's two APPEND system-prompt flags, which behave as ONE
@@ -805,11 +984,14 @@ mod tests {
         let cfg = tmpl("claude --output-format stream-json");
         let argv = render_argv(&s, &cfg, "claude");
         let pty = render_pty_command(&s, &cfg, false);
-        // PTY head is bare `claude`; the remaining space-split tokens must equal
-        // argv[1..] (tokens here are space-free, so split round-trips).
+        // PTY head is bare `claude`, then the profile's PTY-only args; the
+        // remaining space-split tokens must equal argv[1..] (tokens here are
+        // space-free, so split round-trips).
         let pty_tokens: Vec<String> = pty.split(' ').map(String::from).collect();
+        let pty_only = pty_only_args(&s, &[]);
         assert_eq!(pty_tokens[0], "claude");
-        assert_eq!(&pty_tokens[1..], &argv[1..]);
+        assert_eq!(&pty_tokens[1..=pty_only.len()], &pty_only[..]);
+        assert_eq!(&pty_tokens[pty_only.len() + 1..], &argv[1..]);
     }
 
     #[test]
@@ -1026,6 +1208,31 @@ mod tests {
         );
     }
 
+    /// The Claude profile's PTY-only args (`--teammate-mode in-process`, Phase 2
+    /// probe Q4) lead every PTY launch, never the argv one, and never twice.
+    #[test]
+    fn pty_launch_carries_the_profile_pty_args_once() {
+        let pty = shell_tokenize(&render_pty_command(
+            &spec(),
+            &LaunchConfig::default(),
+            false,
+        ));
+        assert_eq!(&pty[..3], ["claude", "--teammate-mode", "in-process"]);
+        let argv = render_argv(&spec(), &LaunchConfig::default(), "claude");
+        assert!(!argv.iter().any(|a| a == "--teammate-mode"));
+
+        for template in ["claude --teammate-mode tmux", "claude --teammate-mode=tmux"] {
+            let pty = shell_tokenize(&render_pty_command(&spec(), &tmpl(template), false));
+            assert_eq!(
+                pty.iter()
+                    .filter(|a| a.starts_with("--teammate-mode"))
+                    .count(),
+                1,
+                "an operator's own choice is kept, not doubled: {pty:?}"
+            );
+        }
+    }
+
     #[test]
     fn pty_quotes_prompt_with_spaces() {
         let mut s = spec();
@@ -1069,7 +1276,8 @@ mod tests {
         assert_eq!(
             cmd,
             "$env:CLAUDE_CONFIG_DIR=\"C:\\claude\\.claude-hotmail\"; \
-             claude --permission-mode bypassPermissions --model opus --session-id abc"
+             claude --teammate-mode in-process \
+             --permission-mode bypassPermissions --model opus --session-id abc"
         );
     }
 
@@ -1083,7 +1291,8 @@ mod tests {
         assert_eq!(
             cmd,
             "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" \
-             claude --permission-mode bypassPermissions --session-id abc"
+             claude --teammate-mode in-process \
+             --permission-mode bypassPermissions --session-id abc"
         );
     }
 
@@ -1101,7 +1310,8 @@ mod tests {
         assert_eq!(
             cmd,
             "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" \
-             claude --permission-mode bypassPermissions --session-id abc --continue"
+             claude --teammate-mode in-process \
+             --permission-mode bypassPermissions --session-id abc --continue"
         );
     }
 
@@ -1124,6 +1334,135 @@ mod tests {
             !cmd.contains("abc"),
             "verbatim alias must not carry the pin"
         );
+    }
+
+    // ── Profile-driven: a non-Claude CLI (Codex) ────────────────────────────
+
+    fn codex() -> &'static CliProfile {
+        cli_profile::profile_for(cli_profile::codex::ID).expect("codex profile")
+    }
+
+    /// A Codex launch reads every spelling from the Codex profile: its program,
+    /// its auto-approve flag, `CODEX_HOME` as the account variable — and no
+    /// pin, because Codex mints its own id.
+    #[test]
+    fn codex_pty_launch_reads_the_codex_profile_and_pins_nothing() {
+        let s = LaunchSpec {
+            provider: codex(),
+            config_dir: Some("/h/.codex-work".to_string()),
+            session_id: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(!s.pins_session_id());
+        assert_eq!(
+            render_pty_command(&s, &LaunchConfig::default(), false),
+            "CODEX_HOME=\"/h/.codex-work\" codex --dangerously-bypass-approvals-and-sandbox"
+        );
+        assert_eq!(
+            render_pty_command(&s, &LaunchConfig::default(), true),
+            "$env:CODEX_HOME=\"/h/.codex-work\"; codex --dangerously-bypass-approvals-and-sandbox"
+        );
+    }
+
+    /// The operator templates and account aliases are CLAUDE settings: a Codex
+    /// launch neither types a Claude alias nor layers a Claude template in.
+    #[test]
+    fn claude_launch_settings_never_reach_a_codex_launch() {
+        let cfg = LaunchConfig {
+            default_template: Some("claude --model opus --permission-mode acceptEdits".to_string()),
+            account_command: Some("clh".to_string()),
+        };
+        let s = LaunchSpec {
+            provider: codex(),
+            ..Default::default()
+        };
+        let cmd = render_pty_command(&s, &cfg, false);
+        assert_eq!(cmd, "codex --dangerously-bypass-approvals-and-sandbox");
+        // …while the same config still drives a Claude launch.
+        assert_eq!(render_pty_command(&spec(), &cfg, false), "clh");
+    }
+
+    /// `--name` is a Claude Code flag: a display name set on a Codex launch is
+    /// dropped, never typed at a CLI that has no such flag.
+    #[test]
+    fn display_name_is_claude_only() {
+        let s = LaunchSpec {
+            provider: codex(),
+            name: Some("worker-1".to_string()),
+            ..Default::default()
+        };
+        let argv = render_argv(&s, &LaunchConfig::default(), "codex");
+        assert!(!argv.iter().any(|a| a == "--name"), "{argv:?}");
+    }
+
+    /// Codex resumes positionally (`codex resume <id>`): the subcommand follows
+    /// the program, ahead of every flag; nothing is emitted as `--resume`.
+    #[test]
+    fn codex_resume_is_a_positional_subcommand_after_the_program() {
+        let id = "01a0ef49-1234-7abc-8def-0123456789ab";
+        let s = LaunchSpec {
+            provider: codex(),
+            resume_id: Some(id.to_string()),
+            model: Some("o3".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_argv(&s, &LaunchConfig::default(), "/usr/bin/codex"),
+            vec![
+                "/usr/bin/codex",
+                "resume",
+                id,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "o3",
+            ]
+        );
+        let pty = render_pty_command(&s, &LaunchConfig::default(), false);
+        assert!(pty.starts_with(&format!("codex resume {id} ")), "{pty}");
+        assert!(!pty.contains("--resume"));
+    }
+
+    /// Both permission modes come from the profile: Claude's two spellings are
+    /// its auto-approve argv and its single-flag detect form.
+    #[test]
+    fn permission_modes_read_the_profile_spellings() {
+        let claude = &*claude::PROFILE;
+        assert_eq!(
+            permission_flags(claude, PermissionMode::BypassPermissions),
+            vec!["--permission-mode", "bypassPermissions"]
+        );
+        assert_eq!(
+            permission_flags(claude, PermissionMode::DangerouslySkip),
+            vec!["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            permission_flags(codex(), PermissionMode::DangerouslySkip),
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        // A profile that declares no auto-approval renders no permission flag.
+        let mut none = codex().clone();
+        none.auto_approve = AutoApprove::Unknown;
+        assert!(permission_flags(&none, PermissionMode::BypassPermissions).is_empty());
+        assert!(permission_flag_names(&none).is_empty());
+        assert_eq!(
+            permission_flag_names(claude),
+            vec![
+                "--permission-mode",
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "--permission-mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_claude_spec_pins_unless_it_resumes() {
+        let mut s = spec();
+        assert!(!s.pins_session_id());
+        s.session_id = Some("sid".to_string());
+        assert!(s.pins_session_id());
+        s.resume_id = Some("rid".to_string());
+        assert!(!s.pins_session_id());
     }
 
     #[test]

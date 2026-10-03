@@ -2302,7 +2302,9 @@ impl TerminalSession {
                 // `swap` reports whether a runner-initiated close (`close_inner`
                 // / `close_kill_only`) had already cleared `is_alive` before its
                 // kill — in which case the exit code is the KILL's, not the
-                // agent's (see `on_exit_hook_code`).
+                // agent's (see `on_exit_hook_code`). A flag still set here means
+                // the child went on its own — the only kind of exit that can be
+                // a failure.
                 let runner_initiated = mark_exited_was_runner_initiated(&waiter_alive);
                 let exit_facts = PaneExitFacts {
                     code,
@@ -2313,6 +2315,18 @@ impl TerminalSession {
                 }
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
+
+                // The exit is a failure SIGNAL for the AI session this pane
+                // hosted, classified and acted on by the one recovery table
+                // (plan 2026-09-20-ai-session-handling-is-claude-shaped,
+                // Phase 7). Reported BEFORE the exit notice below, because the
+                // frontend closes the session's lifecycle row on that notice
+                // and the recovery needs the row.
+                crate::session::failure_recovery::report_pty_exit(
+                    &waiter_id,
+                    code,
+                    runner_initiated,
+                );
 
                 // "The child process ended" — the Tauri event plus its WS
                 // re-broadcast. NOT the only notice a pane sends: the
@@ -2584,15 +2598,37 @@ impl TerminalSession {
     }
 
     pub(crate) fn caller_pinned_config_dir(extra_env: Option<&[(String, String)]>) -> Option<&str> {
+        let var = Self::account_env_var()?;
         extra_env?
             .iter()
-            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .find(|(k, _)| k == var)
             .map(|(_, v)| v.as_str())
             .filter(|v| !v.trim().is_empty())
     }
 
+    /// The environment variable that selects a PTY child's account: the Claude
+    /// Code profile's [`AccountIsolation::EnvVar`]
+    /// (`qontinui_runner_lib::cli_profile::account_env_var`), because the
+    /// runner's account roster is a roster of Claude config dirs. `None` only if
+    /// that profile stopped declaring one, in which case no account is pinned.
+    ///
+    /// [`AccountIsolation::EnvVar`]: qontinui_types::cli_session::AccountIsolation::EnvVar
+    fn account_env_var() -> Option<&'static str> {
+        use qontinui_runner_lib::cli_profile;
+        cli_profile::account_env_var(&cli_profile::claude::PROFILE)
+    }
+
+    /// Environment variables naming the RUNNER's own tmux pane. A PTY child is
+    /// not in that pane, but a tmux-aware program that finds them acts on the
+    /// operator's tmux window anyway — Claude Code's agent teams split it
+    /// (plan
+    /// `2026-09-20-ai-session-handling-is-claude-shaped-provider-manifest-and-failure-taxonomy`,
+    /// Phase 2 probe Q4, 2.1.285 on Linux). Removed from every PTY child.
+    const INHERITED_TMUX_ENV: &[&str] = &["TMUX", "TMUX_PANE"];
+
     /// The final env mutations applied to a PTY child before it is spawned:
-    /// the resolved-account pin, then the credential-value scrub.
+    /// the resolved-account pin, the inherited-tmux strip, the temp root, then
+    /// the credential-value scrub.
     ///
     /// **Why the scrub is last.** Same class as the `CLAUDECODE` /
     /// `CLAUDE_CHILD_SESSION_ENV` strips in [`Self::apply_base_child_env`], but for
@@ -2624,9 +2660,18 @@ impl TerminalSession {
         caller_pinned_config_dir: bool,
     ) {
         if !caller_pinned_config_dir {
-            if let Some(config_dir) = effective_claude_config_dir {
-                cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+            if let (Some(config_dir), Some(var)) =
+                (effective_claude_config_dir, Self::account_env_var())
+            {
+                cmd.env(var, config_dir);
             }
+        }
+
+        // The runner's own tmux pane is not the child's — see
+        // `INHERITED_TMUX_ENV`. Every PTY child, not only a directly-spawned CLI:
+        // a CLI typed into a shell pane inherits the shell's environment.
+        for var in Self::INHERITED_TMUX_ENV {
+            cmd.env_remove(var);
         }
 
         Self::apply_session_temp_root(cmd, effective_claude_config_dir);
@@ -2767,12 +2812,12 @@ impl TerminalSession {
         // the ONLY thing that can carry that intent, for exactly the reason
         // above.
 
-        // The account in force is whatever CLAUDE_CONFIG_DIR ends up being --
-        // the caller's pin when there is one, the resolved dir otherwise.
+        // The account in force is whatever the account env var ends up being
+        // -- the caller's pin when there is one, the resolved dir otherwise.
         // Reading it back off `cmd` covers both without restating the
         // precedence rule its caller already applied.
-        let config_dir: String = match cmd
-            .get_env("CLAUDE_CONFIG_DIR")
+        let config_dir: String = match Self::account_env_var()
+            .and_then(|var| cmd.get_env(var))
             .and_then(|v| v.to_str())
             .map(|s| s.to_string())
             .or_else(|| effective_claude_config_dir.map(|s| s.to_string()))
@@ -2978,7 +3023,7 @@ impl TerminalSession {
     ///
     /// The resume forms are NOT optional extras: the account-migration respawn
     /// ([`crate::terminal::account_migration`]) composes its argv through
-    /// [`crate::claude_session::launch_spec::render_argv`], which renders
+    /// [`crate::session::launch_spec::render_argv`], which renders
     /// `--resume <id>` and DROPS `--session-id`. Without them this function
     /// returned `None` for that whole class and the seam minted a fresh uuid no
     /// process ever ran under — an authoritative row unconfirmable by
@@ -2993,14 +3038,24 @@ impl TerminalSession {
     /// flag, the RESUME id wins, because that is the id the launched process
     /// will actually run under. This mirrors `launch_spec::render_argv` step 3
     /// ("Session — … resume takes precedence over session-id",
-    /// `claude_session/launch_spec.rs:225-235`), which emits `--resume` and
+    /// `session/launch_spec.rs` `compose_flags` step 3), which emits `--resume` and
     /// omits `--session-id` when both are specified. Getting this backwards
     /// would re-introduce the phantom for that argv shape.
     fn explicit_session_id_from(cmd: &CommandBuilder) -> Option<String> {
+        use qontinui_runner_lib::cli_profile;
         let argv = cmd.get_argv();
-        // The ambiguous SHORT form only when the child IS claude — see
-        // `argv_head_is_claude`.
-        let allow_short_r = Self::argv_head_is_claude(argv);
+        // The id flags come from the child's CLI profile — see `argv_profile`.
+        // A head no profile claims still has every profile's LONG flags read
+        // (they are unambiguous), but never a short alias: `-r` is an
+        // extremely common unrelated short flag.
+        let flags: Vec<(&str, bool)> = match Self::argv_profile(argv) {
+            Some(profile) => cli_profile::id_flags(profile),
+            None => cli_profile::all()
+                .iter()
+                .flat_map(cli_profile::id_flags)
+                .filter(|(flag, _)| flag.starts_with("--"))
+                .collect(),
+        };
 
         let mut session_id: Option<String> = None;
         let mut resume_id: Option<String> = None;
@@ -3009,16 +3064,22 @@ impl TerminalSession {
         while let Some(arg) = it.next() {
             let s = arg.to_string_lossy();
             // `(is_resume, id)` for the flags that NAME an id; everything else
-            // (including `--continue` / `-c`) falls through unmatched.
-            let matched = if let Some(rest) = s.strip_prefix("--session-id") {
-                Self::flag_id_value(rest, &mut it).map(|v| (false, v))
-            } else if let Some(rest) = s.strip_prefix("--resume") {
-                Self::flag_id_value(rest, &mut it).map(|v| (true, v))
-            } else if s.as_ref() == "-r" && allow_short_r {
-                Self::flag_id_value("", &mut it).map(|v| (true, v))
-            } else {
-                None
-            };
+            // (including `--continue` / `-c`) falls through unmatched. A long
+            // flag also matches its attached `--flag=<id>` form; a short alias
+            // only as a whole token.
+            let matched = flags.iter().find_map(|&(flag, is_resume)| {
+                let rest = if flag.starts_with("--") {
+                    s.strip_prefix(flag)?
+                } else if s.as_ref() == flag {
+                    ""
+                } else {
+                    return None;
+                };
+                Some((is_resume, rest))
+            });
+            let matched = matched.and_then(|(is_resume, rest)| {
+                Self::flag_id_value(rest, &mut it).map(|v| (is_resume, v))
+            });
             if let Some((is_resume, id)) = matched {
                 let slot = if is_resume {
                     &mut resume_id
@@ -3031,7 +3092,7 @@ impl TerminalSession {
             }
         }
 
-        // resume beats session-id (launch_spec.rs:225-235).
+        // resume beats session-id (`launch_spec::compose_flags` step 3).
         resume_id.or(session_id)
     }
 
@@ -3076,29 +3137,22 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
-    /// True when argv's head names the claude CLI image (basename compare,
-    /// tolerant of a path and a `.exe`/`.cmd`/`.bat` suffix).
+    /// The CLI profile argv's head names
+    /// ([`qontinui_runner_lib::cli_profile::profile_for_program`]: basename,
+    /// case-insensitive, tolerant of a path and a Windows launcher suffix), or
+    /// `None` for any other program (a shell, `cp`, a wrapper).
     ///
-    /// Gates the SHORT `-r` form only. `--session-id` / `--resume` are
-    /// unambiguous long flags, but `-r` is an extremely common unrelated short
-    /// flag (`cp -r`, `grep -r`, `ls -r`) and this seam builds a command for
+    /// Gates the SHORT resume aliases (`-r`) above. The long flags are
+    /// unambiguous, but `-r` is an extremely common unrelated short flag
+    /// (`cp -r`, `grep -r`, `ls -r`) and this seam builds a command for
     /// ARBITRARY direct spawns — an ungated `-r` could pin a path as a session
     /// id. This mirrors the identity shim, which reaches its own
-    /// `--session-id | --resume | -r | …` equivalence class
-    /// (`bin/qontinui_shim.rs::user_chose_session`) only after
-    /// `detect_identity_tool` has confirmed argv0 is claude/gemini.
-    fn argv_head_is_claude(argv: &[std::ffi::OsString]) -> bool {
-        let Some(head) = argv.first() else {
-            return false;
-        };
-        let lower = head.to_string_lossy().to_ascii_lowercase();
-        let base = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
-        let stem = base
-            .strip_suffix(".exe")
-            .or_else(|| base.strip_suffix(".cmd"))
-            .or_else(|| base.strip_suffix(".bat"))
-            .unwrap_or(base);
-        stem == "claude"
+    /// user-chose-session scan (`bin/qontinui_shim.rs::user_chose_session`) only
+    /// after `detect_identity_tool` has matched argv0 to a profile.
+    fn argv_profile(
+        argv: &[std::ffi::OsString],
+    ) -> Option<&'static qontinui_types::cli_session::CliProfile> {
+        qontinui_runner_lib::cli_profile::profile_for_program(&argv.first()?.to_string_lossy())
     }
 
     /// Install-interception env-seam (plan §4 Phase 1). Behind the master flag
@@ -3161,12 +3215,14 @@ impl TerminalSession {
     /// 1. Generate a per-terminal session UUID (`QONTINUI_PINNED_SESSION_ID`).
     /// 2. Inject it + `QONTINUI_TERMINAL_ID` + the bound loopback port into the
     ///    child env (the identity shim reads them to pin + confirm).
-    /// 3. Materialize the always-on `claude`/`gemini` identity shims and prepend
-    ///    their dir to `PATH` so a hand-started provider is pinned to the id.
+    /// 3. Materialize the always-on identity shims (`claude` pins, `codex`
+    ///    signals a read-back) and prepend their dir to `PATH`, so a
+    ///    hand-started CLI's session is identified.
     /// 4. Record the session AUTHORITATIVELY at spawn via
     ///    [`crate::commands::terminal::record_pinned_session_open`] — identity is
     ///    fixed with zero round-trip; the hook POST is confirmation/liveness
-    ///    only (§3b determinism mechanism).
+    ///    only (§3b determinism mechanism). Skipped when the launched CLI does
+    ///    not take a pinned id ([`Self::spawn_record_provider`]).
     ///
     /// Fail-open at every step: a materialize failure injects nothing (the
     /// terminal still spawns un-shimmed); a missing lifecycle store skips the
@@ -3363,25 +3419,36 @@ impl TerminalSession {
             let _span =
                 tracing::debug_span!("terminal_spawn.record_open", terminal_id = %terminal_id)
                     .entered();
-            crate::commands::terminal::record_pinned_session_open(
-                store.inner(),
-                pinned.clone(),
-                terminal_id.to_string(),
-                // The effective account dir placed into the PTY env — stamped
-                // authoritatively at spawn so restore is account-correct without
-                // waiting on the hook echo. The store normalizes empty→None.
-                config_dir,
-                cwd.to_string(),
-                title.to_string(),
-                page_id.to_string(),
-                0,
-                crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
-            );
-            info!(
-                terminal_id = %terminal_id,
-                session_id = %pinned,
-                "session-restore: session recorded authoritatively at spawn"
-            );
+            match Self::spawn_record_provider(Self::argv_profile(cmd.get_argv())) {
+                Some(provider) => {
+                    crate::commands::terminal::record_pinned_session_open(
+                        store.inner(),
+                        pinned.clone(),
+                        terminal_id.to_string(),
+                        // The effective account dir placed into the PTY env —
+                        // stamped authoritatively at spawn so restore is
+                        // account-correct without waiting on the hook echo. The
+                        // store normalizes empty→None.
+                        config_dir,
+                        cwd.to_string(),
+                        title.to_string(),
+                        page_id.to_string(),
+                        0,
+                        provider.to_string(),
+                    );
+                    info!(
+                        terminal_id = %terminal_id,
+                        session_id = %pinned,
+                        provider = %provider,
+                        "session-restore: session recorded authoritatively at spawn"
+                    );
+                }
+                None => info!(
+                    terminal_id = %terminal_id,
+                    "session-restore: the launched CLI does not take a pinned id — nothing \
+                     recorded at spawn; its identity shim's start signal drives the read-back"
+                ),
+            }
         }
 
         // The served-corpus measurement for the briefing's header line. Bounded
@@ -3399,6 +3466,31 @@ impl TerminalSession {
             coord_mcp,
             served,
         })
+    }
+
+    /// The provider the spawn-time record is stamped with, or `None` when the
+    /// pinned id cannot be the session's id and nothing may be recorded.
+    ///
+    /// - A directly-launched CLI whose profile PINS its id: that profile.
+    /// - A directly-launched CLI that does not (Codex reads its own id back,
+    ///   an unknown identity is unverified): `None`. The pin would name a
+    ///   session the CLI never runs under; the read-back records the real one.
+    /// - A shell pane (no CLI in argv): Claude. The pane's pinned id is
+    ///   speculative — it becomes a session id only when the Claude identity
+    ///   shim hands it to a hand-typed `claude` as `--session-id`, Claude being
+    ///   the only profile that pins. A Codex launch in the pane supersedes it
+    ///   (`session::codex_capture::record_captured_session`).
+    fn spawn_record_provider(
+        launched: Option<&'static qontinui_types::cli_session::CliProfile>,
+    ) -> Option<&'static str> {
+        use qontinui_types::cli_session::IdentitySource;
+        match launched {
+            None => Some(qontinui_runner_lib::cli_profile::claude::ID),
+            Some(profile) => match profile.identity {
+                IdentitySource::Pinned { .. } => Some(profile.id.as_str()),
+                IdentitySource::ReadBack { .. } | IdentitySource::Unknown => None,
+            },
+        }
     }
 
     /// Steps 1 + 2 of [`Self::apply_identity_seam`]: settle the session id
@@ -3613,13 +3705,13 @@ impl TerminalSession {
             return;
         };
         for line in completed {
-            if let Some(parsed) = super::claude_resume_sniff::parse_typed_claude_resume(&line) {
+            if let Some(parsed) = super::typed_resume_sniff::parse_typed_resume(&line) {
                 let title = self
                     .title
                     .lock()
                     .map(|g| g.clone())
                     .unwrap_or_else(|e| e.into_inner().clone());
-                super::claude_resume_sniff::spawn_register_typed_resume(
+                super::typed_resume_sniff::spawn_register_typed_resume(
                     app_handle.clone(),
                     self.id.clone(),
                     self.working_dir.clone(),
@@ -5073,6 +5165,26 @@ pub(crate) mod tests {
         );
     }
 
+    /// A runner launched from inside tmux must not hand its pane to a PTY
+    /// child: Claude Code's agent teams would split the operator's window
+    /// (Phase 2 probe Q4). Both variables go, whatever the child is.
+    #[test]
+    fn pty_finalize_child_env_strips_the_runners_tmux_pane() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env("TMUX", "/tmp/tmux-1000/default,1234,0");
+        cmd.env("TMUX_PANE", "%3");
+        cmd.env("TERM_PROGRAM", "tmux");
+
+        TerminalSession::finalize_child_env(&mut cmd, None, false);
+
+        assert_eq!(cmd.get_env("TMUX"), None);
+        assert_eq!(cmd.get_env("TMUX_PANE"), None);
+        assert!(
+            cmd.get_env("TERM_PROGRAM").is_some(),
+            "only the pane-addressing variables are stripped"
+        );
+    }
+
     /// The non-interactive git credential posture, asserted from the ONE shared
     /// list so this seam cannot drift from the other seven. Removing the
     /// `apply_non_interactive_git_env_*` call from the production function
@@ -5601,6 +5713,7 @@ pub(crate) mod tests {
         crate::terminal::graceful_exit::ClaudeProbe::Readable(
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: subtree.to_vec(),
+                provider: (!subtree.is_empty()).then(|| "claude".to_string()),
                 top_level_children: 0,
                 tracked_alive: alive.to_vec(),
             },
@@ -6900,6 +7013,24 @@ pub(crate) mod tests {
     fn pinned_session_id_accessor_reports_the_spawn_time_pin() {
         let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
         assert_eq!(session.pinned_session_id(), "test-pinned-session");
+    }
+
+    /// The spawn-time record is stamped with the launched CLI's provider only
+    /// when that CLI takes the pinned id; a read-back CLI records nothing.
+    #[test]
+    fn spawn_record_provider_follows_the_launched_profile_identity() {
+        use qontinui_runner_lib::cli_profile::{claude, codex, profile_for_program};
+        assert_eq!(TerminalSession::spawn_record_provider(None), Some(claude::ID));
+        assert_eq!(
+            TerminalSession::spawn_record_provider(profile_for_program("claude")),
+            Some(claude::ID)
+        );
+        assert_eq!(
+            TerminalSession::spawn_record_provider(profile_for_program("/usr/bin/codex")),
+            None,
+            "codex mints its own id; the pin is never its session id"
+        );
+        assert!(profile_for_program("codex").is_some_and(|p| p.id == codex::ID));
     }
 
     #[test]

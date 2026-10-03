@@ -37,17 +37,22 @@
 //! tests and `src/components/terminal/cliScreens.test.ts` read the same files).
 
 pub mod claude;
+pub mod codex;
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use qontinui_types::cli_session::{AccountIsolation, CliProfile, RestoreTier, ResumeSpec};
+use qontinui_types::cli_session::{
+    AccountIsolation, AutoApprove, CliProfile, GracefulExit, IdentitySource, RestoreTier,
+    ResumeSpec,
+};
 
 /// The placeholder a [`ResumeSpec::ByIdArgv`] template carries where the
 /// session id goes.
 pub const ID_PLACEHOLDER: &str = "{id}";
 
-static PROFILES: LazyLock<Vec<CliProfile>> = LazyLock::new(|| vec![claude::profile()]);
+static PROFILES: LazyLock<Vec<CliProfile>> =
+    LazyLock::new(|| vec![claude::PROFILE.clone(), codex::PROFILE.clone()]);
 
 /// Every profile the runner knows, in a stable order. This is exactly what the
 /// served routes return.
@@ -62,20 +67,29 @@ pub fn profile_for(id: &str) -> Option<&'static CliProfile> {
 }
 
 /// The profile whose [`CliProfile::programs`] contains `program`'s stem — the
-/// path's last component with a Windows `.exe` / `.cmd` suffix removed, compared
+/// path's last component, stripped of surrounding quotes and of a Windows
+/// launcher suffix (`.exe` / `.cmd` / `.bat` / `.ps1`), compared
 /// ASCII-case-insensitively (`claude`, `claude.exe`, `/usr/bin/claude`,
-/// `C:\bin\Claude.cmd`). `None` when no profile claims it.
+/// `C:\bin\Claude.cmd`, `"claude"`). `None` when no profile claims it.
 pub fn profile_for_program(program: &str) -> Option<&'static CliProfile> {
-    let stem = program_stem(program);
+    let stem = program_stem(program.trim_matches(|c| c == '"' || c == '\''));
     all()
         .iter()
         .find(|p| p.programs.iter().any(|s| s.eq_ignore_ascii_case(stem)))
 }
 
-/// `program` without its directory and without a trailing `.exe` / `.cmd`.
+/// Every program stem any profile claims, in profile order — the process-image
+/// names an AI-CLI census matches.
+pub fn all_programs() -> impl Iterator<Item = &'static str> {
+    all()
+        .iter()
+        .flat_map(|p| p.programs.iter().map(String::as_str))
+}
+
+/// `program` without its directory and without a trailing launcher suffix.
 fn program_stem(program: &str) -> &str {
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    for suffix in [".exe", ".cmd"] {
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
         let Some(cut) = base.len().checked_sub(suffix.len()) else {
             continue;
         };
@@ -87,6 +101,123 @@ fn program_stem(program: &str) -> &str {
         }
     }
     base
+}
+
+/// The flag that carries the id in `profile`'s by-id resume template — the
+/// token right before [`ID_PLACEHOLDER`] (`--resume` for
+/// `["claude", "--resume", "{id}"]`). `None` when the profile declares no by-id
+/// resume, or when its template takes the id positionally (`codex resume
+/// {id}`, where the token before it is a subcommand, not a flag).
+pub fn resume_flag(profile: &CliProfile) -> Option<&str> {
+    let ResumeSpec::ByIdArgv { template } = &profile.resume else {
+        return None;
+    };
+    let at = template.iter().position(|arg| arg == ID_PLACEHOLDER)?;
+    let flag = template.get(at.checked_sub(1)?)?;
+    flag.starts_with('-').then_some(flag.as_str())
+}
+
+/// The flag with which the runner pins `profile`'s session id at launch
+/// (`--session-id`), when its identity is [`IdentitySource::Pinned`].
+pub fn pin_flag(profile: &CliProfile) -> Option<&str> {
+    match &profile.identity {
+        IdentitySource::Pinned { flag } => Some(flag.as_str()),
+        IdentitySource::ReadBack { .. } | IdentitySource::Unknown => None,
+    }
+}
+
+/// Every flag that names a session id on one of `profile`'s launches, each with
+/// whether it RESUMES that id (`true`) or pins a fresh one (`false`): the pin
+/// flag, the resume flag, then the resume flag's aliases. A launch carrying
+/// both a resume and a pin runs under the resumed id.
+pub fn id_flags(profile: &CliProfile) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    if let Some(flag) = pin_flag(profile) {
+        out.push((flag, false));
+    }
+    if let Some(flag) = resume_flag(profile) {
+        out.push((flag, true));
+    }
+    out.extend(
+        profile
+            .resume_flag_aliases
+            .iter()
+            .map(|alias| (alias.as_str(), true)),
+    );
+    out
+}
+
+/// Whether `command` (a whole command line, or an argv joined with spaces)
+/// already runs `profile` without approval prompts: it contains one of the
+/// profile's [`AutoApprove::Flags`] `detect` spellings. `false` for a profile
+/// that declares no auto-approval (or none known).
+pub fn implies_auto_approve(profile: &CliProfile, command: &str) -> bool {
+    match &profile.auto_approve {
+        AutoApprove::Flags { detect, .. } => detect
+            .iter()
+            .any(|token| !token.is_empty() && command.contains(token.as_str())),
+        AutoApprove::None | AutoApprove::Unknown => false,
+    }
+}
+
+/// [`implies_auto_approve`] against every known profile. For a command whose
+/// CLI is not known in advance (a spawn argv, possibly wrapped in a shell
+/// string), where any profile's auto-approve spelling means the same thing.
+pub fn command_implies_auto_approve(argv: &[String]) -> bool {
+    let joined = argv.join(" ");
+    all().iter().any(|p| implies_auto_approve(p, &joined))
+}
+
+/// The text the runner types to exit a live session of `profile` cleanly, or
+/// why it must type nothing. Only [`GracefulExit::TypedCommand`] yields text: a
+/// [`GracefulExit::Signal`] exit is not something a typed-input exit can
+/// deliver, and [`GracefulExit::Unknown`] means nobody has verified what exits
+/// this CLI — typing a guess into a live session is never safe.
+pub fn graceful_exit_text(profile: &CliProfile) -> Result<&str, String> {
+    match &profile.graceful_exit {
+        GracefulExit::TypedCommand { text } if !text.is_empty() => Ok(text.as_str()),
+        GracefulExit::TypedCommand { .. } => Err(format!(
+            "the {} profile declares an empty exit command",
+            profile.display_name
+        )),
+        GracefulExit::Signal => Err(format!(
+            "the {} profile exits by signal, which a typed graceful exit cannot send",
+            profile.display_name
+        )),
+        GracefulExit::Unknown => Err(format!(
+            "the {} profile has no verified graceful exit (graceful_exit: unknown)",
+            profile.display_name
+        )),
+    }
+}
+
+/// The environment variable that selects `profile`'s account, when its
+/// isolation is [`AccountIsolation::EnvVar`] (`CLAUDE_CONFIG_DIR`).
+pub fn account_env_var(profile: &CliProfile) -> Option<&str> {
+    match &profile.account_isolation {
+        AccountIsolation::EnvVar { name } => Some(name.as_str()),
+        AccountIsolation::HomeDir | AccountIsolation::None | AccountIsolation::Unknown => None,
+    }
+}
+
+/// Whether `args` show the user choosing `profile`'s session themselves — any
+/// id flag ([`id_flags`]) or [`CliProfile::session_choice_args`] token, as a
+/// whole argv entry compared case-insensitively; a `--long` token also matches
+/// its `--long=…` spelling. A launch that does is never pinned to an id of the
+/// runner's own.
+pub fn user_chose_session(profile: &CliProfile, args: &[String]) -> bool {
+    let tokens: Vec<&str> = id_flags(profile)
+        .into_iter()
+        .map(|(flag, _)| flag)
+        .chain(profile.session_choice_args.iter().map(String::as_str))
+        .collect();
+    args.iter().any(|arg| {
+        let name = match arg.split_once('=') {
+            Some((name, _)) if name.starts_with("--") => name,
+            _ => arg.as_str(),
+        };
+        tokens.iter().any(|t| t.eq_ignore_ascii_case(name))
+    })
 }
 
 /// The argv that resumes `session_id` under `profile`, or `None` when the
@@ -140,6 +271,7 @@ mod tests {
     fn claude_resolves_by_id_and_unknown_providers_resolve_to_none() {
         let p = profile_for("claude").expect("claude profile");
         assert_eq!(p.id, claude::ID);
+        assert_eq!(profile_for("codex").map(|p| p.id.as_str()), Some(codex::ID));
         assert!(profile_for("gemini").is_none());
         assert!(profile_for("totally-new").is_none());
         assert!(profile_for("").is_none());
@@ -165,6 +297,17 @@ mod tests {
         }
         for program in [
             "codex",
+            "codex.exe",
+            "/usr/local/bin/codex",
+            r"C:\Users\u\AppData\Roaming\npm\codex.cmd",
+        ] {
+            assert_eq!(
+                profile_for_program(program).map(|p| p.id.as_str()),
+                Some("codex"),
+                "{program}"
+            );
+        }
+        for program in [
             "gemini",
             "claude-code",
             "bash",
@@ -174,6 +317,147 @@ mod tests {
         ] {
             assert!(profile_for_program(program).is_none(), "{program}");
         }
+    }
+
+    #[test]
+    fn program_lookup_strips_quotes_and_every_windows_launcher_suffix() {
+        for program in ["\"claude\"", "'claude'", "claude.bat", "Claude.PS1"] {
+            assert_eq!(
+                profile_for_program(program).map(|p| p.id.as_str()),
+                Some("claude"),
+                "{program}"
+            );
+        }
+        assert!(all_programs().any(|p| p == "claude"));
+    }
+
+    #[test]
+    fn id_flags_come_from_the_identity_resume_and_alias_facts() {
+        let p = profile_for("claude").unwrap();
+        assert_eq!(pin_flag(p), Some("--session-id"));
+        assert_eq!(resume_flag(p), Some("--resume"));
+        assert_eq!(
+            id_flags(p),
+            vec![("--session-id", false), ("--resume", true), ("-r", true)]
+        );
+        // A positional id (`codex resume {id}`) has no resume FLAG.
+        let mut positional = p.clone();
+        positional.resume = ResumeSpec::ByIdArgv {
+            template: vec!["codex".into(), "resume".into(), "{id}".into()],
+        };
+        positional.identity = IdentitySource::Unknown;
+        positional.resume_flag_aliases.clear();
+        assert_eq!(resume_flag(&positional), None);
+        assert!(id_flags(&positional).is_empty());
+    }
+
+    /// The Codex profile through every lookup: read-back identity (no pin, no
+    /// resume flag), a positional resume, terminal-only restore while resume
+    /// continuity is unknown, and no typed exit to send.
+    #[test]
+    fn codex_profile_lookups_follow_its_read_back_facts() {
+        let p = profile_for(codex::ID).unwrap();
+        assert_eq!(pin_flag(p), None);
+        assert_eq!(resume_flag(p), None);
+        assert!(id_flags(p).is_empty());
+        assert!(matches!(
+            &p.identity,
+            IdentitySource::ReadBack { capture } if capture == codex::CAPTURE_SESSION_FILE
+        ));
+        // Ids are UUIDv7 — the template takes whatever id it is handed.
+        let v7 = "01a0ef49-1234-7abc-8def-0123456789ab";
+        assert_eq!(
+            resume_argv(p, v7).unwrap(),
+            vec!["codex", "resume", v7]
+        );
+        assert_eq!(restore_tier(p), RestoreTier::TerminalOnly);
+        assert_eq!(account_env_var(p), Some("CODEX_HOME"));
+        assert!(graceful_exit_text(p).is_err());
+        assert!(implies_auto_approve(
+            p,
+            "codex --dangerously-bypass-approvals-and-sandbox"
+        ));
+        assert!(implies_auto_approve(p, "codex resume x --ask-for-approval never"));
+        assert!(!implies_auto_approve(p, "codex --ask-for-approval on-request"));
+        let args = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(user_chose_session(p, &args(&["resume", "--last"])));
+        assert!(!user_chose_session(p, &args(&["--model", "o3"])));
+        // No handshake markers are claimed for an unauthenticated probe.
+        let hp = &p.handshake;
+        assert!(hp.success.is_empty() && hp.failure.is_empty());
+        assert!(hp.success_regex.is_empty() && hp.failure_regex.is_empty());
+    }
+
+    #[test]
+    fn auto_approve_detection_reads_the_profile_spellings() {
+        let p = profile_for("claude").unwrap();
+        assert!(implies_auto_approve(
+            p,
+            "claude --dangerously-skip-permissions"
+        ));
+        assert!(implies_auto_approve(
+            p,
+            "claude --permission-mode bypassPermissions --resume x"
+        ));
+        assert!(!implies_auto_approve(p, "claude --permission-mode default"));
+        let argv = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(command_implies_auto_approve(&argv(&[
+            "claude",
+            "--permission-mode",
+            "bypassPermissions",
+        ])));
+        assert!(!command_implies_auto_approve(&argv(&["bash", "-l"])));
+        let mut unknown = p.clone();
+        unknown.auto_approve = AutoApprove::Unknown;
+        assert!(!implies_auto_approve(
+            &unknown,
+            "claude --dangerously-skip-permissions"
+        ));
+    }
+
+    #[test]
+    fn graceful_exit_text_types_only_a_declared_command() {
+        let p = profile_for("claude").unwrap();
+        assert_eq!(graceful_exit_text(p), Ok("/exit"));
+        let mut other = p.clone();
+        for exit in [GracefulExit::Unknown, GracefulExit::Signal] {
+            other.graceful_exit = exit;
+            assert!(graceful_exit_text(&other).is_err());
+        }
+        other.graceful_exit = GracefulExit::TypedCommand {
+            text: String::new(),
+        };
+        assert!(graceful_exit_text(&other).is_err());
+    }
+
+    #[test]
+    fn user_chose_session_matches_whole_tokens_only() {
+        let p = profile_for("claude").unwrap();
+        let args = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        for tok in [
+            "--session-id",
+            "--SESSION-ID",
+            "--resume",
+            "-r",
+            "-R",
+            "--continue",
+            "-c",
+            "resume",
+            "--resume=abc",
+            "--session-id=abc",
+        ] {
+            assert!(user_chose_session(p, &args(&["-p", "hi", tok])), "{tok}");
+        }
+        for tok in [
+            "--session-id-ish",
+            "--continued",
+            "-cc",
+            "resume the work",
+            "-c=1",
+        ] {
+            assert!(!user_chose_session(p, &args(&[tok])), "{tok}");
+        }
+        assert_eq!(account_env_var(p), Some("CLAUDE_CONFIG_DIR"));
     }
 
     #[test]
