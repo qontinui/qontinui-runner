@@ -250,6 +250,36 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   (`Authorization: Bearer <nonce>` and the legacy `X-Coord-Mcp-Proxy-Key`), and
   replay it verbatim. The nonce is staged into a private header file, never
   argv, never stdout.
+- **A STDIO `.mcp.json` rides too** — the shape the runner now provisions,
+  `{"command": <python>, "args": [<…>/coord-mcp-shim.py, "--credential", <file>]}`.
+  The verbs ask the shim itself (`coord-mcp-shim.py --credential <file>
+  --print-door <outfile>`): it reads that credential file exactly as its own
+  rung 1 does — url normalised to `127.0.0.1`, only the allowlisted headers, a
+  non-loopback or provision-session url refused — writes the headers to a 0600
+  file inside this script's private temp dir for `curl -H @file`, and prints only
+  the url. One credential grammar, not a second copy in bash. The file is read
+  afresh by every call, so a rotated nonce does not kill the door.
+  `X-Coord-Caller-Session` is appended exactly as on the proxy path. Typed
+  failures, nothing sent: `STDIO_CREDENTIAL_UNUSABLE` (the shim refused the file,
+  or the `--credential` path is not a readable file, with its reason),
+  `STDIO_SHIM_FAILED` (the shim did not run — says nothing about the
+  credential), `AUTH_HEADER_STAGING_FAILED` (it ran but could not write its
+  header file, exit 4 — a local write fault), `STDIO_SHIM_PARSER_ABSENT` (no reachable shim carries
+  `--print-door` — pull this repo), `STDIO_DOOR_NO_PYTHON` (no Python >= 3.6). When a
+  proxy-shaped `.mcp.json` sits ABOVE the stdio one, the verbs fall back to it,
+  as they did before, in exactly two cases: the stdio door cannot be opened (any
+  verdict above — nothing was sent), or the stdio request was provably **not
+  carried** — HTTP 401 (refused before dispatch, e.g. a stale credential) or a
+  curl connect failure (exit 6/7, no connection). That retry happens once, is
+  announced on stderr, and the proxy's outcome is the one reported. A carried
+  answer — any JSON-RPC result or error, another HTTP status, or a timeout — is
+  never retried, because the call may have reached a handler and a retry could
+  double a write. The shim run is the one this script resolves
+  for itself (the fleet config checkout's `scripts/`), **never** the
+  path the `.mcp.json` entry names — that file comes from whatever repo `$PWD`
+  is in. Stated limit: the skill's `_scripts/` render does not carry the shim
+  yet, so a device with no checkout reads `STDIO_SHIM_PARSER_ABSENT`. Plan
+  `2026-10-01-coord-revive-call-cannot-ride-a-stdio-shim-mcp-json`.
 - **They NEVER mint.** `POST /coord-mcp/provision-session` re-provisions this
   workdir+terminal's key and evicts the live peer's binding — the failure class
   Phase 1a of that plan exists to end. The cascade's own mint (L4 source 3) is
@@ -263,8 +293,9 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   the nonce came from. `0` the tool answered; `3` the tool answered with a
   JSON-RPC **error** (printed verbatim on stderr — that is *its* answer, the
   door carried the call); `1` the door did not carry the call, with a typed
-  reason: `NO_PROXY_CONFIG` (no provisioned nonce on the walk up — a statement
-  about this filesystem), `COORD_MCP_PROXY_UNAUTHORIZED` (below),
+  reason: `NO_PROXY_CONFIG` (neither a proxy-shaped nonce nor a stdio shim
+  entry naming `--credential` on the walk up — a statement about this
+  filesystem), the four `STDIO_*` verdicts above, `COORD_MCP_PROXY_UNAUTHORIZED` (below),
   `CONNECT_REFUSED` / `TIMEOUT` / the classifier's other verdicts; `4` usage
   (arguments must be ONE JSON **object**, parsed and refused locally before any
   request is sent).
@@ -1634,7 +1665,8 @@ evict a live peer and will not unlatch your client. Use
   **fallback**: the in-process invoke door is tried on every runner first,
   headless or not, and only a build that lacks the entry reaches the arm.
 - **The `call` / `tools` verbs never mint, and never print the nonce.** They
-  ride the caller's own `.mcp.json` key only; a missing one is
+  ride the caller's own `.mcp.json` key only (or, for a stdio shim entry, the
+  credential file it names, read by the shim's `--print-door`); a missing one is
   `NO_PROXY_CONFIG`, a rejected one is a 401 with its recovery named — never a
   `/coord-mcp/provision-session` mint, which would evict the live peer holding
   that workdir slot.
