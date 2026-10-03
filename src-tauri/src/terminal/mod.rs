@@ -27,6 +27,9 @@ pub mod scan_interval;
 pub mod session;
 pub mod transcript;
 pub mod transcript_watcher;
+#[cfg(test)]
+mod transport_cost;
+pub mod transport_stats;
 pub mod types;
 pub mod usage_limit;
 pub mod visibility;

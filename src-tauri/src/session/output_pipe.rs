@@ -69,14 +69,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::auth::TenantScope;
 
 use super::coord_sync::CoordSync;
-use super::redact::redact_secrets;
 
 /// Flush the coalescing buffer at least this often, even if it hasn't hit
 /// the byte threshold. Keeps live-tail latency low (sub-100ms) while still
@@ -156,12 +154,10 @@ async fn run_pipe(
             recv = rx.recv() => {
                 match recv {
                     Ok(encoded) => {
-                        match base64::engine::general_purpose::STANDARD
-                            .decode(encoded.as_bytes())
-                        {
+                        match crate::terminal::transport_stats::pipe_decode(&encoded) {
                             Ok(raw) => {
                                 let processed = if redact {
-                                    redact_secrets(&raw)
+                                    crate::terminal::transport_stats::pipe_redact(&raw)
                                 } else {
                                     raw
                                 };
@@ -257,7 +253,7 @@ async fn flush(
     if buffer.is_empty() {
         return;
     }
-    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&buffer[..]);
+    let payload_b64 = crate::terminal::transport_stats::pipe_reencode(&buffer[..]);
     let offset = *next_offset;
     let len = buffer.len() as i64;
     let body = serde_json::json!({

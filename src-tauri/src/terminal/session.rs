@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use super::transport_stats::{self, Leg};
 use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 
@@ -561,15 +561,15 @@ impl SyncFrameCoalescer {
 /// keeps its own offset-free payload.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalOutputWire<'a> {
-    terminal_id: &'a str,
-    data: &'a str,
+pub(super) struct TerminalOutputWire<'a> {
+    pub(super) terminal_id: &'a str,
+    pub(super) data: &'a str,
     /// Absolute byte offset of this chunk's first byte in the session's
     /// output stream (the value of `total_bytes_produced` before this chunk
     /// was teed). Lets the frontend dedup a scrollback-ring replay against
     /// live chunks — see `terminal_get_scrollback` and the frontend's
     /// `scrollbackReplay.ts`.
-    offset: u64,
+    pub(super) offset: u64,
 }
 
 /// Emit one `terminal-output` event to the webview.
@@ -585,7 +585,10 @@ fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offse
         data: encoded,
         offset,
     };
-    if let Err(e) = app.emit("terminal-output", &event) {
+    let started = Instant::now();
+    let emitted = app.emit("terminal-output", &event);
+    transport_stats::record_webview_emit(encoded, started.elapsed());
+    if let Err(e) = emitted {
         warn!(
             terminal_id = %terminal_id,
             error = %e,
@@ -1889,6 +1892,7 @@ impl TerminalSession {
                 // and (through them) the coord output pipe receive every chunk,
                 // in order, byte-identical, in every tier.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
+                    transport_stats::record_frame(payload.len());
                     let tier = reader_visibility.tier();
                     let sent = reader_bytes_sent.load(Ordering::Relaxed);
                     let acked = reader_bytes_acked.load(Ordering::Relaxed);
@@ -1926,19 +1930,29 @@ impl TerminalSession {
                     // does not need encoding here — one encode per flush
                     // window instead of one per chunk.
                     let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
-                        Some(STANDARD.encode(payload))
+                        Some(transport_stats::encode(payload))
                     } else {
                         None
                     };
+                    transport_stats::classify_encode(
+                        &reader_app,
+                        &reader_id,
+                        encoded.is_some(),
+                        admission == WebviewAdmission::Now,
+                        to_sse,
+                        to_ws,
+                    );
 
                     // Broadcast to HTTP/SSE subscribers (skipped when none —
                     // the `send` would drop the value anyway, and the clone is
                     // a full copy of the base64 payload).
                     if let (true, Some(encoded)) = (to_sse, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Sse, payload.len());
                         let _ = reader_output_tx.send(encoded.clone());
                     }
                     // Broadcast to backend relay for remote mobile access
                     if let (true, Some(encoded)) = (to_ws, encoded.as_ref()) {
+                        transport_stats::record_leg(Leg::Ws, payload.len());
                         crate::event_system::broadcast_ws_notification(
                             &reader_app,
                             "terminal-output",
@@ -1974,7 +1988,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -1985,7 +1999,7 @@ impl TerminalSession {
                                 emit_terminal_output(
                                     &reader_app,
                                     &reader_id,
-                                    &STANDARD.encode(&window),
+                                    &transport_stats::encode(&window),
                                     window_offset,
                                 );
                             }
@@ -2022,6 +2036,7 @@ impl TerminalSession {
                             break;
                         }
                         Ok(n) => {
+                            transport_stats::record_reader_chunk(n);
                             let data = interceptor.process(&reader_id, &buf[..n]);
 
                             // Tee processed output into the per-session
@@ -2144,7 +2159,7 @@ impl TerminalSession {
                         emit_terminal_output(
                             &reader_app,
                             &reader_id,
-                            &STANDARD.encode(&window),
+                            &transport_stats::encode(&window),
                             window_offset,
                         );
                     }
@@ -3821,7 +3836,7 @@ impl TerminalSession {
         };
         // Emit under the lock: it is this session's webview ordering point.
         if let Some((window, offset)) = taken {
-            emit_terminal_output(app, &self.id, &STANDARD.encode(&window), offset);
+            emit_terminal_output(app, &self.id, &transport_stats::encode(&window), offset);
         }
     }
 

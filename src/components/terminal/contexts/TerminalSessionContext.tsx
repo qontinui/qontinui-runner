@@ -107,6 +107,7 @@ import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
+import { noteDecode, transportClockStart } from "../transportStats";
 
 import { instanceStorage } from "@/lib/instance-storage";
 
@@ -642,7 +643,10 @@ const PageSessionScope = memo(function PageSessionScope({
       // Drop events for tabs this scope doesn't own (another page/window) or
       // doesn't know about — exactly one scope owns any given terminalId.
       if (!tabIdSetRef.current.has(tid)) return;
-      coalescer.push(tid, base64ToBytes(payload.data));
+      const decodeStart = transportClockStart();
+      const bytes = base64ToBytes(payload.data);
+      noteDecode("tap", decodeStart, bytes.length);
+      coalescer.push(tid, bytes);
       scheduleFlush();
     });
 

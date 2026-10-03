@@ -351,6 +351,9 @@ export function flattenRun(run) {
     put("chunks.webview_events_per_sec", chunks.webviewEventsPerSec);
     put("chunks.paints_per_webview_event", chunks.paintsPerWebviewEvent);
 
+    const derived = level.transport?.derived ?? {};
+    for (const [key, field] of TRANSPORT_METRICS) put(key, derived[field]);
+
     for (const [span, st] of Object.entries(level.spawnSpans ?? {})) {
       if (Number.isFinite(st?.p50)) flat[`${s}/spawn_spans/${span}.p50`] = st.p50;
       if (Number.isFinite(st?.p95)) flat[`${s}/spawn_spans/${span}.p95`] = st.p95;
@@ -510,6 +513,12 @@ export function renderSingleRun(run) {
     ),
   );
 
+  const transport = renderTransportSection(run);
+  if (transport) {
+    out.push("");
+    out.push(transport);
+  }
+
   const spanRows = [];
   for (const level of run.levels ?? []) {
     for (const [span, st] of Object.entries(level.spawnSpans ?? {})) {
@@ -655,4 +664,384 @@ export function foldChunkRates(backendDelta, frontend) {
     webviewEventsPerSec,
     paintsPerWebviewEvent,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Load generator presets
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+// Phase 1: the default generator (a PowerShell 20 Hz timestamp loop) is not the
+// load a `claude` TUI produces. The presets run `scripts/tui-repaint-generator.mjs`
+// under node instead — cross-platform, no PowerShell.
+
+/** The `--generator-preset` names the harness accepts. */
+export const GENERATOR_PRESETS = ["tui-repaint", "spinner"];
+
+/**
+ * Characters that are NOT literal inside a double-quoted argument in at least
+ * one shell a terminal may run: `"` ends the quote everywhere; `$` expands in
+ * PowerShell and POSIX shells; a backtick is PowerShell's escape and POSIX
+ * command substitution; `!` is interactive bash history expansion; `%` expands
+ * in cmd. The harness does not know which shell the terminal runs, so a path
+ * holding any of them is refused rather than quoted per shell.
+ */
+const UNQUOTABLE_PATH_CHARS = /["$`!%]/;
+
+/**
+ * Build the command line typed into each terminal for a generator preset.
+ *
+ * `node` is resolved from the terminal shell's PATH rather than spelled as an
+ * absolute exe path: a quoted exe path as the first token is a *string* in
+ * PowerShell (it needs `&`), while `node "<script>"` parses the same in
+ * PowerShell, cmd and POSIX shells — for a path free of
+ * {@link UNQUOTABLE_PATH_CHARS}, which is refused.
+ *
+ * @param {{preset:string, scriptPath:string, cols:number, rows:number, fps?:number}} opts
+ * @returns {string}
+ */
+export function buildGeneratorCommand({ preset, scriptPath, cols, rows, fps = 30 }) {
+  if (!GENERATOR_PRESETS.includes(preset)) {
+    throw new Error(
+      `unknown --generator-preset "${preset}" (expected one of: ${GENERATOR_PRESETS.join(", ")})`,
+    );
+  }
+  if (typeof scriptPath !== "string" || UNQUOTABLE_PATH_CHARS.test(scriptPath)) {
+    throw new Error(`generator script path cannot be quoted safely: ${scriptPath}`);
+  }
+  const args = [`--fps ${fps}`, `--cols ${cols}`, `--rows ${rows}`];
+  if (preset === "spinner") args.push("--spinner");
+  return `node "${scriptPath}" ${args.join(" ")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Transport counters (runner GET /terminals/transport-stats + the webview's
+// window.__qontinuiTransportStats)
+// ---------------------------------------------------------------------------
+
+/** Upper bounds of the runner's frame-size histogram; the 7th bucket is `> last`. */
+export const FRAME_SIZE_BOUNDS = [1024, 4096, 16384, 49152, 65536, 262144];
+/**
+ * The relay-truncation hazard: `devices_ws.py` cuts a `terminal_output` `data`
+ * string longer than 65 536 characters, i.e. any frame over 49 152 raw bytes
+ * once base64-encoded.
+ */
+export const RELAY_HAZARD_BYTES = 49152;
+
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+const num = (v) => (isNum(v) ? v : null);
+const ratio = (a, b) => (isNum(a) && isNum(b) && b > 0 ? a / b : null);
+const pct = (a, b) => {
+  const r = ratio(a, b);
+  return r === null ? null : r * 100;
+};
+
+/**
+ * Validate and unwrap a `GET /terminals/transport-stats` body. Accepts the bare
+ * document or the runner's `{success, data}` envelope. Returns null when the
+ * body does not carry the documented shape — a partial document is UNKNOWN,
+ * not zeros.
+ *
+ * @param {unknown} payload
+ * @returns {object|null}
+ */
+export function unwrapTransportStats(payload) {
+  let doc = payload;
+  if (doc && typeof doc === "object" && "success" in doc && "data" in doc) {
+    if (doc.success === false) return null;
+    doc = doc.data;
+  }
+  if (!doc || typeof doc !== "object") return null;
+  const ok =
+    isNum(doc.since_reset_ms) &&
+    isNum(doc.reader?.chunks) &&
+    isNum(doc.reader?.bytes) &&
+    isNum(doc.encode?.count) &&
+    isNum(doc.encode?.ns) &&
+    isNum(doc.encode?.waste) &&
+    // `encode.frame_count` (per-frame shared encodes — the waste-eligible
+    // population) is optional: a build without it leaves the waste % UNKNOWN.
+    (doc.encode.frame_count === undefined || isNum(doc.encode.frame_count)) &&
+    isNum(doc.legs?.webview?.emits) &&
+    isNum(doc.legs?.webview?.emit_ns) &&
+    Array.isArray(doc.frame_size_hist?.counts) &&
+    doc.frame_size_hist.counts.length === FRAME_SIZE_BOUNDS.length + 1;
+  return ok ? doc : null;
+}
+
+/**
+ * Count histogram frames strictly above `threshold` bytes. The threshold must
+ * be one of the bucket bounds, otherwise a bucket would straddle it.
+ *
+ * @param {{bounds?:number[], counts:number[]}} hist
+ * @param {number} threshold
+ * @returns {number|null}
+ */
+export function framesAbove(hist, threshold) {
+  const bounds = Array.isArray(hist?.bounds) ? hist.bounds : FRAME_SIZE_BOUNDS;
+  const counts = hist?.counts;
+  if (!Array.isArray(counts) || counts.length !== bounds.length + 1) return null;
+  const at = bounds.indexOf(threshold);
+  if (at < 0) return null;
+  let n = 0;
+  for (let i = at + 1; i < counts.length; i += 1) n += Number(counts[i]) || 0;
+  return n;
+}
+
+/**
+ * Normalize a `window.__qontinuiTransportStats` snapshot (as the in-page probe
+ * returns it). Null when the webview did not expose the object — a runner
+ * build that predates it — rather than zeros.
+ *
+ * @param {unknown} sample
+ * @returns {object|null}
+ */
+export function normalizeFrontendTransport(sample) {
+  if (!sample || typeof sample !== "object" || !sample.decodeNs) return null;
+  return {
+    sinceResetMs: num(sample.sinceResetMs),
+    decodeNs: { pane: num(sample.decodeNs?.pane), tap: num(sample.decodeNs?.tap) },
+    decodeCalls: { pane: num(sample.decodeCalls?.pane), tap: num(sample.decodeCalls?.tap) },
+    decodeBytes: { pane: num(sample.decodeBytes?.pane), tap: num(sample.decodeBytes?.tap) },
+    writeToRenderNs: num(sample.writeToRenderNs),
+    writeToRenderCount: num(sample.writeToRenderCount),
+    writeToRenderBytes: num(sample.writeToRenderBytes),
+    eventsDelivered: num(sample.eventsDelivered),
+    eventsForeign: num(sample.eventsForeign),
+    ringReplay: {
+      fetches: num(sample.ringReplay?.fetches),
+      bytesFetched: num(sample.ringReplay?.bytesFetched),
+      bytesWritten: num(sample.ringReplay?.bytesWritten),
+    },
+    // Phase 4 fills this; null = not probed.
+    rawIpc: typeof sample.rawIpc === "boolean" ? sample.rawIpc : null,
+    timingEnabled: typeof sample.enabled === "boolean" ? sample.enabled : null,
+  };
+}
+
+/**
+ * Decide whether the webview's IPC fell back from the custom protocol to
+ * `postMessage` during the probe window.
+ *
+ *  - `true`  — Tauri's flip warning was observed, or the hooked
+ *              `window.ipc.postMessage` was called (on desktop it is only
+ *              used after the flip);
+ *  - `false` — the hook was installed and saw no call while the page was
+ *              making IPC calls (a flip before the probe would route every
+ *              later call through it);
+ *  - `null`  — not determinable: `window.ipc.postMessage` could not be hooked
+ *              (frozen) and no warning was seen, which cannot exclude a flip
+ *              that happened before the probe was installed.
+ *
+ * @param {{fallbackWarned?:boolean, postMessageHooked?:boolean, postMessageCalls?:number}|null|undefined} ipc
+ * @returns {{postMessageFallback: boolean|null, method: string}}
+ */
+export function foldIpcFallback(ipc) {
+  if (!ipc || typeof ipc !== "object") {
+    return { postMessageFallback: null, method: "no probe sample" };
+  }
+  if (ipc.fallbackWarned) {
+    return { postMessageFallback: true, method: "Tauri flip warning observed" };
+  }
+  if (ipc.postMessageHooked) {
+    return isNum(ipc.postMessageCalls) && ipc.postMessageCalls > 0
+      ? { postMessageFallback: true, method: "window.ipc.postMessage called" }
+      : { postMessageFallback: false, method: "window.ipc.postMessage hooked, never called" };
+  }
+  return {
+    postMessageFallback: null,
+    method: "window.ipc.postMessage not hookable and no flip warning since probe install",
+  };
+}
+
+/**
+ * Fold one level's transport readings into the run document's `transport`
+ * block: the raw counters (backend + webview) plus the derived ratios the
+ * Phase 1 kill criteria are read from.
+ *
+ * `k1TransportSharePct` = (encode ns + webview emit ns + pane decode ns + tap
+ * decode ns) / (that + write→render ns). The encode term covers EVERY session
+ * while write→render covers only rendering panes, so the share is biased HIGH:
+ * a value under K1's 15 % is conclusive, one over it needs the per-focused-frame
+ * reading.
+ *
+ * @param {{backend?:object|null, backendError?:string|null, frontend?:object|null, frontendError?:string|null, ipc?:object|null, altScreen?:object|null}} input
+ * @returns {object}
+ */
+export function foldTransport(input) {
+  const backend = input?.backend ?? null;
+  const frontend = input?.frontend ?? null;
+  const derived = {};
+
+  if (backend) {
+    const secs = backend.since_reset_ms > 0 ? backend.since_reset_ms / 1000 : null;
+    const hist = backend.frame_size_hist;
+    const totalFrames = Array.isArray(hist?.counts)
+      ? hist.counts.reduce((a, b) => a + (Number(b) || 0), 0)
+      : null;
+    const overHazard = framesAbove(hist, RELAY_HAZARD_BYTES);
+    derived.readerBytesPerSec = secs ? backend.reader.bytes / secs : null;
+    derived.readerChunksPerSec = secs ? backend.reader.chunks / secs : null;
+    derived.encodeNsPerChunk = ratio(backend.encode.ns, backend.encode.count);
+    // Waste is only possible for per-frame shared encodes; `encode.count` also
+    // includes hold-window flush encodes, which can never be waste. So the
+    // denominator is `frame_count`, and without it the ratio is UNKNOWN — never
+    // silently divided by `count`.
+    derived.encodeFrameCount = num(backend.encode.frame_count);
+    derived.encodeWastePct = pct(backend.encode.waste, derived.encodeFrameCount);
+    derived.encodeInflation = ratio(backend.encode.bytes_out, backend.encode.bytes_in);
+    derived.webviewEmitNsPerEmit = ratio(backend.legs.webview.emit_ns, backend.legs.webview.emits);
+    derived.pipeNsPerChunk = ratio(
+      (num(backend.pipe?.decode_ns) ?? 0) +
+        (num(backend.pipe?.redact_ns) ?? 0) +
+        (num(backend.pipe?.reencode_ns) ?? 0),
+      num(backend.pipe?.chunks),
+    );
+    derived.framesOverRelayHazard = overHazard;
+    derived.framesOverRelayHazardPct = pct(overHazard, totalFrames);
+    derived.ringReplayBytesPerCall = ratio(
+      num(backend.ring_replay?.bytes),
+      num(backend.ring_replay?.calls),
+    );
+  }
+
+  if (frontend) {
+    const pane = frontend.decodeNs.pane;
+    const tap = frontend.decodeNs.tap;
+    derived.paneDecodeNsPerCall = ratio(pane, frontend.decodeCalls.pane);
+    derived.tapDecodeNsPerCall = ratio(tap, frontend.decodeCalls.tap);
+    derived.writeToRenderMsMean =
+      ratio(frontend.writeToRenderNs, frontend.writeToRenderCount) === null
+        ? null
+        : ratio(frontend.writeToRenderNs, frontend.writeToRenderCount) / 1e6;
+    derived.eventsForeignPct = pct(frontend.eventsForeign, frontend.eventsDelivered);
+    derived.ringReplayFetchToWriteRatio = ratio(
+      frontend.ringReplay.bytesFetched,
+      frontend.ringReplay.bytesWritten,
+    );
+  }
+
+  if (backend && frontend) {
+    const parts = [
+      backend.encode.ns,
+      backend.legs.webview.emit_ns,
+      frontend.decodeNs.pane,
+      frontend.decodeNs.tap,
+    ];
+    if (parts.every(isNum) && isNum(frontend.writeToRenderNs)) {
+      const transportNs = parts.reduce((a, b) => a + b, 0);
+      derived.k1TransportSharePct = pct(transportNs, transportNs + frontend.writeToRenderNs);
+    } else {
+      derived.k1TransportSharePct = null;
+    }
+  }
+
+  return {
+    backend,
+    backendError: input?.backendError ?? null,
+    frontend,
+    frontendError: input?.frontendError ?? null,
+    ipc: foldIpcFallback(input?.ipc),
+    altScreen: input?.altScreen ?? null,
+    derived,
+  };
+}
+
+/** Flattened transport keys → `derived` field, for `flattenRun` and the table. */
+export const TRANSPORT_METRICS = [
+  ["transport.reader_bytes_per_sec", "readerBytesPerSec"],
+  ["transport.encode_ns_per_chunk", "encodeNsPerChunk"],
+  ["transport.encode_waste_pct", "encodeWastePct"],
+  ["transport.encode_frame_count", "encodeFrameCount"],
+  ["transport.webview_emit_ns_per_emit", "webviewEmitNsPerEmit"],
+  ["transport.pipe_ns_per_chunk", "pipeNsPerChunk"],
+  ["transport.frames_over_relay_hazard_pct", "framesOverRelayHazardPct"],
+  ["transport.pane_decode_ns_per_call", "paneDecodeNsPerCall"],
+  ["transport.tap_decode_ns_per_call", "tapDecodeNsPerCall"],
+  ["transport.write_to_render_ms_mean", "writeToRenderMsMean"],
+  ["transport.events_foreign_pct", "eventsForeignPct"],
+  ["transport.ring_replay_fetch_to_write_ratio", "ringReplayFetchToWriteRatio"],
+  ["transport.k1_transport_share_pct", "k1TransportSharePct"],
+];
+
+Object.assign(METRIC_UNITS, {
+  "transport.reader_bytes_per_sec": { unit: "B/s", lowerIsBetter: false },
+  "transport.encode_ns_per_chunk": { unit: "ns", lowerIsBetter: true },
+  "transport.encode_waste_pct": { unit: "%", lowerIsBetter: true },
+  "transport.encode_frame_count": { unit: "", lowerIsBetter: true },
+  "transport.webview_emit_ns_per_emit": { unit: "ns", lowerIsBetter: true },
+  "transport.pipe_ns_per_chunk": { unit: "ns", lowerIsBetter: true },
+  "transport.frames_over_relay_hazard_pct": { unit: "%", lowerIsBetter: true },
+  "transport.pane_decode_ns_per_call": { unit: "ns", lowerIsBetter: true },
+  "transport.tap_decode_ns_per_call": { unit: "ns", lowerIsBetter: true },
+  "transport.write_to_render_ms_mean": { unit: "ms", lowerIsBetter: true },
+  "transport.events_foreign_pct": { unit: "%", lowerIsBetter: true },
+  "transport.ring_replay_fetch_to_write_ratio": { unit: "x", lowerIsBetter: true },
+  "transport.k1_transport_share_pct": { unit: "%", lowerIsBetter: true },
+});
+
+/**
+ * Render the per-level transport table, or an explicit "unavailable" line
+ * naming why — never an all-dash table that reads like zeros.
+ *
+ * @param {object} run
+ * @returns {string}
+ */
+export function renderTransportSection(run) {
+  const levels = (run?.levels ?? []).filter((l) => l.transport);
+  if (levels.length === 0) return "";
+  const out = ["#### Transport (`/terminals/transport-stats` + `__qontinuiTransportStats`)", ""];
+  const rows = levels.map((l) => {
+    const d = l.transport.derived ?? {};
+    const ipc = l.transport.ipc?.postMessageFallback;
+    const alt = l.transport.altScreen;
+    return [
+      String(l.sessions),
+      fmtNumber(d.readerBytesPerSec, 0),
+      fmtNumber(d.encodeNsPerChunk, 0),
+      fmtNumber(d.encodeFrameCount, 0),
+      fmtNumber(d.encodeWastePct),
+      fmtNumber(d.webviewEmitNsPerEmit, 0),
+      fmtNumber(d.framesOverRelayHazardPct),
+      fmtNumber(d.paneDecodeNsPerCall, 0),
+      fmtNumber(d.tapDecodeNsPerCall, 0),
+      fmtNumber(d.writeToRenderMsMean, 2),
+      fmtNumber(d.eventsForeignPct),
+      fmtNumber(d.ringReplayFetchToWriteRatio, 2),
+      fmtNumber(d.k1TransportSharePct),
+      ipc === true ? "YES" : ipc === false ? "no" : "?",
+      alt && isNum(alt.onAltScreen) ? `${alt.onAltScreen}/${alt.sampled}` : "?",
+    ];
+  });
+  out.push(
+    renderMarkdownTable(
+      [
+        "S",
+        "reader B/s",
+        "encode ns/chunk",
+        "frame encodes",
+        "waste % (of frame)",
+        "emit ns",
+        ">49152 %",
+        "pane dec ns",
+        "tap dec ns",
+        "write→render ms",
+        "foreign ev %",
+        "ring fetch/write",
+        "K1 share %",
+        "postMessage",
+        "alt screen",
+      ],
+      rows,
+    ),
+  );
+  for (const l of levels) {
+    if (l.transport.backendError) {
+      out.push(`- S${l.sessions}: runner counters UNAVAILABLE — ${l.transport.backendError}`);
+    }
+    if (l.transport.frontendError) {
+      out.push(`- S${l.sessions}: webview counters UNAVAILABLE — ${l.transport.frontendError}`);
+    }
+  }
+  return out.join("\n");
 }
