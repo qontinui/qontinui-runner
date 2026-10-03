@@ -947,6 +947,24 @@ fn submit_payload_of(report: &SanitizeReport) -> SubmitPayload {
     }
 }
 
+/// Describe an insert — the paste block alone, with no submitting CR.
+fn insert_payload_of(report: &SanitizeReport) -> SubmitPayload {
+    SubmitPayload {
+        bytes: BRACKETED_PASTE_BEGIN.len() + report.body.len() + BRACKETED_PASTE_END.len(),
+        sanitized: report.changed,
+    }
+}
+
+/// Which of the two prompt writes [`TerminalSession::paste_prompt`] serves —
+/// only the attribution log line differs between them.
+#[derive(Clone, Copy)]
+enum PromptOp {
+    /// [`TerminalSession::submit_prompt`]: paste, then a CR.
+    Submit,
+    /// [`TerminalSession::insert_prompt`]: paste only.
+    Insert,
+}
+
 /// WHO put bytes on a PTY — the caller tag every producer of
 /// [`TerminalSession::write`] and [`TerminalSession::submit_prompt`] passes.
 ///
@@ -982,6 +1000,10 @@ pub enum PtyWriteCaller {
     AutoResponse { rule_id: String },
     /// `claude_session::worker_session`'s sender.
     WorkerSession,
+    /// `POST /sessions/{id}/review/send` and `…/review/insert`
+    /// (`mcp/session_review.rs`) — the operator's composed review notes,
+    /// submitted as a turn or inserted as an unsent draft.
+    ReviewNotes,
     // ---- `write` producers ----------------------------------------------
     /// The Tauri `terminal_write` command — the pane's own keystrokes.
     TauriTerminalWrite,
@@ -1029,6 +1051,7 @@ impl PtyWriteCaller {
                 return Cow::Owned(format!("auto_response:{rule_id}"))
             }
             Self::WorkerSession => "worker_session",
+            Self::ReviewNotes => "review_notes",
             Self::TauriTerminalWrite => "tauri_terminal_write",
             Self::TauriInvokeProxy => "tauri_invoke_proxy",
             Self::RemoteTerminalInput => "remote_terminal_input",
@@ -2208,6 +2231,14 @@ impl TerminalSession {
                 // away, which is a different fact and the one that makes the
                 // webview drop the tab. See `terminal::exit_notice`.
                 TauriExitSink { app: &waiter_app }.emit_exit(&waiter_id, code);
+
+                // Review notes sent into this pane and not yet seen arriving in
+                // its transcript can no longer arrive: settle them `unknown`
+                // (never `confirmed` on a guess). Fire-and-forget.
+                crate::mcp::session_review::settle_on_terminal_exit(
+                    waiter_app.clone(),
+                    waiter_id.clone(),
+                );
 
                 // Push notification for mobile (fire-and-forget)
                 crate::commands::workflow_events::emit_terminal_exited(
@@ -3536,6 +3567,66 @@ impl TerminalSession {
         message: &str,
         caller: PtyWriteCaller,
     ) -> Result<SubmitPayload, String> {
+        let report = self.paste_prompt(message, caller, PromptOp::Submit)?;
+
+        // Sleep so Claude Code's readline can fully process the paste
+        // sequence BEFORE the submit byte arrives. Without this, the
+        // bracketed-paste handler consumes the trailing CR as paste-tail
+        // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
+        // reproduction. Sync sleep is acceptable here; callers
+        // (`claude_session/worker_message.rs::send_message_to_worker`) tolerate ~150ms
+        // blocking on the multi-threaded tokio runtime. Move to
+        // `tokio::task::spawn_blocking` if this ever goes hot-path.
+        std::thread::sleep(POST_PASTE_DELAY);
+
+        // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
+        // the writer lock; if the worker pty has been closed in the
+        // meantime, this Err propagates cleanly.
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+        writer
+            .write_all(SUBMIT_ENTER)
+            .map_err(|e| format!("Failed to write submit enter: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        // Both halves are on the wire, so this describes a write that really
+        // happened rather than one that was merely predicted.
+        Ok(submit_payload_of(&report))
+    }
+
+    /// Put `message` into a Claude-style prompt WITHOUT submitting it: the
+    /// same neutralized bracketed-paste block [`Self::submit_prompt`] writes,
+    /// and no trailing CR, so the text lands in the TUI's input box as a draft
+    /// the operator sends (or edits) themselves.
+    ///
+    /// Shares every gate of `submit_prompt` through [`Self::paste_prompt`] —
+    /// the liveness refusal, the body neutralizer, the rewrite warn and the
+    /// attribution `info!` (spelled `terminal insert_prompt`, so an inserted
+    /// draft is never mistaken for a submitted turn) — because an inserted
+    /// body is exactly as untrusted as a submitted one. The returned
+    /// [`SubmitPayload::bytes`] counts the paste block only.
+    pub fn insert_prompt(
+        &self,
+        message: &str,
+        caller: PtyWriteCaller,
+    ) -> Result<SubmitPayload, String> {
+        let report = self.paste_prompt(message, caller, PromptOp::Insert)?;
+        Ok(insert_payload_of(&report))
+    }
+
+    /// The half [`Self::submit_prompt`] and [`Self::insert_prompt`] share:
+    /// the liveness gate, the neutralizer, the two log lines, the paste-block
+    /// write and the input-slot record. Returns the sanitize report so the
+    /// caller can describe what it wrote.
+    fn paste_prompt(
+        &self,
+        message: &str,
+        caller: PtyWriteCaller,
+        op: PromptOp,
+    ) -> Result<SanitizeReport, String> {
         // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
         // directly rather than routing through `write`, so it does NOT inherit
         // that gate — without this, `POST /terminals/{id}/submit-prompt` and
@@ -3594,13 +3685,22 @@ impl TerminalSession {
         // body is untrusted and never logged; its length (matchable against a
         // transcript turn) and a short KEYED digest of the sanitized body (what
         // actually reaches the wire; see `short_body_hash`) are logged instead.
-        info!(
-            terminal_id = %self.id,
-            caller = %caller,
-            body_bytes = report.body.len(),
-            body_hmac_8 = %short_body_hash(&report.body),
-            "terminal submit_prompt"
-        );
+        match op {
+            PromptOp::Submit => info!(
+                terminal_id = %self.id,
+                caller = %caller,
+                body_bytes = report.body.len(),
+                body_hmac_8 = %short_body_hash(&report.body),
+                "terminal submit_prompt"
+            ),
+            PromptOp::Insert => info!(
+                terminal_id = %self.id,
+                caller = %caller,
+                body_bytes = report.body.len(),
+                body_hmac_8 = %short_body_hash(&report.body),
+                "terminal insert_prompt"
+            ),
+        }
 
         let block = paste_block_from_body(&report.body);
 
@@ -3621,9 +3721,9 @@ impl TerminalSession {
         } // writer lock released
 
         // The body is on the wire now, so this is an input event the PTY
-        // child can act on even if the trailing CR below fails — record it
-        // here rather than after the CR, or a half-written submit would read
-        // as "no input" to the phantom-turn detector.
+        // child can act on even if a submit's trailing CR then fails — record
+        // it here rather than after the CR, or a half-written submit would
+        // read as "no input" to the phantom-turn detector.
         self.record_input(
             PtyInputObservation {
                 caller,
@@ -3633,32 +3733,7 @@ impl TerminalSession {
             InputSlot::Submit,
         );
 
-        // Sleep so Claude Code's readline can fully process the paste
-        // sequence BEFORE the submit byte arrives. Without this, the
-        // bracketed-paste handler consumes the trailing CR as paste-tail
-        // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
-        // reproduction. Sync sleep is acceptable here; callers
-        // (`claude_session/worker_message.rs::send_message_to_worker`) tolerate ~150ms
-        // blocking on the multi-threaded tokio runtime. Move to
-        // `tokio::task::spawn_blocking` if this ever goes hot-path.
-        std::thread::sleep(POST_PASTE_DELAY);
-
-        // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
-        // the writer lock; if the worker pty has been closed in the
-        // meantime, this Err propagates cleanly.
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-        writer
-            .write_all(SUBMIT_ENTER)
-            .map_err(|e| format!("Failed to write submit enter: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-        // Both halves are on the wire, so this describes a write that really
-        // happened rather than one that was merely predicted.
-        Ok(submit_payload_of(&report))
+        Ok(report)
     }
 
     /// Resize the pane's viewport.
@@ -7317,6 +7392,34 @@ pub(crate) mod tests {
         assert_eq!(written, b"\x1b[200~hello\x1b[201~\r");
     }
 
+    /// The review send bar's "insert without sending": the same neutralized
+    /// paste block `submit_prompt` writes, and NO submitting CR — the text is a
+    /// draft in the TUI's input box, not a turn.
+    #[test]
+    fn insert_prompt_writes_the_neutralized_paste_block_and_no_cr() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        let payload = session
+            .insert_prompt("a\x1b[201~b", PtyWriteCaller::ReviewNotes)
+            .expect("insert_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        assert_eq!(written, b"\x1b[200~a[201~b\x1b[201~");
+        assert_eq!(payload.bytes, written.len());
+        assert!(payload.sanitized, "the embedded paste END was neutralized");
+    }
+
+    /// The insert shares submit's liveness gate: nothing reaches a dead PTY.
+    #[test]
+    fn insert_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        let err = session
+            .insert_prompt("draft", PtyWriteCaller::ReviewNotes)
+            .expect_err("insert_prompt to an exited pty must be refused");
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn submit_prompt_does_not_emit_lf() {
         // Regression guard: the Phase 6 §6 bug was that send_user_message
@@ -7423,6 +7526,7 @@ pub(crate) mod tests {
                 rule_id: "rule-7".to_string(),
             },
             PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::ReviewNotes,
             PtyWriteCaller::TauriTerminalWrite,
             PtyWriteCaller::TauriInvokeProxy,
             PtyWriteCaller::RemoteTerminalInput,
@@ -7454,6 +7558,7 @@ pub(crate) mod tests {
                 "session_message_poller",
                 "auto_response:rule-7",
                 "worker_session",
+                "review_notes",
                 "tauri_terminal_write",
                 "tauri_invoke_proxy",
                 "remote_terminal_input",

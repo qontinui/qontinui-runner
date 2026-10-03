@@ -149,6 +149,7 @@ pub mod session_compliance;
 pub mod session_message_poller;
 pub mod session_recap;
 pub mod session_repository;
+pub mod session_review;
 pub mod session_work_status;
 pub mod sessions;
 pub mod settings;

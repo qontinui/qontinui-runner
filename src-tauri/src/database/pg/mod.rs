@@ -71,6 +71,7 @@ pub mod scheduler;
 pub mod security_audit;
 pub mod session_file_snapshots;
 pub mod session_pr_ops;
+pub mod session_review;
 pub mod session_touched_files;
 pub mod settings;
 pub mod skills;
@@ -1151,6 +1152,15 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
+
+        // Operator review of a session's changes — read hunks and review
+        // notes. Plan
+        // `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`
+        // Phase 3. Runner-native `project.*` tables, NOT re-homed ones; see
+        // `session_review.rs`.
+        conn.batch_execute(session_review::SESSION_REVIEW_DDL)
+            .await
+            .map_err(|e| format!("session review schema self-heal failed: {}", e))?;
 
         // P3 of plan
         // `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`:

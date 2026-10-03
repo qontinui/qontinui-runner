@@ -782,16 +782,7 @@ pub fn read_user_prompts(
             Ok(v) => v,
             Err(_) => continue, // Skip malformed lines
         };
-        if record.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        if is_machine_authored_user_record(&record) {
-            continue;
-        }
-        // Reuse the shared extractor so this view and the transcript panel
-        // agree on what a record's text IS — they differ only in which
-        // records they keep.
-        if let Some(msg) = parse_user_record(&record) {
+        if let Some(msg) = operator_prompt_record(&record) {
             prompts.push(UserPromptRecord {
                 uuid: msg.uuid,
                 timestamp: msg.timestamp,
@@ -805,6 +796,31 @@ pub fn read_user_prompts(
         unchanged: false,
         prompts,
     })
+}
+
+/// The operator's own prompt in `record`, or `None` for anything else: a
+/// non-`user` record, a machine-authored `user` record
+/// ([`is_machine_authored_user_record`]), or one carrying no text (a bare
+/// `tool_result`). Reuses the shared extractor so the prompts view and the
+/// transcript panel agree on what a record's text IS — they differ only in
+/// which records they keep.
+fn operator_prompt_record(record: &serde_json::Value) -> Option<TranscriptMessage> {
+    if record.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    if is_machine_authored_user_record(record) {
+        return None;
+    }
+    parse_user_record(record)
+}
+
+/// [`operator_prompt_record`]'s text for ONE raw transcript line, as a live
+/// tail sees it. The review-note confirmation (`mcp::session_review`) reads
+/// prompts this way so it agrees with [`read_user_prompts`] — the read the
+/// Terminal page's prompts panel shows — about which lines are prompts.
+pub(crate) fn operator_prompt_text_of_line(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    operator_prompt_record(&record).map(|msg| msg.text)
 }
 
 /// True when a `user` record was written by the harness rather than typed by

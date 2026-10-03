@@ -12025,6 +12025,7 @@ pub fn create_router(
         .merge(crate::mcp::knowledge_acquisition_api::routes())
         .merge(crate::mcp::reviews::routes())
         .merge(crate::mcp::snapshots::routes())
+        .merge(crate::mcp::session_review::routes())
         .merge(crate::mcp::session_recap::routes())
         .merge(crate::mcp::api_surface::routes())
         .merge(crate::mcp::api_surface_diff::routes())

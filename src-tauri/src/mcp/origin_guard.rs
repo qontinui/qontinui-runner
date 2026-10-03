@@ -251,6 +251,12 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // transcript above. Bounded per file / per report, but a bound on volume is
     // not a bound on who may read it.
     "GET /sessions/{id}/file-changes",
+    // The operator's review of that same content: hunk read marks and notes
+    // whose excerpts quote it (local source content again), and the send /
+    // insert routes, which TYPE the composed review prompt into a live PTY or
+    // task-run session — the same capability as `POST /terminals/{id}/write`.
+    "GET /sessions/{id}/review",
+    "/sessions/{id}/review/*",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",
