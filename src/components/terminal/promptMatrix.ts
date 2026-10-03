@@ -29,16 +29,46 @@ import {
 export const DEFAULT_MAX_MEMBERS = 24;
 
 /**
- * Upper bound on one rendered prompt, in UTF-16 code units (JS `.length`).
+ * Upper bound on one rendered prompt, in UTF-8 BYTES.
  *
  * Phase 6 passes the prompt to `claude` as a positional argv element. Windows
  * caps a whole command line at 32,767 UTF-16 characters (`CreateProcessW`),
  * and that budget is shared with the executable path, `--session-id`,
- * `--settings` and every other flag, plus quoting/escaping growth. 24,000
- * leaves ~8 K of headroom for all of that. A prompt over this bound is a
- * typed row error, never a truncation.
+ * `--settings` and every other flag, plus quoting/escaping growth. The runner
+ * enforces exactly this bound at `POST /fanout` (`fanout/model.rs`
+ * `MAX_PROMPT_BYTES = 24 * 1024`, measured as Rust `str::len`, i.e. UTF-8
+ * bytes), so the preview measures the same unit: a JS `.length` (UTF-16 code
+ * units) under-counts any non-ASCII prompt and would let the preview pass a
+ * prompt the server then refuses. A prompt over this bound is a typed row
+ * error, never a truncation.
  */
-export const MAX_ARGV_PROMPT_CHARS = 24_000;
+export const MAX_PROMPT_BYTES = 24 * 1024;
+
+/**
+ * Hard ceiling on members the runner accepts in one run (`fanout/model.rs`
+ * `MAX_MEMBERS`). `DEFAULT_MAX_MEMBERS` is the preview's own, lower ceiling.
+ */
+export const SERVER_MAX_MEMBERS = 64;
+
+/** Longest member title, in characters, the runner accepts (`MAX_TITLE_CHARS`). */
+export const MAX_TITLE_CHARS = 200;
+
+const utf8 = new TextEncoder();
+
+/** UTF-8 byte length of `text` — the unit the runner's prompt bound counts. */
+export function utf8ByteLength(text: string): number {
+  return utf8.encode(text).length;
+}
+
+/**
+ * Trim the way the runner's Rust `str::trim` does for its blank checks: JS
+ * `trim()` does not strip U+0085 (NEL) and Rust does, so a NEL-only title
+ * would pass a JS-trimmed check and be refused by the server. (JS also strips
+ * U+FEFF, which Rust keeps — that only makes the preview stricter.)
+ */
+export function serverTrim(text: string): string {
+  return text.replace(/^[\s\u0085]+|[\s\u0085]+$/g, "");
+}
 
 /** Same placeholder grammar `renderPromptTemplate` substitutes. */
 const PLACEHOLDER_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
@@ -90,9 +120,21 @@ export type MatrixExpandResult =
   | { ok: true; members: MatrixMember[] }
   | { ok: false; error: MatrixExpandError };
 
+/**
+ * Row errors mirror the runner's `build_members` refusals one for one, so a
+ * row the preview passes is a row `POST /fanout` accepts.
+ */
 export type FanoutRowError =
-  /** The rendered prompt exceeds `MAX_ARGV_PROMPT_CHARS` (argv-unsafe). */
-  { kind: "prompt_too_long"; length: number; max: number };
+  /** The rendered prompt exceeds `MAX_PROMPT_BYTES` UTF-8 bytes (argv-unsafe). */
+  | { kind: "prompt_too_long"; bytes: number; max: number }
+  /** The rendered prompt is blank. */
+  | { kind: "empty_prompt" }
+  /** The rendered prompt contains a NUL, which no argv element can carry. */
+  | { kind: "prompt_contains_nul" }
+  /** The rendered title is blank after trimming. */
+  | { kind: "empty_title" }
+  /** The rendered title (trimmed) exceeds `MAX_TITLE_CHARS` characters. */
+  | { kind: "title_too_long"; length: number; max: number };
 
 export type FanoutRowWarning =
   /** The prompt body references no matrix axis, so every member gets the same prompt. */
@@ -271,15 +313,17 @@ function hasValue(values: PromptParamValues, name: string): boolean {
  *
  * When there is more than one member and the body references no matrix axis
  * (or every rendered prompt comes out identical anyway), every row carries an
- * `identical_prompts` warning. A prompt longer than `MAX_ARGV_PROMPT_CHARS`
- * is a `prompt_too_long` row error.
+ * `identical_prompts` warning. A prompt longer than `maxPromptBytes` UTF-8
+ * bytes is a `prompt_too_long` row error; a blank prompt, a NUL in the prompt,
+ * a blank title and an over-long title are row errors too, matching the
+ * runner's `POST /fanout` validation.
  */
 export function planFanout(
   template: FanoutTemplate,
   fixedValues: PromptParamValues,
   members: readonly MatrixMember[],
   titleTemplate: string,
-  maxPromptChars: number = MAX_ARGV_PROMPT_CHARS,
+  maxPromptBytes: number = MAX_PROMPT_BYTES,
 ): FanoutRow[] {
   const parameters: readonly PromptParameter[] = template.parameters ?? [];
   const declared = new Set(parameters.map((p) => p.name));
@@ -302,8 +346,17 @@ export function planFanout(
     }
 
     const errors: FanoutRowError[] = [];
-    if (prompt.length > maxPromptChars) {
-      errors.push({ kind: "prompt_too_long", length: prompt.length, max: maxPromptChars });
+    const bytes = utf8ByteLength(prompt);
+    if (bytes > maxPromptBytes) {
+      errors.push({ kind: "prompt_too_long", bytes, max: maxPromptBytes });
+    }
+    if (serverTrim(prompt).length === 0) errors.push({ kind: "empty_prompt" });
+    if (prompt.includes("\0")) errors.push({ kind: "prompt_contains_nul" });
+    const trimmedTitle = serverTrim(title);
+    const titleChars = Array.from(trimmedTitle).length;
+    if (titleChars === 0) errors.push({ kind: "empty_title" });
+    else if (titleChars > MAX_TITLE_CHARS) {
+      errors.push({ kind: "title_too_long", length: titleChars, max: MAX_TITLE_CHARS });
     }
 
     const warnings: FanoutRowWarning[] = [];

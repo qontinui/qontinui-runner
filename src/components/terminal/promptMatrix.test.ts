@@ -3,7 +3,11 @@ import { describe, expect, it } from "vitest";
 import type { PromptParameter } from "./promptLibraryApi";
 import {
   DEFAULT_MAX_MEMBERS,
-  MAX_ARGV_PROMPT_CHARS,
+  MAX_PROMPT_BYTES,
+  MAX_TITLE_CHARS,
+  SERVER_MAX_MEMBERS,
+  serverTrim,
+  utf8ByteLength,
   expandMatrix,
   parseMatrix,
   planFanout,
@@ -257,7 +261,7 @@ describe("planFanout", () => {
   });
 
   it("is a typed row error when a rendered prompt exceeds the argv bound", () => {
-    const long = "x".repeat(MAX_ARGV_PROMPT_CHARS);
+    const long = "x".repeat(MAX_PROMPT_BYTES);
     const rows = planFanout(
       { body: "{{blob}}{{platform}}", parameters: [] },
       { blob: long },
@@ -265,14 +269,68 @@ describe("planFanout", () => {
       "{{platform}}",
     );
     expect(rows[0].errors).toEqual([
-      { kind: "prompt_too_long", length: MAX_ARGV_PROMPT_CHARS + 3, max: MAX_ARGV_PROMPT_CHARS },
+      { kind: "prompt_too_long", bytes: MAX_PROMPT_BYTES + 3, max: MAX_PROMPT_BYTES },
     ]);
     // Not truncated.
-    expect(rows[0].prompt.length).toBe(MAX_ARGV_PROMPT_CHARS + 3);
+    expect(rows[0].prompt.length).toBe(MAX_PROMPT_BYTES + 3);
+  });
+
+  it("measures the prompt bound in UTF-8 bytes, not UTF-16 units", () => {
+    // "é" is 1 UTF-16 unit but 2 UTF-8 bytes: 13,000 of them is 13,000
+    // `.length` (under the bound) yet 26,000 bytes (over it) — the server
+    // counts bytes, so the preview must too.
+    const accented = "é".repeat(13_000);
+    expect(accented.length).toBeLessThan(MAX_PROMPT_BYTES);
+    expect(utf8ByteLength(accented)).toBe(26_000);
+    const rows = planFanout({ body: "{{blob}}", parameters: [] }, { blob: accented }, [{}], "t");
+    expect(rows[0].errors).toEqual([
+      { kind: "prompt_too_long", bytes: 26_000, max: MAX_PROMPT_BYTES },
+    ]);
+  });
+
+  it("accepts a prompt exactly at the byte bound", () => {
+    const rows = planFanout(
+      { body: "{{blob}}", parameters: [] },
+      { blob: "x".repeat(MAX_PROMPT_BYTES) },
+      [{}],
+      "t",
+    );
+    expect(rows[0].errors).toEqual([]);
   });
 
   it("keeps the argv bound below Windows' 32 KiB command-line limit", () => {
-    expect(MAX_ARGV_PROMPT_CHARS).toBeLessThan(32_767);
+    expect(MAX_PROMPT_BYTES).toBeLessThan(32_767);
+  });
+
+  it("keeps the preview member ceiling within the server's", () => {
+    expect(DEFAULT_MAX_MEMBERS).toBeLessThanOrEqual(SERVER_MAX_MEMBERS);
+  });
+
+  it("trims NEL the way the server's Rust trim does", () => {
+    expect(serverTrim("\u0085 a \u0085")).toBe("a");
+    const rows = planFanout({ body: "p", parameters: [] }, {}, [{}], "\u0085");
+    expect(rows[0].errors).toEqual([{ kind: "empty_title" }]);
+  });
+
+  it("mirrors the server's blank-prompt, NUL, blank-title and long-title refusals", () => {
+    const blank = planFanout({ body: "{{x}}", parameters: [] }, { x: "  " }, [{}], "t");
+    expect(blank[0].errors).toEqual([{ kind: "empty_prompt" }]);
+
+    const nul = planFanout({ body: "a\0b", parameters: [] }, {}, [{}], "t");
+    expect(nul[0].errors).toEqual([{ kind: "prompt_contains_nul" }]);
+
+    const noTitle = planFanout({ body: "p", parameters: [] }, {}, [{}], "  ");
+    expect(noTitle[0].errors).toEqual([{ kind: "empty_title" }]);
+
+    const longTitle = planFanout(
+      { body: "p", parameters: [] },
+      {},
+      [{}],
+      "t".repeat(MAX_TITLE_CHARS + 1),
+    );
+    expect(longTitle[0].errors).toEqual([
+      { kind: "title_too_long", length: MAX_TITLE_CHARS + 1, max: MAX_TITLE_CHARS },
+    ]);
   });
 
   it("warns on a title placeholder with no value", () => {
