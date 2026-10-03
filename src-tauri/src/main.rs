@@ -136,6 +136,9 @@ mod execution_core;
 mod executor;
 mod exploration;
 mod external_volume;
+// Prompt-matrix fan-out: N previewed prompts admitted under a concurrency cap
+// (plan 2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out, Phase 6).
+mod fanout;
 mod findings;
 mod fixer;
 // Row 2 Phase 1 (fleet topology + per-device budget). Detects local
@@ -5691,6 +5694,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     scheduler_service::start_scheduler_service(scheduler_pg, scheduler_app_state)
                         .await;
                 });
+            }
+
+            // Fan-out dispatcher (plan
+            // `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`,
+            // Phase 6): manage it for `/fanout` and start its admission loop,
+            // which first reloads THIS instance's active runs and reconciles
+            // their admitted members against the surviving terminals. Per
+            // instance, like the conductor resume below: a temp runner shares
+            // the PG cluster but never touches the primary's runs. Started even
+            // when PG is not yet reachable: the loop retries the load each tick,
+            // so a degraded-mode reconnect brings fan-out back without a restart.
+            {
+                let fanout_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                fanout::start(app.handle(), fanout_pg);
             }
 
             // Conductor restart-resume: relaunch every `running` orchestration

@@ -267,6 +267,12 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // task-run session — the same capability as `POST /terminals/{id}/write`.
     "GET /sessions/{id}/review",
     "/sessions/{id}/review/*",
+    // The prompt-matrix fan-out (plan 2026-09-20-terminal-page-review-notes-
+    // become-prompts-and-prompt-matrix-fan-out, Phase 6): a create queues `claude`
+    // spawns, cancel/release/PATCH drive them, and every read returns the
+    // operator's prompts — process spawning plus local content, every method.
+    "/fanout",
+    "/fanout/*",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",

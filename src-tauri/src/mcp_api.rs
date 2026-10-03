@@ -13437,6 +13437,7 @@ pub fn create_router(
         .merge(crate::mcp::state_machine::routes())
         .merge(crate::state_discovery::routes())
         .merge(crate::mcp::executor::routes())
+        .merge(crate::mcp::fanout::routes())
         .merge(crate::mcp::gui_config::routes())
         .merge(crate::mcp::image_quality_tests::routes())
         .merge(crate::mcp::step_type_knowledge_api::routes())

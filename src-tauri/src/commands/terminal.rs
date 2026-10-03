@@ -59,6 +59,44 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     Ok(tenant)
 }
 
+/// The repo a spawn edits: the caller's declared `intent_repo`, else the one
+/// derived from `working_dir`.
+///
+/// L2 (shared-checkout coordination gap fix) — when the caller did NOT declare
+/// an `intent_repo`, derive it from the session's `working_dir`: if that
+/// directory sits inside a known canonical checkout (`<root>/<repo>/...`),
+/// treat the session as editing that repo. This makes `acquire_for_terminal`
+/// route through isolated worktree acquisition when
+/// `QONTINUI_AGENT_WORKTREE_MODE` is on — which is the DEFAULT
+/// (`agent_worktree::worktree_mode_enabled` reads `.unwrap_or(true)`; only an
+/// explicit `0`/`false`/`no` disables it). When the operator has disabled the
+/// flag, `acquire_for_terminal` still returns `(working_dir, None)`, so the
+/// derivation has ZERO effect there.
+///
+/// The ONE derivation every spawn door that offers a `working_dir` shares
+/// ([`terminal_create`], the HTTP-proxy `terminal_create`, and the fan-out
+/// dispatcher's member spawn), so they cannot drift on which repo a cwd means.
+pub(crate) fn effective_intent_repo(
+    intent_repo: Option<String>,
+    working_dir: Option<&str>,
+) -> Option<String> {
+    intent_repo.or_else(|| {
+        working_dir.and_then(|wd| {
+            let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                std::path::Path::new(wd),
+            );
+            if let Some(ref repo) = derived {
+                tracing::debug!(
+                    working_dir = %wd,
+                    derived_intent_repo = %repo,
+                    "derived intent_repo from working_dir"
+                );
+            }
+            derived
+        })
+    })
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -151,32 +189,10 @@ pub async fn terminal_create(
         window_label.as_deref().unwrap_or("main"),
     );
 
-    // L2 (shared-checkout coordination gap fix) — when the caller did
-    // NOT declare an `intent_repo`, derive it from the session's
-    // `working_dir`: if that directory sits inside a known canonical
-    // checkout (`<root>/<repo>/...`), treat the session as editing that
-    // repo. This makes `acquire_for_terminal` route through isolated
-    // worktree acquisition when `QONTINUI_AGENT_WORKTREE_MODE` is on —
-    // which is the DEFAULT (`agent_worktree::worktree_mode_enabled`
-    // reads `.unwrap_or(true)`; only an explicit `0`/`false`/`no`
-    // disables it). When the operator has disabled the flag,
-    // `acquire_for_terminal` still returns `(working_dir, None)`, so the
-    // derivation has ZERO effect there.
-    let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
-        working_dir.as_deref().and_then(|wd| {
-            let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
-                std::path::Path::new(wd),
-            );
-            if let Some(ref repo) = derived {
-                tracing::debug!(
-                    working_dir = %wd,
-                    derived_intent_repo = %repo,
-                    "terminal_create: derived intent_repo from working_dir"
-                );
-            }
-            derived
-        })
-    });
+    // L2 (shared-checkout coordination gap fix) — see
+    // [`effective_intent_repo`].
+    let effective_intent_repo: Option<String> =
+        effective_intent_repo(intent_repo.clone(), working_dir.as_deref());
 
     // Phase 2 — route through the shared `acquire_for_terminal` helper
     // so this entry point + the HTTP-proxy / backend-relay siblings stay
@@ -2221,6 +2237,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
+    tenant_id: Option<uuid::Uuid>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     create_terminal_session_backend(
         terminal_manager,
@@ -2236,6 +2253,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
         Some(capture_hint),
         page_id,
         resource_override,
+        tenant_id,
     )
 }
 
@@ -2279,6 +2297,13 @@ pub(crate) fn create_terminal_session_backend(
     // while an account-migration respawn is the continuation of a session that
     // already existed a moment ago. See each call site.
     resource_override: bool,
+    // The tenant a picker or an admitted queue chose for THIS spawn — already
+    // through [`admit_spawn_tenant`] at the door that took it. `None` is the
+    // device-default binding every coord-spawned caller (gate continuation,
+    // condition check, looping agent, account migration) has always had. The
+    // fan-out dispatcher passes the tenant its run was admitted under, so a
+    // member admitted an hour after the click still spawns under it.
+    tenant_id: Option<uuid::Uuid>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
@@ -2287,13 +2312,16 @@ pub(crate) fn create_terminal_session_backend(
     // convenience for `claude` launches is appended into `command` by the
     // caller (gate-continuation in `agent_runtime.rs`), since only the caller
     // knows the launch is `claude`.
-    // No acting tenant: a gate continuation is coord-spawned, so no picker chose
-    // one (`tenant_id: None` below), and there is nothing here to key the
-    // plan/prompt directories by. `None` resolves the DEVICE DEFAULT, which is
-    // what this path has always been handed — inventing a tenant would let
-    // something other than the picker decide which directory it authors into.
-    let mut env_pairs: Vec<(String, String)> =
-        crate::agent_worktree::session_env::session_env(isolated_ctx.as_ref(), None);
+    // The admitted spawn tenant keys the plan/prompt directory lookup, exactly
+    // as `terminal_create` keys it. `None` (a coord-spawned caller: no picker
+    // chose one) resolves the DEVICE DEFAULT, which is what those paths have
+    // always been handed — inventing a tenant would let something other than
+    // the picker decide which directory a session authors into.
+    let spawn_tenant_key = tenant_id.map(|t| t.to_string());
+    let mut env_pairs: Vec<(String, String)> = crate::agent_worktree::session_env::session_env(
+        isolated_ctx.as_ref(),
+        spawn_tenant_key.as_deref(),
+    );
     // Account selection: pin the spawned PTY to the account the caller chose
     // (gate continuations set `capture_hint.config_dir` to the selected,
     // token-bearing account). Without this, a backend-spawned `claude` inherits
@@ -2362,8 +2390,9 @@ pub(crate) fn create_terminal_session_backend(
         // `claude` — so trust is DERIVED for that account, never minted for every
         // account on the box.
         crate::terminal::TrustArm::Pinned(capture_hint.as_ref().and_then(|h| h.config_dir.clone())),
-        // A gate continuation is coord-spawned: no picker chose a tenant.
-        None,
+        // The admitted spawn tenant (D1 durable stamp), or `None` for a
+        // coord-spawned caller, where no picker chose one.
+        tenant_id,
     )?;
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
@@ -2423,9 +2452,9 @@ pub(crate) fn create_terminal_session_backend(
         declared_paths: vec![std::path::PathBuf::from(&working_dir)],
         share_output,
         redact_secrets,
-        // Gate-continuation terminal — device-default binding; the registry
-        // stamps machine.json's default-for-new-sessions.
-        tenant_id: None,
+        // The admitted spawn tenant; `None` → the registry stamps
+        // machine.json's default-for-new-sessions (every coord-spawned caller).
+        tenant_id,
     };
 
     // Lineage, read BEFORE the hint is destructured below.

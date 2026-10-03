@@ -6534,6 +6534,8 @@ async fn run_continuation_terminal(
             // once the box breathes — the same defer-don't-reject posture
             // `ci_node::admission` takes for CI work.
             false,
+            // Coord-spawned: no picker chose a tenant — the device default.
+            None,
         );
 
         let (terminal_id, coord_session_id) = match result {
@@ -7534,6 +7536,8 @@ async fn run_condition_check_terminal(
         // pass, so a refusal here costs one deferred probe rather than a lost
         // session.
         false,
+        // Coord-spawned: no picker chose a tenant — the device default.
+        None,
     );
 
     match result {

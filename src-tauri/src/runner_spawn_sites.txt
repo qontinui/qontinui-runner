@@ -57,6 +57,11 @@ commands/terminal.rs | terminal_migrate_session_account | operator | -
 config_report_cmd.rs | seam_reports | exempt | builds the fix-agent command ONLY to report its environment (the seam table); never spawns it
 fixer/trigger.rs | launch_fixer | autonomous | launch_fixer
 follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up
+# The prompt-matrix fan-out's admission tick (plan 2026-09-20-terminal-page-review-notes-
+# become-prompts-and-prompt-matrix-fan-out, Phase 6): an operator queued the run, but each
+# member spawns on a tick with nobody at the keyboard, so it is autonomous. The gate is the
+# drain-first `authorize_fanout_spawn_with_budget` in the host's spawn fn.
+fanout/host.rs | spawn_member_terminal | autonomous | spawn_fanout_member > spawn_member_terminal
 looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal
 mcp/ai_session.rs | run_prompt | autonomous | run_prompt
 mcp/backend_relay.rs | handle_chat_create | autonomous | handle_chat_create
