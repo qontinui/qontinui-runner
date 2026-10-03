@@ -13,6 +13,8 @@ import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
 import { getTerminalHotStore } from "../terminalHotStore";
 import { windowTitleCounts } from "../sessionCounts";
+import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
+import { planRestart } from "../restartResume";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
@@ -28,7 +30,13 @@ type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
  */
 export type RestartOutcome =
   | { restarted: true; tabId: string; retiredTabId: string | null }
-  | { restarted: false; reason: "not-restartable" | "spawn-failed"; state?: string };
+  | {
+      restarted: false;
+      reason: "not-restartable" | "spawn-failed" | "resume-unsafe";
+      state?: string;
+      /** Why a resume was refused (`resume-unsafe`). */
+      detail?: string;
+    };
 
 export interface TransitionEffectsContextValue extends TransitionEffectsReturn {
   handleRestartInZone: (zoneIdx: number) => Promise<RestartOutcome>;
@@ -46,7 +54,15 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   // TerminalCore + SessionState pair. `stateTracking` shape is
   // preserved via spread in `useTerminalSession()`'s value-object.
   const session = useTerminalSession();
-  const { tabs, createTerminal, closeTerminal, zoneLayout, terminalRefs, pageId } = session;
+  const {
+    tabs,
+    createTerminal,
+    closeTerminal,
+    zoneLayout,
+    terminalRefs,
+    pageId,
+    shellIntegration,
+  } = session;
   const stateTracking = session;
   const { labelsAndTags, addHistoryEvent } = useZoneMetadata();
 
@@ -59,6 +75,10 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   );
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
+  // Zones with a restart in flight. A restart awaits a liveness read and a resume
+  // before the zone is reassigned; a second trigger (chip, hover action, shortcut,
+  // auto-restart) in that window would otherwise resume the same session id twice.
+  const restartingZonesRef = useRef<Set<number>>(new Set());
 
   /**
    * Replace the finished/errored pane in `zoneIdx` with a fresh terminal.
@@ -86,6 +106,17 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
    * session — deterministically, instead of waiting out the poll's debounce —
    * kills the PTY, and re-syncs the tab list against the backend afterwards.
    *
+   * WHAT THE REPLACEMENT IS. A pane that hosted a Claude session (its tab carries
+   * `claudeSessionId`) is RESUMED: `claude --resume <id>`, through the same
+   * `handleResumeSession` path Past Sessions -> Resume takes, not replaced by a
+   * bare shell. The chip's "Restart? Session errored" promised a restart and
+   * delivered an empty `powershell.exe`. Only a pane with no Claude session gets
+   * a shell. The old pane's close record is harmless to the resumed session: the
+   * resume re-opens the record under the NEW terminal first, and a close naming
+   * the old terminal then resolves against that terminal, not the session id.
+   * If a live process already hosts the id (or liveness cannot be read) the
+   * restart is refused rather than forking the transcript.
+   *
    * Ordering: the replacement is created FIRST and the old pane retired only
    * once it exists. The spawn can legitimately fail (the resource gate refuses
    * below the free-commit floor, and the operator can decline the override), and
@@ -100,28 +131,48 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       if (state !== "completed" && state !== "error") {
         return { restarted: false, reason: "not-restartable", state };
       }
-      const label = labelsAndTags.zoneLabels[zoneIdx];
-      const tabId = await createTerminal(
-        oldTab?.title ? `${oldTab.title} (2)` : undefined,
-        oldTab?.workingDir ?? undefined,
-      );
-      if (tabId) {
-        zoneLayout.assignTabToZone(zoneIdx, tabId);
-        zoneLayout.setFocusedZone(zoneIdx);
-        if (label) {
-          labelsAndTags.setZoneLabel(zoneIdx, label);
-        }
-        // Retire the pane we just replaced — after the zone points at the
-        // replacement, so the zone is never momentarily empty.
-        if (oldTabId) {
-          closeTerminal(oldTabId);
-        }
-        return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
+      if (restartingZonesRef.current.has(zoneIdx)) {
+        return { restarted: false, reason: "not-restartable", state: "restart-in-progress" };
       }
-      // `createTerminal` returned nothing: the replacement never existed, so
-      // the old pane was deliberately NOT retired. Saying so is the whole
-      // point of this return type.
-      return { restarted: false, reason: "spawn-failed" };
+      restartingZonesRef.current.add(zoneIdx);
+      try {
+        const label = labelsAndTags.zoneLabels[zoneIdx];
+        // Liveness is only consulted for a pane that hosted a Claude session.
+        const plan = planRestart(
+          oldTab,
+          oldTab?.claudeSessionId ? await fetchLiveClaudeSessionIds() : new Set(),
+        );
+        if (plan.kind === "blocked") {
+          console.warn(`[restart] zone ${zoneIdx + 1}: ${plan.detail}`);
+          return { restarted: false, reason: "resume-unsafe", state, detail: plan.detail };
+        }
+        const tabId =
+          plan.kind === "resume"
+            ? await shellIntegration.handleResumeSession(plan.session)
+            : await createTerminal(
+                oldTab?.title ? `${oldTab.title} (2)` : undefined,
+                oldTab?.workingDir ?? undefined,
+              );
+        if (tabId) {
+          zoneLayout.assignTabToZone(zoneIdx, tabId);
+          zoneLayout.setFocusedZone(zoneIdx);
+          if (label) {
+            labelsAndTags.setZoneLabel(zoneIdx, label);
+          }
+          // Retire the pane we just replaced — after the zone points at the
+          // replacement, so the zone is never momentarily empty.
+          if (oldTabId) {
+            closeTerminal(oldTabId);
+          }
+          return { restarted: true, tabId, retiredTabId: oldTabId ?? null };
+        }
+        // `createTerminal` returned nothing: the replacement never existed, so
+        // the old pane was deliberately NOT retired. Saying so is the whole
+        // point of this return type.
+        return { restarted: false, reason: "spawn-failed" };
+      } finally {
+        restartingZonesRef.current.delete(zoneIdx);
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -134,6 +185,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
       labelsAndTags.setZoneLabel,
       createTerminal,
       closeTerminal,
+      shellIntegration,
     ],
   );
 

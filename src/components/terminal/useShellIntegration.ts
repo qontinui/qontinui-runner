@@ -58,7 +58,8 @@ interface UseShellIntegrationParams {
 interface UseShellIntegrationResult {
   commandHistories: Record<string, CommandHistoryEntry[]>;
   handleShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
-  handleResumeSession: (session: TranscriptSession) => void;
+  /** Resolves to the new tab's id, or `null` when the terminal could not be created. */
+  handleResumeSession: (session: TranscriptSession) => Promise<string | null>;
   handleFirstInput: (tabId: string, input: string) => void;
   pendingResumeRef: React.MutableRefObject<{ tabId: string; resumeCmd: string } | null>;
 }
@@ -150,11 +151,11 @@ export function useShellIntegration({
   // ── Resume Claude Code session in terminal ─────────────────────────────────
 
   const handleResumeSession = useCallback(
-    async (session: TranscriptSession) => {
+    async (session: TranscriptSession): Promise<string | null> => {
       // Derive a short label from the session ID for the tab title
       const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
       const tabId = await createTerminal(tabTitle, session.project_path);
-      if (!tabId) return;
+      if (!tabId) return null;
 
       // Track which Claude session is running in this tab so "Generate Workflow"
       // can find the correct transcript instead of picking a random recent session.
@@ -206,7 +207,11 @@ export function useShellIntegration({
         terminalId: tabId,
         origin: "authoritative",
       };
-      invoke("terminal_session_record_open", openArgs)
+      // Awaited at the END of this function (after the resume command is queued, so
+      // the shell-prompt handler is not delayed): a caller that retires another pane
+      // for this session right after (the restart chip) must not have its close
+      // overtake this open.
+      const openRecorded = invoke("terminal_session_record_open", openArgs)
         // Written is not bound — report which, rather than only the failure.
         .then((response) =>
           recordOpenLogger.debug(
@@ -253,6 +258,9 @@ export function useShellIntegration({
           "resume fallback timer",
         );
       }, 1500);
+      // Bounded: a hung IPC must not strand the caller's replacement unassigned.
+      await Promise.race([openRecorded, new Promise<void>((r) => setTimeout(r, 3000))]);
+      return tabId;
     },
     [
       createTerminal,

@@ -1078,6 +1078,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // rendered `✓` for exactly that, which told the operator their errored
       // session had been replaced when it had not.
       const restarted = await transitionEffects.handleRestartInZone(zone.index);
+      // A refused resume says WHY (a live process already hosts the session, or
+      // liveness was unreadable) instead of the generic short-fall message.
+      if (!restarted.restarted && restarted.reason === "resume-unsafe") {
+        return fail("restart-failed", restarted.detail ?? "refused to resume the session");
+      }
       return deriveVerdict({
         produced: restarted,
         requested: 1,
