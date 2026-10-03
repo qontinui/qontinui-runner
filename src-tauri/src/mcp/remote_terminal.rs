@@ -42,7 +42,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
-use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
+use crate::terminal::remote_pane_io::{
+    AttachedRing, RemoteFrameSink, RemotePaneIo, REMOTE_PANE_CLOSED,
+};
 
 // ---------------------------------------------------------------------------
 // Target role — grants
@@ -2605,11 +2607,12 @@ impl RemoteAttachClient {
         &self,
         pane: &RemotePaneIo,
     ) -> Result<oneshot::Receiver<Result<(), AttachError>>, AttachError> {
+        let closed = || AttachError {
+            code: "pane_closed".to_string(),
+            message: "the tab closed before the reattach was sent".to_string(),
+        };
         if pane.is_finished() {
-            return Err(AttachError {
-                code: "pane_closed".to_string(),
-                message: "the tab closed before the reattach was sent".to_string(),
-            });
+            return Err(closed());
         }
         let jti = pane.grant_jti();
         let seq = self.reattach_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2624,8 +2627,11 @@ impl RemoteAttachClient {
                 },
             );
         }
-        if let Err(e) = self.send(pane.reattach_frame(&rid)) {
+        if let Err(e) = pane.send_reattach(&rid) {
             self.take_reattach_waiter(&jti);
+            if e == REMOTE_PANE_CLOSED {
+                return Err(closed());
+            }
             return Err(AttachError {
                 code: "relay_unavailable".to_string(),
                 message: e,
@@ -3013,6 +3019,11 @@ impl RemoteAttachClient {
         to: u64,
         timeout: Duration,
     ) -> Result<AttachedReply, AttachError> {
+        pane.admit_frame("remote_terminal_buffer")
+            .map_err(|message| AttachError {
+                code: "pane_closed".to_string(),
+                message,
+            })?;
         let request_id = format!("{HISTORY_PREFIX}{}", Uuid::new_v4());
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -3259,6 +3270,13 @@ impl RemoteAttachClient {
                                 // in wire order ahead of any later output frame.
                                 pane.note_reattached();
                                 pane.splice_replay(&reply.ring);
+                                if let Err(e) = pane.reassert_flow() {
+                                    debug!(
+                                        grant_jti = %reply.grant_jti,
+                                        error = %e,
+                                        "remote attach: the pause in force could not be re-sent after the reattach"
+                                    );
+                                }
                                 info!(
                                     grant_jti = %reply.grant_jti,
                                     terminal_id = %reply.terminal_id,
@@ -3491,9 +3509,33 @@ impl RemoteAttachClient {
                     let _ = tx.send(Err(AttachError { code, message }));
                     return true;
                 }
+                // The relay's per-frame refusal of an expired (or unknown)
+                // grant arrives bare — a `grant_jti` and no request id of ours
+                // — and by then the relay has already dropped the attachment
+                // and detached the target. Settled like the eviction's
+                // `remote_terminal_error`, so a live pane is renewed through
+                // the reactive backstop; returned unconsumed, the tab silently
+                // stopped accepting input.
+                if matches!(
+                    code.as_str(),
+                    "attach_grant_expired" | "attach_grant_unknown"
+                ) {
+                    if let Some(jti) = grant_jti {
+                        if self.pane(jti).is_some_and(|p| p.is_reattaching()) {
+                            // Every frame sent before the owner re-binds is
+                            // refused this way; the owner has it in hand.
+                            debug!(grant_jti = jti, code = %code, "remote attach: expiry refusal for a pane already being reattached");
+                        } else {
+                            self.settle_pane_error(jti, &code, &message, None);
+                        }
+                        return true;
+                    }
+                }
                 // The relay holds no attachment for the grant a frame we sent
                 // named. Consumed here: left to the relay's warn arm it was
-                // one WARN per refused frame, 1874 of them for one closed tab.
+                // one WARN per refused frame — 1874 of them for one closed tab
+                // (coord finding b35c9f82; spaceship `.dev-logs`, grant
+                // 01a0fc26-690d).
                 if code == ATTACH_NOT_REGISTERED {
                     self.settle_not_registered(grant_jti, &message);
                     return true;
@@ -4007,11 +4049,25 @@ fn spawn_reattach_supervisors(c: &'static RemoteAttachClient) {
     }
 }
 
-/// The tokio instant at which the wall-clock `expires_at` falls. Converted
-/// once per grant, so the rest of its schedule runs on tokio's clock.
-fn expiry_instant(expires_at: DateTime<Utc>) -> tokio::time::Instant {
-    let left = (expires_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-    tokio::time::Instant::now() + left
+/// The wall clock a renewal schedule reads `expires_at` against. A parameter,
+/// not a call to `Utc::now`, so a test can drive it from tokio's paused clock
+/// and move it the way a suspend does.
+pub(crate) type WallClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+/// Longest single sleep of a renewal schedule. The deadline is recomputed
+/// from the wall clock after every wake, so a machine that suspended through
+/// it renews within this long of resuming — tokio's clock does not count a
+/// suspend on every platform, coord's expiry does.
+const RENEW_RECHECK: Duration = Duration::from_secs(60);
+
+/// How long from `now` until `at` on the wall clock; zero once it has passed.
+fn wall_until(at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (at - now).to_std().unwrap_or(Duration::ZERO)
+}
+
+/// `Some` while the pane is still alive and open.
+fn live_pane(pane: &Weak<RemotePaneIo>) -> Option<Arc<RemotePaneIo>> {
+    pane.upgrade().filter(|p| !p.is_finished())
 }
 
 /// Renew `pane`'s grant [`RENEW_LEAD`] before each expiry, for as long as the
@@ -4022,12 +4078,22 @@ fn expiry_instant(expires_at: DateTime<Utc>) -> tokio::time::Instant {
 /// scheduled by the same task. Needs a tokio runtime; without one the pane
 /// keeps only the reactive renewal in `settle_pane_error`.
 pub fn schedule_grant_renewal(client: &'static RemoteAttachClient, pane: &Arc<RemotePaneIo>) {
+    schedule_grant_renewal_with(client, pane, Arc::new(Utc::now));
+}
+
+/// [`schedule_grant_renewal`] against an explicit wall clock.
+fn schedule_grant_renewal_with(
+    client: &'static RemoteAttachClient,
+    pane: &Arc<RemotePaneIo>,
+    clock: WallClock,
+) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(renew_grants_before_expiry(
                 client,
                 Arc::downgrade(pane),
                 ReattachPolicy::default(),
+                clock,
             ));
         }
         Err(_) => warn!(
@@ -4039,44 +4105,73 @@ pub fn schedule_grant_renewal(client: &'static RemoteAttachClient, pane: &Arc<Re
 
 /// The per-pane renewal schedule behind [`schedule_grant_renewal`]. Holds the
 /// pane weakly, so a closed tab is not kept alive by its timer.
+///
+/// A grant that is ALREADY inside [`RENEW_LEAD`] when the pane takes it gets
+/// no scheduled renewal: renewing it would mint at once, and a local clock
+/// running ahead of coord's would do that to every grant, back to back. That
+/// is logged once per pane and left to the reactive path (the relay's expiry
+/// refusal). A grant that entered the lead while this task slept — a suspend —
+/// is renewed as soon as the task wakes.
 async fn renew_grants_before_expiry(
     client: &'static RemoteAttachClient,
     pane: Weak<RemotePaneIo>,
     policy: ReattachPolicy,
+    clock: WallClock,
 ) {
+    let mut skew_warned = false;
     loop {
-        let Some(p) = pane.upgrade().filter(|p| !p.is_finished()) else {
+        let Some(p) = live_pane(&pane) else {
             return;
         };
         let jti = p.grant_jti();
-        let expiry = p.grant_expires_at().map(expiry_instant);
+        let expires_at = p.grant_expires_at();
         drop(p);
-        match expiry {
-            Some(expiry) => {
-                tokio::time::sleep_until(
-                    expiry
-                        .checked_sub(RENEW_LEAD)
-                        .unwrap_or_else(tokio::time::Instant::now),
-                )
-                .await;
-                let Some(p) = pane.upgrade().filter(|p| !p.is_finished()) else {
-                    return;
-                };
-                // A supervisor renewed it while we slept: schedule the new one.
-                if p.grant_jti() == jti {
-                    renew_ahead_of_expiry(client, &p, &jti, expiry, &policy).await;
-                }
-            }
+        match expires_at {
             None => debug!(
                 grant_jti = %jti,
                 "remote attach: coord reported no usable expiry for this grant — no scheduled \
                  renewal; an expiry refusal renews it reactively"
             ),
+            Some(at) if wall_until(at, clock()) <= RENEW_LEAD => {
+                if !skew_warned {
+                    skew_warned = true;
+                    warn!(
+                        grant_jti = %jti,
+                        expires_at = %at,
+                        now = %clock(),
+                        lead_secs = RENEW_LEAD.as_secs(),
+                        "remote attach: a newly installed grant already expires within the \
+                         renewal lead — this clock may run ahead of coord's; no scheduled \
+                         renewal, an expiry refusal renews it reactively"
+                    );
+                }
+            }
+            Some(at) => {
+                loop {
+                    let left = wall_until(at, clock()).saturating_sub(RENEW_LEAD);
+                    if left.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(left.min(RENEW_RECHECK)).await;
+                    match live_pane(&pane) {
+                        None => return,
+                        Some(p) if p.grant_jti() != jti => break,
+                        Some(_) => {}
+                    }
+                }
+                let Some(p) = live_pane(&pane) else {
+                    return;
+                };
+                // A supervisor renewed it while we slept: schedule the new one.
+                if p.grant_jti() == jti {
+                    renew_ahead_of_expiry(client, &p, &jti, at, &policy, &clock).await;
+                }
+            }
         }
         // Wait for whatever replaces this grant — the handoff above, or a
         // reattach supervisor's renewal — and schedule that one.
         loop {
-            let Some(p) = pane.upgrade().filter(|p| !p.is_finished()) else {
+            let Some(p) = live_pane(&pane) else {
                 return;
             };
             if p.grant_jti() != jti {
@@ -4088,19 +4183,26 @@ async fn renew_grants_before_expiry(
     }
 }
 
-/// Renew `pane`'s grant `jti` before `expiry`. Mint FIRST, under the pane's
-/// reattach claim, so a refused mint leaves the live attachment untouched: it
-/// is retried every `min(60 s, time-to-expiry / 2)` (at least 1 s) until
-/// expiry, after which the reactive path owns the pane. A pane a supervisor
-/// already owns is retried on the same cadence. Returns once the pane has been handed to a
-/// supervisor under the new grant, or the grant can no longer be renewed
-/// ahead of time.
+/// Renew `pane`'s grant `jti` before it expires at `at`. Mint FIRST, under
+/// the pane's reattach claim, so a refused mint leaves the live attachment
+/// untouched: it is retried every `min(60 s, time-to-expiry / 2)` (at least
+/// 1 s) until expiry, after which the reactive path owns the pane. A pane a
+/// supervisor already owns is retried on the same cadence. Returns once the
+/// pane has been handed to a supervisor under the new grant, or the grant can
+/// no longer be renewed ahead of time.
+///
+/// The claim makes `on_relay_connected` skip the pane, so a relay reconnect
+/// while the claim is held must be noticed HERE: the reconnect is armed with
+/// the claim, a refused mint after one hands the OLD grant to a supervisor
+/// (the pane would otherwise sit unattached), and the handoff cuts its learn
+/// wait short.
 async fn renew_ahead_of_expiry(
     client: &'static RemoteAttachClient,
     pane: &Arc<RemotePaneIo>,
     jti: &str,
-    expiry: tokio::time::Instant,
+    at: DateTime<Utc>,
     policy: &ReattachPolicy,
+    clock: &WallClock,
 ) {
     let (Some(renewer), Some(session)) = (
         client.grant_renewer(),
@@ -4118,8 +4220,8 @@ async fn renew_ahead_of_expiry(
         if pane.is_finished() || pane.grant_jti() != jti {
             return;
         }
-        let now = tokio::time::Instant::now();
-        if now >= expiry {
+        let left = wall_until(at, clock());
+        if left.is_zero() {
             warn!(
                 grant_jti = jti,
                 "remote attach: the grant expired before it could be renewed ahead of time — \
@@ -4127,14 +4229,35 @@ async fn renew_ahead_of_expiry(
             );
             return;
         }
-        let retry_in = RENEW_RETRY_CEILING
-            .min((expiry - now) / 2)
-            .max(RENEW_RETRY_FLOOR);
+        let retry_in = RENEW_RETRY_CEILING.min(left / 2).max(RENEW_RETRY_FLOOR);
         if pane.try_begin_reattach() {
+            let reconnected = client.reconnected.notified();
+            tokio::pin!(reconnected);
+            reconnected.as_mut().enable();
+            let generation = client.reconnect_gen.load(Ordering::Acquire);
             match renewer.renew(&session, target.as_deref()).await {
                 Ok(renewed) => {
-                    hand_over_renewed_grant(client, pane, renewed, expiry, policy).await;
+                    hand_over_renewed_grant(
+                        client,
+                        pane,
+                        renewed,
+                        at,
+                        policy,
+                        clock,
+                        reconnected,
+                        generation,
+                    )
+                    .await;
                     return;
+                }
+                Err(e) if client.reconnect_gen.load(Ordering::Acquire) != generation => {
+                    warn!(
+                        grant_jti = jti,
+                        error = %e,
+                        "remote attach: renewing the grant ahead of expiry was refused across a \
+                         relay reconnect — reattaching under the current grant, then retrying"
+                    );
+                    spawn_supervisor(client, pane, None, policy);
                 }
                 Err(e) => {
                     pane.end_reattach();
@@ -4157,6 +4280,27 @@ async fn renew_ahead_of_expiry(
     }
 }
 
+/// Hand `pane` (whose reattach claim the caller holds) to a reattach
+/// supervisor, which releases the claim when it is done.
+fn spawn_supervisor(
+    client: &'static RemoteAttachClient,
+    pane: &Arc<RemotePaneIo>,
+    renewed_at: Option<tokio::time::Instant>,
+    policy: &ReattachPolicy,
+) {
+    tokio::spawn(supervise_reattach(
+        client,
+        ReattachRequest {
+            pane: pane.clone(),
+            first: None,
+            announced_target_down: false,
+            sent_generation: client.reconnect_gen.load(Ordering::Acquire),
+            renewed_at,
+        },
+        policy.clone(),
+    ));
+}
+
 /// The renewal handoff, run under the pane's reattach claim with a freshly
 /// minted grant in hand: give the target time to learn it (bounded by the
 /// learn window and by the old grant's expiry less a margin), swap it in so
@@ -4169,24 +4313,43 @@ async fn renew_ahead_of_expiry(
 /// The old-jti detach is deliberately NOT `RemotePaneIo`'s own detach: that
 /// one latches per pane and names the current jti, so it would release the
 /// NEW grant, or swallow the tab's real close-time detach.
+///
+/// A relay reconnect since the claim (`generation` moved; `reconnected` ends
+/// the wait early) skips both the rest of the learn wait and the old-jti
+/// detach: the reconnect skipped this claimed pane, so it is unattached until
+/// the supervisor presents, and the old binding went with the old socket.
+#[allow(clippy::too_many_arguments)]
 async fn hand_over_renewed_grant(
     client: &'static RemoteAttachClient,
     pane: &Arc<RemotePaneIo>,
     renewed: RenewedGrant,
-    expiry: tokio::time::Instant,
+    at: DateTime<Utc>,
     policy: &ReattachPolicy,
+    clock: &WallClock,
+    reconnected: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+    generation: u64,
 ) {
-    let learn_until = expiry.checked_sub(RENEW_EXPIRY_MARGIN).unwrap_or(expiry);
-    let wait = policy
-        .learn_window
-        .min(learn_until.saturating_duration_since(tokio::time::Instant::now()));
-    tokio::time::sleep(wait).await;
+    let reconnected_since = || client.reconnect_gen.load(Ordering::Acquire) != generation;
+    if !reconnected_since() {
+        let learn_until = at - chrono::Duration::seconds(RENEW_EXPIRY_MARGIN.as_secs() as i64);
+        let wait = policy.learn_window.min(wall_until(learn_until, clock()));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = reconnected => {}
+        }
+    }
     if pane.is_finished() {
         pane.end_reattach();
         return;
     }
     let old = client.swap_grant(pane, &renewed);
-    if let Err(e) = client.send(json!({
+    if reconnected_since() {
+        debug!(
+            old_grant_jti = %old,
+            "remote attach: the relay reconnected during the renewal — the old grant's binding \
+             went with the old socket, no detach sent"
+        );
+    } else if let Err(e) = client.send(json!({
         "type": "remote_terminal_detach",
         "grant_jti": old,
         "terminal_id": pane.terminal_id(),
@@ -4198,17 +4361,7 @@ async fn hand_over_renewed_grant(
              holds its binding until it expires, and the reattach retries until then"
         );
     }
-    tokio::spawn(supervise_reattach(
-        client,
-        ReattachRequest {
-            pane: pane.clone(),
-            first: None,
-            announced_target_down: false,
-            sent_generation: client.reconnect_gen.load(Ordering::Acquire),
-            renewed_at: Some(tokio::time::Instant::now()),
-        },
-        policy.clone(),
-    ));
+    spawn_supervisor(client, pane, Some(tokio::time::Instant::now()), policy);
 }
 
 /// What the relay calls on every `connected`: re-present every live pane and
@@ -6731,9 +6884,54 @@ mod tests {
 
     // ---- renewal ahead of expiry (plan 2026-10-03) --------------------------
 
+    /// A wall clock driven by tokio's (paused) clock — deterministic against
+    /// the grant expiries a test writes — plus a jump, which is what a
+    /// suspend looks like to it.
+    struct TestClock {
+        base: DateTime<Utc>,
+        start: tokio::time::Instant,
+        jump_secs: std::sync::atomic::AtomicI64,
+    }
+
+    impl TestClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                base: DateTime::parse_from_rfc3339("2026-10-03T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                start: tokio::time::Instant::now(),
+                jump_secs: std::sync::atomic::AtomicI64::new(0),
+            })
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            self.base
+                + chrono::Duration::from_std(self.start.elapsed()).unwrap()
+                + chrono::Duration::seconds(self.jump_secs.load(Ordering::Acquire))
+        }
+
+        /// `secs` after the clock's start.
+        fn at(&self, secs: i64) -> DateTime<Utc> {
+            self.base + chrono::Duration::seconds(secs)
+        }
+
+        fn jump(&self, secs: i64) {
+            self.jump_secs.fetch_add(secs, Ordering::AcqRel);
+        }
+
+        fn wall(self: &Arc<Self>) -> WallClock {
+            let c = self.clone();
+            Arc::new(move || c.now())
+        }
+    }
+
     /// A pane that can renew (it knows its session and device) whose grant
-    /// expires `secs` from now.
-    fn expiring_pane(client: &RemoteAttachClient, jti: &str, secs: i64) -> Arc<RemotePaneIo> {
+    /// expires at `expires_at`.
+    fn expiring_pane(
+        client: &RemoteAttachClient,
+        jti: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Arc<RemotePaneIo> {
         Arc::new(
             RemotePaneIo::new(
                 jti,
@@ -6746,7 +6944,7 @@ mod tests {
             )
             .with_session_id("session-uuid")
             .with_target_device_id("target-device")
-            .with_grant_expires_at(Some(Utc::now() + chrono::Duration::seconds(secs))),
+            .with_grant_expires_at(Some(expires_at)),
         )
     }
 
@@ -6759,7 +6957,7 @@ mod tests {
     }
 
     fn assert_near(at: Duration, want: Duration) {
-        let slack = Duration::from_secs(1);
+        let slack = Duration::from_millis(100);
         assert!(
             at + slack >= want && at <= want + slack,
             "at {at:?}, want {want:?}"
@@ -6776,15 +6974,15 @@ mod tests {
         let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
         client.set_grant_renewer(renewer.clone());
         let mut pump = client.lock_outbound().await;
-        let pane = expiring_pane(client, "jti-1", 600);
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
         client.register_pane(pane.clone());
         pane.push_output(b"0123456789");
-        let started = tokio::time::Instant::now();
-        schedule_grant_renewal(client, &pane);
+        schedule_grant_renewal_with(client, &pane, clock.wall());
 
         let detach = pump.recv().await.unwrap();
         assert_near(
-            started.elapsed(),
+            clock.start.elapsed(),
             Duration::from_secs(600) - RENEW_LEAD + GRANT_LEARN_WINDOW,
         );
         assert_eq!(renewer.calls.lock().unwrap().len(), 1);
@@ -6828,9 +7026,10 @@ mod tests {
         let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
         client.set_grant_renewer(renewer.clone());
         let mut pump = client.lock_outbound().await;
-        let pane = expiring_pane(client, "jti-1", 600);
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
         client.register_pane(pane.clone());
-        schedule_grant_renewal(client, &pane);
+        schedule_grant_renewal_with(client, &pane, clock.wall());
 
         assert_eq!(pump.recv().await.unwrap()["grant_jti"], "jti-1");
         let f = pump.recv().await.unwrap();
@@ -6868,10 +7067,10 @@ mod tests {
         let renewer = FixedRenewer::new(&[]);
         client.set_grant_renewer(renewer.clone());
         let mut pump = client.lock_outbound().await;
-        let pane = expiring_pane(client, "jti-1", 600);
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
         client.register_pane(pane.clone());
-        let started = tokio::time::Instant::now();
-        schedule_grant_renewal(client, &pane);
+        schedule_grant_renewal_with(client, &pane, clock.wall());
 
         tokio::time::sleep(Duration::from_secs(421)).await;
         assert_eq!(renewer.calls.lock().unwrap().len(), 1);
@@ -6891,7 +7090,7 @@ mod tests {
         let detach = pump.recv().await.unwrap();
         // Retried at 8 min, then the learn window.
         assert_near(
-            started.elapsed(),
+            clock.start.elapsed(),
             Duration::from_secs(480) + GRANT_LEARN_WINDOW,
         );
         assert_eq!(renewer.calls.lock().unwrap().len(), 2);
@@ -6903,23 +7102,154 @@ mod tests {
         assert!(read_all(&pane).is_empty(), "nothing written into the pane");
     }
 
+    /// A mint refused all the way to expiry stops there (the reactive path
+    /// takes over): a bounded number of attempts, never a spin, and nothing
+    /// sent or written.
+    #[tokio::test(start_paused = true)]
+    async fn a_mint_refused_until_expiry_stops_without_spinning() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
+        client.register_pane(pane.clone());
+        schedule_grant_renewal_with(client, &pane, clock.wall());
+
+        tokio::time::sleep(Duration::from_secs(601)).await;
+        let attempts = renewer.calls.lock().unwrap().len();
+        // 420, 480, 540, 570, 585, then halving to the 1 s floor.
+        assert!((5..=12).contains(&attempts), "{attempts} attempts");
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(
+            renewer.calls.lock().unwrap().len(),
+            attempts,
+            "nothing after expiry"
+        );
+        assert!(pump.try_recv().is_err());
+        assert!(!pane.is_finished() && !pane.is_reattaching());
+    }
+
+    /// A tab closed while the handoff waits for the target to learn the new
+    /// grant: the claim is released and nothing is swapped or sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_pane_closed_during_the_learn_wait_releases_its_claim() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
+        client.register_pane(pane.clone());
+        schedule_grant_renewal_with(client, &pane, clock.wall());
+
+        tokio::time::sleep(Duration::from_secs(430)).await;
+        assert_eq!(renewer.calls.lock().unwrap().len(), 1);
+        assert!(pane.is_reattaching(), "mid-handoff");
+        pane.mark_exit(0);
+        tokio::time::sleep(GRANT_LEARN_WINDOW).await;
+        assert!(!pane.is_reattaching(), "the claim was released");
+        assert_eq!(pane.grant_jti(), "jti-1", "nothing was swapped");
+        assert!(pump.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// A relay reconnect during the handoff skipped the claimed pane, so the
+    /// handoff must present at once rather than sit out the learn window —
+    /// and must NOT detach the old grant, whose binding died with the old
+    /// socket.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_during_the_handoff_presents_at_once_without_a_detach() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
+        client.register_pane(pane.clone());
+        schedule_grant_renewal_with(client, &pane, clock.wall());
+
+        tokio::time::sleep(Duration::from_secs(430)).await;
+        assert!(pane.is_reattaching(), "mid-handoff");
+        client.on_relay_disconnected();
+        client.on_relay_connected();
+        assert!(
+            client.take_reattach_requests().is_empty(),
+            "the reconnect skipped the claimed pane"
+        );
+        let f = pump.recv().await.unwrap();
+        assert_near(clock.start.elapsed(), Duration::from_secs(430));
+        assert_eq!(f["type"], "remote_terminal_attach", "no detach first: {f}");
+        assert!(rid_of(&f).starts_with("reattach:jti-2#"), "{f}");
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-2", b"", 0)
+        ));
+        until_released(&pane).await;
+        assert!(!pane.is_finished());
+        assert!(pump.try_recv().is_err(), "no old-jti detach afterwards");
+    }
+
+    /// The deadline is re-read from the wall clock after every wake: a
+    /// machine that slept through the renewal time (the wall clock jumped)
+    /// renews within one recheck of waking, not when tokio's clock says.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_through_the_renewal_time_renews_on_wake() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
+        client.register_pane(pane.clone());
+        schedule_grant_renewal_with(client, &pane, clock.wall());
+
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        clock.jump(360);
+        let detach = pump.recv().await.unwrap();
+        // Woken at 120 s (wall 480 s, inside the lead), learn wait 80 s.
+        assert_near(
+            clock.start.elapsed(),
+            Duration::from_secs(120) + GRANT_LEARN_WINDOW,
+        );
+        assert_eq!(detach["grant_jti"], "jti-1");
+    }
+
+    /// A grant that arrives already inside the renewal lead (a clock running
+    /// ahead of coord's) gets no scheduled renewal — no back-to-back mints.
+    #[tokio::test(start_paused = true)]
+    async fn a_grant_already_inside_the_lead_is_left_to_the_reactive_path() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let clock = TestClock::new();
+        let pane = expiring_pane(client, "jti-1", clock.at(120));
+        client.register_pane(pane.clone());
+        schedule_grant_renewal_with(client, &pane, clock.wall());
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(renewer.calls.lock().unwrap().is_empty());
+        assert!(pump.try_recv().is_err());
+        assert_eq!(pane.grant_jti(), "jti-1");
+    }
+
     /// The schedule follows every grant the pane takes: the renewed grant's
     /// own expiry is renewed ahead of time too.
     #[tokio::test(start_paused = true)]
     async fn every_renewed_grant_is_renewed_again_before_it_expires() {
         let client = leaked_client();
+        let clock = TestClock::new();
         let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt"), ("jti-3", "grant-3.jwt")]);
         for g in renewer.next.lock().unwrap().iter_mut() {
             if g.grant_jti == "jti-2" {
-                g.expires_at = Some(Utc::now() + chrono::Duration::seconds(900));
+                g.expires_at = Some(clock.at(1400));
             }
         }
         client.set_grant_renewer(renewer.clone());
         let mut pump = client.lock_outbound().await;
-        let pane = expiring_pane(client, "jti-1", 600);
+        let pane = expiring_pane(client, "jti-1", clock.at(600));
         client.register_pane(pane.clone());
-        let started = tokio::time::Instant::now();
-        schedule_grant_renewal(client, &pane);
+        schedule_grant_renewal_with(client, &pane, clock.wall());
 
         assert_eq!(pump.recv().await.unwrap()["grant_jti"], "jti-1");
         let f = pump.recv().await.unwrap();
@@ -6932,13 +7262,128 @@ mod tests {
         let detach = pump.recv().await.unwrap();
         assert_eq!(detach["type"], "remote_terminal_detach");
         assert_eq!(detach["grant_jti"], "jti-2");
-        assert!(
-            started.elapsed() > Duration::from_secs(900),
-            "the second renewal waits for the second grant's own lead time"
+        assert_near(
+            clock.start.elapsed(),
+            Duration::from_secs(1400) - RENEW_LEAD + GRANT_LEARN_WINDOW,
         );
         let f = pump.recv().await.unwrap();
         assert!(rid_of(&f).starts_with("reattach:jti-3#"), "{f}");
         assert_eq!(renewer.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Review item 6: the target keys its flow gate by grant and drops it on
+    /// detach, so a pane paused when it reattaches re-asserts the pause under
+    /// the (new) jti once the reattach lands; an unpaused one sends nothing.
+    #[tokio::test]
+    async fn a_paused_pane_reasserts_its_pause_after_a_reattach() {
+        let client = RemoteAttachClient::new();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        pane.set_paused(true).unwrap();
+        assert_eq!(pump.try_recv().unwrap()["paused"], true);
+        client.swap_grant(
+            &pane,
+            &RenewedGrant {
+                grant_jti: "jti-2".to_string(),
+                grant: "grant-2.jwt".to_string(),
+                expires_at: None,
+            },
+        );
+        let rx = client.send_reattach(&pane).unwrap();
+        let f = pump.try_recv().unwrap();
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-2", b"", 0)
+        ));
+        assert!(rx.await.unwrap().is_ok());
+        let flow = pump.try_recv().expect("the pause is re-sent");
+        assert_eq!(flow["type"], "remote_terminal_flow");
+        assert_eq!(flow["grant_jti"], "jti-2");
+        assert_eq!(flow["paused"], true);
+
+        pane.set_paused(false).unwrap();
+        pump.try_recv().unwrap();
+        let rx = client.send_reattach(&pane).unwrap();
+        let f = pump.try_recv().unwrap();
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-2", b"", 0)
+        ));
+        assert!(rx.await.unwrap().is_ok());
+        assert!(pump.try_recv().is_err(), "an unpaused pane sends no flow");
+    }
+
+    /// Review item 4: a reattach cannot be queued behind the tab's detach.
+    #[tokio::test]
+    async fn no_reattach_is_queued_after_the_detach() {
+        let client = RemoteAttachClient::new();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        pane.release(Duration::from_millis(10)).unwrap();
+        assert!(!pane.is_finished(), "release alone settles no exit");
+        assert_eq!(client.send_reattach(&pane).unwrap_err().code, "pane_closed");
+        assert_eq!(pump.try_recv().unwrap()["type"], "remote_terminal_detach");
+        assert!(pump.try_recv().is_err());
+    }
+
+    /// Review item 5: a finished pane sends no history request.
+    #[tokio::test]
+    async fn a_finished_pane_requests_no_history() {
+        let client = RemoteAttachClient::new();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        pane.mark_exit(0);
+        let err = client
+            .request_history(&pane, 0, 10, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "pane_closed");
+        assert!(pump.try_recv().is_err());
+    }
+
+    /// Review item 1: the relay's PER-FRAME expiry refusal is a bare `error`
+    /// with a `grant_jti` and no request id. It reaches the reactive backstop
+    /// (one supervisor for a live pane with a session), later ones are
+    /// consumed while that supervisor owns the pane, and for a pane with no
+    /// session it closes the tab with the notice.
+    #[test]
+    fn the_relays_bare_expiry_refusal_reaches_the_backstop() {
+        let client = RemoteAttachClient::new();
+        client.set_grant_renewer(FixedRenewer::new(&[]));
+        let bare = |jti: &str| {
+            json!({
+                "type": "error",
+                "code": "attach_grant_expired",
+                "grant_jti": jti,
+                "message": "the attach grant has expired",
+            })
+        };
+        let pane = expiring_pane(
+            &client,
+            "jti-1",
+            Utc::now() + chrono::Duration::seconds(600),
+        );
+        client.register_pane(pane.clone());
+        for _ in 0..3 {
+            assert!(client.handle_inbound("error", &bare("jti-1")));
+        }
+        assert!(client.handle_inbound(
+            "error",
+            &json!({"type": "error", "code": ATTACH_NOT_REGISTERED, "grant_jti": "jti-1"})
+        ));
+        assert_eq!(client.take_reattach_requests().len(), 1, "one supervisor");
+        assert!(!pane.is_finished());
+
+        let sessionless = new_pane(&client, "jti-b", AttachedRing::default());
+        client.register_pane(sessionless.clone());
+        assert!(client.handle_inbound("error", &bare("jti-b")));
+        assert!(sessionless.is_finished());
+        assert!(client.take_reattach_requests().is_empty());
+        assert!(
+            client.handle_inbound("error", &bare("jti-gone")),
+            "a grant no pane routes is consumed"
+        );
     }
 
     /// Phase 1.4, the reactive backstop: the relay's eviction of an expired
@@ -6963,7 +7408,7 @@ mod tests {
             ("jti-1", "attach_grant_expired"),
             ("jti-2", "attach_grant_unknown"),
         ] {
-            let pane = expiring_pane(&client, jti, 600);
+            let pane = expiring_pane(&client, jti, Utc::now() + chrono::Duration::seconds(600));
             client.register_pane(pane.clone());
             assert!(client.handle_inbound("remote_terminal_error", &refusal(jti, code)));
             assert!(client.handle_inbound("remote_terminal_error", &refusal(jti, code)));

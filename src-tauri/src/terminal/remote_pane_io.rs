@@ -327,6 +327,11 @@ pub struct RemotePaneIo {
     /// A "relay lost" / "target not connected" notice is the pane's latest
     /// word, so a successful reattach must say it recovered.
     awaiting_reattach: AtomicBool,
+    /// The last `remote_terminal_flow` this pane queued asked for a pause.
+    /// The target keys its flow gate by grant and drops it on detach, so a
+    /// reattach (a relay reconnect or a renewal) comes back unpaused unless
+    /// this is re-asserted — see [`Self::reassert_flow`].
+    flow_paused: AtomicBool,
     sink: Arc<dyn RemoteFrameSink>,
     /// Sender half of the output channel. `None` once closed — the reader
     /// sees EOF when the last sender drops.
@@ -392,6 +397,7 @@ impl RemotePaneIo {
             target_device_id: None,
             reattaching: AtomicBool::new(false),
             awaiting_reattach: AtomicBool::new(false),
+            flow_paused: AtomicBool::new(false),
             sink,
             output_tx: Mutex::new(Some(tx)),
             output_rx: Mutex::new(Some(rx)),
@@ -846,11 +852,16 @@ impl RemotePaneIo {
     /// is held across the (non-blocking) queue attempt so a concurrent
     /// `kill`/`release` cannot queue a second frame. Only a successful queue
     /// latches: a failure is recorded and left retryable.
+    ///
+    /// The close gate is shut HERE, under the detach lock: a reattach checks
+    /// the gate under the same lock ([`Self::send_reattach`]), so none can be
+    /// queued behind this detach and re-bind the terminal to a closed tab.
     fn send_detach_once(&self) -> Result<(), String> {
         let mut slot = match self.detach.lock() {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
         };
+        self.close_gate.closed.store(true, Ordering::Release);
         if *slot == DetachOutcome::Queued {
             return Ok(());
         }
@@ -872,6 +883,51 @@ impl RemotePaneIo {
             }
         };
         sent
+    }
+
+    /// Queue this pane's [`Self::reattach_frame`] — refused with
+    /// [`REMOTE_PANE_CLOSED`] once the pane has closed or detached. Checked
+    /// under the detach lock, so a reattach can never follow the detach.
+    pub fn send_reattach(&self, request_id: &str) -> Result<(), String> {
+        let _detach = match self.detach.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.close_gate.closed.load(Ordering::Acquire) {
+            return Err(REMOTE_PANE_CLOSED.to_string());
+        }
+        self.send(self.reattach_frame(request_id))
+    }
+
+    /// `Err` once the pane has closed, for a frame built OUTSIDE the pane (a
+    /// history request). Counted and logged like the pane's own refusals.
+    pub fn admit_frame(&self, frame_type: &str) -> Result<(), String> {
+        self.close_gate
+            .admit(frame_type, &self.grant_jti(), &self.terminal_id)
+    }
+
+    /// After a reattach: re-send a pause that was in force, under the CURRENT
+    /// jti. The target dropped the old attachment's flow gate with it, so
+    /// without this a paused tab streams again until its next flow edge.
+    /// Nothing is sent for a pane that was not paused.
+    pub fn reassert_flow(&self) -> Result<(), String> {
+        if !self.flow_paused.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.send_flow(true)
+    }
+
+    fn send_flow(&self, paused: bool) -> Result<(), String> {
+        self.close_gate
+            .admit("remote_terminal_flow", &self.grant_jti(), &self.terminal_id)?;
+        self.send(json!({
+            "type": "remote_terminal_flow",
+            "grant_jti": self.grant_jti(),
+            "terminal_id": self.terminal_id,
+            "paused": paused,
+        }))?;
+        self.flow_paused.store(paused, Ordering::Release);
+        Ok(())
     }
 
     /// The `remote_terminal_attach` frame a reconnect re-presents for this
@@ -1052,14 +1108,7 @@ impl PaneIo for RemotePaneIo {
     }
 
     fn set_paused(&self, paused: bool) -> Result<(), String> {
-        self.close_gate
-            .admit("remote_terminal_flow", &self.grant_jti(), &self.terminal_id)?;
-        self.send(json!({
-            "type": "remote_terminal_flow",
-            "grant_jti": self.grant_jti(),
-            "terminal_id": self.terminal_id,
-            "paused": paused,
-        }))
+        self.send_flow(paused)
     }
 
     fn pid(&self) -> Option<u32> {
