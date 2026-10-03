@@ -748,12 +748,19 @@ pub struct TerminalSessionRecord {
     /// operator's action.
     ///
     /// `false` on a finished record therefore means "coord write still owed".
-    /// The write is enqueued when the mark is made AND again on the session's
-    /// next FRESH registration with coord in this process
-    /// (`AiCoordRegistrar::register_inner`), which covers a mark made while
-    /// the session had no coord row yet. A write coord REFUSES (4xx) is
-    /// ACK-dropped and not retried until the next registration — the flag
-    /// stays `false`, which is the honest reading.
+    /// The write is enqueued when the mark is made, again on any no-op
+    /// re-finish of the still-unsynced mark (`set_finished`'s retry door), AND
+    /// again when the session next gets a coord row in this process — a FRESH
+    /// registration (`AiCoordRegistrar::register_inner`) or, for the terminal
+    /// plane, its terminal being bound to its coord row
+    /// (`AiCoordRegistrar::deliver_owed_finish`). That late delivery covers
+    /// only the IN-PROCESS window between `record_open` and the coord bind: a
+    /// finished session is not restored on boot, so no terminal re-binds for
+    /// it after a runner restart and a mark still unsynced then is carried
+    /// only by an outbox row already queued (or a re-run). A write coord
+    /// REFUSES (4xx) is ACK-dropped and not retried until the next
+    /// registration or re-run — the flag stays `false`, which is the honest
+    /// reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
     /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
@@ -777,6 +784,32 @@ pub struct TerminalSessionRecord {
     /// re-record nor a restore re-spawn overwrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_device_default: Option<SpawnDeviceDefault>,
+    /// The harness id this session was ADOPTED FROM — the session that most
+    /// recently started on the same terminal
+    /// ([`SessionLifecycleStore::latest_open_on_terminal`]) when the provider's
+    /// SessionStart hook reported this id with `source: "clear"` (`/clear` inside a running
+    /// provider mints a new harness id inside the SAME process).
+    /// [`SessionLifecycleStore::mark_adopted_from`] is the one writer.
+    ///
+    /// It records WHOSE session was cleared, not merely which terminal it
+    /// ran on. Every restored session is a typed `claude --resume X` in a
+    /// pane pinned to some OTHER id P, so the terminal alone cannot say
+    /// whether a `/clear` continued P (the pane's own coord row) or X (X's
+    /// own row, registered by `AiCoordRegistrar::register_sniffed_session`).
+    /// A finished marker therefore resolves its coord row as its predecessor
+    /// does, walking this chain
+    /// ([`crate::claude_session::coord_register::resolve_adoption_chain`]).
+    ///
+    /// Not recorded — so the session resolves by its own id alone, and its
+    /// mark stays local-only until that id has a coord row — when the id
+    /// changed without a `clear` hook: the in-process `/resume` picker, or an
+    /// adoption whose hook posted `startup` (the Windows `.cmd` shim).
+    ///
+    /// Sticky: written only by a `clear` hook for this id, never rewritten by
+    /// `record_open`. `None` = not adopted, or the record predates the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_from: Option<String>,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -878,6 +911,17 @@ pub struct SessionLifecycleStore {
     /// superseded PTY cannot outlive the runner that spawned it, so there is
     /// nothing to persist. Consumed on first match.
     superseded_terminals: Mutex<HashSet<String>>,
+    /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
+    /// and, per session id, the counter value of the most recent hook that
+    /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
+    /// open sessions on this terminal STARTED most recently", which
+    /// [`Self::latest_open_on_terminal`] needs and no persisted field can say:
+    /// `confirmed_at` is monotonic (a typed `claude --resume X` of a session
+    /// confirmed earlier keeps X's OLD stamp) and `last_seen_at` is bumped by
+    /// every liveness touch of every open record. Process-local by design: a
+    /// runner restart re-spawns every PTY, and each restored provider fires its
+    /// hook again. LOCK ORDER — `map` then this, never the reverse.
+    session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
     /// shim-fix plan). When attached, every layout-meaningful mutation
@@ -931,6 +975,24 @@ pub struct SessionLifecycleStore {
     /// keeps an unmark from leaving coord saying `finished`. Unattached
     /// (tests, ephemeral fallbacks) → every change stays local-only.
     finish_observer: OnceLock<FinishObserver>,
+    /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
+    /// finish-observer hand-off — so the order coord's outbox receives
+    /// finished / working rows in is the order the local marker changed in.
+    ///
+    /// Without it the observer runs after the map guard is released, so a
+    /// finish (or a no-op retry carrying a snapshot) and a concurrent unmark
+    /// could enqueue in the opposite order to their local writes, leaving
+    /// coord `finished` while the local record is unmarked. Taken BEFORE the
+    /// map lock, and never taken by the observer or anything it calls, so it
+    /// adds no lock cycle.
+    ///
+    /// Residual: the registrar's late-delivery paths
+    /// (`AiCoordRegistrar::register_inner`'s re-offer and
+    /// `deliver_owed_finish`) read a record and enqueue outside this lock, so
+    /// one of them racing an unmark can still land its `Finished` after the
+    /// unmark's `working`. Both fire only on a coord (re-)registration, not on
+    /// an operator call.
+    finish_forward: Mutex<()>,
 }
 
 /// Boxed close-observer callback (see `SessionLifecycleStore::close_observer`).
@@ -938,7 +1000,150 @@ pub struct SessionLifecycleStore {
 struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
 
 /// Boxed finish-observer callback (see `SessionLifecycleStore::finish_observer`).
-struct FinishObserver(Box<dyn Fn(&TerminalSessionRecord) + Send + Sync>);
+/// Returns whether the change it was told about reached the coord outbox.
+struct FinishObserver(Box<dyn Fn(&TerminalSessionRecord) -> FinishSync + Send + Sync>);
+
+/// Whether a finished-marker change was handed to coord — the verdict
+/// `POST /sessions/{id}/finish` reports, so a local-only mark can never read
+/// as a coord write.
+///
+/// Decided at ENQUEUE time: `Queued` means the outbox holds a row addressed to
+/// `coord_session_id`, not that coord has applied it. `finishSynced` on the
+/// record (stamped by the drain's ACK) is the later, stronger answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishSync {
+    /// An outbox row addressed to this coord session is queued.
+    Queued { coord_session_id: uuid::Uuid },
+    /// Nothing was queued; the change is local-only, for this reason.
+    LocalOnly(LocalOnlyReason),
+}
+
+/// Why a finished-marker change stayed local-only. See [`FinishSync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalOnlyReason {
+    /// No coord session id resolves for this session on any runner plane.
+    NoCoordSession,
+    /// A coord id resolved, but the outbox write failed.
+    OutboxWriteFailed,
+    /// Nothing forwarded the change: no finish observer is attached (tests,
+    /// ephemeral stores), or the registrar it forwards to has been dropped.
+    NoForwarder,
+    /// The mark is already synced (coord ACKed it), so no coord write was
+    /// owed and none was queued: a no-op re-run on a synced mark, a no-op
+    /// unmark, or a reason-only rewrite on a synced mark.
+    NotRequeued,
+}
+
+impl LocalOnlyReason {
+    /// The wire spelling (`coord.reason` in the finish route's response).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCoordSession => "no_coord_session",
+            Self::OutboxWriteFailed => "outbox_write_failed",
+            Self::NoForwarder => "no_forwarder",
+            Self::NotRequeued => "not_requeued",
+        }
+    }
+}
+
+/// What a [`SessionLifecycleStore::set_finished`] call actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishChange {
+    /// The marker itself flipped (a fresh mark, or an unmark).
+    Marker,
+    /// The session was already finished; only `finish_reason` was rewritten.
+    ReasonOnly,
+    /// Nothing was written — the marker was already in the requested state and
+    /// no reason was sent. The timestamp did not move.
+    None,
+}
+
+impl FinishChange {
+    /// The wire spelling (`changed` in the finish route's response).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Marker => "marker",
+            Self::ReasonOnly => "reason_only",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Why [`SessionLifecycleStore::set_finished`] produced no [`FinishOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetFinishedError {
+    /// The id is unknown to this lifecycle registry — and ONLY that. The
+    /// finish route answers `404`.
+    UnknownSession,
+    /// The registry could not be read (its lock is poisoned), so whether the
+    /// id is known is itself unknown. Never collapsed into
+    /// [`Self::UnknownSession`]: the finish route answers `500`.
+    Unavailable,
+}
+
+/// The result of a [`SessionLifecycleStore::set_finished`] call on a KNOWN
+/// session: the record as it now stands, what changed, and whether coord was
+/// told.
+#[derive(Debug, Clone)]
+pub struct FinishOutcome {
+    pub record: TerminalSessionRecord,
+    pub changed: FinishChange,
+    pub coord: FinishSync,
+}
+
+impl FinishOutcome {
+    /// The wire body both finish doors answer with — `POST
+    /// /sessions/{id}/finish` and the `terminal_session_set_finished` Tauri
+    /// command:
+    ///
+    /// ```json
+    /// {"success": true, "session": <record>,
+    ///  "changed": "marker" | "reason_only" | "none",
+    ///  "coord": {"queued": bool, "coordSessionId": <uuid|null>,
+    ///            "reason": null | "no_coord_session" | "outbox_write_failed"
+    ///                      | "no_forwarder" | "not_requeued"}}
+    /// ```
+    ///
+    /// `coord.queued` is decided at enqueue time; `session.finishSynced` is
+    /// the later verdict the drain's ACK stamps. A caller that must know coord
+    /// APPLIED the mark re-reads `finishSynced`.
+    ///
+    /// `queued: true` beside `changed: "reason_only"` re-queues the finished
+    /// MARKER, not the reason: the `Finished` row's payload carries no reason
+    /// text, so coord never receives the new reason — it lives in the local
+    /// record only.
+    pub fn response_json(&self) -> serde_json::Value {
+        let coord = match self.coord {
+            FinishSync::Queued { coord_session_id } => serde_json::json!({
+                "queued": true,
+                "coordSessionId": coord_session_id.to_string(),
+                "reason": null,
+            }),
+            FinishSync::LocalOnly(reason) => serde_json::json!({
+                "queued": false,
+                "coordSessionId": null,
+                "reason": reason.as_str(),
+            }),
+        };
+        let mut session = serde_json::to_value(&self.record).unwrap_or_default();
+        // The record omits `finishSynced` when false (compact on disk); the
+        // response ALWAYS carries it, so a caller never has to read an absent
+        // key as `false` — absence would be indistinguishable from a build
+        // that predates the field.
+        if let Some(obj) = session.as_object_mut() {
+            obj.insert(
+                "finishSynced".to_string(),
+                serde_json::Value::Bool(self.record.finish_synced),
+            );
+        }
+        serde_json::json!({
+            "success": true,
+            "session": session,
+            "changed": self.changed.as_str(),
+            "coord": coord,
+        })
+    }
+}
 
 impl std::fmt::Debug for FinishObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -974,11 +1179,13 @@ impl SessionLifecycleStore {
             wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
             superseded_terminals: Mutex::new(HashSet::new()),
+            session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
+            finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -1009,7 +1216,7 @@ impl SessionLifecycleStore {
     /// the production wiring. Without it every change is local-only.
     pub fn attach_finish_observer(
         &self,
-        f: impl Fn(&TerminalSessionRecord) + Send + Sync + 'static,
+        f: impl Fn(&TerminalSessionRecord) -> FinishSync + Send + Sync + 'static,
     ) {
         if self
             .finish_observer
@@ -1968,30 +2175,87 @@ impl SessionLifecycleStore {
     /// **Metadata only — never touches the process.** A finished session keeps
     /// running until it exits on its own.
     ///
-    /// Returns the resulting record when it changed, so the caller can report
-    /// what actually landed rather than what it asked for. `None` = the session
-    /// is unknown, or the marker was already in the requested state (no write).
+    /// For a known session it returns a [`FinishOutcome`] naming what changed
+    /// — the marker, only the reason, or nothing — and whether coord was told
+    /// ([`FinishSync`]), so a caller can report what actually landed rather
+    /// than what it asked for, and a re-run can read the current sync verdict
+    /// instead of an error.
+    ///
+    /// [`SetFinishedError::UnknownSession`] means the id is unknown, and
+    /// nothing else; a poisoned registry lock is
+    /// [`SetFinishedError::Unavailable`], so an unreadable registry can never
+    /// read as "no such session".
+    ///
+    /// A no-op re-finish on a mark coord has NOT ACKed (`finish_synced:
+    /// false`) is the retry door: nothing local is written (`changed:
+    /// None`), but the owed coord write is re-offered to the finish observer
+    /// and its verdict returned — so a mark that stayed local-only (no coord
+    /// row yet, an outbox write failure) can be pushed again by re-running the
+    /// same call. A duplicate enqueue is harmless (idempotent path-addressed
+    /// PATCH).
+    ///
+    /// Each re-run while the mark stays unsynced appends one more `Finished`
+    /// row, including while an earlier one is still pending: the outbox has
+    /// no side-effect-free "is a row for this session pending" probe (its
+    /// `pending()` is the drain loop's cursor-bearing scan), so the count is
+    /// bounded by operator re-runs rather than deduplicated, and each row is
+    /// the same idempotent PATCH.
+    ///
+    /// Calls are serialized end to end (`finish_forward`), so the retry's
+    /// snapshot cannot be overtaken by a concurrent unmark: the order coord's
+    /// outbox sees is the order the marker changed in.
     pub fn set_finished(
         &self,
         claude_session_id: &str,
         finished: bool,
         reason: Option<String>,
-    ) -> Option<TerminalSessionRecord> {
+    ) -> Result<FinishOutcome, SetFinishedError> {
+        // Held to the end of this call: see `finish_forward`. It guards no
+        // data, so a poisoned guard is simply taken over.
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Utc::now().timestamp_millis();
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on set_finished");
-                return None;
+                return Err(SetFinishedError::Unavailable);
             }
         };
-        let rec = m.get_mut(claude_session_id)?;
+        let rec = m
+            .get_mut(claude_session_id)
+            .ok_or(SetFinishedError::UnknownSession)?;
 
         // Idempotent: re-finishing an already-finished session must not move
         // its timestamp, or every repeat call would look like fresh work.
         if finished == rec.finished_at.is_some() && (!finished || reason.is_none()) {
-            return None;
+            let current = rec.clone();
+            // Release the map lock BEFORE the observer runs (it may read the
+            // store, and it enqueues to the outbox). `finish_forward` stays
+            // held, so no concurrent unmark can change the marker between
+            // this snapshot and its enqueue.
+            drop(m);
+            let coord = if current.finished_at.is_some() && !current.finish_synced {
+                self.forward_finish_change(&current)
+            } else {
+                FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
+            };
+            return Ok(FinishOutcome {
+                record: current,
+                changed: FinishChange::None,
+                coord,
+            });
         }
+
+        // Past the guard, an already-finished record can only be a reason
+        // rewrite (`finished` and a `reason` sent); anything else flips it.
+        let changed_kind = if finished && rec.finished_at.is_some() {
+            FinishChange::ReasonOnly
+        } else {
+            FinishChange::Marker
+        };
 
         if finished {
             if rec.finished_at.is_none() {
@@ -2022,12 +2286,25 @@ impl SessionLifecycleStore {
         // ACKed yet, or an unmark (reaching here means it really changed). A
         // duplicate enqueue is harmless: both coord writes are idempotent
         // path-addressed PATCHes.
-        if changed.finished_at.is_none() || !changed.finish_synced {
-            if let Some(obs) = self.finish_observer.get() {
-                (obs.0)(&changed);
-            }
+        let coord = if changed.finished_at.is_none() || !changed.finish_synced {
+            self.forward_finish_change(&changed)
+        } else {
+            FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
+        };
+        Ok(FinishOutcome {
+            record: changed,
+            changed: changed_kind,
+            coord,
+        })
+    }
+
+    /// Hand `rec`'s finished-marker state to the finish observer and return
+    /// its verdict. MUST be called with the map lock released.
+    fn forward_finish_change(&self, rec: &TerminalSessionRecord) -> FinishSync {
+        match self.finish_observer.get() {
+            Some(obs) => (obs.0)(rec),
+            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
         }
-        Some(changed)
     }
 
     /// Record that coord has ACKed this session's finished marker.
@@ -2184,6 +2461,38 @@ impl SessionLifecycleStore {
         // honest restore tier (terminal_only → full for a Full-tier
         // provider), which is a material wire-field change.
         self.mirror_restore_record(&confirmed);
+    }
+
+    /// Record that the provider ADOPTED `claude_session_id` from
+    /// `predecessor` — its SessionStart hook reported the id with `source:
+    /// "clear"` while `predecessor` was the session open on that terminal
+    /// (see [`TerminalSessionRecord::adopted_from`]). Writes only on change;
+    /// no-op when the session is absent, `predecessor` is empty, or names the
+    /// session itself. Never creates a record.
+    pub fn mark_adopted_from(&self, claude_session_id: &str, predecessor: &str) {
+        if predecessor.trim().is_empty() || predecessor == claude_session_id {
+            return;
+        }
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_adopted_from");
+                return;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.adopted_from.as_deref() != Some(predecessor) => {
+                rec.adopted_from = Some(predecessor.to_string());
+                rec.clone()
+            }
+            _ => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
     }
 
     /// Persist the coord-minted stable fleet session handle (`fsh_…`) onto the
@@ -2558,6 +2867,86 @@ impl SessionLifecycleStore {
             .filter(|r| r.confirmed_at.is_some())
     }
 
+    /// Record that a provider's SessionStart hook just reported
+    /// `claude_session_id` — the process that hook came from is now the one
+    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`].
+    pub fn note_session_start_hook(&self, claude_session_id: &str) {
+        match self.session_start_hooks.lock() {
+            Ok(mut g) => {
+                g.0 += 1;
+                let seq = g.0;
+                g.1.insert(claude_session_id.to_string(), seq);
+            }
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on note_session_start_hook");
+            }
+        }
+    }
+
+    /// The MOST RECENT open session on `terminal_id`, other than `exclude` —
+    /// the session a `/clear` hook on that terminal continued.
+    ///
+    /// A terminal routinely carries several open, confirmed rows (a pane
+    /// pinned to P whose operator then typed `claude --resume X`: the hook
+    /// bind evicts only UNCONFIRMED siblings, confirming runs no supersede
+    /// scan, and liveness keeps both alive while any provider runs in the
+    /// subtree), so [`Self::find_open_by_terminal`]'s first-match over the
+    /// `HashMap` would pick one by iteration order. This ranks instead, greatest
+    /// wins:
+    ///
+    /// 1. the latest SessionStart hook seen for the id in this process
+    ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
+    ///    without;
+    /// 2. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 3. then `last_seen_at`, then `opened_at`;
+    /// 4. then `claude_session_id`, so the choice is deterministic even on a
+    ///    full tie.
+    ///
+    /// The hook order comes first because `confirmed_at` is monotonic: a typed
+    /// resume of a session confirmed BEFORE the pane's own session keeps the
+    /// older stamp and would lose to the pane on `confirmed_at` alone.
+    pub fn latest_open_on_terminal(
+        &self,
+        terminal_id: &str,
+        exclude: &str,
+    ) -> Option<TerminalSessionRecord> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on latest_open_on_terminal");
+                return None;
+            }
+        };
+        let hooks = match self.session_start_hooks.lock() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: hook-order lock poisoned on latest_open_on_terminal");
+                return None;
+            }
+        };
+        m.values()
+            .filter(|r| {
+                r.state == "open" && r.terminal_id == terminal_id && r.claude_session_id != exclude
+            })
+            .max_by(|a, b| {
+                let key = |r: &TerminalSessionRecord| {
+                    (
+                        hooks.1.get(&r.claude_session_id).copied(),
+                        r.confirmed_at,
+                        r.last_seen_at,
+                        r.opened_at,
+                    )
+                };
+                key(a)
+                    .cmp(&key(b))
+                    .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+            })
+            .cloned()
+    }
+
     /// Clone of the record for `claude_session_id`, open or closed.
     pub fn get(&self, claude_session_id: &str) -> Option<TerminalSessionRecord> {
         match self.map.lock() {
@@ -2590,6 +2979,24 @@ impl SessionLifecycleStore {
             Ok(m) => m.values().cloned().collect(),
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Clone of every record carrying a finished marker coord has not ACKed
+    /// (`finished_at` set, `finish_synced` false) — the marks whose coord
+    /// write is still owed. Filtered under the lock so a late-delivery pass
+    /// clones only those, not the whole registry.
+    pub fn unsynced_finished_records(&self) -> Vec<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m
+                .values()
+                .filter(|r| r.finished_at.is_some() && !r.finish_synced)
+                .cloned()
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on unsynced_finished_records");
                 Vec::new()
             }
         }
@@ -3853,6 +4260,47 @@ pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     }
 }
 
+/// A minimal open record for `id`, for tests OUTSIDE this module that need a
+/// session the store knows (the finish route, the registrar).
+#[cfg(test)]
+pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
+    TerminalSessionRecord {
+        claude_session_id: id.to_string(),
+        config_dir: None,
+        working_dir: None,
+        page_id: "default".to_string(),
+        zone_index: 0,
+        title: None,
+        terminal_id: format!("term-{id}"),
+        opened_at: 0,
+        last_seen_at: 0,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        provider: DEFAULT_PROVIDER.to_string(),
+        origin: None,
+        restore_pending_at: None,
+        confirmed_at: None,
+        handle: None,
+        account_label: None,
+        account_wrapper: None,
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
+        finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
+        finish_reason: None,
+        finish_synced: false,
+        spawn_device_default: None,
+        adopted_from: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4072,6 +4520,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
@@ -5630,6 +6079,75 @@ mod tests {
         );
     }
 
+    /// `latest_open_on_terminal` ranks hook order, then `confirmed_at`, then
+    /// `last_seen_at` / `opened_at`, then the id — so it is deterministic on a
+    /// full tie, never names the excluded id, and ignores closed rows and other
+    /// terminals.
+    #[test]
+    fn latest_open_on_terminal_ranks_deterministically() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            // Inserted as `observed` + unconfirmed, which supersedes nothing,
+            // then confirmed in place — how several open confirmed rows come to
+            // share one terminal without `record_open`'s supersede arm.
+            for id in ["b-tied", "a-tied", "c-tied"] {
+                let mut r = rec(id);
+                r.terminal_id = "term-t".to_string();
+                r.origin = Some(ORIGIN_OBSERVED.to_string());
+                store.record_open(r);
+            }
+            store.record_open(auth_on("other-term", "term-elsewhere"));
+            store.note_session_start_hook("other-term");
+            {
+                let mut m = store.map.lock().unwrap();
+                for id in ["a-tied", "b-tied", "c-tied"] {
+                    let r = m.get_mut(id).unwrap();
+                    r.confirmed_at = Some(5);
+                    r.last_seen_at = 7;
+                    r.opened_at = 7;
+                }
+            }
+            // Full tie: the greatest id, every time.
+            assert_eq!(
+                store
+                    .latest_open_on_terminal("term-t", "nobody")
+                    .unwrap()
+                    .claude_session_id,
+                "c-tied"
+            );
+            // The excluded id is never the answer.
+            assert_eq!(
+                store
+                    .latest_open_on_terminal("term-t", "c-tied")
+                    .unwrap()
+                    .claude_session_id,
+                "b-tied"
+            );
+            // A hook outranks every timestamp, and the latest hook wins.
+            store.note_session_start_hook("b-tied");
+            store.note_session_start_hook("a-tied");
+            assert_eq!(
+                store
+                    .latest_open_on_terminal("term-t", "nobody")
+                    .unwrap()
+                    .claude_session_id,
+                "a-tied"
+            );
+            // A closed row is not a candidate however recent its hook.
+            store.record_close("a-tied", "explicit");
+            assert_eq!(
+                store
+                    .latest_open_on_terminal("term-t", "nobody")
+                    .unwrap()
+                    .claude_session_id,
+                "b-tied"
+            );
+            assert!(store.latest_open_on_terminal("term-none", "x").is_none());
+            assert!(store.latest_open_on_terminal("", "x").is_none());
+        }
+    }
+
     /// The redirect must be correct — and DETERMINISTIC — when the caller's
     /// terminal carries more than one open row (the per-terminal single-open-row
     /// invariant is enforced at open and at boot, never in between). It ranks
@@ -6054,8 +6572,8 @@ mod tests {
         store.record_open(rec("finished-pty-exit"));
         store.record_close("finished-pty-exit", "pty-exit");
 
-        store.set_finished("finished-open", true, Some("work landed".into()));
-        store.set_finished("finished-pty-exit", true, None);
+        let _ = store.set_finished("finished-open", true, Some("work landed".into()));
+        let _ = store.set_finished("finished-pty-exit", true, None);
 
         let now = Utc::now().timestamp_millis();
         let ids: Vec<String> = store
@@ -6084,7 +6602,8 @@ mod tests {
         store.record_open(rec("live"));
         let after = store
             .set_finished("live", true, Some("done".into()))
-            .expect("marking a known session reports the new record");
+            .expect("marking a known session reports the new record")
+            .record;
 
         assert_eq!(
             after.state, "open",
@@ -6124,11 +6643,20 @@ mod tests {
 
         store.record_open(rec("s"));
         let first = store.set_finished("s", true, Some("r1".into())).unwrap();
-        let stamped = first.finished_at.unwrap();
+        assert_eq!(first.changed, FinishChange::Marker);
+        let stamped = first.record.finished_at.unwrap();
 
-        assert!(
-            store.set_finished("s", true, None).is_none(),
+        let again = store.set_finished("s", true, None).unwrap();
+        assert_eq!(
+            again.changed,
+            FinishChange::None,
             "re-finishing with no new reason is a no-op — no write, no restamp"
+        );
+        assert_eq!(
+            again.coord,
+            FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            "a no-op on an UNSYNCED mark re-offers the owed write; with no \
+             forwarder attached it stays local-only"
         );
         let snap = store
             .all_records()
@@ -6146,8 +6674,15 @@ mod tests {
                 .unwrap()
                 .finish_synced
         );
+        assert_eq!(
+            store.set_finished("s", true, None).unwrap().coord,
+            FinishSync::LocalOnly(LocalOnlyReason::NotRequeued),
+            "a no-op on a SYNCED mark owes coord nothing"
+        );
 
         let un = store.set_finished("s", false, None).unwrap();
+        assert_eq!(un.changed, FinishChange::Marker);
+        let un = un.record;
         assert!(un.finished_at.is_none());
         assert!(un.finish_reason.is_none(), "the reason is cleared with it");
         assert!(
@@ -6157,14 +6692,54 @@ mod tests {
         );
 
         assert!(
-            store.set_finished("nope", true, None).is_none(),
-            "an unknown session is None, never a panic or a phantom record"
+            matches!(
+                store.set_finished("nope", true, None),
+                Err(SetFinishedError::UnknownSession)
+            ),
+            "an unknown session is UnknownSession, never a panic or a phantom record"
+        );
+    }
+
+    /// Review round 2, L-a: every observer hand-off — a fresh mark, the
+    /// no-op retry's snapshot, an unmark — runs with `finish_forward` held,
+    /// so a concurrent unmark cannot enqueue between a snapshot and its
+    /// forward and leave coord `finished` for an unmarked record.
+    #[test]
+    fn set_finished_holds_the_forward_serializer_across_the_observer() {
+        let dir = tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(SessionLifecycleStore::open(dir.path().join("s.json")).unwrap());
+        let held: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        {
+            let weak = std::sync::Arc::downgrade(&store);
+            let held = held.clone();
+            store.attach_finish_observer(move |_rec| {
+                let store = weak.upgrade().expect("store alive");
+                held.lock()
+                    .unwrap()
+                    .push(store.finish_forward.try_lock().is_err());
+                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+            });
+        }
+        store.record_open(rec("s"));
+        let _ = store.set_finished("s", true, None); // fresh mark
+        let _ = store.set_finished("s", true, None); // no-op retry (unsynced)
+        let _ = store.set_finished("s", false, None); // unmark
+        assert_eq!(
+            *held.lock().unwrap(),
+            vec![true, true, true],
+            "the serializer is held for every forward"
+        );
+        assert!(
+            store.finish_forward.try_lock().is_ok(),
+            "and released when set_finished returns"
         );
     }
 
     /// The finish observer is the producer seam for coord's `Finished` outbox
-    /// row: it must fire for a fresh mark, stay silent on a no-op repeat, on an
-    /// unmark and on an unknown id, and stop firing once coord has ACKed.
+    /// row: it must fire for a fresh mark and re-fire for a no-op repeat while
+    /// the mark is UNSYNCED (the retry door), stay silent on a no-op unmark
+    /// and on an unknown id, and stop firing once coord has ACKed.
     #[test]
     fn finish_observer_fires_only_while_a_coord_write_is_owed() {
         let dir = tempdir().unwrap();
@@ -6176,48 +6751,51 @@ mod tests {
             store.attach_finish_observer(move |rec| {
                 seen.lock()
                     .unwrap()
-                    .push((rec.claude_session_id.clone(), rec.finished_at.is_some()))
+                    .push((rec.claude_session_id.clone(), rec.finished_at.is_some()));
+                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
             });
         }
         store.record_open(rec("s"));
 
-        store.set_finished("ghost", true, None);
-        store.set_finished("s", false, None);
+        let _ = store.set_finished("ghost", true, None);
+        let _ = store.set_finished("s", false, None);
         assert!(
             seen.lock().unwrap().is_empty(),
             "an unknown id and a no-op unmark never fire"
         );
 
-        store.set_finished("s", true, None);
+        let _ = store.set_finished("s", true, None);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![("s".to_string(), true)],
             "fresh mark fires"
         );
 
-        store.set_finished("s", true, None);
-        assert_eq!(
-            seen.lock().unwrap().len(),
-            1,
-            "a no-op repeat does not fire"
-        );
-
-        store.set_finished("s", true, Some("reason".into()));
+        let _ = store.set_finished("s", true, None);
         assert_eq!(
             seen.lock().unwrap().len(),
             2,
+            "a no-op repeat on an UNSYNCED mark re-fires — the retry door"
+        );
+
+        let _ = store.set_finished("s", true, Some("reason".into()));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
             "a reason update on an UNSYNCED mark re-fires — coord still owes the write"
         );
 
         store.mark_finish_synced("s", None);
-        store.set_finished("s", true, Some("later reason".into()));
+        let _ = store.set_finished("s", true, Some("later reason".into()));
+        let _ = store.set_finished("s", true, None);
         assert_eq!(
             seen.lock().unwrap().len(),
-            2,
-            "once coord has ACKed, a reason-only update owes coord nothing"
+            3,
+            "once coord has ACKed, neither a reason-only update nor a no-op owes \
+             coord anything"
         );
 
-        store.set_finished("s", false, None);
+        let _ = store.set_finished("s", false, None);
         assert_eq!(
             seen.lock().unwrap().last(),
             Some(&("s".to_string(), false)),
@@ -6233,10 +6811,18 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(rec("s"));
 
-        let first = store.set_finished("s", true, None).unwrap().finished_at;
-        store.set_finished("s", false, None);
+        let first = store
+            .set_finished("s", true, None)
+            .unwrap()
+            .record
+            .finished_at;
+        let _ = store.set_finished("s", false, None);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let second = store.set_finished("s", true, None).unwrap().finished_at;
+        let second = store
+            .set_finished("s", true, None)
+            .unwrap()
+            .record
+            .finished_at;
         assert_ne!(first, second);
 
         store.mark_finish_synced("s", first);
@@ -6258,8 +6844,8 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         store.record_open(rec("s"));
-        store.set_finished("s", true, None);
-        store.set_finished("s", false, None);
+        let _ = store.set_finished("s", true, None);
+        let _ = store.set_finished("s", false, None);
 
         store.mark_finish_synced("s", None); // the in-flight ACK lands late
 
@@ -7728,6 +8314,7 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 

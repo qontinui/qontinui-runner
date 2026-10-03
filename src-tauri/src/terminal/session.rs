@@ -4044,6 +4044,12 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// This terminal's id (the [`super::manager::TerminalManager`] key, and
+    /// the `terminal_id` its lifecycle records carry).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// The harness session id the identity seam pinned this PTY child to —
     /// the value of `QONTINUI_PINNED_SESSION_ID` in the child's env, and the
     /// id the coord session row is registered under. Fixed at spawn.
