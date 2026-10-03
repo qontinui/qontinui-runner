@@ -488,6 +488,14 @@ impl TranscriptEmitter {
             return;
         };
 
+        // The tenant refused this session's transcript sync (coord 429
+        // `transcript_sync_disabled`, recorded by the drain): stop queueing
+        // rows that coord has already said it will not take, until the next
+        // runner start. No offset is reserved, so nothing leaves a hole.
+        if super::coord_sync::transcript_sync_refused(session_id) {
+            return;
+        }
+
         // Gate 3 — redact unconditionally. Workflow runs carry no
         // coord-native Intent with a per-session opt-out, so no secret byte
         // ever reaches the durable outbox file.

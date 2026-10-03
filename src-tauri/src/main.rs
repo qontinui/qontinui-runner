@@ -3972,6 +3972,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 coord_sync_facade.attach_registry(&registry);
 
+                // Enqueue-time tenant stamp for the owner-only `/events` rows
+                // (restore-record, coord-transport-rung — plan
+                // 2026-09-28-anyone-holding-a-session-uuid-can-write-its-
+                // transcript-because-session-output-and-event-writes-are-
+                // anonymous, Phase 2). Their session ids belong to either
+                // registry, so the lookup asks both; weak handles, because
+                // this global outlives neither and must not keep them alive.
+                {
+                    let registry_w = std::sync::Arc::downgrade(&registry);
+                    let registrar_w = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    let installed = session::session_tenant_stamp::install(std::sync::Arc::new(
+                        move |sid: uuid::Uuid| {
+                            registry_w
+                                .upgrade()
+                                .and_then(|r| r.describe_by_id(sid).ok())
+                                .and_then(|d| d.intent.tenant_id)
+                                .or_else(|| {
+                                    registrar_w
+                                        .upgrade()
+                                        .and_then(|r| r.tenant_of_session(sid))
+                                })
+                        },
+                    ));
+                    if !installed {
+                        tracing::warn!(
+                            "session: the session-tenant stamp lookup was already installed — \
+                             keeping the first"
+                        );
+                    }
+                }
+
                 // Outbox handle kept for the restore-record mirror emitter
                 // attached to the lifecycle store below (plan 2026-07-09
                 // §3.4, Phase 4).

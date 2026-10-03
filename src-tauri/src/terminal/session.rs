@@ -7796,6 +7796,11 @@ pub(crate) mod tests {
             c
         };
         cmd.env("TERM", "xterm-256color");
+        // portable-pty defaults the child's cwd to $HOME, captured when the
+        // command is built. A concurrent `IsolatedAmbient` test points HOME at a
+        // temp dir it deletes on drop, so the spawn's chdir could hit ENOENT —
+        // pin a directory that always exists.
+        cmd.cwd(std::env::temp_dir());
 
         let mut child = pair.slave.spawn_command(cmd).expect("spawn echo child");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
