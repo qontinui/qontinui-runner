@@ -1678,6 +1678,17 @@ impl ClaudeSession {
         }
     }
 
+    /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
+    /// parked `IsolatedEditContext` holds; empty for a fresh or
+    /// shared-checkout session. Mirrors `TerminalSession::allocation_bases`.
+    pub fn allocation_bases(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.allocation_bases()))
+            .unwrap_or_default()
+    }
+
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
