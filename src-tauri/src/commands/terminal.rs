@@ -384,6 +384,13 @@ pub async fn terminal_create(
                 // which fires once the session's identity is long past
                 // changing.
                 let exit_pinned_session_id = session.pinned_session_id().to_string();
+                // A boot-restored gate continuation is re-registered in the
+                // continuation registry against THIS terminal (plan 2026-10-03
+                // D3), so its death must reach the same producer a backend
+                // spawn's does. A no-op for a terminal the registry does not
+                // hold — every ordinary operator tab.
+                let exited_terminal_id = info.id.clone();
+                let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
                 session.set_on_exit(Box::new(move |coord_id, exit| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
@@ -392,6 +399,11 @@ pub async fn terminal_create(
                             "terminal exit hook: coord session close failed"
                         );
                     }
+                    crate::agent_runtime::notify_continuation_terminal_exit(
+                        &exited_terminal_id,
+                        Some(&exit_rt_handle),
+                        Some(exit),
+                    );
                     // Trigger 4 (session_exit) — plan
                     // 2026-08-27-operator-touch-observation-runner-emitter,
                     // Phase B2 §2b/§2c.
