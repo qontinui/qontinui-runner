@@ -203,7 +203,13 @@ Every gate needs exactly ONE anchor:
   - This is a **separate FIRST call**: the `register-gate` route does NOT upsert
     (it 404s `work_unit_not_found` if the slug is absent).
 - **Claim-anchored:** `(claim_kind, resource_key)` — only when the gate is bound
-  to a specific coord claim, not a plan phase.
+  to a specific coord claim, not a plan phase. **Never anchor a "watch / babysit
+  this OPEN PR" continuation on `claim:pr:<owner>/<repo>#<n>`**: coord's auto-PR
+  hook registers (on PR open, when enabled) its own open `pr_merged` gate on
+  that exact anchor, so your cleared continuation is held until the PR lands
+  while `will_dispatch` still reads `true`. Use a work-unit anchor or a
+  non-`pr` `claim_kind` (e.g. `babysit`).
+  Canonical: `_gate-registration` → "Anchor derivation (zero user input)".
 
 > **The work-unit WRITES are device-authed — no more upsert wall.** The work-unit
 > upsert + register routes live on coord's `require_jwt` sub-router, so a **device
