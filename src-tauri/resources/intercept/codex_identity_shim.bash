@@ -72,15 +72,27 @@ if [ "${QONTINUI_INSTALL_INTERCEPT_GUARD:-}" = "1" ]; then
   exec_real "$@"
 fi
 
+# A string as JSON string content: backslash and quote escaped, newline, CR
+# and tab as their escapes, and every other control character dropped (none
+# belongs in a path). Unescaped, a cwd holding one made the body invalid JSON
+# and the signal was silently lost.
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s" | tr -d '\001-\010\013\014\016-\037\177'
 }
 
-# Best-effort start signal. Never load-bearing — short timeout, every failure
-# ignored. The cwd is reported in the frame the CLI records it in: under
-# Git-Bash `$PWD` is the mingw `/c/...` form while a Windows binary writes
-# `C:\...`, so prefer `pwd -W` (MSYS Windows form) and fall back to `$PWD` on a
-# real Unix shell. The runner also folds the mingw form (#651, `6b38190c6`).
+# Best-effort start signal. Never load-bearing, and never in the way: it runs
+# in the BACKGROUND with a 2 s ceiling, so the CLI starts at once whatever the
+# runner's port does; every failure is ignored. The cwd is reported in the
+# frame the CLI records it in: under Git-Bash `$PWD` is the mingw `/c/...`
+# form while a Windows binary writes `C:\...`, so prefer `pwd -W` (MSYS
+# Windows form) and fall back to `$PWD` on a real Unix shell. The runner also
+# folds the mingw form (#651, `6b38190c6`).
 notify_session_start() {
   local port="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
   [ -z "$port" ] && return 0
@@ -93,10 +105,10 @@ notify_session_start() {
     body="$body,\"config_dir\":\"$(json_escape "$CODEX_HOME")\""
   fi
   body="$body}"
-  curl -fsS --connect-timeout 3 --max-time 10 \
+  curl -fsS --connect-timeout 1 --max-time 2 \
       -X POST "http://127.0.0.1:$port/control/session-open" \
       -H 'Content-Type: application/json' \
-      -d "$body" >/dev/null 2>&1 || true
+      -d "$body" >/dev/null 2>&1 &
 }
 
 # Only a launch that can start a session signals. A management subcommand
