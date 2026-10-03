@@ -156,9 +156,11 @@ pub async fn run_fix_agent(
 
     let mut cmd = build_fix_agent_command(&prompt_file.display().to_string(), model);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+    // Retries a transient launch failure (the CLI mid-reinstall by its own
+    // auto-updater) before reporting it.
+    let mut child = crate::claude_cli_spawn::spawn_tokio_with_retry(&mut cmd, None)
+        .await
+        .map_err(|f| format!("Failed to spawn Claude CLI: {}", f.describe_error()))?;
 
     // Log stdout/stderr
     let stdout = child.stdout.take();
