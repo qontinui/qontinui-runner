@@ -661,10 +661,10 @@ describe("WorkerSessionCell wiring", () => {
   const source = readFileSync(resolve(__dirname, "./WorkerSessionCell.tsx"), "utf8");
 
   it("hands the cell's visibility to the file-changes hook", () => {
-    // Pins the fix: `visible` must reach `useWorkerFileChanges`, not just the
+    // Pins the fix: `visible` must reach `useSessionReview` (formerly `useWorkerFileChanges`), not just the
     // `data-visible` attribute it used to be spent on.
     expect(source).toMatch(
-      /useWorkerFileChanges\(\s*taskRunId,\s*session\.sessionState,\s*visible,\s*\)/,
+      /useSessionReview\(taskRunId,\s*\{\s*visible,\s*sessionState:\s*session\.sessionState\s*\}\)/,
     );
   });
 });

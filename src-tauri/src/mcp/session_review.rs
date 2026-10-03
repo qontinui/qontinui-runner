@@ -47,7 +47,9 @@
 //! transcript tail (`terminal/transcript_watcher.rs`), so a tail parked after
 //! 600 s idle and revived on the next write is covered by the same call. When
 //! the target terminal exits, its still-`submitted` notes settle to `unknown`
-//! ([`settle_on_terminal_exit`]) — never to `confirmed` on a guess.
+//! ([`settle_on_terminal_exit`]) — never to `confirmed` on a guess. A task-run
+//! target settles the same way when its stream-json worker process ends with
+//! no successor ([`settle_on_task_run_end`]).
 //!
 //! Every mutation emits `session-review-changed` `{ "sessionId": … }` so the
 //! page refreshes.
@@ -57,7 +59,8 @@
 //! Confirmation reads the PTY transcript tail. A stream-json task run's
 //! transcript is not tailed by it (the watcher tears workflow sessions down),
 //! so a note sent to a `taskRunId` target stays `submitted` — which is true —
-//! rather than being promoted on the strength of a stdin write.
+//! rather than being promoted on the strength of a stdin write, until the
+//! worker's process ends, when it settles to `unknown`.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -1201,25 +1204,63 @@ pub async fn observe_transcript_line(app: &tauri::AppHandle, store: &dyn ReviewS
 /// Exit hook for a terminal's waiter thread: settle the notes sent into it
 /// that were never seen arriving. Fire-and-forget; needs no caller runtime.
 pub fn settle_on_terminal_exit(app: tauri::AppHandle, terminal_id: String) {
+    spawn_settle(app, NoteTarget::TerminalId(terminal_id), "terminal exit");
+}
+
+/// End hook for a stream-json task-run worker's process-exit waiter
+/// (`claude_session/session.rs`): its transcript is never tailed, so without
+/// this a note sent to it would sit `submitted` forever. Settles to `unknown`
+/// only when no live session holds the task-run id any more — a rate-limit
+/// auto-restart re-registers a successor under the same id BEFORE the old
+/// process's waiter gets here, and that successor can still receive the turn.
+/// Fire-and-forget; needs no caller runtime.
+pub fn settle_on_task_run_end(app: tauri::AppHandle, task_run_id: String) {
+    use tauri::Manager;
+    let successor_live = app
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .and_then(|sm| sm.get(&task_run_id))
+        .is_some_and(|session| session.state().is_active());
+    if !task_run_end_settles(successor_live) {
+        info!(
+            task_run_id = %task_run_id,
+            "session review: worker process ended but a live successor holds the task run; notes left submitted"
+        );
+        return;
+    }
+    spawn_settle(app, NoteTarget::TaskRunId(task_run_id), "task-run end");
+}
+
+/// Whether a task-run worker's end settles its notes: only when no live
+/// session took over the id.
+fn task_run_end_settles(successor_live: bool) -> bool {
+    !successor_live
+}
+
+/// Settle `target`'s still-`submitted` notes to `unknown` off-thread, then
+/// emit `session-review-changed` for each session that changed.
+fn spawn_settle(app: tauri::AppHandle, target: NoteTarget, cause: &'static str) {
     let Some(pg) = crate::database::pg::PgDb::try_global() else {
         return;
     };
     tauri::async_runtime::spawn(async move {
-        let target = NoteTarget::TerminalId(terminal_id);
         match settle_target_exit(&*pg, &target).await {
             Ok(sessions) => {
                 for session_id in sessions {
                     info!(
                         session_id = %session_id,
-                        terminal_id = %target.id(),
-                        "session review: unconfirmed notes settled to unknown on terminal exit"
+                        target_kind = target.kind(),
+                        target_id = %target.id(),
+                        cause,
+                        "session review: unconfirmed notes settled to unknown"
                     );
                     emit_review_changed(&app, &session_id);
                 }
             }
             Err(e) => warn!(
-                "session review: settling notes for exited terminal {} failed: {}",
+                "session review: settling notes for {} {} ({}) failed: {}",
+                target.kind(),
                 target.id(),
+                cause,
                 e
             ),
         }
@@ -2099,6 +2140,62 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.note(&sent.id).state, NoteState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn session_review_task_run_end_settles_submitted_to_unknown() {
+        let store = MemoryStore::default();
+        let worker = NoteTarget::TaskRunId("run-1".to_string());
+        let sent = attached_note(&store, SESSION).await;
+        let to_terminal = attached_note(&store, SESSION).await;
+        let mut req = send_req(&[&sent.id]);
+        req.target = worker.clone();
+        send(
+            &store,
+            &ScriptedDoor::ok(),
+            &MarkerSightings::new(),
+            SESSION,
+            req,
+            SendMode::Submit,
+        )
+        .await
+        .expect("send to worker");
+        assert_eq!(store.note(&sent.id).state, NoteState::Submitted);
+        send(
+            &store,
+            &ScriptedDoor::ok(),
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&to_terminal.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect("send to terminal");
+
+        // A different task run ending, or the terminal exiting, leaves the
+        // worker's note alone; a terminal id equal to the run id is a
+        // different target.
+        let other = NoteTarget::TaskRunId("run-2".to_string());
+        assert!(settle_target_exit(&store, &other).await.unwrap().is_empty());
+        let same_id_terminal = NoteTarget::TerminalId("run-1".to_string());
+        assert!(settle_target_exit(&store, &same_id_terminal)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.note(&sent.id).state, NoteState::Submitted);
+
+        let changed = settle_target_exit(&store, &worker).await.unwrap();
+        assert_eq!(changed, BTreeSet::from([SESSION.to_string()]));
+        assert_eq!(store.note(&sent.id).state, NoteState::Unknown);
+        assert_eq!(store.note(&to_terminal.id).state, NoteState::Submitted);
+        // Idempotent: a second end settles nothing.
+        assert!(settle_target_exit(&store, &worker).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_review_task_run_end_defers_to_a_live_successor() {
+        assert!(task_run_end_settles(false));
+        assert!(!task_run_end_settles(true));
     }
 
     // ---- wiring ------------------------------------------------------------

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, type ReactNode } from "react";
 import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap, MessageSquare } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
@@ -64,6 +64,7 @@ export function ZoneLabel({
   filterActive,
   onTogglePrompts,
   promptsVisible,
+  reviewSlot,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -84,6 +85,8 @@ export function ZoneLabel({
   /** Omitted when the tab has no Claude session — there are no prompts to show. */
   onTogglePrompts?: () => void;
   promptsVisible?: boolean;
+  /** The review toggle + unread badge (`SessionReviewToggle`), beside the prompts toggle. */
+  reviewSlot?: ReactNode;
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -366,6 +369,8 @@ export function ZoneLabel({
           <MessageSquare className="w-2.5 h-2.5" />
         </button>
       )}
+
+      {reviewSlot}
 
       {onScrollToBottom && (
         <button
