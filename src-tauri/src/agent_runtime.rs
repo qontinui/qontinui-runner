@@ -6479,6 +6479,25 @@ fn never_started_detail(evidence: &NeverStartedEvidence) -> String {
     }
 }
 
+/// The condition-check reading of a start verdict: `None` when the session
+/// started (it owns its own report from here), else the `spawn_failed` reason.
+///
+/// Both non-start arms are reported, unlike the gate path's retry: a closed
+/// pane with no transcript is also a session that will never post the run's
+/// report, so leaving the row `running` would be the same silence.
+fn condition_check_never_started_reason(start: &ContinuationStart) -> Option<String> {
+    match start {
+        ContinuationStart::Started { .. } => None,
+        ContinuationStart::Closed => {
+            Some("condition-check pane was closed before the session started".to_string())
+        }
+        ContinuationStart::NeverStarted(evidence) => Some(format!(
+            "condition-check never started: {}",
+            never_started_detail(evidence)
+        )),
+    }
+}
+
 /// The PTY-seam twin of [`classify_spawn_error`]: the terminal spawn surfaces
 /// hand back a `String`, so the trust gate's refusal is recognised by its
 /// [`crate::claude_session::trust_gate::SPAWN_BLOCKED_REFUSAL_PREFIX`] rather
@@ -6654,7 +6673,9 @@ fn is_simple_uuid_char(c: &char) -> bool {
 /// The token is SINGLE-SHOT — coord clears it on this UPDATE. That is safe here
 /// and only here: every call site is a path on which the session definitively
 /// did not spawn, so there is no agent left that could have wanted to report.
-/// Never call this after a successful `create_tracked_terminal_session_backend`.
+/// Never call this after a successful `create_tracked_terminal_session_backend`
+/// UNLESS the start verdict ([`await_continuation_start`]) ruled the session
+/// never started — then, too, no agent is left that could report.
 async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: String) {
     let Some(base) = connected_coord_base() else {
         return;
@@ -7046,6 +7067,10 @@ async fn run_condition_check_terminal(
         uuid::Uuid::new_v4().to_string()
     });
 
+    // Kept for the start verdict below: the transcript probe looks in the
+    // selected account's config dir first.
+    let transcript_paths =
+        continuation_transcript_paths(selected_config_dir.as_deref(), &workdir, &pinned_session_id);
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
@@ -7102,7 +7127,40 @@ async fn run_condition_check_terminal(
             // Surface it: switch the main view to the Terminal panel + select the
             // tab (scoped to the MAIN window, same as the gate path).
             emit_terminal_focus_request(&app, &terminal_id);
-            Ok(())
+            // A CREATED pty is not a STARTED session (the 2026-10-01 incident the
+            // gate path's start verdict exists for: `exec: claude: not found`,
+            // pty gone in 73 ms). A condition check that never started has no
+            // agent that could ever post its report, so without this its
+            // `coord.condition_runs` row stays `running`. Same verdict as the
+            // gate path; no local retry — a terminal `error` row is what lets
+            // coord's scheduler dispatch the group again on its next pass.
+            let started =
+                await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
+            match condition_check_never_started_reason(&started) {
+                None => Ok(()),
+                Some(reason) => {
+                    // A pane that died within ~100 ms can exit before its coord
+                    // session id was set, so its exit hook never closed the
+                    // coord row. Close it here (idempotent if the hook did).
+                    if let Some(coord_id) = coord_session_id {
+                        if let Err(e) = session_registry.close_by_id(coord_id) {
+                            debug!(
+                                "agent_runtime: never-started condition-check coord session \
+                                 {coord_id} close: {e}"
+                            );
+                        }
+                    }
+                    warn!(
+                        "agent_runtime: condition-check run_id={} terminal_id={terminal_id}: \
+                         {reason}",
+                        payload.run_id
+                    );
+                    // Safe to spend the single-shot report token: no session
+                    // started, so nothing is left that could have wanted it.
+                    report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+                    Err(anyhow::anyhow!(reason))
+                }
+            }
         }
         Err(e) => {
             // Same classification as the gate-continuation terminal: a
@@ -15570,6 +15628,39 @@ mod tests {
             "pty exited (code unknown) 0ms after spawn, no session transcript"
         );
         assert_eq!(last_output_line("\r\n  \n"), None);
+    }
+
+    /// A condition check reads the same start verdict: a started session owns
+    /// its report; a never-started or closed-before-start pane is reported as
+    /// `spawn_failed`, since no agent is left to drive the run row terminal.
+    #[test]
+    fn condition_check_never_started_reason_reports_every_non_start() {
+        assert_eq!(
+            condition_check_never_started_reason(&ContinuationStart::Started { pty_alive: true }),
+            None
+        );
+        assert_eq!(
+            condition_check_never_started_reason(&ContinuationStart::Started { pty_alive: false }),
+            None
+        );
+        let closed = condition_check_never_started_reason(&ContinuationStart::Closed).unwrap();
+        assert!(
+            closed.contains("closed before the session started"),
+            "{closed}"
+        );
+        let never = condition_check_never_started_reason(&ContinuationStart::NeverStarted(
+            NeverStartedEvidence {
+                exit_code: Some(1),
+                lifetime_ms: 73,
+                last_output: Some("exec: claude: not found".to_string()),
+            },
+        ))
+        .unwrap();
+        assert!(
+            never.starts_with("condition-check never started: exec: claude: not found"),
+            "{never}"
+        );
+        assert!(!never.contains('\n'), "{never}");
     }
 
     /// A continuation inside its start window counts toward the P4 cap until
