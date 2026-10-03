@@ -198,7 +198,8 @@ jobs:
   # THIS JOB MUST NOT FAIL: the script always exits 0 with outputs written, and
   # the step adds a hand-built hosted fallback if it somehow wrote none.
   route:
-    if: ${{ (github.event_name == 'pull_request' && ((vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted') || (vars.RUNNER_WINDOWS_LANE != '' && vars.RUNNER_WINDOWS_LANE != 'hosted'))) || (github.event_name == 'workflow_dispatch' && (inputs.force_linux_lane == 'self-hosted' || (inputs.force_linux_lane != 'hosted' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted'))) }}
+    # Only RUNNER_LINUX_LANE wakes it: no job consumes windows_lane until Phase 4.
+    if: ${{ (github.event_name == 'pull_request' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted') || (github.event_name == 'workflow_dispatch' && (inputs.force_linux_lane == 'self-hosted' || (inputs.force_linux_lane != 'hosted' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -312,7 +313,8 @@ jobs:
         with:
           siblings: qontinui-schemas qontinui-web ui-bridge
           check-build-deps: 'true'
-          target-key: pr-${{ github.event.pull_request.number || format('run-{0}', github.run_id) }}
+          target-key: ${{ github.event.pull_request.number && format('pr-{0}-test', github.event.pull_request.number) || format('run-{0}-test', github.run_id) }}
+          check-rust: 'true'
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -404,6 +406,9 @@ jobs:
       # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
       # 1.95.0 and fail with "'cargo-fmt' is not installed".
       - name: Setup Rust
+        # Hosted lane only: on the pool the toolchain is operator-installed and
+        # RUSTUP_HOME read-only; public-pool-prepare verifies it instead.
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
@@ -1670,7 +1675,8 @@ jobs:
         uses: ./.github/actions/public-pool-prepare
         with:
           siblings: qontinui-schemas
-          target-key: pr-${{ github.event.pull_request.number || format('run-{0}', github.run_id) }}
+          target-key: ${{ github.event.pull_request.number && format('pr-{0}-holder', github.event.pull_request.number) || format('run-{0}-holder', github.run_id) }}
+          check-rust: 'true'
 
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
@@ -1679,6 +1685,8 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Setup Rust
+        # Hosted lane only (see `test`).
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"

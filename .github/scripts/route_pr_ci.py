@@ -60,8 +60,9 @@ it runs on ubuntu-latest). test_route_pr_ci.py pins all of that against the tree
 
 OUTPUTS ($GITHUB_OUTPUT), per OS in {linux, windows}: <os>_lane (self-hosted|hosted),
 <os>_labels (JSON array), <os>_reason (one line). Plus approval_policy (the value read,
-or UNKNOWN). The script ALWAYS exits 0 with every output written: a failing route job
-would skip its dependants, and a skipped required check reads as a pass.
+or UNKNOWN). The script ALWAYS exits 0 with every output written. Dependants run on
+`!cancelled()` and read an empty output as hosted, so a failed route cannot skip them;
+exit 0 keeps the route job itself green and its outputs present.
 
 Stdlib only. Tests: .github/scripts/test_route_pr_ci.py (hermetic).
 """
@@ -407,7 +408,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:  # noqa: BLE001
-        # Never exit non-zero: a failed route job skips its dependants, and a skipped
-        # required check reads as a pass. Emit the hosted floor.
+        # Never exit non-zero; emit the hosted floor (see the module docstring).
         emit(hosted_floor(f"UNKNOWN: route script fault ({type(exc).__name__}); hosted floor"), "UNKNOWN (script fault)", 0)
         sys.exit(0)

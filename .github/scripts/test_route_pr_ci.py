@@ -243,6 +243,20 @@ class TreePins(unittest.TestCase):
     def squash(text):
         return " ".join(str(text).split())
 
+    @classmethod
+    def guarded(cls, cond):
+        # The guard must be a TOP-LEVEL `&&` conjunct of an `if:` with no `||`, so
+        # `x || env.SELF_HOSTED_LANE != 'true'` (true on the pool) does not count.
+        c = cls.squash(cond)
+        if "||" in c:
+            return False
+        return cls.GUARD in [part.strip() for part in c.split("&&")]
+
+    @classmethod
+    def blanked(cls, expr):
+        # `env.SELF_HOSTED_LANE != 'true' && secrets.X || ''` -- exactly this shape.
+        return re.fullmatch(r"env\.SELF_HOSTED_LANE != 'true' && secrets\.[A-Z0-9_]+ \|\| ''", cls.squash(expr)) is not None
+
     def test_routed_jobs_guard_host_mutating_steps(self):
         # The guard must point the right way: `!= 'true'` (skip on the pool), never
         # `== 'true'`, which would run the step ONLY on the pool.
@@ -250,9 +264,10 @@ class TreePins(unittest.TestCase):
             for step in job.get("steps", []):
                 uses = str(step.get("uses", ""))
                 run = str(step.get("run", ""))
-                if any(a in uses for a in self.HOSTED_ONLY_ACTIONS) or self.HOST_MUTATING_RUN.search(run):
-                    self.assertIn(self.GUARD, self.squash(step.get("if", "")),
-                                  f"{key}: step {step.get('name') or uses} is not skipped on the pool")
+                if (any(a in uses for a in self.HOSTED_ONLY_ACTIONS) or "dtolnay/rust-toolchain" in uses
+                        or self.HOST_MUTATING_RUN.search(run)):
+                    self.assertTrue(self.guarded(step.get("if", "")),
+                                    f"{key}: step {step.get('name') or uses} is not skipped on the pool")
 
     def test_routed_jobs_deliver_no_secret_to_the_pool(self):
         # Every `secrets.` occurrence anywhere in a routed job (job env, step env,
@@ -264,15 +279,41 @@ class TreePins(unittest.TestCase):
             for env_key, value in (job.get("env") or {}).items():
                 self.assertNotIn("secrets.", str(value), f"{key}: job-level env {env_key} carries a secret")
             for step in job.get("steps", []):
-                if self.GUARD in self.squash(step.get("if", "")):
+                if self.guarded(step.get("if", "")):
                     continue
                 text = yaml.safe_dump({k: v for k, v in step.items() if k != "if"})
                 for m in expr.finditer(text):
                     e = self.squash(m.group(1))
                     if "secrets." in e:
-                        self.assertTrue(self.GUARD in e and "|| ''" in e,
+                        self.assertTrue(self.blanked(e),
                                         f"{key}: step {step.get('name')} delivers a secret to the pool: {e}")
                 self.assertNotIn("secrets.", expr.sub("", text), f"{key}: step {step.get('name')} names a secret outside an expression")
+
+    def test_workflow_level_env_carries_only_the_run_token(self):
+        doc = self.load(WORKFLOWS / "ci.yml")
+        for k, v in (doc.get("env") or {}).items():
+            if "secrets." in str(v):
+                self.assertEqual(self.squash(v), "${{ secrets.GITHUB_TOKEN }}", f"workflow env {k}")
+
+    def test_no_unrouted_job_can_reach_a_self_hosted_runner(self):
+        # Any job, in any workflow, whose runs-on names self-hosted/public-pool must
+        # be one of the pinned routed ci.yml jobs (toolcache-probe is the one known
+        # dispatch-only exception, pending deletion in qontinui-runner#1966).
+        allowed = {("ci.yml", k) for k in self.routed_jobs()} | {("toolcache-probe.yml", "probe")}
+        for path in self.workflows():
+            doc = self.load(path)
+            for key, job in (doc.get("jobs") or {}).items():
+                ro = str(job.get("runs-on", "")).lower()
+                if "self-hosted" in ro or "public-pool" in ro:
+                    self.assertIn((path.name, key), allowed, f"{path.name}#{key} can reach a self-hosted runner")
+
+    def test_route_job_if_is_pinned(self):
+        doc = self.load(WORKFLOWS / "ci.yml")
+        self.assertEqual(
+            self.squash(doc["jobs"]["route"]["if"]),
+            "${{ (github.event_name == 'pull_request' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted') "
+            "|| (github.event_name == 'workflow_dispatch' && (inputs.force_linux_lane == 'self-hosted' || "
+            "(inputs.force_linux_lane != 'hosted' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted'))) }}")
 
     def test_routed_runs_on_are_pinned(self):
         pool = "'[\"self-hosted\",\"Linux\",\"public-pool\"]'"
@@ -285,8 +326,13 @@ class TreePins(unittest.TestCase):
         self.assertEqual(set(jobs), set(want))
         for key, expected in want.items():
             self.assertEqual(self.squash(jobs[key]["runs-on"]), expected, key)
-            env = self.squash(jobs[key]["env"]["SELF_HOSTED_LANE"])
-            self.assertIn("needs.route.outputs.linux_lane == 'self-hosted'", env, key)
+        lane = {
+            "test": "${{ matrix.platform == 'ubuntu-22.04' && needs.route.outputs.linux_lane == 'self-hosted' }}",
+            "holder-crates": "${{ matrix.platform == 'ubuntu-latest' && needs.route.outputs.linux_lane == 'self-hosted' }}",
+            "frontend-tests": "${{ needs.route.outputs.linux_lane == 'self-hosted' }}",
+        }
+        for key, expected in lane.items():
+            self.assertEqual(self.squash(jobs[key]["env"]["SELF_HOSTED_LANE"]), expected, key)
 
     def test_every_routed_job_prepares_first(self):
         for key, job in self.routed_jobs().items():

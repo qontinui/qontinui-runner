@@ -23,10 +23,17 @@
 #   3. A PERSISTENT TARGET DIR PER PR replaces rust-cache. `actions/checkout`
 #      cleans the workspace (`git clean -ffdx`), so `./target` would be cold every
 #      run. The target dir lives OUTSIDE the workspace, keyed by `target-key` (the
-#      PR number): repeat pushes to one PR build incrementally, but one PR's
-#      artifacts are never loaded by another PR's build. Keys untouched for 3 days
-#      are pruned, and the oldest keys go first when the total passes
-#      `max-target-gb`.
+#      PR number + job): repeat pushes to one PR build incrementally, and PRs do
+#      not share artifacts BY ACCIDENT. This is accident isolation, not
+#      adversarial: every job runs as `runner-public` and can write any key; the
+#      adversarial fix is the host prerequisite (one uid per repo, `_work`/`_tool`
+#      wiped between jobs). Keys untouched for 3+ days are pruned, and the oldest
+#      go first when the total passes `max-target-gb`. No key, no target dir.
+#
+#   5. THE RUST TOOLCHAIN IS VERIFIED, NOT INSTALLED. On the pool, ci.yml skips
+#      dtolnay/rust-toolchain (it writes RUSTUP_HOME); this step requires
+#      toolchain 1.95.0 with clippy+rustfmt to be present AND RUSTUP_HOME to be
+#      read-only to the job account -- the host prerequisite, enforced here.
 #
 #   4. A PER-JOB HOME. More than one runner listener can run as `runner-public`
 #      (qontinui-web's does today), so `$HOME` is shared between concurrent jobs.
@@ -60,9 +67,13 @@ inputs:
     required: false
     default: '200'
   target-key:
-    description: Per-PR key for the persistent target dir (e.g. pr-1234); [A-Za-z0-9._-] only.
+    description: Key for the persistent target dir (e.g. pr-1234-test); [A-Za-z0-9._-] only. Empty = no target dir.
     required: false
     default: ''
+  check-rust:
+    description: "'true' to require toolchain 1.95.0 (+clippy, rustfmt) preinstalled and RUSTUP_HOME read-only."
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -72,6 +83,7 @@ runs:
         CHECK_BUILD_DEPS: ${{ inputs.check-build-deps }}
         MAX_TARGET_GB: ${{ inputs.max-target-gb }}
         TARGET_KEY: ${{ inputs.target-key }}
+        CHECK_RUST: ${{ inputs.check-rust }}
       run: |
         set -euo pipefail
         set -f   # no glob expansion of the sibling list
@@ -82,6 +94,9 @@ runs:
         fi
         grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null || true
 
+        # Remove a path, tolerating read-only modes; never fail the job on it.
+        zap() { chmod -R u+w -- "$1" 2>/dev/null || true; rm -rf -- "$1" 2>/dev/null || { echo "::warning::could not remove $1"; return 1; }; }
+
         # 1. Stale sibling checkouts -- exactly the named directories.
         parent="$(cd "${GITHUB_WORKSPACE}/.." && pwd)"
         for name in ${SIBLINGS}; do
@@ -91,9 +106,9 @@ runs:
           if [ "${parent}/${name}" = "${GITHUB_WORKSPACE}" ]; then
             echo "::error::sibling '${name}' is the workspace itself"; exit 1
           fi
-          if [ -e "${parent}/${name}" ]; then
+          if [ -e "${parent}/${name}" ] || [ -L "${parent}/${name}" ]; then
             echo "removing stale sibling checkout ${parent}/${name}"
-            rm -rf -- "${parent:?}/${name}"
+            zap "${parent:?}/${name}" || { echo "::error::cannot clear ${parent}/${name}"; exit 1; }
           fi
         done
 
@@ -114,43 +129,69 @@ runs:
           echo "build deps present"
         fi
 
-        # 3. Persistent per-PR target dir outside the cleaned workspace (real home).
         real_home="${HOME}"
-        root="${real_home}/.cache/qontinui-runner-ci/targets"
-        mkdir -p "${root}"
-        # Prune keys untouched for 3 days, then the oldest while over the cap.
-        find "${root}" -mindepth 1 -maxdepth 1 -type d -mtime +3 -print0 2>/dev/null \
-          | xargs -0 -r rm -rf --
-        total_gb() { du -s --block-size=1G "${root}" 2>/dev/null | awk 'NR==1{print $1+0}'; }
-        while [ "$(total_gb)" -gt "${MAX_TARGET_GB}" ]; do
-          oldest="$(ls -1tr "${root}" 2>/dev/null | head -1 || true)"
-          [ -n "${oldest}" ] || break
-          echo "target cache over ${MAX_TARGET_GB} GiB; removing ${oldest}"
-          rm -rf -- "${root:?}/${oldest}"
-        done
-        if [ -n "${TARGET_KEY}" ] && [[ "${TARGET_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-          key="${TARGET_KEY}"
-        else
-          key="run-${GITHUB_RUN_ID:?}"
-        fi
-        target="${root}/${key}"
-        mkdir -p "${target}"
-        touch "${target}"
+        rustup_home="${RUSTUP_HOME:-${real_home}/.rustup}"
 
-        # 4. Per-job HOME, XDG dirs and CARGO_HOME; RUSTUP_HOME pinned to the real
-        #    home so the installed toolchain is found (a host prerequisite makes it
-        #    operator-owned and read-only -- plan Phase 2 precondition (d)).
+        # 5 (run early). Rust toolchain: verified, never installed; RUSTUP_HOME read-only.
+        if [ "${CHECK_RUST}" = "true" ]; then
+          if [ -w "${rustup_home}" ]; then
+            echo "::error title=public-pool RUSTUP_HOME is writable::${rustup_home} is writable by $(id -un); a routed job could change the toolchain every later job runs. Host prerequisite: operator-owned, read-only RUSTUP_HOME with 1.95.0 (+clippy, rustfmt) preinstalled"
+            exit 1
+          fi
+          rustup_bin="$(command -v rustup || true)"
+          if [ -z "${rustup_bin}" ]; then
+            echo "::error::rustup not on PATH for $(id -un) -- host prerequisite"; exit 1
+          fi
+          RUSTUP_HOME="${rustup_home}" rustup run 1.95.0 rustc --version
+          comps="$(RUSTUP_HOME="${rustup_home}" rustup component list --toolchain 1.95.0 --installed 2>/dev/null || true)"
+          for c in clippy rustfmt; do
+            grep -q "^${c}" <<<"${comps}" || { echo "::error::toolchain 1.95.0 lacks ${c} -- host prerequisite"; exit 1; }
+          done
+          echo "RUSTUP_TOOLCHAIN=1.95.0" >> "${GITHUB_ENV}"
+          echo "$(dirname "${rustup_bin}")" >> "${GITHUB_PATH}"
+        fi
+
+        # 3. Persistent per-key target dir outside the cleaned workspace (real home).
+        target=""
+        if [ -n "${TARGET_KEY}" ]; then
+          [[ "${TARGET_KEY}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad target-key '${TARGET_KEY}'"; exit 1; }
+          [[ "${MAX_TARGET_GB}" =~ ^[0-9]+$ ]] || { echo "::error::bad max-target-gb '${MAX_TARGET_GB}'"; exit 1; }
+          root="${real_home}/.cache/qontinui-runner-ci/targets"
+          mkdir -p "${root}"
+          # Prune keys untouched for 3+ days.
+          while IFS= read -r -d '' d; do zap "${d}" || true; done \
+            < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -mtime +2 -print0 2>/dev/null)
+          # Oldest first while over the cap; one du, then subtract.
+          declare -A sizes=()
+          total=0
+          while IFS=$'\t' read -r gb path; do
+            sizes["${path}"]="${gb}"; total=$(( total + gb ))
+          done < <(du -s --block-size=1G "${root}"/*/ 2>/dev/null || true)
+          while [ "${total}" -gt "${MAX_TARGET_GB}" ]; do
+            oldest="$(ls -1dtr "${root}"/*/ 2>/dev/null | head -1 || true)"
+            [ -n "${oldest}" ] || break
+            echo "target cache ${total} GiB > ${MAX_TARGET_GB}; removing ${oldest}"
+            zap "${oldest%/}" || break
+            total=$(( total - ${sizes["${oldest}"]:-0} ))
+          done
+          target="${root}/${TARGET_KEY}"
+          mkdir -p "${target}"
+          touch "${target}"
+        fi
+
+        # 4. Per-job HOME, XDG dirs and CARGO_HOME; RUSTUP_HOME stays the
+        #    (read-only, operator-owned) real one so the toolchain is found.
         job_home="${RUNNER_TEMP:?}/home"
         rm -rf -- "${job_home:?}"
         mkdir -p "${job_home}/.config" "${job_home}/.cache" "${job_home}/.local/share" "${job_home}/.local/state" "${job_home}/.cargo"
         {
-          echo "CARGO_TARGET_DIR=${target}"
+          [ -z "${target}" ] || echo "CARGO_TARGET_DIR=${target}"
           echo "CARGO_HOME=${job_home}/.cargo"
-          echo "RUSTUP_HOME=${RUSTUP_HOME:-${real_home}/.rustup}"
+          echo "RUSTUP_HOME=${rustup_home}"
           echo "XDG_CONFIG_HOME=${job_home}/.config"
           echo "XDG_CACHE_HOME=${job_home}/.cache"
           echo "XDG_DATA_HOME=${job_home}/.local/share"
           echo "XDG_STATE_HOME=${job_home}/.local/state"
           echo "HOME=${job_home}"
         } >> "${GITHUB_ENV}"
-        echo "CARGO_TARGET_DIR=${target}; HOME=${job_home} (CARGO_HOME + XDG dirs per job); RUSTUP_HOME=${RUSTUP_HOME:-${real_home}/.rustup}"
+        echo "target=${target:-<none>}; HOME=${job_home} (CARGO_HOME + XDG per job); RUSTUP_HOME=${rustup_home}"
