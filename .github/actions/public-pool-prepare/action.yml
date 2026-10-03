@@ -197,13 +197,16 @@ runs:
             gb="${e%% *}"; path="${e#* }"
             # A key prepared within the last 3 h may belong to a job still building
             # (job timeout 150 min); never prune it under that job.
-            if [ $(( now - $(stat -c %Y -- "${path}" 2>/dev/null || echo 0) )) -lt 10800 ]; then
+            if [ $(( now - $(stat -c %Y -- "${path}" 2>/dev/null || echo "${now}") )) -lt 10800 ]; then
               continue
             fi
             echo "target cache ${total} GiB > ${MAX_TARGET_GB}; removing ${path}"
             zap "${path}" || break
             total=$(( total - gb ))
           done
+          if [ "${total}" -gt "${MAX_TARGET_GB}" ]; then
+            echo "::warning::target cache still ${total} GiB > ${MAX_TARGET_GB} (remaining keys are in use)"
+          fi
           target="${root}/${TARGET_KEY}"
           mkdir -p "${target}"
           touch "${target}"
