@@ -13643,6 +13643,7 @@ mod self_id_chain_tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
         }
     }
 
