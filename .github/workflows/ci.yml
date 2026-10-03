@@ -86,7 +86,21 @@ on:
   # and makes no API call. That is the right behaviour for re-establishing a
   # verdict on `main` after an upstream land; it is NOT a way to re-resolve a
   # PR's declared sibling (see `ci-rerun-on-declaration.yml` for that).
+  #
+  # `force_linux_lane` is the public-pool TRIAL lever (plan
+  # 2026-10-03-runner-pr-branch-windows-ci-has-no-off-hosted-path, Phase 1): a
+  # dispatch with `self-hosted` runs the routed Linux jobs on the public pool
+  # whatever RUNNER_LINUX_LANE says, which is how a host passes onboarding (two
+  # consecutive forced runs green) BEFORE the variable is ever flipped. Only a
+  # principal with write access can dispatch. `variable` (the default) defers to
+  # the repo variable.
   workflow_dispatch:
+    inputs:
+      force_linux_lane:
+        description: "Linux lane for the routed jobs: variable (use RUNNER_LINUX_LANE) | hosted | self-hosted"
+        type: choice
+        options: [variable, hosted, self-hosted]
+        default: variable
 
 # Least-privilege, stated explicitly rather than inherited.
 #
@@ -153,6 +167,78 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # route -- does this run's routable Linux work go to the PUBLIC self-hosted
+  # pool (`[self-hosted, Linux, public-pool]`, user `runner-public`), or stay on
+  # the hosted floor?
+  #
+  # Plan 2026-10-03-runner-pr-branch-windows-ci-has-no-off-hosted-path
+  # (qontinui-dev-notes), Phases 1-2; decision_record/self-hosted-runners-on-
+  # public-repos. Every rule, fallback and its tests live in
+  # .github/scripts/route_pr_ci.py / test_route_pr_ci.py. In short:
+  #   * only `pull_request` (and a dispatch) is routed; pushes -- main and the
+  #     merge-candidate refs -- always stay hosted;
+  #   * repo variables RUNNER_LINUX_LANE / RUNNER_WINDOWS_LANE =
+  #     hosted | auto | self-hosted are the kill switches, and UNSET MEANS
+  #     HOSTED. Do not flip one off `hosted` until that OS's public-pool runner
+  #     has passed onboarding (two consecutive forced dispatches green);
+  #   * a FORK PR is routed only when the fork-PR approval policy was READ as
+  #     `all_external_contributors` (the GITHUB_TOKEN cannot read it, so forks
+  #     stay hosted), and a policy read as anything weaker routes EVERY run
+  #     hosted -- fail closed;
+  #   * in `auto`, a stalled (>= 10 min) or saturated (>= 3 queued) pool, or any
+  #     unreadable signal, routes hosted.
+  #
+  # The job is SKIPPED (no hosted queue wait, zero cost) whenever both lane
+  # variables are hosted/unset and no dispatch forces a lane -- so while the
+  # switches read `hosted` this workflow behaves exactly as before. Its
+  # dependants run on `!cancelled()` and read an empty output as hosted, so a
+  # skipped, failed or cancelled route can only ever mean HOSTED.
+  #
+  # THIS JOB MUST NOT FAIL: the script always exits 0 with outputs written, and
+  # the step adds a hand-built hosted fallback if it somehow wrote none.
+  route:
+    # Only RUNNER_LINUX_LANE wakes it: no job consumes windows_lane until Phase 4.
+    if: ${{ (github.event_name == 'pull_request' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted') || (github.event_name == 'workflow_dispatch' && (inputs.force_linux_lane == 'self-hosted' || (inputs.force_linux_lane != 'hosted' && vars.RUNNER_LINUX_LANE != '' && vars.RUNNER_LINUX_LANE != 'hosted'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      linux_lane: ${{ steps.route.outputs.linux_lane }}
+      linux_reason: ${{ steps.route.outputs.linux_reason }}
+      windows_lane: ${{ steps.route.outputs.windows_lane }}
+      approval_policy: ${{ steps.route.outputs.approval_policy }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+      - name: Route PR CI (public pool or hosted floor)
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_USER_TYPE: ${{ github.event.pull_request.user.type }}
+          RUNNER_LINUX_LANE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_linux_lane != 'variable') && inputs.force_linux_lane || vars.RUNNER_LINUX_LANE }}
+          RUNNER_LINUX_LANE_SOURCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_linux_lane != 'variable') && 'workflow_dispatch input force_linux_lane' || 'repo variable RUNNER_LINUX_LANE' }}
+          RUNNER_WINDOWS_LANE: ${{ vars.RUNNER_WINDOWS_LANE }}
+          RUNNER_PUBLIC_POOL_STALL_MINUTES: ${{ vars.RUNNER_PUBLIC_POOL_STALL_MINUTES }}
+          RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH: ${{ vars.RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH }}
+        run: |
+          python3 -B .github/scripts/route_pr_ci.py || true
+          if ! grep -q '^linux_lane=' "$GITHUB_OUTPUT" 2>/dev/null; then
+            {
+              echo "linux_lane=hosted"
+              echo "linux_reason=UNKNOWN: route script produced no output; hosted floor"
+              echo "windows_lane=hosted"
+              echo "approval_policy=UNKNOWN (route script produced no output)"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning title=PR CI route::route script produced no output; routed everything hosted"
+          fi
+
   test:
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
@@ -167,7 +253,21 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    runs-on: ${{ matrix.platform }}
+    # The ubuntu leg may run on the public pool (see the `route` job); the
+    # windows leg stays hosted until Phase 4 of plan
+    # 2026-10-03-runner-pr-branch-windows-ci-has-no-off-hosted-path. The matrix
+    # values are unchanged, so the required contexts stay `test (ubuntu-22.04)`
+    # and `test (windows-latest)` and every `matrix.platform == 'ubuntu-22.04'`
+    # step condition below keeps its meaning. `toJSON(matrix.platform)` is the
+    # hosted floor: an empty / skipped route output can only mean hosted.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(matrix.platform == 'ubuntu-22.04' && needs.route.outputs.linux_lane == 'self-hosted' && '["self-hosted","Linux","public-pool"]' || toJSON(matrix.platform)) }}
+    env:
+      # 'true' only on the public-pool lane. Host-mutating hosted-VM steps
+      # (sudo apt, free-disk-space, swapfile, pagefile) and rust-cache are
+      # skipped there, and .github/actions/public-pool-prepare runs instead.
+      SELF_HOSTED_LANE: ${{ matrix.platform == 'ubuntu-22.04' && needs.route.outputs.linux_lane == 'self-hosted' }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -206,6 +306,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: "Public-pool lane: prepare persistent host"
+        if: env.SELF_HOSTED_LANE == 'true'
+        uses: ./.github/actions/public-pool-prepare
+        with:
+          siblings: qontinui-schemas qontinui-web ui-bridge
+          check-build-deps: 'true'
+          target-key: ${{ github.event.pull_request.number && format('pr-{0}-test', github.event.pull_request.number) || format('run-{0}-test', github.run_id) }}
+          check-rust: 'true'
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -297,6 +406,9 @@ jobs:
       # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
       # 1.95.0 and fail with "'cargo-fmt' is not installed".
       - name: Setup Rust
+        # Hosted lane only: on the pool the toolchain is operator-installed and
+        # RUSTUP_HOME read-only; public-pool-prepare verifies it instead.
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
@@ -347,7 +459,9 @@ jobs:
       # converting a hang into a fast, obvious failure and an immediate
       # re-propose.
       - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        # Hosted VM only: the public pool has no sudo; public-pool-prepare
+        # verifies the same package list instead.
+        if: matrix.platform == 'ubuntu-22.04' && env.SELF_HOSTED_LANE != 'true'
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -378,7 +492,9 @@ jobs:
       # haskell + docker-images alone reclaim ~20 GB, which is ample headroom
       # without touching the apt libs installed above.
       - name: Free disk space (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        # Hosted VM only: on a persistent host this would delete the HOST's
+        # toolchains and docker images.
+        if: matrix.platform == 'ubuntu-22.04' && env.SELF_HOSTED_LANE != 'true'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -400,7 +516,8 @@ jobs:
       # Pre-allocate paging space so the OS can absorb the spike instead
       # of the runner agent dying.
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
-        if: matrix.platform == 'ubuntu-22.04'
+        # Hosted VM only: `swapoff -a` on a persistent host is the host's swap.
+        if: matrix.platform == 'ubuntu-22.04' && env.SELF_HOSTED_LANE != 'true'
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -427,7 +544,9 @@ jobs:
       # D: is the only cost. If JOBS=2 OOMs again at 32 GB, stop climbing:
       # revert the test step to JOBS=1 and keep this pagefile.
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        if: matrix.platform == 'windows-latest'
+        # Hosted VM only (needs admin; the public pool's Windows hosts run as a
+        # non-admin `runner-public` account -- Phase 4 of the public-pool plan).
+        if: matrix.platform == 'windows-latest' && env.SELF_HOSTED_LANE != 'true'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -462,6 +581,9 @@ jobs:
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
       - name: Cache Rust dependencies
+        # Hosted lane only: the public pool keeps a persistent CARGO_TARGET_DIR
+        # (public-pool-prepare) instead of restoring a cache.
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
@@ -814,7 +936,9 @@ jobs:
           #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
           #     at a time, ~no swap pressure, slower wall-clock but
           #     deterministic.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
+          # Public pool (48-core host): 8. The JOBS=1 above is a 16 GB hosted
+          # VM's OOM guard, not a property of the build.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || (env.SELF_HOSTED_LANE == 'true' && '8' || '1') }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1212,7 +1336,10 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
+          # Not delivered to a public-pool host: a long-lived production write
+          # token has no place on a persistent machine that runs PR code. On the
+          # pool the script parses and warns "COORD_INGEST_TOKEN not set" instead.
+          COORD_INGEST_TOKEN: ${{ env.SELF_HOSTED_LANE != 'true' && secrets.COORD_INGEST_TOKEN || '' }}
           # `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid via
           # $GITHUB_ENV, and `Unpoison ambient state` — which blanks it — runs
           # AFTER this step. So without this override the ingest POSTs to the
@@ -1278,6 +1405,18 @@ jobs:
           echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER blanked"
         shell: bash
 
+      # `Unpoison ambient state` carries no `if: always()`, so a red suite skips
+      # it. On the public pool `$HOME` is already a per-job dir under
+      # $RUNNER_TEMP (public-pool-prepare), so nothing outlives the job; this
+      # removes the poison by name on every outcome anyway, belt and braces.
+      - name: "Public-pool lane: remove ambient-state poison"
+        if: always() && env.SELF_HOSTED_LANE == 'true'
+        shell: bash
+        run: |
+          q="$HOME/.qontinui"
+          rm -f -- "$q/machine.json" "$q/profiles.json" "$q/coord-device-jwt"
+          rmdir -- "$q" 2>/dev/null || true
+
       - name: Live AI extractor smoke
         # Single live API call per PR — Haiku 4.5, ~$0.001 each. Ubuntu-only so the
         # 3-platform matrix doesn't 3x the cost for no extra signal. continue-on-error
@@ -1288,7 +1427,10 @@ jobs:
         # `secrets` context is not available to step-level `if:` (only job-level
         # `if:` and step `env:`/`run:`/`with:`). Setting an empty env var is
         # safe; we early-exit before invoking cargo.
-        if: matrix.platform == 'ubuntu-22.04'
+        # Hosted lane only: the paid ANTHROPIC_API_KEY is not delivered to a
+        # public-pool host (plan 2026-10-03-runner-pr-branch-windows-ci-has-no-
+        # off-hosted-path, D5). On the pool the smoke is skipped, not failed.
+        if: matrix.platform == 'ubuntu-22.04' && env.SELF_HOSTED_LANE != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -1513,7 +1655,12 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+    # Ubuntu leg may run on the public pool -- see the `route` job and `test`.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(matrix.platform == 'ubuntu-latest' && needs.route.outputs.linux_lane == 'self-hosted' && '["self-hosted","Linux","public-pool"]' || toJSON(matrix.platform)) }}
+    env:
+      SELF_HOSTED_LANE: ${{ matrix.platform == 'ubuntu-latest' && needs.route.outputs.linux_lane == 'self-hosted' }}
     # UNMEASURED at introduction: no run of this job exists yet. Both crates
     # are small with few dependencies, so the budget should be dominated by
     # checkout + toolchain + cache restore. 20
@@ -1523,6 +1670,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: "Public-pool lane: prepare persistent host"
+        if: env.SELF_HOSTED_LANE == 'true'
+        uses: ./.github/actions/public-pool-prepare
+        with:
+          siblings: qontinui-schemas
+          target-key: ${{ github.event.pull_request.number && format('pr-{0}-holder', github.event.pull_request.number) || format('run-{0}-holder', github.run_id) }}
+          check-rust: 'true'
+
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
       # as the `test` and `clippy-windows` jobs.
@@ -1530,12 +1685,16 @@ jobs:
         uses: ./.github/actions/checkout-sibling
 
       - name: Setup Rust
+        # Hosted lane only (see `test`).
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: clippy
 
       - name: Cache Rust dependencies
+        # Hosted lane only (the public pool keeps a persistent target dir).
+        if: env.SELF_HOSTED_LANE != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -1564,13 +1723,48 @@ jobs:
   # src/lib/spec-registry.ts (that static import is a typecheck/build concern,
   # not a test-time one). 764 tests across 64 files all pass on main as of this
   # job's introduction, so it is born green and is a real required check.
+  # The public-pool routing script's own tests, plus the tree pins that keep a
+  # pull_request_target / workflow_run workflow, a secret-bearing workflow (D5)
+  # or an unguarded sudo/hosted-VM step from ever reaching a self-hosted host.
+  # Plan 2026-10-03-runner-pr-branch-windows-ci-has-no-off-hosted-path. Hosted,
+  # seconds; PyYAML is installed rather than assumed, so the tree pins can never
+  # skip silently on an image that lacks it.
+  route-script-tests:
+    name: PR CI routing script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github
+      # setup-python, not the image's system python: ubuntu-24.04's system pip
+      # refuses installs (PEP 668 externally-managed-environment).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check 'PyYAML==6.0.2'
+      - name: Run route_pr_ci.py tests
+        run: python3 -B .github/scripts/test_route_pr_ci.py
+
   frontend-tests:
     name: Frontend unit tests (vitest)
-    runs-on: ubuntu-latest
+    # May run on the public pool -- see the `route` job. Node/pnpm only, but it
+    # still gets a per-job HOME (pnpm store, ~/.cache, lifecycle scripts) from
+    # public-pool-prepare, like every routed job.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.route.outputs.linux_lane == 'self-hosted' && '["self-hosted","Linux","public-pool"]' || '"ubuntu-latest"') }}
+    env:
+      SELF_HOSTED_LANE: ${{ needs.route.outputs.linux_lane == 'self-hosted' }}
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: "Public-pool lane: prepare persistent host"
+        if: env.SELF_HOSTED_LANE == 'true'
+        uses: ./.github/actions/public-pool-prepare
 
       # Mirror the matrix job's frontend setup EXACTLY: pnpm 10.33.2, node 20,
       # pnpm cache keyed on the root lockfile, frozen-lockfile install.
