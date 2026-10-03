@@ -20,6 +20,7 @@ import {
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
+  resumeGateEnv,
   runVerifiedResume,
   classifyRestoreAction,
   recordBelongsToRestore,
@@ -647,6 +648,32 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
     const unbound = buildResumeCmd("sess-1", undefined, "summary");
     expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
     expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+});
+
+// Plan 2026-10-03 D3 — a resumed gate continuation keeps its gate identity, so
+// the session can still report its own work outcome after a runner restart.
+describe("buildResumeCmd (gate continuation identity)", () => {
+  const GATE = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
+  const DEVICE = "eb2155ed-0000-4000-8000-000000000001";
+
+  it("re-injects QONTINUI_GATE_ID and QONTINUI_GATE_DEVICE_ID when both are present", () => {
+    const cmd = buildResumeCmd("sess-1", undefined, "summary", undefined, {
+      gateId: GATE,
+      gateConsumingDeviceId: DEVICE,
+    });
+    expect(cmd).toContain(`QONTINUI_GATE_ID="${GATE}"`);
+    expect(cmd).toContain(`QONTINUI_GATE_DEVICE_ID="${DEVICE}"`);
+    expect(cmd).toContain("--resume sess-1\r");
+  });
+
+  it("injects neither half when one is missing or malformed (never interpolates junk)", () => {
+    expect(resumeGateEnv({ gateId: GATE })).toEqual([]);
+    expect(resumeGateEnv({ gateId: GATE, gateConsumingDeviceId: "x; rm -rf /" })).toEqual([]);
+    expect(resumeGateEnv(undefined)).toEqual([]);
+    expect(buildResumeCmd("sess-1", undefined, "summary", undefined, { gateId: GATE })).toBe(
+      "claude --permission-mode bypassPermissions --resume sess-1\r",
+    );
   });
 });
 

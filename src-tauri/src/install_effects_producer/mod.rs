@@ -1336,6 +1336,7 @@ fn record_session_open_into(
         page_id,
         zone_index,
         provider.to_string(),
+        None,
     );
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
@@ -2486,6 +2487,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -3004,6 +3008,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3301,6 +3308,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3387,6 +3397,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         let req = SessionOpenRequest {
