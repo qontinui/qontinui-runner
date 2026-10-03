@@ -294,8 +294,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
       // any row a concurrent writer added in between — the same lost update the
       // patch door exists to remove, and `repo_checkouts` is gated the same way
       // for the same reason. Not-dirty ⇒ omitted ⇒ the stored maps survive.
-      const tenantMapsDirty =
-        showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
+      const tenantMapsDirty = showSwitcher && tenantDraftsAreDirty(view.configured, tenantDrafts);
       const payload = buildPathSettingsPayload(
         view.configured,
         drafts,
@@ -481,7 +480,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
  * is not running), and that renders as UNKNOWN — a `0` here would claim the
  * adapter looked and found nothing, which is not what a missing report means.
  */
-function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
+export function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
   const accent = resolved.plan_tier_active ? getAccentColors("green") : getAccentColors("amber");
   return (
     <div
@@ -501,8 +500,8 @@ function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
         </p>
         <p className={`text-[10px] ${accent.text}`}>
           {resolved.plan_tier_active
-            ? "The adapter is scanning the plans directory in effect and pushing work units to coord."
-            : "No plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on."}
+            ? "The adapter is scanning the device-wide plans directory and pushing work units to coord."
+            : "No device-wide plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on."}
         </p>
       </div>
     </div>
@@ -719,7 +718,7 @@ interface PerTenantPathsProps {
  * UNKNOWN about the bindings, not evidence of one tenant — the note below says
  * so instead of the rows implying anything.
  */
-function PerTenantPaths({
+export function PerTenantPaths({
   showSwitcher,
   candidates,
   defaultTenantId,
