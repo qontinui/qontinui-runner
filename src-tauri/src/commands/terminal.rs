@@ -2405,7 +2405,7 @@ pub(crate) fn create_terminal_session_backend(
                 let close_registry = session_registry.clone();
                 // Capacity-freed re-poll: capture this terminal's id so the exit
                 // hook can tell `agent_runtime` a continuation slot just freed and
-                // a deferred (AtCap) continuation can be re-polled promptly. The
+                // a load-deferred continuation can be re-polled promptly. The
                 // notify is a no-op unless this terminal is a registered
                 // continuation session, so operator tabs (a different create path)
                 // never trigger a poll. The PTY waiter that fires this hook is a
