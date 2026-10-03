@@ -351,16 +351,6 @@ reviewed = [
 ]
 
 [[disposition]]
-class = "tenant_literal"
-file = "src/ai_provider/oauth_refresh.rs"
-symbol = "const CLIENT_ID"
-disposition = "fallback_correct"
-note = "Not a tenant: the public OAuth client id of the Claude CLI app, identical on every install."
-reviewed = [
-    "const CLIENT_ID: &str = \"9d1c250a-e61b-44d9-88ed-5944d1962f5e\";",
-]
-
-[[disposition]]
 class = "supervisor_dependency"
 file = "src/env_agent/collectors.rs"
 symbol = "const KNOWN_DEV_PORTS"
@@ -431,21 +421,6 @@ note = "Runs check_supervisor_available on a blocking thread and passes == Some(
 reviewed = [
     "spawn_blocking_tracked(super::auto_continue::check_supervisor_available)",
 ]
-
-[[disposition]]
-class = "supervisor_dependency"
-file = "src/mcp/app_discovery.rs"
-symbol = "const DESKTOP_APP_PORTS"
-disposition = "fallback_correct"
-note = "One port in a discovery scan list; an absent listener is simply not discovered."
-reviewed = [
-    "9875,",
-]
-
-# Surfaced by the fleet-nouns.toml vocabulary (plan
-# 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
-# Phase A6): keys the pre-vocabulary roster did not carry. Acknowledged, NOT
-# triaged — each counts toward unreviewed_ceiling until someone reviews it.
 
 [[disposition]]
 class = "dev_ports"
