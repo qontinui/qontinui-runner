@@ -90,16 +90,27 @@ export function DiffView({
   /** The scroll box the diff lives in — the root the scroll-past observer watches. */
   scrollRootRef?: RefObject<HTMLElement | null>;
 }) {
+  // Keyed on whether there IS a review, not on the review object: the keys
+  // depend only on the hunks, and the review changes on every mark.
+  const hasReview = review !== undefined;
   const keys = useMemo(
-    () => (review && filePath !== undefined ? hunkKeysForFile(filePath, hunks) : null),
-    [review, filePath, hunks],
+    () => (hasReview && filePath !== undefined ? hunkKeysForFile(filePath, hunks) : null),
+    [hasReview, filePath, hunks],
   );
   const hunkEls = useRef(new Map<string, HTMLElement>());
+  // The observer calls the LATEST handler through a ref, so a mark (which
+  // changes the handler's read set) does not tear the observer down and
+  // rebuild it over every hunk.
   const onScrolledPast = review?.onScrolledPast;
+  const onScrolledPastRef = useRef(onScrolledPast);
+  useEffect(() => {
+    onScrolledPastRef.current = onScrolledPast;
+  }, [onScrolledPast]);
+  const observes = onScrolledPast !== undefined;
 
   useEffect(() => {
     const root = scrollRootRef?.current;
-    if (!keys || !onScrolledPast || filePath === undefined || !root) return;
+    if (!keys || !observes || filePath === undefined || !root) return;
     if (typeof IntersectionObserver === "undefined") return;
     const byEl = new Map<Element, string>();
     for (const [key, el] of hunkEls.current) byEl.set(el, key);
@@ -115,7 +126,7 @@ export function DiffView({
               rootTop: entry.rootBounds?.top ?? null,
             })
           ) {
-            onScrolledPast(filePath, key);
+            onScrolledPastRef.current?.(filePath, key);
           }
         }
       },
@@ -123,7 +134,7 @@ export function DiffView({
     );
     for (const el of byEl.keys()) observer.observe(el);
     return () => observer.disconnect();
-  }, [keys, onScrolledPast, filePath, scrollRootRef]);
+  }, [keys, observes, filePath, scrollRootRef]);
 
   return (
     <div className="m-0 overflow-x-auto font-mono text-[10px] leading-4">
@@ -240,9 +251,10 @@ export function FileChangeRow({
 }) {
   const hunks = useMemo(() => diffHunks(change), [change]);
   const stat = useMemo(() => diffStat(hunks), [hunks]);
+  const hasReview = review !== undefined;
   const keys = useMemo(
-    () => (review && hunks ? hunkKeysForFile(change.filePath, hunks) : null),
-    [review, hunks, change.filePath],
+    () => (hasReview && hunks ? hunkKeysForFile(change.filePath, hunks) : null),
+    [hasReview, hunks, change.filePath],
   );
   const reason = noDiffReason(change);
   const [open, setOpen] = useState(false);

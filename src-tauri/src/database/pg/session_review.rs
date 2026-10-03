@@ -51,8 +51,12 @@ pub const REVIEW_RETENTION_DAYS: i32 = super::session_file_snapshots::SNAPSHOT_R
 /// terminal id, or `task_run` + task-run id) — the key a `terminal-exit`
 /// settles still-unconfirmed notes by, since the review's own `session_id` (a
 /// `claude` session id or a task-run id) is not a terminal id. The partial
-/// indexes cover the two background reads that run on every observed prompt
-/// marker and every terminal exit; both only ever look at `submitted` rows.
+/// indexes cover the background reads: the marker index serves every observed
+/// prompt marker (which confirms `submitted` AND `unknown` notes) and every
+/// send's marker-reuse check, so it spans every note that carries a marker;
+/// the target index serves every terminal exit and the boot sweep, which only
+/// ever look at `submitted` rows. The marker index replaced a `submitted`-only
+/// one, dropped here so a provisioned database does not keep both.
 pub const SESSION_REVIEW_DDL: &str = "\
 CREATE SCHEMA IF NOT EXISTS project; \
 CREATE TABLE IF NOT EXISTS project.session_review_hunks ( \
@@ -81,8 +85,9 @@ CREATE TABLE IF NOT EXISTS project.session_review_notes ( \
 ); \
 CREATE INDEX IF NOT EXISTS idx_session_review_notes_session \
     ON project.session_review_notes (session_id, created_at); \
-CREATE INDEX IF NOT EXISTS idx_session_review_notes_submitted_marker \
-    ON project.session_review_notes (marker) WHERE state = 'submitted'; \
+DROP INDEX IF EXISTS project.idx_session_review_notes_submitted_marker; \
+CREATE INDEX IF NOT EXISTS idx_session_review_notes_marker \
+    ON project.session_review_notes (marker) WHERE marker IS NOT NULL; \
 CREATE INDEX IF NOT EXISTS idx_session_review_notes_submitted_target \
     ON project.session_review_notes (target_kind, target_id) WHERE state = 'submitted';";
 
@@ -330,9 +335,12 @@ impl ReviewStore for PgDb {
         Ok(updated == 1)
     }
 
-    async fn submitted_notes_with_marker(&self, marker: &str) -> Result<Vec<ReviewNote>, String> {
-        self.query_notes("state = 'submitted' AND marker = $1", &[&marker])
-            .await
+    async fn notes_with_marker(&self, marker: &str) -> Result<Vec<ReviewNote>, String> {
+        self.query_notes("marker = $1", &[&marker]).await
+    }
+
+    async fn submitted_notes(&self) -> Result<Vec<ReviewNote>, String> {
+        self.query_notes("state = 'submitted'", &[]).await
     }
 
     async fn submitted_notes_for_target(

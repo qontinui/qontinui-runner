@@ -49,7 +49,17 @@
 //! the target terminal exits, its still-`submitted` notes settle to `unknown`
 //! ([`settle_on_terminal_exit`]) — never to `confirmed` on a guess. A task-run
 //! target settles the same way when its stream-json worker process ends with
-//! no successor ([`settle_on_task_run_end`]).
+//! no successor ([`settle_on_task_run_end`]). `unknown` is not terminal: a
+//! later sighting of the marker is positive evidence the prompt arrived, so
+//! `unknown → confirmed` is an edge.
+//!
+//! Two paths would otherwise strand a note at `submitted`. A target that exits
+//! between the delivery and the `submitted` write has already run its exit
+//! hook, which found nothing to settle — so [`send`] re-checks the target's
+//! liveness AFTER that write and settles in-line ([`PromptDoor::target_live`]).
+//! And a runner restart drops every exit hook on the floor — so
+//! [`start_stranded_note_sweep`] settles, once at boot, every `submitted` note
+//! whose target no live terminal or task run holds.
 //!
 //! Every mutation emits `session-review-changed` `{ "sessionId": … }` so the
 //! page refreshes.
@@ -185,7 +195,10 @@ impl NoteEventKind {
                 &[NoteState::Pending, NoteState::Attached]
             }
             NoteEventKind::Submit => &[NoteState::Attached],
-            NoteEventKind::Confirm | NoteEventKind::SessionEnded => &[NoteState::Submitted],
+            // `unknown → confirmed`: a marker sighting after the target ended
+            // (or after a restart's sweep) is positive evidence it arrived.
+            NoteEventKind::Confirm => &[NoteState::Submitted, NoteState::Unknown],
+            NoteEventKind::SessionEnded => &[NoteState::Submitted],
         }
     }
 }
@@ -425,8 +438,13 @@ pub trait ReviewStore: Send + Sync {
     /// is still `expected`. `false` means another writer moved it first.
     async fn replace_note_if(&self, note: &ReviewNote, expected: NoteState)
         -> Result<bool, String>;
-    /// `submitted` notes carrying `marker`, whatever their session.
-    async fn submitted_notes_with_marker(&self, marker: &str) -> Result<Vec<ReviewNote>, String>;
+    /// Every note carrying `marker`, in any state, whatever its session — the
+    /// confirmation read (filtered to `submitted` / `unknown`) and the send's
+    /// marker-reuse refusal.
+    async fn notes_with_marker(&self, marker: &str) -> Result<Vec<ReviewNote>, String>;
+    /// Every `submitted` note, whatever its session or target — the boot
+    /// sweep's read.
+    async fn submitted_notes(&self) -> Result<Vec<ReviewNote>, String>;
     /// `submitted` notes that were sent to `target`.
     async fn submitted_notes_for_target(
         &self,
@@ -462,8 +480,13 @@ pub enum DeliveryError {
     TargetNotFound(String),
     /// The target cannot do this mode (a task run has no draft to insert into).
     Unsupported(String),
-    /// The write itself failed (an exited PTY, a refused task-run send).
+    /// The write itself failed (an exited PTY, a refused task-run send) before
+    /// any of the text reached the target.
     Failed(String),
+    /// The write failed AFTER some or all of the text reached the target's
+    /// input: the paste was written but the submitting CR was not, or the paste
+    /// itself broke part-way. The text may be sitting in the TUI's input box.
+    Partial(String),
 }
 
 /// Where composed text is delivered. Production is [`LiveDoor`].
@@ -475,6 +498,33 @@ pub trait PromptDoor: Send + Sync {
         text: &str,
         mode: SendMode,
     ) -> Result<Delivered, DeliveryError>;
+
+    /// Can `target` still receive a turn? Read AFTER a send records
+    /// `submitted`: a target that exited in between ran its exit hook before
+    /// that write and settled nothing.
+    fn target_live(&self, target: &NoteTarget) -> bool;
+}
+
+/// Whether `target` is live in this runner process: a terminal the manager
+/// holds whose process has not exited, or a task run whose session is active.
+///
+/// The terminal half reads `is_alive`, which the waiter clears BEFORE it runs
+/// the exit hook ([`settle_on_terminal_exit`]); the task-run half is the same
+/// predicate [`settle_on_task_run_end`] uses, whose waiter force-closes the
+/// session state before calling it. So whichever of "the hook" and "a send's
+/// re-check" reads second sees the other's write.
+pub fn target_is_live(app: &tauri::AppHandle, target: &NoteTarget) -> bool {
+    use tauri::Manager;
+    match target {
+        NoteTarget::TerminalId(id) => app
+            .try_state::<Arc<crate::terminal::TerminalManager>>()
+            .and_then(|tm| tm.get(id))
+            .is_some_and(|session| session.is_alive()),
+        NoteTarget::TaskRunId(id) => app
+            .try_state::<Arc<crate::claude_session::SessionManager>>()
+            .and_then(|sm| sm.get(id))
+            .is_some_and(|session| session.state().is_active()),
+    }
 }
 
 /// The production door: the PTY submit choke point for a terminal, the
@@ -506,8 +556,16 @@ impl PromptDoor for LiveDoor {
                     SendMode::Insert => session.insert_prompt(&text, PtyWriteCaller::ReviewNotes),
                 })
                 .await
-                .map_err(|e| DeliveryError::Failed(format!("terminal write panicked: {e}")))?
-                .map_err(DeliveryError::Failed)?;
+                .map_err(|e| DeliveryError::Partial(format!("terminal write panicked: {e}")))?
+                .map_err(|e| {
+                    // The choke point tags an error raised once the paste had
+                    // started reaching the PTY; nothing else wrote a byte.
+                    if e.starts_with(crate::terminal::session::PROMPT_PARTIALLY_WRITTEN) {
+                        DeliveryError::Partial(e)
+                    } else {
+                        DeliveryError::Failed(e)
+                    }
+                })?;
                 Ok(Delivered {
                     sanitized: Some(payload.sanitized),
                     bytes: Some(payload.bytes),
@@ -550,6 +608,10 @@ impl PromptDoor for LiveDoor {
                 })
             }
         }
+    }
+
+    fn target_live(&self, target: &NoteTarget) -> bool {
+        target_is_live(&self.state.app_handle, target)
     }
 }
 
@@ -1014,6 +1076,42 @@ pub async fn send(
         )
         .with_notes(foreign));
     }
+    // The notes recorded `submitted` must be the notes the text carries: a
+    // note whose comment is not in the text would be claimed sent when it was
+    // not. Checked in the form `composeReviewPrompt` writes a comment.
+    let absent: Vec<String> = notes
+        .iter()
+        .filter(|n| !req.text.contains(&composed_comment(&n.body)))
+        .map(|n| n.id.clone())
+        .collect();
+    if !absent.is_empty() {
+        return Err(ApiError::invalid(
+            "note_not_in_text",
+            "the text does not carry these notes' comments; compose it with composeReviewPrompt \
+             from the notes being sent",
+        )
+        .with_notes(absent));
+    }
+    // A marker is one send's identity: confirmation promotes every note that
+    // carries it, so reusing one would let one prompt's arrival confirm
+    // another's notes.
+    let holders: Vec<String> = store
+        .notes_with_marker(&marker)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+    if !holders.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "marker_in_use",
+            format!(
+                "marker {marker} already identifies an earlier send; compose with a fresh marker"
+            ),
+        )
+        .with_notes(holders));
+    }
     // Every edge is validated BEFORE the write, so a send either delivers with
     // all of its notes legal or delivers nothing.
     let at = now_iso();
@@ -1042,7 +1140,15 @@ pub async fn send(
             DeliveryError::Failed(m) => ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "delivery_failed",
-                format!("{m} — the notes stay attached"),
+                format!("{m} — nothing was written; the notes stay attached"),
+            ),
+            DeliveryError::Partial(m) => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "delivery_partial",
+                format!(
+                    "{m} — the text may already be in the session's input box, unsent; \
+                     the notes stay attached"
+                ),
             ),
         })?;
 
@@ -1072,24 +1178,47 @@ pub async fn send(
         }
     }
     if !unrecorded.is_empty() {
-        return Err(ApiError::internal(format!(
-            "the prompt WAS delivered (marker {marker}) but these notes could not be \
-             recorded submitted"
-        ))
+        // Not a failed send: the text went out. A client that read this as
+        // one would send the same notes twice.
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delivered_unrecorded",
+            format!(
+                "the prompt WAS delivered (marker {marker}) but these notes could not be \
+                 recorded submitted — do not send them again"
+            ),
+        )
         .with_notes(unrecorded));
     }
 
     let mut notes = submitted;
+    let mut refresh = false;
     if sightings.seen(&marker) {
         match confirm_marker(store, &marker, &now_iso()).await {
-            Ok(_) => {
-                for n in &mut notes {
-                    if let Ok(Some(fresh)) = store.get_note(&n.id).await {
-                        *n = fresh;
-                    }
-                }
-            }
+            Ok(_) => refresh = true,
             Err(e) => warn!("session review: confirming marker {} failed: {}", marker, e),
+        }
+    }
+    // The exit-vs-send race: a target that exited between the delivery and the
+    // `submitted` write ran its exit hook BEFORE that write, found nothing to
+    // settle, and will not run again. Re-checked here, after the write, so one
+    // of the two always sees the other.
+    if !door.target_live(&req.target) {
+        match settle_target_exit(store, &req.target).await {
+            Ok(_) => refresh = true,
+            Err(e) => warn!(
+                "session review: settling notes for exited {} {} failed: {}",
+                req.target.kind(),
+                req.target.id(),
+                e
+            ),
+        }
+    }
+    if refresh {
+        for n in &mut notes {
+            if let Ok(Some(fresh)) = store.get_note(&n.id).await {
+                *n = fresh;
+            }
         }
     }
     info!(
@@ -1109,21 +1238,34 @@ pub async fn send(
     })
 }
 
-/// `submitted → confirmed` for every note carrying `marker`. Returns the
-/// sessions whose notes changed.
+/// A note's comment as `composeReviewPrompt` writes it into the text:
+/// trimmed (JS `String.prototype.trim`, which also strips U+FEFF), continuation
+/// lines indented three spaces.
+fn composed_comment(body: &str) -> String {
+    body.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .split('\n')
+        .collect::<Vec<_>>()
+        .join("\n   ")
+}
+
+/// `submitted | unknown → confirmed` for every note carrying `marker`.
+/// Returns the sessions whose notes changed.
 pub async fn confirm_marker(
     store: &dyn ReviewStore,
     marker: &str,
     at: &str,
 ) -> Result<BTreeSet<String>, String> {
     let mut changed = BTreeSet::new();
-    for note in store.submitted_notes_with_marker(marker).await? {
+    for note in store.notes_with_marker(marker).await? {
+        if !NoteEventKind::Confirm.legal_from().contains(&note.state) {
+            continue;
+        }
         let event = NoteEvent::Confirm {
             marker: marker.to_string(),
             at: at.to_string(),
         };
         if let Ok(next) = transition(&note, event) {
-            if store.replace_note_if(&next, NoteState::Submitted).await? {
+            if store.replace_note_if(&next, note.state).await? {
                 changed.insert(next.session_id);
             }
         }
@@ -1153,6 +1295,29 @@ pub async fn settle_target_exit(
 ) -> Result<BTreeSet<String>, String> {
     let mut changed = BTreeSet::new();
     for note in store.submitted_notes_for_target(target).await? {
+        if let Ok(next) = transition(&note, NoteEvent::SessionEnded) {
+            if store.replace_note_if(&next, NoteState::Submitted).await? {
+                changed.insert(next.session_id);
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// `submitted → unknown` for every `submitted` note whose target `is_live`
+/// says is gone — the boot sweep's body, over the store and a liveness seam.
+/// Returns the sessions whose notes changed.
+pub async fn settle_stranded(
+    store: &dyn ReviewStore,
+    is_live: &(dyn Fn(&NoteTarget) -> bool + Send + Sync),
+) -> Result<BTreeSet<String>, String> {
+    let mut changed = BTreeSet::new();
+    for note in store.submitted_notes().await? {
+        // A `submitted` note always records its target; one that somehow does
+        // not has nowhere it could still arrive.
+        if note.target.as_ref().is_some_and(is_live) {
+            continue;
+        }
         if let Ok(next) = transition(&note, NoteEvent::SessionEnded) {
             if store.replace_note_if(&next, NoteState::Submitted).await? {
                 changed.insert(next.session_id);
@@ -1234,6 +1399,57 @@ pub fn settle_on_task_run_end(app: tauri::AppHandle, task_run_id: String) {
 /// session took over the id.
 fn task_run_end_settles(successor_live: bool) -> bool {
     !successor_live
+}
+
+/// How long the boot sweep waits before its first attempt, and between
+/// attempts when the store is not reachable yet.
+const STRANDED_SWEEP_DELAY: Duration = Duration::from_secs(15);
+/// Attempts before the boot sweep gives up (the store never came up).
+const STRANDED_SWEEP_ATTEMPTS: u32 = 8;
+
+/// The boot sweep: once, settle every `submitted` note whose target is not
+/// live in THIS process to `unknown`.
+///
+/// A runner restart loses every exit hook a note was waiting on: the terminal
+/// it was sent into, and the stream-json worker, died with the old process,
+/// and nothing will ever fire for them. Safe at any point after the terminal
+/// and session managers are `.manage()`d — which is before Tauri's `setup`
+/// runs, where this is started — because it never relies on those managers
+/// being POPULATED: every terminal id is a fresh UUIDv4 per spawn
+/// (`TerminalManager::create` / `create_with_io`) and nothing re-registers a
+/// pre-restart terminal id, so a note's terminal is either live in this process
+/// or gone for good. A note THIS process sent to a target that is still live is
+/// left alone, and one to a target that has since exited is the exit hook's —
+/// settling it here too is the same compare-and-set, so the two cannot disagree.
+/// `unknown` is not terminal: a later marker sighting still confirms it.
+pub fn start_stranded_note_sweep(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        for attempt in 1..=STRANDED_SWEEP_ATTEMPTS {
+            tokio::time::sleep(STRANDED_SWEEP_DELAY).await;
+            let Some(pg) = crate::database::pg::PgDb::try_global() else {
+                continue;
+            };
+            let probe = app.clone();
+            let is_live = move |target: &NoteTarget| target_is_live(&probe, target);
+            match settle_stranded(&*pg, &is_live).await {
+                Ok(sessions) => {
+                    info!(
+                        sessions = sessions.len(),
+                        "session review: boot sweep settled stranded submitted notes"
+                    );
+                    for session_id in sessions {
+                        emit_review_changed(&app, &session_id);
+                    }
+                    return;
+                }
+                Err(e) => warn!(
+                    "session review: boot sweep attempt {}/{} failed: {}",
+                    attempt, STRANDED_SWEEP_ATTEMPTS, e
+                ),
+            }
+        }
+        warn!("session review: boot sweep gave up; stranded submitted notes stay submitted");
+    });
 }
 
 /// Settle `target`'s still-`submitted` notes to `unknown` off-thread, then
@@ -1514,16 +1730,24 @@ mod tests {
             }
         }
 
-        async fn submitted_notes_with_marker(
-            &self,
-            marker: &str,
-        ) -> Result<Vec<ReviewNote>, String> {
+        async fn notes_with_marker(&self, marker: &str) -> Result<Vec<ReviewNote>, String> {
             Ok(self
                 .notes
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|n| n.state == NoteState::Submitted && n.marker.as_deref() == Some(marker))
+                .filter(|n| n.marker.as_deref() == Some(marker))
+                .cloned()
+                .collect())
+        }
+
+        async fn submitted_notes(&self) -> Result<Vec<ReviewNote>, String> {
+            Ok(self
+                .notes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| n.state == NoteState::Submitted)
                 .cloned()
                 .collect())
         }
@@ -1547,6 +1771,9 @@ mod tests {
     struct ScriptedDoor {
         result: Result<Delivered, DeliveryError>,
         calls: Mutex<Vec<(NoteTarget, String, SendMode)>>,
+        /// What `target_live` answers — the target exiting mid-send is a
+        /// `false` here.
+        live: bool,
     }
 
     impl ScriptedDoor {
@@ -1561,6 +1788,15 @@ mod tests {
             Self {
                 result,
                 calls: Mutex::new(Vec::new()),
+                live: true,
+            }
+        }
+
+        /// Delivers, but the target is gone by the time the send re-checks.
+        fn ok_then_exited() -> Self {
+            Self {
+                live: false,
+                ..Self::ok()
             }
         }
 
@@ -1583,6 +1819,10 @@ mod tests {
                 .push((target.clone(), text.to_string(), mode));
             self.result.clone()
         }
+
+        fn target_live(&self, _target: &NoteTarget) -> bool {
+            self.live
+        }
     }
 
     const SESSION: &str = "11111111-2222-3333-4444-555555555555";
@@ -1593,7 +1833,16 @@ mod tests {
     }
 
     fn text() -> String {
-        format!("[review {MARKER}]\n\nReview notes on this session's changes (1 note):")
+        text_with(MARKER)
+    }
+
+    /// A composed text carrying `marker` and the test notes' comment, in
+    /// `composeReviewPrompt`'s form.
+    fn text_with(marker: &str) -> String {
+        format!(
+            "[review {marker}]\n\nReview notes on this session's changes (1 note):\n\n\
+             1. src/lib.rs @@ -1,2 +1,3 @@\n```diff\n+added\n```\nComment: why this?"
+        )
     }
 
     fn patch(event: &str) -> PatchNoteRequest {
@@ -1700,6 +1949,7 @@ mod tests {
             (S::Attached, E::Edit, S::Attached),
             (S::Attached, E::Submit, S::Submitted),
             (S::Submitted, E::Confirm, S::Confirmed),
+            (S::Unknown, E::Confirm, S::Confirmed),
             (S::Submitted, E::SessionEnded, S::Unknown),
         ];
         for from in NoteState::ALL {
@@ -2132,14 +2382,15 @@ mod tests {
         assert_eq!(store.note(&sent.id).state, NoteState::Unknown);
         assert_eq!(store.note(&still_attached.id).state, NoteState::Attached);
 
-        // An unknown note is never promoted by a late sighting.
-        assert!(
-            observe_operator_prompt(&store, &MarkerSightings::new(), &text())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(store.note(&sent.id).state, NoteState::Unknown);
+        // A late sighting is positive evidence it arrived: unknown → confirmed.
+        let promoted = observe_operator_prompt(&store, &MarkerSightings::new(), &text())
+            .await
+            .unwrap();
+        assert_eq!(promoted, BTreeSet::from([SESSION.to_string()]));
+        let n = store.note(&sent.id);
+        assert_eq!(n.state, NoteState::Confirmed);
+        assert!(n.confirmed_at.is_some());
+        assert_eq!(store.note(&still_attached.id).state, NoteState::Attached);
     }
 
     #[tokio::test]
@@ -2161,12 +2412,14 @@ mod tests {
         .await
         .expect("send to worker");
         assert_eq!(store.note(&sent.id).state, NoteState::Submitted);
+        let mut to_term = send_req(&[&to_terminal.id]);
+        to_term.text = text_with("feedf00d");
         send(
             &store,
             &ScriptedDoor::ok(),
             &MarkerSightings::new(),
             SESSION,
-            send_req(&[&to_terminal.id]),
+            to_term,
             SendMode::Submit,
         )
         .await
@@ -2189,7 +2442,280 @@ mod tests {
         assert_eq!(store.note(&sent.id).state, NoteState::Unknown);
         assert_eq!(store.note(&to_terminal.id).state, NoteState::Submitted);
         // Idempotent: a second end settles nothing.
-        assert!(settle_target_exit(&store, &worker).await.unwrap().is_empty());
+        assert!(settle_target_exit(&store, &worker)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // ---- send integrity ------------------------------------------------
+
+    /// Every note recorded `submitted` must be in the text that went out; a
+    /// marker identifies one send only.
+    #[tokio::test]
+    async fn session_review_send_refuses_absent_notes_and_a_reused_marker() {
+        let store = MemoryStore::default();
+        let note = attached_note(&store, SESSION).await;
+        let door = ScriptedDoor::ok();
+
+        let mut req = send_req(&[&note.id]);
+        req.text = format!("[review {MARKER}]\n\nsomething else entirely");
+        let err = send(
+            &store,
+            &door,
+            &MarkerSightings::new(),
+            SESSION,
+            req,
+            SendMode::Submit,
+        )
+        .await
+        .expect_err("the note's comment is not in the text");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "note_not_in_text");
+        assert_eq!(err.note_ids, vec![note.id.clone()]);
+        assert_eq!(door.calls(), 0);
+        assert_eq!(store.note(&note.id).state, NoteState::Attached);
+
+        // A multi-line comment is matched in its composed (indented) form.
+        let multi = create_note(
+            &store,
+            SESSION,
+            CreateNoteRequest {
+                file_path: "src/lib.rs".to_string(),
+                hunk_key: format!("{}-1", "cd".repeat(32)),
+                hunk_header: "@@ -3 +3 @@".to_string(),
+                excerpt: "-x".to_string(),
+                body: "  line one\nline two \n".to_string(),
+            },
+        )
+        .await
+        .expect("create");
+        apply_client_event(&store, SESSION, &multi.id, patch("attach"))
+            .await
+            .expect("attach");
+        let mut req = send_req(&[&note.id, &multi.id]);
+        req.text = format!(
+            "{}\n\n2. src/lib.rs @@ -3 +3 @@\nComment: line one\n   line two",
+            text()
+        );
+        send(
+            &store,
+            &door,
+            &MarkerSightings::new(),
+            SESSION,
+            req,
+            SendMode::Submit,
+        )
+        .await
+        .expect("both comments are in the text");
+
+        // The marker now identifies that send: a second send reusing it is a
+        // conflict, naming the notes that already carry it.
+        let again = attached_note(&store, SESSION).await;
+        let err = send(
+            &store,
+            &door,
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&again.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect_err("marker reuse");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "marker_in_use");
+        assert_eq!(err.note_ids.len(), 2);
+        assert_eq!(store.note(&again.id).state, NoteState::Attached);
+    }
+
+    /// A paste that landed without its CR is a distinct refusal: the text may
+    /// be in the input box, and the notes are not recorded sent.
+    #[tokio::test]
+    async fn session_review_partial_delivery_is_its_own_code() {
+        let store = MemoryStore::default();
+        let note = attached_note(&store, SESSION).await;
+        let door = ScriptedDoor::answering(Err(DeliveryError::Partial(format!(
+            "{}: the paste was written but the submit enter failed: broken pipe",
+            crate::terminal::session::PROMPT_PARTIALLY_WRITTEN
+        ))));
+        let err = send(
+            &store,
+            &door,
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&note.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect_err("a partial write");
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.code, "delivery_partial");
+        assert!(err.message.contains("input box"), "{err:?}");
+        assert_eq!(store.note(&note.id).state, NoteState::Attached);
+    }
+
+    /// A store that refuses every compare-and-set: the prompt goes out and no
+    /// note can be recorded.
+    struct UnrecordingStore(MemoryStore);
+
+    #[async_trait]
+    impl ReviewStore for UnrecordingStore {
+        async fn read_hunks(&self, s: &str) -> Result<Vec<ReadHunk>, String> {
+            self.0.read_hunks(s).await
+        }
+        async fn set_hunks_read(&self, s: &str, h: &[HunkRef], r: bool) -> Result<usize, String> {
+            self.0.set_hunks_read(s, h, r).await
+        }
+        async fn list_notes(&self, s: &str) -> Result<Vec<ReviewNote>, String> {
+            self.0.list_notes(s).await
+        }
+        async fn get_note(&self, id: &str) -> Result<Option<ReviewNote>, String> {
+            self.0.get_note(id).await
+        }
+        async fn insert_note(&self, n: &ReviewNote) -> Result<(), String> {
+            self.0.insert_note(n).await
+        }
+        async fn replace_note_if(&self, _: &ReviewNote, _: NoteState) -> Result<bool, String> {
+            Err("database went away".to_string())
+        }
+        async fn notes_with_marker(&self, m: &str) -> Result<Vec<ReviewNote>, String> {
+            self.0.notes_with_marker(m).await
+        }
+        async fn submitted_notes(&self) -> Result<Vec<ReviewNote>, String> {
+            self.0.submitted_notes().await
+        }
+        async fn submitted_notes_for_target(
+            &self,
+            t: &NoteTarget,
+        ) -> Result<Vec<ReviewNote>, String> {
+            self.0.submitted_notes_for_target(t).await
+        }
+    }
+
+    /// Delivered but not recorded is NOT a failed send: its own code, so the
+    /// page renders it as delivered and does not invite a second send.
+    #[tokio::test]
+    async fn session_review_delivered_but_unrecorded_is_not_a_failed_send() {
+        let inner = MemoryStore::default();
+        let note = attached_note(&inner, SESSION).await;
+        let store = UnrecordingStore(inner);
+        let door = ScriptedDoor::ok();
+        let err = send(
+            &store,
+            &door,
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&note.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect_err("recording fails");
+        assert_eq!(door.calls(), 1, "the prompt went out");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.code, "delivered_unrecorded");
+        assert_eq!(err.note_ids, vec![note.id.clone()]);
+        assert!(err.message.contains("do not send them again"), "{err:?}");
+    }
+
+    // ---- stranded `submitted` notes --------------------------------------
+
+    /// The target exits between the delivery and the `submitted` write: its
+    /// exit hook already ran and found nothing, so the send settles in-line.
+    #[tokio::test]
+    async fn session_review_a_target_that_exits_mid_send_is_settled_by_the_send() {
+        let store = MemoryStore::default();
+        let note = attached_note(&store, SESSION).await;
+        let out = send(
+            &store,
+            &ScriptedDoor::ok_then_exited(),
+            &MarkerSightings::new(),
+            SESSION,
+            send_req(&[&note.id]),
+            SendMode::Submit,
+        )
+        .await
+        .expect("delivered");
+        assert_eq!(out.notes[0].state, NoteState::Unknown);
+        assert_eq!(store.note(&note.id).state, NoteState::Unknown);
+
+        // Same race for a task-run target.
+        let worker_note = attached_note(&store, SESSION).await;
+        let mut req = send_req(&[&worker_note.id]);
+        req.target = NoteTarget::TaskRunId("run-9".to_string());
+        req.text = text_with("0badcafe");
+        let out = send(
+            &store,
+            &ScriptedDoor::ok_then_exited(),
+            &MarkerSightings::new(),
+            SESSION,
+            req,
+            SendMode::Submit,
+        )
+        .await
+        .expect("delivered to the worker");
+        assert_eq!(out.notes[0].state, NoteState::Unknown);
+
+        // A sighting that already happened wins over the exit: confirmed.
+        let seen = attached_note(&store, SESSION).await;
+        let sightings = MarkerSightings::new();
+        let mut req = send_req(&[&seen.id]);
+        req.text = text_with("5eed5eed");
+        sightings.record("5eed5eed");
+        let out = send(
+            &store,
+            &ScriptedDoor::ok_then_exited(),
+            &sightings,
+            SESSION,
+            req,
+            SendMode::Submit,
+        )
+        .await
+        .expect("delivered and seen");
+        assert_eq!(out.notes[0].state, NoteState::Confirmed);
+    }
+
+    /// The boot sweep settles exactly the `submitted` notes whose target is
+    /// not live, and leaves every other note alone.
+    #[tokio::test]
+    async fn session_review_boot_sweep_settles_only_dead_targets() {
+        let store = MemoryStore::default();
+        let dead = attached_note(&store, SESSION).await;
+        let live = attached_note(&store, SESSION).await;
+        let untouched = attached_note(&store, SESSION).await;
+        for (note, target, marker) in [
+            (
+                &dead,
+                NoteTarget::TerminalId("old-term".to_string()),
+                "000000aa",
+            ),
+            (
+                &live,
+                NoteTarget::TerminalId("new-term".to_string()),
+                "000000bb",
+            ),
+        ] {
+            let mut req = send_req(&[&note.id]);
+            req.target = target;
+            req.text = text_with(marker);
+            send(
+                &store,
+                &ScriptedDoor::ok(),
+                &MarkerSightings::new(),
+                SESSION,
+                req,
+                SendMode::Submit,
+            )
+            .await
+            .expect("send");
+        }
+        let is_live = |t: &NoteTarget| t.id() == "new-term";
+        let changed = settle_stranded(&store, &is_live).await.unwrap();
+        assert_eq!(changed, BTreeSet::from([SESSION.to_string()]));
+        assert_eq!(store.note(&dead.id).state, NoteState::Unknown);
+        assert_eq!(store.note(&live.id).state, NoteState::Submitted);
+        assert_eq!(store.note(&untouched.id).state, NoteState::Attached);
+        // Idempotent.
+        assert!(settle_stranded(&store, &is_live).await.unwrap().is_empty());
     }
 
     #[test]

@@ -154,15 +154,34 @@ pub enum BaseBlob {
     Oversize { bytes: usize, sha256: String },
 }
 
+/// Why [`BaseProbe::base_blob`] produced no "before" side — and whether the
+/// base nonetheless POSITIVELY has an entry at the path, which decides whether
+/// a path that is gone now is still reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseError {
+    /// No base could be established for this path — not a repository, an
+    /// unopenable one, an unresolvable base, a failed tree lookup. Nothing
+    /// says the path ever existed, so a path that is gone now is omitted.
+    NoBase(String),
+    /// The base was resolved and HAS an entry at this path, but it is not read:
+    /// a symlink, a directory or submodule, a blob over the digest ceiling, a
+    /// failed object read, a filter that cannot be applied in-process. The
+    /// entry is `unreadable` whether or not the file still exists — the base
+    /// positively had something there, so dropping it would hide a change.
+    EntryUnread { base: ResolvedBase, why: String },
+}
+
 /// The git-base source for a snapshot-less path's "before" side, narrow enough
 /// that a test can supply an in-memory one.
 pub trait BaseProbe {
-    /// The blob of `path` at its repository's resolved base, bounded at `cap`
-    /// exactly as [`FileProbe::read_capped`] is, together with which base it
-    /// came from. `Err` names why no base could be established for this path —
-    /// not a repository, an unopenable one, an unresolvable base, an
-    /// unreadable blob — and the entry is then `unreadable`, never `created`.
-    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), String>;
+    /// The blob of `path` at its repository's resolved base, in the form a
+    /// checkout would write it to the working tree (eol conversion, `ident`),
+    /// bounded at `cap` exactly as [`FileProbe::read_capped`] is, together with
+    /// which base it came from. `Err` says why there is no "before" side and
+    /// whether the base has an entry here — see [`BaseError`]; the entry is
+    /// then `unreadable` (or omitted, for [`BaseError::NoBase`] on a path that
+    /// is gone), never `created`.
+    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), BaseError>;
 }
 
 /// One repository's resolved base, opened once per report.
@@ -170,6 +189,13 @@ struct RepoBase {
     repo: git2::Repository,
     tree: git2::Oid,
     base: ResolvedBase,
+    /// `core.ignorecase`: the checkout lives on a case-insensitive
+    /// filesystem, so a touched path's recorded case need not match the
+    /// tree's.
+    ignorecase: bool,
+    /// `core.autocrlf=true`: a checkout converts LF to CRLF for every path
+    /// git judges to be text, with no attribute naming it.
+    autocrlf_on_checkout: bool,
 }
 
 /// The real [`BaseProbe`]: blobs read in-process with `git2`.
@@ -217,21 +243,43 @@ impl BaseBlobs {
         if !path.is_absolute() {
             return Err(format!("touched path is not absolute: {}", path.display()));
         }
-        // The file — and its directory — may be gone (a session that deleted
-        // them), so discovery starts from the nearest directory that exists.
-        let mut dir = path.parent();
-        while let Some(d) = dir {
-            if d.is_dir() {
-                break;
+        // When the file itself exists (and is not a link, whose own name is
+        // what the tree records) the WHOLE path is canonicalised, so on a
+        // filesystem that folds case the leaf takes its on-disk spelling
+        // rather than whatever case the touch was recorded in.
+        let is_plain_file = std::fs::symlink_metadata(path)
+            .map(|m| !m.file_type().is_symlink())
+            .unwrap_or(false);
+        let (canon_dir, rest) = match is_plain_file
+            .then(|| std::fs::canonicalize(path).ok())
+            .flatten()
+            .and_then(|full| {
+                let name = full.file_name()?.to_os_string();
+                Some((full.parent()?.to_path_buf(), PathBuf::from(name)))
+            }) {
+            Some(split) => split,
+            None => {
+                // The file — and its directory — may be gone (a session that
+                // deleted them), so discovery starts from the nearest
+                // directory that exists.
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if d.is_dir() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+                let dir =
+                    dir.ok_or_else(|| format!("no existing ancestor of {}", path.display()))?;
+                let rest = path
+                    .strip_prefix(dir)
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                    .to_path_buf();
+                let canon_dir = std::fs::canonicalize(dir)
+                    .map_err(|e| format!("canonicalize {}: {e}", dir.display()))?;
+                (canon_dir, rest)
             }
-            dir = d.parent();
-        }
-        let dir = dir.ok_or_else(|| format!("no existing ancestor of {}", path.display()))?;
-        let rest = path
-            .strip_prefix(dir)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let canon_dir = std::fs::canonicalize(dir)
-            .map_err(|e| format!("canonicalize {}: {e}", dir.display()))?;
+        };
 
         let workdir = self
             .workdir_for_dir
@@ -269,55 +317,194 @@ impl BaseBlobs {
 }
 
 impl BaseProbe for BaseBlobs {
-    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), String> {
-        let (workdir, rel) = self.locate(path)?;
-        let rb = self.base_for(&workdir)?;
+    fn base_blob(&mut self, path: &str, cap: usize) -> Result<(ResolvedBase, BaseBlob), BaseError> {
+        let (workdir, rel) = self.locate(path).map_err(BaseError::NoBase)?;
+        let rb = self.base_for(&workdir).map_err(BaseError::NoBase)?;
         let tree = rb
             .repo
             .find_tree(rb.tree)
-            .map_err(|e| format!("base tree {}: {e}", rb.base.sha))?;
-        let entry = match tree.get_path(Path::new(&rel)) {
-            Ok(entry) => entry,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                return Ok((rb.base.clone(), BaseBlob::Absent))
+            .map_err(|e| BaseError::NoBase(format!("base tree {}: {e}", rb.base.sha)))?;
+        let (entry, rel) = match lookup_entry(&rb.repo, &tree, &rel, rb.ignorecase) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Ok((rb.base.clone(), BaseBlob::Absent)),
+            Err(e) => {
+                return Err(BaseError::NoBase(format!(
+                    "look up {rel} at base {}: {e}",
+                    rb.base.sha
+                )))
             }
-            Err(e) => return Err(format!("look up {rel} at base {}: {e}", rb.base.sha)),
+        };
+        // From here on the base positively HAS an entry at this path: every
+        // refusal below is "present but not read", never "no base".
+        let unread = |why: String| BaseError::EntryUnread {
+            base: rb.base.clone(),
+            why,
         };
         if entry.kind() != Some(git2::ObjectType::Blob) {
-            return Err(format!(
+            return Err(unread(format!(
                 "{rel} is not a file at base {} (a directory or submodule there)",
                 rb.base.sha
-            ));
+            )));
         }
         // A symlink's blob is its target string, while the current side is
         // read THROUGH the link — comparing the two would invent a change.
         if entry.filemode() == 0o120_000 {
-            return Err(format!("{rel} is a symlink at base {}", rb.base.sha));
+            return Err(unread(format!(
+                "{rel} is a symlink at base {}",
+                rb.base.sha
+            )));
         }
-        let odb = rb.repo.odb().map_err(|e| format!("open object db: {e}"))?;
+        let odb = rb
+            .repo
+            .odb()
+            .map_err(|e| unread(format!("open object db: {e}")))?;
         let (size, _) = odb
             .read_header(entry.id())
-            .map_err(|e| format!("read base blob header for {rel}: {e}"))?;
+            .map_err(|e| unread(format!("read base blob header for {rel}: {e}")))?;
         if size > BASE_BLOB_DIGEST_CEILING_BYTES {
-            return Err(format!(
+            return Err(unread(format!(
                 "base blob for {rel} is {size} bytes, above the {BASE_BLOB_DIGEST_CEILING_BYTES}-byte ceiling this route loads to digest"
-            ));
+            )));
         }
-        let blob = rb
-            .repo
-            .find_blob(entry.id())
-            .map_err(|e| format!("read base blob for {rel}: {e}"))?;
-        let content = blob.content();
+        let content = worktree_form(rb, &rel, entry.id()).map_err(unread)?;
         let side = if content.len() <= cap {
-            BaseBlob::Text(content.to_vec())
+            BaseBlob::Text(content)
         } else {
             BaseBlob::Oversize {
                 bytes: content.len(),
-                sha256: sha256_hex(content),
+                sha256: sha256_hex(&content),
             }
         };
         Ok((rb.base.clone(), side))
     }
+}
+
+/// The tree entry at `rel`, with the path as the TREE spells it.
+///
+/// `tree.get_path` is case-sensitive; on a checkout with `core.ignorecase` a
+/// touched path recorded as `README.md` names the same file as a tracked
+/// `Readme.md`, and reading that as "the base lacks it" would report a
+/// modification as a creation. So when the exact lookup misses and the
+/// repository folds case, each component is matched case-insensitively —
+/// preferring an exact match at every level — before concluding absence.
+fn lookup_entry(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    rel: &str,
+    ignorecase: bool,
+) -> Result<Option<(git2::TreeEntry<'static>, String)>, git2::Error> {
+    match tree.get_path(Path::new(rel)) {
+        Ok(entry) => return Ok(Some((entry, rel.to_string()))),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if !ignorecase {
+        return Ok(None);
+    }
+    let components: Vec<&str> = rel.split('/').collect();
+    let mut current = repo.find_tree(tree.id())?;
+    let mut spelled: Vec<String> = Vec::with_capacity(components.len());
+    for (i, want) in components.iter().enumerate() {
+        let found = current
+            .iter()
+            .find(|e| e.name_bytes() == want.as_bytes())
+            .or_else(|| {
+                current.iter().find(|e| {
+                    e.name()
+                        .is_some_and(|name| name.to_lowercase() == want.to_lowercase())
+                })
+            })
+            .map(|e| e.to_owned());
+        let Some(entry) = found else {
+            return Ok(None);
+        };
+        spelled.push(String::from_utf8_lossy(entry.name_bytes()).into_owned());
+        if i + 1 == components.len() {
+            return Ok(Some((entry, spelled.join("/"))));
+        }
+        if entry.kind() != Some(git2::ObjectType::Tree) {
+            return Ok(None);
+        }
+        current = repo.find_tree(entry.id())?;
+    }
+    Ok(None)
+}
+
+/// A path's attribute, owned (`git2::AttrValue` borrows the repository).
+#[derive(Debug, PartialEq, Eq)]
+enum Attr {
+    Unspecified,
+    True,
+    False,
+    Value(String),
+}
+
+fn attr_of(repo: &git2::Repository, rel: &str, name: &str) -> Result<Attr, String> {
+    let raw = repo
+        .get_attr_bytes(Path::new(rel), name, git2::AttrCheckFlags::FILE_THEN_INDEX)
+        .map_err(|e| format!("read the `{name}` attribute of {rel}: {e}"))?;
+    Ok(match git2::AttrValue::from_bytes(raw) {
+        git2::AttrValue::Unspecified => Attr::Unspecified,
+        git2::AttrValue::True => Attr::True,
+        git2::AttrValue::False => Attr::False,
+        git2::AttrValue::String(value) => Attr::Value(value.to_string()),
+        git2::AttrValue::Bytes(value) => Attr::Value(String::from_utf8_lossy(value).into_owned()),
+    })
+}
+
+/// The blob `id` at `rel` as a checkout would write it to the working tree.
+///
+/// The "after" side is the file on disk, which went through git's checkout
+/// filters — `core.autocrlf`, a `.gitattributes` `eol=crlf` / `text`, `ident`
+/// — while the object store holds the CLEAN form. Comparing a raw blob to a
+/// smudged file reports every line of a CRLF checkout as changed, so the base
+/// side is smudged first.
+///
+/// The common case (no attribute or config that could convert anything) is the
+/// raw blob, unread twice. Otherwise libgit2's own checkout writes this one path
+/// into a scratch directory, which runs exactly the filters a real checkout
+/// would, with the repository's attributes and configuration. A path carrying a
+/// `filter=<driver>` attribute (Git LFS, a custom clean/smudge pair) needs an
+/// external program libgit2 does not run, so it is refused rather than compared
+/// in its clean form.
+fn worktree_form(rb: &RepoBase, rel: &str, id: git2::Oid) -> Result<Vec<u8>, String> {
+    let attr = |name: &str| attr_of(&rb.repo, rel, name);
+    if let Attr::Value(driver) = attr("filter")? {
+        return Err(format!(
+            "{rel} carries `filter={driver}`, whose smudge program the runner does not run in-process"
+        ));
+    }
+    let text = attr("text")?;
+    let untouched = attr("ident")? != Attr::True
+        && attr("eol")? == Attr::Unspecified
+        && attr("crlf")? == Attr::Unspecified
+        && (text == Attr::False || (text == Attr::Unspecified && !rb.autocrlf_on_checkout));
+    if untouched {
+        return rb
+            .repo
+            .find_blob(id)
+            .map(|blob| blob.content().to_vec())
+            .map_err(|e| format!("read base blob for {rel}: {e}"));
+    }
+
+    let scratch = tempfile::tempdir().map_err(|e| format!("scratch dir to smudge {rel}: {e}"))?;
+    let tree = rb
+        .repo
+        .find_object(rb.tree, Some(git2::ObjectType::Tree))
+        .map_err(|e| format!("base tree {}: {e}", rb.base.sha))?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout
+        .target_dir(scratch.path())
+        .force()
+        .recreate_missing(true)
+        .update_index(false)
+        .disable_pathspec_match(true)
+        .path(rel);
+    rb.repo
+        .checkout_tree(&tree, Some(&mut checkout))
+        .map_err(|e| format!("apply checkout filters to {rel}: {e}"))?;
+    std::fs::read(scratch.path().join(rel))
+        .map_err(|e| format!("read {rel} as checked out with filters: {e}"))
 }
 
 /// The canonical workdir of the repository holding `dir`.
@@ -335,7 +522,20 @@ fn open_repo_base(workdir: &Path, allocated_parent_sha: Option<&str>) -> Result<
     let repo = git2::Repository::open(workdir)
         .map_err(|e| format!("open repository {}: {e}", workdir.display()))?;
     let (tree, base) = resolve_base(&repo, allocated_parent_sha)?;
-    Ok(RepoBase { repo, tree, base })
+    let config = repo
+        .config()
+        .map_err(|e| format!("read config of {}: {e}", workdir.display()))?;
+    let ignorecase = config.get_bool("core.ignorecase").unwrap_or(false);
+    // `core.autocrlf` is `true`, `input` or `false`; only `true` converts on
+    // checkout (`input` converts on commit only).
+    let autocrlf_on_checkout = config.get_bool("core.autocrlf").unwrap_or(false);
+    Ok(RepoBase {
+        repo,
+        tree,
+        base,
+        ignorecase,
+        autocrlf_on_checkout,
+    })
 }
 
 /// Rung 1: the allocation's recorded `parent_sha`. Rung 2: a linked worktree
@@ -790,6 +990,29 @@ fn no_base_entry(file_path: &str, why: &str) -> SessionFileChange {
     }
 }
 
+/// The entry for a snapshot-less path whose base HAS an entry that was not
+/// read (a symlink, a directory, an over-ceiling blob, a filter driver). Its
+/// base is named, since it was resolved; the entry is `unreadable` even when
+/// the file is gone now, because the base positively had something there.
+fn unread_base_entry(file_path: &str, base: ResolvedBase, why: &str) -> SessionFileChange {
+    SessionFileChange {
+        file_path: file_path.to_string(),
+        status: "unreadable".to_string(),
+        before: None,
+        after: None,
+        before_bytes: None,
+        after_bytes: None,
+        before_sha256: None,
+        after_sha256: None,
+        truncated: false,
+        taken_at: None,
+        detail: Some(format!("git base entry not read: {why}")),
+        before_source: BeforeSource::GitBase,
+        base_kind: Some(base.kind),
+        base_sha: Some(base.sha),
+    }
+}
+
 /// Build the change list for a session from its snapshot rows and touched
 /// paths. Pure over `files` so the pairing/status logic is unit-testable
 /// without a filesystem.
@@ -804,6 +1027,8 @@ fn no_base_entry(file_path: &str, why: &str) -> SessionFileChange {
 ///   (the session never left a file there). When no base can be established
 ///   it is `unreadable` with the reason — or omitted, if it does not exist
 ///   now either, since nothing then positively says there was ever a file.
+///   When the base HAS an entry it will not read ([`BaseError::EntryUnread`])
+///   the path is `unreadable` whether or not it exists now.
 /// - A base side is read under the same per-side cap and spends the same
 ///   aggregate budget as a snapshot side. Presence at the base is decided by
 ///   the tree lookup, not by the bytes, so a spent budget truncates a base
@@ -861,13 +1086,19 @@ pub fn assemble_file_changes(
                 let cap = budget.cap();
                 match base.base_blob(path, cap) {
                     Ok((resolved, blob)) => (BeforeOrigin::GitBase(resolved), blob.into_side(cap)),
-                    Err(why) => {
-                        // A one-byte probe: all this needs is whether the path
+                    Err(BaseError::NoBase(why)) => {
+                        // A zero-byte probe: all this needs is whether the path
                         // exists now, not its contents.
                         match files.read_capped(path, 0) {
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                             _ => out.push(no_base_entry(path, &why)),
                         }
+                        continue;
+                    }
+                    Err(BaseError::EntryUnread { base, why }) => {
+                        // The base positively had an entry here, so the path
+                        // is reported whether or not it still exists.
+                        out.push(unread_base_entry(path, base, &why));
                         continue;
                     }
                 }
@@ -1426,6 +1657,8 @@ mod file_changes_tests {
     struct FakeBase {
         blobs: HashMap<String, Vec<u8>>,
         unavailable: HashMap<String, String>,
+        /// Paths the base HAS but will not read.
+        unread: HashMap<String, String>,
         handed_caps: Vec<usize>,
     }
 
@@ -1440,6 +1673,7 @@ mod file_changes_tests {
                     .map(|(p, b)| (p.to_string(), b.to_vec()))
                     .collect(),
                 unavailable: HashMap::new(),
+                unread: HashMap::new(),
                 handed_caps: Vec::new(),
             }
         }
@@ -1456,10 +1690,16 @@ mod file_changes_tests {
             &mut self,
             path: &str,
             cap: usize,
-        ) -> Result<(ResolvedBase, BaseBlob), String> {
+        ) -> Result<(ResolvedBase, BaseBlob), BaseError> {
             self.handed_caps.push(cap);
             if let Some(why) = self.unavailable.get(path) {
-                return Err(why.clone());
+                return Err(BaseError::NoBase(why.clone()));
+            }
+            if let Some(why) = self.unread.get(path) {
+                return Err(BaseError::EntryUnread {
+                    base: Self::base(),
+                    why: why.clone(),
+                });
             }
             let blob = match self.blobs.get(path) {
                 None => BaseBlob::Absent,
@@ -2186,6 +2426,29 @@ mod file_changes_tests {
         assert_eq!(out.shared_base(), None);
     }
 
+    /// "Base has an entry I won't read" is not "no base": a gone file is still
+    /// reported, where a gone file with no base at all is omitted.
+    #[test]
+    fn an_unread_base_entry_survives_the_file_being_gone() {
+        let read = fs(&[]);
+        let mut base = FakeBase::empty();
+        base.unread
+            .insert("/src/gone.rs".to_string(), "a directory there".to_string());
+        base.unavailable
+            .insert("/src/never.rs".to_string(), "no repository".to_string());
+        let touched = ["/src/gone.rs".to_string(), "/src/never.rs".to_string()];
+        let out =
+            assemble_file_changes(&[], &touched, &read, &mut base, NO_FILE_CAP, NO_TEXT_BUDGET);
+
+        assert_eq!(out.files.len(), 1, "{:?}", out.files);
+        let c = &out.files[0];
+        assert_eq!(c.file_path, "/src/gone.rs");
+        assert_eq!(c.status, "unreadable");
+        assert_eq!(c.before_source, BeforeSource::GitBase);
+        assert_eq!(c.base_kind, Some(BaseKind::Head));
+        assert!(c.detail.as_deref().unwrap().contains("a directory there"));
+    }
+
     /// A snapshot still wins over the git base, and says so.
     #[test]
     fn a_snapshot_is_preferred_over_the_git_base() {
@@ -2375,6 +2638,129 @@ mod file_changes_tests {
         assert_eq!(out.files[1].before_source, BeforeSource::GitBase);
         assert_eq!(out.files[1].before, None);
         assert_eq!(out.files[1].after.as_deref(), Some("hello\n"));
+    }
+
+    /// A checkout with `eol=crlf` holds CRLF on disk while the object store
+    /// holds LF. The base side is smudged first, so an untouched file reads
+    /// `unchanged` and an edit diffs one line — not the whole file.
+    #[test]
+    fn a_crlf_checkout_compares_the_smudged_base_not_the_raw_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        write(dir.path(), ".gitattributes", b"*.txt eol=crlf\n");
+        let same = write(dir.path(), "same.txt", b"one\ntwo\n");
+        let edited = write(dir.path(), "edited.txt", b"one\ntwo\n");
+        commit_all(&repo, "c1");
+        // What a checkout of that commit leaves on disk.
+        write(dir.path(), "same.txt", b"one\r\ntwo\r\n");
+        write(dir.path(), "edited.txt", b"one\r\nTWO\r\n");
+
+        let out = assemble_real(&[same, edited], &mut BaseBlobs::new([]));
+        assert_eq!(out.files[0].status, "unchanged", "{:?}", out.files[0]);
+        let c = &out.files[1];
+        assert_eq!(c.status, "modified", "{c:?}");
+        assert_eq!(c.before.as_deref(), Some("one\r\ntwo\r\n"));
+        assert_eq!(c.after.as_deref(), Some("one\r\nTWO\r\n"));
+    }
+
+    /// `core.autocrlf=true` converts with no attribute naming the path.
+    #[test]
+    fn autocrlf_true_smudges_the_base_side() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        let path = write(dir.path(), "a.txt", b"x\ny\n");
+        commit_all(&repo, "c1");
+        repo.config()
+            .expect("config")
+            .set_str("core.autocrlf", "true")
+            .expect("set autocrlf");
+        write(dir.path(), "a.txt", b"x\r\ny\r\n");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        assert_eq!(out.files[0].status, "unchanged", "{:?}", out.files[0]);
+    }
+
+    /// A `filter=<driver>` path (LFS) cannot be smudged in-process, so it is
+    /// `unreadable` rather than a pointer file diffed against real content.
+    #[test]
+    fn a_filter_driver_path_is_unreadable_not_diffed_in_its_clean_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        write(dir.path(), ".gitattributes", b"*.bin filter=lfs\n");
+        let path = write(
+            dir.path(),
+            "big.bin",
+            b"version https://git-lfs.github.com/spec/v1\n",
+        );
+        commit_all(&repo, "c1");
+        write(dir.path(), "big.bin", b"the real content");
+
+        let out = assemble_real(&[path], &mut BaseBlobs::new([]));
+        let c = &out.files[0];
+        assert_eq!(c.status, "unreadable", "{c:?}");
+        assert_eq!(c.before_source, BeforeSource::GitBase);
+        assert!(c.detail.as_deref().unwrap().contains("filter=lfs"), "{c:?}");
+    }
+
+    /// On a case-folding checkout a touch recorded as `README.md` names the
+    /// tracked `Readme.md`: it must not read as a creation.
+    #[test]
+    fn an_ignorecase_checkout_finds_the_base_entry_in_any_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        write(dir.path(), "Docs/Readme.md", b"hello\n");
+        commit_all(&repo, "c1");
+        repo.config()
+            .expect("config")
+            .set_bool("core.ignorecase", true)
+            .expect("set ignorecase");
+        // This filesystem is case-sensitive, so the recorded spelling is
+        // made to exist on disk to stand in for a folding one.
+        std::fs::rename(dir.path().join("Docs"), dir.path().join("docs")).expect("rename dir");
+        std::fs::rename(
+            dir.path().join("docs/Readme.md"),
+            dir.path().join("docs/README.md"),
+        )
+        .expect("rename file");
+        let touched = dir
+            .path()
+            .join("docs/README.md")
+            .to_string_lossy()
+            .into_owned();
+
+        let out = assemble_real(std::slice::from_ref(&touched), &mut BaseBlobs::new([]));
+        assert_eq!(out.files[0].status, "unchanged", "{:?}", out.files[0]);
+
+        // Without `core.ignorecase` the same lookup is case-sensitive.
+        repo.config()
+            .expect("config")
+            .set_bool("core.ignorecase", false)
+            .expect("unset ignorecase");
+        let out = assemble_real(&[touched], &mut BaseBlobs::new([]));
+        assert_eq!(out.files[0].status, "created", "{:?}", out.files[0]);
+    }
+
+    /// The base HAS a symlink at this path, and the session removed it: the
+    /// entry is reported `unreadable` with its base, not dropped because the
+    /// file is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_base_entry_that_is_not_read_is_reported_even_when_the_file_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(dir.path());
+        write(dir.path(), "target.txt", b"t\n");
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link")).expect("symlink");
+        let head = commit_all(&repo, "c1");
+        std::fs::remove_file(dir.path().join("link")).expect("rm link");
+        let link = dir.path().join("link").to_string_lossy().into_owned();
+
+        let out = assemble_real(&[link], &mut BaseBlobs::new([]));
+        assert_eq!(out.files.len(), 1, "{:?}", out.files);
+        let c = &out.files[0];
+        assert_eq!(c.status, "unreadable", "{c:?}");
+        assert_eq!(c.before_source, BeforeSource::GitBase);
+        assert_eq!(c.base_sha.as_deref(), Some(head.to_string().as_str()));
+        assert!(c.detail.as_deref().unwrap().contains("symlink"), "{c:?}");
     }
 
     /// A `.git` that points nowhere is a repository git cannot open: the path

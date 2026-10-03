@@ -36,7 +36,7 @@ import { cn } from "@/lib/utils";
 import { FileChangesPanel, type HunkReview, type NoteDraftTarget } from "./FileChangesView";
 import { REVIEW_PANEL_GEOMETRY } from "./promptsPanelLayout";
 import { ORPHAN_LABEL } from "./sessionReview";
-import type { ReviewNoteRow, ReviewTarget } from "./sessionReviewApi";
+import { ReviewApiError, type ReviewNoteRow, type ReviewTarget } from "./sessionReviewApi";
 import {
   attachedNotes,
   canInsert,
@@ -233,17 +233,24 @@ export function useHunkReviewBinding(handle: SessionReviewHandle): {
     [draft, addNote, patchNote],
   );
 
-  const draftSlot: ReactNode = draft ? (
-    <NoteDraftEditor
-      key={draft.hunkKey}
-      target={draft}
-      onSave={saveDraft}
-      onCancel={() => setDraft(null)}
-    />
-  ) : null;
+  const cancelDraft = useCallback(() => setDraft(null), []);
+  const draftSlot: ReactNode = useMemo(
+    () =>
+      draft ? (
+        <NoteDraftEditor
+          key={draft.hunkKey}
+          target={draft}
+          onSave={saveDraft}
+          onCancel={cancelDraft}
+        />
+      ) : null,
+    [draft, saveDraft, cancelDraft],
+  );
 
-  return {
-    hunkReview: {
+  // One object per real change: a fresh `hunkReview` every render invalidated
+  // every `keys` memo below it and rebuilt each diff's IntersectionObserver.
+  const hunkReview = useMemo<HunkReview>(
+    () => ({
       readKeys,
       notes,
       onToggleRead,
@@ -251,9 +258,11 @@ export function useHunkReviewBinding(handle: SessionReviewHandle): {
       onAddNote: setDraft,
       draftKey: draft?.hunkKey ?? null,
       draftSlot,
-    },
-    error,
-  };
+    }),
+    [readKeys, notes, onToggleRead, onScrolledPast, draft, draftSlot],
+  );
+
+  return { hunkReview, error };
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +431,17 @@ export function ReviewSendBar({
         nextSalt: newSalt(),
       });
     } catch (err) {
-      dispatch({ type: "failed", mode, message: errorText(err), atMs: Date.now() });
+      const typed = err instanceof ReviewApiError ? err : null;
+      dispatch({
+        type: "failed",
+        mode,
+        message: errorText(err),
+        atMs: Date.now(),
+        code: typed?.code ?? null,
+        marker: composed.marker,
+        noteIds: typed?.noteIds ?? [],
+        nextSalt: newSalt(),
+      });
     }
   };
 
@@ -548,12 +567,31 @@ export function ReviewSendBar({
         <div
           className={cn(
             "mt-0.5 flex items-center gap-1 text-[10px]",
-            bar.result.kind === "error" ? "text-red-400" : "text-zinc-400",
+            bar.result.kind === "error" && !bar.result.partial && "text-red-400",
+            bar.result.kind === "error" && bar.result.partial && "text-amber-300",
+            bar.result.kind === "deliveredUnrecorded" && "text-amber-300",
+            (bar.result.kind === "sent" || bar.result.kind === "inserted") && "text-zinc-400",
           )}
           data-review-send-result={bar.result.kind}
+          data-review-send-partial={
+            bar.result.kind === "error" && bar.result.partial ? "true" : undefined
+          }
         >
-          {bar.result.kind !== "error" && <ClipboardCheck className="h-3 w-3 shrink-0" />}
-          <span className="truncate" title={sendResultLabel(bar.result)}>
+          {(bar.result.kind === "sent" ||
+            bar.result.kind === "inserted" ||
+            bar.result.kind === "deliveredUnrecorded") && (
+            <ClipboardCheck className="h-3 w-3 shrink-0" />
+          )}
+          <span
+            // A warning the operator must act on is never cut off.
+            className={cn(
+              bar.result.kind === "deliveredUnrecorded" ||
+                (bar.result.kind === "error" && bar.result.partial)
+                ? "break-words"
+                : "truncate",
+            )}
+            title={sendResultLabel(bar.result)}
+          >
             {sendResultLabel(bar.result)}
           </span>
         </div>

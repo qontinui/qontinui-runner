@@ -615,6 +615,43 @@ const SUBMIT_ENTER: &[u8] = b"\r";
 /// through every one of them.
 pub const TERMINAL_EXITED: &str = "TERMINAL_EXITED";
 
+/// Machine-readable code prefixing an error [`TerminalSession::submit_prompt`]
+/// or [`TerminalSession::insert_prompt`] returns once some of the prompt had
+/// already reached the PTY: the paste block broke part-way, or it was written
+/// whole and the submitting CR then failed. Either way text may be sitting in
+/// the TUI's input box, unsent — which a caller must tell its operator rather
+/// than report "nothing was written". An error WITHOUT this prefix wrote no
+/// byte.
+pub const PROMPT_PARTIALLY_WRITTEN: &str = "PROMPT_PARTIALLY_WRITTEN";
+
+/// `write_all`, counting: on failure, how many bytes reached `writer` first.
+fn write_all_counting(
+    writer: &mut dyn Write,
+    mut buf: &[u8],
+) -> Result<(), (usize, std::io::Error)> {
+    let mut written = 0usize;
+    while !buf.is_empty() {
+        match writer.write(buf) {
+            Ok(0) => {
+                return Err((
+                    written,
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ),
+                ))
+            }
+            Ok(n) => {
+                written += n;
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err((written, e)),
+        }
+    }
+    Ok(())
+}
+
 /// Delay between the bracketed-paste block and the trailing submit keystroke.
 ///
 /// **Why this exists:** the original `submit_prompt` wrote
@@ -3647,16 +3684,17 @@ impl TerminalSession {
         // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
         // the writer lock; if the worker pty has been closed in the
         // meantime, this Err propagates cleanly.
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-        writer
-            .write_all(SUBMIT_ENTER)
-            .map_err(|e| format!("Failed to write submit enter: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        // Every failure from here on follows a paste that is already on the
+        // wire, so each is tagged: the text is in the input box, unsent.
+        let mut writer = self.writer.lock().map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but the writer lock is poisoned before the submit enter: {e}")
+        })?;
+        writer.write_all(SUBMIT_ENTER).map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but the submit enter failed: {e}")
+        })?;
+        writer.flush().map_err(|e| {
+            format!("{PROMPT_PARTIALLY_WRITTEN}: the paste was written but flushing the submit enter failed: {e}")
+        })?;
         // Both halves are on the wire, so this describes a write that really
         // happened rather than one that was merely predicted.
         Ok(submit_payload_of(&report))
@@ -3777,12 +3815,21 @@ impl TerminalSession {
                 .writer
                 .lock()
                 .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-            writer
-                .write_all(&block)
-                .map_err(|e| format!("Failed to write paste block: {}", e))?;
-            writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+            // A paste that broke before its first byte wrote nothing; one that
+            // broke after it may have left a fragment in the input box.
+            write_all_counting(&mut **writer, &block).map_err(|(written, e)| {
+                if written == 0 {
+                    format!("Failed to write paste block: {}", e)
+                } else {
+                    format!(
+                        "{PROMPT_PARTIALLY_WRITTEN}: the paste block broke after {written} of {} bytes: {e}",
+                        block.len()
+                    )
+                }
+            })?;
+            writer.flush().map_err(|e| {
+                format!("{PROMPT_PARTIALLY_WRITTEN}: the paste block was written but flushing it failed: {e}")
+            })?;
         } // writer lock released
 
         // The body is on the wire now, so this is an input event the PTY
@@ -7495,6 +7542,79 @@ pub(crate) mod tests {
                 message
             );
         }
+    }
+
+    /// Writes its first `ok_writes` calls, then fails every write.
+    struct FailingAfter {
+        buf: Arc<Mutex<Vec<u8>>>,
+        ok_writes: usize,
+        partial_first: bool,
+    }
+
+    impl Write for FailingAfter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.ok_writes == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pty gone",
+                ));
+            }
+            self.ok_writes -= 1;
+            // Optionally accept only part of the first buffer, so the next
+            // call (which fails) leaves a fragment behind.
+            let n = if self.partial_first {
+                data.len().min(3)
+            } else {
+                data.len()
+            };
+            self.partial_first = false;
+            self.buf.lock().unwrap().extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_failing_after(
+        ok_writes: usize,
+        partial_first: bool,
+    ) -> (LiveTestSession, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        *session.writer.lock().unwrap() = Box::new(FailingAfter {
+            buf: buf.clone(),
+            ok_writes,
+            partial_first,
+        });
+        (session, buf)
+    }
+
+    /// The review send's "the text may already be in the input box": a CR
+    /// that fails after the paste landed, or a paste that broke part-way, is
+    /// tagged [`PROMPT_PARTIALLY_WRITTEN`]; a paste that wrote nothing is not.
+    #[test]
+    fn submit_prompt_tags_a_failure_after_bytes_reached_the_pty() {
+        let (paste_only, buf) = session_failing_after(1, false);
+        let err = paste_only
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the CR fails");
+        assert!(err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert_eq!(buf.lock().unwrap().as_slice(), b"\x1b[200~hello\x1b[201~");
+
+        let (fragment, buf) = session_failing_after(1, true);
+        let err = fragment
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the paste breaks part-way");
+        assert!(err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert_eq!(buf.lock().unwrap().len(), 3);
+
+        let (nothing, buf) = session_failing_after(0, false);
+        let err = nothing
+            .submit_prompt("hello", PtyWriteCaller::Test)
+            .expect_err("the paste fails at once");
+        assert!(!err.starts_with(PROMPT_PARTIALLY_WRITTEN), "got {err:?}");
+        assert!(buf.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -138,16 +138,33 @@ export function hunkKey(filePath: string, hunk: DiffHunk, ordinal = 0): string {
   return `${hunkContentHash(filePath, hunk)}-${ordinal}`;
 }
 
-/** Keys for every hunk of one file, in hunk order, distinct even for byte-identical twins. */
-export function hunkKeysForFile(filePath: string, hunks: readonly DiffHunk[]): string[] {
+/**
+ * Keys for every hunk of one file, in hunk order, distinct even for
+ * byte-identical twins.
+ *
+ * Memoised per `hunks` ARRAY (and path): `diffHunks` hands every caller the
+ * same array for the same row, so the badge, the file row and the diff view
+ * share one SHA-256 pass instead of one each per render. The result is shared
+ * — treat it as read-only.
+ */
+export function hunkKeysForFile(filePath: string, hunks: readonly DiffHunk[]): readonly string[] {
+  const cached = HUNK_KEYS_CACHE.get(hunks);
+  if (cached && cached.filePath === filePath) return cached.keys;
   const seen = new Map<string, number>();
-  return hunks.map((hunk) => {
+  const keys = hunks.map((hunk) => {
     const hash = hunkContentHash(filePath, hunk);
     const ordinal = seen.get(hash) ?? 0;
     seen.set(hash, ordinal + 1);
     return `${hash}-${ordinal}`;
   });
+  HUNK_KEYS_CACHE.set(hunks, { filePath, keys });
+  return keys;
 }
+
+const HUNK_KEYS_CACHE = new WeakMap<
+  readonly DiffHunk[],
+  { filePath: string; keys: readonly string[] }
+>();
 
 // ---------------------------------------------------------------------------
 // Counts
@@ -266,7 +283,9 @@ const LEGAL_FROM: Record<ReviewNoteEventType, readonly ReviewNoteState[]> = {
   discard: ["pending", "attached"],
   edit: ["pending", "attached"],
   submit: ["attached"],
-  confirm: ["submitted"],
+  // `unknown → confirmed`: a marker seen after the session ended (or after a
+  // runner restart settled the note) is positive evidence it arrived.
+  confirm: ["submitted", "unknown"],
   sessionEnded: ["submitted"],
 };
 

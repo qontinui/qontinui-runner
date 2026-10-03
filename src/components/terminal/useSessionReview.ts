@@ -22,7 +22,7 @@
  * never becomes an empty list.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { AiSessionState } from "@qontinui/shared-types";
 import { describeThrown } from "@/lib/utils";
@@ -105,8 +105,12 @@ function useGatedRead<T>(
     for: null,
     read: { status: "loading", previous: null },
   });
-  const read: GatedRead<T>["read"] =
-    tagged.for === sessionId ? tagged.read : { status: "loading", previous: null };
+  // Referentially stable across renders that change nothing, so a consumer's
+  // memo keyed on the read (the badge walks every hunk) actually holds.
+  const read: GatedRead<T>["read"] = useMemo(
+    () => (tagged.for === sessionId ? tagged.read : { status: "loading", previous: null }),
+    [tagged, sessionId],
+  );
   const latestRef = useRef<T | null>(null);
   const inFlightRef = useRef<AbortController | null>(null);
   const fetchedForRef = useRef<string | null>(null);
@@ -254,7 +258,8 @@ export function useSessionFileChanges(
     }
   }, [sessionState, refreshIfVisible]);
 
-  return { read: toChangesRead(changes.read), refresh: changes.refresh };
+  const read = useMemo(() => toChangesRead(changes.read), [changes.read]);
+  return { read, refresh: changes.refresh };
 }
 
 export interface SessionReviewHandle {
@@ -323,15 +328,29 @@ export function useSessionReview(
     [settle],
   );
 
-  return {
-    sessionId,
-    changes,
-    review: toReviewRead(review.read),
-    refresh,
-    refreshChanges,
-    markRead,
-    addNote,
-    patchNote,
-    deliver,
-  };
+  const reviewRead = useMemo(() => toReviewRead(review.read), [review.read]);
+  return useMemo(
+    () => ({
+      sessionId,
+      changes,
+      review: reviewRead,
+      refresh,
+      refreshChanges,
+      markRead,
+      addNote,
+      patchNote,
+      deliver,
+    }),
+    [
+      sessionId,
+      changes,
+      reviewRead,
+      refresh,
+      refreshChanges,
+      markRead,
+      addNote,
+      patchNote,
+      deliver,
+    ],
+  );
 }

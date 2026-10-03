@@ -114,7 +114,7 @@ export function noteStateLabel(note: ReviewNoteRow): string {
     case "confirmed":
       return "confirmed in the transcript";
     case "unknown":
-      return "UNKNOWN — the session ended before it was seen arriving";
+      return "UNKNOWN — the session ended (or the runner restarted) before it was seen arriving";
     case "discarded":
       return "discarded";
   }
@@ -131,6 +131,10 @@ export function noteStateLabel(note: ReviewNoteRow): string {
  * - `unknown` — the change list or the read state could not be established
  *   (`?`, with the reason in the tooltip).
  * - `count` — `n unread`, which can be `0 unread`: hunks exist and all are read.
+ *   When the route capped the change list (`filesTruncated`), the files it did
+ *   not read may hold more unread hunks, so the count is a LOWER BOUND and
+ *   renders `≥ n unread`; and a capped list with no countable hunk is `unknown`,
+ *   never `none` — nothing was established about the files it left out.
  */
 export type ReviewBadgeState =
   | { kind: "none" }
@@ -141,6 +145,8 @@ export type ReviewBadgeState =
       total: number;
       /** Files whose diff could not be produced — the count does not include them. */
       unknownFiles: number;
+      /** The change list was capped: `unread` counts only the files it read. */
+      lowerBound: boolean;
       text: string;
       title: string;
       stale: boolean;
@@ -163,12 +169,22 @@ export function reviewBadgeState(
   const files = reviewFiles(changeList.files);
   const shownRead = shownReview(review);
   const counts = reviewCounts(files, readKeySet(shownRead));
-  if (counts.total === 0 && counts.unknown === 0) return { kind: "none" };
+  const omitted = changeList.filesTruncated ? Math.max(changeList.omittedFiles, 0) : 0;
+  const lowerBound = changeList.filesTruncated;
+  const omittedText =
+    omitted > 0
+      ? `${omitted} more changed file${omitted === 1 ? " was" : "s were"} not read (the change list is capped)`
+      : "more changed files were not read (the change list is capped)";
+  if (counts.total === 0 && counts.unknown === 0 && !lowerBound) return { kind: "none" };
   if (counts.total === 0) {
-    return {
-      kind: "unknown",
-      title: `UNKNOWN — ${counts.unknown} changed file${counts.unknown === 1 ? "" : "s"} could not be diffed`,
-    };
+    const why: string[] = [];
+    if (counts.unknown > 0) {
+      why.push(
+        `${counts.unknown} changed file${counts.unknown === 1 ? "" : "s"} could not be diffed`,
+      );
+    }
+    if (lowerBound) why.push(omittedText);
+    return { kind: "unknown", title: `UNKNOWN — ${why.join("; ")}` };
   }
   if (!shownRead) {
     return {
@@ -188,13 +204,15 @@ export function reviewBadgeState(
       } not counted`,
     );
   }
+  if (lowerBound) parts.push(`${omittedText} — at least this many are unread`);
   if (stale) parts.push("from the last successful read — a refresh is pending or failed");
   return {
     kind: "count",
     unread: counts.unread,
     total: counts.total,
     unknownFiles: counts.unknown,
-    text: `${counts.unread} unread`,
+    lowerBound,
+    text: `${lowerBound ? "≥ " : ""}${counts.unread} unread`,
     title: parts.join("; "),
     stale,
   };
@@ -245,7 +263,34 @@ export type SendMode = "send" | "insert";
 export type SendBarResult =
   | { kind: "sent"; marker: string; sanitized: boolean | null; atMs: number }
   | { kind: "inserted"; marker: string; sanitized: boolean | null; atMs: number }
-  | { kind: "error"; mode: SendMode; message: string; atMs: number };
+  /**
+   * The text WENT OUT but the runner could not record some notes as sent
+   * (`delivered_unrecorded`). Not a failure to retry: a second send would
+   * deliver the same notes twice.
+   */
+  | {
+      kind: "deliveredUnrecorded";
+      marker: string;
+      noteIds: string[];
+      message: string;
+      atMs: number;
+    }
+  /**
+   * Nothing was recorded sent. `partial`: the write broke after some of the
+   * text reached the PTY (`delivery_partial`) — it may be sitting in the
+   * session's input box, unsent.
+   */
+  | { kind: "error"; mode: SendMode; message: string; partial: boolean; atMs: number };
+
+/** How a failed delivery reads, from the route's typed code. */
+export type SendFailureKind = "deliveredUnrecorded" | "partial" | "failed";
+
+/** The route's code → how the bar must present it. */
+export function sendFailureKind(code: string | null | undefined): SendFailureKind {
+  if (code === "delivered_unrecorded") return "deliveredUnrecorded";
+  if (code === "delivery_partial") return "partial";
+  return "failed";
+}
 
 export interface SendBarState {
   freeText: string;
@@ -272,7 +317,19 @@ export type SendBarAction =
       atMs: number;
       nextSalt: string;
     }
-  | { type: "failed"; mode: SendMode; message: string; atMs: number };
+  | {
+      type: "failed";
+      mode: SendMode;
+      message: string;
+      atMs: number;
+      /** The route's typed code, when the refusal carried one. */
+      code: string | null;
+      /** The marker the attempted text carried. */
+      marker: string;
+      /** Notes the refusal named (for `delivered_unrecorded`, the unrecorded ones). */
+      noteIds: string[];
+      nextSalt: string;
+    };
 
 export function initialSendBar(salt: string): SendBarState {
   return { freeText: "", previewOpen: false, salt, busy: null, result: null };
@@ -304,12 +361,38 @@ export function sendBarReducer(state: SendBarState, action: SendBarAction): Send
           atMs: action.atMs,
         },
       };
-    case "failed":
+    case "failed": {
+      const kind = sendFailureKind(action.code);
+      if (kind === "deliveredUnrecorded") {
+        // The text went out: the marker is spent and the free text consumed,
+        // exactly as on a clean send.
+        return {
+          ...state,
+          busy: null,
+          salt: action.nextSalt,
+          freeText: "",
+          previewOpen: false,
+          result: {
+            kind: "deliveredUnrecorded",
+            marker: action.marker,
+            noteIds: action.noteIds,
+            message: action.message,
+            atMs: action.atMs,
+          },
+        };
+      }
       return {
         ...state,
         busy: null,
-        result: { kind: "error", mode: action.mode, message: action.message, atMs: action.atMs },
+        result: {
+          kind: "error",
+          mode: action.mode,
+          message: action.message,
+          partial: kind === "partial",
+          atMs: action.atMs,
+        },
       };
+    }
   }
 }
 
@@ -348,7 +431,7 @@ export function liveKeysOf(changes: SessionFileChangesResponse | null): Set<stri
 export function sendResultLabel(result: SendBarResult): string {
   const at = new Date(result.atMs).toLocaleTimeString();
   const neutralized =
-    result.kind !== "error" && result.sanitized
+    (result.kind === "sent" || result.kind === "inserted") && result.sanitized
       ? " (control characters in the text were neutralized)"
       : "";
   switch (result.kind) {
@@ -356,8 +439,16 @@ export function sendResultLabel(result: SendBarResult): string {
       return `sent [review ${result.marker}] at ${at} — waiting to see it arrive in the transcript${neutralized}`;
     case "inserted":
       return `typed [review ${result.marker}] at ${at} without Enter — sending it is yours; the notes stay attached${neutralized}`;
+    case "deliveredUnrecorded":
+      return `sent [review ${result.marker}] at ${at} — DELIVERED, but ${result.noteIds.length} note${
+        result.noteIds.length === 1 ? "" : "s"
+      } could not be recorded as sent. Do NOT send ${
+        result.noteIds.length === 1 ? "it" : "them"
+      } again: the session already has the text. (${result.message})`;
     case "error":
-      return `${result.mode === "send" ? "send" : "insert"} failed at ${at}: ${result.message} — the notes stay attached`;
+      return result.partial
+        ? `${result.mode === "send" ? "send" : "insert"} broke part-way at ${at}: ${result.message} — the text may already be in the session's input box, unsent; check it before sending again`
+        : `${result.mode === "send" ? "send" : "insert"} failed at ${at}: ${result.message} — the notes stay attached`;
   }
 }
 

@@ -162,6 +162,7 @@ describe("noteTransition", () => {
     "attached:edit",
     "attached:submit",
     "submitted:confirm",
+    "unknown:confirm",
     "submitted:sessionEnded",
   ]);
 
@@ -214,6 +215,21 @@ describe("noteTransition", () => {
       type: "sessionEnded",
     });
     expect(r.ok && r.note.state).toBe("unknown");
+  });
+
+  it("confirms an unknown note on a later sighting of its marker — the server's edge too", () => {
+    const r = noteTransition(note({ state: "unknown", marker: "deadbeef" }), {
+      type: "confirm",
+      marker: "deadbeef",
+      at: "t3",
+    });
+    expect(r.ok && r.note).toMatchObject({ state: "confirmed", confirmedAt: "t3" });
+    const foreign = noteTransition(note({ state: "unknown", marker: "deadbeef" }), {
+      type: "confirm",
+      marker: "cafef00d",
+      at: "t3",
+    });
+    expect(foreign.ok).toBe(false);
   });
 
   it("refuses confirmation by a different marker", () => {
