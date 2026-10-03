@@ -170,6 +170,31 @@ export function resumeReports(tabs: TerminalTab[], reported: ReadonlySet<string>
   return { failed, verified };
 }
 
+/**
+ * Forget every tab id in `tracked` that is no longer among `tabs` — the
+ * per-tab bookkeeping of a closed tab. Mutates `tracked`; returns the ids it
+ * dropped. Without it the sets grow with every tab the page ever had.
+ */
+export function forgetClosedTabs(tracked: Set<string>, tabs: TerminalTab[]): string[] {
+  const live = new Set(tabs.map((t) => t.id));
+  const dropped = [...tracked].filter((id) => !live.has(id));
+  for (const id of dropped) tracked.delete(id);
+  return dropped;
+}
+
+/** `byTerminal` without the entries of tabs no longer in `tabs`. Pure. */
+export function retainLiveTabFailures(
+  byTerminal: FailuresByTerminal,
+  tabs: TerminalTab[],
+): FailuresByTerminal {
+  const live = new Set(tabs.map((t) => t.id));
+  const dead = Object.keys(byTerminal).filter((id) => !live.has(id));
+  if (dead.length === 0) return byTerminal;
+  const next = { ...byTerminal };
+  for (const id of dead) delete next[id];
+  return next;
+}
+
 /** Human labels for the actions the banner can name. */
 export const ACTION_LABELS: Record<FailureAction, string> = {
   retry: "Retry",

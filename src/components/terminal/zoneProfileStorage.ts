@@ -31,6 +31,24 @@ export interface ZoneSessionInfo {
   claudeConfigDir?: string;
 }
 
+/**
+ * The tab fields a profile resume stamps when it types `s`'s resume line: the
+ * session, its account, and its provider — the provider is what a later
+ * retry (the failure banner's Resume) resolves the CLI profile from, so a tab
+ * without it cannot be retried. Pure.
+ */
+export function profileResumeTabFields(s: ZoneSessionInfo): {
+  claudeSessionId: string;
+  claudeConfigDir: string | undefined;
+  sessionProvider: string;
+} {
+  return {
+    claudeSessionId: s.claudeSessionId,
+    claudeConfigDir: s.claudeConfigDir,
+    sessionProvider: ZONE_SESSION_PROVIDER,
+  };
+}
+
 export interface ZoneProfile {
   layoutId: string;
   labels: Record<number, string>;

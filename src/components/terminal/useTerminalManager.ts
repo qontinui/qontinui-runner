@@ -389,6 +389,7 @@ export function workerTabFromRecord(
     | "openedAt"
     | "lane"
     | "bypassPermissions"
+    | "provider"
   >,
   now: number = Date.now(),
 ): TerminalTab | null {
@@ -404,6 +405,9 @@ export function workerTabFromRecord(
     claudeSessionId: rec.claudeSessionId,
     taskRunId: rec.taskRunId,
     sessionBacked: true,
+    // The record's provider — the badge and every provider-keyed affordance
+    // (failure retry, resume) read it off the tab.
+    ...(rec.provider ? { sessionProvider: rec.provider } : {}),
     ...(rec.lane === "structured" && rec.bypassPermissions === false
       ? { promptsForPermission: true }
       : {}),

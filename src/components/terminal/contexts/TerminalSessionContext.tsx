@@ -77,7 +77,11 @@ import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
-import { type ZoneSessionInfo, ZONE_SESSION_PROVIDER } from "../zoneProfileStorage";
+import {
+  profileResumeTabFields,
+  type ZoneSessionInfo,
+  ZONE_SESSION_PROVIDER,
+} from "../zoneProfileStorage";
 import { loadCliProfiles, providerDescriptorFor } from "../providerAdapter";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
@@ -409,10 +413,7 @@ const PageSessionScope = memo(function PageSessionScope({
           );
           continue;
         }
-        updateTab(tabId, {
-          claudeSessionId: s.claudeSessionId,
-          claudeConfigDir: s.claudeConfigDir,
-        });
+        updateTab(tabId, profileResumeTabFields(s));
         // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
         // the exact id in the typed command — no transcript guess.
         //

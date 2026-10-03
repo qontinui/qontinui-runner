@@ -148,6 +148,34 @@ export interface ServedCliProfile {
 /** The placeholder a `by_id_argv` resume template carries for the session id. */
 const ID_PLACEHOLDER = "{id}";
 
+/**
+ * A session id safe to put on a command line: 1–128 ASCII letters, digits,
+ * `-` and `_`, not starting with `-`. Mirrors Rust
+ * `cli_profile::is_valid_session_id`; every id a supported CLI mints passes.
+ */
+const SESSION_ID_RE = /^(?!-)[A-Za-z0-9_-]{1,128}$/;
+
+/** Whether `id` may be interpolated into a typed command. */
+export function isValidSessionId(id: string): boolean {
+  return SESSION_ID_RE.test(id);
+}
+
+/**
+ * `value` as ONE literal word for the target shell: POSIX single quotes
+ * (`'\''` for an embedded quote), or PowerShell single quotes (`''`), neither
+ * of which expands `$`, backticks or anything else inside.
+ */
+export function shellQuote(value: string, isWindows: boolean): string {
+  return isWindows ? `'${value.replace(/'/g, "''")}'` : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** An environment assignment prefix for a typed command line. */
+export function shellEnvAssignment(name: string, value: string, isWindows: boolean): string {
+  return isWindows
+    ? `$env:${name}=${shellQuote(value, true)}; `
+    : `${name}=${shellQuote(value, false)} `;
+}
+
 /** Build the descriptor for one served profile. Regexes compile once, here. */
 export function descriptorFromProfile(profile: ServedCliProfile): SessionProviderDescriptor {
   const hp = profile.handshake ?? {};
@@ -163,8 +191,11 @@ export function descriptorFromProfile(profile: ServedCliProfile): SessionProvide
   // the profile also says HOW to resume.
   const tier: RestoreTier =
     profile.restoreTier === "full" && template !== null ? "full" : "terminal-only";
+  // An id outside the strict charset is never spliced into a command line.
   const resumeCommand = (sessionId: string): string[] | null =>
-    template === null ? null : template.map((arg) => arg.split(ID_PLACEHOLDER).join(sessionId));
+    template === null || !isValidSessionId(sessionId)
+      ? null
+      : template.map((arg) => arg.split(ID_PLACEHOLDER).join(sessionId));
   const accountEnvVar =
     profile.accountIsolation?.kind === "env_var" ? profile.accountIsolation.name : null;
   const autoApproveArgv = profile.autoApprove?.kind === "flags" ? profile.autoApprove.argv : [];
@@ -189,9 +220,7 @@ export function descriptorFromProfile(profile: ServedCliProfile): SessionProvide
         " ",
       );
       if (!options.configDir || accountEnvVar === null) return line;
-      return options.isWindows
-        ? `$env:${accountEnvVar}="${options.configDir}"; ${line}`
-        : `${accountEnvVar}="${options.configDir}" ${line}`;
+      return `${shellEnvAssignment(accountEnvVar, options.configDir, options.isWindows)}${line}`;
     },
     handshakePatterns: () => patterns,
     restoreTier: () => tier,

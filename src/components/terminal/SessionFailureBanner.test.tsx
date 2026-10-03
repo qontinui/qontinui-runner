@@ -14,8 +14,10 @@ import { terminalOnlyRestoreTabs } from "./RestoreTerminalOnlyNote";
 import {
   applyFailureNotice,
   failureBannerEntries,
+  forgetClosedTabs,
   isHint,
   resumeReports,
+  retainLiveTabFailures,
   setTerminalFailures,
   type FailuresByTerminal,
   type ServedSessionFailure,
@@ -174,6 +176,21 @@ describe("resumeReports", () => {
       failed: [],
       verified: [],
     });
+  });
+});
+
+describe("closed-tab pruning", () => {
+  it("forgets a closed tab's bookkeeping and keeps a live one's", () => {
+    const tracked = new Set(["t-1", "t-gone"]);
+    expect(forgetClosedTabs(tracked, [tab("t-1"), tab("t-2")])).toEqual(["t-gone"]);
+    expect([...tracked]).toEqual(["t-1"]);
+  });
+
+  it("drops a closed tab's failures and returns the same object when nothing closed", () => {
+    const byTerminal = { "t-1": [failure()], "t-gone": [failure({ id: "f-2" })] };
+    expect(retainLiveTabFailures(byTerminal, [tab("t-1")])).toEqual({ "t-1": [failure()] });
+    const live = { "t-1": [failure()] };
+    expect(retainLiveTabFailures(live, [tab("t-1")])).toBe(live);
   });
 });
 

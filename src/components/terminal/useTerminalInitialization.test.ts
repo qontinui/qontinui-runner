@@ -644,8 +644,8 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
 describe("buildResumeCmd (resume-size picker policy)", () => {
   it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
     const cmd = buildResumeCmd("sess-1", undefined, "full", "claude");
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
-    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD='999999999'");
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES='999999999'");
     expect(cmd).toContain("--resume sess-1\r");
   });
 
@@ -657,7 +657,7 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
 
   it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
     const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full", "claude");
-    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
+    expect(cmd).toContain("CLAUDE_CONFIG_DIR='C:/claude/.claude-hotmail'");
     expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     expect(cmd).toContain("--resume sess-1\r");
   });
@@ -677,7 +677,7 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
   // is asserted.
   it("emits the CLAUDE_CONFIG_DIR prefix iff an account dir is bound (config-dir branch, no thresholds)", () => {
     const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary", "claude");
-    expect(bound).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-qontinui"');
+    expect(bound).toContain("CLAUDE_CONFIG_DIR='C:/claude/.claude-qontinui'");
     expect(bound).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     expect(bound).toContain("--resume sess-1\r");
 
