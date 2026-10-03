@@ -7,7 +7,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { failedResumeTabs, terminalOnlyRestoreTabs } from "./ResumeFailedBanner";
+import {
+  failedResumeTabs,
+  resumeFailedDetail,
+  terminalOnlyRestoreTabs,
+} from "./ResumeFailedBanner";
 import type { TerminalTab } from "./useTerminalManager";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -60,5 +64,17 @@ describe("terminalOnlyRestoreTabs (Phase 5 honest tiers)", () => {
   it("dead terminal-only tabs are dropped", () => {
     const tabs = [tab("t-1", { restoreTerminalOnly: true, isAlive: false })];
     expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
+  });
+});
+
+// A `failed` resume where nothing was typed (qontinui-runner#1867's probe)
+// must not read as "the --resume was typed and never hand-shook".
+describe("resumeFailedDetail", () => {
+  it("explains a not-typed failure, and adds nothing for a typed one", () => {
+    expect(resumeFailedDetail("pane-occupied")).toMatch(/already running.*nothing was typed/i);
+    expect(resumeFailedDetail("pane-unreadable")).toMatch(
+      /could not be checked.*nothing was typed/i,
+    );
+    expect(resumeFailedDetail(undefined)).toBeNull();
   });
 });

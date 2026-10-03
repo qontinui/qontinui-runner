@@ -344,6 +344,18 @@ export async function probeClaudeInPane(
 export type ResumeOutcome = "verified" | "failed";
 
 /**
+ * Why a `failed` {@link typeResumeAndVerify} typed NOTHING — reported through
+ * `onNotTyped` so the caller can tell the operator the truth instead of the
+ * generic "resume failed":
+ * - `pane-occupied` — a claude is already running in the pane and is not
+ *   provably the requested session. Retrying re-probes and refuses again
+ *   until that claude exits, so a bare "Retry" cannot clear it.
+ * - `pane-unreadable` — the pane's process table could not be read, so it was
+ *   not safe to type. A retry may succeed once the table reads.
+ */
+export type ResumeNotTypedReason = "pane-occupied" | "pane-unreadable";
+
+/**
  * ESC clears any partially-typed line in PSReadLine / readline before a
  * retry retype, so a half-landed first attempt can't corrupt the second.
  */
@@ -397,6 +409,15 @@ export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
    * - `absent` / `remote` → typed as before (a remote pane cannot be probed).
    */
   probeClaude?: (tabId: string) => Promise<PaneClaudeProbe>;
+  /**
+   * Called once, just before a `failed` return, when the probe stopped the
+   * loop and NOTHING has been typed in this call — see
+   * {@link ResumeNotTypedReason}. Not called when an earlier attempt already
+   * typed the command (a claude found on attempt 2 may be the one that typed
+   * command launched, so "nothing was typed" would be false), nor on a `live`
+   * probe that matched `sessionId` (that is `verified`).
+   */
+  onNotTyped?: (reason: ResumeNotTypedReason) => void;
   /** The session being resumed — what a `live` probe is matched against. */
   sessionId?: string;
   /**
@@ -438,6 +459,7 @@ export async function typeResumeAndVerify(
     onProbe,
     onWriteFailure,
     probeClaude = probeClaudeInPane,
+    onNotTyped,
     sessionId,
     skipFirstProbe = false,
     ...waitOpts
@@ -468,6 +490,9 @@ export async function typeResumeAndVerify(
     }
     return null;
   };
+  // Whether any write of the resume command reached the pane in this call —
+  // gates `onNotTyped`, which must only claim "nothing was typed" when true.
+  let typedAny = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     // Don't type a shell command into a running Claude session. Checked
     // first thing on every attempt: the boot-restore retype and the operator
@@ -485,12 +510,15 @@ export async function typeResumeAndVerify(
           `[resumeVerification] claude already running in ${tabId} (attempt ${attempt}/${attempts}, ` +
             `${same ? "the requested session" : `not provably ${sessionId ?? "the requested session"}: [${pane.sessionIds.join(", ")}]`}) — not typing the resume command`,
         );
-        return same ? "verified" : "failed";
+        if (same) return "verified";
+        if (!typedAny) onNotTyped?.("pane-occupied");
+        return "failed";
       }
       if (pane.state === "unknown") {
         console.warn(
           `[resumeVerification] could not read ${tabId}'s process tree (attempt ${attempt}/${attempts}) — not typing the resume command`,
         );
+        if (!typedAny) onNotTyped?.("pane-unreadable");
         return "failed";
       }
     }
@@ -512,6 +540,7 @@ export async function typeResumeAndVerify(
       if (refusal.code === TERMINAL_EXITED || attempt === attempts) return "failed";
       continue;
     }
+    typedAny = true;
     await new Promise((r) => setTimeout(r, settleMs));
     const outcome = await waitForClaudeHandshake(tabId, { ...waitOpts, onProbe: probe });
     if (outcome === "verified") return "verified";
