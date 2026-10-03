@@ -2799,6 +2799,24 @@ struct ContinuationSession {
     /// When this entry was registered — the session's lifetime for the
     /// `work_unreported` detail's `after=` field is measured from here.
     registered_at: std::time::Instant,
+    /// The device that CLAIMED [`Self::gate_id`]'s continuation, when it may
+    /// differ from this boot's local device id: set for a continuation a boot
+    /// restore re-registered (plan `2026-10-03-…` D3), from the durable
+    /// record's stored consuming id. coord's outcome UPDATE is keyed
+    /// `AND continuation_consumed_by`, so the outcome producers prefer this over
+    /// [`load_local_device_id`] (see [`outcome_device_for`]). `None` for a
+    /// continuation this process spawned, whose claimer IS the local device.
+    consuming_device_id: Option<uuid::Uuid>,
+}
+
+/// The device id a work-outcome POST for `session` must present: the
+/// continuation's stored CONSUMING device when it carries one, else this boot's
+/// local id. `None` when neither is known — the post is then skipped.
+fn outcome_device_for(
+    session: &ContinuationSession,
+    local_device_id: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    session.consuming_device_id.or(local_device_id)
 }
 
 /// The value behind [`continuation_sessions`]: the LIVE continuation sessions
@@ -2864,6 +2882,7 @@ impl ContinuationRegistry {
         terminal_id: String,
         anchor_key: Option<String>,
         gate_id: Option<uuid::Uuid>,
+        consuming_device_id: Option<uuid::Uuid>,
     ) {
         self.live.insert(
             terminal_id.clone(),
@@ -2872,6 +2891,7 @@ impl ContinuationRegistry {
                 anchor_key,
                 gate_id,
                 registered_at: std::time::Instant::now(),
+                consuming_device_id,
             },
         );
     }
@@ -3022,6 +3042,13 @@ fn next_anchor_reservation_token() -> AnchorReservationToken {
 /// (new `gate_id`, same `anchor_key`) is deduped (P3) and the live count is
 /// capped (P4) — and, beside them, the anchors reserved by dispatches still
 /// between the guard and the spawn (see [`ContinuationRegistry`]).
+/// Serializes every test that touches [`continuation_sessions`] — the tests
+/// here reset it wholesale, so a test in another module registering into it
+/// must hold this too.
+#[cfg(test)]
+pub(crate) static CONTINUATION_REGISTRY_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
 fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
         std::sync::OnceLock::new();
@@ -3135,9 +3162,7 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let Some(device_id) = load_local_device_id() else {
-        return;
-    };
+    let local_device_id = load_local_device_id();
     for session in &reaped {
         let snapshot = pane_exit_facts(&session.terminal_id);
         let detail = work_unreported_detail(
@@ -3145,13 +3170,17 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
             session_lifetime(session.registered_at, snapshot.map(|(_, at)| at)),
             &session.terminal_id,
         );
-        spawn_work_unreported_fallback(
-            &handle,
-            session.gate_id,
-            device_id,
-            &session.terminal_id,
-            detail,
-        );
+        // A restored continuation reports under its stored CONSUMING device,
+        // never this boot's (plan 2026-10-03 D3).
+        if let Some(device_id) = outcome_device_for(session, local_device_id) {
+            spawn_work_unreported_fallback(
+                &handle,
+                session.gate_id,
+                device_id,
+                &session.terminal_id,
+                detail,
+            );
+        }
     }
 }
 
@@ -3640,10 +3669,24 @@ fn register_continuation_session(
     anchor_key: Option<String>,
     gate_id: Option<uuid::Uuid>,
 ) {
+    register_continuation_session_with_device(terminal_id, anchor_key, gate_id, None);
+}
+
+/// [`register_continuation_session`] carrying the continuation's CONSUMING
+/// device id — for a continuation whose claimer may not be this boot's local
+/// device (a boot-restored one, plan `2026-10-03-…` D3, and the account
+/// migration's re-pin of such a session). Same registry rules otherwise.
+fn register_continuation_session_with_device(
+    terminal_id: String,
+    anchor_key: Option<String>,
+    gate_id: Option<uuid::Uuid>,
+    consuming_device_id: Option<uuid::Uuid>,
+) {
     lock_recover(continuation_sessions(), "continuation_sessions").insert_live(
         terminal_id,
         anchor_key,
         gate_id,
+        consuming_device_id,
     );
 }
 
@@ -3741,13 +3784,18 @@ impl AnchorReservation {
     /// no same-anchor dispatch can observe the anchor held by neither half.
     /// Consumes the permit — there is nothing left to fire later, and the
     /// token would refuse it anyway.
-    fn handed_to_registry(mut self, terminal_id: String, gate_id: Option<uuid::Uuid>) {
+    fn handed_to_registry(
+        mut self,
+        terminal_id: String,
+        gate_id: Option<uuid::Uuid>,
+        consuming_device_id: Option<uuid::Uuid>,
+    ) {
         // Taken out of `self` so this fn settles the entry and the drop below
         // is a no-op: one removal, not two.
         let held = self.held.take();
         let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
-        registry.insert_live(terminal_id, anchor_key, gate_id);
+        registry.insert_live(terminal_id, anchor_key, gate_id, consuming_device_id);
         if let Some((anchor, token)) = held {
             // Owner-checked like every other removal, through the SAME
             // comparison — `release_owned` is the only remover there is, so
@@ -3822,9 +3870,14 @@ pub(crate) fn notify_continuation_terminal_exit(
         session_lifetime(session.registered_at, exited_at),
         terminal_id,
     );
-    let Some(device_id) = load_local_device_id() else {
+    let local_device_id = load_local_device_id();
+    // The outcome goes out under the continuation's CONSUMING device (a
+    // boot-restored session's may not be this boot's — plan 2026-10-03 D3);
+    // the capacity re-poll below is this device's own business.
+    let outcome_device_id = outcome_device_for(&session, local_device_id);
+    if local_device_id.is_none() && outcome_device_id.is_none() {
         return;
-    };
+    }
     let Some(handle) = rt_handle else {
         debug!(
             "agent_runtime: continuation terminal_id={terminal_id} exited but no tokio \
@@ -3840,7 +3893,19 @@ pub(crate) fn notify_continuation_terminal_exit(
     // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
-    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id, detail);
+    if let Some(outcome_device_id) = outcome_device_id {
+        spawn_work_unreported_fallback(
+            handle,
+            session.gate_id,
+            outcome_device_id,
+            terminal_id,
+            detail,
+        );
+    }
+    // The re-poll lists THIS device's pending rows — never the claimer's.
+    let Some(device_id) = local_device_id else {
+        return;
+    };
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
@@ -4049,9 +4114,10 @@ async fn post_work_unreported_fallback(
 /// The two in-process producers above die with the runner, so without this the
 /// gate stays `spawned` forever — and a supersession loser is refused forever
 /// behind it. Unlike [`post_work_unreported_fallback`] this carries a detail in
-/// runner#1902's grammar (`exit=crashed …`), so coord#2729 can re-deliver the
-/// lost work, and it posts under the record's STORED consuming device id, never
-/// this boot's.
+/// the exit-class grammar proposed by runner#1902 (`exit=crashed …`, both that
+/// PR and coord#2729 still open), so the lost work can be re-delivered once
+/// coord#2729 lands. It posts under the record's STORED consuming device id,
+/// never this boot's.
 ///
 /// Same safety as the fallback: coord admits one `spawned → work_*` transition,
 /// so a session that reported for itself before the crash keeps its answer.
@@ -4081,6 +4147,18 @@ pub(crate) async fn post_runner_restart_unreported(
                  session already reported {standing:?}; runner-restart report correctly refused"
             );
         }
+        // An earlier `work_unreported` (a bare fallback from before the crash,
+        // or this same report from a prior boot) already stands. coord refuses
+        // `work_* → work_*` and the gate is already released, so this is a
+        // benign refusal, not a failure to report.
+        OutcomeAck::Superseded(standing)
+            if marker_matches(ContinuationOutcome::WorkUnreported.wire(), &standing) =>
+        {
+            info!(
+                "agent_runtime: continuation gate_id={gate_id} lost to a runner restart — \
+                 {standing:?} already stands; runner-restart report benignly refused"
+            );
+        }
         OutcomeAck::Superseded(standing) => {
             warn!(
                 "agent_runtime: continuation gate_id={gate_id} lost to a runner restart — \
@@ -4104,17 +4182,40 @@ pub(crate) async fn post_runner_restart_unreported(
 /// restart. A resumed continuation therefore takes a cap slot but does not
 /// dedupe a same-anchor dispatch (P3) — the gate it continues is already
 /// consumed, so no such dispatch is outstanding for it.
-pub(crate) fn register_restored_continuation(terminal_id: String, gate_id: uuid::Uuid) {
-    register_continuation_session(terminal_id, None, Some(gate_id));
+///
+/// `consuming_device_id` is the record's STORED claimer: the exit hook and
+/// reaper post under it rather than this boot's local id, which coord's
+/// `AND continuation_consumed_by` term would refuse after a re-pairing.
+pub(crate) fn register_restored_continuation(
+    terminal_id: String,
+    gate_id: uuid::Uuid,
+    consuming_device_id: Option<uuid::Uuid>,
+) {
+    register_continuation_session_with_device(
+        terminal_id,
+        None,
+        Some(gate_id),
+        consuming_device_id,
+    );
 }
 
-/// The gate a live continuation registration carries, by terminal (tests).
+/// Drop one live continuation registration without an exit (tests in other
+/// modules, which must not reset the whole registry).
 #[cfg(test)]
-pub(crate) fn registered_continuation_gate(terminal_id: &str) -> Option<Option<uuid::Uuid>> {
+pub(crate) fn deregister_continuation_for_test(terminal_id: &str) {
+    deregister_exited_continuation(terminal_id);
+}
+
+/// The `(gate_id, consuming_device_id)` a live continuation registration
+/// carries, by terminal (tests).
+#[cfg(test)]
+pub(crate) fn registered_continuation_gate(
+    terminal_id: &str,
+) -> Option<(Option<uuid::Uuid>, Option<uuid::Uuid>)> {
     lock_recover(continuation_sessions(), "continuation_sessions")
         .live
         .get(terminal_id)
-        .map(|s| s.gate_id)
+        .map(|s| (s.gate_id, s.consuming_device_id))
 }
 
 /// Whether `recorded` is an outcome only the SESSION can write — i.e. the
@@ -4185,6 +4286,9 @@ pub(crate) struct CarriedContinuation {
     pub anchor_key: Option<String>,
     /// The gate it reports its work outcome to, if any.
     pub gate_id: Option<uuid::Uuid>,
+    /// The device that claimed that gate, when it may not be this boot's (a
+    /// boot-restored continuation — plan 2026-10-03 D3).
+    pub consuming_device_id: Option<uuid::Uuid>,
 }
 
 /// Lift a continuation's registry entry off `terminal_id` WITHOUT treating the
@@ -4227,6 +4331,7 @@ pub(crate) fn take_continuation_registration(
             CarriedContinuation {
                 anchor_key: session.anchor_key,
                 gate_id: session.gate_id,
+                consuming_device_id: session.consuming_device_id,
             },
             reservation,
         )
@@ -4288,12 +4393,21 @@ pub(crate) fn restore_continuation_registration(
         );
     }
     if reservation.held.is_some() {
-        reservation.handed_to_registry(terminal_id, carried.gate_id);
+        reservation.handed_to_registry(
+            terminal_id,
+            carried.gate_id,
+            carried.consuming_device_id,
+        );
     } else {
         // A permit over nothing: its drop is a no-op, and the anchor the
         // session actually had lives on `carried`.
         drop(reservation);
-        register_continuation_session(terminal_id, carried.anchor_key, carried.gate_id);
+        register_continuation_session_with_device(
+            terminal_id,
+            carried.anchor_key,
+            carried.gate_id,
+            carried.consuming_device_id,
+        );
     }
 }
 
@@ -6701,7 +6815,7 @@ async fn run_continuation_terminal(
                 // back under ONE lock acquisition, so no same-anchor dispatch can
                 // observe the anchor held by neither — and the permit is consumed,
                 // so nothing of this dispatch's can touch the anchor again.
-                reservation.handed_to_registry(terminal_id.clone(), reportable_gate);
+                reservation.handed_to_registry(terminal_id.clone(), reportable_gate, None);
                 // A session that STARTED and has already exited (at the verdict,
                 // or in the instant between the verdict and the hand-over above)
                 // ended before it was registered, so its PTY exit hook found
@@ -14958,7 +15072,7 @@ mod tests {
 
     /// Poison-recovering (`unwrap_or_else(into_inner)`), matching the shared
     /// `env_lock()`: a panicking guard test must not cascade-poison the rest.
-    static CONT_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::CONTINUATION_REGISTRY_TEST_LOCK as CONT_GUARD_LOCK;
 
     /// A thread verdict that says nothing: the machine has headroom, or the
     /// sensor had no opinion. The default for every guard test that is about the
@@ -15189,7 +15303,7 @@ mod tests {
 
         // 3. This time the dispatch spawns: the hand-over registers the live
         //    entry and gives the permit back, under one lock.
-        reservation.handed_to_registry("term-x1".to_string(), None);
+        reservation.handed_to_registry("term-x1".to_string(), None, None);
         assert!(
             !anchor_is_reserved(anchor),
             "the hand-over must give back the reservation it replaces"
@@ -15245,7 +15359,7 @@ mod tests {
         // A continuation is live on the anchor — the session about to migrate.
         let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
         assert_eq!(verdict, ContinuationGuard::Proceed);
-        reservation.handed_to_registry("term-old".to_string(), Some(gate));
+        reservation.handed_to_registry("term-old".to_string(), Some(gate), None);
 
         // The migration lifts the registration before closing the old PTY —
         // and the anchor goes straight into an owned reservation.
@@ -16736,6 +16850,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
         let csid = "restored-cont-1";
         let rec: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
             "claudeSessionId": csid,
@@ -16746,11 +16861,13 @@ mod tests {
             "lastSeenAt": 0,
             "state": "open",
             "gateId": gate.to_string(),
-            "gateConsumingDeviceId": uuid::Uuid::now_v7().to_string(),
+            "gateConsumingDeviceId": device.to_string(),
             "gateBoundBootMs": 1_000,
         }))
         .unwrap();
         store.record_open(rec);
+        // This boot's restore pass marks the record before typing the resume.
+        store.mark_restore_pending(csid);
         // The restore's re-record: the resumed session now lives on a new
         // terminal, written by a gate-less writer.
         let mut reasserted = store.get(csid).unwrap();
@@ -16763,11 +16880,12 @@ mod tests {
         let this_boot = 2_000;
         let adopted =
             crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_boot);
-        assert_eq!(adopted, Some(("term-restored".to_string(), gate)));
+        assert_eq!(adopted, Some(("term-restored".to_string(), gate, Some(device))));
         assert_eq!(
             registered_continuation_gate("term-restored"),
-            Some(Some(gate)),
-            "the resumed terminal must be a live continuation carrying its gate"
+            Some((Some(gate), Some(device))),
+            "the resumed terminal must be a live continuation carrying its gate AND \
+             its stored consuming device"
         );
         assert_eq!(store.get(csid).unwrap().gate_bound_boot_ms, Some(this_boot));
 
@@ -16777,6 +16895,86 @@ mod tests {
         assert_eq!(
             runner_restart_unreported_report(&store.get(csid).unwrap(), this_boot),
             None
+        );
+        clear_continuation_registry();
+    }
+
+    /// Review r1 item 1: reopening is not restoring. A prior-generation gate
+    /// record re-recorded open WITHOUT this boot's restore marker (an operator
+    /// resuming a long-settled continuation by hand) is not adopted and
+    /// registers nothing.
+    #[test]
+    fn reopened_gate_record_without_a_restore_marker_is_not_adopted() {
+        use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let csid = "reopened-by-hand";
+        let rec: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": "term-manual",
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "gateId": uuid::Uuid::now_v7().to_string(),
+            "gateConsumingDeviceId": uuid::Uuid::now_v7().to_string(),
+            "gateBoundBootMs": 1_000,
+        }))
+        .unwrap();
+        store.record_open(rec);
+        assert_eq!(
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, 2_000),
+            None
+        );
+        assert_eq!(registered_continuation_gate("term-manual"), None);
+        assert_eq!(store.get(csid).unwrap().gate_bound_boot_ms, Some(1_000));
+        // A restore marker from an EARLIER boot does not count either.
+        let mut stale = store.get(csid).unwrap();
+        stale.restored_from_boot_at = Some(1_500);
+        store.record_open(stale);
+        assert_eq!(
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, 2_000),
+            None
+        );
+    }
+
+    /// Review r1 item 2: the outcome producers present a continuation's STORED
+    /// consuming device when it carries one, and this boot's local id only
+    /// otherwise.
+    #[test]
+    fn outcome_device_prefers_the_stored_consuming_device() {
+        let local = uuid::Uuid::now_v7();
+        let claimer = uuid::Uuid::now_v7();
+        let mut s = ContinuationSession {
+            terminal_id: "t".into(),
+            anchor_key: None,
+            gate_id: Some(uuid::Uuid::now_v7()),
+            consuming_device_id: Some(claimer),
+        };
+        assert_eq!(outcome_device_for(&s, Some(local)), Some(claimer));
+        assert_eq!(outcome_device_for(&s, None), Some(claimer));
+        s.consuming_device_id = None;
+        assert_eq!(outcome_device_for(&s, Some(local)), Some(local));
+        assert_eq!(outcome_device_for(&s, None), None);
+    }
+
+    /// Review r1 item 2: the consuming device survives the account-migration
+    /// hop of a restored continuation (lift → re-pin).
+    #[test]
+    fn migration_hop_carries_the_consuming_device() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        register_restored_continuation("term-r-old".into(), gate, Some(device));
+        let (carried, reservation) = take_continuation_registration("term-r-old").unwrap();
+        restore_continuation_registration("term-r-new".into(), carried, reservation);
+        assert_eq!(
+            registered_continuation_gate("term-r-new"),
+            Some((Some(gate), Some(device)))
         );
         clear_continuation_registry();
     }

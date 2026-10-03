@@ -4246,12 +4246,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             r.close_session(csid);
                         }
                         mcp::session_compliance::finalize_on_close(csid, &store);
-                        let report = store.upgrade().and_then(|s| s.get(csid)).and_then(|rec| {
-                            session::session_lifecycle_store::runner_restart_unreported_report(
-                                &rec,
+                        let report =
+                            session::session_lifecycle_store::runner_restart_report_on_close(
+                                &store,
+                                csid,
                                 session::tracking_health::primary_boot_unix_millis_or_init(),
-                            )
-                        });
+                            );
                         if let Some(report) = report {
                             tracing::info!(
                                 claude_session = %csid,

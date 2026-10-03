@@ -2815,11 +2815,13 @@ fn gate_record_fields(gate: Option<GateIdentity>) -> (Option<String>, Option<Str
 /// provider's session-open hook ([`record_pinned_session_open`] with no gate)
 /// and the frontend's verified-resume re-assert
 /// ([`terminal_session_record_open`]). Idempotent: once adopted, the record is
-/// this generation's and later calls do nothing. Returns what was adopted.
+/// this generation's and later calls do nothing. Only a record THIS boot's
+/// restore pass marked is adopted (see
+/// [`SessionLifecycleStore::adopt_restored_gate`]). Returns what was adopted.
 pub(crate) fn adopt_restored_continuation(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
-) -> Option<(String, uuid::Uuid)> {
+) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
     adopt_restored_continuation_at(
         store,
         claude_session_id,
@@ -2832,10 +2834,15 @@ pub(crate) fn adopt_restored_continuation_at(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
     current_boot_ms: i64,
-) -> Option<(String, uuid::Uuid)> {
-    let (terminal_id, gate_id) = store.adopt_restored_gate(claude_session_id, current_boot_ms)?;
-    crate::agent_runtime::register_restored_continuation(terminal_id.clone(), gate_id);
-    Some((terminal_id, gate_id))
+) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
+    let (terminal_id, gate_id, consuming_device_id) =
+        store.adopt_restored_gate(claude_session_id, current_boot_ms)?;
+    crate::agent_runtime::register_restored_continuation(
+        terminal_id.clone(),
+        gate_id,
+        consuming_device_id,
+    );
+    Some((terminal_id, gate_id, consuming_device_id))
 }
 
 /// Verification arm for a pre-pinned session: poll `verify` (pinned
@@ -3366,6 +3373,44 @@ mod tests {
         assert_eq!(
             open[0].zone_index, 4,
             "caller-supplied zone (account-migration respawn) is durably recorded"
+        );
+    }
+
+    /// Review r1 item 4(ii): the transcript-resolved (non-pinned) continuation
+    /// path persists all three gate fields too.
+    #[tokio::test]
+    async fn poll_and_record_session_persists_the_gate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::now_v7(),
+            consuming_device_id: uuid::Uuid::now_v7(),
+        };
+        poll_and_record_session(
+            store.clone(),
+            || Some("resolved-gate-sess".to_string()),
+            "term-g".to_string(),
+            None,
+            "/work/dir".to_string(),
+            "Gate Continuation".to_string(),
+            "default".to_string(),
+            0,
+            Some(gate),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await;
+        let rec = store.get("resolved-gate-sess").expect("recorded");
+        assert_eq!(rec.gate_id, Some(gate.gate_id.to_string()));
+        assert_eq!(
+            rec.gate_consuming_device_id,
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(
+            rec.gate_bound_boot_ms,
+            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init())
         );
     }
 
