@@ -83,6 +83,12 @@ export interface TerminalAgentStateEvent {
    * Absent on a runner build that predates it.
    */
   seq?: number;
+  /**
+   * The runner process's publish epoch (a random boot id). `seq` restarts at
+   * 0 with every runner process, so seqs are ordered only within one epoch.
+   * Absent on a runner build that predates it.
+   */
+  epoch?: string;
   verdict: Verdict;
   hookDelivery: HookDelivery;
 }
@@ -238,14 +244,45 @@ export type AgentStateOrigin = "event" | "row";
  * any event with a higher one — the snapshot that resolves after a live event
  * must not overwrite it. A runner build that sends no `seq` is applied as
  * before (no ordering to go on).
+ *
+ * `heldEpoch` / `incomingEpoch` are the runner's publish epochs. A DIFFERENT
+ * epoch than the held one always wins (a restarted runner counts from 0
+ * again — comparing its seqs with the old process's would discard every new
+ * event); the caller then resets the held seq to the incoming one.
  */
 export function isNewerAgentState(
   held: number | undefined,
   incoming: number | undefined,
   origin: AgentStateOrigin,
+  heldEpoch?: string,
+  incomingEpoch?: string,
 ): boolean {
+  if (typeof incomingEpoch === "string" && incomingEpoch !== heldEpoch) return true;
   if (typeof incoming !== "number" || typeof held !== "number") return true;
   return origin === "row" ? incoming >= held : incoming > held;
+}
+
+/** What the webview holds per terminal to order incoming verdicts. */
+export interface HeldAgentSeq {
+  seq?: number;
+  epoch?: string;
+}
+
+/**
+ * Admit an incoming verdict against what is held for its terminal: `null`
+ * when it is stale (drop it), otherwise the marker to hold from now on. A new
+ * epoch resets the held seq to the incoming one (or to none).
+ */
+export function admitAgentState(
+  held: HeldAgentSeq | undefined,
+  incoming: Pick<TerminalAgentStateEvent, "seq" | "epoch">,
+  origin: AgentStateOrigin,
+): HeldAgentSeq | null {
+  if (!isNewerAgentState(held?.seq, incoming.seq, origin, held?.epoch, incoming.epoch)) {
+    return null;
+  }
+  const epoch = typeof incoming.epoch === "string" ? incoming.epoch : held?.epoch;
+  return typeof incoming.seq === "number" ? { seq: incoming.seq, epoch } : { epoch };
 }
 
 /**
@@ -257,12 +294,18 @@ export function isNewerAgentState(
  * (`completed` on process exit, an `idle` from the quiet sweep). It may only
  * seed a tab that has no local state yet. A verdict from an event channel or
  * any runner-side source (`hook`, `sideband`, `statusline`, `transcript`)
- * always overrides.
+ * overrides — unless the pane's PROCESS has exited (`exited`): the CLI is
+ * gone, so the `completed` / `error` derived from its exit is final, and a
+ * late hook verdict (a `Stop` in flight when the process died) must not
+ * resurrect it. Only a new session start (`starting`) replaces an exited
+ * pane's state; a new terminal id is a new pane and holds no exit.
  */
 export function verdictOverridesLocalState(
   verdict: Verdict,
   local: SessionState | undefined,
+  exited = false,
 ): boolean {
+  if (exited) return verdict.state.name === "starting";
   const echo = verdict.source === "regex" || verdict.source === "screen_stability";
   if (!echo) return true;
   return local === undefined || local === "unknown";
