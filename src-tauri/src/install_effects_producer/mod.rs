@@ -2317,7 +2317,9 @@ mod tests {
     /// renewed to this boot.
     #[test]
     fn session_open_hook_adopts_a_restored_gate_continuation() {
-        use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
         let _g = crate::agent_runtime::CONTINUATION_REGISTRY_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -2354,7 +2356,11 @@ mod tests {
 
         let after = store.get(csid).unwrap();
         assert_eq!(after.terminal_id, "term-after-restore");
-        assert_eq!(after.gate_bound_boot_ms, Some(boot), "stamp renewed to this boot");
+        assert_eq!(
+            after.gate_bound_boot_ms,
+            Some(boot),
+            "stamp renewed to this boot"
+        );
         assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
         assert_eq!(
             crate::agent_runtime::registered_continuation_gate("term-after-restore"),
