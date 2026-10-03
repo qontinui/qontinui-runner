@@ -106,6 +106,26 @@ mod tests {
     }
 
     #[test]
+    fn present_element_state_is_forwarded_as_an_object() {
+        let r = PlannedActionResult {
+            index: 1,
+            success: true,
+            action: "check".into(),
+            resolved_element_id: Some("e1".into()),
+            error: None,
+            skipped_low_confidence: false,
+            duration_ms: 2,
+            element_state: element_state_of(
+                &serde_json::json!({"elementState": {"checked": true}}),
+            ),
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"index":1,"success":true,"action":"check","resolvedElementId":"e1","skippedLowConfidence":false,"durationMs":2,"elementState":{"checked":true}}"#
+        );
+    }
+
+    #[test]
     fn absent_element_state_is_omitted_from_the_wire() {
         let r = PlannedActionResult {
             index: 0,

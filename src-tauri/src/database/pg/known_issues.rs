@@ -815,7 +815,11 @@ impl PgDb {
             description: row.get(2),
             category: row.get(3),
             detection_type: row.get(4),
-            step_template: step_template_json.and_then(|s| serde_json::from_str(&s).ok()),
+            step_template: stored_json_object(
+                "issue_pattern_templates.step_template",
+                &row.get::<_, String>(0),
+                step_template_json.as_deref(),
+            ),
             ai_prompt_template: row.get(6),
             parameters: serde_json::from_str(&parameters_json).unwrap_or_default(),
             built_in: built_in_val,
@@ -896,12 +900,12 @@ impl PgDb {
             scope_tags: serde_json::from_str(&scope_tags_json).unwrap_or_default(),
             detection_method: DetectionMethod::from_str(&row.get::<_, String>(7))
                 .unwrap_or(DetectionMethod::AiJudgment),
-            // A row written before the object check existed may hold any
-            // JSON; serve only an object, so the published schema holds.
-            detection_config: serde_json::from_str::<serde_json::Value>(&detection_config_json)
-                .ok()
-                .filter(|v| v.is_object())
-                .unwrap_or(serde_json::json!({})),
+            detection_config: stored_json_object(
+                "known_issues.detection_config",
+                &row.get::<_, String>(0),
+                Some(&detection_config_json),
+            )
+            .unwrap_or(serde_json::json!({})),
             pattern_template_id: row.get(9),
             reproduction_context: row.get(10),
             trigger_conditions: serde_json::from_str(&trigger_conditions_json).unwrap_or_default(),
@@ -914,9 +918,11 @@ impl PgDb {
             source_finding_ids: serde_json::from_str(&source_finding_ids_json).unwrap_or_default(),
             source_task_run_id: row.get(17),
             verification_hint: row.get(18),
-            verification_step_template: verification_step_json
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .filter(|v| v.is_object()),
+            verification_step_template: stored_json_object(
+                "known_issues.verification_step_template",
+                &row.get::<_, String>(0),
+                verification_step_json.as_deref(),
+            ),
             times_detected: times_detected as u32,
             times_checked: times_checked as u32,
             last_detected_at,
@@ -924,6 +930,48 @@ impl PgDb {
             resolved_at,
             created_at,
             updated_at,
+        }
+    }
+}
+
+/// Read a stored JSON-object column for serving. The published schema says
+/// these fields are objects, and writes have been checked since the
+/// session-4e change, but a row stored before that may hold any JSON (or
+/// text that does not parse). Such a value is served as ABSENT (the caller
+/// picks `{}` or `None`) and logged, rather than forwarded as a shape the
+/// schema says cannot occur. NULL is absent without a log.
+fn stored_json_object(column: &str, row_id: &str, raw: Option<&str>) -> Option<serde_json::Value> {
+    let raw = raw?;
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) if v.is_object() => Some(v),
+        Ok(serde_json::Value::Null) => None,
+        Ok(_) | Err(_) => {
+            tracing::warn!(
+                "{column} of row {row_id} is not a JSON object; serving it as absent                  (rewritten as absent on the row's next update)"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod stored_json_object_tests {
+    use super::stored_json_object;
+
+    #[test]
+    fn serves_only_objects() {
+        assert_eq!(
+            stored_json_object("c", "r", Some(r#"{"a":1}"#)),
+            Some(serde_json::json!({"a": 1}))
+        );
+        for raw in [
+            None,
+            Some("null"),
+            Some("[1]"),
+            Some("\"x\""),
+            Some("not json"),
+        ] {
+            assert_eq!(stored_json_object("c", "r", raw), None, "{raw:?}");
         }
     }
 }
