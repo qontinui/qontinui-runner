@@ -170,7 +170,7 @@ src/components/terminal/terminalLaunchMenuActions.ts:119	guarded	free	create-pla
 src/components/terminal/terminalLaunchMenuActions.ts:136	guarded	free	create-ai-session	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:171	guarded	free	create-best-account	schema=yes	arity=-	effect=destructive
 src/components/terminal/terminalLaunchMenuActions.ts:205	guarded	free	create-with-command	schema=yes	arity=-	effect=destructive
-src/hooks/changeTrackingHandler.test.ts:50	builtin	element	click	schema=no	arity=-	effect=-
+src/hooks/changeTrackingHandler.test.ts:52	builtin	element	click	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/usePageEvents.ts:1359	delegated	component	map	schema=no	arity=-	effect=-
 src/hooks/ui-bridge-events/utils.ts:192	delegated	component	map	schema=no	arity=-	effect=-
 src/lib/ui-bridge/pages/uibridgeintegrationpage-registrations.tsx:17	literal	component	open-advanced-controls	schema=no	arity=0	effect=read

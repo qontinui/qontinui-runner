@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { handleChangeTrackingCommand } from "../changeTrackingHandler";
+import { buildChangeTrackingResponse, handleChangeTrackingCommand } from "../changeTrackingHandler";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -462,11 +462,13 @@ export function useChangeTrackingEvents(
             },
           );
 
+          // The SDK's `actionSuccess` decides the outer verdict for the
+          // execute-with-diff commands; the result (and its diff) is kept as
+          // `data` on a failure too. See `buildChangeTrackingResponse`.
           await sendResponse({
             requestId,
             type,
-            success: true,
-            data: ctResult,
+            ...buildChangeTrackingResponse(type, ctResult),
             timestamp: Date.now(),
           });
           return true;
