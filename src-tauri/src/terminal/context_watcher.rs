@@ -1,8 +1,15 @@
 //! Proactive context-exhaustion handoff — the grid-scan watcher + PreCompact
 //! signal sink (plan `2026-07-17-session-autonomy-fabric.md`, Phase 7).
 //!
-//! Two redundant signals, ONE trigger path, one per-session debounce:
+//! Three redundant signals, ONE trigger path, one per-session debounce:
 //!
+//! 0. **Transcript context usage** — ranked ABOVE the grid scan (plan
+//!    `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`
+//!    Phase 7). `transcript_watcher` derives each pane's context usage from its
+//!    Claude transcript (`terminal::agent_metrics`); when that reading has a
+//!    known window, its remaining % decides for the pane and the grid is not
+//!    scanned. The grid scan below stays as the fallback for panes with no
+//!    such reading.
 //! 1. **Grid-scan watcher** — [`scan_terminals_once`] rides the EXISTING
 //!    auto-response grid-scan tick (`auto_response::spawn_grid_scan_loop`,
 //!    ~1.5s) and evaluates every live terminal's *rendered* VT grid with the
@@ -71,7 +78,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use qontinui_runner_lib::looping_agent::idle::snapshot_context_low;
+use qontinui_runner_lib::looping_agent::idle::{
+    snapshot_context_low, snapshot_until_autocompact_pct,
+};
 use qontinui_runner_lib::looping_agent::registry::LifecyclePolicy;
 
 use crate::mcp::continuation_verdict::Mode;
@@ -157,6 +166,39 @@ pub fn decide(mode: Mode, context_low: bool, already_fired: bool) -> WatchDecisi
         Mode::On => WatchDecision::Fire,
         Mode::Off => unreachable!("handled above"),
     }
+}
+
+/// Which signal decided a pane's context-low evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSignal {
+    /// Transcript-derived remaining % (ranked first).
+    Transcript,
+    /// The rendered grid's auto-compact countdown / `context low` marker.
+    Grid,
+}
+
+impl ContextSignal {
+    pub fn origin(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::Grid => "grid-scan",
+        }
+    }
+}
+
+/// Is the pane context-low, and which signal said so? The transcript's
+/// remaining % (when its window is known) outranks the grid; `grid` is only
+/// consulted without one, and answers `None` when it has nothing new to say
+/// (the scan gate saw no change) — then the pane is skipped this tick. Pure.
+pub fn context_low_signal(
+    transcript_remaining_pct: Option<f64>,
+    threshold_pct: u32,
+    grid: impl FnOnce() -> Option<bool>,
+) -> Option<(bool, ContextSignal)> {
+    if let Some(remaining) = transcript_remaining_pct.filter(|r| r.is_finite()) {
+        return Some((remaining <= f64::from(threshold_pct), ContextSignal::Transcript));
+    }
+    grid().map(|low| (low, ContextSignal::Grid))
 }
 
 /// Which recovery lever a fired trigger pulls.
@@ -249,27 +291,46 @@ pub fn scan_terminals_once() {
     }
 
     for (tid, session) in sessions {
-        // Skip sessions whose grid has not been mutated since the last pass:
-        // the rendered screen is byte-identical, so the (pure) context-low
-        // predicate would return exactly what it returned last tick. One
-        // atomic load instead of a grid lock + full screen render.
-        {
-            let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
-            let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
-            if !gate.should_scan(&tid, session.grid_generation()) {
-                continue;
+        let transcript_remaining = session
+            .agent_state_slot()
+            .lock()
+            .ok()
+            .and_then(|s| s.metrics().transcript_remaining_pct());
+        let grid = || {
+            // Skip sessions whose grid has not been mutated since the last
+            // pass: the rendered screen is byte-identical, so the (pure)
+            // context-low predicate would return exactly what it returned
+            // last tick. One atomic load instead of a grid lock + full
+            // screen render.
+            {
+                let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+                let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
+                if !gate.should_scan(&tid, session.grid_generation()) {
+                    return None;
+                }
             }
-        }
-        // Rendered screen text (rows joined by `\n`) — same read the
-        // auto-response scanner uses; immune to synchronized-output frame
-        // batching. `snapshot_context_low` wants per-row lines.
-        let text = {
-            let grid = session.grid();
-            let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-            guard.text_snapshot().text
+            // Rendered screen text (rows joined by `\n`) — same read the
+            // auto-response scanner uses; immune to synchronized-output frame
+            // batching. `snapshot_context_low` wants per-row lines.
+            let text = {
+                let grid = session.grid();
+                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+                guard.text_snapshot().text
+            };
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            // The countdown is also the pane's `grid` context reading.
+            let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+            let reading = snapshot_until_autocompact_pct(&lines).and_then(|left| {
+                super::agent_metrics::ContextReading::from_grid_until_autocompact(left, now_ms)
+            });
+            if let Ok(mut slot) = session.agent_state_slot().lock() {
+                slot.metrics_mut().set_grid(reading);
+            }
+            Some(snapshot_context_low(&lines, threshold))
         };
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        let low = snapshot_context_low(&lines, threshold);
+        let Some((low, signal)) = context_low_signal(transcript_remaining, threshold, grid) else {
+            continue;
+        };
 
         match decide(mode, low, already_fired(&tid)) {
             WatchDecision::Skip => {}
@@ -279,7 +340,8 @@ pub fn scan_terminals_once() {
                         terminal = %tid,
                         threshold_pct = threshold,
                         mode = mode.as_str(),
-                        "context_watcher: WOULD FIRE (observe) — context-low on rendered grid"
+                        signal = signal.origin(),
+                        "context_watcher: WOULD FIRE (observe) — context-low"
                     );
                 }
             }
@@ -288,9 +350,10 @@ pub fn scan_terminals_once() {
                     info!(
                         terminal = %tid,
                         threshold_pct = threshold,
-                        "context_watcher: context-low on rendered grid — triggering handoff"
+                        signal = signal.origin(),
+                        "context_watcher: context-low — triggering handoff"
                     );
-                    spawn_trigger_task(tid, "grid-scan");
+                    spawn_trigger_task(tid, signal.origin());
                 }
             }
         }
@@ -745,6 +808,58 @@ mod tests {
     fn observe_would_fire_and_on_fires() {
         assert_eq!(decide(Mode::Observe, true, false), WatchDecision::WouldFire);
         assert_eq!(decide(Mode::On, true, false), WatchDecision::Fire);
+    }
+
+    // ── signal ranking: transcript above grid ────────────────────────────
+
+    #[test]
+    fn context_watcher_transcript_signal_ranks_above_grid() {
+        // A known transcript reading decides — the grid is never consulted.
+        let mut grid_called = false;
+        let got = context_low_signal(Some(10.0), 15, || {
+            grid_called = true;
+            Some(false)
+        });
+        assert_eq!(got, Some((true, ContextSignal::Transcript)));
+        assert!(!grid_called, "grid not scanned when the transcript knows");
+        // Healthy transcript context stays healthy even if the grid says low.
+        assert_eq!(
+            context_low_signal(Some(60.0), 15, || Some(true)),
+            Some((false, ContextSignal::Transcript))
+        );
+        // Boundary: remaining == threshold is low (same rule as the grid).
+        assert_eq!(
+            context_low_signal(Some(15.0), 15, || None),
+            Some((true, ContextSignal::Transcript))
+        );
+    }
+
+    #[test]
+    fn context_watcher_grid_is_the_fallback() {
+        assert_eq!(
+            context_low_signal(None, 15, || Some(true)),
+            Some((true, ContextSignal::Grid))
+        );
+        // Unchanged grid (scan gate) ⇒ no evaluation this tick.
+        assert_eq!(context_low_signal(None, 15, || None), None);
+        // A non-finite transcript figure is no reading.
+        assert_eq!(
+            context_low_signal(Some(f64::NAN), 15, || Some(false)),
+            Some((false, ContextSignal::Grid))
+        );
+    }
+
+    #[test]
+    fn context_watcher_transcript_signal_keeps_the_ramp_and_debounce() {
+        // The transcript signal feeds the SAME decide(): off never fires,
+        // observe would-fires, on fires, and a fired key never fires again.
+        let (low, _) = context_low_signal(Some(5.0), 15, || None).unwrap();
+        assert_eq!(decide(Mode::Off, low, false), WatchDecision::Skip);
+        assert_eq!(decide(Mode::Observe, low, false), WatchDecision::WouldFire);
+        assert_eq!(decide(Mode::On, low, false), WatchDecision::Fire);
+        assert_eq!(decide(Mode::On, low, true), WatchDecision::Skip);
+        assert_eq!(ContextSignal::Transcript.origin(), "transcript");
+        assert_eq!(ContextSignal::Grid.origin(), "grid-scan");
     }
 
     // ── fired-marker registry (claim-first debounce) ─────────────────────

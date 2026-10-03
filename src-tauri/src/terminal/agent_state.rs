@@ -48,6 +48,7 @@ use qontinui_runner_lib::agent_truth::{
     RegexState, SidebandWord, Source, StateCapabilities, Verdict,
 };
 
+use crate::terminal::agent_metrics::{MetricsSlot, SessionMetrics, TerminalAgentMetrics};
 use crate::terminal::agent_status_sideband::{
     LimiterDecision, ObservedAgentState, SidebandRateLimiter,
 };
@@ -174,6 +175,8 @@ pub struct AgentStateSlot {
     shadow: Option<(u64, Option<String>)>,
     /// What was last published, for change detection.
     published: Option<(Verdict, HookDelivery)>,
+    /// Context usage and headroom (plan Phase 6).
+    metrics: MetricsSlot,
 }
 
 impl AgentStateSlot {
@@ -188,7 +191,22 @@ impl AgentStateSlot {
             beacon_settings_delivered: None,
             shadow: None,
             published: None,
+            metrics: MetricsSlot::default(),
         }
+    }
+
+    pub fn metrics(&self) -> &MetricsSlot {
+        &self.metrics
+    }
+
+    pub fn metrics_mut(&mut self) -> &mut MetricsSlot {
+        &mut self.metrics
+    }
+
+    /// The reducer's current state, for consumers that gate on a turn
+    /// boundary (the headroom trigger).
+    pub fn current_state(&self, now_ms: u64) -> AgentState {
+        self.truth.verdict(now_ms).state
     }
 
     /// A pane's slot. Claude is the only provider with an event source today,
@@ -328,6 +346,8 @@ pub struct TerminalAgentState {
     pub verdict: Verdict,
     pub hook_delivery: HookDelivery,
     pub last_seen_age_ms: LastSeenAges,
+    /// Context usage and account headroom (plan Phase 6).
+    pub metrics: SessionMetrics,
 }
 
 /// What a read feeds the slot from outside it.
@@ -430,13 +450,41 @@ fn valid_terminal_id(raw: &str) -> bool {
 
 /// Handle one `POST /terminals/agent-event` body. Never logs field content;
 /// every outcome is counted.
+///
+/// A top-level `StopFailure{error: rate_limit}` is ALSO an immediate,
+/// non-regex hint into the reactive account-migration path (plan Phase 8).
+/// That path is probe-confirmed, so transient throttling with a healthy probe
+/// migrates nothing; the hint shares the grid scanner's per-terminal debounce.
 pub fn ingest(
     dir: &impl SlotDirectory,
     header_terminal: Option<&str>,
     body: &[u8],
     now_ms: u64,
 ) -> IngestOutcome {
-    ingest_at(dir, header_terminal, body, now_ms, Instant::now())
+    let out = ingest_at(dir, header_terminal, body, now_ms, Instant::now());
+    let resolved = match &out {
+        IngestOutcome::Applied { terminal_id }
+        | IngestOutcome::Deferred { terminal_id, .. }
+        | IngestOutcome::Coalesced { terminal_id } => Some(terminal_id),
+        IngestOutcome::Dropped(_) => None,
+    };
+    if let Some(terminal_id) = resolved {
+        if agent_event::project_bytes(body).is_ok_and(|p| stop_failure_is_rate_limit(&p)) {
+            super::usage_limit::fire_event_hint(terminal_id.clone(), RATE_LIMIT_HINT);
+        }
+    }
+    out
+}
+
+/// The label the `StopFailure` rate-limit hint carries into the migration
+/// path's logs.
+pub const RATE_LIMIT_HINT: &str = "hook:StopFailure{error:rate_limit}";
+
+/// Is this projection a top-level `StopFailure` carrying `rate_limit`?
+/// (`error` is read first, `error_type` as the fallback — the projection
+/// already folded them.) A subagent's is ignored, as for state.
+pub fn stop_failure_is_rate_limit(p: &AgentEventProjection) -> bool {
+    p.hook_event_name == "StopFailure" && !p.is_subagent && p.error.as_deref() == Some("rate_limit")
 }
 
 /// [`ingest`] with the limiter's monotonic clock injected (the test seam).
@@ -567,11 +615,13 @@ pub fn read_session(
         delivery,
         ages,
     } = state;
+    let (metrics, _) = crate::terminal::agent_metrics::compute(session, terminal_id, false);
     TerminalAgentState {
         terminal_id: terminal_id.to_string(),
         verdict,
         hook_delivery: delivery,
         last_seen_age_ms: ages,
+        metrics: metrics.metrics,
     }
 }
 
@@ -639,22 +689,46 @@ fn compute(
 }
 
 /// Publish `session`'s verdict if it changed since the last publish.
+///
+/// Also publishes the pane's metrics when THEY changed, and offers the
+/// verdict + headroom to the proactive-migration trigger (a zero-cost no-op
+/// while `QONTINUI_PROACTIVE_MIGRATION` is off).
 pub fn publish_session(session: &crate::terminal::session::TerminalSession, terminal_id: &str) {
     let (parts, changed) = compute(session, false);
-    if !changed {
+    let (metrics, metrics_changed) =
+        crate::terminal::agent_metrics::compute(session, terminal_id, true);
+    crate::terminal::headroom::on_tick(
+        terminal_id,
+        &parts.verdict.state,
+        metrics.account.as_deref(),
+        metrics.headroom.as_ref(),
+        now_ms(),
+    );
+    if !changed && !metrics_changed {
         return;
     }
     let Some(app) = crate::tauri_app_handle::current() else {
         return;
     };
-    emit(
-        &app,
-        &AgentStateEvent {
-            terminal_id: terminal_id.to_string(),
-            verdict: parts.verdict,
-            hook_delivery: parts.delivery,
-        },
-    );
+    if changed {
+        emit(
+            &app,
+            &AgentStateEvent {
+                terminal_id: terminal_id.to_string(),
+                verdict: parts.verdict,
+                hook_delivery: parts.delivery,
+            },
+        );
+    }
+    if metrics_changed {
+        crate::terminal::agent_metrics::emit(
+            &app,
+            &TerminalAgentMetrics {
+                terminal_id: terminal_id.to_string(),
+                metrics: metrics.metrics,
+            },
+        );
+    }
 }
 
 /// Publish one terminal by id, if it is live.
@@ -693,7 +767,9 @@ pub fn publish_all_once() {
     let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
         return;
     };
-    for (id, session) in tm.sessions_snapshot() {
+    let sessions = tm.sessions_snapshot();
+    crate::terminal::headroom::retain_live(sessions.iter().map(|(id, _)| id.as_str()));
+    for (id, session) in sessions {
         publish_session(&session, &id);
     }
 }
@@ -1160,10 +1236,35 @@ mod tests {
                 hook: Some(5),
                 ..Default::default()
             },
+            metrics: SessionMetrics::default(),
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["lastSeenAgeMs"]["hook"], 5);
         assert!(v["lastSeenAgeMs"]["screen_stability"].is_null());
+        assert!(v["metrics"]["contextUsedPct"].is_null());
+        assert!(v["metrics"]["costUsd"].is_null());
+    }
+
+    #[test]
+    fn migration_stop_failure_rate_limit_is_an_immediate_hint() {
+        let p = |v: serde_json::Value| agent_event::project_bytes(&body(v)).unwrap();
+        assert!(stop_failure_is_rate_limit(&p(
+            serde_json::json!({"hook_event_name": "StopFailure", "error": "rate_limit"})
+        )));
+        // The documented `error_type` spelling is the fallback.
+        assert!(stop_failure_is_rate_limit(&p(
+            serde_json::json!({"hook_event_name": "StopFailure", "error_type": "rate_limit"})
+        )));
+        // Other failures, other events and subagents are not hints.
+        assert!(!stop_failure_is_rate_limit(&p(
+            serde_json::json!({"hook_event_name": "StopFailure", "error": "overloaded"})
+        )));
+        assert!(!stop_failure_is_rate_limit(&p(
+            serde_json::json!({"hook_event_name": "Stop", "error": "rate_limit"})
+        )));
+        assert!(!stop_failure_is_rate_limit(&p(serde_json::json!({
+            "hook_event_name": "StopFailure", "error": "rate_limit", "agent_id": "sub-1"
+        }))));
     }
 
     #[test]

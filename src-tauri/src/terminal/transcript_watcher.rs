@@ -1423,6 +1423,16 @@ async fn tail_session(
         crate::session::transcript_autobind::spawn_ensure_bound(t, &path);
     }
 
+    // ── Context usage (plan
+    // `2026-09-20-terminal-session-state-comes-from-events-not-screen-scraping`,
+    // Phase 6) ────────────────────────────────────────────────────────────
+    //
+    // The last assistant record's `input + cache_creation + cache_read`,
+    // reset at a `compact_boundary`. Per tail; a truncation resets it. The
+    // tracker's substring prefilter keeps the JSON parse off every line that
+    // cannot carry usage.
+    let mut context = super::agent_metrics::ContextTracker::default();
+
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
         session_id,
@@ -1439,8 +1449,11 @@ async fn tail_session(
         if truncated {
             workflow_check_buf.clear();
             did_workflow_recheck = false;
+            context = super::agent_metrics::ContextTracker::default();
         }
         let mut rows_landed = 0usize;
+        let mut context_changed = false;
+        let batch_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
         // Session-repository Phase 2: the tailer gets the whole batch this
         // wake consumed (`bytes`) — ONE outbox append, one durable offset
         // reservation per wake instead of one per line.
@@ -1449,6 +1462,8 @@ async fn tail_session(
             if !did_workflow_recheck && workflow_check_buf.lines().count() < 5 {
                 workflow_check_buf.push_str(line);
             }
+
+            context_changed |= context.observe_line(line, batch_ms);
 
             match parse_line_for_touched_files(&session_id, line) {
                 Ok(touched) => {
@@ -1542,6 +1557,14 @@ async fn tail_session(
                     }
                 }
             }
+        }
+
+        // ── 4b. Publish the pane's context usage when it moved ────────────
+        //
+        // Resolves the pane running this Claude session (pinned or learned
+        // session id); a transcript with no pane (SDK, workflow) is a no-op.
+        if context_changed {
+            super::agent_metrics::record_transcript_context(&session_id, context.reading());
         }
 
         // ── 5. Trigger commit-state emit if rows landed ───────────────────
