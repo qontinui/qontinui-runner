@@ -73,6 +73,11 @@ interface CommitTrafficLightProps {
   /** Inject text into the PTY for `isPtyTab=true`. Sourced by the
    *  caller from `terminalRefs.current.get(tab.id)?.current?.writeToTerminal`. */
   onWriteToTerminal?: (text: string) => void;
+  /** Render-time clock (epoch ms) for the stale-age note. The caller owns the
+   *  tick (`useCommitState` keeps one internally but does not return it), so
+   *  this component stays pure.
+   *  Without it a stale tooltip names the observation time instead of an age. */
+  nowMs?: number;
 }
 
 // Color palette mirrors `STATE_DOT_COLORS` in `TerminalTabBar.tsx`
@@ -86,15 +91,31 @@ const DOT_BG: Record<CommitState["status"], string | null> = {
 };
 
 /** Build the hover-tooltip string per plan §3:
- *  "{dirty}/{touched} dirty in {N} repo(s)[; merging: a, b]". */
-function buildTooltip(state: CommitState): string {
+ *  "{dirty}/{touched} dirty in {N} repo(s)[; merging: a, b]", plus — when the
+ *  runner answered from its cache under memory pressure — a note that this is
+ *  the last known answer and how old it is. */
+export function buildTooltip(state: CommitState, nowMs?: number): string {
   const repos = state.repo_roots.length;
   const repoWord = `${repos} repo${repos === 1 ? "" : "s"}`;
-  const base = `${state.dirty_count}/${state.touched_count} dirty in ${repoWord}`;
+  let text = `${state.dirty_count}/${state.touched_count} dirty in ${repoWord}`;
   if (state.merging_repos.length > 0) {
-    return `${base}; merging: ${state.merging_repos.join(", ")}`;
+    text = `${text}; merging: ${state.merging_repos.join(", ")}`;
   }
-  return base;
+  if (state.stale) {
+    const when =
+      nowMs === undefined
+        ? `observed at ${new Date(state.generated_at_ms).toLocaleTimeString()}`
+        : `from ${Math.max(0, Math.round((nowMs - state.generated_at_ms) / 1000))}s ago`;
+    // A stale "unknown" is a poll that got NO answer (shed with nothing
+    // cached, or a failed call) — not one the runner served from its cache —
+    // so it does not claim memory pressure as the cause.
+    const cause =
+      state.status === "unknown"
+        ? "runner gave no current answer"
+        : "probe paused under memory pressure";
+    text = `${text} — last known answer ${when} — ${cause}`;
+  }
+  return text;
 }
 
 /** Returns true iff the commit button should be clickable. */
@@ -107,6 +128,7 @@ export function CommitTrafficLight({
   sessionId,
   isPtyTab,
   onWriteToTerminal,
+  nowMs,
 }: CommitTrafficLightProps) {
   // Don't render the indicator when state is undefined (probe never fired
   // / no claudeSessionId yet). The button still slots in disabled so the
@@ -114,7 +136,10 @@ export function CommitTrafficLight({
   const status = state?.status ?? "unknown";
   const dotClass = DOT_BG[status];
   const enabled = isCommitButtonEnabled(state);
-  const tooltip = state ? buildTooltip(state) : "Commit state unknown";
+  // A stale answer is still an answer — a stale `dirty` keeps the commit
+  // button (the AI re-checks the tree before committing) — but it is labelled.
+  const stale = Boolean(state?.stale);
+  const tooltip = state ? buildTooltip(state, nowMs) : "Commit state unknown";
   const buttonTitle = (() => {
     if (status === "merging") {
       const repos = state?.merging_repos.join(", ") || "this repo";
@@ -155,11 +180,14 @@ export function CommitTrafficLight({
       className="flex items-center gap-1 shrink-0"
       data-testid="commit-traffic-light"
       data-commit-status={status}
+      data-commit-stale={stale ? "true" : undefined}
     >
       {dotClass && (
         <span
           aria-label={`Commit state: ${status}`}
-          className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`}
+          className={`w-2 h-2 rounded-full shrink-0 ${dotClass}${
+            stale ? " opacity-50 ring-1 ring-[#565f89]" : ""
+          }`}
           title={tooltip}
         />
       )}

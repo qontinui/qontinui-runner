@@ -1036,11 +1036,13 @@ pub(crate) async fn commit_session_progress_inner(
 /// touched-file set. Returns a `CommitState` describing whether the tracker
 /// is empty / clean / dirty / mid-merge across one or more enclosing repos.
 ///
-/// Used by:
-/// 1. The Tauri command `get_session_commit_state` for frontend polling.
-/// 2. The `commit-state-changed` event emitter that fires from
-///    `auto_register_file`, the transcript-tail watcher, and post-commit
-///    paths — see `emit_commit_state_for_session` below.
+/// Two halves, split so a caller can decide between them:
+/// [`session_touched_files`] (the PG tracker read, no `git`) and
+/// [`probe_commit_state`] (the `git` probe). This composes them, ungated, for
+/// the `commit-state-changed` event driver (`probe_and_emit_commit_state`),
+/// which is gated upstream by [`emit_commit_state_for_session`]. The frontend's
+/// poll does NOT come through here: `get_session_commit_state` reads the
+/// tracker itself and hands the probe decision to [`poll_commit_state`].
 ///
 /// Errors are surfaced as `(StatusCode, String)` so callers can map them onto
 /// the existing `CommandResponse { success: false, message }` shape used by
@@ -1049,8 +1051,21 @@ pub(crate) async fn session_commit_state_inner(
     app_handle: &tauri::AppHandle,
     session_id: &str,
 ) -> Result<crate::git_status_subset::CommitState, (StatusCode, String)> {
+    let files = session_touched_files(app_handle, session_id).await?;
+    if files.is_empty() {
+        // An empty tracker costs no git — never worth gating or probing.
+        return Ok(crate::git_status_subset::CommitState::empty());
+    }
+    probe_commit_state(files).await
+}
+
+/// Read the session's touched-files tracker (steps 1-2 of
+/// [`session_commit_state_inner`]). One PG read, no `git`.
+pub(crate) async fn session_touched_files(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<Vec<String>, (StatusCode, String)> {
     use crate::commands::AppState;
-    use crate::git_status_subset::{now_ms, CommitState, CommitStateStatus};
 
     // 1. Resolve AppState (for pg_db). Same gating as
     //    `commit_session_progress_inner` step 2.
@@ -1069,50 +1084,45 @@ pub(crate) async fn session_commit_state_inner(
     //    live PTYs (see `commit_session_progress_inner:527-528`). The PTY
     //    transcript watcher writes rows under the same id.
     let pg = app_state.pg_db.clone();
-    let files = pg.get_files_touched(session_id).await.map_err(|e| {
+    pg.get_files_touched(session_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to read touched-files tracker: {}", e),
         )
-    })?;
+    })
+}
 
-    if files.is_empty() {
-        return Ok(CommitState {
-            status: CommitStateStatus::Empty,
-            touched_count: 0,
-            dirty_count: 0,
-            repo_roots: Vec::new(),
-            merging_repos: Vec::new(),
-            generated_at_ms: now_ms(),
-        });
-    }
-
-    // Steps 3-5 are the SYNCHRONOUS git probe, moved to the blocking pool.
-    //
-    // RT-P0: this probe fires from `dispatcher::auto_register_file` (every
-    // Edit/Write hook) and from `transcript_watcher::tail_session` (every
-    // transcript append that lands rows) — through
-    // `emit_commit_state_for_session`, whose per-session pacing, global
-    // in-flight cap and shedding bound how often it runs — and from the
-    // frontend's 30 s `get_session_commit_state` poll. Each probe runs one
-    // `git rev-parse --show-toplevel` per touched directory plus a `git status`
-    // and a mid-merge check per repo.
-    //
-    // Run inline in this `async fn` (as it was), every one of those subprocess
-    // round-trips parked a MAIN-runtime worker for its full duration. With
-    // enough sessions that is every worker at once, which is exactly the
-    // observed failure: `:9876` completing the TCP handshake — the listening
-    // socket is still there — and then answering nothing at all, `/health` and
-    // `/web-integration/status` included.
-    //
-    // A blocking-pool thread is the right home for a subprocess wait. Each of
-    // those `git` calls is bounded: `git_status_subset` runs them through
-    // `process_helpers::run_probe` under its `GIT_TIMEOUT` (20 s PER CALL), so
-    // an actually-hung git (index.lock, a stalled mount) holds this thread for
-    // at most 20 s per call and then gives it back. A probe is one
-    // `rev-parse --show-toplevel` per distinct parent directory of the touched
-    // files, plus two calls per repo (the mid-merge `rev-parse --git-dir` and
-    // the `status --porcelain`), each bounded by `GIT_TIMEOUT` on its own.
+/// Steps 3-5 of [`session_commit_state_inner`] — the SYNCHRONOUS git probe over
+/// a non-empty touched-file set, moved to the blocking pool.
+///
+/// RT-P0: this probe fires from `dispatcher::auto_register_file` (every
+/// Edit/Write hook) and from `transcript_watcher::tail_session` (every
+/// transcript append that lands rows) — through
+/// `emit_commit_state_for_session`, whose per-session pacing, global in-flight
+/// cap and shedding bound how often it runs — and from the frontend's 30 s
+/// `get_session_commit_state` poll, which [`poll_commit_state`] gates by the
+/// same verdict and runs under the same global cap. Each probe runs one
+/// `git rev-parse --show-toplevel` per touched directory plus a `git status`
+/// and a mid-merge check per repo.
+///
+/// Run inline in an `async fn` (as it once was), every one of those subprocess
+/// round-trips parked a MAIN-runtime worker for its full duration. With
+/// enough sessions that is every worker at once, which is exactly the
+/// observed failure: `:9876` completing the TCP handshake — the listening
+/// socket is still there — and then answering nothing at all, `/health` and
+/// `/web-integration/status` included.
+///
+/// A blocking-pool thread is the right home for a subprocess wait. Each of
+/// those `git` calls is bounded: `git_status_subset` runs them through
+/// `process_helpers::run_probe` under its `GIT_TIMEOUT` (20 s PER CALL), so
+/// an actually-hung git (index.lock, a stalled mount) holds this thread for
+/// at most 20 s per call and then gives it back. A probe is one
+/// `rev-parse --show-toplevel` per distinct parent directory of the touched
+/// files, plus two calls per repo (the mid-merge `rev-parse --git-dir` and
+/// the `status --porcelain`), each bounded by `GIT_TIMEOUT` on its own.
+pub(crate) async fn probe_commit_state(
+    files: Vec<String>,
+) -> Result<crate::git_status_subset::CommitState, (StatusCode, String)> {
     tokio::task::spawn_blocking(move || commit_state_from_touched_files(files))
         .await
         .map_err(|e| {
@@ -1147,6 +1157,7 @@ fn commit_state_from_touched_files(files: Vec<String>) -> crate::git_status_subs
             repo_roots: Vec::new(),
             merging_repos: Vec::new(),
             generated_at_ms: now_ms(),
+            stale: false,
         };
     }
 
@@ -1194,6 +1205,7 @@ fn commit_state_from_touched_files(files: Vec<String>) -> crate::git_status_subs
         repo_roots,
         merging_repos,
         generated_at_ms: now_ms(),
+        stale: false,
     }
 }
 
@@ -1214,11 +1226,17 @@ const COMMIT_STATE_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// across N sessions at 500 ms); ten times the window is a tenth of the rate,
 /// which on the ~12-session box that aborted takes the commit-state probe from
 /// ~24 a second to ~2.4 — while a session that is actively editing still gets a
-/// fresh badge every five seconds (the burst's trailing probe included), and
-/// the frontend's own 30 s poll (`useCommitState.ts`) is unchanged underneath.
+/// fresh badge every five seconds (the burst's trailing probe included). The
+/// frontend's own 30 s poll (`useCommitState.ts`) takes the same tenfold cut at
+/// Throttle — see [`COMMIT_STATE_POLL_THROTTLE_WINDOW`].
 const COMMIT_STATE_THROTTLE_FACTOR: u32 = 10;
 
-/// Global cap on commit-state probes in flight at once, across every session.
+/// Global cap on commit-state probes in flight at once, across every session
+/// AND both callers: the event driver ([`CommitStateLimiter::drive`]) and the
+/// frontend's poll ([`poll_commit_state`], via
+/// [`CommitStateLimiter::run_under_permit`]). Until plan
+/// `2026-10-01-resource-guard-floors-follow-ups-…` Phase 4 only the driver took
+/// a permit, so N polling tabs still fanned out N concurrent probes at Run.
 ///
 /// Phase 3 of the same plan: this spender had NO global bound — one
 /// independent `spawn_blocking` per session per emit. A probe is a run of
@@ -1299,8 +1317,11 @@ struct CommitStateBook {
 /// The global in-flight cap, per-session coalescing and per-session pacing for
 /// commit-state probes.
 ///
-/// - `permits` bounds how many probes run AT ONCE, across all sessions
-///   ([`COMMIT_STATE_MAX_IN_FLIGHT`]).
+/// - `permits` bounds how many probes run AT ONCE, across all sessions and
+///   both callers ([`COMMIT_STATE_MAX_IN_FLIGHT`]). The poll takes a permit
+///   through [`Self::run_under_permit`] and nothing else: it claims no slot and
+///   records no `last_start`, because it is a request/response read, not a
+///   coalesced emit.
 /// - A session's slot bounds how many probes it can have QUEUED to one. A
 ///   session with a driver already outstanding does not spawn a second; it sets
 ///   that driver's `rerun` flag instead. Every request that landed before a
@@ -1516,6 +1537,18 @@ impl CommitStateLimiter {
         }
     }
 
+    /// Run `fut` holding one of the global in-flight permits — the frontend
+    /// poll's way into the cap. Claims no slot and records no `last_start`:
+    /// the poll is a request/response read, so neither coalescing nor the
+    /// emit's per-session pacing applies to it.
+    pub(crate) async fn run_under_permit<F: std::future::Future>(&self, fut: F) -> F::Output {
+        // The semaphore is never closed, so the permit is always `Ok`; were it
+        // ever not, running the read anyway is still correct (it is bounded by
+        // `GIT_TIMEOUT` per call regardless).
+        let _permit = self.permits.acquire().await.ok();
+        fut.await
+    }
+
     /// Shed the owed probe: release the slot and return `true` — unless a
     /// forced claim has landed, in which case the probe is owed regardless and
     /// this returns `false`.
@@ -1533,6 +1566,256 @@ impl CommitStateLimiter {
 fn commit_state_limiter() -> &'static CommitStateLimiter {
     static LIMITER: std::sync::OnceLock<CommitStateLimiter> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| CommitStateLimiter::new(COMMIT_STATE_MAX_IN_FLIGHT))
+}
+
+/// The oldest cached commit state a shed poll may still serve — and the age at
+/// which the cache prunes an entry.
+///
+/// Five minutes is the frontend's own `STALE_CAP_MS` (`useCommitState.ts`),
+/// past which the badge pins any state to `unknown` on arrival anyway: one
+/// threshold for "this is still an answer", so the runner and the badge agree
+/// on the instant it stops being one.
+const COMMIT_STATE_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The frontend's commit-state poll interval (`POLL_INTERVAL_MS` in
+/// `useCommitState.ts`).
+const COMMIT_STATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// At a THROTTLE verdict, a poll serves the cache when it is younger than this
+/// rather than probing: the poll interval × [`COMMIT_STATE_THROTTLE_FACTOR`]
+/// (300 s), the same tenfold rate cut the emit takes at Throttle. The emit's
+/// own throttled window (5 s) would be meaningless here — a 30 s poll's cache
+/// is almost never that young. An actively-edited session still refreshes the
+/// cache through the throttled emit every 5 s.
+const COMMIT_STATE_POLL_THROTTLE_WINDOW: std::time::Duration =
+    COMMIT_STATE_POLL_INTERVAL.saturating_mul(COMMIT_STATE_THROTTLE_FACTOR);
+
+/// Edge-triggered shed logger for the frontend's commit-state poll — its own,
+/// so the poll's transitions are not folded into the emit's
+/// ([`COMMIT_STATE_SHED_LOG`]).
+static COMMIT_STATE_POLL_SHED_LOG: std::sync::Mutex<crate::resource_guard::ShedLog> =
+    std::sync::Mutex::new(crate::resource_guard::ShedLog::new("commit_state_poll"));
+
+/// How far in the future a cached state's stamp may sit before the cache treats
+/// it as unusable. A small allowance absorbs ordinary clock jitter between the
+/// probe and the read; anything beyond it means the wall clock stepped
+/// backwards, and an age computed from it would read as zero for as long as the
+/// step lasts — keeping an arbitrarily old answer servable.
+const COMMIT_STATE_FUTURE_STAMP_TOLERANCE_MS: u64 = 5_000;
+
+/// The age of a commit state at `now_ms` (wall-clock millis). A stamp more than
+/// [`COMMIT_STATE_FUTURE_STAMP_TOLERANCE_MS`] in the future reads as
+/// [`std::time::Duration::MAX`] — too old to serve, and pruned on the next
+/// write — rather than as age zero.
+fn commit_state_age(
+    state: &crate::git_status_subset::CommitState,
+    now_ms: u64,
+) -> std::time::Duration {
+    if state.generated_at_ms > now_ms.saturating_add(COMMIT_STATE_FUTURE_STAMP_TOLERANCE_MS) {
+        return std::time::Duration::MAX;
+    }
+    std::time::Duration::from_millis(now_ms.saturating_sub(state.generated_at_ms))
+}
+
+/// Session id → the last SUCCESSFUL commit-state probe, so a poll shed under
+/// memory pressure can answer with the last known state, labelled `stale`,
+/// instead of with nothing or with a fresh-looking guess.
+///
+/// Written by every successful probe — the poll's ([`poll_commit_state`]) and
+/// the event driver's (`probe_and_emit_commit_state`) — and pruned of entries
+/// older than [`COMMIT_STATE_CACHE_MAX_AGE`] on every write, so it holds only
+/// recently-probed sessions.
+pub(crate) struct CommitStateCache {
+    entries:
+        std::sync::Mutex<std::collections::HashMap<String, crate::git_status_subset::CommitState>>,
+}
+
+impl CommitStateCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn entries(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, crate::git_status_subset::CommitState>,
+    > {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a successful probe of `session_id`, pruning every entry past
+    /// [`COMMIT_STATE_CACHE_MAX_AGE`].
+    ///
+    /// A tracker-EMPTY answer (`touched_count == 0`) evicts the session instead
+    /// of being stored: it is never a valid answer for the non-empty tracker a
+    /// later shed poll would be asking about, so serving it would be a
+    /// fresh-looking `Empty` for files the session has since touched. With the
+    /// entry evicted, that poll answers UNKNOWN — which is the truth.
+    ///
+    /// `state.generated_at_ms` must come from THIS process's wall clock (every
+    /// caller stamps it just before recording); a foreign stamp far in the
+    /// future would drag the prune clock forward with it.
+    ///
+    /// `now_ms` may predate the probe it records — a poll reads its clock
+    /// before waiting for a permit and running git — so the prune measures ages
+    /// against the later of `now_ms` and the answer's own stamp. Otherwise a
+    /// slow probe would read every entry recorded meanwhile as future-stamped
+    /// and prune good answers.
+    pub(crate) fn record(
+        &self,
+        session_id: &str,
+        state: &crate::git_status_subset::CommitState,
+        now_ms: u64,
+    ) {
+        let now_ms = now_ms.max(state.generated_at_ms);
+        let mut entries = self.entries();
+        entries.retain(|_, cached| commit_state_age(cached, now_ms) < COMMIT_STATE_CACHE_MAX_AGE);
+        // A slower probe can finish after a newer one already recorded; keep
+        // whichever answer was generated last — an eviction included.
+        if entries
+            .get(session_id)
+            .is_some_and(|cached| cached.generated_at_ms > state.generated_at_ms)
+        {
+            return;
+        }
+        if state.touched_count == 0 {
+            entries.remove(session_id);
+            return;
+        }
+        let mut state = state.clone();
+        state.stale = false;
+        entries.insert(session_id.to_string(), state);
+    }
+
+    /// The cached state of `session_id`, iff it is younger than `max_age`.
+    fn younger_than(
+        &self,
+        session_id: &str,
+        max_age: std::time::Duration,
+        now_ms: u64,
+    ) -> Option<crate::git_status_subset::CommitState> {
+        self.entries()
+            .get(session_id)
+            .filter(|cached| commit_state_age(cached, now_ms) < max_age)
+            .cloned()
+    }
+}
+
+/// The process-wide [`CommitStateCache`].
+static COMMIT_STATE_CACHE: std::sync::OnceLock<CommitStateCache> = std::sync::OnceLock::new();
+
+fn commit_state_cache() -> &'static CommitStateCache {
+    COMMIT_STATE_CACHE.get_or_init(CommitStateCache::new)
+}
+
+/// What [`poll_commit_state`] needs besides the request: the cache it reads and
+/// writes, the limiter whose permits bound it, and its shed logger. Injected so
+/// tests run against their own.
+pub(crate) struct CommitStatePollCtx<'a> {
+    pub(crate) cache: &'a CommitStateCache,
+    pub(crate) limiter: &'a CommitStateLimiter,
+    pub(crate) shed_log: &'a std::sync::Mutex<crate::resource_guard::ShedLog>,
+}
+
+/// The process-wide [`CommitStatePollCtx`] the `get_session_commit_state`
+/// command runs under.
+pub(crate) fn commit_state_poll_ctx() -> CommitStatePollCtx<'static> {
+    CommitStatePollCtx {
+        cache: commit_state_cache(),
+        limiter: commit_state_limiter(),
+        shed_log: &COMMIT_STATE_POLL_SHED_LOG,
+    }
+}
+
+/// The decision behind the frontend's `get_session_commit_state` poll, over an
+/// injected verdict, cache, limiter, clock (`now_ms`, wall-clock millis) and
+/// probe — the `external_processes_response` (`commands/transcript.rs`) shape.
+///
+/// Plan `2026-10-01-resource-guard-floors-follow-ups-capability-wire-linux-commit-pid-marker-poll-gate`,
+/// Phase 4. The poll fires every 30 s per tab and each probe is 3-7+ `git`
+/// calls, so it is gated by the same background-work verdict as the emit:
+///
+/// - **Tracker empty** (`files` empty) → a fresh `Empty`, at every verdict. It
+///   costs no `git`, so shedding it would buy nothing.
+/// - **Run** (or UNKNOWN reading / guard disabled) → probe, holding one of the
+///   global in-flight permits ([`CommitStateLimiter::run_under_permit`]); cache
+///   and return the fresh state.
+/// - **Throttle** → serve the cache, `stale: true`, when it is younger than
+///   [`COMMIT_STATE_POLL_THROTTLE_WINDOW`]; otherwise probe as at Run.
+/// - **Skip** → serve the cache, `stale: true`, when it is younger than
+///   [`COMMIT_STATE_CACHE_MAX_AGE`]; otherwise `Err` — UNKNOWN, which the
+///   command returns as `success: false`. **Never** a fresh-looking `Clean` or
+///   `Empty` for a non-empty tracker: that would read as "nothing to commit"
+///   on a tree nobody looked at.
+///
+/// A failed probe is `Err` and writes nothing to the cache: it knew nothing,
+/// so it cannot replace something that was known.
+pub(crate) async fn poll_commit_state<P, Fut>(
+    verdict: &crate::resource_guard::BackgroundWork,
+    ctx: &CommitStatePollCtx<'_>,
+    session_id: &str,
+    files: Vec<String>,
+    now_ms: u64,
+    probe: P,
+) -> Result<crate::git_status_subset::CommitState, String>
+where
+    P: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<crate::git_status_subset::CommitState, (StatusCode, String)>,
+    >,
+{
+    use crate::git_status_subset::CommitState;
+    use crate::resource_guard::{BackgroundWork, ShedState};
+
+    let shed_state = match verdict {
+        BackgroundWork::Run => ShedState::Running,
+        BackgroundWork::Throttle(_) => ShedState::Throttled,
+        BackgroundWork::Skip(_) => ShedState::Skipped,
+    };
+    ctx.shed_log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note(shed_state, verdict);
+
+    if files.is_empty() {
+        let mut empty = CommitState::empty();
+        empty.generated_at_ms = now_ms;
+        ctx.cache.record(session_id, &empty, now_ms);
+        return Ok(empty);
+    }
+
+    // How old a cached answer may be and still stand in for a probe — `None`
+    // at Run, which always probes.
+    let serve_cache_within = match verdict {
+        BackgroundWork::Run => None,
+        BackgroundWork::Throttle(_) => Some(COMMIT_STATE_POLL_THROTTLE_WINDOW),
+        BackgroundWork::Skip(_) => Some(COMMIT_STATE_CACHE_MAX_AGE),
+    };
+    if let Some(max_age) = serve_cache_within {
+        if let Some(mut cached) = ctx.cache.younger_than(session_id, max_age, now_ms) {
+            cached.stale = true;
+            return Ok(cached);
+        }
+        if matches!(verdict, BackgroundWork::Skip(_)) {
+            return Err(format!(
+                "Commit state was not probed: the probe was skipped under memory pressure and \
+                 no answer from the last {} minutes exists for this session. This is UNKNOWN, \
+                 not clean.",
+                COMMIT_STATE_CACHE_MAX_AGE.as_secs() / 60
+            ));
+        }
+    }
+
+    let state = ctx
+        .limiter
+        .run_under_permit(probe(files))
+        .await
+        .map_err(|(_status, msg)| msg)?;
+    ctx.cache.record(session_id, &state, now_ms);
+    Ok(state)
 }
 
 /// What one background commit-state emit does.
@@ -1592,9 +1875,11 @@ fn decide_commit_state_emit(
 /// - **Throttle**: that window is [`COMMIT_STATE_THROTTLE_FACTOR`]× longer.
 /// - **Skip**: nothing is probed and nothing is recorded, so the first trigger
 ///   after the pressure clears probes immediately. A skipped emit costs a stale
-///   badge until that trigger, or the frontend's 30 s poll
-///   (`get_session_commit_state`, which this does not gate) — never a
-///   permanent one.
+///   badge until that trigger, or until the frontend's 30 s poll
+///   (`get_session_commit_state`) next probes — which it does not do at Skip
+///   either: it answers from [`COMMIT_STATE_CACHE`] marked `stale`, or UNKNOWN
+///   ([`poll_commit_state`]). Never a permanent stale badge, and never a
+///   fresh-looking one.
 ///
 /// Inside a window a request is deferred, not dropped: the burst gets one
 /// trailing probe at the window's end ([`decide_commit_state_emit`]). At every
@@ -1688,6 +1973,8 @@ async fn probe_and_emit_commit_state(app_handle: tauri::AppHandle, session_id: S
             return;
         }
     };
+    // Every successful probe feeds the cache a shed poll answers from.
+    commit_state_cache().record(&session_id, &state, crate::git_status_subset::now_ms());
 
     // Build the payload with explicit keys — never via a
     // camelCase-renamed struct (see camelcase trap memo above).
@@ -4527,5 +4814,374 @@ mod commit_state_limiter_tests {
         let book = limiter.book();
         assert!(!book.last_start.contains_key("gone"), "stale entry pruned");
         assert!(book.last_start.contains_key("live"), "fresh entry kept");
+    }
+}
+
+/// The frontend commit-state poll's gate — plan
+/// `2026-10-01-resource-guard-floors-follow-ups-capability-wire-linux-commit-pid-marker-poll-gate`,
+/// Phase 4. Every test injects its own verdict, cache, limiter and clock; none
+/// reads the live verdict (which reads real settings).
+#[cfg(test)]
+mod commit_state_poll_tests {
+    use super::*;
+    use crate::git_status_subset::{CommitState, CommitStateStatus};
+    use crate::resource_guard::{
+        test_skip_verdict, test_throttle_verdict, BackgroundWork, ShedLog,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const NOW: u64 = 1_000_000_000;
+    const SESSION: &str = "session-a";
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn state(status: CommitStateStatus, generated_at_ms: u64) -> CommitState {
+        CommitState {
+            status,
+            touched_count: 2,
+            dirty_count: usize::from(status == CommitStateStatus::Dirty),
+            repo_roots: vec!["/repo".into()],
+            merging_repos: Vec::new(),
+            generated_at_ms,
+            stale: false,
+        }
+    }
+
+    fn files() -> Vec<String> {
+        vec!["/repo/a.rs".into(), "/repo/b.rs".into()]
+    }
+
+    fn ms(d: Duration) -> u64 {
+        d.as_millis() as u64
+    }
+
+    struct Fixture {
+        cache: CommitStateCache,
+        limiter: CommitStateLimiter,
+        log: std::sync::Mutex<ShedLog>,
+        probes: Arc<AtomicUsize>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                cache: CommitStateCache::new(),
+                limiter: CommitStateLimiter::new(COMMIT_STATE_MAX_IN_FLIGHT),
+                log: std::sync::Mutex::new(ShedLog::new("commit_state_poll")),
+                probes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn ctx(&self) -> CommitStatePollCtx<'_> {
+            CommitStatePollCtx {
+                cache: &self.cache,
+                limiter: &self.limiter,
+                shed_log: &self.log,
+            }
+        }
+
+        /// Poll once with a counting probe that answers a fresh `Clean`
+        /// stamped `now`.
+        fn poll(
+            &self,
+            verdict: &BackgroundWork,
+            files: Vec<String>,
+            now: u64,
+        ) -> Result<CommitState, String> {
+            let probes = self.probes.clone();
+            rt().block_on(poll_commit_state(
+                verdict,
+                &self.ctx(),
+                SESSION,
+                files,
+                now,
+                move |_files| async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    Ok(state(CommitStateStatus::Clean, now))
+                },
+            ))
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Skip with a fresh cache: zero probes, and the cached state (Dirty — not
+    /// the probe's Clean) comes back labelled stale.
+    #[test]
+    fn skip_with_a_fresh_cache_serves_it_stale_without_probing() {
+        let f = Fixture::new();
+        f.cache.record(
+            SESSION,
+            &state(CommitStateStatus::Dirty, NOW - 60_000),
+            NOW - 60_000,
+        );
+        let got = f
+            .poll(&test_skip_verdict(), files(), NOW)
+            .expect("cached answer");
+        assert_eq!(f.probes(), 0, "a Skip poll must not probe");
+        assert_eq!(got.status, CommitStateStatus::Dirty);
+        assert!(got.stale, "a cached answer must be labelled stale");
+        assert_eq!(got.generated_at_ms, NOW - 60_000, "the age travels with it");
+    }
+
+    /// Skip with nothing cached: UNKNOWN, zero probes — never a Clean.
+    #[test]
+    fn skip_with_no_cache_is_unknown_not_clean() {
+        let f = Fixture::new();
+        let err = f
+            .poll(&test_skip_verdict(), files(), NOW)
+            .expect_err("no cache at Skip must be UNKNOWN");
+        assert_eq!(f.probes(), 0);
+        assert!(err.contains("UNKNOWN"), "{err}");
+        assert!(err.contains("memory pressure"), "{err}");
+    }
+
+    /// Skip with only a cache past the max age: UNKNOWN, zero probes.
+    #[test]
+    fn skip_with_a_cache_past_max_age_is_unknown() {
+        let f = Fixture::new();
+        let old = NOW - ms(COMMIT_STATE_CACHE_MAX_AGE) - 1_000;
+        f.cache
+            .record(SESSION, &state(CommitStateStatus::Dirty, old), old);
+        let err = f
+            .poll(&test_skip_verdict(), files(), NOW)
+            .expect_err("an expired cache is no answer");
+        assert_eq!(f.probes(), 0);
+        assert!(err.contains("UNKNOWN"), "{err}");
+    }
+
+    /// An empty tracker answers a fresh Empty at Skip without any git.
+    #[test]
+    fn empty_tracker_at_skip_is_a_fresh_empty_without_probing() {
+        let f = Fixture::new();
+        let got = f
+            .poll(&test_skip_verdict(), Vec::new(), NOW)
+            .expect("empty tracker is always answerable");
+        assert_eq!(f.probes(), 0);
+        assert_eq!(got.status, CommitStateStatus::Empty);
+        assert!(!got.stale);
+    }
+
+    /// An empty tracker evicts the cached answer: once the session touches
+    /// files again, a Skip poll must not serve the pre-commit state (or an
+    /// Empty) as if it described them.
+    #[test]
+    fn empty_tracker_evicts_the_cached_answer() {
+        let f = Fixture::new();
+        f.cache.record(
+            SESSION,
+            &state(CommitStateStatus::Dirty, NOW - 1_000),
+            NOW - 1_000,
+        );
+        f.poll(&BackgroundWork::Run, Vec::new(), NOW).unwrap();
+        assert!(f.poll(&test_skip_verdict(), files(), NOW + 1_000).is_err());
+        assert_eq!(f.probes(), 0);
+    }
+
+    /// Throttle with a young cache: zero probes, the cache labelled stale.
+    #[test]
+    fn throttle_with_a_young_cache_serves_it_stale() {
+        let f = Fixture::new();
+        f.cache.record(
+            SESSION,
+            &state(CommitStateStatus::Dirty, NOW - 90_000),
+            NOW - 90_000,
+        );
+        let got = f.poll(&test_throttle_verdict(), files(), NOW).unwrap();
+        assert_eq!(f.probes(), 0);
+        assert_eq!(got.status, CommitStateStatus::Dirty);
+        assert!(got.stale);
+    }
+
+    /// Throttle with an expired cache: one probe, a fresh answer, and the cache
+    /// now holds it.
+    #[test]
+    fn throttle_with_an_expired_cache_probes_and_writes_the_cache() {
+        let f = Fixture::new();
+        let old = NOW - ms(COMMIT_STATE_POLL_THROTTLE_WINDOW) - 1_000;
+        f.cache
+            .record(SESSION, &state(CommitStateStatus::Dirty, old), old);
+        let got = f.poll(&test_throttle_verdict(), files(), NOW).unwrap();
+        assert_eq!(f.probes(), 1);
+        assert_eq!(got.status, CommitStateStatus::Clean);
+        assert!(!got.stale);
+        let cached = f
+            .cache
+            .younger_than(SESSION, COMMIT_STATE_CACHE_MAX_AGE, NOW)
+            .expect("a successful probe is cached");
+        assert_eq!(cached.status, CommitStateStatus::Clean);
+        assert_eq!(cached.generated_at_ms, NOW);
+    }
+
+    /// Run always probes — even with a young cache — and answers fresh.
+    #[test]
+    fn run_probes_once_and_answers_fresh() {
+        let f = Fixture::new();
+        f.cache.record(
+            SESSION,
+            &state(CommitStateStatus::Dirty, NOW - 1_000),
+            NOW - 1_000,
+        );
+        let got = f.poll(&BackgroundWork::Run, files(), NOW).unwrap();
+        assert_eq!(f.probes(), 1);
+        assert_eq!(got.status, CommitStateStatus::Clean);
+        assert!(!got.stale);
+    }
+
+    /// A failed probe is UNKNOWN and does not clobber the cache.
+    #[test]
+    fn a_failed_probe_does_not_clobber_the_cache() {
+        let f = Fixture::new();
+        f.cache.record(
+            SESSION,
+            &state(CommitStateStatus::Dirty, NOW - 1_000),
+            NOW - 1_000,
+        );
+        let err = rt()
+            .block_on(poll_commit_state(
+                &BackgroundWork::Run,
+                &f.ctx(),
+                SESSION,
+                files(),
+                NOW,
+                |_files| async { Err((StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())) },
+            ))
+            .expect_err("a failed probe is no answer");
+        assert_eq!(err, "boom");
+        let cached = f
+            .cache
+            .younger_than(SESSION, COMMIT_STATE_CACHE_MAX_AGE, NOW)
+            .expect("the previous answer survives");
+        assert_eq!(cached.status, CommitStateStatus::Dirty);
+    }
+
+    /// The cache prunes entries past the max age on write.
+    #[test]
+    fn the_cache_prunes_expired_entries_on_write() {
+        let cache = CommitStateCache::new();
+        let old = NOW - ms(COMMIT_STATE_CACHE_MAX_AGE) - 1;
+        cache.record("gone", &state(CommitStateStatus::Dirty, old), old);
+        cache.record("live", &state(CommitStateStatus::Dirty, NOW), NOW);
+        let entries = cache.entries();
+        assert!(!entries.contains_key("gone"), "expired entry pruned");
+        assert!(entries.contains_key("live"));
+    }
+
+    /// A probe that finishes after a newer one already recorded must not
+    /// overwrite it: the cache keeps the answer generated last.
+    #[test]
+    fn the_cache_keeps_the_newer_answer() {
+        let cache = CommitStateCache::new();
+        cache.record(SESSION, &state(CommitStateStatus::Clean, NOW), NOW);
+        cache.record(SESSION, &state(CommitStateStatus::Dirty, NOW - 1_000), NOW);
+        let kept = cache.younger_than(SESSION, COMMIT_STATE_CACHE_MAX_AGE, NOW);
+        assert_eq!(kept.map(|s| s.status), Some(CommitStateStatus::Clean));
+    }
+
+    /// A record whose `now_ms` predates its own probe (a poll that waited for a
+    /// permit and ran git) must not prune an answer another session recorded
+    /// in the meantime as future-stamped.
+    #[test]
+    fn a_slow_probe_does_not_prune_answers_recorded_meanwhile() {
+        let cache = CommitStateCache::new();
+        let later = NOW + 30_000;
+        cache.record("b", &state(CommitStateStatus::Dirty, later), later);
+        cache.record(SESSION, &state(CommitStateStatus::Clean, later), NOW);
+        assert!(cache
+            .younger_than("b", COMMIT_STATE_CACHE_MAX_AGE, later)
+            .is_some());
+    }
+
+    /// A late, older tracker-empty answer does not evict a newer cached one.
+    #[test]
+    fn a_late_older_empty_answer_does_not_evict_a_newer_one() {
+        let cache = CommitStateCache::new();
+        cache.record(SESSION, &state(CommitStateStatus::Dirty, NOW), NOW);
+        let mut empty = CommitState::empty();
+        empty.generated_at_ms = NOW - 1_000;
+        cache.record(SESSION, &empty, NOW);
+        assert!(cache
+            .younger_than(SESSION, COMMIT_STATE_CACHE_MAX_AGE, NOW)
+            .is_some());
+    }
+
+    /// A stamp far in the future (the wall clock stepped backwards) is not
+    /// age zero: it is unusable, so a Skip poll answers UNKNOWN rather than
+    /// serving an answer of unknowable age.
+    #[test]
+    fn a_future_stamped_cache_entry_is_not_servable() {
+        let f = Fixture::new();
+        let future = NOW + COMMIT_STATE_FUTURE_STAMP_TOLERANCE_MS + 1;
+        f.cache
+            .record(SESSION, &state(CommitStateStatus::Clean, future), future);
+        assert!(f
+            .cache
+            .younger_than(SESSION, COMMIT_STATE_CACHE_MAX_AGE, NOW)
+            .is_none());
+        // Within the jitter allowance the entry still serves.
+        let near = NOW + COMMIT_STATE_FUTURE_STAMP_TOLERANCE_MS;
+        f.cache
+            .record("near", &state(CommitStateStatus::Clean, near), near);
+        assert!(f
+            .cache
+            .younger_than("near", COMMIT_STATE_CACHE_MAX_AGE, NOW)
+            .is_some());
+    }
+
+    /// The poll holds a global in-flight permit: with every permit taken, a Run
+    /// poll does not probe until one is released.
+    #[test]
+    fn a_run_poll_waits_for_a_global_permit() {
+        let cache = CommitStateCache::new();
+        let limiter = CommitStateLimiter::new(1);
+        let log = std::sync::Mutex::new(ShedLog::new("commit_state_poll"));
+        let ctx = CommitStatePollCtx {
+            cache: &cache,
+            limiter: &limiter,
+            shed_log: &log,
+        };
+        let probes = Arc::new(AtomicUsize::new(0));
+        rt().block_on(async {
+            let held = limiter.permits.acquire().await.unwrap();
+            let counted = probes.clone();
+            let poll = poll_commit_state(
+                &BackgroundWork::Run,
+                &ctx,
+                SESSION,
+                files(),
+                NOW,
+                move |_files| async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(state(CommitStateStatus::Clean, NOW))
+                },
+            );
+            tokio::pin!(poll);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut poll)
+                    .await
+                    .is_err(),
+                "the poll must wait while every permit is held"
+            );
+            assert_eq!(probes.load(Ordering::SeqCst), 0);
+            drop(held);
+            let got = tokio::time::timeout(Duration::from_secs(5), poll)
+                .await
+                .expect("released permit lets the poll finish")
+                .unwrap();
+            assert_eq!(got.status, CommitStateStatus::Clean);
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        // The poll took a permit and nothing else: no slot, no pacing stamp.
+        let book = limiter.book();
+        assert!(book.slots.is_empty());
+        assert!(book.last_start.is_empty());
     }
 }
