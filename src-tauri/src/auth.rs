@@ -1372,6 +1372,24 @@ impl AuthManager {
         self.secure_storage.get_device_machine_key()
     }
 
+    /// Recorded expiry (unix seconds) of the stored machine key, if web
+    /// reported one. See [`SecureStorage::get_device_machine_key_expires_at`].
+    pub fn get_device_machine_key_expires_at(&self) -> Option<i64> {
+        self.secure_storage.get_device_machine_key_expires_at()
+    }
+
+    /// Persist a machine key minted by web (enrolment / rotation) with its
+    /// reported expiry. Background-safe (`Merge`: refuses to overwrite an
+    /// unreadable store).
+    pub fn store_device_machine_key_with_expiry(
+        &self,
+        key: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.secure_storage
+            .store_device_machine_key_with_expiry(key, expires_at)
+    }
+
     /// `true` iff the Cognito access token is missing OR within
     /// [`COGNITO_REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
