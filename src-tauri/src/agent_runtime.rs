@@ -13909,9 +13909,9 @@ mod tests {
     fn guard_verdict(
         anchor_key: Option<&str>,
         is_live: &dyn Fn(&str) -> bool,
-        thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+        load_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, thread_pressure).0
+        evaluate_continuation_guard(anchor_key, is_live, load_pressure).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -15584,7 +15584,7 @@ mod tests {
     #[test]
     fn spawn_admission_json_names_each_lane_and_the_stamp_it_would_write() {
         let floors = crate::settings::SessionGuardSettings::default();
-        let lanes = |memory, threads| crate::resource_guard::LaneVerdicts {
+        let lanes = |memory, graded: usize, threads| crate::resource_guard::LaneVerdicts {
             memory_lane: "host",
             free_commit_bytes: Some(WARN_BAND_FREE),
             free_phys_bytes: None,
@@ -15592,7 +15592,7 @@ mod tests {
             critical_free_commit_bytes: floors.critical_free_commit_bytes,
             memory,
             threads: crate::resource_guard::ThreadLane {
-                graded: Some(300),
+                graded: Some(graded),
                 warn_ceiling: 256,
                 critical_ceiling: 400,
                 verdict: threads,
@@ -15601,7 +15601,7 @@ mod tests {
 
         // Memory tripped, threads calm: the composed verdict and the stamp are
         // the memory lane's.
-        let v = spawn_admission_json(Some(&lanes(commit_verdict(WARN_BAND_FREE), calm())), 7);
+        let v = spawn_admission_json(Some(&lanes(commit_verdict(WARN_BAND_FREE), 200, calm())), 7);
         assert_eq!(v["enabled"], true);
         assert_eq!(v["verdict"], "warn");
         assert_eq!(
@@ -15617,7 +15617,7 @@ mod tests {
         assert_eq!(v["memory"]["verdict"], "warn");
         assert_eq!(v["threads"]["verdict"], "proceed");
         // The graded reading is reported whether or not the lane tripped.
-        assert_eq!(v["threads"]["gradedThreads"], 300);
+        assert_eq!(v["threads"]["gradedThreads"], 200);
         assert_eq!(v["threads"]["warnCeiling"], 256);
         assert_eq!(v["threads"]["criticalCeiling"], 400);
         assert_eq!(v["liveContinuations"], 7);
@@ -15628,6 +15628,7 @@ mod tests {
         let v = spawn_admission_json(
             Some(&lanes(
                 commit_verdict(WARN_BAND_FREE),
+                540,
                 thread_verdict(Some(540)),
             )),
             0,
@@ -15635,9 +15636,10 @@ mod tests {
         assert_eq!(v["verdict"], "critical");
         assert_eq!(v["deferStamp"], "thread_pressure:critical:540_over_400");
         assert_eq!(v["threads"]["verdict"], "critical");
+        assert_eq!(v["threads"]["gradedThreads"], 540);
 
         // Calm: no stamp.
-        let v = spawn_admission_json(Some(&lanes(calm(), calm())), 0);
+        let v = spawn_admission_json(Some(&lanes(calm(), 200, calm())), 0);
         assert_eq!(v["verdict"], "proceed");
         assert_eq!(v["deferStamp"], serde_json::Value::Null);
 
