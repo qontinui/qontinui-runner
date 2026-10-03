@@ -16,12 +16,18 @@
 //!   `Source::ScreenStability`).
 //!
 //! PTY input evidence (`PtyInputSlots`) and the grid-idle observation are fed
-//! at verdict-READ time ([`read_session`]), so no extra hot-path work exists.
-//! A verdict change is published as the Tauri event [`EVENT_NAME`] plus the WS
-//! re-broadcast `terminal-exit` uses, so a headless runner's remote webview
-//! sees it too. The periodic sweep ([`publish_all_once`], riding the grid-scan
-//! tick) re-publishes changes that come from TIME alone — a freshness TTL
-//! lapsing, a human answering a permission prompt, `HookDelivery` turning
+//! at verdict-compute time. A verdict change is published as the Tauri event
+//! [`EVENT_NAME`] plus the WS re-broadcast `terminal-exit` uses, so a headless
+//! runner's remote webview sees it too. Every published change carries a
+//! per-terminal, monotonically increasing `seq` (so is every read row), which
+//! lets the webview discard a snapshot older than an event it already holds.
+//!
+//! Only a PUBLISH consumes a change; a READ ([`read_session`], [`read_all`])
+//! never does, so a read between a change and its publish cannot swallow it.
+//! A human answering a `NeedsYou` is published from the PTY input path
+//! ([`on_pty_input`], debounced, off the writer's thread). The periodic sweep
+//! ([`publish_all_once`], riding the grid-scan tick) re-publishes changes that
+//! come from TIME alone — a freshness TTL lapsing, `HookDelivery` turning
 //! `Absent` ten seconds after a silent submit.
 //!
 //! ## Untrusted input
@@ -31,10 +37,10 @@
 //! kept, and no field content is ever logged — only counters
 //! ([`ingest_counters`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -71,17 +77,45 @@ const SHADOW_RECHECK_MS: u64 = 60_000;
 /// How often the installed CLI version is re-probed.
 const CLI_VERSION_RECHECK: Duration = Duration::from_secs(60 * 60);
 
+/// A `claude --version` probe that has not answered by then is killed.
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// PTY input is published at most once per this window per terminal (an
+/// answer is a few keystrokes; one publish covers them).
+const INPUT_PUBLISH_DEBOUNCE: Duration = Duration::from_millis(50);
+
 /// Largest settings file the shadow inspection will read.
 const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
 
-fn now_ms() -> u64 {
+/// Wall-clock unix millis — only for comparisons against provider-stamped
+/// times (the headroom trigger). The reducer runs on [`now_ms`].
+fn wall_now_ms() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
 }
 
-/// Unix millis of a monotonic instant in the past, anchored at `now_ms`.
-fn instant_to_unix_ms(at: Instant, now_ms: u64) -> u64 {
-    let ago = u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    now_ms.saturating_sub(ago)
+/// The process's one `Instant` ↔ unix-millis anchor, taken on first use.
+fn clock_anchor() -> (Instant, u64) {
+    static ANCHOR: OnceLock<(Instant, u64)> = OnceLock::new();
+    *ANCHOR.get_or_init(|| (Instant::now(), wall_now_ms()))
+}
+
+/// The reducer's clock: unix millis that never step backwards. Derived from
+/// the monotonic clock through ONE anchor per process, so a wall-clock step
+/// (NTP, a suspend, a manual change) cannot reorder observations, and every
+/// stamp — an ingest's, an input slot's, a read's — is on the same timeline.
+pub fn now_ms() -> u64 {
+    instant_to_unix_ms(Instant::now())
+}
+
+/// Unix millis of a monotonic instant, on the [`now_ms`] timeline. The same
+/// instant always maps to the same millis (no per-call re-anchoring).
+fn instant_to_unix_ms(at: Instant) -> u64 {
+    let (base, base_ms) = clock_anchor();
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    match at.checked_duration_since(base) {
+        Some(after) => base_ms.saturating_add(ms(after)),
+        None => base_ms.saturating_sub(ms(base.duration_since(at))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +125,7 @@ fn instant_to_unix_ms(at: Instant, now_ms: u64) -> u64 {
 static RECEIVED: AtomicU64 = AtomicU64::new(0);
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static DROPPED_OVERSIZE: AtomicU64 = AtomicU64::new(0);
+static DROPPED_BROKEN_STREAM: AtomicU64 = AtomicU64::new(0);
 static DROPPED_MALFORMED: AtomicU64 = AtomicU64::new(0);
 static DROPPED_UNKNOWN_EVENT: AtomicU64 = AtomicU64::new(0);
 static DROPPED_NO_TERMINAL: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +141,8 @@ pub struct IngestCounters {
     /// Applied to a terminal's reducer (immediately or by a deferred flush).
     pub accepted: u64,
     pub dropped_oversize: u64,
+    /// The request body stream failed before it was read in full.
+    pub dropped_broken_stream: u64,
     /// Not JSON, not an object, or no usable `hook_event_name`.
     pub dropped_malformed: u64,
     pub dropped_unknown_event: u64,
@@ -115,7 +152,8 @@ pub struct IngestCounters {
     pub dropped_subagent: u64,
     /// Superseded inside the per-terminal limiter window (latest wins).
     pub coalesced: u64,
-    /// Asserted no state (`SessionStart: compact`, …) or arrived out of order.
+    /// Asserted no state (`SessionStart: compact`, `Notification:
+    /// agent_completed`, …).
     pub dropped_no_state: u64,
 }
 
@@ -123,11 +161,12 @@ impl IngestCounters {
     /// One line, for the config report.
     pub fn summary(&self) -> String {
         format!(
-            "received={} accepted={} oversize={} malformed={} unknown_event={} no_terminal={} \
-             subagent={} coalesced={} no_state={}",
+            "received={} accepted={} oversize={} broken_stream={} malformed={} unknown_event={} \
+             no_terminal={} subagent={} coalesced={} no_state={}",
             self.received,
             self.accepted,
             self.dropped_oversize,
+            self.dropped_broken_stream,
             self.dropped_malformed,
             self.dropped_unknown_event,
             self.dropped_no_terminal,
@@ -144,6 +183,7 @@ pub fn ingest_counters() -> IngestCounters {
         received: r(&RECEIVED),
         accepted: r(&ACCEPTED),
         dropped_oversize: r(&DROPPED_OVERSIZE),
+        dropped_broken_stream: r(&DROPPED_BROKEN_STREAM),
         dropped_malformed: r(&DROPPED_MALFORMED),
         dropped_unknown_event: r(&DROPPED_UNKNOWN_EVENT),
         dropped_no_terminal: r(&DROPPED_NO_TERMINAL),
@@ -156,6 +196,30 @@ pub fn ingest_counters() -> IngestCounters {
 fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Why a `POST /terminals/agent-event` body never reached [`ingest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableBody {
+    /// Longer than `agent_event::MAX_BODY_BYTES`.
+    Oversize,
+    /// The body stream failed (client hung up, transport error).
+    BrokenStream,
+}
+
+/// Count a body the route could not read — without allocating anything.
+pub fn note_unreadable_body(why: UnreadableBody) {
+    bump(&RECEIVED);
+    match why {
+        UnreadableBody::Oversize => bump(&DROPPED_OVERSIZE),
+        UnreadableBody::BrokenStream => bump(&DROPPED_BROKEN_STREAM),
+    }
+    debug!(reason = ?why, "agent-event: body unreadable, dropped");
+}
+
+/// The source of every published `seq`: one process-wide counter, so a
+/// terminal's sequence is strictly increasing even across a slot that was
+/// replaced under the same terminal id.
+static PUBLISH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // The slot
@@ -175,6 +239,8 @@ pub struct AgentStateSlot {
     shadow: Option<(u64, Option<String>)>,
     /// What was last published, for change detection.
     published: Option<(Verdict, HookDelivery)>,
+    /// The `seq` of the last publish (0 = never published).
+    seq: u64,
     /// Context usage and headroom (plan Phase 6).
     metrics: MetricsSlot,
 }
@@ -191,6 +257,7 @@ impl AgentStateSlot {
             beacon_settings_delivered: None,
             shadow: None,
             published: None,
+            seq: 0,
             metrics: MetricsSlot::default(),
         }
     }
@@ -302,18 +369,38 @@ impl AgentStateSlot {
         (verdict, agent_event::hook_delivery(&evidence, now_ms))
     }
 
-    /// True (and remembered) when `(v, d)` differs from what was last
-    /// published.
-    fn take_if_changed(&mut self, v: Verdict, d: &HookDelivery) -> bool {
-        if self
+    /// True when `(v, d)` differs from what was last published. Pure: a
+    /// READ asks this and consumes nothing.
+    fn differs_from_published(&self, v: Verdict, d: &HookDelivery) -> bool {
+        !self
             .published
             .as_ref()
             .is_some_and(|(pv, pd)| *pv == v && pd == d)
-        {
+    }
+
+    /// True (and remembered, with a fresh `seq`) when `(v, d)` differs from
+    /// what was last published. Only a PUBLISH calls this.
+    fn take_if_changed(&mut self, v: Verdict, d: &HookDelivery) -> bool {
+        if !self.differs_from_published(v, d) {
             return false;
         }
         self.published = Some((v, d.clone()));
+        self.seq = PUBLISH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         true
+    }
+
+    /// The `seq` of the last publish (0 = never published).
+    pub fn published_seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Could PTY input change this pane's verdict right now? Only while the
+    /// published verdict is a `NeedsYou` (rule 5: the human answered) — every
+    /// other state ignores input, so the input path does no work for it.
+    fn input_may_answer(&self) -> bool {
+        self.published
+            .as_ref()
+            .is_some_and(|(v, _)| matches!(v.state, AgentState::NeedsYou { .. }))
     }
 }
 
@@ -334,6 +421,8 @@ pub struct LastSeenAges {
 #[serde(rename_all = "camelCase")]
 pub struct AgentStateEvent {
     pub terminal_id: String,
+    /// This publish's per-terminal sequence number (strictly increasing).
+    pub seq: u64,
     pub verdict: Verdict,
     pub hook_delivery: HookDelivery,
 }
@@ -343,6 +432,10 @@ pub struct AgentStateEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalAgentState {
     pub terminal_id: String,
+    /// The `seq` of the terminal's last publish when this row was read. The
+    /// row is at least as new as that publish, so a reader holding a HIGHER
+    /// `seq` (from an event) must discard the row.
+    pub seq: u64,
     pub verdict: Verdict,
     pub hook_delivery: HookDelivery,
     pub last_seen_age_ms: LastSeenAges,
@@ -461,17 +554,9 @@ pub fn ingest(
     body: &[u8],
     now_ms: u64,
 ) -> IngestOutcome {
-    let out = ingest_at(dir, header_terminal, body, now_ms, Instant::now());
-    let resolved = match &out {
-        IngestOutcome::Applied { terminal_id }
-        | IngestOutcome::Deferred { terminal_id, .. }
-        | IngestOutcome::Coalesced { terminal_id } => Some(terminal_id),
-        IngestOutcome::Dropped(_) => None,
-    };
-    if let Some(terminal_id) = resolved {
-        if agent_event::project_bytes(body).is_ok_and(|p| stop_failure_is_rate_limit(&p)) {
-            super::usage_limit::fire_event_hint(terminal_id.clone(), RATE_LIMIT_HINT);
-        }
+    let (out, rate_limit_hint) = ingest_at(dir, header_terminal, body, now_ms, Instant::now());
+    if let Some(terminal_id) = rate_limit_hint {
+        super::usage_limit::fire_event_hint(terminal_id, RATE_LIMIT_HINT);
     }
     out
 }
@@ -488,13 +573,15 @@ pub fn stop_failure_is_rate_limit(p: &AgentEventProjection) -> bool {
 }
 
 /// [`ingest`] with the limiter's monotonic clock injected (the test seam).
+/// The second value is the resolved terminal when the body was a top-level
+/// `StopFailure{rate_limit}` — read off the ONE projection, never a re-parse.
 fn ingest_at(
     dir: &impl SlotDirectory,
     header_terminal: Option<&str>,
     body: &[u8],
     now_ms: u64,
     now_instant: Instant,
-) -> IngestOutcome {
+) -> (IngestOutcome, Option<String>) {
     bump(&RECEIVED);
     let projection = match agent_event::project_bytes(body) {
         Ok(p) => p,
@@ -507,7 +594,7 @@ fn ingest_at(
                 | ProjectionError::NoEventName => bump(&DROPPED_MALFORMED),
             }
             debug!(reason = e.as_str(), "agent-event: dropped");
-            return IngestOutcome::Dropped(e.as_str());
+            return (IngestOutcome::Dropped(e.as_str()), None);
         }
     };
 
@@ -527,21 +614,29 @@ fn ingest_at(
             event = projection.hook_event_name,
             "agent-event: no terminal"
         );
-        return IngestOutcome::Dropped("no_terminal");
+        return (IngestOutcome::Dropped("no_terminal"), None);
     };
+    let rate_limit_hint = stop_failure_is_rate_limit(&projection).then(|| terminal_id.clone());
 
     let Ok(mut slot) = slot.lock() else {
         bump(&DROPPED_NO_TERMINAL);
-        return IngestOutcome::Dropped("slot_poisoned");
+        return (IngestOutcome::Dropped("slot_poisoned"), None);
     };
     // A subagent's event still PROVES delivery; it just claims no state (v1).
     slot.note_hook_event(&projection, now_ms);
     if projection.is_subagent {
         bump(&DROPPED_SUBAGENT);
-        return IngestOutcome::Dropped("subagent");
+        return (IngestOutcome::Dropped("subagent"), rate_limit_hint);
     }
     let obs = Observation::hook(projection.to_hook_event(), now_ms);
-    match slot.hook_limiter.offer(obs, now_instant) {
+    // An event that claims no state is dropped BEFORE the limiter: latest-wins
+    // would otherwise let it displace a pending real edge (a deferred `Stop`)
+    // and then apply nothing.
+    if obs.kind.claimed_state().is_none() {
+        bump(&DROPPED_NO_STATE);
+        return (IngestOutcome::Dropped("no_state"), rate_limit_hint);
+    }
+    let out = match slot.hook_limiter.offer(obs, now_instant) {
         LimiterDecision::EmitNow(obs) => {
             apply(&mut slot, &obs, now_ms);
             IngestOutcome::Applied { terminal_id }
@@ -551,16 +646,15 @@ fn ingest_at(
             bump(&COALESCED);
             IngestOutcome::Coalesced { terminal_id }
         }
-    }
+    };
+    (out, rate_limit_hint)
 }
 
 fn apply(slot: &mut AgentStateSlot, obs: &Observation, now_ms: u64) {
     match slot.offer(obs, now_ms) {
         ObserveOutcome::Accepted => bump(&ACCEPTED),
         ObserveOutcome::DroppedSubagent => bump(&DROPPED_SUBAGENT),
-        ObserveOutcome::DroppedNoState | ObserveOutcome::DroppedOutOfOrder => {
-            bump(&DROPPED_NO_STATE)
-        }
+        ObserveOutcome::DroppedNoState => bump(&DROPPED_NO_STATE),
     }
 }
 
@@ -603,21 +697,24 @@ impl SlotDirectory for crate::terminal::TerminalManager {
 // ---------------------------------------------------------------------------
 
 /// Compute one pane's state. `with_grid` also takes a grid-idle observation
-/// (a full grid read — only on an explicit read, never on the sweep).
+/// (a full grid read — only on an explicit read, never on the sweep). A READ:
+/// it consumes no pending publish.
 pub fn read_session(
     session: &crate::terminal::session::TerminalSession,
     terminal_id: &str,
     with_grid: bool,
 ) -> TerminalAgentState {
-    let (state, _) = compute(session, with_grid);
+    let (state, _) = compute(session, with_grid, false);
     let TerminalAgentStateParts {
         verdict,
         delivery,
         ages,
+        seq,
     } = state;
     let (metrics, _) = crate::terminal::agent_metrics::compute(session, terminal_id, false);
     TerminalAgentState {
         terminal_id: terminal_id.to_string(),
+        seq,
         verdict,
         hook_delivery: delivery,
         last_seen_age_ms: ages,
@@ -629,24 +726,31 @@ struct TerminalAgentStateParts {
     verdict: Verdict,
     delivery: HookDelivery,
     ages: LastSeenAges,
+    /// The slot's `seq` after this compute (bumped only by a consuming one
+    /// that saw a change).
+    seq: u64,
 }
 
-/// Compute (and return whether it changed since the last publish).
+/// Compute a pane's state, and whether it changed since the last publish.
+///
+/// `consume` is true ONLY for a publish: it records the result as published
+/// (and assigns a new `seq`). A read passes `false`, reports `changed = false`
+/// and leaves the pending change for the publish that owes it — a read that
+/// consumed would leave subscribers holding the stale verdict (e.g. an
+/// authoritative permission ask the human already answered).
 fn compute(
     session: &crate::terminal::session::TerminalSession,
     with_grid: bool,
+    consume: bool,
 ) -> (TerminalAgentStateParts, bool) {
     let now = now_ms();
     let slots = session.last_input();
     let input = InputEvidence {
         // Any human or runner input, control responses excluded — the
         // "human answered" signal of the reducer's rule 5.
-        last_submit_ms: slots.latest().map(|o| instant_to_unix_ms(o.at, now)),
+        last_submit_ms: slots.latest().map(|o| instant_to_unix_ms(o.at)),
     };
-    let runner_submit_ms = slots
-        .last_submit
-        .as_ref()
-        .map(|o| instant_to_unix_ms(o.at, now));
+    let runner_submit_ms = slots.last_submit.as_ref().map(|o| instant_to_unix_ms(o.at));
     let grid = with_grid.then(|| match session.observe_grid_idle() {
         qontinui_runner_lib::wind_down::GridIdle::Idle { since_ms } => GridIdle::Idle {
             since_ms: u64::try_from(since_ms).unwrap_or(0),
@@ -676,13 +780,15 @@ fn compute(
         guard.shadow = Some((now, finding));
     }
     let (verdict, delivery) = guard.read(&ctx, now);
-    let changed = guard.take_if_changed(verdict, &delivery);
+    let changed = consume && guard.take_if_changed(verdict, &delivery);
     let ages = guard.last_seen_ages(now);
+    let seq = guard.published_seq();
     (
         TerminalAgentStateParts {
             verdict,
             delivery,
             ages,
+            seq,
         },
         changed,
     )
@@ -694,15 +800,15 @@ fn compute(
 /// verdict + headroom to the proactive-migration trigger (a zero-cost no-op
 /// while `QONTINUI_PROACTIVE_MIGRATION` is off).
 pub fn publish_session(session: &crate::terminal::session::TerminalSession, terminal_id: &str) {
-    let (parts, changed) = compute(session, false);
+    let (parts, changed) = compute(session, false, true);
     let (metrics, metrics_changed) =
         crate::terminal::agent_metrics::compute(session, terminal_id, true);
     crate::terminal::headroom::on_tick(
         terminal_id,
-        &parts.verdict.state,
+        &parts.verdict,
         metrics.account.as_deref(),
         metrics.headroom.as_ref(),
-        now_ms(),
+        wall_now_ms(),
     );
     if !changed && !metrics_changed {
         return;
@@ -715,6 +821,7 @@ pub fn publish_session(session: &crate::terminal::session::TerminalSession, term
             &app,
             &AgentStateEvent {
                 terminal_id: terminal_id.to_string(),
+                seq: parts.seq,
                 verdict: parts.verdict,
                 hook_delivery: parts.delivery,
             },
@@ -753,6 +860,60 @@ fn emit(app: &tauri::AppHandle, event: &AgentStateEvent) {
     if let Ok(payload) = serde_json::to_value(event) {
         crate::event_system::broadcast_ws_notification(app, EVENT_NAME, &payload);
     }
+}
+
+/// PTY input reached terminal `terminal_id` (called by `TerminalSession`'s
+/// input recorder AFTER the bytes are on the wire and its own lock is
+/// released). When the pane's published verdict is a `NeedsYou` — the only
+/// state input can change — schedule ONE debounced publish of this terminal
+/// on a detached thread, so the answered state reaches the webview now rather
+/// than on the next sweep tick. Any other state costs one short slot lock.
+pub fn on_pty_input(terminal_id: &str, slot: &Mutex<AgentStateSlot>) {
+    let may_answer = slot
+        .lock()
+        .map(|s| s.input_may_answer())
+        .unwrap_or_else(|e| e.into_inner().input_may_answer());
+    if may_answer {
+        schedule_input_publish(terminal_id);
+    }
+}
+
+/// Terminals with an input-triggered publish already scheduled.
+static INPUT_PUBLISH_PENDING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Claim (`true`) or release (`false`) a terminal's pending input publish.
+/// A claim fails while one is already pending.
+fn input_publish_pending(terminal_id: &str, claim: bool) -> bool {
+    let mut guard = INPUT_PUBLISH_PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if claim {
+        set.insert(terminal_id.to_string())
+    } else {
+        set.remove(terminal_id)
+    }
+}
+
+/// Schedule one publish of `terminal_id` after [`INPUT_PUBLISH_DEBOUNCE`].
+/// `false` when one was already pending (the keystrokes coalesce into it).
+fn schedule_input_publish(terminal_id: &str) -> bool {
+    if !input_publish_pending(terminal_id, true) {
+        return false;
+    }
+    let id = terminal_id.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("agent-state-input-publish".into())
+        .spawn(move || {
+            std::thread::sleep(INPUT_PUBLISH_DEBOUNCE);
+            input_publish_pending(&id, false);
+            publish_terminal(&id);
+        });
+    if spawned.is_err() {
+        // The sweep tick still publishes it.
+        input_publish_pending(terminal_id, false);
+    }
+    true
 }
 
 /// Re-publish every live pane whose verdict changed with time alone. Rides the
@@ -896,7 +1057,8 @@ fn parse_cli_version(stdout: &str) -> Option<String> {
 }
 
 /// Probe `claude --version` on a detached thread when never probed or an hour
-/// stale. Never blocks the caller; a failed probe leaves the version UNKNOWN.
+/// stale, killed after [`CLI_VERSION_TIMEOUT`]. Never blocks the caller; a
+/// failed or timed-out probe leaves the version UNKNOWN.
 fn refresh_cli_version_if_due() {
     {
         let Ok(mut s) = CLI_VERSION.lock() else {
@@ -913,9 +1075,11 @@ fn refresh_cli_version_if_due() {
     let spawned = std::thread::Builder::new()
         .name("agent-state-cli-version".into())
         .spawn(|| {
-            let value = crate::process_helpers::no_window("claude")
-                .arg("--version")
-                .output()
+            // Bounded: a hung CLI is killed at the budget, so `in_flight`
+            // always clears and the next probe is only an hour away.
+            let mut cmd = crate::process_helpers::no_window("claude");
+            cmd.arg("--version");
+            let value = crate::process_helpers::output_with_timeout(cmd, CLI_VERSION_TIMEOUT)
                 .ok()
                 .filter(|o| o.status.success())
                 .and_then(|o| parse_cli_version(&String::from_utf8_lossy(&o.stdout)));
@@ -1005,6 +1169,7 @@ mod tests {
             now_ms,
             at(TICK.fetch_add(1, Ordering::Relaxed)),
         )
+        .0
     }
 
     #[test]
@@ -1144,6 +1309,7 @@ mod tests {
                 NOW,
                 burst,
             )
+            .0
         };
         assert!(matches!(
             send("UserPromptSubmit"),
@@ -1218,11 +1384,13 @@ mod tests {
     fn agent_event_wire_payload_is_camel_case() {
         let ev = AgentStateEvent {
             terminal_id: "t1".into(),
+            seq: 7,
             verdict: Verdict::UNKNOWN,
             hook_delivery: HookDelivery::Installed,
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["terminalId"], "t1");
+        assert_eq!(v["seq"], 7);
         assert_eq!(v["verdict"]["state"]["name"], "unknown");
         assert_eq!(
             v["hookDelivery"],
@@ -1230,6 +1398,7 @@ mod tests {
         );
         let row = TerminalAgentState {
             terminal_id: "t1".into(),
+            seq: 3,
             verdict: Verdict::UNKNOWN,
             hook_delivery: HookDelivery::Installed,
             last_seen_age_ms: LastSeenAges {
@@ -1239,6 +1408,7 @@ mod tests {
             metrics: SessionMetrics::default(),
         };
         let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["seq"], 3);
         assert_eq!(v["lastSeenAgeMs"]["hook"], 5);
         assert!(v["lastSeenAgeMs"]["screen_stability"].is_null());
         assert!(v["metrics"]["contextUsedPct"].is_null());
@@ -1305,5 +1475,196 @@ mod tests {
         );
         assert_eq!(parse_cli_version(""), None);
         assert_eq!(parse_cli_version("error: nope"), None);
+    }
+
+    fn permission_ask(at_ms: u64) -> Observation {
+        Observation::hook(
+            agent_event::project_bytes(&body(serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+            })))
+            .unwrap()
+            .to_hook_event(),
+            at_ms,
+        )
+    }
+
+    fn test_session() -> crate::terminal::session::TerminalSession {
+        crate::terminal::session::tests::make_test_session(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// H1: a READ between a change and its publish must not consume the
+    /// change — the publish still emits it, with a new `seq`.
+    #[test]
+    fn agent_event_read_between_change_and_publish_does_not_swallow_it() {
+        let session = test_session();
+        let (first, _) = compute(&session, false, true);
+        let seq0 = first.seq;
+        session
+            .agent_state_slot()
+            .lock()
+            .unwrap()
+            .offer(&permission_ask(now_ms()), now_ms());
+
+        // A read (GET /terminals/agent-state, get_terminal_agent_states).
+        let (read, changed) = compute(&session, false, false);
+        assert!(!changed, "a read reports no change");
+        assert!(read.verdict.is_authoritative_permission_ask());
+        assert_eq!(read.seq, seq0, "a read assigns no seq");
+        let row = read_session(&session, "test", false);
+        assert_eq!(row.seq, seq0);
+
+        // The publish still sees — and emits — the change.
+        let (published, changed) = compute(&session, false, true);
+        assert!(changed, "the publish must still emit the change");
+        assert!(published.verdict.is_authoritative_permission_ask());
+        assert!(published.seq > seq0);
+        // … exactly once.
+        let (_, again) = compute(&session, false, true);
+        assert!(!again);
+    }
+
+    /// M2: `seq` is strictly increasing per terminal, across publishes and
+    /// even across a replaced slot (one process-wide source).
+    #[test]
+    fn agent_event_publish_seq_is_strictly_increasing() {
+        let mut a = AgentStateSlot::new(StateCapabilities::claude());
+        assert_eq!(a.published_seq(), 0);
+        let d = HookDelivery::Installed;
+        assert!(a.take_if_changed(Verdict::UNKNOWN, &d));
+        let s1 = a.published_seq();
+        assert!(s1 > 0);
+        assert!(!a.take_if_changed(Verdict::UNKNOWN, &d));
+        assert_eq!(a.published_seq(), s1, "no change, no new seq");
+        assert!(a.take_if_changed(Verdict::UNKNOWN, &HookDelivery::Unknown { evidence: None }));
+        let s2 = a.published_seq();
+        assert!(s2 > s1);
+        let mut replaced = AgentStateSlot::new(StateCapabilities::claude());
+        assert!(replaced.take_if_changed(Verdict::UNKNOWN, &d));
+        assert!(replaced.published_seq() > s2);
+    }
+
+    /// M1: a no-state hook (`Notification: agent_completed`) is dropped BEFORE
+    /// the limiter, so it cannot displace a deferred real edge.
+    #[test]
+    fn agent_event_no_state_hook_never_displaces_a_pending_edge() {
+        let dir = Dir::with(&[("t1", "sid-1")]);
+        let burst = at(20_000);
+        let send = |v: serde_json::Value| ingest_at(&dir, Some("t1"), &body(v), NOW, burst).0;
+        assert!(matches!(
+            send(serde_json::json!({"hook_event_name": "UserPromptSubmit"})),
+            IngestOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            send(serde_json::json!({"hook_event_name": "Stop"})),
+            IngestOutcome::Deferred { .. }
+        ));
+        let before = ingest_counters().dropped_no_state;
+        assert_eq!(
+            send(serde_json::json!({
+                "hook_event_name": "Notification",
+                "notification_type": "agent_completed",
+            })),
+            IngestOutcome::Dropped("no_state")
+        );
+        assert!(ingest_counters().dropped_no_state > before);
+        assert!(flush_deferred(&dir, "t1", NOW + 300));
+        assert_eq!(
+            dir.verdict("t1").state,
+            AgentState::TurnEnded,
+            "the Stop survived"
+        );
+    }
+
+    /// L2: the rate-limit hint comes off the ingest's own projection.
+    #[test]
+    fn migration_rate_limit_hint_is_returned_by_the_ingest() {
+        let dir = Dir::with(&[("t1", "sid-1")]);
+        let (out, hint) = ingest_at(
+            &dir,
+            Some("t1"),
+            &body(serde_json::json!({"hook_event_name": "StopFailure", "error": "rate_limit"})),
+            NOW,
+            at(30_000),
+        );
+        assert!(matches!(out, IngestOutcome::Applied { .. }));
+        assert_eq!(hint.as_deref(), Some("t1"));
+        let (_, hint) = ingest_at(
+            &dir,
+            Some("t1"),
+            &body(serde_json::json!({"hook_event_name": "Stop"})),
+            NOW + 1,
+            at(30_010),
+        );
+        assert_eq!(hint, None);
+        let (_, hint) = ingest_at(
+            &dir,
+            Some("nobody"),
+            &body(serde_json::json!({"hook_event_name": "StopFailure", "error": "rate_limit"})),
+            NOW + 2,
+            at(30_020),
+        );
+        assert_eq!(hint, None, "an unresolved terminal gets no hint");
+    }
+
+    /// L1: an unreadable body is counted without allocating, and a broken
+    /// stream is told apart from an oversize one.
+    #[test]
+    fn agent_event_route_unreadable_body_is_counted_by_kind() {
+        let c0 = ingest_counters();
+        note_unreadable_body(UnreadableBody::Oversize);
+        let c1 = ingest_counters();
+        assert!(c1.dropped_oversize > c0.dropped_oversize);
+        assert!(c1.received > c0.received);
+        note_unreadable_body(UnreadableBody::BrokenStream);
+        let c2 = ingest_counters();
+        assert!(c2.dropped_broken_stream > c1.dropped_broken_stream);
+        assert!(c2.summary().contains("broken_stream="));
+    }
+
+    /// M4: PTY input schedules a publish only while the published verdict is
+    /// a `NeedsYou`, and a burst of keystrokes coalesces into one.
+    #[test]
+    fn agent_event_pty_input_publishes_only_an_answerable_verdict() {
+        let mut slot = AgentStateSlot::new(StateCapabilities::claude());
+        assert!(!slot.input_may_answer(), "never published");
+        slot.offer(&permission_ask(NOW), NOW);
+        let v = slot.truth.verdict(NOW + 1);
+        assert!(slot.take_if_changed(v, &HookDelivery::Installed));
+        assert!(slot.input_may_answer());
+        let working = Verdict {
+            state: AgentState::Working,
+            ..v
+        };
+        assert!(slot.take_if_changed(working, &HookDelivery::Installed));
+        assert!(
+            !slot.input_may_answer(),
+            "input cannot change a Working verdict"
+        );
+
+        let tid = format!("t-input-{}", uuid::Uuid::new_v4());
+        assert!(schedule_input_publish(&tid));
+        assert!(
+            !schedule_input_publish(&tid),
+            "coalesced into the pending one"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !schedule_input_publish(&tid) {
+            assert!(Instant::now() < deadline, "the pending publish never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// M7: the reducer clock is one anchored timeline — the same instant maps
+    /// to the same millis on every call, and later instants never map earlier.
+    #[test]
+    fn agent_event_clock_is_anchored_and_monotonic() {
+        let i = Instant::now();
+        let a = instant_to_unix_ms(i);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(instant_to_unix_ms(i), a, "no per-call re-anchoring");
+        let later = now_ms();
+        assert!(later >= a);
+        assert!(instant_to_unix_ms(i + Duration::from_secs(1)) >= a + 1_000);
     }
 }

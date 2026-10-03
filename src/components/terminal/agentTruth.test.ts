@@ -17,11 +17,13 @@ import {
   isAuthoritativePermissionAsk,
   isEventSourced,
   isInferredVerdict,
+  isNewerAgentState,
   isTerminalAgentStateEvent,
   offerAgentObservation,
   partitionPermissionAsks,
   sessionStateToObservation,
   stateSourceText,
+  verdictOverridesLocalState,
   verdictToSessionState,
   type AgentState,
   type AgentTruthEntry,
@@ -178,5 +180,55 @@ describe("stateSourceText (Phase 4, SessionInfoDropdown)", () => {
 
   it("is null (rendered unknown) when the runner has reported nothing", () => {
     expect(stateSourceText(undefined)).toBeNull();
+  });
+});
+
+describe("isNewerAgentState (M2: a snapshot never overwrites a newer event)", () => {
+  it("drops an initial snapshot row older than an event already applied", () => {
+    // Event seq 5 applied, then the snapshot read before it resolves (seq 4).
+    expect(isNewerAgentState(5, 4, "row")).toBe(false);
+  });
+
+  it("applies a row read after the held publish (equal seq: at least as new)", () => {
+    expect(isNewerAgentState(5, 5, "row")).toBe(true);
+    expect(isNewerAgentState(5, 6, "row")).toBe(true);
+  });
+
+  it("applies an event only with a strictly higher seq", () => {
+    expect(isNewerAgentState(5, 6, "event")).toBe(true);
+    // Equal: a duplicate, or older than a row read after that publish.
+    expect(isNewerAgentState(5, 5, "event")).toBe(false);
+    expect(isNewerAgentState(5, 4, "event")).toBe(false);
+  });
+
+  it("applies anything when nothing is held, or when the runner sends no seq", () => {
+    expect(isNewerAgentState(undefined, 1, "row")).toBe(true);
+    expect(isNewerAgentState(undefined, 1, "event")).toBe(true);
+    expect(isNewerAgentState(5, undefined, "event")).toBe(true);
+    expect(isNewerAgentState(5, undefined, "row")).toBe(true);
+  });
+});
+
+describe("verdictOverridesLocalState (L6: an echo of the webview's own offer)", () => {
+  const echo = (source: "regex" | "screen_stability") =>
+    verdict({ state: { name: "working" }, source, confidence: "fallback" });
+
+  it("never lets a regex / screen-stability echo overwrite a locally derived state", () => {
+    for (const source of ["regex", "screen_stability"] as const) {
+      for (const local of ["completed", "error", "idle", "working", "needs-input"] as const) {
+        expect(verdictOverridesLocalState(echo(source), local)).toBe(false);
+      }
+    }
+  });
+
+  it("lets an echo seed a tab with no local state yet", () => {
+    expect(verdictOverridesLocalState(echo("regex"), undefined)).toBe(true);
+    expect(verdictOverridesLocalState(echo("screen_stability"), "unknown")).toBe(true);
+  });
+
+  it("always lets a hook / sideband / runner-side verdict override", () => {
+    for (const source of ["hook", "sideband", "statusline", "transcript"] as const) {
+      expect(verdictOverridesLocalState(verdict({ source }), "completed")).toBe(true);
+    }
   });
 });

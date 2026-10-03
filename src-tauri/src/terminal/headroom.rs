@@ -15,16 +15,23 @@
 //! ## A reading is only a hint
 //!
 //! Anything local can forge a headroom reading (a `.claude.json` is a user
-//! file). So a trigger never migrates by itself: it runs the EXISTING confirm,
-//! where the OAuth probe is the verdict. A forged 100 % with a healthy probe
-//! migrates nothing.
+//! file). So a trigger never migrates by itself: the confirm re-runs the
+//! OAuth probe and only the PROBE decides ([`probe_confirms`]) — its fresh
+//! reading at/over the threshold, or a projection over the probe's OWN
+//! five-hour samples (never the cached file's) that agrees. A forged 100 %
+//! with a healthy probe migrates nothing. (The reactive path's confirm —
+//! "the probe says exhausted" — is unchanged; it would make this trigger dead,
+//! since a 95 % threshold fires well before the probe reads exhausted.)
 //!
 //! ## Only at a turn boundary
 //!
-//! A trigger fires only while the pane's verdict is a POSITIVE turn boundary
-//! (`TurnEnded`, `NeedsYou`, `Failed`). `Working` defers to the next boundary;
-//! so do `Unknown` and `Starting` — an unknown state is not evidence that no
-//! turn is in flight, and migrating mid-turn would cut it off.
+//! A trigger fires only at a POSITIVE, AUTHORITATIVE turn boundary: the
+//! verdict is `TurnEnded` with `Confidence::Authoritative` (a hook `Stop` or
+//! the agent's own sideband `finished`). A `NeedsYou` of any reason is not a
+//! boundary (the turn is paused mid-flight, waiting on the human), nor is a
+//! `TurnEnded` read off the screen or inferred. `Working`, `Unknown`,
+//! `Starting` and `Failed` defer too — an unknown state is not evidence that
+//! no turn is in flight, and migrating mid-turn would cut it off.
 //!
 //! ## Flag
 //!
@@ -39,10 +46,10 @@ use std::sync::Mutex;
 
 use tracing::{debug, info};
 
-use qontinui_runner_lib::agent_truth::AgentState;
+use qontinui_runner_lib::agent_truth::{AgentState, Confidence, Verdict};
 
 use crate::mcp::continuation_verdict::Mode;
-use crate::terminal::agent_metrics::{self, FiveHourSample, HeadroomReading};
+use crate::terminal::agent_metrics::{self, FiveHourSample, HeadroomReading, HeadroomSource};
 
 /// Tri-state ramp flag. `off` (default) | `observe` | `on`.
 pub const FLAG_ENV: &str = "QONTINUI_PROACTIVE_MIGRATION";
@@ -86,7 +93,7 @@ pub fn threshold_from(raw: Option<&str>) -> f64 {
         .unwrap_or(DEFAULT_THRESHOLD_PCT)
 }
 
-fn threshold_pct() -> f64 {
+pub(crate) fn threshold_pct() -> f64 {
     threshold_from(std::env::var(THRESHOLD_ENV).ok().as_deref())
 }
 
@@ -183,8 +190,14 @@ pub fn projected_exhaustion_at(samples: &[FiveHourSample]) -> Option<u64> {
 /// Why a headroom hint fired.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HeadroomTrigger {
-    Utilization { window: &'static str, pct: f64 },
-    Projected { exhaustion_at_ms: u64, resets_at_ms: u64 },
+    Utilization {
+        window: &'static str,
+        pct: f64,
+    },
+    Projected {
+        exhaustion_at_ms: u64,
+        resets_at_ms: u64,
+    },
 }
 
 impl HeadroomTrigger {
@@ -233,6 +246,32 @@ pub fn trigger(
     )
 }
 
+/// The headroom-specific CONFIRM: does the OAuth PROBE itself agree?
+///
+/// `probe` must be the probe's own fresh reading (a cached-file reading is
+/// refused, whatever it says); `probe_history` the probe's own five-hour
+/// samples. Confirmed when the probe reading is at/over the threshold, or the
+/// projection over the probe samples says the window runs dry before its
+/// reset within the horizon — the same [`trigger`] rule, fed only what a
+/// local file cannot forge. Pure.
+pub fn probe_confirms(
+    probe: Option<&HeadroomReading>,
+    probe_history: &[FiveHourSample],
+    threshold_pct: f64,
+    now_ms: u64,
+) -> bool {
+    let Some(reading) = probe.filter(|r| r.source == HeadroomSource::OauthProbe) else {
+        return false;
+    };
+    trigger(
+        reading,
+        project(probe_history).as_ref(),
+        threshold_pct,
+        now_ms,
+    )
+    .is_some()
+}
+
 /// What one evaluation should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadroomDecision {
@@ -247,14 +286,19 @@ pub enum HeadroomDecision {
     Fire,
 }
 
-/// Is this state a positive turn boundary?
-fn at_turn_boundary(state: &AgentState) -> Option<bool> {
+/// Is this verdict a positive turn boundary? `Some(true)` only for an
+/// AUTHORITATIVE `TurnEnded`; `None` (skip) once the session ended; every
+/// other verdict — `NeedsYou` of any reason, a screen-read or inferred
+/// `TurnEnded`, `Failed`, `Working`, `Unknown`, `Starting` — defers.
+fn at_turn_boundary(state: &AgentState, confidence: Option<Confidence>) -> Option<bool> {
     match state {
-        AgentState::TurnEnded | AgentState::NeedsYou { .. } | AgentState::Failed { .. } => {
-            Some(true)
-        }
-        AgentState::Working | AgentState::Unknown | AgentState::Starting => Some(false),
         AgentState::Ended { .. } => None,
+        AgentState::TurnEnded => Some(confidence == Some(Confidence::Authoritative)),
+        AgentState::NeedsYou { .. }
+        | AgentState::Failed { .. }
+        | AgentState::Working
+        | AgentState::Unknown
+        | AgentState::Starting => Some(false),
     }
 }
 
@@ -262,7 +306,7 @@ fn at_turn_boundary(state: &AgentState) -> Option<bool> {
 pub fn decide(
     mode: Mode,
     triggered: bool,
-    state: &AgentState,
+    verdict: &Verdict,
     last_fired_ms: Option<u64>,
     now_ms: u64,
 ) -> HeadroomDecision {
@@ -272,7 +316,7 @@ pub fn decide(
     if last_fired_ms.is_some_and(|t| now_ms.saturating_sub(t) < HINT_COOLDOWN_MS) {
         return HeadroomDecision::Skip;
     }
-    match at_turn_boundary(state) {
+    match at_turn_boundary(&verdict.state, verdict.confidence) {
         None => HeadroomDecision::Skip,
         Some(false) => HeadroomDecision::Defer,
         Some(true) => match mode {
@@ -309,7 +353,7 @@ pub fn retain_live<'a>(live: impl Iterator<Item = &'a str>) {
 /// zero-cost early-out.
 pub fn on_tick(
     terminal_id: &str,
-    state: &AgentState,
+    verdict: &Verdict,
     account: Option<&str>,
     reading: Option<&HeadroomReading>,
     now_ms: u64,
@@ -330,7 +374,7 @@ pub fn on_tick(
         .get_or_insert_with(HashMap::new)
         .entry(terminal_id.to_string())
         .or_default();
-    match decide(mode, fired.is_some(), state, entry.last_fired_ms, now_ms) {
+    match decide(mode, fired.is_some(), verdict, entry.last_fired_ms, now_ms) {
         HeadroomDecision::Skip => {}
         HeadroomDecision::Defer => {
             if !entry.deferred_logged {
@@ -464,7 +508,10 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(trigger(&reading(Some(50.0), Some(50.0)), None, 95.0, NOW), None);
+        assert_eq!(
+            trigger(&reading(Some(50.0), Some(50.0)), None, 95.0, NOW),
+            None
+        );
         // Unknown fields never trigger.
         assert_eq!(trigger(&reading(None, None), None, 95.0, NOW), None);
         // A projection inside the horizon and before the reset triggers …
@@ -476,7 +523,26 @@ mod tests {
         ));
         // … one beyond the horizon does not yet.
         let far = project(&[sample(NOW - HOUR, 20.0, reset), sample(NOW, 50.0, reset)]).unwrap();
-        assert_eq!(trigger(&reading(Some(50.0), None), Some(&far), 95.0, NOW), None);
+        assert_eq!(
+            trigger(&reading(Some(50.0), None), Some(&far), 95.0, NOW),
+            None
+        );
+    }
+
+    /// A verdict in `state` at `confidence`.
+    fn v(state: AgentState, confidence: Confidence) -> Verdict {
+        Verdict {
+            state,
+            source: None,
+            since_ms: Some(NOW),
+            confidence: Some(confidence),
+            disagreement: None,
+        }
+    }
+
+    /// The one turn boundary: an authoritative `TurnEnded`.
+    fn ended_turn() -> Verdict {
+        v(AgentState::TurnEnded, Confidence::Authoritative)
     }
 
     #[test]
@@ -488,7 +554,13 @@ mod tests {
             AgentState::Unknown,
         ] {
             assert_eq!(
-                decide(Mode::Off, true, &state, None, NOW),
+                decide(
+                    Mode::Off,
+                    true,
+                    &v(state, Confidence::Authoritative),
+                    None,
+                    NOW
+                ),
                 HeadroomDecision::Skip
             );
         }
@@ -497,7 +569,7 @@ mod tests {
         let tid = format!("term-{}", uuid::Uuid::new_v4());
         on_tick(
             &tid,
-            &AgentState::TurnEnded,
+            &ended_turn(),
             Some("/test/headroom/off"),
             Some(&reading(Some(100.0), Some(100.0))),
             NOW,
@@ -509,9 +581,9 @@ mod tests {
     #[test]
     fn headroom_hint_during_working_defers_to_the_next_turn_end() {
         let turn = [
-            AgentState::Working,
-            AgentState::Working,
-            AgentState::TurnEnded,
+            v(AgentState::Working, Confidence::Authoritative),
+            v(AgentState::Working, Confidence::Authoritative),
+            ended_turn(),
         ];
         let decisions: Vec<_> = turn
             .iter()
@@ -527,28 +599,19 @@ mod tests {
         );
         // No evidence of a boundary is not a boundary.
         assert_eq!(
-            decide(Mode::On, true, &AgentState::Unknown, None, NOW),
+            decide(Mode::On, true, &Verdict::UNKNOWN, None, NOW),
             HeadroomDecision::Defer
         );
         assert_eq!(
             decide(
                 Mode::On,
                 true,
-                &AgentState::NeedsYou {
-                    reason: NeedsYouReason::IdlePrompt
-                },
-                None,
-                NOW
-            ),
-            HeadroomDecision::Fire
-        );
-        assert_eq!(
-            decide(
-                Mode::On,
-                true,
-                &AgentState::Ended {
-                    why: EndReason::Other
-                },
+                &v(
+                    AgentState::Ended {
+                        why: EndReason::Other
+                    },
+                    Confidence::Authoritative
+                ),
                 None,
                 NOW
             ),
@@ -556,22 +619,65 @@ mod tests {
         );
         // Observe never acts.
         assert_eq!(
-            decide(Mode::Observe, true, &AgentState::TurnEnded, None, NOW),
+            decide(Mode::Observe, true, &ended_turn(), None, NOW),
             HeadroomDecision::WouldFire
+        );
+    }
+
+    /// M6: only an AUTHORITATIVE `TurnEnded` is a boundary. A `NeedsYou` of
+    /// any reason is a paused turn; a screen-read or inferred `TurnEnded` is
+    /// not evidence the turn ended.
+    #[test]
+    fn headroom_turn_boundary_is_an_authoritative_turn_end_only() {
+        for reason in [
+            NeedsYouReason::Permission,
+            NeedsYouReason::Question,
+            NeedsYouReason::Elicitation,
+            NeedsYouReason::IdlePrompt,
+            NeedsYouReason::Unspecified,
+        ] {
+            assert_eq!(
+                decide(
+                    Mode::On,
+                    true,
+                    &v(AgentState::NeedsYou { reason }, Confidence::Authoritative),
+                    None,
+                    NOW
+                ),
+                HeadroomDecision::Defer,
+                "{reason:?}"
+            );
+        }
+        for conf in [Confidence::Fallback, Confidence::Inferred] {
+            assert_eq!(
+                decide(Mode::On, true, &v(AgentState::TurnEnded, conf), None, NOW),
+                HeadroomDecision::Defer,
+                "{conf:?}"
+            );
+        }
+        let mut no_confidence = ended_turn();
+        no_confidence.confidence = None;
+        assert_eq!(
+            decide(Mode::On, true, &no_confidence, None, NOW),
+            HeadroomDecision::Defer
+        );
+        assert_eq!(
+            decide(Mode::On, true, &ended_turn(), None, NOW),
+            HeadroomDecision::Fire
         );
     }
 
     #[test]
     fn headroom_cooldown_bounds_the_probe_rate() {
         assert_eq!(
-            decide(Mode::On, true, &AgentState::TurnEnded, Some(NOW - MIN), NOW),
+            decide(Mode::On, true, &ended_turn(), Some(NOW - MIN), NOW),
             HeadroomDecision::Skip
         );
         assert_eq!(
             decide(
                 Mode::On,
                 true,
-                &AgentState::TurnEnded,
+                &ended_turn(),
                 Some(NOW - HINT_COOLDOWN_MS),
                 NOW
             ),
@@ -579,6 +685,15 @@ mod tests {
         );
     }
 
+    fn probe_reading(five: Option<f64>, seven: Option<f64>) -> HeadroomReading {
+        HeadroomReading {
+            source: HeadroomSource::OauthProbe,
+            ..reading(five, seven)
+        }
+    }
+
+    /// M5: a forged 100 % hint (the cached file) with a healthy probe confirms
+    /// nothing; the probe itself at/over the threshold confirms.
     #[test]
     fn headroom_forged_full_reading_with_healthy_probe_migrates_nothing() {
         // A forged 100% reading does trigger a HINT …
@@ -586,16 +701,73 @@ mod tests {
         let t = trigger(&forged, None, DEFAULT_THRESHOLD_PCT, NOW);
         assert!(t.is_some());
         assert_eq!(
-            decide(Mode::On, t.is_some(), &AgentState::TurnEnded, None, NOW),
+            decide(Mode::On, t.is_some(), &ended_turn(), None, NOW),
             HeadroomDecision::Fire
         );
-        // … but the confirm step reads the PROBE, which says healthy.
+        // … but the headroom confirm reads only the PROBE, which says healthy.
+        let healthy = probe_reading(Some(20.0), Some(30.0));
+        assert!(!probe_confirms(
+            Some(&healthy),
+            &[],
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
+        // The forged reading itself is refused as a confirm, whatever it says.
+        assert!(!probe_confirms(
+            Some(&forged),
+            &[],
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
+        assert!(!probe_confirms(None, &[], DEFAULT_THRESHOLD_PCT, NOW));
+        // The reactive confirm is unchanged: a healthy probe is not exhausted.
         let dir = format!("/test/headroom/forged-{}", uuid::Uuid::new_v4());
-        crate::ai_provider::record_account_usage(&[(dir.clone(), 0.2, Some(-0.1), Some(0.3), false)]);
+        crate::ai_provider::record_account_usage(&[(
+            dir.clone(),
+            0.2,
+            Some(-0.1),
+            Some(0.3),
+            false,
+        )]);
         assert_eq!(
             crate::terminal::account_migration::confirm_step(&dir),
             crate::terminal::account_migration::ConfirmStep::NotConfirmed
         );
+    }
+
+    #[test]
+    fn headroom_probe_at_threshold_or_projecting_exhaustion_confirms() {
+        // The probe at/over the threshold confirms (either window) …
+        assert!(probe_confirms(
+            Some(&probe_reading(Some(96.0), Some(40.0))),
+            &[],
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
+        assert!(probe_confirms(
+            Some(&probe_reading(Some(10.0), Some(97.0))),
+            &[],
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
+        // … as does the probe's own projection running dry within the horizon
+        // and before the reset, though the reading itself is under threshold.
+        let reset = NOW + 2 * HOUR;
+        let probe_samples = [sample(NOW - HOUR, 20.0, reset), sample(NOW, 80.0, reset)];
+        assert!(probe_confirms(
+            Some(&probe_reading(Some(80.0), None)),
+            &probe_samples,
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
+        // A slow burn does not.
+        let slow = [sample(NOW - HOUR, 20.0, reset), sample(NOW, 25.0, reset)];
+        assert!(!probe_confirms(
+            Some(&probe_reading(Some(25.0), None)),
+            &slow,
+            DEFAULT_THRESHOLD_PCT,
+            NOW
+        ));
     }
 
     #[test]

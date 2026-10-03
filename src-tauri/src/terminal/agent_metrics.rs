@@ -468,10 +468,7 @@ pub fn parse_cached_usage(doc: &Value) -> Result<HeadroomReading, HeadroomUnknow
 }
 
 /// [`parse_cached_usage`] then [`apply_freshness`]. Pure.
-pub fn evaluate_cached_usage(
-    doc: &Value,
-    now_ms: u64,
-) -> Result<HeadroomReading, HeadroomUnknown> {
+pub fn evaluate_cached_usage(doc: &Value, now_ms: u64) -> Result<HeadroomReading, HeadroomUnknown> {
     parse_cached_usage(doc).and_then(|r| apply_freshness(&r, now_ms))
 }
 
@@ -479,7 +476,10 @@ pub fn evaluate_cached_usage(
 /// failed probe (its `utilization: 1.0` is an error placeholder, not a
 /// measurement). The weekly figure is taken only with its reset time: the
 /// probe coerces an absent weekly window to 0.0, which must not render as 0%.
-pub fn reading_from_usage_info(info: &AccountUsageInfo, observed_at_ms: u64) -> Option<HeadroomReading> {
+pub fn reading_from_usage_info(
+    info: &AccountUsageInfo,
+    observed_at_ms: u64,
+) -> Option<HeadroomReading> {
     if info.error.is_some() {
         return None;
     }
@@ -497,7 +497,11 @@ pub fn reading_from_usage_info(info: &AccountUsageInfo, observed_at_ms: u64) -> 
 /// Of two usable readings, the one observed most recently.
 fn fresher(a: Option<HeadroomReading>, b: Option<HeadroomReading>) -> Option<HeadroomReading> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(if b.observed_at_ms > a.observed_at_ms { b } else { a }),
+        (Some(a), Some(b)) => Some(if b.observed_at_ms > a.observed_at_ms {
+            b
+        } else {
+            a
+        }),
         (a, b) => a.or(b),
     }
 }
@@ -513,30 +517,41 @@ pub struct FiveHourSample {
 #[derive(Debug, Default)]
 struct AccountHeadroom {
     oauth: Option<HeadroomReading>,
+    /// Every usable reading's five-hour figure (probe AND cached file) — the
+    /// display/trigger projection.
     history: Vec<FiveHourSample>,
+    /// The OAuth probe's five-hour figures ONLY. A cached `.claude.json` is a
+    /// user file anything local can forge, so the headroom CONFIRM projects
+    /// from this history alone.
+    probe_history: Vec<FiveHourSample>,
 }
 
 impl AccountHeadroom {
     fn push_sample(&mut self, r: &HeadroomReading) {
-        let (Some(pct), Some(resets_at_ms)) = (r.five_hour_pct, r.five_hour_resets_at_ms) else {
-            return;
-        };
-        if self.history.iter().any(|s| s.at_ms == r.observed_at_ms) {
-            return;
-        }
-        self.history.push(FiveHourSample {
-            at_ms: r.observed_at_ms,
-            pct,
-            resets_at_ms,
-        });
-        self.history.sort_by_key(|s| s.at_ms);
-        let newest = self.history.last().map_or(0, |s| s.at_ms);
-        self.history
-            .retain(|s| newest.saturating_sub(s.at_ms) <= HISTORY_RETENTION_MS);
-        if self.history.len() > MAX_HISTORY {
-            let excess = self.history.len() - MAX_HISTORY;
-            self.history.drain(..excess);
-        }
+        push_five_hour_sample(&mut self.history, r);
+    }
+}
+
+/// Append `r`'s five-hour figure to `history` (deduplicated by observation
+/// time, sorted, bounded by age and count).
+fn push_five_hour_sample(history: &mut Vec<FiveHourSample>, r: &HeadroomReading) {
+    let (Some(pct), Some(resets_at_ms)) = (r.five_hour_pct, r.five_hour_resets_at_ms) else {
+        return;
+    };
+    if history.iter().any(|s| s.at_ms == r.observed_at_ms) {
+        return;
+    }
+    history.push(FiveHourSample {
+        at_ms: r.observed_at_ms,
+        pct,
+        resets_at_ms,
+    });
+    history.sort_by_key(|s| s.at_ms);
+    let newest = history.last().map_or(0, |s| s.at_ms);
+    history.retain(|s| newest.saturating_sub(s.at_ms) <= HISTORY_RETENTION_MS);
+    if history.len() > MAX_HISTORY {
+        let excess = history.len() - MAX_HISTORY;
+        history.drain(..excess);
     }
 }
 
@@ -557,8 +572,20 @@ pub fn record_oauth_results(results: &[AccountUsageInfo]) {
         };
         let entry = map.entry(info.config_dir.clone()).or_default();
         entry.push_sample(&reading);
+        push_five_hour_sample(&mut entry.probe_history, &reading);
         entry.oauth = Some(reading);
     }
+}
+
+/// The account's five-hour samples from the OAuth probe ALONE, oldest first —
+/// what the headroom confirm may project from.
+pub fn probe_five_hour_history(config_dir: &str) -> Vec<FiveHourSample> {
+    let guard = ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(config_dir))
+        .map(|a| a.probe_history.clone())
+        .unwrap_or_default()
 }
 
 /// The account's five-hour samples, oldest first.
@@ -928,8 +955,14 @@ mod tests {
         t.observe_line(&assistant(1, 0, 900_000, "claude-opus-5-5"), NOW);
         assert!(t.reading().is_some());
         assert!(t.observe_line(&compact(), NOW + 1), "a reset is a change");
-        assert!(t.reading().is_none(), "compacted ⇒ unknown until next usage");
-        assert!(!t.observe_line(&compact(), NOW + 2), "a second reset changes nothing");
+        assert!(
+            t.reading().is_none(),
+            "compacted ⇒ unknown until next usage"
+        );
+        assert!(
+            !t.observe_line(&compact(), NOW + 2),
+            "a second reset changes nothing"
+        );
         t.observe_line(&assistant(5, 30_000, 0, "claude-opus-5-5"), NOW + 3);
         assert_eq!(t.reading().unwrap().tokens, Some(30_005));
     }
@@ -959,8 +992,9 @@ mod tests {
         assert!(!t.observe_line(&missing, NOW));
         assert!(t.reading().is_none());
         // Absent cache fields count as zero cache, not as unknown input.
-        let plain = json!({"type":"assistant","message":{"model":"claude-x","usage":{"input_tokens":7}}})
-            .to_string();
+        let plain =
+            json!({"type":"assistant","message":{"model":"claude-x","usage":{"input_tokens":7}}})
+                .to_string();
         assert!(t.observe_line(&plain, NOW));
         assert_eq!(t.reading().unwrap().tokens, Some(7));
     }
@@ -1020,7 +1054,11 @@ mod tests {
             assert!(v.get(key).is_some(), "{key} is present");
             assert!(v[key].is_null(), "{key} is null, never 0: {v}");
         }
-        assert_eq!(v.as_object().unwrap().len(), 11, "exactly the contract keys");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            11,
+            "exactly the contract keys"
+        );
 
         // A failed probe (its utilization 1.0 is a placeholder) is no reading.
         let failed = AccountUsageInfo {
@@ -1078,10 +1116,19 @@ mod tests {
         assert_eq!(m["headroomObservedAtMs"], NOW - 1000);
         let grid = serde_json::to_value(ContextSource::Grid).unwrap();
         assert_eq!(grid, "grid");
-        assert_eq!(serde_json::to_value(HeadroomSource::OauthProbe).unwrap(), "oauth_probe");
+        assert_eq!(
+            serde_json::to_value(HeadroomSource::OauthProbe).unwrap(),
+            "oauth_probe"
+        );
     }
 
-    fn cached_doc(fetched: u64, five: f64, five_reset: &str, seven: f64, seven_reset: &str) -> Value {
+    fn cached_doc(
+        fetched: u64,
+        five: f64,
+        five_reset: &str,
+        seven: f64,
+        seven_reset: &str,
+    ) -> Value {
         json!({
             "numStartups": 3,
             "cachedUsageUtilization": {
@@ -1104,7 +1151,13 @@ mod tests {
 
     #[test]
     fn agent_metrics_cached_usage_fresh_reading_is_used() {
-        let doc = cached_doc(NOW - 60_000, 55.0, &iso(NOW + HOUR), 36.0, &iso(NOW + 72 * HOUR));
+        let doc = cached_doc(
+            NOW - 60_000,
+            55.0,
+            &iso(NOW + HOUR),
+            36.0,
+            &iso(NOW + 72 * HOUR),
+        );
         let r = evaluate_cached_usage(&doc, NOW).unwrap();
         assert_eq!(r.five_hour_pct, Some(55.0));
         assert_eq!(r.seven_day_pct, Some(36.0));
@@ -1116,11 +1169,29 @@ mod tests {
     fn agent_metrics_cached_usage_stale_is_unknown() {
         // The vet's measured inversion case: a 15-hour-old 100 with a reset
         // 13 hours in the past is NOT an exhausted account.
-        let doc = cached_doc(NOW - 15 * HOUR, 100.0, &iso(NOW - 13 * HOUR), 36.0, &iso(NOW + 72 * HOUR));
-        assert_eq!(evaluate_cached_usage(&doc, NOW), Err(HeadroomUnknown::Stale));
+        let doc = cached_doc(
+            NOW - 15 * HOUR,
+            100.0,
+            &iso(NOW - 13 * HOUR),
+            36.0,
+            &iso(NOW + 72 * HOUR),
+        );
+        assert_eq!(
+            evaluate_cached_usage(&doc, NOW),
+            Err(HeadroomUnknown::Stale)
+        );
         // Just past the four-hour bound.
-        let doc = cached_doc(NOW - 4 * HOUR - 1, 10.0, &iso(NOW + HOUR), 1.0, &iso(NOW + HOUR));
-        assert_eq!(evaluate_cached_usage(&doc, NOW), Err(HeadroomUnknown::Stale));
+        let doc = cached_doc(
+            NOW - 4 * HOUR - 1,
+            10.0,
+            &iso(NOW + HOUR),
+            1.0,
+            &iso(NOW + HOUR),
+        );
+        assert_eq!(
+            evaluate_cached_usage(&doc, NOW),
+            Err(HeadroomUnknown::Stale)
+        );
     }
 
     #[test]
@@ -1140,20 +1211,43 @@ mod tests {
             ),
             Err(HeadroomUnknown::Unstamped)
         );
-        let future = cached_doc(NOW + 10 * 60_000, 5.0, &iso(NOW + HOUR), 5.0, &iso(NOW + HOUR));
-        assert_eq!(evaluate_cached_usage(&future, NOW), Err(HeadroomUnknown::FutureStamp));
+        let future = cached_doc(
+            NOW + 10 * 60_000,
+            5.0,
+            &iso(NOW + HOUR),
+            5.0,
+            &iso(NOW + HOUR),
+        );
+        assert_eq!(
+            evaluate_cached_usage(&future, NOW),
+            Err(HeadroomUnknown::FutureStamp)
+        );
         // Every reset in the past ⇒ expired_reset, never "still exhausted".
         let expired = cached_doc(NOW - HOUR, 100.0, &iso(NOW - 60_000), 90.0, &iso(NOW - 1));
-        assert_eq!(evaluate_cached_usage(&expired, NOW), Err(HeadroomUnknown::ExpiredReset));
+        assert_eq!(
+            evaluate_cached_usage(&expired, NOW),
+            Err(HeadroomUnknown::ExpiredReset)
+        );
         // One expired, one live ⇒ the live one survives alone.
-        let half = cached_doc(NOW - HOUR, 100.0, &iso(NOW - 60_000), 30.0, &iso(NOW + HOUR));
+        let half = cached_doc(
+            NOW - HOUR,
+            100.0,
+            &iso(NOW - 60_000),
+            30.0,
+            &iso(NOW + HOUR),
+        );
         let r = evaluate_cached_usage(&half, NOW).unwrap();
         assert_eq!(r.five_hour_pct, None);
         assert_eq!(r.five_hour_resets_at_ms, None);
         assert_eq!(r.seven_day_pct, Some(30.0));
         // A used window with an unparsable reset is unknowable, not 0.
         let bad_reset = cached_doc(NOW - HOUR, 40.0, "tomorrow-ish", 30.0, &iso(NOW + HOUR));
-        assert_eq!(evaluate_cached_usage(&bad_reset, NOW).unwrap().five_hour_pct, None);
+        assert_eq!(
+            evaluate_cached_usage(&bad_reset, NOW)
+                .unwrap()
+                .five_hour_pct,
+            None
+        );
         assert_eq!(
             evaluate_cached_usage(&json!([1, 2]), NOW),
             Err(HeadroomUnknown::Unreadable)
@@ -1171,7 +1265,10 @@ mod tests {
             observed_at_ms: NOW,
         };
         assert!(apply_freshness(&r, NOW + HOUR).is_ok());
-        assert_eq!(apply_freshness(&r, NOW + 4 * HOUR + 1), Err(HeadroomUnknown::Stale));
+        assert_eq!(
+            apply_freshness(&r, NOW + 4 * HOUR + 1),
+            Err(HeadroomUnknown::Stale)
+        );
     }
 
     #[test]
@@ -1190,10 +1287,15 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            fresher(Some(base.clone()), Some(newer.clone())).unwrap().source,
+            fresher(Some(base.clone()), Some(newer.clone()))
+                .unwrap()
+                .source,
             HeadroomSource::CachedUsage
         );
-        assert_eq!(fresher(Some(base.clone()), None).unwrap().source, HeadroomSource::OauthProbe);
+        assert_eq!(
+            fresher(Some(base.clone()), None).unwrap().source,
+            HeadroomSource::OauthProbe
+        );
         assert_eq!(fresher(None, None), None);
     }
 

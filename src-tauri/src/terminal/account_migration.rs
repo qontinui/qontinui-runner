@@ -138,6 +138,38 @@ pub fn confirm_step(src_config_dir: &str) -> ConfirmStep {
     }
 }
 
+/// The PROACTIVE (headroom) confirm. The reactive [`confirm_step`] asks "is
+/// the account exhausted?", which a 95 % headroom threshold reaches long
+/// before — it would leave the proactive trigger dead. So a headroom hint is
+/// confirmed when the just-refreshed PROBE (`usage`, never the cached file
+/// that raised the hint) reads at/over the threshold, or the projection over
+/// the probe's own five-hour samples agrees ([`super::headroom::probe_confirms`]);
+/// an exhausted account confirms as well.
+pub fn headroom_confirm_step(
+    src_config_dir: &str,
+    usage: &[crate::commands::ai_settings::AccountUsageInfo],
+    now_ms: u64,
+) -> ConfirmStep {
+    if confirm_step(src_config_dir) == ConfirmStep::Confirmed {
+        return ConfirmStep::Confirmed;
+    }
+    let probe = usage
+        .iter()
+        .find(|i| i.config_dir == src_config_dir)
+        .and_then(|i| super::agent_metrics::reading_from_usage_info(i, now_ms));
+    let history = super::agent_metrics::probe_five_hour_history(src_config_dir);
+    if super::headroom::probe_confirms(
+        probe.as_ref(),
+        &history,
+        super::headroom::threshold_pct(),
+        now_ms,
+    ) {
+        ConfirmStep::Confirmed
+    } else {
+        ConfirmStep::NotConfirmed
+    }
+}
+
 /// Entry point for a PTY usage-limit hint (spawned async off the reader
 /// thread). Resolves everything it needs from the global app handle, mirrors
 /// `agent_runtime`'s state-access pattern.
@@ -209,7 +241,14 @@ async fn run_hint(terminal_id: String, origin: HintOrigin) {
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // and require the account to actually be exhausted before acting.
     let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if confirm_step(&src) == ConfirmStep::NotConfirmed {
+    let confirmed = match &origin {
+        HintOrigin::UsageLimit(_) => confirm_step(&src),
+        HintOrigin::Headroom(_) => {
+            let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+            headroom_confirm_step(&src, &usage, now_ms)
+        }
+    };
+    if confirmed == ConfirmStep::NotConfirmed {
         info!(
             terminal_id,
             session = %record.claude_session_id,
@@ -1182,6 +1221,49 @@ mod tests {
         // An account the probe never measured is not confirmed either.
         assert_eq!(
             confirm_step("/test/migration/never-probed"),
+            ConfirmStep::NotConfirmed
+        );
+    }
+
+    /// M5: the headroom confirm reads the fresh PROBE result, not the
+    /// (forgeable) reading that raised the hint.
+    #[test]
+    fn migration_headroom_confirm_reads_the_probe_not_the_hint() {
+        use crate::commands::ai_settings::AccountUsageInfo;
+        let dir = format!("/test/migration/headroom-{}", uuid::Uuid::new_v4());
+        let now_ms: u64 = 1_900_000_000_000;
+        let resets = now_ms / 1000 + 2 * 3600;
+        let info = |session: f64| AccountUsageInfo {
+            config_dir: dir.clone(),
+            utilization: 0.3,
+            resets_at: Some(now_ms / 1000 + 4 * 24 * 3600),
+            session_utilization: Some(session),
+            session_resets_at: Some(resets),
+            ..Default::default()
+        };
+        // Healthy probe (a forged 100 % hint elsewhere does not matter).
+        assert_eq!(
+            headroom_confirm_step(&dir, &[info(0.2)], now_ms),
+            ConfirmStep::NotConfirmed
+        );
+        // The probe itself at/over the threshold.
+        assert_eq!(
+            headroom_confirm_step(&dir, &[info(0.97)], now_ms),
+            ConfirmStep::Confirmed
+        );
+        // A failed probe confirms nothing.
+        let failed = AccountUsageInfo {
+            error: Some("probe failed".into()),
+            utilization: 1.0,
+            ..info(1.0)
+        };
+        assert_eq!(
+            headroom_confirm_step(&dir, &[failed], now_ms),
+            ConfirmStep::NotConfirmed
+        );
+        // No probe row for the account at all.
+        assert_eq!(
+            headroom_confirm_step(&dir, &[], now_ms),
             ConfirmStep::NotConfirmed
         );
     }

@@ -1161,16 +1161,39 @@ mod tests {
         assert!(stop_text.contains("stop_hook_active"));
     }
 
+    /// The `Stop` entries of a parsed settings file that spawn a process
+    /// (`type: "command"`, i.e. the continuation stop-hook script). The
+    /// agent-event `type: "http"` `Stop` hook spawns nothing and is not one.
+    fn stop_command_hooks(v: &serde_json::Value) -> usize {
+        v["hooks"]["Stop"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .flat_map(|b| b["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter(|h| h["type"] != "http")
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     #[test]
     fn materialize_omitted_drops_the_stop_key_and_keeps_everything_else() {
-        let tmp = tempfile::tempdir().unwrap();
-        let settings_path = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV)
-            .expect("materialize ok");
-        let v =
-            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Omitted);
-
-        // THE POINT: a dark session gets no `Stop` key at all, so Claude never
-        // spawns `bash` for it once per assistant turn.
+        // Without the agent-event hooks, a dark session gets no `Stop` key at
+        // all, so Claude never spawns `bash` for it once per assistant turn.
+        let bare = tempfile::tempdir().unwrap();
+        let settings_path = materialize_with(
+            bare.path(),
+            StopHookRegistration::Omitted,
+            AgentEventHooks::Omitted,
+        )
+        .expect("materialize ok");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            v["hooks"]["SessionStart"].is_array(),
+            "everything else is kept"
+        );
         assert!(
             v["hooks"]["Stop"].is_null(),
             "no Stop registration when the continuation flag is dark"
@@ -1179,6 +1202,20 @@ mod tests {
             !v["hooks"].as_object().unwrap().contains_key("Stop"),
             "the Stop key is REMOVED, not merely nulled"
         );
+
+        // With them, the only `Stop` entry is the agent-event http hook (the
+        // verdict's turn-end edge) — still nothing that spawns a process.
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = materialize_with(tmp.path(), StopHookRegistration::Omitted, EV)
+            .expect("materialize ok");
+        let v =
+            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Omitted);
+        assert_eq!(
+            stop_command_hooks(&v),
+            0,
+            "no Stop COMMAND registration when the continuation flag is dark"
+        );
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
     }
 
     /// FIX 1 — the hook dir is MACHINE-GLOBAL (every runner instance on the box
@@ -1207,9 +1244,10 @@ mod tests {
             armed_v["hooks"]["Stop"][0]["hooks"][0]["command"].is_string(),
             "the ARMED file still registers Stop after a dark materialize ran in the same dir"
         );
-        assert!(
-            !dark_v["hooks"].as_object().unwrap().contains_key("Stop"),
-            "the DARK file has no Stop key"
+        assert_eq!(
+            stop_command_hooks(&dark_v),
+            0,
+            "the DARK file has no Stop command (only the agent-event http hook)"
         );
 
         // Simulate the cross-instance case the shared dir makes possible: the
@@ -1301,7 +1339,7 @@ mod tests {
         );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dark).unwrap()).unwrap();
-        assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
+        assert_eq!(stop_command_hooks(&v), 0, "no Stop command when dark");
 
         let armed_dir = tempfile::tempdir().unwrap();
         std::env::set_var(FLAG_ENV, "observe");

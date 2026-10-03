@@ -76,6 +76,13 @@ export interface HookDelivery {
 /** Payload of the `terminal-agent-state` Tauri event. */
 export interface TerminalAgentStateEvent {
   terminalId: string;
+  /**
+   * The terminal's publish sequence number, strictly increasing per terminal.
+   * On an event: this publish's. On a `get_terminal_agent_states` row: the
+   * last publish's when the row was read (the row is at least that new).
+   * Absent on a runner build that predates it.
+   */
+  seq?: number;
   verdict: Verdict;
   hookDelivery: HookDelivery;
 }
@@ -213,6 +220,52 @@ export function verdictToSessionState(verdict: Verdict): SessionState {
     case "ended":
       return "completed";
   }
+}
+
+// ── Ordering and precedence of what the runner sends ────────────────────────
+
+/** Where a verdict reached the webview from. */
+export type AgentStateOrigin = "event" | "row";
+
+/**
+ * Is an incoming verdict newer than the one held for its terminal?
+ *
+ * `held` is the highest `seq` already applied. An EVENT is newer only with a
+ * strictly higher `seq` (an equal one is a duplicate, or older than a row
+ * read after that publish). A ROW (the initial `get_terminal_agent_states`
+ * snapshot) carries the seq of the last publish BEFORE it was read, so it is
+ * at least as new as that publish: it applies at an equal `seq`, and loses to
+ * any event with a higher one — the snapshot that resolves after a live event
+ * must not overwrite it. A runner build that sends no `seq` is applied as
+ * before (no ordering to go on).
+ */
+export function isNewerAgentState(
+  held: number | undefined,
+  incoming: number | undefined,
+  origin: AgentStateOrigin,
+): boolean {
+  if (typeof incoming !== "number" || typeof held !== "number") return true;
+  return origin === "row" ? incoming >= held : incoming > held;
+}
+
+/**
+ * May this runner verdict overwrite the chip the webview derived locally?
+ *
+ * A verdict whose source is `regex` or `screen_stability` is the runner
+ * ECHOING the webview's own fallback offer back — it knows nothing the
+ * webview did not, and is older than what the webview has derived since
+ * (`completed` on process exit, an `idle` from the quiet sweep). It may only
+ * seed a tab that has no local state yet. A verdict from an event channel or
+ * any runner-side source (`hook`, `sideband`, `statusline`, `transcript`)
+ * always overrides.
+ */
+export function verdictOverridesLocalState(
+  verdict: Verdict,
+  local: SessionState | undefined,
+): boolean {
+  const echo = verdict.source === "regex" || verdict.source === "screen_stability";
+  if (!echo) return true;
+  return local === undefined || local === "unknown";
 }
 
 // ── Offering observations to the runner ─────────────────────────────────────

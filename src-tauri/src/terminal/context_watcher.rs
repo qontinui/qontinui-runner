@@ -196,7 +196,10 @@ pub fn context_low_signal(
     grid: impl FnOnce() -> Option<bool>,
 ) -> Option<(bool, ContextSignal)> {
     if let Some(remaining) = transcript_remaining_pct.filter(|r| r.is_finite()) {
-        return Some((remaining <= f64::from(threshold_pct), ContextSignal::Transcript));
+        return Some((
+            remaining <= f64::from(threshold_pct),
+            ContextSignal::Transcript,
+        ));
     }
     grid().map(|low| (low, ContextSignal::Grid))
 }
