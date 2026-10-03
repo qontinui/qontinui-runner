@@ -1770,9 +1770,33 @@ mod tests {
     /// scan `#[cfg(test)]` code, or a negative assertion matches its OWN string
     /// literals — which is exactly how the first version of this pin failed,
     /// reporting two offenders that were both this test's search patterns.
+    ///
+    /// A file opening `#![cfg(test)]` has no production half at all: an
+    /// extracted test module carries no in-file `#[cfg(test)]` to cut at (plan
+    /// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b).
     fn prod_part(src: &str) -> &str {
+        if crate::source_lex::is_test_only_file(src) {
+            return "";
+        }
         src.split_once("\n#[cfg(test)]\nmod ")
             .map_or(src, |(before, _)| before)
+    }
+
+    /// An extracted test module's discarded slot is test code, not an offender
+    /// for [`no_call_site_discards_a_blocking_slot`]; the same line in a
+    /// production file still is (the control).
+    #[test]
+    fn an_extracted_test_only_file_has_no_production_part() {
+        let body = "fn t() {\n    let _ = BlockingSlot::enter();\n}\n";
+        let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+        assert!(
+            !squeezed_code(prod_part(&extracted)).contains("BlockingSlot::enter"),
+            "a `#![cfg(test)]` file's code was read as production"
+        );
+        assert!(
+            squeezed_code(prod_part(body)).contains("let_=BlockingSlot::enter();"),
+            "control: a production file's discard is still visible to the scan"
+        );
     }
 
     /// Strip whole-line comments, then all whitespace.

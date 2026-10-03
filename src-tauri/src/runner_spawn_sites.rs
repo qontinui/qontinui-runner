@@ -162,8 +162,13 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
         if !line.trim_start().starts_with("#[cfg(test)]") {
             continue;
         }
+        // The attributed item is the first line that opens a brace or ends in
+        // `;`. A braceless one — `mod tests;`, which the test-module extraction
+        // leaves in the parent — has no span here; searching past it would
+        // latch onto the next PRODUCTION `mod … {`.
         let Some(open) = (i + 1..(i + 8).min(lines.len()))
-            .find(|&j| lines[j].contains("mod ") && lines[j].contains('{'))
+            .find(|&j| lines[j].contains('{') || lines[j].trim_end().ends_with(';'))
+            .filter(|&j| lines[j].contains("mod ") && lines[j].contains('{'))
         else {
             continue;
         };
@@ -285,7 +290,13 @@ fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String
             continue;
         }
         let lines: Vec<&str> = src.lines().collect();
-        let spans = test_spans(&lines);
+        // A file opening `#![cfg(test)]` (an extracted test module) is test
+        // code end to end — it carries no in-file `#[cfg(test)]` span.
+        let spans = if crate::source_lex::is_test_only_file(src) {
+            vec![(0, lines.len())]
+        } else {
+            test_spans(&lines)
+        };
         let comments = comment_mask(&lines);
         // Blank comment and test-module lines, keeping line numbering, so a
         // multi-line call can be matched on the joined text.
@@ -789,6 +800,43 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
             ("new_door.rs".to_string(), "recipe".to_string()),
             ("new_door.rs".to_string(), "uses_recipe".to_string()),
         ]
+    );
+}
+
+/// An extracted test module (`foo/tests.rs`, opening `#![cfg(test)]` and
+/// carrying no in-file `#[cfg(test)]` span) is test code: its spawn calls are
+/// not sites. Plan `2026-10-01-oversized-source-files-owe-a-decomposition`
+/// Phase 2b.
+#[test]
+fn an_extracted_test_only_file_is_not_scanned_as_production() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "new_door/tests.rs".to_string(),
+        "#![cfg(test)]\n\nuse super::*;\n\nfn t(tm: &T) {\n    let _ = tm.create(a);\n    let _ = ClaudeSession::spawn(x);\n}\n"
+            .to_string(),
+    );
+    assert!(
+        scan_sites(&sources, &BTreeMap::new()).is_empty(),
+        "a `#![cfg(test)]` file's spawn calls were read as production sites"
+    );
+}
+
+/// The parent the extraction leaves behind: `#[cfg(test)]` on a braceless
+/// `mod tests;`. A production inline `mod … {` right after it is still scanned.
+#[test]
+fn production_after_an_out_of_line_test_mod_is_still_scanned() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "door.rs".to_string(),
+        "#[cfg(test)]\nmod tests;\n\nmod inner {\n    fn open_door(tm: &T) {\n        let _ = tm.create(a);\n    }\n}\n"
+            .to_string(),
+    );
+    assert_eq!(
+        scan_sites(&sources, &BTreeMap::new())
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![("door.rs".to_string(), "open_door".to_string())],
+        "the `#[cfg(test)] mod tests;` line hid the production module after it"
     );
 }
 

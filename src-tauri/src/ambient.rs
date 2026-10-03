@@ -1853,6 +1853,25 @@ mod tests {
             .collect()
     }
 
+    /// A file opening `#![cfg(test)]` — an extracted test module, which keeps
+    /// no in-file `#[cfg(test)]` — contributes no production tokens, so its env
+    /// reads are not the ambient surface. Plan
+    /// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b; this
+    /// guard's token scan already handled it, and this pins that it still does.
+    #[test]
+    fn an_extracted_test_only_file_has_no_production_tokens() {
+        let body = "fn t() {\n    let _ = std::env::var(\"QONTINUI_X\");\n}\n";
+        let extracted = format!("#![cfg(test)]\n\nuse super::*;\n\n{body}");
+        assert!(
+            prod_tokens(&extracted, "x/tests.rs").leaves.is_empty(),
+            "a `#![cfg(test)]` file's tokens were read as production"
+        );
+        assert!(
+            !prod_tokens(body, "x.rs").leaves.is_empty(),
+            "control: a production file's tokens are kept"
+        );
+    }
+
     /// The key of an `env::var("…")` / `env::var_os("…")` read at `leaves[i]`,
     /// when that is where one starts.
     fn env_read_key(leaves: &[Leaf], i: usize) -> Option<&str> {
