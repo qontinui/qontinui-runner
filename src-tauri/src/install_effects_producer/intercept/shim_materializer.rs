@@ -2029,6 +2029,91 @@ mod tests {
         assert!(out.contains("/tmp/qontinui-identity-x"));
     }
 
+    /// M5: both identity `.cmd` shims hand the user's arguments to the real
+    /// CLI OUTSIDE delayed expansion (which strips every `!` from `%*`), never
+    /// `call` an `.exe` (CALL doubles carets), and never test a quoted first
+    /// argument through `"%~1"`. Content assertions — the templates are only
+    /// executable on Windows — over the source on every OS.
+    #[test]
+    fn identity_cmd_shims_pass_arguments_through_unmangled() {
+        for (name, body) in [
+            (
+                "identity_shim.cmd",
+                include_str!("../../../resources/intercept/identity_shim.cmd"),
+            ),
+            (
+                "codex_identity_shim.cmd",
+                include_str!("../../../resources/intercept/codex_identity_shim.cmd"),
+            ),
+        ] {
+            let lines: Vec<&str> = body.lines().map(str::trim).collect();
+            // Every line that expands %* runs after the delayed-expansion
+            // scope was left for a DisableDelayedExpansion one.
+            let disable = lines
+                .iter()
+                .position(|l| l.starts_with("setlocal DisableDelayedExpansion"))
+                .unwrap_or_else(|| panic!("{name}: never leaves delayed expansion"));
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("%*")
+                    && !line.starts_with("rem")
+                    && !line.starts_with("for %%A in (%*)")
+                {
+                    assert!(
+                        i > disable,
+                        "{name}:{}: `{line}` expands %* inside delayed expansion",
+                        i + 1
+                    );
+                }
+            }
+            assert!(
+                lines.iter().any(|l| l.starts_with("\"%QSHIM_REAL%\" %*")),
+                "{name}: an .exe runs without CALL"
+            );
+            assert!(
+                !body.contains("call \"%REAL%\" %*"),
+                "{name}: the old CALL-everything passthrough is gone"
+            );
+            assert!(
+                !body.contains("\"%~1\"=="),
+                "{name}: no quote-fragile first-argument test"
+            );
+        }
+    }
+
+    /// The Codex bash shim's JSON escaping is total: a cwd holding a quote,
+    /// a backslash, a newline, a tab or any other control character still
+    /// yields a body that parses, with the text it was given.
+    #[cfg(unix)]
+    #[test]
+    fn codex_shim_json_escape_yields_valid_json_for_any_cwd() {
+        let start = READ_BACK_SHIM_BASH
+            .find("json_escape() {")
+            .expect("json_escape defined");
+        let end = start
+            + READ_BACK_SHIM_BASH[start..]
+                .find("\n}\n")
+                .expect("json_escape closes")
+            + 3;
+        let func = &READ_BACK_SHIM_BASH[start..end];
+        let input = "C:\\it's \"q\"\nline\ttab\r\u{1}end&";
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{func}\njson_escape \"$1\""))
+            .arg("json-escape-test")
+            .arg(input)
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success());
+        let escaped = String::from_utf8(out.stdout).unwrap();
+        let parsed: String = serde_json::from_str(&format!("\"{escaped}\""))
+            .unwrap_or_else(|e| panic!("not JSON string content: {escaped:?}: {e}"));
+        assert_eq!(parsed, "C:\\it's \"q\"\nline\ttab\rend&");
+        assert!(
+            READ_BACK_SHIM_BASH.contains("--max-time 2"),
+            "the start signal is bounded"
+        );
+    }
+
     /// The template follows the tool's CLI profile: Claude pins, Codex reads
     /// back. Every tool in the family has a profile, so none falls back by
     /// accident.
