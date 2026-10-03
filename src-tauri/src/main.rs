@@ -3512,6 +3512,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_grid_text,
             commands::terminal::terminal_list,
             commands::terminal::get_terminal_agent_states,
+            commands::terminal::get_terminal_agent_metrics,
             commands::terminal::offer_agent_observation,
             commands::terminal::terminal_migrate_session_account,
             commands::terminal::terminal_report_tree_reset,
