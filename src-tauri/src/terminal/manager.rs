@@ -532,6 +532,9 @@ impl TerminalManager {
             self.interceptor.clone(),
             io,
             pinned_session_id,
+            // A remote pane's child is on another machine: its exit is not
+            // an AI-session failure this runner can recover.
+            None,
         )?;
 
         let info = session.info();

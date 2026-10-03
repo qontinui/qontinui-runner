@@ -31,7 +31,7 @@
 
 use qontinui_types::cli_session::{
     CliProfile, FailureAction, FailureCategory, FailureConfidence, FailureEvidence,
-    FailureEvidenceSource, FailureKind, FailureSeverity, RecoveryPolicy, ResumeSpec,
+    FailureEvidenceSource, FailureKind, FailureSeverity, RecoveryPolicy, RestoreTier,
     SessionFailure,
 };
 
@@ -88,52 +88,6 @@ pub enum FailureSignal {
     },
     /// A resume by id was typed and the CLI's handshake never appeared.
     HandshakeTimeout,
-    /// A record from the CLI's transcript that reports an API error.
-    TranscriptRecord(TranscriptFailureRecord),
-}
-
-/// The failure-relevant fields of one transcript record. Claude writes an
-/// errored API call to its JSONL transcript as an assistant record with
-/// `isApiErrorMessage: true`, an `error` code, and the error text as content.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TranscriptFailureRecord {
-    /// The record marks itself an API error message.
-    pub is_api_error: bool,
-    /// The typed error code, when present.
-    pub error_code: Option<String>,
-    /// The error text, when present.
-    pub message: Option<String>,
-}
-
-impl TranscriptFailureRecord {
-    /// Lift the failure-relevant fields out of one parsed transcript record.
-    /// Accepts both the transcript's `isApiErrorMessage` and stream-json's
-    /// `is_api_error_message` spelling.
-    pub fn from_json(record: &serde_json::Value) -> Self {
-        let is_api_error = ["isApiErrorMessage", "is_api_error_message"]
-            .iter()
-            .any(|k| record.get(*k).and_then(serde_json::Value::as_bool) == Some(true));
-        let error_code = record
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let message = record
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| match c {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Array(blocks) => blocks
-                    .iter()
-                    .find_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-                    .map(str::to_string),
-                _ => None,
-            });
-        Self {
-            is_api_error,
-            error_code,
-            message,
-        }
-    }
 }
 
 // ============================================================================
@@ -259,10 +213,18 @@ pub fn kind_of_error_text(text: &str) -> Option<FailureKind> {
 // The recovery table
 // ============================================================================
 
-/// Whether a profile can resume a session by id — the condition under which a
-/// lost or exited session is resumed rather than abandoned.
+/// Whether a profile's sessions are resumed automatically — the condition
+/// under which a lost or exited session is resumed rather than abandoned.
+///
+/// That is the profile's honest restore tier
+/// ([`qontinui_runner_lib::cli_profile::restore_tier`]) being `Full`, not
+/// merely its declaring a by-id resume argv. Codex declares `codex resume
+/// {id}` but is `TerminalOnly` until an end-to-end resume has been observed
+/// (its manifest says why); a by-id argv alone therefore once made a Codex
+/// exit `resume_same_id`, and the PTY lane's resume — which is Claude's —
+/// relaunched it as `claude --resume <codex id>`.
 pub fn profile_is_resumable(profile: &CliProfile) -> bool {
-    matches!(profile.resume, ResumeSpec::ByIdArgv { .. })
+    qontinui_runner_lib::cli_profile::restore_tier(profile) == RestoreTier::Full
 }
 
 /// THE recovery table: what the runner does automatically about each kind.
@@ -393,9 +355,9 @@ pub fn title_for(kind: FailureKind, confidence: FailureConfidence) -> &'static s
     }
 }
 
-/// The longer explanation for a kind: what the runner does about it.
-fn details_for(kind: FailureKind, policy: RecoveryPolicy) -> String {
-    let what = match kind {
+/// The first half of a failure's details: what the kind means.
+fn what_happened(kind: FailureKind) -> &'static str {
+    match kind {
         FailureKind::RateLimited => "The provider is limiting the request rate.",
         FailureKind::QuotaExhausted => "The account's usage quota for its window is used up.",
         FailureKind::BudgetExhausted => "The account's spend or billing budget is used up.",
@@ -410,7 +372,12 @@ fn details_for(kind: FailureKind, policy: RecoveryPolicy) -> String {
         FailureKind::BadRequest => "The provider rejected the request as invalid.",
         FailureKind::InternalError => "The provider reported an internal error.",
         FailureKind::Unknown => "A failure was observed but could not be classified.",
-    };
+    }
+}
+
+/// The longer explanation for a kind: what the runner does about it.
+fn details_for(kind: FailureKind, policy: RecoveryPolicy) -> String {
+    let what = what_happened(kind);
     let then = match policy {
         RecoveryPolicy::Never => "The runner takes no automatic action.",
         RecoveryPolicy::BackoffThenRetry => {
@@ -610,23 +577,32 @@ fn verdict_for(
             FailureEvidenceSource::HandshakeTimeout,
             Some("resume handshake never appeared".to_string()),
         )),
-        FailureSignal::TranscriptRecord(record) => {
-            if !record.is_api_error && record.error_code.is_none() {
-                return None;
-            }
-            let kind = record
-                .error_code
-                .as_deref()
-                .and_then(kind_for_error_type)
-                .or_else(|| record.message.as_deref().and_then(kind_of_error_text))
-                .unwrap_or(FailureKind::Unknown);
-            Some(confirmed(
-                kind,
-                FailureEvidenceSource::Transcript,
-                record.error_code.clone().or_else(|| record.message.clone()),
-            ))
-        }
     }
+}
+
+/// The first line of `screen` that is one of `profile`'s resume-failure
+/// markers (`No conversation found with session ID: …`), trimmed. `None` when
+/// no line is.
+pub fn resume_failure_line(profile: &CliProfile, screen: &str) -> Option<String> {
+    screen
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && is_resume_failure_marker(profile, line))
+        .map(str::to_string)
+}
+
+/// `failure`, re-stated for a recovery the runner is NOT going to run: its
+/// policy becomes [`RecoveryPolicy::Never`] and its details say why, so a
+/// surface never promises an automatic action the runner declined (the cap
+/// spent, the runner draining, a mechanism that cannot drive this CLI). The
+/// actions are kept — they are what a person can still do.
+pub fn with_manual_recovery(mut failure: SessionFailure, why: &str) -> SessionFailure {
+    failure.recovery_policy = RecoveryPolicy::Never;
+    failure.details = Some(format!(
+        "{} The runner is taking no automatic action: {why}.",
+        what_happened(failure.kind)
+    ));
+    failure
 }
 
 /// Does `phrase` match one of the profile's resume-failure markers (its
@@ -859,12 +835,6 @@ mod tests {
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("assistant") => {
                     code = v.get("error").and_then(|e| e.as_str()).map(str::to_string);
-                    let rec = TranscriptFailureRecord::from_json(&v);
-                    assert!(rec.is_api_error);
-                    assert_eq!(
-                        kind_of(FailureSignal::TranscriptRecord(rec)),
-                        Some(FailureKind::BadRequest)
-                    );
                 }
                 Some("result") => {
                     assert_eq!(v.get("is_error"), Some(&serde_json::Value::Bool(true)));
@@ -899,13 +869,6 @@ mod tests {
         assert_eq!(kind_of(FailureSignal::Exit { code: Some(0) }), None);
         assert_eq!(kind_of(stderr("warning: something harmless")), None);
         assert_eq!(kind_of(stderr("")), None);
-        // A plain transcript record is not an error record.
-        assert_eq!(
-            kind_of(FailureSignal::TranscriptRecord(
-                TranscriptFailureRecord::default()
-            )),
-            None
-        );
         // The per-turn rate-limit event reporting `allowed` (probe Q2).
         for status in ["allowed", "allowed_warning"] {
             assert_eq!(
@@ -1029,8 +992,24 @@ mod tests {
         );
 
         let mut no_resume = p.clone();
-        no_resume.resume = ResumeSpec::Unknown;
+        no_resume.resume = qontinui_types::cli_session::ResumeSpec::Unknown;
         let f = classify(&FailureSignal::Exit { code: Some(1) }, &no_resume).unwrap();
+        assert_eq!(f.recovery_policy, RecoveryPolicy::Never);
+        assert_eq!(f.actions, vec![FailureAction::NewSession]);
+
+        // C2: a by-id resume argv is not enough — the tier must be Full.
+        // Codex declares `codex resume {id}` and is TerminalOnly, so its exit
+        // is never auto-resumed (the PTY lane's resume is Claude's).
+        let codex = qontinui_runner_lib::cli_profile::profile_for(
+            qontinui_runner_lib::cli_profile::codex::ID,
+        )
+        .unwrap();
+        assert!(matches!(
+            codex.resume,
+            qontinui_types::cli_session::ResumeSpec::ByIdArgv { .. }
+        ));
+        assert!(!profile_is_resumable(codex));
+        let f = classify(&FailureSignal::Exit { code: Some(1) }, codex).unwrap();
         assert_eq!(f.recovery_policy, RecoveryPolicy::Never);
         assert_eq!(f.actions, vec![FailureAction::NewSession]);
 
@@ -1096,6 +1075,34 @@ mod tests {
             RecoveryPolicy::HandoffNewSession
         );
         assert_eq!(policy_for(K::Unknown, true), RecoveryPolicy::Never);
+    }
+
+    /// A declined recovery is never announced as the automatic one: the
+    /// policy reads `never`, the details say why, the actions stay.
+    #[test]
+    fn a_declined_recovery_is_stated_as_manual() {
+        let f = classify(&FailureSignal::Exit { code: Some(1) }, profile()).unwrap();
+        assert_eq!(f.recovery_policy, RecoveryPolicy::ResumeSameId);
+        let manual = with_manual_recovery(f.clone(), "its automatic-resume cap is spent");
+        assert_eq!(manual.recovery_policy, RecoveryPolicy::Never);
+        let details = manual.details.unwrap();
+        assert!(details.contains("cap is spent"), "{details}");
+        assert!(
+            !details.contains("resumes the same session id"),
+            "{details}"
+        );
+        assert_eq!(manual.actions, f.actions);
+        assert_eq!(manual.id, f.id);
+    }
+
+    #[test]
+    fn resume_failure_lines_are_found_on_a_screen() {
+        let screen = "some output\n\n  No conversation found with session ID: abc  \n$ ";
+        assert_eq!(
+            resume_failure_line(profile(), screen).as_deref(),
+            Some("No conversation found with session ID: abc")
+        );
+        assert_eq!(resume_failure_line(profile(), "all fine\n$ "), None);
     }
 
     #[test]

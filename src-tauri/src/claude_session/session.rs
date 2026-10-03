@@ -65,9 +65,22 @@ struct StructuredLaneRestart {
     /// The dead session's posture: a restart never changes it (a prompted
     /// session restarted in bypass would silently stop asking).
     permission: crate::session::launch_spec::PermissionMode,
+    /// The dead instance's state tracker — its identity. A restart replaces
+    /// only THIS instance: if the `SessionManager` no longer holds it under
+    /// `session_id` (closed, or already replaced), the restart is abandoned.
+    dead_instance: SessionStateTracker,
 }
 
 impl crate::session::failure_recovery::StructuredRestart for StructuredLaneRestart {
+    fn still_wanted(&self) -> Result<(), String> {
+        use tauri::Manager;
+        let sm = self
+            .app
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .ok_or("SessionManager not available")?;
+        ClaudeSession::restart_still_wanted(&sm, &self.session_id, &self.dead_instance)
+    }
+
     fn restart(&self, rotate_account: bool) -> Result<(), String> {
         ClaudeSession::restart_in_place(
             &self.app,
@@ -76,8 +89,19 @@ impl crate::session::failure_recovery::StructuredRestart for StructuredLaneResta
             &self.working_dir,
             rotate_account,
             self.permission,
+            &self.dead_instance,
         )
     }
+}
+
+/// A deliberate close: force the state to Closed FIRST, then close the CLI's
+/// stdin. Closing stdin makes the CLI exit, and the waiter reads this state the
+/// moment it sees the exit to tell a deliberate close from a failure; the
+/// other order let a fast exit read "not closed" and report the operator's own
+/// close as a failure to recover from.
+fn mark_closed_then_close_input(state: &SessionStateTracker, close_input: impl FnOnce()) {
+    state.force_close();
+    close_input();
 }
 
 /// Internal error type for `build_replay_from_history`.
@@ -1343,9 +1367,12 @@ impl ClaudeSession {
                     session_ctx: session_ctx_for_waiter.clone(),
                     working_dir: working_dir_for_waiter.clone(),
                     permission,
+                    dead_instance: state_for_waiter.clone(),
                 });
                 // Say what is happening in the session's own output, as the
-                // pre-taxonomy path did, before any recovery runs.
+                // pre-taxonomy path did, before any recovery runs — from the
+                // failure `report_then` recorded and decided, so the line
+                // states exactly what the runner then does.
                 let announce = |f: &qontinui_types::cli_session::SessionFailure| {
                     if let Some(ref ctx) = session_ctx_for_waiter {
                         let text = match &f.details {
@@ -1365,20 +1392,7 @@ impl ClaudeSession {
                 };
                 let signal = crate::session::failure::FailureSignal::Stderr(stderr_output);
                 let provider = qontinui_runner_lib::cli_profile::claude::ID;
-                if let Some(preview) = crate::session::failure::classify_for(
-                    &signal,
-                    provider,
-                    qontinui_runner_lib::cli_profile::profile_for(provider),
-                ) {
-                    warn!(
-                        session_id = %session_id_for_waiter,
-                        kind = ?preview.kind,
-                        policy = ?preview.recovery_policy,
-                        "stream-json session exited with a classified failure"
-                    );
-                    announce(&preview);
-                }
-                crate::session::failure_recovery::report(
+                crate::session::failure_recovery::report_then(
                     crate::session::failure_recovery::RecoveryTarget::Structured {
                         session_id: session_id_for_waiter.clone(),
                         restart,
@@ -1386,6 +1400,15 @@ impl ClaudeSession {
                     provider,
                     None,
                     signal,
+                    |failure| {
+                        warn!(
+                            session_id = %session_id_for_waiter,
+                            kind = ?failure.kind,
+                            policy = ?failure.recovery_policy,
+                            "stream-json session exited with a classified failure"
+                        );
+                        announce(failure);
+                    },
                 );
             }
         });
@@ -1885,11 +1908,8 @@ impl ClaudeSession {
             // which terminates the persister thread after it processes pending messages.
         }
 
-        // Close stdin (sends EOF to CLI)
-        self.stdin_writer.close();
-
-        // Force state to Closed
-        self.state_tracker.force_close();
+        // Closed, then EOF to the CLI — see `mark_closed_then_close_input`.
+        mark_closed_then_close_input(&self.state_tracker, || self.stdin_writer.close());
 
         // Close stdout pipe on Windows to unblock reader thread
         #[cfg(target_os = "windows")]
@@ -2135,6 +2155,7 @@ impl ClaudeSession {
         working_dir: &str,
         rotate_account: bool,
         permission: crate::session::launch_spec::PermissionMode,
+        dead_instance: &SessionStateTracker,
     ) -> Result<(), String> {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
@@ -2215,10 +2236,16 @@ impl ClaudeSession {
             }
         }
 
-        // Remove old session and re-register under the same ID
-        sm.remove(session_id);
-        sm.register(session_id, new_session.clone())
-            .map_err(|e| format!("failed to re-register session after restart: {e}"))?;
+        // Swap the dead instance for the new one under the same id — only if
+        // the dead instance is STILL what is registered. The spawn above waits
+        // up to a minute for `initialize`; an operator who closed the session
+        // in that time must not find it resurrected.
+        if let Err(why) = sm.replace_if(session_id, new_session.clone(), |current| {
+            current.is_instance(dead_instance)
+        }) {
+            let _ = new_session.close();
+            return Err(why);
+        }
 
         // Emit state event so frontend knows the session is back
         crate::commands::ai_session::emit_session_state_ex(
@@ -2250,6 +2277,32 @@ impl ClaudeSession {
             session_id, label
         );
         Ok(())
+    }
+
+    /// Whether a restart of `session_id` is still wanted: the runner is not
+    /// draining, and `sm` still holds the instance whose state tracker is
+    /// `dead_instance` (the one that failed) under that id. `Err(why)` when the
+    /// operator closed the session or something already replaced it.
+    fn restart_still_wanted(
+        sm: &crate::claude_session::manager::SessionManager,
+        session_id: &str,
+        dead_instance: &SessionStateTracker,
+    ) -> Result<(), String> {
+        if crate::drain::is_draining() {
+            return Err("the runner is draining".into());
+        }
+        match sm.get(session_id) {
+            None => Err("the session was closed".into()),
+            Some(current) if !current.is_instance(dead_instance) => {
+                Err("the session was already replaced".into())
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Whether this session is the instance `tracker` belongs to.
+    pub(crate) fn is_instance(&self, tracker: &SessionStateTracker) -> bool {
+        self.state_tracker.same_instance(tracker)
     }
 
     /// The final env mutations applied to the bidirectional stream-json child
@@ -2356,6 +2409,20 @@ impl std::fmt::Debug for ClaudeSession {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A deliberate close is Closed BEFORE the CLI's stdin closes, so a CLI
+    /// that exits on the EOF finds the waiter reading a deliberate close —
+    /// never a failure to recover from.
+    #[test]
+    fn close_marks_the_state_closed_before_the_cli_sees_eof() {
+        use super::super::state::{SessionState, SessionStateTracker};
+        let state = SessionStateTracker::new();
+        let seen = Mutex::new(None);
+        super::mark_closed_then_close_input(&state, || {
+            *seen.lock().unwrap() = Some(state.get());
+        });
+        assert_eq!(*seen.lock().unwrap(), Some(SessionState::Closed));
+    }
 
     // =======================================================================
     // Bidirectional stream-json spawn seam — production call-site coverage for

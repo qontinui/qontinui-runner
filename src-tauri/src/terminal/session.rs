@@ -1794,6 +1794,23 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
+        // Whether the PTY child IS an AI CLI (a direct exec of `claude` /
+        // `codex`, by its argv head's profile), and whether it resumes an
+        // existing session — captured before the command is sealed. Only then
+        // is the child's exit an AI session's exit; a shell pane's exit is the
+        // shell's, whatever ran inside it earlier.
+        let pane_cli = Self::argv_profile(cmd.get_argv()).map(|profile| {
+            let args: Vec<String> = cmd
+                .get_argv()
+                .iter()
+                .skip(1)
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            crate::session::failure_recovery::PaneCli {
+                provider: profile.id.clone(),
+                resumed: qontinui_runner_lib::cli_profile::resumes_existing_session(profile, &args),
+            }
+        });
         let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
 
         Self::spawn_with_io(
@@ -1807,6 +1824,7 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
+            pane_cli,
         )
     }
 
@@ -1832,6 +1850,11 @@ impl TerminalSession {
     /// target's cwd or `""`). `pinned_session_id` is the harness session id
     /// the pane is registered under: the identity seam's freshly minted id on
     /// the local path, the TARGET's coord session id for a remote pane.
+    ///
+    /// `pane_cli` describes the pane's OWN child process when that child is
+    /// an AI CLI (a direct exec), else `None` (a shell pane, a remote pane).
+    /// It is the waiter's evidence that the process whose exit it observes was
+    /// an AI session — see `session::failure_recovery::report_pty_exit`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_io(
         id: TerminalId,
@@ -1844,6 +1867,7 @@ impl TerminalSession {
         interceptor: Arc<OutputInterceptor>,
         io: Arc<dyn PaneIo>,
         pinned_session_id: String,
+        pane_cli: Option<crate::session::failure_recovery::PaneCli>,
     ) -> Result<Self, String> {
         let child_pid = io.pid();
         info!(
@@ -2281,6 +2305,9 @@ impl TerminalSession {
         let waiter_coord_session_id = coord_session_id.clone();
         let waiter_on_exit = on_exit.clone();
         let waiter_io = io.clone();
+        let waiter_pane_cli = pane_cli;
+        let waiter_grid = grid.clone();
+        let waiter_started = Instant::now();
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
@@ -2322,10 +2349,27 @@ impl TerminalSession {
                 // Phase 7). Reported BEFORE the exit notice below, because the
                 // frontend closes the session's lifecycle row on that notice
                 // and the recovery needs the row.
+                // The screen is read only for an AI-CLI child: a resumed CLI
+                // that failed says so there (its resume-failure marker).
+                let screen = waiter_pane_cli
+                    .as_ref()
+                    .map(|_| {
+                        waiter_grid
+                            .lock()
+                            .map(|g| g.text_snapshot().text)
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                 crate::session::failure_recovery::report_pty_exit(
                     &waiter_id,
-                    code,
                     runner_initiated,
+                    &crate::session::failure_recovery::PtyExit {
+                        code,
+                        provider: waiter_pane_cli.as_ref().map(|c| c.provider.as_str()),
+                        resumed: waiter_pane_cli.as_ref().is_some_and(|c| c.resumed),
+                        lifetime: waiter_started.elapsed(),
+                        screen: &screen,
+                    },
                 );
 
                 // "The child process ended" — the Tauri event plus its WS

@@ -247,6 +247,11 @@ pub fn observe_frame(
             info!("Received result message (success={})", success);
             if success {
                 out.turn_succeeded = true;
+            } else if let Some(why) = unsuccessful_but_not_failed(result, tracker.get()) {
+                // The turn stopped short for a reason the session asked for:
+                // nothing failed, and no recovery policy fits a healthy
+                // session. Not a success either — no failure is cleared.
+                info!(session = %ledger.session_key, why, "unsuccessful result is not a failure");
             } else {
                 out.failure = Some(FailureSignal::StructuredEvent {
                     error_code,
@@ -271,6 +276,29 @@ pub fn observe_frame(
         | ClaudeOutputMessage::ControlRequest(_) => {}
     }
     out
+}
+
+/// Why an unsuccessful `result` is NOT a session failure, or `None` when it
+/// is one. Two turn ends are asked for rather than suffered:
+///
+/// - the runner interrupted the turn (`state` is `Interrupting`: it sent the
+///   interrupt and is waiting for exactly this result), and
+/// - the turn hit the session's own turn limit (`subtype:
+///   "error_max_turns"`), a bound the launch set.
+///
+/// Recording either would show a broken session and pick a recovery for a
+/// session that is fine — as `unknown`, since neither names a provider error.
+pub fn unsuccessful_but_not_failed(
+    result: &crate::claude_protocol::types::ResultMessage,
+    state: SessionState,
+) -> Option<&'static str> {
+    if state == SessionState::Interrupting {
+        return Some("the runner interrupted the turn");
+    }
+    if result.subtype.as_deref() == Some("error_max_turns") {
+        return Some("the turn reached the session's max-turns limit");
+    }
+    None
 }
 
 /// End-of-turn transition: Processing/Interrupting -> Ready. `None` when the
@@ -1312,6 +1340,9 @@ mod tests {
         // Frame, then exit: one failure through the real store.
         struct NoRestart;
         impl StructuredRestart for NoRestart {
+            fn still_wanted(&self) -> Result<(), String> {
+                Ok(())
+            }
             fn restart(&self, _rotate: bool) -> Result<(), String> {
                 panic!("a bad request is never restarted");
             }
@@ -1589,6 +1620,110 @@ mod tests {
         );
         assert_eq!(idle.transitioned_to, None);
         assert!(idle.ready_for_next, "a queued message may still go on idle");
+    }
+
+    /// An interrupted turn and a turn that hit the session's own max-turns
+    /// limit end unsuccessfully but are NOT failures — never recorded (as
+    /// `unknown`), never recovered. A real errored turn still is one.
+    #[test]
+    fn interrupt_and_max_turns_results_are_not_failures() {
+        let mut ledger = FrameLedger::new("dispatcher-test-not-failures");
+        let interrupting = SessionStateTracker::new();
+        interrupting.transition(SessionState::Initializing).unwrap();
+        interrupting.transition(SessionState::Ready).unwrap();
+        interrupting.transition(SessionState::Processing).unwrap();
+        interrupting.transition(SessionState::Interrupting).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &interrupting,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(r.failure, None, "the runner asked for this turn end");
+        assert!(!r.turn_succeeded);
+        assert!(r.turn_ended);
+
+        let processing = SessionStateTracker::new();
+        processing.transition(SessionState::Initializing).unwrap();
+        processing.transition(SessionState::Ready).unwrap();
+        processing.transition(SessionState::Processing).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &processing,
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#,
+        );
+        assert_eq!(r.failure, None, "the launch's own turn limit");
+        assert!(!r.turn_succeeded);
+
+        processing.transition(SessionState::Processing).unwrap();
+        let r = observe_one(
+            &mut ledger,
+            &processing,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["boom"]}"#,
+        );
+        assert!(
+            r.failure.is_some(),
+            "a real errored turn is still a failure"
+        );
+    }
+
+    /// M1, from the wire: one turn's `rate_limit_event` reports `rejected`
+    /// (the account's window is spent), then its `result` errors with HTTP
+    /// 429. Both are recorded; the child's exit executes the QUOTA's
+    /// `migrate_account` — not the later-stored rate limit's backoff on the
+    /// dead account.
+    #[test]
+    fn rejected_window_then_429_result_migrates_the_account() {
+        struct Rotations(std::sync::Mutex<Vec<bool>>);
+        impl StructuredRestart for Rotations {
+            fn still_wanted(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn restart(&self, rotate: bool) -> Result<(), String> {
+                self.0.lock().unwrap().push(rotate);
+                Err("not in a test".into())
+            }
+        }
+        let key = "dispatcher-test-rejected-then-429";
+        let tracker = SessionStateTracker::new();
+        tracker.transition(SessionState::Initializing).unwrap();
+        tracker.transition(SessionState::Ready).unwrap();
+        tracker.transition(SessionState::Processing).unwrap();
+        let mut ledger = FrameLedger::new(key);
+        let provider = qontinui_runner_lib::cli_profile::claude::ID;
+        for line in [
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790727000,"rateLimitType":"five_hour"}}"#,
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: 429 rate limited"}"#,
+        ] {
+            let signal = observe_one(&mut ledger, &tracker, line)
+                .failure
+                .expect("each frame states a failure");
+            failure_recovery::record_only(key, Lane::Structured, provider, &signal).unwrap();
+        }
+        let kinds: Vec<_> = failure_recovery::active(key)
+            .iter()
+            .map(|f| f.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![FailureKind::QuotaExhausted, FailureKind::RateLimited]
+        );
+
+        let restart = Arc::new(Rotations(std::sync::Mutex::new(Vec::new())));
+        let decided = failure_recovery::report(
+            RecoveryTarget::Structured {
+                session_id: key.to_string(),
+                restart: restart.clone(),
+            },
+            provider,
+            None,
+            FailureSignal::Exit { code: Some(1) },
+        )
+        .unwrap();
+        assert_eq!(decided.kind, FailureKind::QuotaExhausted);
+        assert_eq!(*restart.0.lock().unwrap(), vec![true], "migrate_account");
+        for f in failure_recovery::active(key) {
+            failure_recovery::dismiss(key, &f.id);
+        }
     }
 
     // ── Phase 9: control requests answered by subtype ─────────────────────

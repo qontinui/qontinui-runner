@@ -116,6 +116,25 @@ fn should_fire<'a>(
 
 // ── Grid scanner ─────────────────────────────────────────────────────────────
 
+/// The AI session terminal `tid` hosts and the profile whose phrases its
+/// screen is scanned for. `None` — nothing to look for — unless a CONFIRMED
+/// session is open on it and its provider has a profile. The spawn-time
+/// identity seam writes a provisional row for every pane, plain shells
+/// included; scanning a shell against that row's provider would turn a limit
+/// phrase someone `cat`s in a shell into a migration of a session that never
+/// existed (`SessionLifecycleStore::find_confirmed_open_by_terminal`).
+fn scan_target(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    tid: &str,
+) -> Option<(
+    crate::session::session_lifecycle_store::TerminalSessionRecord,
+    &'static qontinui_types::cli_session::CliProfile,
+)> {
+    let record = store.find_confirmed_open_by_terminal(tid)?;
+    let profile = qontinui_runner_lib::cli_profile::profile_for(&record.provider)?;
+    Some((record, profile))
+}
+
 /// One scan pass over every live terminal: read its rendered screen, and for
 /// any AI session showing one of its profile's usage-limit phrases
 /// (debounce-permitting) report a grid-phrase failure signal. Cheap: one
@@ -157,14 +176,7 @@ pub fn scan_grids_once() {
             if !gate.should_scan(tid, session.grid_generation()) {
                 continue;
             }
-            // The phrases this terminal's CLI declares, from the provider its
-            // lifecycle record names. No record or no profile ⇒ nothing
-            // declared to look for.
-            let Some(record) = store.find_open_by_terminal(tid) else {
-                continue;
-            };
-            let Some(profile) = qontinui_runner_lib::cli_profile::profile_for(&record.provider)
-            else {
+            let Some((record, profile)) = scan_target(&store, tid) else {
                 continue;
             };
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
@@ -193,6 +205,15 @@ pub fn scan_grids_once() {
     // A failure recorded against a terminal that has gone away described a
     // session that is gone too. Outside the locks: it announces the clears.
     failure_recovery::retain_live_terminals(&sessions.iter().map(|(t, _)| t).collect());
+    // Likewise a structured session the SessionManager no longer holds.
+    if let Some(sm) = app.try_state::<Arc<crate::claude_session::manager::SessionManager>>() {
+        let live: Vec<String> = sm
+            .list_all_with_state()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        failure_recovery::retain_live_structured(&live.iter().collect());
+    }
 
     for (record, pattern) in to_fire {
         info!(
@@ -256,6 +277,34 @@ pub fn spawn_grid_scan_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1: only a CONFIRMED session's screen is scanned; the provisional
+    /// spawn-time row every pane carries is not a session.
+    #[test]
+    fn only_a_confirmed_session_is_scanned() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        crate::commands::terminal::record_pinned_session_open(
+            &store,
+            "minted".to_string(),
+            "pane-1".to_string(),
+            None,
+            "/w".to_string(),
+            "t".to_string(),
+            "default".to_string(),
+            0,
+            qontinui_runner_lib::cli_profile::claude::ID.to_string(),
+        );
+        assert!(
+            scan_target(&store, "pane-1").is_none(),
+            "provisional row: nothing to scan"
+        );
+        store.confirm_session("minted");
+        let (record, profile) = scan_target(&store, "pane-1").expect("confirmed: scanned");
+        assert_eq!(record.claude_session_id, "minted");
+        assert_eq!(profile.id, qontinui_runner_lib::cli_profile::claude::ID);
+    }
 
     /// The Claude profile's declared phrases — the list a Claude session's
     /// grid is scanned for.
