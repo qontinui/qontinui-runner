@@ -1458,6 +1458,23 @@ impl AuthManager {
             .try_list_tenant_device_jwt_tenants()
             .context("Failed to enumerate per-tenant device-JWT slots")
     }
+
+    /// The pending-redeem anchor: the newest device JWT this store has held,
+    /// kept across slot clears (see `secure_storage::StoredTokens::redeem_anchor_jwt`).
+    /// Used ONLY as the bearer for web's pending-redeem poll.
+    pub fn get_redeem_anchor_jwt(&self) -> Result<Option<String>> {
+        self.secure_storage
+            .get_redeem_anchor_jwt()
+            .context("Failed to read the pending-redeem anchor")
+    }
+
+    /// Drop the spent pending-redeem anchor after a successful redeem; the
+    /// store re-seeds it from the device JWTs it now holds.
+    pub fn reset_redeem_anchor(&self) -> Result<()> {
+        self.secure_storage
+            .reset_redeem_anchor()
+            .context("Failed to reset the pending-redeem anchor")
+    }
 }
 
 impl Default for AuthManager {
