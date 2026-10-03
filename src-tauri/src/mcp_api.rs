@@ -5009,6 +5009,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_memory_search",
     "coord_memory_supersede",
     "coord_merge_order",
+    // Plan 2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant
+    // Phase 1: coord's sender-side receipt read — the messaging family's
+    // sender-side verb beside `coord_send_message` / `coord_inbox` / `coord_ack_message`,
+    // so a sender can see whether its message was delivered and acked. coord's
+    // device grant is the authority; this list only forwards.
+    "coord_message_status",
     "coord_migration_queue",
     "coord_mute_gate",
     "coord_next_step_settings_effective",
@@ -16670,6 +16676,36 @@ mod coord_mcp_body_gate_tests {
                 }))
                 .is_ok(),
                 "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`
+    /// Phase 1: coord's sender-side receipt read forwards beside its messaging
+    /// siblings, sits in sorted position, and the source-text parser reads it
+    /// back exactly once despite the comment above it.
+    #[test]
+    fn coord_message_status_is_allowed_beside_its_messaging_siblings() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_ack_message",
+            "coord_inbox",
+            "coord_message_status",
+            "coord_send_message",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
