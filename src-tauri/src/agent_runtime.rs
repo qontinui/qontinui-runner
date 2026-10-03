@@ -3423,13 +3423,13 @@ fn evaluate_continuation_guard_live(
 /// (Its first line used to say "a freshly-spawned continuation session (after
 /// `create_terminal_session_backend` succeeds)". That has not been this
 /// function's caller for some time — the dispatch path registers through
-/// [`AnchorReservation::handed_to_registry`] — and the one production caller
-/// left is the permit-less arm named below.)
+/// [`AnchorReservation::handed_to_registry`]. Since plan 2026-10-03 D3 the
+/// permit-less arm of [`restore_continuation_registration`] calls
+/// [`register_continuation_session_with_device`] directly, so this wrapper is
+/// TEST-ONLY.)
 ///
 /// **Touches [`ContinuationRegistry::live`] only — never `pending_anchors`.**
-/// This is the registration path for a caller that holds NO reservation: the
-/// anchor-less arm of the account-migration re-pin
-/// ([`restore_continuation_registration`]), and the unit tests. A by-key
+/// This is the registration path for a caller that holds NO reservation. A by-key
 /// removal here would steal whatever reservation currently sits under the
 /// anchor, which is not this caller's to take — see
 /// [`ContinuationRegistry::pending_anchors`]. Every caller that DOES hold a
@@ -3438,6 +3438,7 @@ fn evaluate_continuation_guard_live(
 /// owned permit across the respawn — because that inserts the live entry and
 /// gives its own permit back under one lock acquisition, so there is no
 /// instant at which a same-anchor dispatch sees neither.
+#[cfg(test)]
 fn register_continuation_session(
     terminal_id: String,
     anchor_key: Option<String>,
@@ -3651,6 +3652,8 @@ pub(crate) fn notify_continuation_terminal_exit(
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
     if let Some(outcome_device_id) = outcome_device_id {
+        // Always `Some` past the early return above; kept as a pattern so a
+        // future relaxation of that guard cannot post under a missing id.
         spawn_work_unreported_fallback(handle, session.gate_id, outcome_device_id, terminal_id);
     }
     // The re-poll lists THIS device's pending rows — never the claimer's.

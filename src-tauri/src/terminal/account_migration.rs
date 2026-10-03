@@ -919,6 +919,8 @@ fn carried_gate_identity_for(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn carried_gate_identity_keeps_the_stored_consuming_device() {
         use crate::agent_runtime::CarriedContinuation;
@@ -950,7 +952,6 @@ mod tests {
         };
         assert!(super::carried_gate_identity_for(&no_gate, Some(local)).is_none());
     }
-    use super::*;
 
     /// The `--resume` respawn carries the hook carrier and, with a cached body,
     /// the body-only file — and never the inline flag, since it has no briefing.
