@@ -707,6 +707,11 @@ function ZoneGridInner({
     maximizedReviewAvailable ? (maximizedTab?.claudeSessionId ?? null) : null,
     { visible: maximizedReviewAvailable },
   );
+  // Memoised on the two reads: the badge walks every hunk of every file.
+  const maximizedBadge = useMemo(
+    () => reviewBadgeState(maximizedReview.changes, maximizedReview.review),
+    [maximizedReview.changes, maximizedReview.review],
+  );
 
   if (isSingleView && layout.id !== "single") {
     const tab = maximizedTab;
@@ -760,7 +765,7 @@ function ZoneGridInner({
               <SessionReviewToggle
                 open={maximizedReviewOpen}
                 onToggle={() => toggleReviewForTab(tab.id)}
-                badge={reviewBadgeState(maximizedReview.changes, maximizedReview.review)}
+                badge={maximizedBadge}
                 iconClassName="w-3 h-3"
               />
             )}
@@ -1415,11 +1420,17 @@ function ZoneCellInner({
   const showReviewPanel = reviewAvailable && reviewOpen;
   const showPromptsPanel = promptsAvailable && promptsOpen && !showReviewPanel;
   // Changes + read state for the badge and the panel. Visible-gated: a zone
-  // behind a compact card (or virtualized) reads nothing.
-  const review = useSessionReview(reviewAvailable ? (tab?.claudeSessionId ?? null) : null, {
-    visible: reviewAvailable,
+  // behind a compact card (or virtualized), or whose tab the grid classifies
+  // hidden, reads nothing. (The maximized view's read lives in the grid: no
+  // ZoneCell is mounted while a zone is maximized, so the two never overlap.)
+  const reviewReadable = reviewAvailable && classification !== "hidden";
+  const review = useSessionReview(reviewReadable ? (tab?.claudeSessionId ?? null) : null, {
+    visible: reviewReadable,
   });
-  const reviewBadge = reviewBadgeState(review.changes, review.review);
+  const reviewBadge = useMemo(
+    () => reviewBadgeState(review.changes, review.review),
+    [review.changes, review.review],
+  );
   const panelOpen = showPromptsPanel || showReviewPanel;
   const panelGeometry = showReviewPanel ? REVIEW_PANEL_GEOMETRY : PROMPTS_PANEL_GEOMETRY;
   // Measured only while a panel is open — a closed panel allocates no observer.

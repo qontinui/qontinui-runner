@@ -167,6 +167,19 @@ export const DIFF_CONTEXT_LINES = 3;
  * one diffs to empty.
  */
 export function diffHunks(change: SessionFileChange): DiffHunk[] | null {
+  // Memoised per change OBJECT: a read's rows are never mutated after
+  // `normalizeChange` builds them, and the badge, the file row and the diff
+  // view all ask for the same row's hunks — a Myers diff each time otherwise,
+  // on every render of every zone.
+  if (DIFF_HUNKS_CACHE.has(change)) return DIFF_HUNKS_CACHE.get(change) ?? null;
+  const hunks = computeDiffHunks(change);
+  DIFF_HUNKS_CACHE.set(change, hunks);
+  return hunks;
+}
+
+const DIFF_HUNKS_CACHE = new WeakMap<SessionFileChange, DiffHunk[] | null>();
+
+function computeDiffHunks(change: SessionFileChange): DiffHunk[] | null {
   if (change.status === "binary" || change.status === "unreadable" || change.truncated) {
     return null;
   }

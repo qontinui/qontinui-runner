@@ -6071,6 +6071,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 snapshot_pruner_pg,
             );
 
+            // Review notes left `submitted` by the previous runner process:
+            // their targets died with it, so no exit hook will ever settle
+            // them. One pass, settling only notes whose target is not live
+            // here; safe this early because it never relies on the terminal /
+            // session managers being POPULATED (terminal ids are fresh per
+            // spawn) — see `start_stranded_note_sweep`.
+            crate::mcp::session_review::start_stranded_note_sweep(app.handle().clone());
+
             // Start the Rust deconflicter loop — §4.1 of
             // plans/2026-05-13-coord-as-deconflicter-plan.md. Consumes
             // the `touch_events_rx` we created alongside AppState's

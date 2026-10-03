@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { hunkKeysForFile } from "./sessionReview";
 import {
   baseLabel,
   changedCountLabel,
@@ -267,5 +268,24 @@ describe("beforeSource", () => {
     // A current runner's row passes through untouched.
     const current = change({ beforeSource: "git_base", baseKind: "head", baseSha: SHA });
     expect(normalizeChange(current)).toEqual(current);
+  });
+});
+
+describe("diff memoisation", () => {
+  it("computes a row's hunks once and its keys once, shared by every caller", () => {
+    const row = change({ before: "a\nb\n", after: "a\nB\n", beforeBytes: 4, afterBytes: 4 });
+    const hunks = diffHunks(row);
+    expect(hunks).not.toBeNull();
+    // Same row object → the same array, not a second Myers diff.
+    expect(diffHunks(row)).toBe(hunks);
+    // An equal but distinct row is diffed on its own.
+    expect(diffHunks({ ...row })).not.toBe(hunks);
+    expect(diffHunks({ ...row })).toEqual(hunks);
+    const keys = hunkKeysForFile(row.filePath, hunks!);
+    expect(hunkKeysForFile(row.filePath, hunks!)).toBe(keys);
+    // The key includes the path, so a different path is never served the cache.
+    const other = hunkKeysForFile("/elsewhere.ts", hunks!);
+    expect(other).not.toEqual(keys);
+    expect(hunkKeysForFile("/elsewhere.ts", hunks!)).toEqual(other);
   });
 });

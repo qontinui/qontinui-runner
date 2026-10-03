@@ -24,6 +24,7 @@ import {
   reviewBadgeState,
   scrolledPast,
   sendBarReducer,
+  sendFailureKind,
   sendResultLabel,
   sentNotes,
   shouldAutoMarkRead,
@@ -132,6 +133,32 @@ describe("reviewBadgeState — three distinct renders", () => {
     });
     const read = reviewBadgeState(okChanges([change({})]), okReview(reviewOf([onlyKey()])));
     expect(read).toMatchObject({ kind: "count", unread: 0, text: "0 unread" });
+  });
+
+  it("renders a capped change list as a lower bound, never a bare `0 unread`", () => {
+    const capped = (files: SessionFileChange[], omittedFiles: number): FileChangesRead => ({
+      status: "ok",
+      response: { ...response(files), filesTruncated: true, omittedFiles },
+    });
+    const read = reviewBadgeState(capped([change({})], 37), okReview(reviewOf([onlyKey()])));
+    expect(read).toMatchObject({ kind: "count", unread: 0, lowerBound: true, text: "≥ 0 unread" });
+    if (read.kind === "count") {
+      expect(read.title).toContain("37 more changed files were not read");
+    }
+    const unread = reviewBadgeState(capped([change({})], 1), okReview(reviewOf([])));
+    expect(unread).toMatchObject({ kind: "count", text: "≥ 1 unread" });
+    if (unread.kind === "count") expect(unread.title).toContain("1 more changed file was not read");
+
+    // Nothing countable in what WAS read: unknown, never `none`.
+    const empty = reviewBadgeState(capped([], 400), okReview(reviewOf([])));
+    expect(empty.kind).toBe("unknown");
+    if (empty.kind === "unknown") expect(empty.title).toContain("400 more changed files");
+
+    // An uncapped list keeps the exact count.
+    expect(reviewBadgeState(okChanges([change({})]), okReview(reviewOf([])))).toMatchObject({
+      lowerBound: false,
+      text: "1 unread",
+    });
   });
 
   it("is `?` when the change list was never read", () => {
@@ -404,17 +431,58 @@ describe("sendBarReducer", () => {
     expect(done.result?.kind).toBe("inserted");
   });
 
+  const failure = (code: string | null, message: string, noteIds: string[] = []) => ({
+    type: "failed" as const,
+    mode: "send" as const,
+    message,
+    atMs: 0,
+    code,
+    marker: "abcd1234",
+    noteIds,
+    nextSalt: "salt-2",
+  });
+
   it("a failure keeps everything and names the error", () => {
     const typed = sendBarReducer(start, { type: "setText", text: "t" });
-    const failed = sendBarReducer(sendBarReducer(typed, { type: "start", mode: "send" }), {
-      type: "failed",
-      mode: "send",
-      message: "HTTP 404 target_not_found",
-      atMs: 0,
-    });
+    const failed = sendBarReducer(
+      sendBarReducer(typed, { type: "start", mode: "send" }),
+      failure("target_not_found", "HTTP 404 target_not_found"),
+    );
     expect(failed).toMatchObject({ freeText: "t", salt: "salt-1", busy: null });
+    expect(failed.result).toMatchObject({ kind: "error", partial: false });
     expect(sendResultLabel(failed.result!)).toContain("target_not_found");
     expect(sendResultLabel(failed.result!)).toContain("the notes stay attached");
+  });
+
+  it("renders delivered-but-unrecorded as DELIVERED with a do-not-resend warning", () => {
+    expect(sendFailureKind("delivered_unrecorded")).toBe("deliveredUnrecorded");
+    const typed = sendBarReducer(start, { type: "setText", text: "t" });
+    const done = sendBarReducer(
+      sendBarReducer(typed, { type: "start", mode: "send" }),
+      failure("delivered_unrecorded", "HTTP 500 delivered_unrecorded: …", ["n1", "n2"]),
+    );
+    // The text went out: free text consumed and the marker spent, as on a send.
+    expect(done).toMatchObject({ freeText: "", salt: "salt-2", busy: null });
+    expect(done.result).toMatchObject({ kind: "deliveredUnrecorded", noteIds: ["n1", "n2"] });
+    const label = sendResultLabel(done.result!);
+    expect(label).toContain("DELIVERED");
+    expect(label).toContain("Do NOT send them again");
+    expect(label).not.toContain("failed");
+    expect(label).not.toContain("stay attached");
+  });
+
+  it("says a partial write may have left the text in the input box", () => {
+    expect(sendFailureKind("delivery_partial")).toBe("partial");
+    expect(sendFailureKind("delivery_failed")).toBe("failed");
+    expect(sendFailureKind(null)).toBe("failed");
+    const typed = sendBarReducer(start, { type: "setText", text: "t" });
+    const broke = sendBarReducer(
+      sendBarReducer(typed, { type: "start", mode: "send" }),
+      failure("delivery_partial", "HTTP 502 delivery_partial: the submit enter failed"),
+    );
+    expect(broke).toMatchObject({ freeText: "t", salt: "salt-1" });
+    expect(broke.result).toMatchObject({ kind: "error", partial: true });
+    expect(sendResultLabel(broke.result!)).toContain("may already be in the session's input box");
   });
 
   it("says delivery is the operator's after an insert, and awaits the transcript after a send", () => {
