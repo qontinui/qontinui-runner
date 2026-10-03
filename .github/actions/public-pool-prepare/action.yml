@@ -138,13 +138,13 @@ runs:
         rustup_home="${RUSTUP_HOME:-${real_home}/.rustup}"
 
         # 5. (runs before 3 and 4) Rust toolchain: verified, never installed. The job account must neither
-        #    own nor be able to write RUSTUP_HOME (any level) or the toolchain's bin;
+        #    own nor be able to write anything under RUSTUP_HOME, or the toolchain's bin;
         #    PATH gets the TOOLCHAIN's bin dir, never the rustup proxy dir (which a
         #    default install puts in the job account's own ~/.cargo/bin).
         if [ "${CHECK_RUST}" = "true" ]; then
           me_u="$(id -u)"; me_n="$(id -un)"
           if [ ! -d "${rustup_home}" ] || [ "$(stat -c %u "${rustup_home}")" = "${me_u}" ] \
-             || [ -n "$(find "${rustup_home}" -maxdepth 3 \( -user "${me_n}" -o -writable \) -print -quit 2>/dev/null)" ]; then
+             || [ -n "$(find "${rustup_home}" \( -user "${me_n}" -o -writable \) -print -quit 2>/dev/null)" ]; then
             echo "::error title=public-pool RUSTUP_HOME is not operator-owned read-only::${rustup_home} is missing, owned by ${me_n}, or writable by it somewhere; a routed job could change the toolchain every later job runs. Host prerequisite: operator-owned, read-only RUSTUP_HOME with 1.95.0 (+clippy, rustfmt) preinstalled"
             exit 1
           fi
@@ -177,12 +177,14 @@ runs:
           # find, never a glob.
           entries=()
           total=0
-          while IFS= read -r line; do
-            path="${line#* }"
-            gb="$(du -s --block-size=1G -- "${path}" 2>/dev/null | awk 'NR==1{print $1+0}')"
+          while IFS= read -r -d '' rec; do
+            path="${rec#* }"
+            # du may exit non-zero on a file vanishing under a concurrent build;
+            # that must never fail the job.
+            gb="$( { du -s --block-size=1G -- "${path}" 2>/dev/null || true; } | awk 'NR==1{print $1+0}')"
             entries+=("${gb:-0} ${path}")
             total=$(( total + ${gb:-0} ))
-          done < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find "${root}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\0' 2>/dev/null | sort -zn)
           for e in "${entries[@]}"; do
             [ "${total}" -gt "${MAX_TARGET_GB}" ] || break
             gb="${e%% *}"; path="${e#* }"

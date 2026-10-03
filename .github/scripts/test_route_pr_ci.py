@@ -459,11 +459,14 @@ class PrepareActionShell(unittest.TestCase):
                 (d / "blob").write_bytes(b"x" * 1024)
                 t = time.time() - age_days * 86400
                 os.utime(d, (t, t))
-            r = self.run_prepare(tmp, TARGET_KEY="pr-9-test", MAX_TARGET_GB="0")
+            # pr-old + pr-new round up to 1 GiB each: total 2 > cap 1, so exactly the
+            # OLDEST goes. (A newest-first sort would remove pr-new instead.)
+            r = self.run_prepare(tmp, TARGET_KEY="pr-9-test", MAX_TARGET_GB="1")
             self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
             left = sorted(p.name for p in root.iterdir())
             self.assertNotIn("pr-stale", left)   # age prune
             self.assertNotIn("pr-old", left)     # cap prune, oldest first
+            self.assertIn("pr-new", left)
             self.assertIn("pr-9-test", left)
             env = (Path(tmp) / "env").read_text()
             self.assertIn(f"CARGO_TARGET_DIR={root}/pr-9-test", env)
@@ -473,6 +476,32 @@ class PrepareActionShell(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertNotEqual(self.run_prepare(tmp, TARGET_KEY="../escape").returncode, 0)
+
+    def shim_dir(self, tmp, foreign_uid):
+        # `stat` reports a FOREIGN owner, so the ownership arm passes and only the
+        # writability / toolchain-bin arms can refuse; `rustup` resolves a fake bin.
+        shim = Path(tmp) / "shim"
+        shim.mkdir()
+        (shim / "stat").write_text(f"#!/bin/sh\necho {foreign_uid}\n")
+        tc = Path(tmp) / "tc/bin"
+        tc.mkdir(parents=True)
+        (shim / "rustup").write_text(
+            "#!/bin/sh\n"
+            f'case "$1" in which) echo {tc}/cargo ;; component) printf "clippy\\nrustfmt\\n" ;; esac\n')
+        for f in ("stat", "rustup"):
+            (shim / f).chmod(0o755)
+        return shim, tc
+
+    def test_writable_file_under_foreign_rustup_home_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rh = Path(tmp) / "home/.rustup/toolchains/x/lib"
+            rh.mkdir(parents=True)
+            shim, _ = self.shim_dir(tmp, os.getuid() + 1)
+            r = self.run_prepare(tmp, CHECK_RUST="true", PATH=f"{shim}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("RUSTUP_HOME is not operator-owned", r.stdout)
 
     def test_writable_rustup_home_refused(self):
         import tempfile
