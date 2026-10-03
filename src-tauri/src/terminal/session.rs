@@ -3578,12 +3578,23 @@ impl TerminalSession {
     /// skipped: the slot is diagnostic evidence, and silently losing it on one
     /// panic elsewhere would make the phantom-turn detector read "no input" —
     /// the exact false positive it must not produce.
+    ///
+    /// Real input (not a control response) is then offered to the agent-state
+    /// slot, AFTER the input lock is released: when the pane's published
+    /// verdict is a `NeedsYou`, this input may be the human's answer, and
+    /// [`crate::terminal::agent_state::on_pty_input`] schedules one debounced
+    /// publish off this thread so the answered state reaches the webview now.
     fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
-        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
-        match slot {
-            InputSlot::Write => slots.last_write = Some(obs),
-            InputSlot::Submit => slots.last_submit = Some(obs),
-            InputSlot::ControlResponse => slots.last_control_response = Some(obs),
+        {
+            let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+            match slot {
+                InputSlot::Write => slots.last_write = Some(obs),
+                InputSlot::Submit => slots.last_submit = Some(obs),
+                InputSlot::ControlResponse => slots.last_control_response = Some(obs),
+            }
+        }
+        if slot != InputSlot::ControlResponse {
+            crate::terminal::agent_state::on_pty_input(&self.id, &self.agent_state);
         }
     }
 

@@ -191,11 +191,23 @@ mod claude_event_fixtures {
                     BTreeSet::from(["channel", "cli_version", "event", "variants"]),
                     "{at}: unexpected top-level keys"
                 );
-                assert_eq!(obj["cli_version"], Value::from(version.as_str()), "{at}: cli_version must match its directory");
+                assert_eq!(
+                    obj["cli_version"],
+                    Value::from(version.as_str()),
+                    "{at}: cli_version must match its directory"
+                );
                 let event = file_stem(&path);
-                assert_eq!(obj["event"], Value::from(event.as_str()), "{at}: event must match its file name");
+                assert_eq!(
+                    obj["event"],
+                    Value::from(event.as_str()),
+                    "{at}: event must match its file name"
+                );
                 let channel = obj["channel"].as_str().unwrap_or_default();
-                let expected_channel = if event == "statusline" { "statusline" } else { "hook" };
+                let expected_channel = if event == "statusline" {
+                    "statusline"
+                } else {
+                    "hook"
+                };
                 assert_eq!(channel, expected_channel, "{at}: channel");
 
                 let variants = obj["variants"]
@@ -208,7 +220,11 @@ mod claude_event_fixtures {
                         .as_object()
                         .unwrap_or_else(|| panic!("{vat}: a variant must be a keys->type map"));
                     assert_skeleton(variant, &vat);
-                    assert_eq!(fields.get("session_id"), Some(&Value::from("string")), "{vat}: session_id");
+                    assert_eq!(
+                        fields.get("session_id"),
+                        Some(&Value::from("string")),
+                        "{vat}: session_id"
+                    );
                     if channel == "hook" {
                         assert_eq!(
                             fields.get("hook_event_name"),
@@ -216,7 +232,11 @@ mod claude_event_fixtures {
                             "{vat}: a hook payload names its event"
                         );
                     } else {
-                        assert_eq!(fields.get("version"), Some(&Value::from("string")), "{vat}: statusline version");
+                        assert_eq!(
+                            fields.get("version"),
+                            Some(&Value::from("string")),
+                            "{vat}: statusline version"
+                        );
                     }
                 }
             }
@@ -226,15 +246,24 @@ mod claude_event_fixtures {
     #[test]
     fn every_probed_version_covers_the_probed_events_and_answers_all_five_questions() {
         for dir in version_dirs() {
-            let present: BTreeSet<String> = fixture_files(&dir).iter().map(|p| file_stem(p)).collect();
+            let present: BTreeSet<String> =
+                fixture_files(&dir).iter().map(|p| file_stem(p)).collect();
             for event in REQUIRED_EVENTS {
-                assert!(present.contains(*event), "{}: no fixture for {event}", dir.display());
+                assert!(
+                    present.contains(*event),
+                    "{}: no fixture for {event}",
+                    dir.display()
+                );
             }
             let probe_md = dir.join("PROBE.md");
             let text = fs::read_to_string(&probe_md)
                 .unwrap_or_else(|err| panic!("{}: {err}", probe_md.display()));
             for question in REQUIRED_QUESTIONS {
-                assert!(text.contains(question), "{}: missing section {question:?}", probe_md.display());
+                assert!(
+                    text.contains(question),
+                    "{}: missing section {question:?}",
+                    probe_md.display()
+                );
             }
         }
     }
@@ -251,7 +280,11 @@ mod claude_event_fixtures {
                 let doc = load(&path);
                 for variant in doc["variants"].as_array().into_iter().flatten() {
                     let payload = synthesize(variant);
-                    assert!(payload.is_object(), "{}: synthesized payload is not an object", path.display());
+                    assert!(
+                        payload.is_object(),
+                        "{}: synthesized payload is not an object",
+                        path.display()
+                    );
                     let text = serde_json::to_string(&payload).expect("serializable");
                     let back: Value = serde_json::from_str(&text).expect("round-trips");
                     assert_eq!(back, payload);
@@ -321,7 +354,10 @@ mod claude_event_fixtures {
     fn the_skeleton_checker_rejects_a_value() {
         let leaked = serde_json::json!({ "session_id": "3f1c-…", "cwd": "string" });
         let caught = std::panic::catch_unwind(|| assert_skeleton(&leaked, "leaked"));
-        assert!(caught.is_err(), "a literal session id must fail the no-values rule");
+        assert!(
+            caught.is_err(),
+            "a literal session id must fail the no-values rule"
+        );
         let number = serde_json::json!({ "used_percentage": 42 });
         assert!(std::panic::catch_unwind(|| assert_skeleton(&number, "number")).is_err());
     }

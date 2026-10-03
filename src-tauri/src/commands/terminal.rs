@@ -3677,7 +3677,7 @@ pub fn offer_agent_observation(
     state: Option<String>,
     busy: Option<bool>,
 ) -> Result<(), String> {
-    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let now_ms = crate::terminal::agent_state::now_ms();
     let obs =
         crate::terminal::agent_state::webview_observation(&source, state.as_deref(), busy, now_ms)?;
     let session = terminal_manager

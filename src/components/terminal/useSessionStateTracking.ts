@@ -7,10 +7,13 @@ import {
   fetchTerminalAgentStates,
   isEventSourced,
   isNeedsInputState,
+  isNewerAgentState,
   isTerminalAgentStateEvent,
   offerAgentObservation,
   sessionStateToObservation,
+  verdictOverridesLocalState,
   verdictToSessionState,
+  type AgentStateOrigin,
   type AgentTruthEntry,
   type TerminalAgentStateEvent,
 } from "./agentTruth";
@@ -138,6 +141,8 @@ export function useSessionStateTracking(
    */
   const sessionStatesRef = useRef<Record<string, SessionState>>({});
   const agentVerdictsRef = useRef<Record<string, AgentTruthEntry>>({});
+  /** Highest runner publish `seq` applied per terminal (see `isNewerAgentState`). */
+  const agentSeqRef = useRef<Record<string, number>>({});
 
   const setSessionStates = useCallback<
     React.Dispatch<React.SetStateAction<Record<string, SessionState>>>
@@ -292,8 +297,12 @@ export function useSessionStateTracking(
   // fallback inference below in charge — the defensive default.
 
   const applyAgentState = useCallback(
-    (payload: TerminalAgentStateEvent) => {
+    (payload: TerminalAgentStateEvent, origin: AgentStateOrigin) => {
       if (!isTerminalAgentStateEvent(payload)) return;
+      // The initial snapshot can resolve AFTER a live event; an older verdict
+      // must never overwrite a newer one.
+      if (!isNewerAgentState(agentSeqRef.current[payload.terminalId], payload.seq, origin)) return;
+      if (typeof payload.seq === "number") agentSeqRef.current[payload.terminalId] = payload.seq;
       const entry: AgentTruthEntry = {
         verdict: payload.verdict,
         hookDelivery: payload.hookDelivery ?? { status: "unknown" },
@@ -304,6 +313,11 @@ export function useSessionStateTracking(
       // has already inferred; every other verdict is what the chip renders.
       if (entry.verdict.state.name === "unknown") return;
       if (!tabsRef.current.some((t) => t.id === payload.terminalId)) return;
+      // An echo of the webview's own fallback offer never overwrites what the
+      // webview derived since (e.g. `completed` on process exit).
+      if (!verdictOverridesLocalState(entry.verdict, sessionStatesRef.current[payload.terminalId])) {
+        return;
+      }
       const mapped = verdictToSessionState(entry.verdict);
       setSessionStates((prev) =>
         prev[payload.terminalId] === mapped ? prev : { ...prev, [payload.terminalId]: mapped },
@@ -317,7 +331,7 @@ export function useSessionStateTracking(
     let unlisten: (() => void) | undefined;
     try {
       listen<TerminalAgentStateEvent>(TERMINAL_AGENT_STATE_EVENT, (event) => {
-        if (!cancelled) applyAgentState(event.payload);
+        if (!cancelled) applyAgentState(event.payload, "event");
       })
         .then((fn) => {
           if (cancelled) fn();
@@ -329,7 +343,7 @@ export function useSessionStateTracking(
     }
     void fetchTerminalAgentStates().then((rows) => {
       if (cancelled) return;
-      for (const row of rows) applyAgentState(row);
+      for (const row of rows) applyAgentState(row, "row");
     });
     return () => {
       cancelled = true;
