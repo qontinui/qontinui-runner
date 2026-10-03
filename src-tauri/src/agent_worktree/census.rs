@@ -68,8 +68,10 @@
 //!
 //! ## Sizing
 //!
-//! `node_modules` and the build `target` dir (`target` for cargo repos,
-//! `src-tauri/target` for the Tauri runner) are measured with a
+//! `node_modules` and the build `target` dir (resolved from the checked-in
+//! cargo manifests by [`target_dir_for`]: `<root>/target` for a root
+//! `Cargo.toml` — including the runner, whose cargo WORKSPACE is the repo
+//! root — `src-tauri/target` only for a Tauri-only layout) are measured with a
 //! recursive walk that **skips any reparse point** (junction) — it
 //! reports 0 bytes for a junctioned dir and never traverses it. This is
 //! the load-bearing safety property: junctioned build dirs (the runner
@@ -1076,7 +1078,7 @@ pub struct WorktreeCensus {
     /// exclusive-open probe + recent-activity mtime window). Reported every
     /// census tick regardless of reclaim arming, so coord can gauge
     /// "instructions that WOULD have been G6-skipped" while arming is still
-    /// OFF — the passive prove-out feed for the Q1 rejunction graduation.
+    /// OFF — the passive prove-out feed for arming reclaim.
     /// `Some(_)` is the live probe result; old runners omit the field and
     /// coord reads NULL (honest unknown).
     pub building: Option<bool>,
@@ -1412,21 +1414,33 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     (true, false, dir_size_skipping_junctions(dir))
 }
 
-/// Pick the build `target` dir for a worktree. The Tauri runner's cargo
-/// workspace lives under `src-tauri/`, so its target is
-/// `src-tauri/target`; everything else uses `target`. We prefer
-/// `src-tauri/target` when `src-tauri/` exists, else fall back to the
-/// top-level `target`.
+/// Pick the build `target` dir to MEASURE for a worktree, keyed on the
+/// checked-in cargo manifests — cargo's own layout rule, not on which
+/// `target` dirs happen to exist:
+///
+/// 1. `<root>/Cargo.toml` is a file → `<root>/target`. It is either a
+///    workspace root (qontinui-runner: `[workspace] members = ["src-tauri",
+///    …]`) or a root package; cargo writes the build output there either way.
+/// 2. Otherwise `<root>/src-tauri/Cargo.toml` is a file → `<root>/src-tauri/target`
+///    (a Tauri-only layout with no root manifest).
+/// 3. Otherwise → `<root>/target`: not a cargo project, and the value is only
+///    a measurement path.
+///
+/// No `exists()` check on any `target` dir: the answer depends only on
+/// manifests, so it is the same at census time and at execution time. The old
+/// "prefer `src-tauri/target` when `src-tauri/` exists" fallback pointed the
+/// census at a ~2 MB `schemas.json` stub while the real workspace output sat in
+/// `<root>/target` (plan
+/// `2026-09-30-rejunction-sinks-follow-the-cargo-workspace-and-coord-stops-emitting-refused-rejunctions`,
+/// D1). A nested `[workspace]` under `src-tauri/` beside a root manifest is out
+/// of scope — no fleet repo has one.
 pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
+    if worktree.join("Cargo.toml").is_file() {
+        return worktree.join("target");
+    }
     let src_tauri = worktree.join("src-tauri");
-    if src_tauri.is_dir() {
-        let st_target = src_tauri.join("target");
-        // Use src-tauri/target if it exists OR if there's no top-level
-        // target (the Tauri layout). If the operator happens to have a
-        // top-level target too, prefer the one that actually exists.
-        if st_target.exists() || !worktree.join("target").exists() {
-            return st_target;
-        }
+    if src_tauri.join("Cargo.toml").is_file() {
+        return src_tauri.join("target");
     }
     worktree.join("target")
 }
@@ -3657,17 +3671,52 @@ mod tests {",
         assert_eq!(drive_letter_of(Path::new("relative/path")), None);
     }
 
+    /// (a) The runner / merytshost case: a ROOT workspace manifest beside a
+    /// `src-tauri/Cargo.toml` member, a `src-tauri/target` stub and NO root
+    /// `target` yet → still `<root>/target`, where cargo writes.
     #[test]
-    fn target_dir_prefers_src_tauri_when_present() {
+    fn target_dir_follows_root_workspace_over_src_tauri_stub() {
         let dir = tempfile::tempdir().unwrap();
-        // No src-tauri → top-level target.
-        assert_eq!(target_dir_for(dir.path()), dir.path().join("target"));
-        // With src-tauri/ → src-tauri/target.
-        std::fs::create_dir(dir.path().join("src-tauri")).unwrap();
-        assert_eq!(
-            target_dir_for(dir.path()),
-            dir.path().join("src-tauri").join("target")
-        );
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"src-tauri\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert!(!root.join("target").exists());
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (b) Tauri-only: `src-tauri/Cargo.toml` and no root manifest →
+    /// `src-tauri/target`, whether or not it exists yet.
+    #[test]
+    fn target_dir_tauri_only_layout_uses_src_tauri_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("src-tauri").join("target"));
+    }
+
+    /// (c) Plain cargo repo: root `Cargo.toml` only → `<root>/target`.
+    #[test]
+    fn target_dir_plain_cargo_repo_uses_root_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (d) No manifest anywhere, even with a `src-tauri/` dir → `<root>/target`
+    /// (the retired "prefer src-tauri when present" fallback was the defect).
+    #[test]
+    fn target_dir_without_manifest_ignores_bare_src_tauri_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
     }
 
     // -----------------------------------------------------------------

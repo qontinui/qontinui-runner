@@ -95,7 +95,6 @@ export interface WorktreeSurvey {
   coord_reachable: boolean;
   coord_error: string | null;
   remove_armed: boolean;
-  rejunction_armed: boolean;
   canonical_excluded: number;
   items: WorktreeSurveyItem[];
   summary: { reapable: number; blocked: number; reclaimable_bytes: number };

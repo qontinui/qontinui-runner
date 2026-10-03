@@ -801,10 +801,9 @@ pub struct Survey {
     /// Health of the BACKGROUND POLLER — the executor. A subsystem's health
     /// signal must report on its OUTPUT, not on the inputs of whoever asked.
     pub poller: reclaim::PollerHealth,
-    /// Echo of coord's arming flags — informational only. The on-demand path
-    /// deliberately does NOT depend on them.
+    /// Echo of coord's remove arming flag — informational only. The
+    /// on-demand path deliberately does NOT depend on it.
     pub remove_armed: bool,
-    pub rejunction_armed: bool,
     /// Canonical repo checkouts filtered out of the list (never reclaimable).
     /// Reported as a count so the omission is visible, not silent.
     pub canonical_excluded: usize,
@@ -1050,7 +1049,6 @@ fn assemble_survey(
 ) -> Survey {
     let coord_reachable = pull.is_some();
     let remove_armed = pull.is_some_and(|p| p.remove_armed);
-    let rejunction_armed = pull.is_some_and(|p| p.rejunction_armed);
 
     let Some(snapshot) = snapshot else {
         // Cold start: we do NOT know what is on disk, and we say so.
@@ -1060,7 +1058,6 @@ fn assemble_survey(
             coord_error,
             poller: reclaim::poller_health(),
             remove_armed,
-            rejunction_armed,
             canonical_excluded: 0,
             items: Vec::new(),
             // INV-D1: the census being pending says NOTHING about free space.
@@ -1131,7 +1128,6 @@ fn assemble_survey(
         coord_error,
         poller: reclaim::poller_health(),
         remove_armed,
-        rejunction_armed,
         canonical_excluded,
         items,
         summary,
@@ -1618,8 +1614,7 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
             retention: None,
         };
         let steps: Vec<ReclaimStep> = reclaim::plan_reclaim(
-            &instr, /* rejunction_armed */ false, /* remove_armed */ true, None,
-            /* root_exists */ true,
+            &instr, /* remove_armed */ true, /* root_exists */ true,
         );
         match reclaim::execute_steps(&item.worktree_path, &steps) {
             Ok(()) => {
@@ -2388,7 +2383,6 @@ mod tests {
     fn pull_with(instructions: Vec<ReclaimInstruction>) -> ReclaimPull {
         serde_json::from_value(serde_json::json!({
             "remove_armed": false,
-            "rejunction_armed": false,
             "instructions": instructions
                 .iter()
                 .map(|i| serde_json::json!({
@@ -3195,7 +3189,6 @@ mod tests {
             coord_error: None,
             poller: reclaim::poller_health(),
             remove_armed: false,
-            rejunction_armed: false,
             canonical_excluded: 0,
             items,
             summary,
