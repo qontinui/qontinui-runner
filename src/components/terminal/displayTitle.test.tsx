@@ -99,6 +99,33 @@ describe("spawnNameOf", () => {
   });
 });
 
+describe("isPathShapedTitle: shell prompt titles", () => {
+  it("treats the OSC `user@host: <cwd>` form as a path, including the home dir", () => {
+    for (const title of [
+      "spinak@merytshost: ~",
+      "spinak@merytshost:~",
+      "spinak@merytshost: /tmp",
+      "root@box: ~/proj",
+    ]) {
+      expect(isPathShapedTitle(title), title).toBe(true);
+    }
+  });
+
+  it("does not swallow a real session name that merely contains an @", () => {
+    for (const title of ["post-merge-runner#1863", "fix a@b bug", "titlebar-demo"]) {
+      expect(isPathShapedTitle(title), title).toBe(false);
+    }
+  });
+
+  it("renders Terminal, not the prompt title, for a shell in the home directory", () => {
+    expect(
+      resolveDisplayTitle({
+        tab: { title: "spinak@merytshost: ~", workingDir: "/home/spinak" },
+      }),
+    ).toBe("Terminal");
+  });
+});
+
 describe("applySpawnNames", () => {
   const tab = (id: string, spawnName?: string) =>
     ({ id, title: "t", spawnName }) as unknown as TerminalTab;
