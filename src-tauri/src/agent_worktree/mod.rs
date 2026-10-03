@@ -1237,6 +1237,14 @@ struct CoordAllocatedWorktree {
     /// `.qontinui/ci.toml` `[[siblings]]`). Absent on an older coord.
     #[serde(default)]
     origin: Option<String>,
+    /// Plan `2026-10-03-an-explicitly-named-sibling-is-allocated-without-the-cargo-override-so-every-build-copies-it`
+    /// - set by coord on a `requested` row that a co-requested consumer also
+    /// declares as a build sibling and that is not plausibly being edited: the
+    /// commit its `.siblings/<repo>@<sha>/` store entry must hold. The row's
+    /// own worktree is cut as usual; only coord's `cargo_config` override
+    /// points at the store. Absent on an older coord.
+    #[serde(default)]
+    sibling_store_sha: Option<String>,
     /// D3 — the four `parent_sha_*` freshness fields, flattened. Each
     /// defaults, so an older coord's row reads `Unknown` / `None`.
     #[serde(flatten)]
@@ -2185,16 +2193,22 @@ fn plan_worktree_rows(
 /// name, the checkout its worktree was cut from, coord's pinned sha)`.
 type SiblingSource = (String, PathBuf, String);
 
-/// The `declared_sibling` rows of a planned allocation, as store sources. Rows
+/// The rows of a planned allocation that need a store entry: every
+/// `declared_sibling` (at its `parent_sha`) and every row carrying a
+/// `sibling_store_sha` (at that sha, cut from the row's own canonical checkout). Rows
 /// [`plan_worktree_rows`] skipped (no checkout on this device) are simply absent,
 /// so their store entry is never filled and the override gate below refuses.
 fn sibling_store_sources(planned: &[PlannedWorktreeRow]) -> Vec<SiblingSource> {
     planned
         .iter()
-        .filter(|p| p.row.origin.as_deref() == Some("declared_sibling"))
         .filter_map(|p| {
+            let sha = match (&p.row.sibling_store_sha, p.row.origin.as_deref()) {
+                (Some(sha), _) => sha.clone(),
+                (None, Some("declared_sibling")) => p.row.parent_sha.clone(),
+                _ => return None,
+            };
             let name = canonical_paths::canonical_segment(&p.row.repo).ok()?;
-            Some((name, p.canonical.clone(), p.row.parent_sha.clone()))
+            Some((name, p.canonical.clone(), sha))
         })
         .collect()
 }
@@ -3437,6 +3451,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_requested_row_with_a_store_sha_becomes_a_store_source_at_that_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = dir.path().join("qontinui-coord");
+        let schemas = dir.path().join("qontinui-schemas");
+        let canonical: std::collections::HashMap<String, PathBuf> = [
+            ("qontinui-coord".to_string(), coord.clone()),
+            ("qontinui-schemas".to_string(), schemas.clone()),
+        ]
+        .into();
+        let pin = "b".repeat(40);
+        let rows = allocated_rows(serde_json::json!([
+            {"repo": "qontinui-coord", "branch": "b", "parent_sha": "c",
+             "worktree_path": "w", "status": "allocated", "origin": "requested"},
+            {"repo": "qontinui-schemas", "branch": "b", "parent_sha": "s",
+             "worktree_path": "w", "status": "allocated", "origin": "requested",
+             "sibling_store_sha": pin}
+        ]));
+        let planned = plan_worktree_rows(rows, &canonical, "agent-a", |_| None).unwrap();
+        assert_eq!(
+            sibling_store_sources(&planned),
+            vec![("qontinui-schemas".to_string(), schemas, pin)]
+        );
+    }
+
+    #[test]
+    fn an_older_coord_row_without_the_field_deserialises_with_none() {
+        let rows = allocated_rows(serde_json::json!([
+            {"repo": "r", "branch": "b", "parent_sha": "p",
+             "worktree_path": "w", "status": "allocated"}
+        ]));
+        assert_eq!(rows[0].sibling_store_sha, None);
+    }
+
     fn allocated_rows(json: serde_json::Value) -> Vec<CoordAllocatedWorktree> {
         serde_json::from_value(json).unwrap()
     }
@@ -3661,6 +3709,7 @@ mod tests {
             status: "allocated".to_string(),
             push_ref: String::new(),
             origin: Some("requested".to_string()),
+            sibling_store_sha: None,
             parent_sha_provenance: ParentShaProvenance::default(),
         };
         let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
@@ -3716,6 +3765,7 @@ mod tests {
             status: "allocated".to_string(),
             push_ref: String::new(),
             origin: Some("requested".to_string()),
+            sibling_store_sha: None,
             parent_sha_provenance: ParentShaProvenance::default(),
         };
         let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
