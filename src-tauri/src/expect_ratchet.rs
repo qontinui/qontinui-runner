@@ -1,4 +1,4 @@
-//! Ratchets for the deny lints that grandfather existing sites with a fn-level
+//! Ratchets for the deny lints that grandfather existing sites with an item-level
 //! `#[expect]` — one table, one walk, one set of tests.
 //!
 //! Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`,
@@ -13,13 +13,15 @@
 //!
 //! The mechanism is the same for every entry of [`RATCHETS`]. A panic class
 //! (`Row::get` on a NULL / type / index mismatch; a `&str` byte slice on a
-//! non-char-boundary) is DENIED in `src-tauri/Cargo.toml` `[lints.clippy]`
-//! (and for `Row::get` the repo-root `clippy.toml` `disallowed-methods` entry
-//! names the method), so a NEW site cannot land. The sites that existed when
-//! each gate landed are grandfathered one fn at a time with
-//! `#[expect(<lint>, reason = …)]`, inserted by
+//! non-char-boundary; an owned `tokio::runtime::Runtime` dropped from an async
+//! context) is DENIED in `src-tauri/Cargo.toml` `[lints.clippy]`
+//! (and for `Row::get` / `Runtime` the repo-root `clippy.toml`
+//! `disallowed-methods` / `disallowed-types` entry names the path), so a NEW site cannot land. The sites that existed when
+//! each gate landed are grandfathered one item (a fn, or a static) at a time
+//! with `#[expect(<lint>, reason = …)]`, inserted by
 //! `scripts/row-get-expect-sweep.py --lint <lint>` (run once per required
-//! clippy leg — ubuntu and `x86_64-pc-windows-msvc`), and this module pins each
+//! clippy leg — ubuntu and `x86_64-pc-windows-msvc`) or by hand where the sweep
+//! cannot attribute a site to an item, and this module pins each
 //! attribute count as a CEILING: it only falls. A fn that migrates (to
 //! `try_get`; to `str::get` / `char_indices` / `str_utils::truncate_str`) must
 //! drop its attribute — `unfulfilled_lint_expectations`, also `deny`, reds the
@@ -58,7 +60,7 @@ mod tests {
         /// sweep-script cross-reference — the classifier matches the lint name
         /// anywhere in the attribute's lint list, deliberately.
         expect_needle: &'static str,
-        /// The ceiling — the number of fn-level `#[expect(<lint>, …)]`
+        /// The ceiling — the number of item-level `#[expect(<lint>, …)]`
         /// attributes the sweep placed when the gate landed. **Lower it when
         /// you migrate a fn; never raise it.** A new site is not grandfathered
         /// — it is a deny error until it is rewritten.
@@ -69,7 +71,7 @@ mod tests {
         gate_wiring: &'static [(&'static str, &'static str)],
     }
 
-    const RATCHETS: [Ratchet; 2] = [
+    const RATCHETS: [Ratchet; 3] = [
         // Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor,
         // Phase 3: carried over from `row_get_ratchet.rs`, whose BASELINE had
         // stayed at 562 while migrations took the real count down to 537 —
@@ -110,6 +112,40 @@ mod tests {
             baseline: 435,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
+                (
+                    "src-tauri/Cargo.toml",
+                    "unfulfilled_lint_expectations = \"deny\"",
+                ),
+            ],
+        },
+        // Plan 2026-09-12-residual-work-from-the-april-2026-plan-audit, Phase 1:
+        // the regression guard plan runner-arc-runtime-root-cause (deliverable
+        // #5) never landed. An owned `tokio::runtime::Runtime` dropped from an
+        // async context panics (`Cannot drop a runtime in a context where
+        // blocking is not allowed`), so naming the type is denied via the
+        // repo-root `clippy.toml` `disallowed-types`. Grandfathered: the
+        // `&Runtime` params in `main.rs`, the two process-lived `OnceLock`
+        // statics (`APP_RUNTIME`, `API_RUNTIME` — item-level expects), and the
+        // `#[cfg(test)]` runtimes that test a sync path or own a test pool
+        // outside any runtime. The gate catches the type wherever it is NAMED
+        // (a field, static, param, `Runtime::new()`), which is every shape of
+        // the original `Arc<Runtime>` field regression; a `Builder::…build()`
+        // local never names it and is not covered — those dedicated-thread
+        // runtimes are legitimate. Measured on the ubuntu `--all-targets` leg;
+        // a source grep found no cfg-gated site, so the `Clippy (windows)` job
+        // of the PR that landed the gate must agree — if it ever does not, the
+        // extra sites belong in that same PR as the initial count, not a raise.
+        Ratchet {
+            lint: "clippy::disallowed_types",
+            expect_needle: "#[expect(clippy::disallowed_types",
+            baseline: 10,
+            gate_wiring: &[
+                ("clippy.toml", "disallowed-types"),
+                ("clippy.toml", "tokio::runtime::Runtime"),
+                (
+                    "src-tauri/Cargo.toml",
+                    "disallowed_types = { level = \"deny\"",
+                ),
                 (
                     "src-tauri/Cargo.toml",
                     "unfulfilled_lint_expectations = \"deny\"",
