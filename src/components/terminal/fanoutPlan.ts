@@ -210,6 +210,8 @@ export function fanoutGate(input: FanoutGateInput): FanoutGate {
 /**
  * The `POST /fanout` body: exactly the ticked rows, in index order, with the
  * title trimmed the way the server trims it. Nothing is re-rendered here.
+ * Each member carries its preview row as `previewIndex`, because the server
+ * numbers the posted list from 0 — so the strip can show the preview's `#n`.
  */
 export function buildCreateFanoutRequest(input: {
   rows: readonly FanoutRow[];
@@ -229,7 +231,7 @@ export function buildCreateFanoutRequest(input: {
     workingDir: input.workingDir.trim(),
     members: input.rows
       .filter((r) => input.ticked.has(r.index))
-      .map((r) => ({ title: serverTrim(r.title), prompt: r.prompt })),
+      .map((r) => ({ title: serverTrim(r.title), prompt: r.prompt, previewIndex: r.index })),
   };
   if (input.tenantId) req.tenantId = input.tenantId;
   return req;

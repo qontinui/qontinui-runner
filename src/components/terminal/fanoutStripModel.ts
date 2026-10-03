@@ -21,15 +21,23 @@ import type { FanoutMemberView, FanoutResult, FanoutRunView } from "./fanoutApi"
 export type FanoutReadState =
   /** No read has completed yet. */
   | { kind: "loading" }
-  /** The last read failed: the scheduler's state is UNKNOWN, not empty. */
-  | { kind: "unknown"; error: string; status: number | null }
+  /**
+   * The last read failed: the scheduler's state is UNKNOWN, not empty. This
+   * includes a runner that answered 503 `FANOUT_LEDGER_NOT_LOADED` (its ledger
+   * is not loaded yet) — `code` carries that word when the server sent one.
+   */
+  | { kind: "unknown"; error: string; status: number | null; code?: string }
   | { kind: "ok"; runs: FanoutRunView[] };
 
 /** Fold a `GET /fanout` result into the read state. */
 export function readStateFromResult(result: FanoutResult<FanoutRunView[]>): FanoutReadState {
-  return result.ok
-    ? { kind: "ok", runs: result.data }
-    : { kind: "unknown", error: result.error, status: result.status };
+  if (result.ok) return { kind: "ok", runs: result.data };
+  return {
+    kind: "unknown",
+    error: result.error,
+    status: result.status,
+    ...(result.code !== undefined ? { code: result.code } : {}),
+  };
 }
 
 /**
@@ -142,6 +150,16 @@ export function fanoutRunSummary(run: FanoutRunView): string {
     parts.push(`${run.counts.refused} refused${refusedReason ? ` (${refusedReason})` : ""}`);
   }
   return `run ${runName(run)} — ${parts.join(" · ")}`;
+}
+
+/**
+ * The `#n` a member is shown under: its row number in the PREVIEW it was
+ * created from, so unticked rows do not shift the numbers between the preview
+ * and the strip. Falls back to the posted position for a run created without
+ * preview indices (or by a runner build that does not echo them).
+ */
+export function memberNumber(m: Pick<FanoutMemberView, "index" | "previewIndex">): number {
+  return (m.previewIndex ?? m.index) + 1;
 }
 
 /** One member row's state text: the state, plus its reason in operator words. */

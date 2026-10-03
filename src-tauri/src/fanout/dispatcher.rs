@@ -135,6 +135,41 @@ pub(crate) enum OpError {
     Conflict(String),
     /// The ledger write failed; nothing changed.
     Store(String),
+    /// The ledger has not been loaded into the book yet (or the last load
+    /// failed): what this runner holds is UNKNOWN, so nothing is answered from
+    /// — or changed in — the book. Carries the operator-facing reason.
+    NotLoaded(String),
+}
+
+/// Whether the book reflects the durable ledger. Until it is `Loaded`, an
+/// empty book is not "no runs" — it is "not read yet".
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LedgerState {
+    /// [`FanoutDispatcher::boot`] has not run yet (the boot settle).
+    Pending,
+    /// The last load attempt failed with this error; it is retried each tick.
+    Failed(String),
+    /// Active runs are loaded and reconciled.
+    Loaded,
+}
+
+impl LedgerState {
+    /// Why the book cannot be served, or `None` once it is loaded.
+    pub(crate) fn not_loaded_reason(&self) -> Option<String> {
+        match self {
+            LedgerState::Loaded => None,
+            LedgerState::Pending => Some(
+                "the fan-out ledger has not been loaded yet — the runner loads and reconciles \
+                 its active runs from PostgreSQL after the boot settle, so its runs are \
+                 UNKNOWN until then"
+                    .to_string(),
+            ),
+            LedgerState::Failed(e) => Some(format!(
+                "the fan-out ledger could not be loaded from PostgreSQL ({e}) — this runner's \
+                 runs are UNKNOWN until a load succeeds (retried every tick)"
+            )),
+        }
+    }
 }
 
 /// How long a completed run stays listed after it completes.
@@ -163,6 +198,9 @@ pub(crate) struct FanoutDispatcher {
     /// The views last published, newest run first — what the read routes
     /// serve, so a read never waits behind a spawn holding the book.
     published: RwLock<Arc<Vec<RunView>>>,
+    /// Whether `published` reflects the ledger. Written under the book lock;
+    /// read lock-free beside `published`.
+    ledger: RwLock<LedgerState>,
     wake: tokio::sync::Notify,
 }
 
@@ -180,6 +218,7 @@ impl FanoutDispatcher {
             events,
             book: tokio::sync::Mutex::new(Book::default()),
             published: RwLock::new(Arc::new(Vec::new())),
+            ledger: RwLock::new(LedgerState::Pending),
             wake: tokio::sync::Notify::new(),
         }
     }
@@ -194,22 +233,65 @@ impl FanoutDispatcher {
         self.wake.notified().await;
     }
 
-    /// Every run this runner holds, newest first.
-    pub(crate) fn list(&self) -> Arc<Vec<RunView>> {
-        match self.published.read() {
+    /// The ledger's load state.
+    pub(crate) fn ledger_state(&self) -> LedgerState {
+        match self.ledger.read() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
         }
     }
 
-    /// One run.
-    pub(crate) fn get(&self, id: Uuid) -> Option<RunView> {
-        self.list().iter().find(|r| r.id == id).cloned()
+    fn set_ledger_state(&self, state: LedgerState) {
+        match self.ledger.write() {
+            Ok(mut g) => *g = state,
+            Err(p) => *p.into_inner() = state,
+        }
+    }
+
+    /// Every run this runner holds, newest first — or, until the ledger is
+    /// loaded, the reason it cannot say. An unloaded book is never served as
+    /// an empty list: that would read as "no runs".
+    pub(crate) fn list(&self) -> Result<Arc<Vec<RunView>>, String> {
+        if let Some(why) = self.ledger_state().not_loaded_reason() {
+            return Err(why);
+        }
+        Ok(match self.published.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        })
+    }
+
+    /// One run (`Ok(None)`: the loaded ledger has no such run).
+    pub(crate) fn get(&self, id: Uuid) -> Result<Option<RunView>, String> {
+        Ok(self.list()?.iter().find(|r| r.id == id).cloned())
+    }
+
+    /// Refuse an operation while the book does not reflect the ledger.
+    fn require_booted(book: &Book, ledger: &LedgerState) -> Result<(), OpError> {
+        if book.booted {
+            return Ok(());
+        }
+        Err(OpError::NotLoaded(
+            ledger
+                .not_loaded_reason()
+                .unwrap_or_else(|| "the fan-out ledger has not been loaded yet".to_string()),
+        ))
     }
 
     /// Create a run. Persisted before it is admitted to the book, so a run
     /// the ledger could not record is never queued at all.
+    ///
+    /// Refused until the ledger is loaded. A run created inside the boot
+    /// window would be inserted into PG, picked up by the concurrent
+    /// [`Self::boot`] load, possibly admitted (spawned) by the first tick after
+    /// it — and then overwritten in the book by this call's all-queued copy,
+    /// so the next tick would spawn its members a second time. `booted` never
+    /// goes back to false, so checking it once up front closes that window.
     pub(crate) async fn create(&self, new: NewRun) -> Result<CapOutcome, OpError> {
+        {
+            let book = self.book.lock().await;
+            Self::require_booted(&book, &self.ledger_state())?;
+        }
         let bound = self.host.fanout_bound().await;
         let max_concurrent = clamp_max_concurrent(new.requested_max_concurrent, bound);
         let run = FanoutRun {
@@ -262,6 +344,7 @@ impl FanoutDispatcher {
     /// member's session is never touched.
     pub(crate) async fn cancel(&self, id: Uuid) -> Result<RunView, OpError> {
         let mut book = self.book.lock().await;
+        Self::require_booted(&book, &self.ledger_state())?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -298,6 +381,7 @@ impl FanoutDispatcher {
         let bound = self.host.fanout_bound().await;
         let max_concurrent = clamp_max_concurrent(requested, bound);
         let mut book = self.book.lock().await;
+        Self::require_booted(&book, &self.ledger_state())?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -322,6 +406,7 @@ impl FanoutDispatcher {
     /// claim on the cap ends.
     pub(crate) async fn release(&self, id: Uuid, index: u32) -> Result<RunView, OpError> {
         let mut book = self.book.lock().await;
+        Self::require_booted(&book, &self.ledger_state())?;
         let entry = book
             .runs
             .get_mut(&id)
@@ -362,7 +447,13 @@ impl FanoutDispatcher {
         if book.booted {
             return Ok(());
         }
-        let loaded = self.store.load_active_runs(&self.owner_instance).await?;
+        let loaded = match self.store.load_active_runs(&self.owner_instance).await {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.set_ledger_state(LedgerState::Failed(e.clone()));
+                return Err(e);
+            }
+        };
         for (run, members) in loaded {
             book.runs.entry(run.id).or_insert(RunEntry {
                 run,
@@ -376,12 +467,18 @@ impl FanoutDispatcher {
             let Some(entry) = book.runs.get_mut(&id) else {
                 continue;
             };
-            if self.reconcile_admitted(entry, reason::RUNNER_RESTARTED).await {
+            if self
+                .reconcile_admitted(entry, reason::RUNNER_RESTARTED)
+                .await
+            {
                 changed.push(self.settle_run_state(entry).await);
             }
         }
         book.booted = true;
         self.publish(&book);
+        // Only after the views are published, so a reader that sees `Loaded`
+        // never reads the empty pre-boot list.
+        self.set_ledger_state(LedgerState::Loaded);
         drop(book);
         for view in &changed {
             self.events.changed(view);
@@ -516,11 +613,7 @@ impl FanoutDispatcher {
             self.persist_member(run_id, m).await;
         }
         if let Some(why) = drain {
-            if entry
-                .members
-                .iter()
-                .any(|m| m.state == MemberState::Queued)
-            {
+            if entry.members.iter().any(|m| m.state == MemberState::Queued) {
                 tracing::debug!(run_id = %run_id, drain = %why, "fanout: admission deferred by the device drain");
             }
         }
@@ -594,7 +687,11 @@ impl FanoutDispatcher {
                 SpawnOutcome::DeferredByDrain { reason: why } => {
                     info!(run_id = %run_id, index = member.index, drain = %why,
                         "fanout: admission deferred by the device drain");
-                    unadmit(member, MemberState::Queued, reason::RUNNER_DRAINING.to_string());
+                    unadmit(
+                        member,
+                        MemberState::Queued,
+                        reason::RUNNER_DRAINING.to_string(),
+                    );
                     (true, true)
                 }
                 SpawnOutcome::BoundOccupied { detail } => {
@@ -691,6 +788,7 @@ mod tests {
     struct MemoryStore {
         rows: Mutex<HashMap<Uuid, (FanoutRun, Vec<FanoutMember>)>>,
         fail_member_writes: std::sync::atomic::AtomicBool,
+        fail_loads: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -730,6 +828,9 @@ mod tests {
             &self,
             owner_instance: &str,
         ) -> Result<Vec<(FanoutRun, Vec<FanoutMember>)>, String> {
+            if self.fail_loads.load(Ordering::SeqCst) {
+                return Err("connection refused".to_string());
+            }
             Ok(self
                 .rows
                 .lock()
@@ -829,6 +930,7 @@ mod tests {
             .map(|i| MemberInput {
                 title: format!("member {i}"),
                 prompt: format!("do task {i}"),
+                preview_index: None,
             })
             .collect();
         build_members(&inputs).unwrap()
@@ -885,7 +987,7 @@ mod tests {
         let f = fixture(15).await;
         let id = f.d.create(new_run(5, 2, None)).await.unwrap().run.id;
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         use MemberState::*;
         assert_eq!(states(&v), vec![Admitted, Admitted, Queued, Queued, Queued]);
         // A second tick with nothing released admits nothing more.
@@ -894,8 +996,11 @@ mod tests {
         // A terminal exit frees exactly one slot, taken by the next index.
         f.host.exit(&csid(&v, 0));
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
-        assert_eq!(states(&v), vec![Released, Admitted, Admitted, Queued, Queued]);
+        let v = f.d.get(id).unwrap().unwrap();
+        assert_eq!(
+            states(&v),
+            vec![Released, Admitted, Admitted, Queued, Queued]
+        );
         assert_eq!(v.members[0].reason.as_deref(), Some(reason::TERMINAL_EXIT));
         assert!(v.members[0].released_at.is_some());
     }
@@ -906,7 +1011,10 @@ mod tests {
         f.d.create(new_run(3, 3, None)).await.unwrap();
         f.d.tick().await;
         let spawns = f.host.spawns.lock().unwrap().clone();
-        let ids: HashSet<&str> = spawns.iter().map(|s| s.claude_session_id.as_str()).collect();
+        let ids: HashSet<&str> = spawns
+            .iter()
+            .map(|s| s.claude_session_id.as_str())
+            .collect();
         assert_eq!(ids.len(), 3, "session ids must be distinct");
         for (i, s) in spawns.iter().enumerate() {
             assert!(Uuid::parse_str(&s.claude_session_id).is_ok());
@@ -927,7 +1035,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for _ in 0..60 {
                     d.tick().await;
-                    let v = d.get(id).unwrap();
+                    let v = d.get(id).unwrap().unwrap();
                     assert!(v.counts.admitted <= 3, "{} admitted", v.counts.admitted);
                     tokio::task::yield_now().await;
                 }
@@ -939,7 +1047,7 @@ mod tests {
             let host = f.host.clone();
             handles.push(tokio::spawn(async move {
                 for _ in 0..200 {
-                    let v = d.get(id).unwrap();
+                    let v = d.get(id).unwrap().unwrap();
                     if let Some(m) = v.members.iter().find(|m| m.state == MemberState::Admitted) {
                         host.exit(m.claude_session_id.as_deref().unwrap());
                     }
@@ -953,7 +1061,7 @@ mod tests {
             let host = f.host.clone();
             handles.push(tokio::spawn(async move {
                 for _ in 0..200 {
-                    let v = d.get(id).unwrap();
+                    let v = d.get(id).unwrap().unwrap();
                     if let Some(m) = v
                         .members
                         .iter()
@@ -975,19 +1083,27 @@ mod tests {
         }
         // Drain the queue to the end.
         for _ in 0..200 {
-            let v = f.d.get(id).unwrap();
-            for m in v.members.iter().filter(|m| m.state == MemberState::Admitted) {
+            let v = f.d.get(id).unwrap().unwrap();
+            for m in v
+                .members
+                .iter()
+                .filter(|m| m.state == MemberState::Admitted)
+            {
                 f.host.exit(m.claude_session_id.as_deref().unwrap());
             }
             f.d.tick().await;
-            if f.d.get(id).unwrap().state == RunState::Completed {
+            if f.d.get(id).unwrap().unwrap().state == RunState::Completed {
                 break;
             }
         }
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(v.state, RunState::Completed, "{:?}", v.counts);
         assert_eq!(v.counts.released, 40);
-        assert_eq!(f.host.spawn_count(), 40, "every member spawned exactly once");
+        assert_eq!(
+            f.host.spawn_count(),
+            40,
+            "every member spawned exactly once"
+        );
         assert!(f.host.max_live.load(Ordering::SeqCst) <= 3);
     }
 
@@ -1013,7 +1129,7 @@ mod tests {
                     // Conflict (not admitted) and Ok are both fine; the cap is
                     // what is under test.
                     let _ = d.release(id, index).await;
-                    let v = d.get(id).unwrap();
+                    let v = d.get(id).unwrap().unwrap();
                     assert!(v.counts.admitted <= 4, "{} admitted", v.counts.admitted);
                     tokio::task::yield_now().await;
                 }
@@ -1022,7 +1138,7 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert!(f.d.get(id).unwrap().counts.admitted <= 4);
+        assert!(f.d.get(id).unwrap().unwrap().counts.admitted <= 4);
     }
 
     #[tokio::test]
@@ -1043,7 +1159,7 @@ mod tests {
         // shrinks the effective cap without a PATCH.
         f.host.bound.store(1, Ordering::SeqCst);
         f.d.tick().await;
-        assert_eq!(f.d.get(id).unwrap().counts.admitted, 1);
+        assert_eq!(f.d.get(id).unwrap().unwrap().counts.admitted, 1);
         // And the persisted run carries the clamped value.
         let rows = f.store.rows.lock().unwrap();
         assert_eq!(rows.get(&id).unwrap().0.max_concurrent, 2);
@@ -1052,12 +1168,16 @@ mod tests {
     #[tokio::test]
     async fn fanout_refusal_keeps_the_member_queued_with_its_reason() {
         let f = fixture(15).await;
-        f.host.scripted.lock().unwrap().push_back(SpawnOutcome::Refused {
-            reason: "resource_guard:critical: commit charge at 97%".to_string(),
-        });
+        f.host
+            .scripted
+            .lock()
+            .unwrap()
+            .push_back(SpawnOutcome::Refused {
+                reason: "resource_guard:critical: commit charge at 97%".to_string(),
+            });
         let id = f.d.create(new_run(3, 2, None)).await.unwrap().run.id;
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         use MemberState::*;
         // The refusal stops this run's admission for the tick.
         assert_eq!(states(&v), vec![Refused, Queued, Queued]);
@@ -1070,7 +1190,7 @@ mod tests {
         assert_eq!(v.counts.admitted, 0);
         // Next tick: back to the queue, then admitted.
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(states(&v), vec![Admitted, Admitted, Queued]);
         assert!(v.members[0].reason.is_none());
     }
@@ -1081,7 +1201,7 @@ mod tests {
         *f.host.drained.lock().unwrap() = Some("coord drained this device".to_string());
         let id = f.d.create(new_run(3, 2, None)).await.unwrap().run.id;
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(f.host.spawn_count(), 0);
         assert!(v.members.iter().all(|m| m.state == MemberState::Queued));
         assert!(v
@@ -1099,12 +1219,15 @@ mod tests {
                 reason: "drained".to_string(),
             });
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert!(v.members.iter().all(|m| m.state == MemberState::Queued));
-        assert_eq!(v.members[0].reason.as_deref(), Some(reason::RUNNER_DRAINING));
+        assert_eq!(
+            v.members[0].reason.as_deref(),
+            Some(reason::RUNNER_DRAINING)
+        );
         // Undrained: admitted, and the stale word is gone from the rest.
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         use MemberState::*;
         assert_eq!(states(&v), vec![Admitted, Admitted, Queued]);
         assert!(v.members.iter().all(|m| m.reason.is_none()));
@@ -1120,11 +1243,14 @@ mod tests {
         assert_eq!(states(&v), vec![Admitted, Cancelled, Cancelled, Cancelled]);
         assert_eq!(v.state, RunState::Active);
         let live = csid(&v, 0);
-        assert!(f.host.live.lock().unwrap().contains_key(&live), "session untouched");
+        assert!(
+            f.host.live.lock().unwrap().contains_key(&live),
+            "session untouched"
+        );
         // Nothing cancelled is ever spawned.
         f.host.exit(&live);
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(states(&v), vec![Released, Cancelled, Cancelled, Cancelled]);
         assert_eq!(v.state, RunState::Completed);
         assert_eq!(f.host.spawn_count(), 1);
@@ -1146,10 +1272,16 @@ mod tests {
             Err(OpError::NotFound(_))
         ));
         let v = f.d.release(id, 0).await.unwrap();
-        assert_eq!(v.members[0].reason.as_deref(), Some(reason::OPERATOR_RELEASE));
+        assert_eq!(
+            v.members[0].reason.as_deref(),
+            Some(reason::OPERATOR_RELEASE)
+        );
         assert!(f.host.live.lock().unwrap().contains_key(&csid(&v, 0)));
         f.d.tick().await;
-        assert_eq!(f.d.get(id).unwrap().members[1].state, MemberState::Admitted);
+        assert_eq!(
+            f.d.get(id).unwrap().unwrap().members[1].state,
+            MemberState::Admitted
+        );
     }
 
     #[tokio::test]
@@ -1157,10 +1289,10 @@ mod tests {
         let f = fixture(15).await;
         let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
         f.d.tick().await;
-        let first = csid(&f.d.get(id).unwrap(), 0);
+        let first = csid(&f.d.get(id).unwrap().unwrap(), 0);
         f.host.finished.lock().unwrap().insert(first);
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(v.members[0].state, MemberState::Released);
         assert_eq!(v.members[0].reason.as_deref(), Some(reason::FINISHED));
         assert_eq!(v.members[1].state, MemberState::Admitted);
@@ -1174,7 +1306,7 @@ mod tests {
         f.host.no_terminal_manager.store(true, Ordering::SeqCst);
         f.host.live.lock().unwrap().clear();
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(v.members[0].state, MemberState::Admitted);
         assert_eq!(v.members[1].state, MemberState::Queued);
     }
@@ -1184,7 +1316,7 @@ mod tests {
         let f = fixture(15).await;
         let id = f.d.create(new_run(4, 3, None)).await.unwrap().run.id;
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         let (survivor, lost) = (csid(&v, 0), csid(&v, 1));
         let survivor_terminal = v.members[0].terminal_id.clone().unwrap();
         // The runner dies: member 1's terminal does not come back, member 0's
@@ -1206,19 +1338,29 @@ mod tests {
             events.clone(),
         );
         restarted.boot().await.unwrap();
-        let v = restarted.get(id).unwrap();
+        let v = restarted.get(id).unwrap().unwrap();
         use MemberState::*;
         assert_eq!(states(&v), vec![Admitted, Released, Admitted, Queued]);
-        assert_eq!(v.members[0].terminal_id.as_deref(), Some(survivor_terminal.as_str()));
-        assert_eq!(v.members[1].reason.as_deref(), Some(reason::RUNNER_RESTARTED));
+        assert_eq!(
+            v.members[0].terminal_id.as_deref(),
+            Some(survivor_terminal.as_str())
+        );
+        assert_eq!(
+            v.members[1].reason.as_deref(),
+            Some(reason::RUNNER_RESTARTED)
+        );
         assert_eq!(v.members[2].terminal_id.as_deref(), Some("term-restored"));
-        assert_eq!(f.host.spawn_count(), spawned_before, "reconcile spawns nothing");
+        assert_eq!(
+            f.host.spawn_count(),
+            spawned_before,
+            "reconcile spawns nothing"
+        );
         assert!(!events.0.lock().unwrap().is_empty());
 
         // Idempotent: a second boot (a supervised respawn of the loop) and a
         // whole second restart both land on the same book.
         restarted.boot().await.unwrap();
-        assert_eq!(restarted.get(id).unwrap(), v);
+        assert_eq!(restarted.get(id).unwrap().unwrap(), v);
         let again = FanoutDispatcher::new(
             "primary".to_string(),
             f.store.clone(),
@@ -1226,14 +1368,14 @@ mod tests {
             Arc::new(RecordingEvents::default()),
         );
         again.boot().await.unwrap();
-        let w = again.get(id).unwrap();
+        let w = again.get(id).unwrap().unwrap();
         assert_eq!(states(&w), states(&v));
         assert_eq!(f.host.spawn_count(), spawned_before);
         assert_eq!(survivor, csid(&w, 0));
 
         // The freed slot goes to the next queued member, and only it.
         again.tick().await;
-        let w = again.get(id).unwrap();
+        let w = again.get(id).unwrap().unwrap();
         assert_eq!(states(&w), vec![Admitted, Released, Admitted, Admitted]);
         assert_eq!(f.host.spawn_count(), spawned_before + 1);
     }
@@ -1249,7 +1391,7 @@ mod tests {
             Arc::new(RecordingEvents::default()),
         );
         temp.boot().await.unwrap();
-        assert!(temp.get(id).is_none());
+        assert!(temp.get(id).unwrap().is_none());
         temp.tick().await;
         assert_eq!(f.host.spawn_count(), 0);
     }
@@ -1258,9 +1400,21 @@ mod tests {
     async fn fanout_the_runs_tenant_reaches_every_member_spawn() {
         let f = fixture(15).await;
         let tenant = Uuid::from_u128(0xA1);
-        let id = f.d.create(new_run(4, 2, Some(tenant))).await.unwrap().run.id;
+        let id =
+            f.d.create(new_run(4, 2, Some(tenant)))
+                .await
+                .unwrap()
+                .run
+                .id;
         f.d.tick().await;
-        for m in f.d.get(id).unwrap().members.iter().filter(|m| m.state == MemberState::Admitted) {
+        for m in
+            f.d.get(id)
+                .unwrap()
+                .unwrap()
+                .members
+                .iter()
+                .filter(|m| m.state == MemberState::Admitted)
+        {
             f.host.exit(m.claude_session_id.as_deref().unwrap());
         }
         f.d.tick().await;
@@ -1274,7 +1428,12 @@ mod tests {
             f.host.clone(),
             Arc::new(RecordingEvents::default()),
         );
-        let id2 = f.d.create(new_run(1, 1, Some(tenant))).await.unwrap().run.id;
+        let id2 =
+            f.d.create(new_run(1, 1, Some(tenant)))
+                .await
+                .unwrap()
+                .run
+                .id;
         restarted.boot().await.unwrap();
         restarted.tick().await;
         let last = f.host.spawns.lock().unwrap().last().cloned().unwrap();
@@ -1287,13 +1446,16 @@ mod tests {
         let id = f.d.create(new_run(2, 2, None)).await.unwrap().run.id;
         f.store.fail_member_writes.store(true, Ordering::SeqCst);
         f.d.tick().await;
-        let v = f.d.get(id).unwrap();
+        let v = f.d.get(id).unwrap().unwrap();
         assert_eq!(f.host.spawn_count(), 0);
         assert_eq!(v.members[0].state, MemberState::Queued);
-        assert_eq!(v.members[0].reason.as_deref(), Some(reason::STORE_UNAVAILABLE));
+        assert_eq!(
+            v.members[0].reason.as_deref(),
+            Some(reason::STORE_UNAVAILABLE)
+        );
         f.store.fail_member_writes.store(false, Ordering::SeqCst);
         f.d.tick().await;
-        assert_eq!(f.d.get(id).unwrap().counts.admitted, 2);
+        assert_eq!(f.d.get(id).unwrap().unwrap().counts.admitted, 2);
     }
 
     #[tokio::test]
@@ -1305,6 +1467,7 @@ mod tests {
         assert!(f
             .d
             .get(id)
+            .unwrap()
             .unwrap()
             .members
             .iter()
@@ -1323,5 +1486,78 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[1].id, id);
         assert_eq!(evs[1].counts.admitted, 1);
+    }
+
+    fn unbooted(store: Arc<MemoryStore>, host: Arc<MockHost>) -> FanoutDispatcher {
+        FanoutDispatcher::new(
+            "primary".to_string(),
+            store,
+            host,
+            Arc::new(RecordingEvents::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn fanout_an_unloaded_ledger_is_unknown_never_an_empty_list() {
+        let f = fixture(15).await;
+        let id = f.d.create(new_run(2, 1, None)).await.unwrap().run.id;
+        // A restarted runner inside its boot settle: the ledger HAS a run.
+        let d = unbooted(f.store.clone(), f.host.clone());
+        assert_eq!(d.ledger_state(), LedgerState::Pending);
+        let err = d.list().unwrap_err();
+        assert!(err.contains("not been loaded yet"), "{err}");
+        assert!(d.get(id).unwrap_err().contains("UNKNOWN"));
+        // Every operator op refuses with the same reason and changes nothing.
+        assert!(matches!(d.cancel(id).await, Err(OpError::NotLoaded(_))));
+        assert!(matches!(d.release(id, 0).await, Err(OpError::NotLoaded(_))));
+        assert!(matches!(
+            d.set_max_concurrent(id, 2).await,
+            Err(OpError::NotLoaded(_))
+        ));
+        let rows_before = f.store.rows.lock().unwrap().len();
+        assert!(matches!(
+            d.create(new_run(1, 1, None)).await,
+            Err(OpError::NotLoaded(_))
+        ));
+        assert_eq!(
+            f.store.rows.lock().unwrap().len(),
+            rows_before,
+            "nothing inserted"
+        );
+        // The tick admits nothing before boot.
+        d.tick().await;
+        assert_eq!(f.host.spawn_count(), 0);
+        // Loaded: the run is there.
+        d.boot().await.unwrap();
+        assert_eq!(d.ledger_state(), LedgerState::Loaded);
+        assert_eq!(d.list().unwrap().len(), 1);
+        assert_eq!(d.get(id).unwrap().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn fanout_a_failed_load_is_unknown_with_the_store_error_until_one_succeeds() {
+        let store = Arc::new(MemoryStore::default());
+        let host = MockHost::with_bound(15);
+        let d = unbooted(store.clone(), host.clone());
+        store.fail_loads.store(true, Ordering::SeqCst);
+        assert!(d.boot().await.is_err());
+        assert_eq!(
+            d.ledger_state(),
+            LedgerState::Failed("connection refused".to_string())
+        );
+        let err = d.list().unwrap_err();
+        assert!(
+            err.contains("could not be loaded") && err.contains("connection refused"),
+            "{err}"
+        );
+        match d.create(new_run(1, 1, None)).await {
+            Err(OpError::NotLoaded(why)) => assert!(why.contains("connection refused"), "{why}"),
+            other => panic!("expected NotLoaded, got {other:?}"),
+        }
+        // The retry succeeds: an empty list is now a real answer.
+        store.fail_loads.store(false, Ordering::SeqCst);
+        d.boot().await.unwrap();
+        assert!(d.list().unwrap().is_empty());
+        assert!(d.create(new_run(1, 1, None)).await.is_ok());
     }
 }

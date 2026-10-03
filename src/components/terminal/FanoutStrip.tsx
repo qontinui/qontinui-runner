@@ -34,6 +34,7 @@ import {
   capClampNote,
   fanoutRunSummary,
   fanoutStripVisible,
+  memberNumber,
   memberStateLabel,
   nextCap,
   unknownStripText,
@@ -58,6 +59,7 @@ export function FanoutStrip({ api }: { api: FanoutRunsApi }) {
         data-ui-bridge-id="terminal.fanout-strip"
         data-fanout-state="unknown"
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap text-[#e0af68]"
+        data-fanout-unknown-code={state.code}
         title={`The fan-out scheduler could not be read${
           state.status !== null ? ` (HTTP ${state.status})` : ""
         }: ${state.error}`}
@@ -224,7 +226,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
                 data-member-state={m.state}
                 className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]/50 last:border-b-0 text-[11px]"
               >
-                <span className="text-[#565f89] font-mono w-6 shrink-0">#{m.index + 1}</span>
+                <span className="text-[#565f89] font-mono w-6 shrink-0">#{memberNumber(m)}</span>
                 <span className="flex-1 min-w-0 truncate text-[#c0caf5]" title={m.prompt}>
                   {m.title}
                 </span>
@@ -244,7 +246,7 @@ function FanoutRunPill({ run, api }: { run: FanoutRunView; api: FanoutRunsApi })
                     onClick={() =>
                       void runOp(
                         () => api.release(run.id, m.index),
-                        () => `released #${m.index + 1}`,
+                        () => `released #${memberNumber(m)}`,
                       )
                     }
                     className="shrink-0 px-1.5 py-0.5 rounded border border-[#2a2d3d] text-[10px] text-[#7aa2f7] hover:bg-[#7aa2f7]/10 disabled:opacity-40"
