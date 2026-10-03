@@ -31,6 +31,34 @@ export const MIN_TERMINAL_BODY_PX = 100;
 export const MIN_PROMPTS_STRIP_PX = 48;
 
 /**
+ * The size contract of a zone overlay panel. The prompts panel and the review
+ * panel (`SessionReviewPanel`) share the orientation rules below and differ
+ * only in these numbers — the review panel carries a diff and a send bar, so
+ * its strip is taller, its column wider, and a strip too short to hold it
+ * sends it to the column sooner.
+ */
+export interface PanelGeometry {
+  /** Natural height of the `"top"` strip. */
+  topHeightPx: number;
+  /** Width of the `"right"` column. */
+  rightWidthPx: number;
+  /** Below this, the strip is not worth its rows — the zone takes the column. */
+  minStripPx: number;
+}
+
+export const PROMPTS_PANEL_GEOMETRY: PanelGeometry = {
+  topHeightPx: PROMPTS_PANEL_TOP_HEIGHT_PX,
+  rightWidthPx: PROMPTS_PANEL_RIGHT_WIDTH_PX,
+  minStripPx: MIN_PROMPTS_STRIP_PX,
+};
+
+export const REVIEW_PANEL_GEOMETRY: PanelGeometry = {
+  topHeightPx: 260,
+  rightWidthPx: 420,
+  minStripPx: 160,
+};
+
+/**
  * Does this zone offer a prompts panel at all?
  *
  * A tab with no Claude session has no prompts — that is an absence, not an
@@ -54,8 +82,12 @@ export function promptsPanelAvailable(opts: {
  * ResizeObserver reports. Treated as unconstrained, so the strip renders at
  * its natural height and corrects a frame later rather than flashing empty.
  */
-export function availableStripHeight(zoneHeightPx: number, chromeTopPx: number): number {
-  if (zoneHeightPx <= 0) return PROMPTS_PANEL_TOP_HEIGHT_PX;
+export function availableStripHeight(
+  zoneHeightPx: number,
+  chromeTopPx: number,
+  geometry: PanelGeometry = PROMPTS_PANEL_GEOMETRY,
+): number {
+  if (zoneHeightPx <= 0) return geometry.topHeightPx;
   return Math.max(0, zoneHeightPx - chromeTopPx - MIN_TERMINAL_BODY_PX);
 }
 
@@ -73,16 +105,22 @@ export function promptsPanelOrientation(opts: {
   isSingleView: boolean;
   zoneHeightPx: number;
   chromeTopPx: number;
+  geometry?: PanelGeometry;
 }): PromptsPanelOrientation {
   if (opts.isSingleView) return "right";
-  return availableStripHeight(opts.zoneHeightPx, opts.chromeTopPx) < MIN_PROMPTS_STRIP_PX
+  const geometry = opts.geometry ?? PROMPTS_PANEL_GEOMETRY;
+  return availableStripHeight(opts.zoneHeightPx, opts.chromeTopPx, geometry) < geometry.minStripPx
     ? "right"
     : "top";
 }
 
 /** Rendered height of the top strip: its natural height, clamped to what fits. */
-export function promptsStripHeight(zoneHeightPx: number, chromeTopPx: number): number {
-  return Math.min(PROMPTS_PANEL_TOP_HEIGHT_PX, availableStripHeight(zoneHeightPx, chromeTopPx));
+export function promptsStripHeight(
+  zoneHeightPx: number,
+  chromeTopPx: number,
+  geometry: PanelGeometry = PROMPTS_PANEL_GEOMETRY,
+): number {
+  return Math.min(geometry.topHeightPx, availableStripHeight(zoneHeightPx, chromeTopPx, geometry));
 }
 
 /**
@@ -90,7 +128,9 @@ export function promptsStripHeight(zoneHeightPx: number, chromeTopPx: number): n
  *
  * `zoneHeaderPx` is the title bar (0 when the zone renders none) and
  * `filterBarPx` the output-filter bar (0 when closed); both sit above the
- * prompts panel, which is why the panel's own top offset is their sum.
+ * open panel, which is why the panel's own top offset is their sum.
+ * `promptsOpen` means "an overlay panel is open"; `geometry` says which one
+ * (the prompts panel's when omitted). At most one is open per zone.
  */
 export function zoneBodyPadding(opts: {
   zoneHeaderPx: number;
@@ -98,15 +138,51 @@ export function zoneBodyPadding(opts: {
   promptsOpen: boolean;
   isSingleView: boolean;
   zoneHeightPx: number;
+  geometry?: PanelGeometry;
 }): { top: number; right: number } {
   const chromeTop = opts.zoneHeaderPx + opts.filterBarPx;
   if (!opts.promptsOpen) return { top: chromeTop, right: 0 };
+  const geometry = opts.geometry ?? PROMPTS_PANEL_GEOMETRY;
   const orientation = promptsPanelOrientation({
     isSingleView: opts.isSingleView,
     zoneHeightPx: opts.zoneHeightPx,
     chromeTopPx: chromeTop,
+    geometry,
   });
   return orientation === "right"
-    ? { top: chromeTop, right: PROMPTS_PANEL_RIGHT_WIDTH_PX }
-    : { top: chromeTop + promptsStripHeight(opts.zoneHeightPx, chromeTop), right: 0 };
+    ? { top: chromeTop, right: geometry.rightWidthPx }
+    : { top: chromeTop + promptsStripHeight(opts.zoneHeightPx, chromeTop, geometry), right: 0 };
+}
+
+/**
+ * Which overlay a zone shows. The prompts and review panels occupy the same
+ * slot, so opening one closes the other for that tab: two overlays at the same
+ * offset would stack, and the body padding can only reserve room for one.
+ */
+export type ZonePanelKind = "prompts" | "review";
+
+/**
+ * Toggle `kind` for `tabId` across the two per-page open sets. Pure: returns
+ * new sets (or the same set when it is unchanged), so React state can hold them.
+ */
+export function toggleZonePanel(
+  sets: { prompts: ReadonlySet<string>; review: ReadonlySet<string> },
+  tabId: string,
+  kind: ZonePanelKind,
+): { prompts: ReadonlySet<string>; review: ReadonlySet<string> } {
+  const own = sets[kind];
+  const other: ZonePanelKind = kind === "prompts" ? "review" : "prompts";
+  const opening = !own.has(tabId);
+  const nextOwn = new Set(own);
+  if (opening) nextOwn.add(tabId);
+  else nextOwn.delete(tabId);
+  let nextOther = sets[other];
+  if (opening && nextOther.has(tabId)) {
+    const copy = new Set(nextOther);
+    copy.delete(tabId);
+    nextOther = copy;
+  }
+  return kind === "prompts"
+    ? { prompts: nextOwn, review: nextOther }
+    : { prompts: nextOther, review: nextOwn };
 }

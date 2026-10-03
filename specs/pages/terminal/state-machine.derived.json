@@ -908,6 +908,192 @@
       "provenance": {
         "source": "ai-generated"
       }
+    },
+    {
+      "id": "review-panel-open",
+      "name": "Session Review Panel Open",
+      "description": "A PTY zone whose tab is bound to a Claude session shows the review panel (`SessionReviewPanel`, terminal/SessionReviewPanel.tsx), toggled from the zone title bar by the `terminal.review-toggle` button beside the prompts toggle; the tab's unread badge (`terminal.review-badge`) sits next to it and reads `n unread`, `?` when the change list or the read state could not be read, and is absent when there are no hunks. The panel overlays the zone with the same top/right orientation contract as the prompts panel (the two are mutually exclusive per tab). Its body is the shared file-changes list (`FileChangesPanel`) for `GET /sessions/{claudeSessionId}/file-changes`, headed by the base it was diffed against (e.g. `vs HEAD — committed work not shown`); each hunk (`terminal.review-hunk.<key12>`) carries an unread dot that is the explicit, reversible read toggle (`terminal.review-hunk-read.<key12>`) and an add-note button (`terminal.review-add-note.<key12>`). A hunk scrolled past inside an expanded file diff is marked read automatically unless the operator explicitly marked it unread. Its footer is the review send bar (`terminal.review-send-bar`): attached notes as chips (`terminal.review-chip.<noteId>`, detach `terminal.review-chip-detach.<noteId>`), a free-text line, Preview exact text, Send (`terminal.review-send`) and Insert without sending (`terminal.review-insert`).",
+      "precondition": "A PTY tab with a populated claudeSessionId is assigned to a visible zone and its review toggle has been clicked",
+      "assertions": [
+        {
+          "id": "review-panel-open-elem-0",
+          "description": "The review panel is mounted over the zone.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-panel"
+            },
+            "label": "Session review panel"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-panel-open-elem-1",
+          "description": "The review send bar's Send button is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-send"
+            },
+            "label": "Review Send button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-panel-open-elem-2",
+          "description": "Insert without sending is offered for a PTY target.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-insert"
+            },
+            "label": "Review Insert button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-panel-open-elem-3",
+          "description": "The review toggle is in the zone title bar.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-toggle"
+            },
+            "label": "Review toggle"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "review-note-draft",
+      "name": "Review Note Draft",
+      "description": "The operator clicked a hunk's add-note button; an inline note editor (`terminal.review-note-draft`) opens under that hunk's header with a textarea (`terminal.review-note-draft-input`), Save (`terminal.review-note-save`, creates a pending note), Save & attach (`terminal.review-note-save-attach`, creates it and attaches it to the next send) and Cancel. A pending note is listed under Drafts with attach / discard (`terminal.review-note-attach.<noteId>`, `terminal.review-note-discard.<noteId>`); an attached note appears as a chip in the send bar, and detaching it returns it to Drafts. Every edge is re-validated server-side (`PATCH /sessions/{id}/review/notes/{noteId}`).",
+      "precondition": "The review panel is open and at least one hunk is expanded",
+      "assertions": [
+        {
+          "id": "review-note-draft-elem-0",
+          "description": "The inline note editor is open under a hunk.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-note-draft"
+            },
+            "label": "Review note draft editor"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-note-draft-elem-1",
+          "description": "The note body input is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-note-draft-input"
+            },
+            "label": "Review note body input"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-note-draft-elem-2",
+          "description": "Save is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-note-save"
+            },
+            "label": "Review note Save"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "review-send-preview",
+      "name": "Review Send Preview",
+      "description": "With at least one note attached, the operator toggled Preview exact text (`terminal.review-preview-toggle`); the send bar shows the exact composed prompt (`terminal.review-send-preview`) that Send would deliver — line 1 the `[review <8-hex>]` marker, then each note's path, hunk header, excerpt and comment (an orphaned note, whose hunk is no longer in the diff, is composed from its stored excerpt and labelled orphaned), then the free text. Send submits it to the PTY (notes become submitted, then confirmed when the marker is seen in the transcript, or UNKNOWN if the session ends first); Insert without sending types it with no Enter and leaves the notes attached — delivery is the operator's.",
+      "precondition": "The review panel is open with at least one attached note",
+      "assertions": [
+        {
+          "id": "review-send-preview-elem-0",
+          "description": "The exact-text preview is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-send-preview"
+            },
+            "label": "Review send preview"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "review-send-preview-elem-1",
+          "description": "The Preview exact text toggle is shown.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "terminal.review-preview-toggle"
+            },
+            "label": "Review preview toggle"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "provenance": {
+        "source": "ai-generated"
+      }
     }
   ],
   "transitions": []

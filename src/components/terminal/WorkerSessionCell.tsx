@@ -39,12 +39,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { RefreshCw, Send, Square } from "lucide-react";
+import { Send, Square } from "lucide-react";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
-import { cn, describeThrown } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import {
   useAiSession,
   type SendMessageOutcome,
@@ -52,21 +51,18 @@ import {
 } from "@/hooks/useAiSession";
 import { StreamingMessageView } from "../shared/StreamingMessageView";
 import type { TerminalTab } from "./useTerminalManager";
-import {
-  changedCountLabel,
-  countChanged,
-  diffHunks,
-  diffStat,
-  fetchSessionFileChanges,
-  noDiffReason,
-  orderChanges,
-  shortPath,
-  type DiffHunk,
-  type FileChangesRead,
-  type SessionFileChange,
-  type SessionFileChangesResponse,
-} from "./workerFileChanges";
+import { changedCountLabel } from "./workerFileChanges";
+import { FileChangesPanel, formatClock } from "./FileChangesView";
+import { ReviewNotesList, ReviewSendBar, useHunkReviewBinding } from "./SessionReviewPanel";
+import type { ReviewTarget } from "./sessionReviewApi";
+import { useSessionReview } from "./useSessionReview";
 import { TabTitle } from "./displayTitle";
+
+// The diff list moved to `FileChangesView.tsx` so the PTY review panel can
+// reuse it; `shouldFetchChanges` moved with the read it gates. Re-exported so
+// existing imports keep resolving.
+export { DiffView, FileChangeRow, FileChangesPanel } from "./FileChangesView";
+export { shouldFetchChanges } from "./useSessionReview";
 
 // ── Pure presentation logic (exported for tests) ──────────────────────────────
 
@@ -324,13 +320,6 @@ export function deliveryLabel(entry: SteeringEntry): string {
   }
 }
 
-function formatClock(ms: number): string {
-  const d = new Date(ms);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(
-    d.getSeconds(),
-  ).padStart(2, "0")}`;
-}
-
 // ── Pure components ───────────────────────────────────────────────────────────
 
 const TONE_CLASSES: Record<WorkerTone, string> = {
@@ -392,177 +381,6 @@ export function SteeringLedger({ entries }: { entries: readonly SteeringEntry[] 
         </li>
       ))}
     </ul>
-  );
-}
-
-export function DiffView({ hunks }: { hunks: DiffHunk[] }) {
-  return (
-    <pre className="m-0 overflow-x-auto whitespace-pre font-mono text-[10px] leading-4">
-      {hunks.map((hunk, hi) => (
-        <div key={hi}>
-          <div className="text-[#7aa2f7]/80">{hunk.header}</div>
-          {hunk.lines.map((line, li) => (
-            <div
-              key={li}
-              className={cn(
-                line.kind === "add" && "bg-emerald-500/10 text-emerald-300",
-                line.kind === "del" && "bg-red-500/10 text-red-300",
-                line.kind === "ctx" && "text-zinc-500",
-              )}
-            >
-              {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
-              {line.text}
-            </div>
-          ))}
-        </div>
-      ))}
-    </pre>
-  );
-}
-
-const STATUS_LABEL: Record<SessionFileChange["status"], string> = {
-  modified: "modified",
-  created: "created",
-  deleted: "deleted",
-  unchanged: "unchanged",
-  binary: "binary",
-  unreadable: "UNKNOWN",
-};
-
-export function FileChangeRow({ change }: { change: SessionFileChange }) {
-  const hunks = useMemo(() => diffHunks(change), [change]);
-  const stat = useMemo(() => diffStat(hunks), [hunks]);
-  const reason = noDiffReason(change);
-  const [open, setOpen] = useState(false);
-  const expandable = hunks !== null && hunks.length > 0;
-  return (
-    <li
-      className="border-b border-[#2a2d3d] last:border-b-0"
-      data-file-change={change.status}
-      data-file-path={change.filePath}
-    >
-      <button
-        type="button"
-        onClick={() => expandable && setOpen((v) => !v)}
-        className={cn(
-          "flex w-full items-center gap-2 px-2 py-1 text-left text-[11px]",
-          expandable ? "hover:bg-white/5 cursor-pointer" : "cursor-default",
-        )}
-        title={change.filePath}
-        aria-expanded={expandable ? open : undefined}
-      >
-        <span
-          className={cn(
-            "shrink-0 rounded px-1 text-[9px] uppercase tracking-wide",
-            change.status === "modified" && "bg-amber-500/15 text-amber-300",
-            change.status === "created" && "bg-emerald-500/15 text-emerald-300",
-            change.status === "deleted" && "bg-red-500/15 text-red-300",
-            change.status === "unchanged" && "bg-zinc-500/15 text-zinc-400",
-            change.status === "binary" && "bg-zinc-500/15 text-zinc-400",
-            change.status === "unreadable" && "bg-fuchsia-500/15 text-fuchsia-300",
-          )}
-        >
-          {STATUS_LABEL[change.status]}
-        </span>
-        <span className="truncate font-mono text-[#a9b1d6]">{shortPath(change.filePath)}</span>
-        {expandable && (
-          <span className="ml-auto shrink-0 font-mono text-[10px]">
-            <span className="text-emerald-400">+{stat.additions}</span>{" "}
-            <span className="text-red-400">-{stat.deletions}</span>
-          </span>
-        )}
-        {reason && <span className="ml-auto shrink-0 text-[10px] text-zinc-500">{reason}</span>}
-      </button>
-      {open && hunks && (
-        <div className="max-h-64 overflow-y-auto border-t border-[#2a2d3d] bg-black/20 px-2 py-1">
-          <DiffView hunks={hunks} />
-        </div>
-      )}
-    </li>
-  );
-}
-
-function ChangeList({ response }: { response: SessionFileChangesResponse }) {
-  if (response.files.length === 0) {
-    return (
-      <div className="px-2 py-3 text-[11px] text-zinc-500">
-        No snapshotted edits yet — the worker has not written to any file the runner saw.
-      </div>
-    );
-  }
-  return (
-    <>
-      <ul className="m-0 list-none p-0">
-        {orderChanges(response.files).map((change) => (
-          <FileChangeRow key={change.filePath} change={change} />
-        ))}
-      </ul>
-      {response.filesTruncated && (
-        <div
-          className="border-t border-[#2a2d3d] px-2 py-1.5 text-[10px] text-fuchsia-300"
-          data-file-changes-cut="true"
-        >
-          list cut at {response.files.length} files — {response.omittedFiles} more path
-          {response.omittedFiles === 1 ? "" : "s"} this worker touched are NOT shown
-        </div>
-      )}
-    </>
-  );
-}
-
-export function FileChangesPanel({
-  read,
-  onRefresh,
-}: {
-  read: FileChangesRead;
-  onRefresh: () => void;
-}) {
-  // During an ordinary refresh the previous list stays up unlabelled (the
-  // header already says "reading…"); only a FAILED read marks it stale.
-  const shown =
-    read.status === "ok" ? read.response : read.status === "loading" ? read.previous : null;
-  const stale = read.status === "error" ? read.previous : null;
-  return (
-    <div className="flex h-full min-h-0 flex-col" data-file-changes-status={read.status}>
-      <div className="flex items-center gap-2 border-b border-[#2a2d3d] px-2 py-1 text-[10px] text-zinc-500">
-        {read.status === "ok" && (
-          <span>
-            {countChanged(read.response.files)} changed · read {formatClock(read.response.readAtMs)}
-          </span>
-        )}
-        {read.status === "loading" && <span>reading…</span>}
-        {read.status === "error" && (
-          <span className="text-fuchsia-300" title={read.error}>
-            UNKNOWN — change list could not be read at {formatClock(read.atMs)}: {read.error}
-          </span>
-        )}
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="ml-auto inline-flex items-center gap-1 rounded px-1 hover:bg-white/5 hover:text-zinc-300"
-          title="Re-read the worker's file changes"
-        >
-          <RefreshCw className="h-3 w-3" />
-          refresh
-        </button>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {shown && <ChangeList response={shown} />}
-        {stale && (
-          <>
-            <div className="px-2 pt-1 text-[10px] text-zinc-600">
-              last successful read {formatClock(stale.readAtMs)} — may be stale
-            </div>
-            <ChangeList response={stale} />
-          </>
-        )}
-        {read.status === "error" && !stale && (
-          <div className="px-2 py-3 text-[11px] text-fuchsia-300">
-            UNKNOWN — nothing has been read successfully for this worker yet.
-          </div>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -665,147 +483,6 @@ export function ConversationView({
 
 // ── Data hooks ────────────────────────────────────────────────────────────────
 
-/** Debounce for `commit-state-changed` bursts (one per Edit/Write hook). */
-const CHANGES_REFRESH_DEBOUNCE_MS = 750;
-
-/**
- * Whether the changes hook should issue a read right now. Pure, exported for
- * the test.
- *
- * A cell whose body the grid has hidden (behind a compact card, or an
- * off-screen zone — `ZoneGrid` passes `visible={!showCompactCard}`) reads
- * NOTHING: the route reads every file the worker touched off disk, and with N
- * workers on a page an unconditional read meant N whole-file sweeps per edit
- * burst for the page's lifetime, for a list no one could see. The read is
- * deferred to the moment the cell first becomes visible, and a refresh
- * triggered while hidden is remembered as `stale` rather than performed.
- */
-export function shouldFetchChanges(args: {
-  visible: boolean;
-  /** `taskRunId` the last read was issued for, or `null` if none ever was. */
-  fetchedFor: string | null;
-  taskRunId: string;
-  /** A refresh was wanted while hidden. */
-  stale: boolean;
-}): boolean {
-  if (!args.visible) return false;
-  if (args.fetchedFor !== args.taskRunId) return true;
-  return args.stale;
-}
-
-function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState, visible: boolean) {
-  const [read, setRead] = useState<FileChangesRead>({ status: "loading", previous: null });
-  const latestRef = useRef<SessionFileChangesResponse | null>(null);
-  const inFlightRef = useRef<AbortController | null>(null);
-  /** The id the last read was issued for — `null` until one has been. */
-  const fetchedForRef = useRef<string | null>(null);
-  /** A refresh was wanted while the cell was hidden; owed on next visible. */
-  const staleRef = useRef(false);
-  /** `visible` readable from the event listener without re-subscribing it. */
-  const visibleRef = useRef(visible);
-  useEffect(() => {
-    visibleRef.current = visible;
-  }, [visible]);
-
-  const refresh = useCallback(() => {
-    inFlightRef.current?.abort();
-    const ctrl = new AbortController();
-    inFlightRef.current = ctrl;
-    fetchedForRef.current = taskRunId;
-    staleRef.current = false;
-    setRead({ status: "loading", previous: latestRef.current });
-    fetchSessionFileChanges(taskRunId, ctrl.signal)
-      .then((response) => {
-        if (ctrl.signal.aborted) return;
-        latestRef.current = response;
-        setRead({ status: "ok", response });
-      })
-      .catch((err: unknown) => {
-        if (ctrl.signal.aborted) return;
-        // A read is still OWED. `fetchedForRef` and `staleRef` were both
-        // settled at issue time, so without this a first FAILED read left
-        // `shouldFetchChanges` answering false forever — visible, same id, not
-        // stale — and the only ways back were a `commit-state-changed`, a turn
-        // end, or a manual refresh. For a worker that failed and went quiet
-        // that is never, so the pane sat on its error until the page reloaded.
-        staleRef.current = true;
-        setRead({
-          status: "error",
-          error: describeThrown(err, "Failed to load session file changes"),
-          atMs: Date.now(),
-          previous: latestRef.current,
-        });
-      });
-  }, [taskRunId]);
-
-  /** Refresh, or remember that one is owed, depending on visibility. */
-  const refreshIfVisible = useCallback(() => {
-    if (!visibleRef.current) {
-      staleRef.current = true;
-      return;
-    }
-    refresh();
-  }, [refresh]);
-
-  // First read once the cell is actually visible, and again on id change or
-  // when a refresh fell due while it was hidden.
-  useEffect(() => {
-    if (
-      shouldFetchChanges({
-        visible,
-        fetchedFor: fetchedForRef.current,
-        taskRunId,
-        stale: staleRef.current,
-      })
-    ) {
-      refresh();
-    }
-  }, [visible, taskRunId, refresh]);
-
-  // Abort whatever is in flight when the cell goes away.
-  useEffect(() => () => inFlightRef.current?.abort(), []);
-
-  // Edit-time refresh: the dispatcher emits `commit-state-changed` for the
-  // session after every Edit/Write hook (`dispatcher.rs`), debounced here so
-  // a burst of edits costs one read.
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-    listen<{ task_run_id?: string }>("commit-state-changed", (event) => {
-      if (event.payload?.task_run_id !== taskRunId) return;
-      // Hidden: mark the list stale and do no work. The read happens when the
-      // operator can see it.
-      if (!visibleRef.current) {
-        staleRef.current = true;
-        return;
-      }
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(refreshIfVisible, CHANGES_REFRESH_DEBOUNCE_MS);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-      unlisten?.();
-    };
-  }, [taskRunId, refreshIfVisible]);
-
-  // Turn-end refresh: catches edits made by a tool the hook did not see.
-  const prevStateRef = useRef<AiSessionState>(sessionState);
-  useEffect(() => {
-    const prev = prevStateRef.current;
-    prevStateRef.current = sessionState;
-    if (prev === "processing" && (sessionState === "ready" || sessionState === "closed")) {
-      refreshIfVisible();
-    }
-  }, [sessionState, refreshIfVisible]);
-
-  return { read, refresh };
-}
-
 // ── The cell ──────────────────────────────────────────────────────────────────
 
 export interface WorkerSessionCellProps {
@@ -819,11 +496,12 @@ type CellPane = "conversation" | "changes";
 
 export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCellProps) {
   const session = useAiSession({ attachTo: taskRunId });
-  const { read: changesRead, refresh: refreshChanges } = useWorkerFileChanges(
-    taskRunId,
-    session.sessionState,
-    visible,
-  );
+  // Changes + review store, visible-gated: a hidden cell reads nothing.
+  const review = useSessionReview(taskRunId, { visible, sessionState: session.sessionState });
+  const changesRead = review.changes;
+  const refreshChanges = review.refreshChanges;
+  const { hunkReview, error: reviewError } = useHunkReviewBinding(review);
+  const reviewTarget = useMemo<ReviewTarget>(() => ({ taskRunId }), [taskRunId]);
   const [pane, setPane] = useState<CellPane>("conversation");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -975,7 +653,18 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
           lastReadError={session.lastReadError}
         />
       ) : (
-        <FileChangesPanel read={changesRead} onRefresh={refreshChanges} />
+        <div className="flex min-h-0 flex-1 flex-col">
+          {reviewError && (
+            <div className="truncate px-2 py-0.5 text-[10px] text-red-400" title={reviewError}>
+              {reviewError}
+            </div>
+          )}
+          <div className="min-h-0 flex-1">
+            <FileChangesPanel read={changesRead} onRefresh={refreshChanges} review={hunkReview} />
+          </div>
+          <ReviewNotesList handle={review} />
+          <ReviewSendBar handle={review} target={reviewTarget} />
+        </div>
       )}
 
       {/* Steering */}
