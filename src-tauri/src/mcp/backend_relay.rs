@@ -4557,7 +4557,7 @@ async fn register_remote_created_session(
             // idempotent door the explicit close uses.
             let close_registry = registry.clone();
             let exit_pinned_session_id = session.pinned_session_id().to_string();
-            session.set_on_exit(Box::new(move |id, exit_code| {
+            session.set_on_exit(Box::new(move |id, exit| {
                 if let Err(e) = close_registry.close_by_id(id) {
                     warn!(
                         coord_session = %id,
@@ -4572,7 +4572,7 @@ async fn register_remote_created_session(
                     &close_registry,
                     id,
                     Some(&exit_pinned_session_id),
-                    exit_code,
+                    exit.agent_exit_code(),
                 );
             }));
             if !session.is_alive() {
