@@ -439,6 +439,7 @@ fn merged_snapshot(
             tenant_id,
             volumes,
             worktrees,
+            cargo_locks: None,
         }),
         taken_at: now,
         build_ms,
@@ -692,6 +693,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: chunk.rows,
+            cargo_locks: None,
         };
         self.send(body, true).await;
     }
@@ -706,7 +708,11 @@ impl ChunkPoster {
     /// exactly as stale after it as before, and letting a 60 s volume POST
     /// open the gate would hand the reclaim poller the previous boot's stale
     /// census — precisely the husk-creating race the gate exists to prevent.
-    async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+    async fn post_volumes(
+        &mut self,
+        volumes: Vec<VolumeReport>,
+        cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
+    ) {
         // DEFENSIVE, not a live path: the only caller
         // ([`sample_and_publish_volumes`]) already returns on an empty probe,
         // so this branch is currently unreachable. It is kept because the
@@ -723,6 +729,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: Vec::new(),
+            cargo_locks,
         };
         self.send(body, false).await;
     }
@@ -1237,6 +1244,14 @@ pub struct WorktreeCensusReq {
     pub tenant_id: Option<Uuid>,
     pub volumes: Vec<VolumeReport>,
     pub worktrees: Vec<WorktreeCensus>,
+    /// Shared cargo target-dir lock state (plan
+    /// `2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats`
+    /// Phase 2). Carried ONLY on the 60 s volumes-only POST — it is device-level
+    /// and minute-fresh, like `volumes`; a census chunk leaves it `None`.
+    /// OMITTED when `None` = UNKNOWN (non-Linux, or the probe failed), so an
+    /// older coord is unaffected; `Some(vec![])` = measured, no shared targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,6 +2625,7 @@ fn build_census_chunked(
         tenant_id,
         volumes,
         worktrees,
+        cargo_locks: None,
     }
 }
 
@@ -2957,7 +2973,82 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     let Some(cached) = guard.as_mut() else {
         return;
     };
-    cached.poster.post_volumes(volumes).await;
+    // Nothing will be sent (coord unconfigured, or a secondary instance): skip
+    // the `/proc` probe entirely rather than measure for nobody.
+    if cached.poster.dest.is_none() {
+        return;
+    }
+    let cargo_locks = probe_cargo_locks().await;
+    cached.poster.post_volumes(volumes, cargo_locks).await;
+}
+
+/// Upper bound on the shared-target lock probe. It reads `/proc` and, on an
+/// unconfirmed holder, scans `/proc/*/fd` — normally milliseconds, but a
+/// saturated box must not stall the volume POST behind it.
+const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared cargo target lock state for this tick
+/// ([`super::cargo_locks::probe_current`]) on the blocking pool, bounded by
+/// [`CARGO_LOCK_PROBE_TIMEOUT`]. A failed or timed-out probe is UNKNOWN
+/// (`None` → the field is omitted), never an empty list.
+async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
+    // A timed-out probe keeps running on its blocking thread; while it does,
+    // later ticks skip instead of stacking one more blocked thread each.
+    if CARGO_LOCK_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug!("worktree_census: previous cargo lock probe still running — cargo_locks UNKNOWN this tick");
+        return None;
+    }
+    // The guard exists BEFORE the spawn and moves into the closure, so the flag
+    // clears on every path: normal return, panic, and a closure dropped unrun
+    // (runtime shutdown while queued, or a panicking spawn).
+    let in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+    let task = spawn_blocking_tracked(move || {
+        let _in_flight = in_flight;
+        super::cargo_locks::probe_current()
+    });
+    match tokio::time::timeout(CARGO_LOCK_PROBE_TIMEOUT, task).await {
+        Ok(Ok(locks)) => locks,
+        Ok(Err(e)) => {
+            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
+            None
+        }
+        Err(_) => {
+            emit_throttled(
+                &LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH,
+                now_epoch_secs(),
+                CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS,
+                || {
+                    warn!(
+                        "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN; \
+                         later ticks skip the probe until it finishes",
+                        CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+                    );
+                    true
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Set while a cargo lock probe runs on the blocking pool (cleared by
+/// [`ClearOnDrop`] when that thread finishes, even on panic).
+static CARGO_LOCK_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Throttle for the probe-timeout warning: one per 10 minutes.
+const CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS: u64 = 600;
+static LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Clears an in-flight flag when dropped.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
@@ -5050,6 +5141,7 @@ mod tests {",
                     // Same PATH, different repo — must be a distinct key.
                     row("qontinui-coord", "D:/x/a", 30),
                 ],
+                cargo_locks: None,
             }),
             taken_at: chrono::Utc::now() - chrono::Duration::hours(2),
             build_ms: 12_345,
@@ -5146,6 +5238,7 @@ mod tests {",
                 tenant_id: None,
                 volumes: Vec::new(),
                 worktrees: vec![row("qontinui-runner", "D:/x/a", 5)],
+                cargo_locks: None,
             },
             777,
         );
