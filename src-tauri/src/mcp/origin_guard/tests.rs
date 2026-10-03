@@ -1773,6 +1773,7 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         status("PUT", "/scheduler/tasks/t1", None, with_probe).await,
         StatusCode::OK
     );
+}
 
 /// Plan `2026-09-20-terminal-session-state-comes-from-events-not-screen-
 /// scraping` Phase 3: the hook ingest route inherits the `/terminals/*` door,

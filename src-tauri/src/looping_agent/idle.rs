@@ -278,7 +278,10 @@ mod tests {
             snapshot_until_autocompact_pct(&lines(&["x", "Context left until auto-compact: 8%"])),
             Some(8)
         );
-        assert_eq!(snapshot_until_autocompact_pct(&lines(&["context low"])), None);
+        assert_eq!(
+            snapshot_until_autocompact_pct(&lines(&["context low"])),
+            None
+        );
         assert_eq!(
             snapshot_until_autocompact_pct(&lines(&["until auto-compact: soon"])),
             None

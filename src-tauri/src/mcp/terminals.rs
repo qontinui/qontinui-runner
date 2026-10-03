@@ -1030,12 +1030,16 @@ const TERMINAL_HEADER: &str = "x-qontinui-terminal";
 /// `type: "http"` Claude Code hooks.
 ///
 /// The body is the CLI's own hook payload, unprojected; it is read up to
-/// `MAX_BODY_BYTES + 1`, projected to the allowlist on parse and otherwise
-/// discarded ([`crate::terminal::agent_state::ingest`]). ALWAYS answers
-/// `200 {}` — a hook must never be slowed or failed by the runner, and `{}` is
-/// a valid no-decision hook output (PROBE.md Q5), so a `PermissionRequest`
-/// still shows its dialog. Under the `/terminals/*` credential door, so no
-/// browser origin can forge a state; the CLI sends no `Origin`.
+/// `MAX_BODY_BYTES` ([`read_capped_body`] — an oversize or broken body is
+/// counted, never buffered past the cap), projected to the allowlist on parse
+/// and otherwise discarded ([`crate::terminal::agent_state::ingest`]). ALWAYS
+/// answers `200 {}` — a hook must never be slowed or failed by the runner, and
+/// `{}` is a valid no-decision hook output (PROBE.md Q5), so a
+/// `PermissionRequest` still shows its dialog. The publish that follows an
+/// applied event (which may read settings files) runs on the blocking pool
+/// AFTER the reply is scheduled, so the CLI's 1 s hook timeout never waits on
+/// it. Under the `/terminals/*` credential door, so no browser origin can
+/// forge a state; the CLI sends no `Origin`.
 pub async fn agent_event_handler(
     State(state): State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -1044,14 +1048,15 @@ pub async fn agent_event_handler(
     use crate::terminal::agent_state;
     use qontinui_runner_lib::agent_event::MAX_BODY_BYTES;
 
-    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-    let tm = get_terminal_manager(&state);
-    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES + 1).await {
+    let bytes = match read_capped_body(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
-        // Over the cap (or a broken stream): fed to the ingest as an
-        // over-long body so it is dropped whole AND counted.
-        Err(_) => axum::body::Bytes::from(vec![b' '; MAX_BODY_BYTES + 1]),
+        Err(why) => {
+            agent_state::note_unreadable_body(why);
+            return Json(serde_json::json!({}));
+        }
     };
+    let now_ms = agent_state::now_ms();
+    let tm = get_terminal_manager(&state);
     let header = headers
         .get(TERMINAL_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -1059,20 +1064,47 @@ pub async fn agent_event_handler(
     let outcome = agent_state::ingest(&*tm, header.as_deref(), &bytes, now_ms);
     match outcome {
         agent_state::IngestOutcome::Applied { terminal_id } => {
-            agent_state::publish_terminal(&terminal_id);
+            // Detached: the reply below does not wait for the publish.
+            drop(tokio::task::spawn_blocking(move || {
+                agent_state::publish_terminal(&terminal_id);
+            }));
         }
         agent_state::IngestOutcome::Deferred { terminal_id, delay } => {
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-                if agent_state::flush_deferred(&*tm, &terminal_id, now_ms) {
-                    agent_state::publish_terminal(&terminal_id);
-                }
+                let _ = tokio::task::spawn_blocking(move || {
+                    if agent_state::flush_deferred(&*tm, &terminal_id, agent_state::now_ms()) {
+                        agent_state::publish_terminal(&terminal_id);
+                    }
+                })
+                .await;
             });
         }
         agent_state::IngestOutcome::Coalesced { .. } | agent_state::IngestOutcome::Dropped(_) => {}
     }
     Json(serde_json::json!({}))
+}
+
+/// Read a request body of at most `cap` bytes. Stops at the first frame that
+/// would cross the cap (nothing past it is buffered) and tells an over-long
+/// body apart from a stream that failed.
+async fn read_capped_body(
+    body: axum::body::Body,
+    cap: usize,
+) -> Result<Vec<u8>, crate::terminal::agent_state::UnreadableBody> {
+    use crate::terminal::agent_state::UnreadableBody;
+    use futures::StreamExt;
+
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let chunk = frame.map_err(|_| UnreadableBody::BrokenStream)?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(UnreadableBody::Oversize);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// `GET /terminals/agent-state` — one read for every live pane: the verdict,
@@ -1168,6 +1200,36 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L1: the agent-event body read stops at the cap without buffering past
+    /// it, and a failed stream is not reported as oversize.
+    #[test]
+    fn agent_event_body_read_caps_and_tells_broken_from_oversize() {
+        use crate::terminal::agent_state::UnreadableBody;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ok = read_capped_body(axum::body::Body::from("{}"), 8).await;
+            assert_eq!(ok.as_deref(), Ok(&b"{}"[..]));
+            let exact = read_capped_body(axum::body::Body::from("12345678"), 8).await;
+            assert_eq!(exact.map(|b| b.len()), Ok(8));
+            let over = read_capped_body(axum::body::Body::from("123456789"), 8).await;
+            assert_eq!(over, Err(UnreadableBody::Oversize));
+            let chunks: Vec<Result<&'static [u8], std::io::Error>> = vec![
+                Ok(b"{\"hook"),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "gone",
+                )),
+            ];
+            let broken = axum::body::Body::from_stream(futures::stream::iter(chunks));
+            assert_eq!(
+                read_capped_body(broken, 1024).await,
+                Err(UnreadableBody::BrokenStream)
+            );
+        });
+    }
 
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —

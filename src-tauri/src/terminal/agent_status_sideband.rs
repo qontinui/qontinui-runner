@@ -388,7 +388,10 @@ pub fn dispatch(
         );
         return;
     };
-    if record_observed_state(last_state, &status, chrono::Utc::now().timestamp_millis()) {
+    // The reducer's monotonic clock, so a wall-clock step cannot reorder a
+    // sideband edge against a hook edge.
+    let now_ms = i64::try_from(crate::terminal::agent_state::now_ms()).unwrap_or(i64::MAX);
+    if record_observed_state(last_state, &status, now_ms) {
         // Publish the (possibly) changed verdict off the PTY reader thread.
         let terminal_id = terminal_id.to_string();
         tauri::async_runtime::spawn(async move {

@@ -47,14 +47,19 @@
 //!    `AskUserQuestion` or elicitation fires no hook either, and a keystroke
 //!    writer must never re-approve a pane the human already answered. A NEW
 //!    same-state edge after the submit (a second permission ask) starts a new
-//!    level and is authoritative again.
+//!    level and is authoritative again — but a `Notification{permission_prompt}`
+//!    is only the CLI's reminder of the ask already on screen, so after an
+//!    answer it continues the answered level instead.
 //! 6. **Quiet is not idle.** `Working` from an authoritative source while the
 //!    grid has been idle for more than [`QUIET_WHILE_WORKING_AFTER_MS`] with no
 //!    live children leaves the state unchanged and records
 //!    [`Disagreement::QuietWhileWorking`] — never an override (the 12-minute
 //!    `rm -rf` was legitimately quiet). A recorded contradiction takes the one
 //!    disagreement slot first; quiet is reported only when none exists.
-//! 7. **Subagent events are ignored in v1** ([`Observation::is_subagent`]): the
+//! 7. **Reducer time is monotonic per source.** An observation stamped before
+//!    its source's last report is clamped forward to it (arrival order wins),
+//!    never dropped — a backward wall-clock step must not lose an edge.
+//! 8. **Subagent events are ignored in v1** ([`Observation::is_subagent`]): the
 //!    reducer keys on the top-level session only. `Stop` inside a subagent
 //!    arrives as `SubagentStop`, which no caller should offer at all.
 //!
@@ -781,13 +786,11 @@ impl Observation {
 #[serde(rename_all = "snake_case")]
 pub enum ObserveOutcome {
     Accepted,
-    /// A subagent event (rule 7).
+    /// A subagent event (rule 8).
     DroppedSubagent,
     /// The observation asserts no state (e.g. `SessionStart: compact`,
     /// `Notification: agent_completed`).
     DroppedNoState,
-    /// Older than the source's last accepted observation (a late arrival).
-    DroppedOutOfOrder,
 }
 
 // ---------------------------------------------------------------------------
@@ -938,12 +941,17 @@ impl AgentTruth {
             return ObserveOutcome::DroppedNoState;
         };
         let source = obs.source();
-        let at = obs.at_ms.min(now_ms);
         let submit = self.input.last_submit_ms;
         let slot = &mut self.levels[source.index()];
+        // Reducer time is monotonic per source: ARRIVAL order wins. An
+        // observation stamped before the source's last report (a backward
+        // wall-clock step, or two stamps taken on different clocks) is
+        // clamped forward to that report rather than dropped — dropping it
+        // would lose a real edge (e.g. a `Stop`) for as long as the step.
+        let at = obs.at_ms.min(now_ms);
+        let at = slot.map_or(at, |prev| at.max(prev.last_seen_ms));
         let next = match *slot {
-            Some(prev) if at < prev.last_seen_ms => return ObserveOutcome::DroppedOutOfOrder,
-            Some(prev) if prev.state == state && continues(source, prev, submit, at) => Level {
+            Some(prev) if prev.state == state && continues(obs.kind, prev, submit, at) => Level {
                 last_seen_ms: at,
                 ..prev
             },
@@ -1083,13 +1091,34 @@ fn fresh(source: Source, level: Level, now_ms: u64) -> bool {
 ///   gap the run restarts.
 /// - A `NeedsYou` edge after a human submit is a NEW ask (rule 5), so it starts
 ///   a new level rather than being masked by the old submit.
-fn continues(source: Source, prev: Level, submit: Option<u64>, at: u64) -> bool {
+/// - EXCEPT a `Notification{permission_prompt}`: it is the CLI's idle REMINDER
+///   of an ask already on screen (PROBE: it lands ~6 s after the
+///   `PermissionRequest`), never an ask of its own. Arriving after the human
+///   already answered, it is the same, answered ask — it must not mint a fresh
+///   authoritative `NeedsYou` a keystroke writer would type into. A genuinely
+///   new ask arrives as its own `PermissionRequest`.
+fn continues(kind: ObservationKind, prev: Level, submit: Option<u64>, at: u64) -> bool {
+    let source = kind.source();
     if source.is_pulse() {
         return at.saturating_sub(prev.last_seen_ms) <= source.freshness_ttl_ms();
+    }
+    if is_permission_prompt_reminder(kind) {
+        return true;
     }
     let answered = matches!(prev.state, AgentState::NeedsYou { .. })
         && submit.is_some_and(|t| t > prev.since_ms);
     !answered
+}
+
+/// Is this the CLI's `permission_prompt` notification (a reminder of an ask
+/// already raised by `PermissionRequest`)?
+const fn is_permission_prompt_reminder(kind: ObservationKind) -> bool {
+    matches!(
+        kind,
+        ObservationKind::Hook(HookEvent::Notification {
+            notification_type: NotificationType::PermissionPrompt
+        })
+    )
 }
 
 #[cfg(test)]
@@ -1590,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_truth_drops_subagent_no_state_and_out_of_order() {
+    fn agent_truth_drops_subagent_and_no_state_and_clamps_a_late_edge() {
         let mut t = AgentTruth::new(StateCapabilities::claude());
         let mut sub = Observation::hook(HookEvent::Stop, T0);
         sub.is_subagent = true;
@@ -1606,14 +1635,80 @@ mod tests {
         assert_eq!(t.last_seen_ms(Source::Hook), None);
 
         t.observe(&Observation::hook(HookEvent::Stop, T0 + 10), T0 + 10);
+        // A late-stamped edge is NOT dropped: arrival order wins, its time is
+        // clamped forward to the source's last report.
         assert_eq!(
             t.observe(
                 &Observation::hook(HookEvent::UserPromptSubmit, T0 + 5),
                 T0 + 10
             ),
-            ObserveOutcome::DroppedOutOfOrder
+            ObserveOutcome::Accepted
         );
-        assert_eq!(t.verdict(T0 + 11).state, AgentState::TurnEnded);
+        let v = t.verdict(T0 + 11);
+        assert_eq!(v.state, AgentState::Working);
+        assert_eq!(v.since_ms, Some(T0 + 10));
+    }
+
+    #[test]
+    fn agent_truth_backward_clock_step_keeps_the_edge() {
+        // The wall clock steps back a minute between two hook edges: the
+        // `Stop` must still end the turn (it used to be dropped as
+        // out-of-order, leaving `Working` for as long as the step).
+        let mut t = AgentTruth::new(StateCapabilities::claude());
+        let before = T0 + 120_000;
+        t.observe(
+            &Observation::hook(HookEvent::UserPromptSubmit, before),
+            before,
+        );
+        let after_step = T0 + 60_000;
+        assert_eq!(
+            t.observe(&Observation::hook(HookEvent::Stop, after_step), after_step),
+            ObserveOutcome::Accepted
+        );
+        let v = t.verdict(after_step + 1);
+        assert_eq!(v.state, AgentState::TurnEnded);
+        assert_eq!(v.since_ms, Some(before), "clamped to the last report");
+        assert_eq!(t.last_seen_ms(Source::Hook), Some(before));
+    }
+
+    #[test]
+    fn agent_truth_late_permission_notification_after_an_answer_is_the_same_ask() {
+        let mut t = AgentTruth::new(StateCapabilities::claude());
+        let ask = HookEvent::PermissionRequest {
+            tool: PermissionTool::from_tool_name(Some("Bash")),
+        };
+        t.observe(&Observation::hook(ask, T0), T0);
+        assert!(t.verdict(T0 + 1).is_authoritative_permission_ask());
+        // The human answers 2 s later.
+        t.observe_input(
+            InputEvidence {
+                last_submit_ms: Some(T0 + 2_000),
+            },
+            T0 + 2_000,
+        );
+        // PROBE: the CLI's permission_prompt notification lands ~6 s after the
+        // PermissionRequest — after the answer.
+        let reminder = HookEvent::Notification {
+            notification_type: NotificationType::PermissionPrompt,
+        };
+        assert_eq!(
+            t.observe(&Observation::hook(reminder, T0 + 6_000), T0 + 6_000),
+            ObserveOutcome::Accepted
+        );
+        let v = t.verdict(T0 + 6_001);
+        assert!(
+            !v.is_authoritative_permission_ask(),
+            "an answered ask must not come back authoritative: {v:?}"
+        );
+        assert_eq!(v.state, AgentState::Working);
+        assert_eq!(v.confidence, Some(Confidence::Inferred));
+        assert_eq!(v.since_ms, Some(T0 + 2_000));
+
+        // A genuinely NEW ask (its own PermissionRequest) is authoritative.
+        t.observe(&Observation::hook(ask, T0 + 9_000), T0 + 9_000);
+        let v = t.verdict(T0 + 9_001);
+        assert!(v.is_authoritative_permission_ask());
+        assert_eq!(v.since_ms, Some(T0 + 9_000));
     }
 
     #[test]
