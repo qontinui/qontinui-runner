@@ -946,9 +946,7 @@ fn stored_json_object(column: &str, row_id: &str, raw: Option<&str>) -> Option<s
         Ok(v) if v.is_object() => Some(v),
         Ok(serde_json::Value::Null) => None,
         Ok(_) | Err(_) => {
-            tracing::warn!(
-                "{column} of row {row_id} is not a JSON object; serving it as absent                  (rewritten as absent on the row's next update)"
-            );
+            tracing::warn!("{column} of row {row_id} is not a JSON object; serving it as absent");
             None
         }
     }
