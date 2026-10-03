@@ -221,7 +221,18 @@ impl<V: Clone + Send + Sync + 'static> CoalescingCache<V> {
                         publisher.publish(value.clone());
                         value
                     });
-                    let future = async move { task.await.ok() }.boxed().shared();
+                    let log_key = key.to_string();
+                    let future = async move {
+                        // Log the JoinError once here: it carries the panic
+                        // payload, which the `None` arm below cannot see.
+                        task.await
+                            .map_err(|err| {
+                                tracing::error!(key = %log_key, %err, "usage-probe fetch task died");
+                            })
+                            .ok()
+                    }
+                    .boxed()
+                    .shared();
                     slots.insert(
                         key.to_string(),
                         Slot::InFlight {
