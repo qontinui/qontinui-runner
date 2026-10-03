@@ -28,6 +28,10 @@
 //!   `unattributed` — matching coord's shipped precedent, `GET
 //!   /coord/trees/wip-owners/:device_id`, described there as an *"ownership
 //!   join (honest `unattributed`)"*;
+//! * no source at all **while the coord ownership index was PARTIAL** ⇒
+//!   [`AttributionSource::NonePartialCoordIndex`] and the label
+//!   `unattributed-partial-coord-index` — the rows the cursor walk never
+//!   reached are a coverage gap, not an established absence of owners;
 //! * an id we have but cannot resolve to a human-readable session (**a
 //!   ghost**: no name-file AND no transcript in ANY of the five
 //!   `C:/claude/.claude-*` account roots — 16 of 111 measured 2026-08-22)
@@ -590,7 +594,22 @@ pub enum AttributionSource {
     CommitTrailer,
     /// Nothing spoke. Renders the literal `unattributed`.
     None,
+    /// Nothing spoke, **but the coord ownership index was PARTIAL** (the
+    /// cursor walk over `GET /coord/sessions/worktrees` stopped before coord's
+    /// last page). Sources 2 and 3 were consulted over a PREFIX of the ledger,
+    /// so the allocation row may sit on a page that was never read — "nobody
+    /// owns this" is not established. Renders
+    /// [`UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL`], never the confident
+    /// `unattributed`. Never produced by [`resolve_attribution`] (which is
+    /// index-agnostic); the survey applies it via
+    /// [`Attribution::unattributed_in_partial_coord_index`].
+    NonePartialCoordIndex,
 }
+
+/// The row label for [`AttributionSource::NonePartialCoordIndex`]. Spelled
+/// the same as the wip-orphan report's `orphan_reason` arm for the same
+/// condition, so the two surfaces cannot disagree about what they mean.
+pub const UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL: &str = "unattributed-partial-coord-index";
 
 impl AttributionSource {
     pub fn as_str(self) -> &'static str {
@@ -600,6 +619,7 @@ impl AttributionSource {
             Self::CoordBranchAuthor => "coord_branch_author",
             Self::CommitTrailer => "commit_trailer",
             Self::None => "none",
+            Self::NonePartialCoordIndex => "none_partial_coord_index",
         }
     }
 }
@@ -717,6 +737,19 @@ pub struct Attribution {
 }
 
 impl Attribution {
+    /// The empty answer when the coord ownership index was PARTIAL: same
+    /// shape as [`Self::unattributed`], but labelled
+    /// [`UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL`] with source
+    /// `none_partial_coord_index`, so no consumer reads a confident
+    /// "unattributed" off an index that did not cover the whole ledger.
+    pub fn unattributed_in_partial_coord_index() -> Self {
+        Self {
+            session_label: UNATTRIBUTED_PARTIAL_COORD_INDEX_LABEL.to_string(),
+            source: AttributionSource::NonePartialCoordIndex.as_str(),
+            ..Self::unattributed()
+        }
+    }
+
     /// The honest empty: `unattributed`, never a blank string.
     pub fn unattributed() -> Self {
         Self {
@@ -1157,11 +1190,184 @@ pub mod coord {
         pub worktrees: Vec<CoordWorktreeRow>,
     }
 
-    #[derive(Debug, Clone, Deserialize)]
+    /// ONE PAGE of `GET /coord/sessions/worktrees`.
+    ///
+    /// Plan `2026-09-12-fleet-principal-session-routes-disagree-about-being-capped`
+    /// Phase 1: the route is keyset-paged on the ledger primary key
+    /// `(agent_id, repo)`. A page is capped at `limit` **worktree ledger rows**
+    /// (not sessions), so a session may appear on MORE THAN ONE page and the
+    /// client merges by `sessionId` — see [`merge_pages`]. `count` and
+    /// `reapStatusCounts` are per-page and are deliberately not read here.
+    #[derive(Debug, Clone, Default, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct CoordSessionWorktrees {
         #[serde(default)]
         pub sessions: Vec<CoordSessionRow>,
+        /// The page size coord applied, in ledger rows. Absent on a coord that
+        /// predates the cursor.
+        #[serde(default)]
+        pub limit: Option<u32>,
+        /// Opaque cursor for the next page, with key PRESENCE kept:
+        /// `Some(Some(c))` = continue from `c`; `Some(None)` = `nextCursor: null`,
+        /// the walk is complete; `None` = the key is ABSENT, i.e. a coord that
+        /// predates the cursor. That coord's one page is final (there is no
+        /// way to ask it for more), but it is a possibly-CAPPED final page —
+        /// [`walk_pages`] declares it partial when it came back full.
+        #[serde(default, deserialize_with = "present_key")]
+        pub next_cursor: Option<Option<String>>,
+    }
+
+    /// Deserialize a present key (including `null`) as `Some(_)`, so an
+    /// ABSENT key — `#[serde(default)]` — stays distinguishable as `None`.
+    fn present_key<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(d).map(Some)
+    }
+
+    /// Page size requested per walk step — coord's own clamp ceiling. A
+    /// pre-cursor coord honours `?limit=` too, so this is also the cap an old
+    /// coord's single page is compared against.
+    pub const PAGE_LIMIT: u32 = 500;
+
+    /// Hard bound on the walk: 100 pages x 500 rows = 50,000 ledger rows, ~35x
+    /// the largest tenant measured (~1,360 live worktrees). Hitting it is
+    /// never silent — the index comes back with [`CoordOwnership::partial`]
+    /// set.
+    pub const MAX_PAGES: usize = 100;
+
+    /// Wall-clock budget for the operator-facing survey's whole walk. The
+    /// per-request client timeout (15 s) bounds ONE page; this bounds the sum,
+    /// so a slow ledger yields a partial index rather than an N x 15 s hang.
+    pub const SURVEY_WALK_BUDGET: Duration = Duration::from_secs(20);
+
+    fn page_rows(page: &CoordSessionWorktrees) -> usize {
+        page.sessions.iter().map(|s| s.worktrees.len()).sum()
+    }
+
+    /// Merge pages into one response, grouping by `sessionId` in first-seen
+    /// order and concatenating each session's `worktrees` across pages.
+    ///
+    /// A session's worktrees are not contiguous under the route's
+    /// primary-key order, so the same `sessionId` can arrive on several
+    /// pages; keeping the first page's row and dropping the rest would lose
+    /// exactly the worktrees past the page boundary.
+    pub fn merge_pages(pages: Vec<CoordSessionWorktrees>) -> CoordSessionWorktrees {
+        let mut order: Vec<CoordSessionRow> = Vec::new();
+        let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut limit = None;
+        for page in pages {
+            limit = limit.or(page.limit);
+            for s in page.sessions {
+                match at.get(&s.session_id) {
+                    Some(&i) => {
+                        let row = &mut order[i];
+                        if row.owner_session_state.is_none() {
+                            row.owner_session_state = s.owner_session_state;
+                        }
+                        row.worktrees.extend(s.worktrees);
+                    }
+                    None => {
+                        at.insert(s.session_id.clone(), order.len());
+                        order.push(s);
+                    }
+                }
+            }
+        }
+        CoordSessionWorktrees {
+            sessions: order,
+            limit,
+            next_cursor: Some(None),
+        }
+    }
+
+    /// Walk the cursor from page one until `nextCursor` is null/absent, until
+    /// `max_pages` pages have been read, or until `budget` has elapsed.
+    ///
+    /// Returns the merged response and, when the walk did NOT establish that
+    /// it read everything, `Some(reason)`: the merged index is then a PREFIX
+    /// and a worktree absent from it is UNKNOWN, not unowned. The arms that
+    /// set it: the page bound, the time budget (once at least one page is
+    /// in), a cursor coord already handed out (a cycle), and a pre-cursor
+    /// coord's page that came back full.
+    ///
+    /// `fetch_page` receives `None` for page one and the previous page's
+    /// cursor afterwards. A page ERROR fails the whole walk, and so does the
+    /// budget expiring before page one — neither leaves anything to report.
+    pub async fn walk_pages<F, Fut>(
+        max_pages: usize,
+        budget: Duration,
+        mut fetch_page: F,
+    ) -> Result<(CoordSessionWorktrees, Option<String>), String>
+    where
+        F: FnMut(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<CoordSessionWorktrees, String>>,
+    {
+        const WHY: &str = "coord's session-worktree index was not fully read";
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut pages = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut partial = None;
+        loop {
+            if pages.len() >= max_pages {
+                partial = Some(format!(
+                    "{WHY}: stopped at the {max_pages}-page bound with a further page still offered"
+                ));
+                break;
+            }
+            let mut page = match tokio::time::timeout_at(deadline, fetch_page(cursor.clone())).await
+            {
+                Ok(r) => r?,
+                Err(_) if pages.is_empty() => {
+                    return Err(format!(
+                        "coord's session-worktree index did not answer within {}s",
+                        budget.as_secs_f32()
+                    ));
+                }
+                Err(_) => {
+                    partial = Some(format!(
+                        "{WHY}: the {}s walk budget ran out after {} page(s)",
+                        budget.as_secs_f32(),
+                        pages.len()
+                    ));
+                    break;
+                }
+            };
+            let next = page.next_cursor.take();
+            let rows = page_rows(&page);
+            pages.push(page);
+            match next {
+                // Key absent: a pre-cursor coord. Its page is final, but a
+                // FULL one may be capped — say so rather than call it whole.
+                None => {
+                    if rows >= PAGE_LIMIT as usize {
+                        partial = Some(format!(
+                            "{WHY}: coord predates the cursor and returned {rows} rows, at the \
+                             {PAGE_LIMIT}-row page cap, with no way to ask for more"
+                        ));
+                    }
+                    break;
+                }
+                Some(None) => break,
+                Some(Some(n)) if n.trim().is_empty() => break,
+                Some(Some(n)) => {
+                    // A cursor already handed out would re-read pages it has
+                    // already served — a cycle; stop rather than spin to the
+                    // bound duplicating rows.
+                    if !seen.insert(n.clone()) {
+                        partial = Some(format!(
+                            "{WHY}: coord repeated a cursor after {} page(s)",
+                            pages.len()
+                        ));
+                        break;
+                    }
+                    cursor = Some(n);
+                }
+            }
+        }
+        Ok((merge_pages(pages), partial))
     }
 
     /// Project coord's five-valued session state onto the tri-state
@@ -1199,6 +1405,12 @@ pub mod coord {
         by_path: std::collections::HashMap<String, usize>,
         /// coord answered at all. `false` ⇒ absence is UNKNOWN, not "no owner".
         pub reachable: bool,
+        /// `Some(reason)` ⇒ the cursor walk stopped before coord's last page,
+        /// so this index is a PREFIX of the ledger: a worktree that
+        /// [`Self::owner_for`] does not find is UNKNOWN, never "unowned".
+        /// `None` ⇒ the walk reached `nextCursor: null` (or an old coord's one
+        /// and only page).
+        pub partial: Option<String>,
     }
 
     impl CoordOwnership {
@@ -1224,7 +1436,14 @@ pub mod coord {
                 rows,
                 by_path,
                 reachable: true,
+                partial: None,
             }
+        }
+
+        /// Mark this index as a prefix of coord's ledger (see [`Self::partial`]).
+        pub fn with_partial(mut self, partial: Option<String>) -> Self {
+            self.partial = partial;
+            self
         }
 
         pub fn len(&self) -> usize {
@@ -1293,30 +1512,57 @@ pub mod coord {
     /// coord base configured); `Err` = a real transport / non-2xx failure.
     /// **Never fatal to the survey** — the caller degrades to sources 1 and 4
     /// and says coord was unreachable rather than reporting `unattributed`.
-    pub async fn fetch_ownership() -> Result<Option<CoordOwnership>, String> {
+    ///
+    /// Walks the route's keyset cursor ([`walk_pages`]) rather than reading
+    /// page one as the whole index: before the walk, every worktree past the
+    /// first 200 ledger rows was reported `unattributed`. A walk that stops at
+    /// [`MAX_PAGES`] returns an index with [`CoordOwnership::partial`] set.
+    ///
+    /// `budget` bounds the WHOLE walk (see [`walk_pages`]); the survey passes
+    /// [`SURVEY_WALK_BUDGET`], the spawn-path trust gate its own shorter one.
+    pub async fn fetch_ownership(budget: Duration) -> Result<Option<CoordOwnership>, String> {
         let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
             return Ok(None);
         };
-        let url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
+        let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("build custody http client: {e}"))?;
-        let resp = crate::coord_http::coord_get(&client, &url)
-            .send()
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(200).collect();
-            return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+        let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
+            let url = page_url(&base_url, cursor.as_deref());
+            let client = client.clone();
+            async move {
+                let resp = crate::coord_http::coord_get(&client, &url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("GET {url}: {e}"))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    let excerpt: String = body.chars().take(200).collect();
+                    return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+                }
+                resp.json::<CoordSessionWorktrees>()
+                    .await
+                    .map_err(|e| format!("decode session-worktrees: {e}"))
+            }
+        })
+        .await?;
+        Ok(Some(
+            CoordOwnership::from_response(merged).with_partial(partial),
+        ))
+    }
+
+    /// `…/coord/sessions/worktrees?limit=500[&cursor=<urlencoded>]`.
+    fn page_url(base_url: &str, cursor: Option<&str>) -> String {
+        match cursor {
+            Some(c) => format!(
+                "{base_url}?limit={PAGE_LIMIT}&cursor={}",
+                urlencoding::encode(c)
+            ),
+            None => format!("{base_url}?limit={PAGE_LIMIT}"),
         }
-        let parsed: CoordSessionWorktrees = resp
-            .json()
-            .await
-            .map_err(|e| format!("decode session-worktrees: {e}"))?;
-        Ok(Some(CoordOwnership::from_response(parsed)))
     }
 
     #[cfg(test)]
@@ -1450,6 +1696,231 @@ pub mod coord {
                 .owner_for("D:/x", "qontinui-runner", Some("b"))
                 .is_none());
             assert!(idx.reachable, "an EMPTY answer is still an answer");
+            assert!(idx.partial.is_none());
+        }
+
+        // ---- cursor walk (plan 2026-09-12-fleet-principal-session-routes-…) --
+
+        fn page(json: &str) -> CoordSessionWorktrees {
+            serde_json::from_str(json).unwrap()
+        }
+
+        /// A fake coord serving `pages` in order, keyed by the cursor it was
+        /// handed; records every cursor it saw.
+        async fn walk_fake(
+            pages: Vec<&str>,
+            max_pages: usize,
+        ) -> (CoordSessionWorktrees, Option<String>, Vec<Option<String>>) {
+            let pages: Vec<CoordSessionWorktrees> = pages.into_iter().map(page).collect();
+            let seen = std::sync::Mutex::new(Vec::new());
+            let (merged, partial) = walk_pages(max_pages, Duration::from_secs(30), |cursor| {
+                seen.lock().unwrap().push(cursor.clone());
+                let i = match cursor.as_deref() {
+                    None => 0,
+                    Some(c) => c.trim_start_matches('p').parse::<usize>().unwrap(),
+                };
+                let p = pages[i].clone();
+                async move { Ok(p) }
+            })
+            .await
+            .unwrap();
+            (merged, partial, seen.into_inner().unwrap())
+        }
+
+        #[tokio::test]
+        async fn a_session_split_across_two_pages_keeps_every_worktree() {
+            let (merged, partial, seen) = walk_fake(
+                vec![
+                    r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"active",
+                        "worktrees":[{"worktreePath":"wt/a","repo":"r"}]},
+                        {"sessionId":"s2","worktrees":[{"worktreePath":"wt/b","repo":"r"}]}],
+                        "count":2,"limit":2,"nextCursor":"p1"}"#,
+                    r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"active",
+                        "worktrees":[{"worktreePath":"wt/c","repo":"r"}]}],
+                        "count":1,"limit":2,"nextCursor":null}"#,
+                ],
+                MAX_PAGES,
+            )
+            .await;
+            assert_eq!(seen, vec![None, Some("p1".to_string())]);
+            assert!(partial.is_none(), "walk reached nextCursor: null");
+            assert_eq!(merged.sessions.len(), 2, "s1 is ONE session, not two");
+            let s1 = &merged.sessions[0];
+            assert_eq!(s1.session_id, "s1");
+            let paths: Vec<&str> = s1
+                .worktrees
+                .iter()
+                .map(|w| w.worktree_path.as_str())
+                .collect();
+            assert_eq!(paths, vec!["wt/a", "wt/c"]);
+
+            let idx = CoordOwnership::from_response(merged);
+            assert_eq!(idx.len(), 3);
+            let got = idx.owner_for("wt/c", "r", None).expect("page-2 row joins");
+            assert_eq!(got.allocation_session_id.as_deref(), Some("s1"));
+        }
+
+        #[tokio::test]
+        async fn hitting_the_page_bound_says_the_index_is_partial() {
+            let (merged, partial, seen) = walk_fake(
+                vec![
+                    r#"{"sessions":[{"sessionId":"s1","worktrees":[{"worktreePath":"a","repo":"r"}]}],
+                        "nextCursor":"p1"}"#,
+                    r#"{"sessions":[{"sessionId":"s2","worktrees":[{"worktreePath":"b","repo":"r"}]}],
+                        "nextCursor":"p2"}"#,
+                    r#"{"sessions":[{"sessionId":"s3","worktrees":[{"worktreePath":"c","repo":"r"}]}],
+                        "nextCursor":null}"#,
+                ],
+                2,
+            )
+            .await;
+            assert_eq!(seen.len(), 2, "the bound caps the requests");
+            assert_eq!(merged.sessions.len(), 2);
+            let reason = partial.expect("a capped walk must SAY it is capped");
+            assert!(reason.contains("2-page bound"), "{reason}");
+            let idx = CoordOwnership::from_response(merged).with_partial(Some(reason));
+            assert!(idx.partial.is_some());
+            assert!(idx.owner_for("c", "r", None).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_coord_without_next_cursor_is_one_final_page() {
+            // Pre-cursor coord: no `limit`, no `nextCursor` key at all.
+            let (merged, partial, seen) = walk_fake(
+                vec![
+                    r#"{"tenantId":"t","sessions":[{"sessionId":"s1",
+                        "worktrees":[{"worktreePath":"a","repo":"r"}]}],
+                        "reapStatusCounts":{},"count":1}"#,
+                ],
+                MAX_PAGES,
+            )
+            .await;
+            assert_eq!(seen, vec![None]);
+            assert!(partial.is_none());
+            assert_eq!(merged.sessions.len(), 1);
+            assert_eq!(merged.limit, None);
+        }
+
+        #[tokio::test]
+        async fn a_repeated_cursor_stops_the_walk_as_partial() {
+            let (_, partial, seen) = walk_fake(
+                vec![
+                    r#"{"sessions":[],"nextCursor":"p1"}"#,
+                    r#"{"sessions":[],"nextCursor":"p1"}"#,
+                ],
+                MAX_PAGES,
+            )
+            .await;
+            assert_eq!(seen.len(), 2);
+            assert!(partial
+                .expect("must be partial")
+                .contains("repeated a cursor"));
+        }
+
+        /// A->B->A: the cycle is caught at the first REPEAT, not only when the
+        /// cursor fails to advance.
+        #[tokio::test]
+        async fn a_cursor_cycle_is_caught_not_walked_to_the_bound() {
+            let (merged, partial, seen) = walk_fake(
+                vec![
+                    r#"{"sessions":[{"sessionId":"s0","worktrees":[{"worktreePath":"a","repo":"r"}]}],
+                        "nextCursor":"p1"}"#,
+                    r#"{"sessions":[{"sessionId":"s1","worktrees":[{"worktreePath":"b","repo":"r"}]}],
+                        "nextCursor":"p2"}"#,
+                    r#"{"sessions":[{"sessionId":"s2","worktrees":[{"worktreePath":"c","repo":"r"}]}],
+                        "nextCursor":"p1"}"#,
+                ],
+                MAX_PAGES,
+            )
+            .await;
+            assert_eq!(seen.len(), 3);
+            assert_eq!(merged.sessions.len(), 3, "no page is merged twice");
+            assert!(partial
+                .expect("a cycle is partial")
+                .contains("repeated a cursor"));
+        }
+
+        /// A pre-cursor coord honours `?limit=` but cannot be asked for more.
+        /// A FULL page from it may be capped, so it is declared partial.
+        #[tokio::test]
+        async fn a_full_page_from_a_pre_cursor_coord_is_partial() {
+            let wts: Vec<String> = (0..PAGE_LIMIT)
+                .map(|i| format!(r#"{{"worktreePath":"wt/{i}","repo":"r"}}"#))
+                .collect();
+            let full = format!(
+                r#"{{"sessions":[{{"sessionId":"s1","worktrees":[{}]}}],"count":1}}"#,
+                wts.join(",")
+            );
+            let (merged, partial, seen) = walk_fake(vec![full.as_str()], MAX_PAGES).await;
+            assert_eq!(seen, vec![None]);
+            assert_eq!(merged.sessions[0].worktrees.len(), PAGE_LIMIT as usize);
+            assert!(partial
+                .expect("a full legacy page may be capped")
+                .contains("predates"));
+
+            // The SAME full page from a cursor-aware coord saying `null` is whole.
+            let whole = full.replace(r#""count":1"#, r#""count":1,"nextCursor":null"#);
+            let (_, partial, _) = walk_fake(vec![whole.as_str()], MAX_PAGES).await;
+            assert!(
+                partial.is_none(),
+                "an explicit null ends the walk completely"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_walk_budget_yields_a_partial_index_not_a_hang() {
+            let (merged, partial) = walk_pages(
+                MAX_PAGES,
+                Duration::from_millis(300),
+                |cursor| async move {
+                    match cursor {
+                        None => Ok(page(
+                            r#"{"sessions":[{"sessionId":"s1","worktrees":[{"worktreePath":"a","repo":"r"}]}],
+                                "nextCursor":"p1"}"#,
+                        )),
+                        Some(_) => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            Ok(page(r#"{"sessions":[],"nextCursor":null}"#))
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("page one arrived, so the walk reports what it has");
+            assert_eq!(merged.sessions.len(), 1);
+            assert!(partial.expect("budget ran out").contains("walk budget"));
+
+            // No page at all inside the budget: nothing to report -> Err.
+            let got = walk_pages(MAX_PAGES, Duration::from_millis(50), |_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(page(r#"{"sessions":[]}"#))
+            })
+            .await;
+            assert!(got.unwrap_err().contains("did not answer"));
+        }
+
+        #[tokio::test]
+        async fn a_failed_page_fails_the_walk_rather_than_returning_a_prefix() {
+            let got = walk_pages(MAX_PAGES, Duration::from_secs(30), |cursor| async move {
+                match cursor {
+                    None => Ok(page(r#"{"sessions":[],"nextCursor":"p1"}"#)),
+                    Some(_) => Err("boom".to_string()),
+                }
+            })
+            .await;
+            assert_eq!(got.unwrap_err(), "boom");
+        }
+
+        #[test]
+        fn the_cursor_is_url_encoded_and_the_limit_is_always_sent() {
+            assert_eq!(
+                page_url("https://c/coord/sessions/worktrees", None),
+                "https://c/coord/sessions/worktrees?limit=500"
+            );
+            assert_eq!(
+                page_url("https://c/coord/sessions/worktrees", Some("a+b/c=")),
+                "https://c/coord/sessions/worktrees?limit=500&cursor=a%2Bb%2Fc%3D"
+            );
         }
     }
 }

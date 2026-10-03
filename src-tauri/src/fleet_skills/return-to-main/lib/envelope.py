@@ -65,7 +65,7 @@ do not re-derive it from a summary elsewhere.
 | coord `GET /coord/agent-work-units/<slug>/citations` | `{work_unit_id, citations, count}` or `{citations_error}` | `require_collection(p, "citations")` |
 | coord `GET /coord/agent-prompt-documents` | `{documents, total, count}` | `require_collection(p, "documents")` |
 | coord `GET /coord/agent-questions/agent-pending` | `{questions, count, shown, total, truncated}` | `require_collection(p, "questions")` |
-| coord `GET /coord/sessions/worktrees` | `{tenantId, sessions, reapStatusCounts, count}` | `require_collection(p, "sessions")` (camelCase door) |
+| coord `GET /coord/sessions/worktrees` | `{tenantId, sessions, reapStatusCounts, count, limit, nextCursor}` | `require_collection(p, "sessions")` (camelCase door) reads ONE PAGE, never the whole index: re-GET with `?limit=500&cursor=<nextCursor>` until `nextCursor` is null (an ABSENT key = a pre-cursor coord, one final page); a session can recur across pages, so merge by `sessionId`; `count`/`reapStatusCounts` are per-page; a walk you stop early must say it read a partial index |
 | coord `GET /coord/alerts` | `{alerts, total_count, count}` | `require_collection(p, "alerts")`; `total_count` is the unpaged total |
 | coord MCP `tools/call` (JSON-RPC) | `{jsonrpc, id, result}` or `{jsonrpc, id, error}` | `require_key(p, "error")` first — its presence IS the answer; then `require_key(p, "result")` |
 | coord `coord_memory_search` | `{hits, count, vector_arm, …}` | `require_collection(p, "hits")`; read `vector_arm` (`skipped_no_embedding` is the normal case) before calling a zero a miss |
