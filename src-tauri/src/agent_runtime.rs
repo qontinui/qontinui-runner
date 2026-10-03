@@ -4041,6 +4041,82 @@ async fn post_work_unreported_fallback(
     }
 }
 
+/// The THIRD `work_unreported` producer (plan
+/// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…` D2):
+/// a continuation whose runner CRASHED, found dead by the NEXT process when the
+/// lifecycle poll closes its durable record non-restorably.
+///
+/// The two in-process producers above die with the runner, so without this the
+/// gate stays `spawned` forever — and a supersession loser is refused forever
+/// behind it. Unlike [`post_work_unreported_fallback`] this carries a detail in
+/// runner#1902's grammar (`exit=crashed …`), so coord#2729 can re-deliver the
+/// lost work, and it posts under the record's STORED consuming device id, never
+/// this boot's.
+///
+/// Same safety as the fallback: coord admits one `spawned → work_*` transition,
+/// so a session that reported for itself before the crash keeps its answer.
+/// Never fails the caller: every arm logs and returns.
+pub(crate) async fn post_runner_restart_unreported(
+    gate_id: uuid::Uuid,
+    consuming_device_id: uuid::Uuid,
+    detail: String,
+) {
+    match post_continuation_outcome(
+        gate_id,
+        consuming_device_id,
+        ContinuationOutcome::WorkUnreported,
+        Some(detail.clone()),
+    )
+    .await
+    {
+        OutcomeAck::Recorded => {
+            info!(
+                "agent_runtime: continuation gate_id={gate_id} was lost to a runner restart — \
+                 recorded work_unreported ({detail})"
+            );
+        }
+        OutcomeAck::Superseded(standing) if is_session_work_outcome(&standing) => {
+            info!(
+                "agent_runtime: continuation gate_id={gate_id} lost to a runner restart — the \
+                 session already reported {standing:?}; runner-restart report correctly refused"
+            );
+        }
+        OutcomeAck::Superseded(standing) => {
+            warn!(
+                "agent_runtime: continuation gate_id={gate_id} lost to a runner restart — \
+                 work_unreported REFUSED; continuation_consumed_outcome still reads {standing:?}"
+            );
+        }
+        OutcomeAck::NoVerdict => {
+            warn!(
+                "agent_runtime: continuation gate_id={gate_id} lost to a runner restart — \
+                 work_unreported POST returned no verdict; the recorded outcome is UNKNOWN"
+            );
+        }
+    }
+}
+
+/// Re-register a continuation that a boot restore RESUMED in this process (plan
+/// `2026-10-03-…` D3) on its new terminal, so the PTY-exit hook and the reaper
+/// cover its eventual death exactly as they cover a freshly spawned one.
+///
+/// No anchor: the anchor key is process-memory only and did not survive the
+/// restart. A resumed continuation therefore takes a cap slot but does not
+/// dedupe a same-anchor dispatch (P3) — the gate it continues is already
+/// consumed, so no such dispatch is outstanding for it.
+pub(crate) fn register_restored_continuation(terminal_id: String, gate_id: uuid::Uuid) {
+    register_continuation_session(terminal_id, None, Some(gate_id));
+}
+
+/// The gate a live continuation registration carries, by terminal (tests).
+#[cfg(test)]
+pub(crate) fn registered_continuation_gate(terminal_id: &str) -> Option<Option<uuid::Uuid>> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .map(|s| s.gate_id)
+}
+
 /// Whether `recorded` is an outcome only the SESSION can write — i.e. the
 /// runner's fallback was correctly refused because the authoritative producer
 /// got there first.
@@ -16643,6 +16719,67 @@ mod tests {
     // =========================================================================
     // Defect A item 3 (layered on #484): capacity-freed re-poll
     // =========================================================================
+
+    /// Plan `2026-10-03-…` Phase 1 test (f): a gate continuation RESUMED by a
+    /// boot restore is re-registered in `continuation_sessions()` on its NEW
+    /// terminal with its gate id, and its record is re-stamped to this
+    /// generation — so the exit hook / reaper own its death and the close
+    /// observer's prior-generation report can no longer fire for it.
+    #[test]
+    fn restored_gate_record_reregisters_and_restamps_its_generation() {
+        use crate::session::session_lifecycle_store::{
+            runner_restart_unreported_report, SessionLifecycleStore, TerminalSessionRecord,
+        };
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let gate = uuid::Uuid::now_v7();
+        let csid = "restored-cont-1";
+        let rec: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": "term-before-crash",
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "gateId": gate.to_string(),
+            "gateConsumingDeviceId": uuid::Uuid::now_v7().to_string(),
+            "gateBoundBootMs": 1_000,
+        }))
+        .unwrap();
+        store.record_open(rec);
+        // The restore's re-record: the resumed session now lives on a new
+        // terminal, written by a gate-less writer.
+        let mut reasserted = store.get(csid).unwrap();
+        reasserted.terminal_id = "term-restored".to_string();
+        reasserted.gate_id = None;
+        reasserted.gate_consuming_device_id = None;
+        reasserted.gate_bound_boot_ms = None;
+        store.record_open(reasserted);
+
+        let this_boot = 2_000;
+        let adopted =
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_boot);
+        assert_eq!(adopted, Some(("term-restored".to_string(), gate)));
+        assert_eq!(
+            registered_continuation_gate("term-restored"),
+            Some(Some(gate)),
+            "the resumed terminal must be a live continuation carrying its gate"
+        );
+        assert_eq!(store.get(csid).unwrap().gate_bound_boot_ms, Some(this_boot));
+
+        // Now its death is this generation's: a later non-restorable close is
+        // NOT reported by the close observer (the exit hook / reaper own it).
+        store.record_close(csid, "no-terminal");
+        assert_eq!(
+            runner_restart_unreported_report(&store.get(csid).unwrap(), this_boot),
+            None
+        );
+        clear_continuation_registry();
+    }
 
     /// A continuation terminal's exit deregisters it from the live registry AND
     /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses

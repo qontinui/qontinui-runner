@@ -2284,6 +2284,9 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
