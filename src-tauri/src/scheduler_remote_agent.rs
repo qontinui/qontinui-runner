@@ -121,7 +121,7 @@ pub(crate) struct RemoteAgentLaunch {
 }
 
 /// Where a scheduled run's transcript lands: `~/.qontinui/scheduler-runs/`.
-fn scheduler_logs_root() -> Option<PathBuf> {
+pub(crate) fn scheduler_logs_root() -> Option<PathBuf> {
     qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("scheduler-runs"))
 }
 
@@ -379,7 +379,7 @@ pub(crate) async fn launch(
 
 /// Copy the child's stdout and stderr, line by line, into the run's log file.
 /// Fail-soft: a log that cannot be opened costs the transcript, not the run.
-async fn pump_to_log(
+pub(crate) async fn pump_to_log(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     log_path: Option<PathBuf>,
