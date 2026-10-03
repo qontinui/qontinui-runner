@@ -1216,6 +1216,8 @@ async fn spawn_looping_agent_terminal(
             // hammer a starved machine with new `claude` processes indefinitely —
             // the exact shape of the 2026-08-06→07 incident.
             false,
+            // A looping agent is coord-armed: no picker chose a tenant.
+            None,
         )?;
     Ok((terminal_id, pinned_session_id))
 }
