@@ -3597,7 +3597,9 @@ impl Drop for AnchorReservation {
 /// Capacity-freed re-poll trigger: called from two on-exit hooks in
 /// `commands/terminal.rs` — `create_terminal_session_backend`'s (a
 /// continuation-spawned PTY) and `terminal_create`'s (the pane a boot restore
-/// resumes a continuation into, plan 2026-10-03 D3) — the instant the PTY exits.
+/// resumes a continuation into, plan 2026-10-03 D3) — the instant the PTY exits;
+/// and directly from the post-start-verdict path for a terminal that had already
+/// exited by the time `spawned` was posted.
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
 /// it WAS a registered continuation session — kicks an immediate
@@ -16221,10 +16223,11 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// An OPERATOR tab's exit must NOT trigger a capacity-freed re-poll. Operator
-    /// tabs are created via `terminal_create` (a path that never registers them in
-    /// the continuation registry), so a terminal id absent from the registry
-    /// reports `false` — no poll storm on unrelated tab closes. This is the
+    /// An OPERATOR tab's exit must NOT trigger a capacity-freed re-poll. An
+    /// ordinary operator tab is not in the continuation registry (only a
+    /// boot-restored continuation's `terminal_create` pane is — plan 2026-10-03
+    /// D3), so the deregister returns `None` — no poll storm on unrelated tab
+    /// closes. This is the
     /// defense-in-depth guard `notify_continuation_terminal_exit` relies on.
     #[test]
     fn operator_tab_exit_does_not_trigger_repoll() {
