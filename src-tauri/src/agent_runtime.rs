@@ -3153,10 +3153,21 @@ enum ContinuationGuard {
 ///    starved. Taken lazily, a deduped row pays nothing.
 /// 2. **Machine load next** — the heavier of the memory and thread lanes, the
 ///    same composed verdict the PTY seam enforces. The pre-check used to read
-///    the thread lane only, so memory pressure was first seen AFTER coord's
-///    consume claim, at the PTY seam, where it is a terminal `spawn_failed`
-///    that nothing re-delivers. Reading both lanes here makes memory pressure a
-///    deferral, like thread pressure always was.
+///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
+///    coord's consume claim, at the PTY seam, where it is a terminal
+///    `spawn_failed` that nothing re-delivers. Reading both lanes here makes
+///    memory pressure a deferral, like thread pressure always was.
+///
+///    **Deferring at memory WARN is NEW, and deliberate.** The seam only refuses
+///    at CRITICAL, so a memory WARN reading used to spawn (with a toast). It now
+///    defers an unattended spawn, by operator direction (an unattended spawn
+///    defers at WARN, an operator's own spawn refuses only at CRITICAL — the same
+///    asymmetry the thread lane has always had). The cost, stated so it is
+///    watched rather than discovered: a box whose IDLE free memory sits under the
+///    warn floor defers every unattended spawn until memory frees; the memory
+///    lane has no at-rest re-basing like the thread lane's. That state is visible
+///    on `/health` `spawnAdmission.memory` and on coord as `commit_pressure:warn`
+///    deferral stamps.
 ///
 /// Operator sessions never enter the registry and never reach this guard.
 ///
@@ -3166,8 +3177,10 @@ enum ContinuationGuard {
 /// `QONTINUI_CONTINUATION_SESSION_CAP`) used to sit after the load lanes. It was
 /// retired on 2026-10-03 by operator direction (see
 /// [`RETIRED_CONTINUATION_SESSION_CAP_ENV`]): a number that says nothing about
-/// the box decided admission, and on spaceship (`=9`) it deferred a gate
-/// continuation five times in four hours while the operator saw seven sessions.
+/// the box decided admission, and on spaceship (`=9`) it deferred gate `e46eb573`'s
+/// continuation five times between 16:10Z and 20:14Z on 2026-10-02 while the
+/// operator saw seven sessions (measured; dossier
+/// `gate-continuation-work-never-happens`).
 /// Its doc justified it as a backstop for costs the thread lane cannot see; each
 /// is bounded elsewhere, measured against `origin/main` when it was removed:
 ///
@@ -3454,7 +3467,6 @@ fn spawn_admission_json(
     let defer_stamp = composed
         .tripped()
         .map(|(severity, observation)| load_pressure_stamp_reason(severity, observation));
-    let threads_observation = lanes.threads.tripped().map(|(_, o)| o);
     serde_json::json!({
         "enabled": true,
         "verdict": verdict_word(&composed),
@@ -3469,14 +3481,16 @@ fn spawn_admission_json(
             "criticalFloorBytes": lanes.critical_free_commit_bytes,
             "verdict": verdict_word(&lanes.memory),
         },
-        // The graded reading and its ceiling are carried only when the lane
-        // TRIPPED (they ride the observation); the raw thread census is
-        // `threadCensus` on this same route.
+        // The GRADED reading (raw minus the idle blocking pool) the lane
+        // judged, `null` only when the OS thread table could not be read —
+        // UNKNOWN, which fails open to `proceed` exactly as the gate does. The
+        // raw census is `threadCensus` on this same route.
         "threads": {
             "metric": crate::resource_guard::LaneMetric::ThreadCount.wire_name(),
-            "verdict": verdict_word(&lanes.threads),
-            "observed": threads_observation.map(|o| o.observed),
-            "limit": threads_observation.map(|o| o.limit),
+            "gradedThreads": lanes.threads.graded,
+            "warnCeiling": lanes.threads.warn_ceiling,
+            "criticalCeiling": lanes.threads.critical_ceiling,
+            "verdict": verdict_word(&lanes.threads.verdict),
         },
         // Registered continuation sessions (P3's population) — reported, never
         // an admission input since the count cap was retired.
@@ -5504,10 +5518,10 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 /// coord ack handshake selected by `consume_target`:
 ///
 /// 0. `target_device_id` sanity check.
-/// 1. Local guards (anchor_key dedup, machine thread pressure, concurrency cap)
+/// 1. Local guards (anchor_key dedup, then the memory and thread load lanes)
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
-///    (contract item 4), and so a machine already out of threads never pays a
-///    `git worktree add` before being told to wait.
+///    (contract item 4), and so a machine already short of memory or threads
+///    never pays a `git worktree add` before being told to wait.
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
@@ -5593,13 +5607,12 @@ async fn run_gate_continuation_inner(
     // `gate_id` dedup (#450, the `dispatched_gate_ids` set, already applied in
     // the dispatcher) collapses a SAME gate delivered twice; this catches the
     // residual cases it can't — a re-cleared gate (new `gate_id`, same
-    // `anchor_key`), a machine out of OS threads, and the count cap. The first
-    // and last are evaluated against sessions that are STILL running; liveness
-    // is tested against the `TerminalManager`, and with no Tauri runtime the
-    // registry is empty so those two lanes are a no-op (the unit-test /
-    // headless-only context). The thread lane needs no registry at all — it
-    // reads the process — so it is the one guard here that still has an opinion
-    // in a headless context.
+    // `anchor_key`), and a machine short of memory or OS threads. The dedup is
+    // evaluated against sessions that are STILL running; liveness is tested
+    // against the `TerminalManager`, and with no Tauri runtime the registry is
+    // empty so that lane is a no-op (the unit-test / headless-only context). The
+    // load lanes need no registry at all — they read the machine and the
+    // process — so they still have an opinion in a headless context.
     //
     // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
     // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
@@ -14426,8 +14439,9 @@ mod tests {
     /// `admit_launch` — the decision `spawn_run_task` takes before
     /// `run_agent_subprocess` — defers on the MEMORY lane exactly as on the
     /// thread lane, with a lane-correct `deferred_load:` reason, and admits a
-    /// calm machine. Before 2026-10-03 the launch pre-check read threads only,
-    /// so memory pressure surfaced as a refusal at the PTY seam instead.
+    /// calm machine. Before 2026-10-03 the launch pre-check read threads only, so
+    /// a memory WARN reading launched and a CRITICAL one was refused later, at
+    /// the spawn seam, instead of being re-offered.
     #[test]
     fn admit_launch_defers_on_the_memory_lane_and_admits_a_calm_machine() {
         let _env_lock = env_lock();
@@ -15488,9 +15502,9 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::thread_pressure`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load and — on Windows
-    /// — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
+    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
+    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of
     /// N duplicate-anchor rows took N system-wide thread snapshots on a machine
@@ -16370,20 +16384,20 @@ mod tests {
     /// (`resource_guard::probe_for_spawn`), never the thread lane alone. The unit
     /// tests above inject the verdict, so they cannot see which function the
     /// production wiring passes; this pins that wiring. Before 2026-10-03 both
-    /// sites passed `thread_pressure`, so memory pressure reached no pre-check and
-    /// surfaced only as a terminal `spawn_failed` at the PTY seam.
+    /// sites passed `thread_pressure`, so memory pressure reached no pre-check: a
+    /// WARN reading spawned anyway, and a CRITICAL one surfaced only as a
+    /// terminal `spawn_failed` at the PTY seam.
     #[test]
     fn the_live_pre_checks_read_both_resource_lanes() {
         let source = include_str!("agent_runtime.rs");
-        let prod = &source[..source
-            .find("#[cfg(test)]\nmod tests")
-            .expect("the test module marker")];
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
         let body_of = |signature: &str| -> &str {
-            let start = prod
-                .find(signature)
+            let (_, rest) = prod
+                .split_once(signature)
                 .unwrap_or_else(|| panic!("{signature} exists"));
-            let rest = &prod[start..];
-            &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())]
+            rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
         };
         for (site, body) in [
             (
@@ -16417,7 +16431,12 @@ mod tests {
             warn_free_commit_bytes: floors.warn_free_commit_bytes,
             critical_free_commit_bytes: floors.critical_free_commit_bytes,
             memory,
-            threads,
+            threads: crate::resource_guard::ThreadLane {
+                graded: Some(300),
+                warn_ceiling: 256,
+                critical_ceiling: 400,
+                verdict: threads,
+            },
         };
 
         // Memory tripped, threads calm: the composed verdict and the stamp are
@@ -16437,7 +16456,10 @@ mod tests {
         assert_eq!(v["memory"]["warnFloorBytes"], floors.warn_free_commit_bytes);
         assert_eq!(v["memory"]["verdict"], "warn");
         assert_eq!(v["threads"]["verdict"], "proceed");
-        assert_eq!(v["threads"]["observed"], serde_json::Value::Null);
+        // The graded reading is reported whether or not the lane tripped.
+        assert_eq!(v["threads"]["gradedThreads"], 300);
+        assert_eq!(v["threads"]["warnCeiling"], 256);
+        assert_eq!(v["threads"]["criticalCeiling"], 400);
         assert_eq!(v["liveContinuations"], 7);
         assert_eq!(v["countCap"], "retired");
 
@@ -16452,8 +16474,7 @@ mod tests {
         );
         assert_eq!(v["verdict"], "critical");
         assert_eq!(v["deferStamp"], "thread_pressure:critical:540_over_400");
-        assert_eq!(v["threads"]["observed"], 540);
-        assert_eq!(v["threads"]["limit"], 400);
+        assert_eq!(v["threads"]["verdict"], "critical");
 
         // Calm: no stamp.
         let v = spawn_admission_json(Some(&lanes(calm(), calm())), 0);
@@ -16468,10 +16489,11 @@ mod tests {
         assert_eq!(v["liveContinuations"], 3);
     }
 
-    /// A continuation offered while free memory is under its WARN floor is
-    /// DEFERRED by the pre-check, naming the memory lane. Before 2026-10-03 the
-    /// pre-check read threads only, so this row passed it, was claimed, and then
-    /// died `spawn_failed` at the PTY seam on the same memory reading.
+    /// A continuation offered while free memory is under its WARN floor — or its
+    /// CRITICAL floor — is DEFERRED by the pre-check, naming the memory lane.
+    /// Before 2026-10-03 the pre-check read threads only: the WARN row spawned
+    /// (the seam admits WARN), and the CRITICAL row was claimed and then died
+    /// `spawn_failed` at the PTY seam on the same memory reading.
     #[test]
     fn memory_pressure_defers_a_continuation_at_the_pre_check() {
         let _env_lock = env_lock();
@@ -16497,6 +16519,18 @@ mod tests {
                 );
             }
             other => panic!("2 GiB free must defer at warn, got {other:?}"),
+        }
+        // CRITICAL band (under 1.5 GiB): still a deferral, naming the critical
+        // floor — the reading that used to die `spawn_failed` after the claim.
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_verdict(GIB)) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "critical");
+                assert_eq!(observation.limit, floors.critical_free_commit_bytes);
+            }
+            other => panic!("1 GiB free must defer at critical, got {other:?}"),
         }
         // Plenty of memory: proceeds.
         assert_eq!(

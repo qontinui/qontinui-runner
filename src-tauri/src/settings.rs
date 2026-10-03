@@ -3098,7 +3098,7 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
 /// Both shipped ceilings are fractions of the one resource they protect:
 /// tokio's blocking pool, whose default `max_blocking_threads` is **512**.
 /// 256 is half of it — half the pool consumed is the point where back-pressure
-/// starts being worth its cost, and it is the number `thread_pressure`'s WARN
+/// starts being worth its cost, and it is the number the thread lane's WARN
 /// band hands to a gate continuation deciding whether to wait. The headroom it
 /// leaves above the calibration box's idle floor (256 − 151 = 105) is what
 /// `resource_guard` keeps CONSTANT on every machine as the blocking-pool arm of
