@@ -331,7 +331,12 @@ pub struct RemotePaneIo {
     /// The target keys its flow gate by grant and drops it on detach, so a
     /// reattach (a relay reconnect or a renewal) comes back unpaused unless
     /// this is re-asserted — see [`Self::reassert_flow`].
-    flow_paused: AtomicBool,
+    ///
+    /// A lock, not an atomic: every flow frame is queued and its state stored
+    /// under it, so a re-assert racing the session's own flow edge cannot
+    /// queue a stale pause AFTER a resume and leave the target paused while
+    /// the session believes it open.
+    flow_paused: Mutex<bool>,
     sink: Arc<dyn RemoteFrameSink>,
     /// Sender half of the output channel. `None` once closed — the reader
     /// sees EOF when the last sender drops.
@@ -397,7 +402,7 @@ impl RemotePaneIo {
             target_device_id: None,
             reattaching: AtomicBool::new(false),
             awaiting_reattach: AtomicBool::new(false),
-            flow_paused: AtomicBool::new(false),
+            flow_paused: Mutex::new(false),
             sink,
             output_tx: Mutex::new(Some(tx)),
             output_rx: Mutex::new(Some(rx)),
@@ -911,13 +916,22 @@ impl RemotePaneIo {
     /// without this a paused tab streams again until its next flow edge.
     /// Nothing is sent for a pane that was not paused.
     pub fn reassert_flow(&self) -> Result<(), String> {
-        if !self.flow_paused.load(Ordering::Acquire) {
+        let mut flow = self.flow_paused.lock().unwrap_or_else(|e| e.into_inner());
+        if !*flow {
             return Ok(());
         }
-        self.send_flow(true)
+        self.queue_flow(&mut flow, true)
     }
 
     fn send_flow(&self, paused: bool) -> Result<(), String> {
+        let mut flow = self.flow_paused.lock().unwrap_or_else(|e| e.into_inner());
+        self.queue_flow(&mut flow, paused)
+    }
+
+    /// Queue one flow frame and record it, under the caller's `flow_paused`
+    /// guard — so the order of frames on the wire is the order of the
+    /// recorded state.
+    fn queue_flow(&self, flow: &mut bool, paused: bool) -> Result<(), String> {
         self.close_gate
             .admit("remote_terminal_flow", &self.grant_jti(), &self.terminal_id)?;
         self.send(json!({
@@ -926,7 +940,7 @@ impl RemotePaneIo {
             "terminal_id": self.terminal_id,
             "paused": paused,
         }))?;
-        self.flow_paused.store(paused, Ordering::Release);
+        *flow = paused;
         Ok(())
     }
 
@@ -1694,6 +1708,79 @@ pub(crate) mod tests {
             None,
             "a renewal replaces the expiry"
         );
+    }
+
+    /// A sink that parks the first `paused: true` flow frame once armed, so a
+    /// test can land another call while that frame is mid-queue.
+    #[derive(Default)]
+    struct ParkingSink {
+        frames: Mutex<Vec<Value>>,
+        armed: AtomicBool,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl RemoteFrameSink for ParkingSink {
+        fn send_frame(&self, frame: Value) -> Result<(), String> {
+            if frame["paused"] == true && self.armed.swap(false, Ordering::AcqRel) {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                }
+                let rx = self.release.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    rx.recv().unwrap();
+                }
+            }
+            self.frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
+    /// Review round 2, M1: a resume landing while a re-assert of the pause is
+    /// mid-queue must not end with the target paused and the pane recording
+    /// "open". Both hold the flow lock across admit, queue and store, so the
+    /// LAST frame on the wire is the recorded state.
+    #[test]
+    fn a_resume_during_a_pause_reassert_is_the_last_word() {
+        let sink = Arc::new(ParkingSink::default());
+        let dyn_sink: Arc<dyn RemoteFrameSink> = sink.clone();
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "term-9",
+            "grant.jwt",
+            dyn_sink,
+            100,
+            40,
+            AttachedRing::default(),
+        ));
+        pane.set_paused(true).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *sink.entered.lock().unwrap() = Some(entered_tx);
+        *sink.release.lock().unwrap() = Some(release_rx);
+        sink.armed.store(true, Ordering::Release);
+
+        let reasserting = pane.clone();
+        let a = thread::spawn(move || reasserting.reassert_flow().unwrap());
+        entered_rx.recv().unwrap();
+        let resuming = pane.clone();
+        let b = thread::spawn(move || resuming.set_paused(false).unwrap());
+        // Before the fix the resume queued here, ahead of the parked pause.
+        thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let frames = sink.frames.lock().unwrap().clone();
+        let paused: Vec<bool> = frames
+            .iter()
+            .map(|f| f["paused"].as_bool().unwrap())
+            .collect();
+        assert_eq!(paused, vec![true, true, false], "{frames:?}");
+        assert!(!*pane.flow_paused.lock().unwrap(), "recorded state agrees");
+        // And nothing is re-asserted on the next reattach.
+        pane.reassert_flow().unwrap();
+        assert_eq!(sink.frames.lock().unwrap().len(), 3);
     }
 
     /// Only one supervisor may claim a pane at a time.
