@@ -8,8 +8,8 @@
 //! Phase-0 probe PROVED that a `SessionStart` hook supplied ONLY via
 //! `claude --settings <file>` fires on both, additively — Claude MERGES the
 //! `--settings` file's hooks on top of any `~/.claude` config WITHOUT writing
-//! to it. So the entire delivery is FIVE runner-owned files in the runner's OWN
-//! app-data dir (`~/.qontinui/runner/session-restore/`) — four bundled scripts
+//! to it. So the entire delivery is SIX runner-owned files in the runner's OWN
+//! app-data dir (`~/.qontinui/runner/session-restore/`) — five bundled scripts
 //! and the one `--settings` carrier that registers them ([`hook_files`] is the
 //! roster):
 //!
@@ -21,25 +21,32 @@
 //!     the substitution to key on the placeholder, not the event).
 //!   * `claude_precompact_hook.sh` — the context-exhaustion signal.
 //!     `PreCompact`, unconditional.
-//!   * `claude_stop_hook.sh` — the continuation verdict. `Stop`, and the ONLY
-//!     one whose REGISTRATION is gated.
-//!   * `claude_hook_settings.json` / `claude_hook_settings-nostop.json` —
-//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...] },
-//!     "permissions": { "allow": [...] } }`, each `command` pointing at the
-//!     corresponding materialized script. **`permissions.allow` rides this same
-//!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
-//!     built structurally rather than by text surgery — see [`build_settings`].
-//!     The `Stop` key is registered ONLY when the continuation flag is armed
-//!     (see [`StopHookRegistration`]); a dark session gets the `-nostop` file,
-//!     which has no `Stop` key at all, so Claude never spawns `bash` for it once
-//!     per assistant turn. The two variants use DISTINCT FILENAMES because the
-//!     hook dir is machine-global — see [`session_restore_dir`].
+//!   * `claude_stop_hook.sh` — the continuation verdict. `Stop`; REGISTRATION
+//!     gated on the continuation flag ([`StopHookRegistration`]).
+//!   * `claude_bash_guard_hook.sh` — the command-safety rewrite guard
+//!     (plan `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`).
+//!     `PreToolUse` on `Bash`, filtered by `"if": "Bash(*rm *)"` so Claude does
+//!     not start it for a command with no `rm`; REGISTRATION gated on the
+//!     tenant's `command_safety_rewrite` fleet-policy dial
+//!     ([`GuardRegistration`]), default on.
+//!   * the `--settings` carrier — `claude_hook_settings[-nostop][-noguard].json`,
+//!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...], "Stop": [...],
+//!     "PreToolUse": [...] }, "permissions": { "allow": [...] } }`, each
+//!     `command` pointing at the corresponding materialized script.
+//!     **`permissions.allow` rides this same carrier** (it pre-approves
+//!     `mcp__coord-mcp`), which is why the file is built structurally rather
+//!     than by text surgery — see [`build_settings`]. Each GATED key is a
+//!     switch of its own ([`CarrierVariant`]): a switched-off key is absent from
+//!     the file altogether, so Claude never spawns `bash` for it, and the file
+//!     NAME carries one suffix per switched-off key (`-nostop`, `-noguard`).
+//!     Variants use DISTINCT FILENAMES because the hook dir is machine-global —
+//!     see [`session_restore_dir`].
 //!
-//! **Exactly one of the two carrier names exists on a given box per posture**,
-//! so nothing outside this module should name one: in the DEFAULT (dark)
-//! posture `claude_hook_settings.json` is the file that is NOT written. The
-//! bundled scripts' own headers therefore say "the runner-owned `--settings`
-//! carrier" rather than a filename — pinned by
+//! **Which carrier name exists on a given box is a posture-dependent fact**, so
+//! nothing outside this module should name one: in the DEFAULT posture (Stop
+//! dark, guard on) `claude_hook_settings.json` is a file that is NOT written.
+//! The bundled scripts' own headers therefore say "the runner-owned
+//! `--settings` carrier" rather than a filename — pinned by
 //! `tests::only_the_stop_script_may_name_a_carrier_file`.
 //!
 //! ## Two delivery paths, because only one has a wrapper in the chain
@@ -68,12 +75,12 @@
 //! ## Materialization
 //!
 //! [`materialize`] is idempotent, and CACHED: the first call in a process
-//! writes all five files (cheap, a few hundred bytes each) and every later call
+//! writes all six files (cheap, a few hundred bytes each) and every later call
 //! for the same (`base_dir`, variant) costs one `stat` per file — see
 //! [`cached_materialization`]. A runner upgrade that ships a newer template
 //! still refreshes them because it is a NEW PROCESS, not because each call
-//! rewrites; an externally deleted file, or a flag flip, also falls through to
-//! a full rewrite. Returns the absolute settings-file path. Fail-open: any
+//! rewrites; an externally deleted file, a flag flip, or a dial flip also falls
+//! through to a full rewrite. Returns the absolute settings-file path. Fail-open: any
 //! IO error returns `None` (the launch then omits `--settings` — identity still
 //! rides the spawn-time `--session-id` pin; only the confirmation hook is
 //! absent). The settings/script live OUTSIDE any session cwd so they are never
@@ -130,10 +137,18 @@ const PRECOMPACT_HOOK_SCRIPT: &str =
 /// delivering the policy became the desired baseline.)
 const POLICY_HOOK_SCRIPT: &str =
     include_str!("../../resources/session-restore/claude_policy_hook.sh");
+/// Command-safety rewrite guard (bundled) — the `PreToolUse` `Bash` hook of
+/// plan `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`
+/// Phase 2. Unlike every other bundled script it calls NOTHING: its rule table
+/// matches the raw `PreToolUse` payload with bash builtins only and answers a
+/// match with a `deny` + rewrite reason, never `allow`. Materialized
+/// unconditionally; REGISTERED only under [`GuardRegistration::Registered`].
+const BASH_GUARD_HOOK_SCRIPT: &str =
+    include_str!("../../resources/session-restore/claude_bash_guard_hook.sh");
 /// Settings template (bundled). [`build_settings`] parses it and resolves each
 /// `command` by the `@@…@@` PLACEHOLDER that command already carries —
 /// `@@HOOK_SCRIPT@@`, `@@STOP_HOOK_SCRIPT@@`, `@@PRECOMPACT_HOOK_SCRIPT@@`,
-/// `@@POLICY_HOOK_SCRIPT@@` — swapping in the matching materialized script's
+/// `@@POLICY_HOOK_SCRIPT@@`, `@@BASH_GUARD_HOOK_SCRIPT@@` — swapping in the matching materialized script's
 /// absolute path.
 ///
 /// **The placeholders are load-bearing, not decoration.** They are the
@@ -153,23 +168,27 @@ const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
 const PRECOMPACT_HOOK_SCRIPT_NAME: &str = "claude_precompact_hook.sh";
 /// File name of the materialized SessionStart policy-injection script.
 const POLICY_HOOK_SCRIPT_NAME: &str = "claude_policy_hook.sh";
-/// File name of the materialized `--settings` file for the ARMED variant
-/// ([`StopHookRegistration::Registered`]).
-const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
-/// File name of the materialized `--settings` file for the DARK variant
-/// ([`StopHookRegistration::Omitted`]).
+/// File name of the materialized `PreToolUse` `Bash` guard script.
+const BASH_GUARD_HOOK_SCRIPT_NAME: &str = "claude_bash_guard_hook.sh";
+/// Stem of the materialized `--settings` file. The full name is
+/// `<stem>[-nostop][-noguard].json` — see [`CarrierVariant::settings_name`].
 ///
-/// The two variants get DISTINCT FILENAMES on purpose. [`session_restore_dir`]
+/// Every variant gets a DISTINCT FILENAME on purpose. [`session_restore_dir`]
 /// is machine-global and deliberately unscoped — every runner instance on the
 /// box (primary, secondary, supervisor-spawned temp runners) shares it. Before
 /// registration gating the content was a pure function of `base_dir`, so every
 /// instance wrote byte-identical bytes and the collision was benign; now it is
-/// a function of each PROCESS's flag, so one filename would let a dark temp
-/// runner silently rewrite the armed primary's settings (and vice versa) while
-/// the other process's cache still reports a hit. Separate names make that
-/// impossible by construction rather than narrowing the race — the same reason
-/// `coord_mcp.rs` keys its `--mcp-config` filename per workdir+terminal.
-const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-nostop.json";
+/// a function of each PROCESS's flag and polled dial, so one filename would let
+/// a dark temp runner silently rewrite the armed primary's settings (and vice
+/// versa) while the other process's cache still reports a hit. Separate names
+/// make that impossible by construction rather than narrowing the race — the
+/// same reason `coord_mcp.rs` keys its `--mcp-config` filename per
+/// workdir+terminal.
+const HOOK_SETTINGS_STEM: &str = "claude_hook_settings";
+/// Name suffix of a carrier with no `Stop` key ([`StopHookRegistration::Omitted`]).
+const NOSTOP_SUFFIX: &str = "-nostop";
+/// Name suffix of a carrier with no `PreToolUse` key ([`GuardRegistration::Omitted`]).
+const NOGUARD_SUFFIX: &str = "-noguard";
 
 /// Template placeholders, one per bundled script. These are the substitution
 /// KEY — [`resolve_commands`] matches each `command` on the placeholder it
@@ -179,6 +198,7 @@ const HOOK_SCRIPT_PLACEHOLDER: &str = "@@HOOK_SCRIPT@@";
 const STOP_HOOK_SCRIPT_PLACEHOLDER: &str = "@@STOP_HOOK_SCRIPT@@";
 const PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER: &str = "@@PRECOMPACT_HOOK_SCRIPT@@";
 const POLICY_HOOK_SCRIPT_PLACEHOLDER: &str = "@@POLICY_HOOK_SCRIPT@@";
+const BASH_GUARD_HOOK_SCRIPT_PLACEHOLDER: &str = "@@BASH_GUARD_HOOK_SCRIPT@@";
 
 /// Whether the delivered settings registers the `Stop` continuation hook.
 ///
@@ -211,15 +231,6 @@ impl StopHookRegistration {
         Self::from_mode(crate::mcp::continuation_verdict::Mode::from_env())
     }
 
-    /// The `--settings` file name this variant materializes. Distinct per
-    /// variant — see [`HOOK_SETTINGS_NAME_NOSTOP`] for why.
-    fn settings_name(self) -> &'static str {
-        match self {
-            StopHookRegistration::Registered => HOOK_SETTINGS_NAME,
-            StopHookRegistration::Omitted => HOOK_SETTINGS_NAME_NOSTOP,
-        }
-    }
-
     /// Stable wire string for the variant, for diagnostics that must name WHICH
     /// carrier a session would get. Distinct vocabulary from
     /// [`crate::mcp::continuation_verdict::Mode::as_str`] on purpose: two of the
@@ -233,17 +244,113 @@ impl StopHookRegistration {
     }
 }
 
-/// The absolute path of the `--settings` carrier `base_dir` holds for `reg`.
+/// Whether the delivered settings registers the `PreToolUse` `Bash`
+/// command-safety guard (plan
+/// `2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts`, D6).
+///
+/// Decided by the tenant's `command_safety_rewrite` fleet-policy dial as the
+/// poller last cached it — `on`, unanswered and unrecognised all register; only
+/// an explicit `off` omits. Like the `Stop` gate it gates REGISTRATION, never
+/// materialization: an omitted guard means no `PreToolUse` key, so Claude never
+/// spawns `bash` for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuardRegistration {
+    /// The dial resolves on — register `hooks.PreToolUse`.
+    Registered,
+    /// The dial resolves off — omit `hooks.PreToolUse`.
+    Omitted,
+}
+
+impl GuardRegistration {
+    /// Pure — the unit-test surface.
+    pub(crate) fn from_level(
+        level: crate::mcp::fleet_policy_poller::CommandSafetyRewriteLevel,
+    ) -> Self {
+        if level.guard_active() {
+            GuardRegistration::Registered
+        } else {
+            GuardRegistration::Omitted
+        }
+    }
+
+    /// Live read of the poller's cached level. Lock-only, no I/O — safe on the
+    /// spawn path.
+    pub fn from_dial() -> Self {
+        Self::from_level(crate::mcp::fleet_policy_poller::effective_command_safety_rewrite_level())
+    }
+
+    /// Stable wire string for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuardRegistration::Registered => "registered",
+            GuardRegistration::Omitted => "omitted",
+        }
+    }
+}
+
+/// The carrier a spawn gets: one independent switch per GATED hook key (D7 —
+/// carrier variants are a product of switches, never a hand-enumerated file per
+/// combination). The file name and the content are both functions of this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CarrierVariant {
+    /// The `Stop` continuation hook — from the process env flag.
+    pub stop: StopHookRegistration,
+    /// The `PreToolUse` `Bash` guard — from the tenant dial.
+    pub bash_guard: GuardRegistration,
+}
+
+impl CarrierVariant {
+    /// The variant a spawn made NOW gets: the Stop flag read live from env plus
+    /// the poller's cached `command_safety_rewrite` level. Resolved inside
+    /// [`materialize`], so every caller — the terminal shim env, the
+    /// resume/launch `LaunchSpec`, and [`direct_spawn_settings_args`] — inherits
+    /// it without a per-call-site choice.
+    pub fn resolve() -> Self {
+        CarrierVariant {
+            stop: StopHookRegistration::from_env(),
+            bash_guard: GuardRegistration::from_dial(),
+        }
+    }
+
+    /// The `--settings` file name this variant materializes: the stem plus one
+    /// suffix per switched-OFF key, in a fixed order. Distinct per variant —
+    /// see [`HOOK_SETTINGS_STEM`] for why.
+    fn settings_name(self) -> String {
+        format!(
+            "{HOOK_SETTINGS_STEM}{}{}.json",
+            match self.stop {
+                StopHookRegistration::Registered => "",
+                StopHookRegistration::Omitted => NOSTOP_SUFFIX,
+            },
+            match self.bash_guard {
+                GuardRegistration::Registered => "",
+                GuardRegistration::Omitted => NOGUARD_SUFFIX,
+            },
+        )
+    }
+
+    /// Stable diagnostic string naming both switches, e.g.
+    /// `stop=omitted bash_guard=registered`.
+    pub fn describe(self) -> String {
+        format!(
+            "stop={} bash_guard={}",
+            self.stop.as_str(),
+            self.bash_guard.as_str()
+        )
+    }
+}
+
+/// The absolute path of the `--settings` carrier `base_dir` holds for `variant`.
 ///
 /// THE one definition of that path. [`materialize_from_template`] writes it,
 /// [`hook_files`] stats it and `config_report_cmd::claude_settings_carrier_reading`
 /// REPORTS it, all through here — so a diagnostic that names the carrier cannot
 /// name a different file than the spawn seam writes. A second copy of
-/// `base_dir.join(reg.settings_name())` would compile, agree on the day it was
-/// written, and start lying the first time either half moved, which is exactly
-/// the defect class the config report exists to expose.
-pub fn settings_path(base_dir: &Path, reg: StopHookRegistration) -> PathBuf {
-    base_dir.join(reg.settings_name())
+/// `base_dir.join(variant.settings_name())` would compile, agree on the day it
+/// was written, and start lying the first time either half moved, which is
+/// exactly the defect class the config report exists to expose.
+pub fn settings_path(base_dir: &Path, variant: CarrierVariant) -> PathBuf {
+    base_dir.join(variant.settings_name())
 }
 
 /// Env var the runner injects at spawn carrying the absolute path of the
@@ -260,7 +367,7 @@ pub const CLAUDE_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 /// shares this one dir (same posture as `session_lifecycle_store`'s hook dir).
 /// Anything written here whose CONTENT varies per process must therefore carry
 /// that variation in its FILE NAME — which is why the settings file is named
-/// per [`StopHookRegistration`] variant.
+/// per [`CarrierVariant`].
 pub fn session_restore_dir() -> PathBuf {
     qontinui_runner_lib::ambient::runner_dir_or_cwd().join("session-restore")
 }
@@ -275,22 +382,25 @@ pub fn session_restore_dir() -> PathBuf {
 /// pinned via `--session-id`; only the confirmation hook is absent). The hook
 /// script is marked executable on Unix.
 ///
-/// CACHED PER (`base_dir`, [`StopHookRegistration`]) (Phase 6, B2). The four
+/// CACHED PER (`base_dir`, [`CarrierVariant`]) (Phase 6, B2). The five
 /// SCRIPTS are byte-identical for a given `base_dir` (they are `include_str!`'d
 /// constants), and the settings file is a function of `base_dir` AND the
-/// registration variant — the two variants write DIFFERENT filenames with
-/// different content, so the cache carries the variant both to key the right
-/// file names and to rewrite rather than serve a path built under the other
-/// flag state. Every terminal spawn used to rewrite all of them plus a `chmod`
+/// carrier variant — the variants write DIFFERENT filenames with different
+/// content, so the cache carries the variant both to key the right file names
+/// and to rewrite rather than serve a path built under another flag or dial
+/// state. A dial flip therefore yields the new variant on the NEXT spawn; a
+/// running session keeps the carrier it was launched with. Every terminal spawn used to rewrite all of them plus a `chmod`
 /// each; after the first materialize in this process a spawn with the SAME
 /// variant costs one `stat` per file (proving they are still there) and nothing
 /// else. An externally deleted or modified file — or a variant mismatch — falls
 /// straight through to a full rewrite, so the cache can never serve a path that
 /// is not on disk or whose content disagrees with the wanted variant.
 ///
-/// Reads the live flag; see [`materialize_with`] for the explicit-variant form.
+/// Resolves the variant live ([`CarrierVariant::resolve`]: the Stop flag plus
+/// the cached `command_safety_rewrite` dial); see [`materialize_with`] for the
+/// explicit-variant form.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
-    materialize_with(base_dir, StopHookRegistration::from_env())
+    materialize_with(base_dir, CarrierVariant::resolve())
 }
 
 /// The `--settings <path>` argv pair for a spawn that execs `claude` DIRECTLY,
@@ -325,7 +435,8 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
 /// fail OPEN (no flag) rather than break a session start. And the variant name
 /// is a function of the `Stop`-hook flag, which only [`materialize`] resolves;
 /// a second copy of that decision is the drift the [`settings_path`] docs warn
-/// about. `materialize` is idempotent and memoized ([`cached_materialization`]),
+/// about — and so is the guard bit, a function of the tenant dial. `materialize`
+/// is idempotent and memoized ([`cached_materialization`]),
 /// so calling it here and again at the spawn seam costs one cache hit.
 pub fn direct_spawn_settings_args() -> Vec<String> {
     settings_args_from(materialize(&session_restore_dir()))
@@ -350,10 +461,10 @@ fn settings_args_from(path: Option<PathBuf>) -> Vec<String> {
     }
 }
 
-/// [`materialize`] with the `Stop`-hook registration variant supplied
-/// explicitly (the unit-test surface; production reads the env).
-pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<PathBuf> {
-    materialize_from_template(base_dir, stop, HOOK_SETTINGS)
+/// [`materialize`] with the carrier variant supplied explicitly (the unit-test
+/// surface; production resolves it live).
+pub fn materialize_with(base_dir: &Path, variant: CarrierVariant) -> Option<PathBuf> {
+    materialize_from_template(base_dir, variant, HOOK_SETTINGS)
 }
 
 /// [`materialize_with`] against an explicit settings template. Private seam:
@@ -362,10 +473,10 @@ pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<P
 /// return `None` WITHOUT leaving a partial settings file behind.
 fn materialize_from_template(
     base_dir: &Path,
-    stop: StopHookRegistration,
+    variant: CarrierVariant,
     template: &str,
 ) -> Option<PathBuf> {
-    if let Some(settings_path) = cached_materialization(base_dir, stop) {
+    if let Some(settings_path) = cached_materialization(base_dir, variant) {
         return Some(settings_path);
     }
     if let Err(e) = std::fs::create_dir_all(base_dir) {
@@ -414,35 +525,46 @@ fn materialize_from_template(
     }
     set_executable(&policy_script_path);
 
+    // PreToolUse `Bash` command-safety guard (plan
+    // 2026-10-03-runner-sessions-stop-on-builtin-command-safety-prompts) — same
+    // carrier, same fail-open posture. Materialized whatever the dial says;
+    // only its REGISTRATION is gated.
+    let bash_guard_script_path = base_dir.join(BASH_GUARD_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(&bash_guard_script_path, BASH_GUARD_HOOK_SCRIPT.as_bytes()) {
+        tracing::warn!(error = %e, path = %bash_guard_script_path.display(), "session-restore: claude bash-guard script write failed");
+        return None;
+    }
+    set_executable(&bash_guard_script_path);
+
     // Build the settings by parsing the template, resolving each `command`'s
-    // OWN `@@…@@` placeholder to that script's absolute path, and (when dark)
-    // dropping the `Stop` key entirely. serde_json does the JSON escaping, so a
+    // OWN `@@…@@` placeholder to that script's absolute path, and dropping each
+    // switched-off gated key entirely. serde_json does the JSON escaping, so a
     // Windows path needs no hand-rolled backslash doubling.
-    let settings = match build_settings(
-        template,
-        &script_path,
-        &stop_script_path,
-        &precompact_script_path,
-        &policy_script_path,
-        stop,
-    ) {
+    let scripts = ScriptPaths {
+        session: &script_path,
+        stop: &stop_script_path,
+        precompact: &precompact_script_path,
+        policy: &policy_script_path,
+        bash_guard: &bash_guard_script_path,
+    };
+    let settings = match build_settings(template, &scripts, variant) {
         Some(s) => s,
         None => {
             tracing::warn!(
-                path = %settings_path(base_dir, stop).display(),
+                path = %settings_path(base_dir, variant).display(),
                 "session-restore: claude hook settings template malformed — --settings hook delivery off (identity still pinned)"
             );
             return None;
         }
     };
-    let settings_path = settings_path(base_dir, stop);
+    let settings_path = settings_path(base_dir, variant);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
         return None;
     }
 
     if let Ok(mut done) = MATERIALIZED.lock() {
-        done.insert(base_dir.to_path_buf(), (stop, settings_path.clone()));
+        done.insert(base_dir.to_path_buf(), (variant, settings_path.clone()));
     }
     Some(settings_path)
 }
@@ -507,6 +629,16 @@ fn resolve_commands(
     Some(())
 }
 
+/// The materialized script paths [`build_settings`] substitutes, one per
+/// placeholder.
+struct ScriptPaths<'a> {
+    session: &'a Path,
+    stop: &'a Path,
+    precompact: &'a Path,
+    policy: &'a Path,
+    bash_guard: &'a Path,
+}
+
 /// Pure: template + resolved script paths + variant → settings JSON.
 ///
 /// `None` on a malformed or unexpected-shape template — never a panic. Every
@@ -516,11 +648,8 @@ fn resolve_commands(
 /// `include_str!` const) is what makes that fail-open path testable.
 fn build_settings(
     template: &str,
-    session: &Path,
-    stop: &Path,
-    precompact: &Path,
-    policy: &Path,
-    reg: StopHookRegistration,
+    scripts: &ScriptPaths<'_>,
+    variant: CarrierVariant,
 ) -> Option<String> {
     let mut root: serde_json::Value = serde_json::from_str(template).ok()?;
     {
@@ -541,7 +670,7 @@ fn build_settings(
         // Validating first would trade the SessionStart identity hook, the
         // policy injection and the coord-mcp pre-approval — the whole
         // `--settings` file — for a block we were about to throw away.
-        match reg {
+        match variant.stop {
             // Armed: the `Stop` registration is the whole point, so a template
             // without it is malformed HERE, even though it is perfectly valid
             // for the dark arm below. Its SHAPE is then validated by the resolve.
@@ -560,13 +689,27 @@ fn build_settings(
                 hooks.remove("Stop");
             }
         }
+        // `PreToolUse` (the Bash guard) is settled the SAME way and for the
+        // same reason, independently of `Stop` (D7): required when registered,
+        // removed unread when the tenant dial says off — so a malformed guard
+        // block can never veto the rest of the carrier for a tenant that turned
+        // the guard off, and a guard-less template is a valid `-noguard` one.
+        match variant.bash_guard {
+            GuardRegistration::Registered => {
+                hooks.get("PreToolUse")?;
+            }
+            GuardRegistration::Omitted => {
+                hooks.remove("PreToolUse");
+            }
+        }
         resolve_commands(
             hooks,
             &[
-                (HOOK_SCRIPT_PLACEHOLDER, session),
-                (STOP_HOOK_SCRIPT_PLACEHOLDER, stop),
-                (PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER, precompact),
-                (POLICY_HOOK_SCRIPT_PLACEHOLDER, policy),
+                (HOOK_SCRIPT_PLACEHOLDER, scripts.session),
+                (STOP_HOOK_SCRIPT_PLACEHOLDER, scripts.stop),
+                (PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER, scripts.precompact),
+                (POLICY_HOOK_SCRIPT_PLACEHOLDER, scripts.policy),
+                (BASH_GUARD_HOOK_SCRIPT_PLACEHOLDER, scripts.bash_guard),
             ],
         )?;
     }
@@ -578,14 +721,14 @@ fn build_settings(
 /// [`materialize_with`] returned. The variant is part of the VALUE (not just
 /// the key) so a mismatch is detectable and forces a rewrite.
 static MATERIALIZED: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, (StopHookRegistration, PathBuf)>>,
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (CarrierVariant, PathBuf)>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Every file a [`materialize`] under `reg` is responsible for, in `base_dir`.
+/// Every file a [`materialize`] under `variant` is responsible for, in `base_dir`.
 ///
-/// The four SCRIPTS are variant-INDEPENDENT (they are written unconditionally
-/// — registration is gated, materialization is not), so both variants leave all
-/// four on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
+/// The five SCRIPTS are variant-INDEPENDENT (they are written unconditionally
+/// — registration is gated, materialization is not), so every variant leaves
+/// all five on disk. The SETTINGS entry FOLLOWS THE VARIANT, so the existence
 /// check below validates the file this variant actually delivers rather than
 /// the other one's.
 ///
@@ -594,21 +737,22 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// after a flag flip). That is fine and harmless — every instance's spawn
 /// points `--settings` at its own name — so DO NOT "clean it up": deleting the
 /// other variant's file would be reaching into another live process's delivery.
-fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
+fn hook_files(base_dir: &Path, variant: CarrierVariant) -> [PathBuf; 6] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
-        settings_path(base_dir, reg),
+        base_dir.join(BASH_GUARD_HOOK_SCRIPT_NAME),
+        settings_path(base_dir, variant),
     ]
 }
 
 /// The settings path for `base_dir` if this process already materialized it
-/// UNDER THE WANTED VARIANT and all five files are still present. `None` (⇒
+/// UNDER THE WANTED VARIANT and all six files are still present. `None` (⇒
 /// full rewrite) otherwise, so an operator who deletes the dir gets it back on
 /// the next spawn — and a variant change rewrites rather than serving a file
-/// whose bytes were produced under the other flag state.
+/// whose bytes were produced under another flag or dial state.
 ///
 /// (Both production call sites share one `base_dir` — [`session_restore_dir`] —
 /// so in prod this is a single cache entry.)
@@ -617,7 +761,7 @@ fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 5] {
 /// nothing about what another runner instance sharing the machine-global dir
 /// may have written. What makes that safe is the per-variant FILE NAME, not
 /// this cache — no other instance writes the name this variant reads.
-fn cached_materialization(base_dir: &Path, want: StopHookRegistration) -> Option<PathBuf> {
+fn cached_materialization(base_dir: &Path, want: CarrierVariant) -> Option<PathBuf> {
     let (cached_variant, settings_path) = MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
     if cached_variant != want {
         return None;
@@ -648,6 +792,60 @@ mod tests {
 
     use crate::mcp::continuation_verdict::Mode;
 
+    /// A carrier variant with the Bash guard REGISTERED (the dial's default)
+    /// and the given Stop switch — the shape every pre-guard test was written
+    /// against.
+    fn guarded(stop: StopHookRegistration) -> CarrierVariant {
+        CarrierVariant {
+            stop,
+            bash_guard: GuardRegistration::Registered,
+        }
+    }
+
+    /// All four variants, for tests that must hold for every one.
+    fn all_variants() -> [CarrierVariant; 4] {
+        let mut out = [guarded(StopHookRegistration::Registered); 4];
+        let mut i = 0;
+        for stop in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            for bash_guard in [GuardRegistration::Registered, GuardRegistration::Omitted] {
+                out[i] = CarrierVariant { stop, bash_guard };
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Every placeholder pointed at the same throwaway path.
+    fn same_path(p: &Path) -> ScriptPaths<'_> {
+        ScriptPaths {
+            session: p,
+            stop: p,
+            precompact: p,
+            policy: p,
+            bash_guard: p,
+        }
+    }
+
+    /// Distinct, recognisable script paths for assertions on WHICH script a
+    /// command resolved to.
+    const X_SESSION: &str = "/x/claude_session_hook.sh";
+    const X_STOP: &str = "/x/claude_stop_hook.sh";
+    const X_PRECOMPACT: &str = "/x/claude_precompact_hook.sh";
+    const X_POLICY: &str = "/x/claude_policy_hook.sh";
+    const X_GUARD: &str = "/x/claude_bash_guard_hook.sh";
+    fn x_paths() -> ScriptPaths<'static> {
+        ScriptPaths {
+            session: Path::new(X_SESSION),
+            stop: Path::new(X_STOP),
+            precompact: Path::new(X_PRECOMPACT),
+            policy: Path::new(X_POLICY),
+            bash_guard: Path::new(X_GUARD),
+        }
+    }
+
     /// The direct-exec carrier: a resolved path becomes the two-token pair, in
     /// that order, with the path VERBATIM (it is a Windows absolute path in
     /// production, so no quoting or normalization may creep in — the argv is
@@ -668,7 +866,7 @@ mod tests {
         assert!(settings_args_from(None).is_empty());
     }
 
-    /// Everything that must hold for BOTH variants: all four scripts on disk,
+    /// Everything that must hold for EVERY variant: all five scripts on disk,
     /// SessionStart + PreCompact registered and pointing at them, no
     /// unsubstituted placeholders, `permissions.allow` intact, and nothing
     /// outside the tempdir. Returns the parsed settings for variant-specific
@@ -676,16 +874,21 @@ mod tests {
     fn assert_variant_invariants(
         tmp: &Path,
         settings_path: &Path,
-        reg: StopHookRegistration,
+        variant: CarrierVariant,
     ) -> serde_json::Value {
         // Settings file exists at the returned path with the VARIANT's name.
         assert!(settings_path.exists());
         assert_eq!(
             settings_path.file_name().unwrap().to_string_lossy(),
-            reg.settings_name()
+            variant.settings_name()
+        );
+        // The guard script is materialized whatever the dial says.
+        assert!(
+            tmp.join(BASH_GUARD_HOOK_SCRIPT_NAME).exists(),
+            "bash-guard script materialized"
         );
 
-        // All four scripts exist alongside it — registration is gated,
+        // All the scripts exist alongside it — registration is gated,
         // MATERIALIZATION is not.
         let script_path = tmp.join(HOOK_SCRIPT_NAME);
         let stop_script_path = tmp.join(STOP_HOOK_SCRIPT_NAME);
@@ -709,6 +912,7 @@ mod tests {
             STOP_HOOK_SCRIPT_PLACEHOLDER,
             PRECOMPACT_HOOK_SCRIPT_PLACEHOLDER,
             POLICY_HOOK_SCRIPT_PLACEHOLDER,
+            BASH_GUARD_HOOK_SCRIPT_PLACEHOLDER,
         ] {
             assert!(
                 !settings_text.contains(placeholder),
@@ -716,6 +920,33 @@ mod tests {
             );
         }
         let v: serde_json::Value = serde_json::from_str(&settings_text).unwrap();
+
+        // The PreToolUse key follows the GUARD switch, independently of Stop.
+        match variant.bash_guard {
+            GuardRegistration::Registered => {
+                let block = &v["hooks"]["PreToolUse"][0];
+                assert_eq!(block["matcher"].as_str(), Some("Bash"));
+                let cmd = block["hooks"][0]["command"]
+                    .as_str()
+                    .expect("PreToolUse registered when the guard is on");
+                assert!(cmd.contains(BASH_GUARD_HOOK_SCRIPT_NAME), "{cmd}");
+                assert_eq!(
+                    block["hooks"][0]["if"].as_str(),
+                    Some("Bash(*rm *)"),
+                    "the hook-level `if` filter keeps bash from starting for rm-free commands"
+                );
+            }
+            GuardRegistration::Omitted => assert!(
+                !v["hooks"].as_object().unwrap().contains_key("PreToolUse"),
+                "no PreToolUse key when the tenant dial is off"
+            ),
+        }
+        match variant.stop {
+            StopHookRegistration::Registered => assert!(v["hooks"]["Stop"].is_array()),
+            StopHookRegistration::Omitted => {
+                assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"))
+            }
+        }
 
         // SessionStart is load-bearing for identity pinning — never gated.
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -897,10 +1128,13 @@ mod tests {
     #[test]
     fn materialize_registered_writes_all_files_and_registers_stop() {
         let tmp = tempfile::tempdir().unwrap();
-        let settings_path =
-            materialize_with(tmp.path(), StopHookRegistration::Registered).expect("materialize ok");
-        let v =
-            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Registered);
+        let settings_path = materialize_with(tmp.path(), guarded(StopHookRegistration::Registered))
+            .expect("materialize ok");
+        let v = assert_variant_invariants(
+            tmp.path(),
+            &settings_path,
+            guarded(StopHookRegistration::Registered),
+        );
 
         // The SAME settings file registers the Stop continuation-verdict hook
         // (session-autonomy-fabric Phase 1) pointing at the materialized stop
@@ -927,10 +1161,13 @@ mod tests {
     #[test]
     fn materialize_omitted_drops_the_stop_key_and_keeps_everything_else() {
         let tmp = tempfile::tempdir().unwrap();
-        let settings_path =
-            materialize_with(tmp.path(), StopHookRegistration::Omitted).expect("materialize ok");
-        let v =
-            assert_variant_invariants(tmp.path(), &settings_path, StopHookRegistration::Omitted);
+        let settings_path = materialize_with(tmp.path(), guarded(StopHookRegistration::Omitted))
+            .expect("materialize ok");
+        let v = assert_variant_invariants(
+            tmp.path(),
+            &settings_path,
+            guarded(StopHookRegistration::Omitted),
+        );
 
         // THE POINT: a dark session gets no `Stop` key at all, so Claude never
         // spawns `bash` for it once per assistant turn.
@@ -953,8 +1190,9 @@ mod tests {
     #[test]
     fn the_two_variants_write_distinct_settings_files_that_coexist() {
         let tmp = tempfile::tempdir().unwrap();
-        let armed = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
-        let dark = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let armed =
+            materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
+        let dark = materialize_with(tmp.path(), guarded(StopHookRegistration::Omitted)).unwrap();
         assert_ne!(
             armed, dark,
             "the two variants must not share one machine-global filename"
@@ -979,7 +1217,8 @@ mod tests {
         // OTHER variant's file is clobbered by another process. The armed
         // instance's cached path is unaffected, because it is a different file.
         std::fs::write(&dark, "{}").unwrap();
-        let armed_again = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let armed_again =
+            materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
         assert_eq!(armed_again, armed);
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&armed_again).unwrap()).unwrap();
@@ -1007,25 +1246,25 @@ mod tests {
     #[test]
     fn a_cache_hit_skips_the_rewrite_and_a_deleted_file_forces_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let a = materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
         let original = std::fs::read_to_string(&a).unwrap();
 
         // Cache HIT is observable: clobber the settings content, call again with
-        // the same (base_dir, variant) — all four files still exist, so the call
+        // the same (base_dir, variant) — all six files still exist, so the call
         // short-circuits and our clobbered bytes are still there.
         std::fs::write(&a, "{\"clobbered\":true}").unwrap();
-        let b = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let b = materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
         assert_eq!(a, b, "stable settings path across calls");
         assert_eq!(
             std::fs::read_to_string(&b).unwrap(),
             "{\"clobbered\":true}",
-            "a cached call must not rewrite the four files"
+            "a cached call must not rewrite the six files"
         );
 
         // Cache MISS on a missing file: delete the settings file and the next
         // call falls through to a full rewrite that restores it.
         std::fs::remove_file(&a).unwrap();
-        let c = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let c = materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
         assert_eq!(a, c);
         assert_eq!(
             std::fs::read_to_string(&c).unwrap(),
@@ -1033,10 +1272,10 @@ mod tests {
             "an externally deleted file forces a rewrite"
         );
 
-        // Same for a deleted SCRIPT — the existence check covers all four.
+        // Same for a deleted SCRIPT — the existence check covers all six.
         std::fs::write(&c, "{\"clobbered\":true}").unwrap();
         std::fs::remove_file(tmp.path().join(STOP_HOOK_SCRIPT_NAME)).unwrap();
-        let d = materialize_with(tmp.path(), StopHookRegistration::Registered).unwrap();
+        let d = materialize_with(tmp.path(), guarded(StopHookRegistration::Registered)).unwrap();
         assert_eq!(
             std::fs::read_to_string(&d).unwrap(),
             original,
@@ -1045,42 +1284,153 @@ mod tests {
         assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
     }
 
-    /// The production entry point is the env wrapper, so pin that it picks the
-    /// variant — and therefore the delivered FILE — from the live flag.
+    /// The production entry point resolves the variant itself, so pin that it
+    /// picks the variant — and therefore the delivered FILE — from the live
+    /// Stop flag AND the cached `command_safety_rewrite` dial.
     #[test]
     fn materialize_reads_the_live_flag_and_delivers_that_variants_file() {
         use crate::mcp::continuation_verdict::FLAG_ENV;
         let _lock = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[FLAG_ENV]);
+        let _dial = crate::mcp::fleet_policy_poller::pin_command_safety_rewrite_for_test();
 
         let dark_dir = tempfile::tempdir().unwrap();
         std::env::remove_var(FLAG_ENV);
         let dark = materialize(dark_dir.path()).unwrap();
         assert_eq!(
             dark.file_name().unwrap().to_string_lossy(),
-            HOOK_SETTINGS_NAME_NOSTOP,
-            "the DEFAULT posture delivers the no-Stop settings file"
+            "claude_hook_settings-nostop.json",
+            "the DEFAULT posture (Stop dark, dial unanswered ⇒ guard on) delivers the no-Stop \
+             file, guard included"
         );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dark).unwrap()).unwrap();
         assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
+        assert!(v["hooks"]["PreToolUse"].is_array());
 
         let armed_dir = tempfile::tempdir().unwrap();
         std::env::set_var(FLAG_ENV, "observe");
         let armed = materialize(armed_dir.path()).unwrap();
         assert_eq!(
             armed.file_name().unwrap().to_string_lossy(),
-            HOOK_SETTINGS_NAME,
+            "claude_hook_settings.json",
             "an armed flag delivers the Stop-registering settings file"
         );
+    }
+
+    /// Phase 3 of the command-safety plan: the dial decides the `PreToolUse`
+    /// key through the PRODUCTION entry point. Off ⇒ no key; on, unanswered
+    /// (no cache) and unrecognised ⇒ the key. And a flip in one process yields
+    /// the new variant on the NEXT materialize — the cache must not pin the
+    /// first variant forever.
+    #[test]
+    fn materialize_registers_the_bash_guard_per_the_tenant_dial() {
+        use crate::mcp::continuation_verdict::FLAG_ENV;
+        use crate::mcp::fleet_policy_poller::CommandSafetyRewriteLevel;
+        let _lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[FLAG_ENV]);
+        std::env::remove_var(FLAG_ENV);
+        let dial = crate::mcp::fleet_policy_poller::pin_command_safety_rewrite_for_test();
+
+        let has_guard = |path: &Path| {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            v["hooks"].as_object().unwrap().contains_key("PreToolUse")
+        };
+        // ONE dir across every flip, so the per-process cache is in play.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Unanswered, no cache ⇒ on.
+        let p = materialize(tmp.path()).unwrap();
+        assert!(has_guard(&p), "unanswered ⇒ guard registered (D6)");
+
+        dial.set(CommandSafetyRewriteLevel::Off);
+        let p = materialize(tmp.path()).unwrap();
+        assert_eq!(
+            p.file_name().unwrap().to_string_lossy(),
+            "claude_hook_settings-nostop-noguard.json"
+        );
+        assert!(!has_guard(&p), "dial off ⇒ carrier has NO PreToolUse key");
+
+        dial.set(CommandSafetyRewriteLevel::On);
+        let p = materialize(tmp.path()).unwrap();
+        assert_eq!(
+            p.file_name().unwrap().to_string_lossy(),
+            "claude_hook_settings-nostop.json",
+            "a flip back yields the guarded variant for the next spawn"
+        );
+        assert!(has_guard(&p));
+
+        dial.set(CommandSafetyRewriteLevel::Unrecognised);
+        let p = materialize(tmp.path()).unwrap();
+        assert!(has_guard(&p), "an unrecognised level reads as on");
+    }
+
+    /// D7: the name is a product of independent switches, one suffix each.
+    #[test]
+    fn settings_names_compose_one_suffix_per_switched_off_key() {
+        let names: Vec<String> = all_variants().iter().map(|v| v.settings_name()).collect();
+        assert_eq!(
+            names,
+            [
+                "claude_hook_settings.json",
+                "claude_hook_settings-noguard.json",
+                "claude_hook_settings-nostop.json",
+                "claude_hook_settings-nostop-noguard.json",
+            ]
+        );
+        assert_eq!(
+            CarrierVariant {
+                stop: StopHookRegistration::Omitted,
+                bash_guard: GuardRegistration::Registered,
+            }
+            .describe(),
+            "stop=omitted bash_guard=registered"
+        );
+    }
+
+    #[test]
+    fn guard_registration_maps_the_dial_level() {
+        use crate::mcp::fleet_policy_poller::CommandSafetyRewriteLevel::{Off, On, Unrecognised};
+        assert_eq!(
+            GuardRegistration::from_level(On),
+            GuardRegistration::Registered
+        );
+        assert_eq!(
+            GuardRegistration::from_level(Unrecognised),
+            GuardRegistration::Registered
+        );
+        assert_eq!(
+            GuardRegistration::from_level(Off),
+            GuardRegistration::Omitted
+        );
+    }
+
+    /// Every variant writes its own file in one shared dir, and each keeps the
+    /// content its switches imply after the others were written beside it.
+    #[test]
+    fn all_four_variants_coexist_in_one_machine_global_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = all_variants()
+            .iter()
+            .map(|v| materialize_with(tmp.path(), *v).unwrap())
+            .collect();
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i + 1) {
+                assert_ne!(a, b, "two variants must not share a filename");
+            }
+        }
+        for (variant, path) in all_variants().iter().zip(&paths) {
+            assert_variant_invariants(tmp.path(), path, *variant);
+        }
     }
 
     #[test]
     fn materialize_omitted_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let a = materialize_with(tmp.path(), guarded(StopHookRegistration::Omitted)).unwrap();
         let before = std::fs::read_to_string(&a).unwrap();
-        let b = materialize_with(tmp.path(), StopHookRegistration::Omitted).unwrap();
+        let b = materialize_with(tmp.path(), guarded(StopHookRegistration::Omitted)).unwrap();
         assert_eq!(a, b, "stable settings path across calls");
         assert!(a.exists());
         assert_eq!(
@@ -1095,10 +1445,7 @@ mod tests {
     /// the raw escaped bytes, which differ per platform.
     #[test]
     fn emitted_settings_round_trip_with_platform_native_paths() {
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
+        for reg in all_variants() {
             let tmp = tempfile::tempdir().unwrap();
             let settings_path = materialize_with(tmp.path(), reg).unwrap();
             let text = std::fs::read_to_string(&settings_path).unwrap();
@@ -1170,13 +1517,14 @@ mod tests {
                 r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]},{"hooks":[]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}]}}"##,
             ),
         ];
+        // Every variant. The fixtures carry no `PreToolUse` key, so under a
+        // REGISTERED guard each also fails for that reason; the guard-omitted
+        // variants are the ones that prove each fixture fails for the reason
+        // it NAMES.
         for (name, template) in bad {
-            for reg in [
-                StopHookRegistration::Registered,
-                StopHookRegistration::Omitted,
-            ] {
+            for reg in all_variants() {
                 assert!(
-                    build_settings(template, p, p, p, p, reg).is_none(),
+                    build_settings(template, &same_path(p), reg).is_none(),
                     "{name} ({reg:?}) must fail open with None, not panic or partial output"
                 );
             }
@@ -1195,15 +1543,62 @@ mod tests {
                 r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"Stop":[{}]}}"##,
             ),
         ];
+        let no_guard = |stop| CarrierVariant {
+            stop,
+            bash_guard: GuardRegistration::Omitted,
+        };
         for (name, template) in bad_stop_only {
             assert!(
-                build_settings(template, p, p, p, p, StopHookRegistration::Registered).is_none(),
+                build_settings(
+                    template,
+                    &same_path(p),
+                    no_guard(StopHookRegistration::Registered)
+                )
+                .is_none(),
                 "{name} must fail open when the Stop hook is being registered"
             );
-            let out = build_settings(template, p, p, p, p, StopHookRegistration::Omitted)
-                .unwrap_or_else(|| panic!("{name}: a dropped Stop key is not a build failure"));
+            let out = build_settings(
+                template,
+                &same_path(p),
+                no_guard(StopHookRegistration::Omitted),
+            )
+            .unwrap_or_else(|| panic!("{name}: a dropped Stop key is not a build failure"));
             let v: serde_json::Value = serde_json::from_str(&out).unwrap();
             assert!(!v["hooks"].as_object().unwrap().contains_key("Stop"));
+        }
+
+        // The SAME rule for the guard, independently of Stop (D7): a malformed
+        // `PreToolUse` block is fatal only when the guard is registered.
+        let bad_guard_only = [
+            (
+                "PreToolUse an empty array",
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PreToolUse":[]}}"##,
+            ),
+            (
+                "PreToolUse command with an unknown placeholder",
+                r##"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '@@NOPE@@'"}]}]}}"##,
+            ),
+        ];
+        for (name, template) in bad_guard_only {
+            let guard = |bash_guard| CarrierVariant {
+                stop: StopHookRegistration::Omitted,
+                bash_guard,
+            };
+            assert!(
+                build_settings(
+                    template,
+                    &same_path(p),
+                    guard(GuardRegistration::Registered)
+                )
+                .is_none(),
+                "{name} must fail open when the guard is being registered"
+            );
+            let out = build_settings(template, &same_path(p), guard(GuardRegistration::Omitted))
+                .unwrap_or_else(|| {
+                    panic!("{name}: a dropped PreToolUse key is not a build failure")
+                });
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert!(!v["hooks"].as_object().unwrap().contains_key("PreToolUse"));
         }
     }
 
@@ -1221,20 +1616,15 @@ mod tests {
             },
             "permissions": { "allow": ["mcp__coord-mcp"] }
         }"#;
-        let session = Path::new("/x/claude_session_hook.sh");
-        let stop = Path::new("/x/claude_stop_hook.sh");
-        let precompact = Path::new("/x/claude_precompact_hook.sh");
-        let policy = Path::new("/x/claude_policy_hook.sh");
+        let session = Path::new(X_SESSION);
+        let precompact = Path::new(X_PRECOMPACT);
+        let dark = CarrierVariant {
+            stop: StopHookRegistration::Omitted,
+            bash_guard: GuardRegistration::Omitted,
+        };
 
-        let out = build_settings(
-            NO_STOP,
-            session,
-            stop,
-            precompact,
-            policy,
-            StopHookRegistration::Omitted,
-        )
-        .expect("a Stop-less template builds in the dark variant");
+        let out = build_settings(NO_STOP, &x_paths(), dark)
+            .expect("a Stop-less (and guard-less) template builds in the dark variant");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         assert!(
@@ -1266,34 +1656,46 @@ mod tests {
         assert!(
             build_settings(
                 NO_STOP,
-                session,
-                stop,
-                precompact,
-                policy,
-                StopHookRegistration::Registered
+                &x_paths(),
+                CarrierVariant {
+                    stop: StopHookRegistration::Registered,
+                    ..dark
+                }
             )
             .is_none(),
             "no Stop key to register ⇒ the armed build fails open"
+        );
+        // …and the same for the guard: a template with no `PreToolUse` key is
+        // a valid `-noguard` template and an invalid guarded one.
+        assert!(
+            build_settings(
+                NO_STOP,
+                &x_paths(),
+                CarrierVariant {
+                    bash_guard: GuardRegistration::Registered,
+                    ..dark
+                }
+            )
+            .is_none(),
+            "no PreToolUse key to register ⇒ the guarded build fails open"
         );
     }
 
     /// FIX 5(c) — the substitution→parse/serialize rewrite is exactly the change
     /// a snapshot guards. Assert on PARSED values (key order and whitespace are
-    /// irrelevant): the armed output registers EXACTLY the three events, each
-    /// pointing at its own script, with `permissions.allow` intact.
+    /// irrelevant): the fully-armed output registers EXACTLY the four events,
+    /// each pointing at its own script, with `permissions.allow` intact.
     #[test]
-    fn armed_settings_registers_exactly_the_three_events_with_the_expected_commands() {
-        let session = Path::new("/x/claude_session_hook.sh");
-        let stop = Path::new("/x/claude_stop_hook.sh");
-        let precompact = Path::new("/x/claude_precompact_hook.sh");
-        let policy = Path::new("/x/claude_policy_hook.sh");
+    fn armed_settings_registers_exactly_the_four_events_with_the_expected_commands() {
+        let session = Path::new(X_SESSION);
+        let stop = Path::new(X_STOP);
+        let precompact = Path::new(X_PRECOMPACT);
+        let policy = Path::new(X_POLICY);
+        let guard = Path::new(X_GUARD);
         let out = build_settings(
             HOOK_SETTINGS,
-            session,
-            stop,
-            precompact,
-            policy,
-            StopHookRegistration::Registered,
+            &x_paths(),
+            guarded(StopHookRegistration::Registered),
         )
         .expect("the bundled template builds when armed");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1303,8 +1705,8 @@ mod tests {
         events.sort_unstable();
         assert_eq!(
             events,
-            ["PreCompact", "SessionStart", "Stop"],
-            "exactly the three events, no more and no fewer"
+            ["PreCompact", "PreToolUse", "SessionStart", "Stop"],
+            "exactly the four events, no more and no fewer"
         );
 
         // Command COUNT per event, stated explicitly. `SessionStart` carries
@@ -1313,7 +1715,12 @@ mod tests {
         // blanket "one command per event" would have been true before
         // `2026-08-08-runner-enforced-policy-pull` Phase 1 and is now exactly
         // the assumption this module must not make.
-        for (event, commands) in [("SessionStart", 2), ("Stop", 1), ("PreCompact", 1)] {
+        for (event, commands) in [
+            ("SessionStart", 2),
+            ("Stop", 1),
+            ("PreCompact", 1),
+            ("PreToolUse", 1),
+        ] {
             let blocks = hooks[event].as_array().unwrap();
             assert_eq!(blocks.len(), 1, "{event}: one matcher block");
             let inner = blocks[0]["hooks"].as_array().unwrap();
@@ -1331,6 +1738,7 @@ mod tests {
             ("SessionStart", 1, policy),
             ("Stop", 0, stop),
             ("PreCompact", 0, precompact),
+            ("PreToolUse", 0, guard),
         ] {
             assert_eq!(
                 hooks[event][0]["hooks"][index]["command"].as_str(),
@@ -1338,6 +1746,15 @@ mod tests {
                 "{event}[{index}]: command points at its OWN script"
             );
         }
+
+        // The guard's registration shape, exactly as Phase 0 probed it on
+        // Claude Code 2.1.288: matcher `Bash` on the block, and the `if`
+        // permission-rule filter on the hook entry beside `type`/`command`.
+        assert_eq!(hooks["PreToolUse"][0]["matcher"].as_str(), Some("Bash"));
+        assert_eq!(
+            hooks["PreToolUse"][0]["hooks"][0]["if"].as_str(),
+            Some("Bash(*rm *)")
+        );
 
         assert_eq!(
             v["permissions"]["allow"].as_array(),
@@ -1372,17 +1789,17 @@ mod tests {
               ]
             }
         }"#;
-        let session = Path::new("/x/claude_session_hook.sh");
-        let stop = Path::new("/x/claude_stop_hook.sh");
-        let precompact = Path::new("/x/claude_precompact_hook.sh");
-        let policy = Path::new("/x/claude_policy_hook.sh");
+        let session = Path::new(X_SESSION);
+        let stop = Path::new(X_STOP);
+        let precompact = Path::new(X_PRECOMPACT);
+        let policy = Path::new(X_POLICY);
         let out = build_settings(
             MULTI,
-            session,
-            stop,
-            precompact,
-            policy,
-            StopHookRegistration::Registered,
+            &x_paths(),
+            CarrierVariant {
+                stop: StopHookRegistration::Registered,
+                bash_guard: GuardRegistration::Omitted,
+            },
         )
         .expect("a multi-block template builds");
         assert!(
@@ -1470,12 +1887,9 @@ mod tests {
         // Sanity: the real bundled template is well-formed in both variants —
         // otherwise the negative test above would pass vacuously.
         let p = Path::new("/tmp/x.sh");
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
+        for reg in all_variants() {
             assert!(
-                build_settings(HOOK_SETTINGS, p, p, p, p, reg).is_some(),
+                build_settings(HOOK_SETTINGS, &same_path(p), reg).is_some(),
                 "the bundled template builds under {reg:?}"
             );
         }
@@ -1484,10 +1898,7 @@ mod tests {
         // partial settings file — while the scripts (materialization, not
         // registration) are still written, and the cache is not poisoned.
         let tmp = tempfile::tempdir().unwrap();
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
+        for reg in all_variants() {
             let settings_path = tmp.path().join(reg.settings_name());
             assert!(
                 materialize_from_template(tmp.path(), reg, "{ not json").is_none(),
@@ -1501,11 +1912,14 @@ mod tests {
             assert!(tmp.path().join(HOOK_SCRIPT_NAME).exists());
             assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
             assert!(tmp.path().join(PRECOMPACT_HOOK_SCRIPT_NAME).exists());
+            assert!(tmp.path().join(BASH_GUARD_HOOK_SCRIPT_NAME).exists());
         }
 
         // A later good build still works — the failed attempt cached nothing.
-        let dark_settings = tmp.path().join(HOOK_SETTINGS_NAME_NOSTOP);
-        let ok = materialize_with(tmp.path(), StopHookRegistration::Omitted);
+        let dark_settings = tmp
+            .path()
+            .join(guarded(StopHookRegistration::Omitted).settings_name());
+        let ok = materialize_with(tmp.path(), guarded(StopHookRegistration::Omitted));
         assert_eq!(ok.as_deref(), Some(dark_settings.as_path()));
         assert!(dark_settings.exists());
     }
@@ -1528,52 +1942,61 @@ mod tests {
 
     /// Only [`STOP_HOOK_SCRIPT`] may name a carrier FILE in its own header.
     ///
-    /// Splitting the carrier into two variant-named files made "the settings
-    /// file" a posture-dependent fact, and **exactly one of the two names
-    /// exists on a given box**: in the DEFAULT (dark) posture the file called
-    /// `claude_hook_settings.json` is precisely the one that is never written.
-    /// So a script header naming it is not merely imprecise — it sends an
-    /// operator debugging "why did my SessionStart hook not run?" to `stat` a
-    /// path that is absent by design, which reads as "the delivery never
-    /// happened". That is the same question
+    /// Splitting the carrier into variant-named files made "the settings file"
+    /// a posture-dependent fact: in the DEFAULT posture (Stop dark, guard on)
+    /// the file called `claude_hook_settings.json` is precisely one that is
+    /// never written. So a script header naming a carrier is not merely
+    /// imprecise — it sends an operator debugging "why did my SessionStart hook
+    /// not run?" to `stat` a path that may be absent by design, which reads as
+    /// "the delivery never happened". That is the same question
     /// `config_report_cmd::claude_settings_carrier_reading` exists to answer,
     /// and it must not get two different answers.
     ///
-    /// The `Stop` hook is the ONE exception, and for a structural reason rather
-    /// than a stylistic one: it is the only script whose REGISTRATION is gated,
-    /// so it is only ever registered in the armed carrier. Its carrier is fixed,
-    /// so it is the only one that can name it and still be true — and the
-    /// assertion below pins that it DOES, because that fact is what makes its
-    /// own dark-mode short-circuit vestigial for runner-spawned sessions.
+    /// The `Stop` hook is the ONE exception, for a structural reason: its
+    /// registration is gated by the one switch that is never per-tenant, so it
+    /// rides exactly the carriers WITHOUT `-nostop` — and the assertion below
+    /// pins that its header names both of those and neither `-nostop` one,
+    /// because that fact is what makes its own dark-mode short-circuit
+    /// vestigial for runner-spawned sessions. The bash guard is gated too, but
+    /// it rides carriers that differ by the Stop switch, so it may name none.
     ///
     /// Pure over `include_str!` constants, so it costs no IO and cannot go
     /// stale against the shipped resources the way a doc comment can.
     #[test]
     fn only_the_stop_script_may_name_a_carrier_file() {
-        // Registered unconditionally ⇒ each of these rides WHICHEVER carrier
-        // the flag selects, so neither name can be true for it.
+        // Every carrier name, built by the SHIPPING composer. Each is checked
+        // separately, NOT by one `contains` on the shortest: no name contains
+        // another (`-nostop` breaks the `.json`), so one check would miss the
+        // others entirely.
+        let carriers: Vec<String> = all_variants().iter().map(|v| v.settings_name()).collect();
         for (script_name, text) in [
             (HOOK_SCRIPT_NAME, HOOK_SCRIPT),
             (PRECOMPACT_HOOK_SCRIPT_NAME, PRECOMPACT_HOOK_SCRIPT),
             (POLICY_HOOK_SCRIPT_NAME, POLICY_HOOK_SCRIPT),
+            (BASH_GUARD_HOOK_SCRIPT_NAME, BASH_GUARD_HOOK_SCRIPT),
         ] {
-            // Checked separately, NOT by a single `contains` on the shorter
-            // name: `claude_hook_settings-nostop.json` does not contain
-            // `claude_hook_settings.json` (the `-nostop` breaks the `.json`),
-            // so one check would miss the other name entirely.
-            for carrier in [HOOK_SETTINGS_NAME, HOOK_SETTINGS_NAME_NOSTOP] {
+            for carrier in &carriers {
                 assert!(
-                    !text.contains(carrier),
-                    "{script_name} rides EITHER carrier, so its header must not name `{carrier}`"
+                    !text.contains(carrier.as_str()),
+                    "{script_name} rides more than one carrier, so its header must not name \
+                     `{carrier}`"
                 );
             }
         }
 
-        // The gated one: its carrier IS fixed, so naming it is the accurate
-        // thing to do, and the header must keep saying so.
-        assert!(
-            STOP_HOOK_SCRIPT.contains(HOOK_SETTINGS_NAME),
-            "{STOP_HOOK_SCRIPT_NAME} is armed-only, so its header must name `{HOOK_SETTINGS_NAME}`"
-        );
+        // The Stop hook: exactly the carriers whose Stop switch is registered.
+        for variant in all_variants() {
+            let name = variant.settings_name();
+            match variant.stop {
+                StopHookRegistration::Registered => assert!(
+                    STOP_HOOK_SCRIPT.contains(name.as_str()),
+                    "{STOP_HOOK_SCRIPT_NAME} rides `{name}`, so its header must name it"
+                ),
+                StopHookRegistration::Omitted => assert!(
+                    !STOP_HOOK_SCRIPT.contains(name.as_str()),
+                    "{STOP_HOOK_SCRIPT_NAME} is never registered in `{name}`"
+                ),
+            }
+        }
     }
 }

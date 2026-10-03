@@ -1348,8 +1348,8 @@ pub(crate) fn fleet_policy_dial_reading(
     let value = format!(
         "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
          thread ceilings warn={} crit={} | \
-         plan_capture={}{} (armed at {:?}; {}) | briefings: {} | poll interval {} ms | last refresh of \
-         the first three caches: {}",
+         plan_capture={}{} (armed at {:?}; {}) | command_safety_rewrite={}{} (guard {}; {}) | \
+         briefings: {} | poll interval {} ms | last refresh of the stampless caches (all but the briefings): {}",
         dial.install_intercept_mode,
         ambiguous(&dial.install_intercept_mode, dial.install_intercept_default),
         floor(dial.host_warn_free_bytes),
@@ -1367,6 +1367,21 @@ pub(crate) fn fleet_policy_dial_reading(
             "coord has NOT answered this process — the level is the unconfirmed default and \
              plan-capture writes are held"
         },
+        dial.command_safety_rewrite_level,
+        ambiguous(
+            dial.command_safety_rewrite_level,
+            dial.command_safety_rewrite_default
+        ),
+        if dial.command_safety_rewrite_guard_active {
+            "registered in new carriers"
+        } else {
+            "omitted from new carriers"
+        },
+        if dial.command_safety_rewrite_answered {
+            "coord has answered"
+        } else {
+            "coord has NOT answered this process — the level is the unconfirmed default"
+        },
         briefings,
         dial.poll_interval_ms,
         if dial.caches_expose_refresh_time {
@@ -1378,7 +1393,7 @@ pub(crate) fn fleet_policy_dial_reading(
     );
     LayerReading::known(
         value,
-        "mcp::fleet_policy_poller::dial_snapshot (four process-global caches, one poll loop — \
+        "mcp::fleet_policy_poller::dial_snapshot (five process-global caches, one poll loop — \
          TIME-VARYING with no restart)",
         captured_at,
     )
@@ -1414,17 +1429,28 @@ pub(crate) fn fleet_policy_dial_reading(
 ///
 /// # Why this does not call `materialize`
 ///
-/// `materialize` WRITES — four scripts, a settings file and up to three
+/// `materialize` WRITES — five scripts, a settings file and up to five
 /// `chmod`s. A diagnostic that materializes the thing it is describing changes
 /// the answer by asking the question, and would report `exists: true` on a
 /// machine where the spawn path had never succeeded. So the path comes from
 /// [`crate::session::claude_hook::settings_path`], which is the ONE definition
 /// the writer itself uses, and the existence bit comes from a plain `stat`.
+///
+/// # Why the guard dial is reported beside the variant
+///
+/// The `bash_guard` half of the variant is a function of the tenant's
+/// `command_safety_rewrite` dial as the poller last cached it, and "registered"
+/// reads the same whether coord said `on`, said nothing yet, or said something
+/// unrecognisable. So the row carries the resolved level and whether coord has
+/// answered, which is what separates "the tenant wants it" from "the runner
+/// defaulted to it".
 pub(crate) fn claude_settings_carrier_reading(
-    reg: crate::session::claude_hook::StopHookRegistration,
+    variant: crate::session::claude_hook::CarrierVariant,
     path: &std::path::Path,
     exists: bool,
     env_injected: Option<&str>,
+    command_safety_rewrite_level: &str,
+    command_safety_rewrite_answered: bool,
     captured_at: DateTime<Utc>,
 ) -> LayerReading {
     let fp = EnvFingerprinter::new();
@@ -1444,21 +1470,29 @@ pub(crate) fn claude_settings_carrier_reading(
     };
     LayerReading::known(
         format!(
-            "{} — on disk: {}; variant `{}`. Two appenders read this ONE file: the identity \
-             shim, for a PATH-resolved `claude`, and \
+            "{} — on disk: {}; variant `{}` (command_safety_rewrite={}, {}). Two appenders \
+             read this ONE file: the identity shim, for a PATH-resolved `claude`, and \
              `claude_hook::direct_spawn_settings_args`, for an autonomous spawn that execs \
              `claude` directly with no shim in the chain. BOTH append `--settings` ONLY when \
              that file exists (fail-open), so a `false` here means spawned sessions get NO \
              hook: no SessionStart confirmation, no SessionStart policy injection, no \
-             PreCompact, and no Stop. {}",
+             PreCompact, no Stop, and no PreToolUse Bash guard. The variant is chosen at \
+             SPAWN, so a dial flip reaches terminals and sessions started after it. {}",
             path.display(),
             exists,
-            reg.as_str(),
+            variant.describe(),
+            command_safety_rewrite_level,
+            if command_safety_rewrite_answered {
+                "coord has answered"
+            } else {
+                "coord has NOT answered this process — the level is the runner's default"
+            },
             injected,
         ),
         format!(
             "session::claude_hook::settings_path(session_restore_dir(), \
-             StopHookRegistration::from_env()) — variant read live from env {}",
+             CarrierVariant::resolve()) — Stop switch read live from env {}, guard switch from \
+             the cached command_safety_rewrite fleet-policy dial",
             crate::mcp::continuation_verdict::FLAG_ENV
         ),
         captured_at,
@@ -1819,11 +1853,12 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
     // Layer 12 — resolved through the writer's OWN path helper, and STATTED
     // rather than materialized: see `claude_settings_carrier_reading` on why a
     // diagnostic must not write the file it is describing.
-    let hook_reg = crate::session::claude_hook::StopHookRegistration::from_env();
+    let hook_variant = crate::session::claude_hook::CarrierVariant::resolve();
     let hook_path = crate::session::claude_hook::settings_path(
         &crate::session::claude_hook::session_restore_dir(),
-        hook_reg,
+        hook_variant,
     );
+    let dial = crate::mcp::fleet_policy_poller::dial_snapshot();
     let hook_exists = hook_path.is_file();
     let hook_env = std::env::var(crate::session::claude_hook::CLAUDE_SETTINGS_ENV).ok();
 
@@ -1856,17 +1891,16 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
             crate::prompt_library::cache_health(),
             now,
         )),
-        fleet_policy_dial: Some(fleet_policy_dial_reading(
-            &crate::mcp::fleet_policy_poller::dial_snapshot(),
-            now,
-        )),
         claude_settings_carrier: Some(claude_settings_carrier_reading(
-            hook_reg,
+            hook_variant,
             &hook_path,
             hook_exists,
             hook_env.as_deref(),
+            dial.command_safety_rewrite_level,
+            dial.command_safety_rewrite_answered,
             now,
         )),
+        fleet_policy_dial: Some(fleet_policy_dial_reading(&dial, now)),
         mcp_config_carrier: Some(mcp_config_carrier_reading(
             mcp_cfg_env.as_deref(),
             mcp_cfg_is_file,
@@ -3202,6 +3236,10 @@ mod tests {
             plan_capture_default: "record",
             plan_capture_record_level: "record",
             plan_capture_answered: true,
+            command_safety_rewrite_level: "on",
+            command_safety_rewrite_default: "on",
+            command_safety_rewrite_guard_active: true,
+            command_safety_rewrite_answered: true,
             briefings,
             caches_expose_refresh_time: false,
         }
@@ -3258,7 +3296,7 @@ mod tests {
 
         assert!(
             value.contains(
-                "last refresh of the first three caches: UNKNOWN — those caches hold a value \
+                "last refresh of the stampless caches (all but the briefings): UNKNOWN — those caches hold a value \
                  and no stamp; the report REFUSES to substitute its own read time"
             ),
             "the row must refuse to invent a refresh time: {value}"
@@ -3267,6 +3305,17 @@ mod tests {
         assert!(
             !value.contains("2026-08-22T12:34:56"),
             "the read time must never appear as a refresh time: {value}"
+        );
+
+        // The command-safety dial: resolved level, what it does to new
+        // carriers, and whether coord answered.
+        assert!(
+            value.contains(
+                "command_safety_rewrite=on [= resting default: EITHER the fleet says so OR no \
+                 poll has ever succeeded — this cache cannot tell them apart] (guard registered \
+                 in new carriers; coord has answered)"
+            ),
+            "got {value}"
         );
 
         // The cache that DOES know its refresh time reports it.
@@ -3355,14 +3404,21 @@ mod tests {
     /// and names the variant that produced the file name.
     #[test]
     fn config_report_settings_carrier_row_states_existence_and_variant() {
-        use crate::session::claude_hook::StopHookRegistration;
+        use crate::session::claude_hook::{
+            CarrierVariant, GuardRegistration, StopHookRegistration,
+        };
         use std::path::Path;
 
         let armed = claude_settings_carrier_reading(
-            StopHookRegistration::Registered,
+            CarrierVariant {
+                stop: StopHookRegistration::Registered,
+                bash_guard: GuardRegistration::Registered,
+            },
             Path::new("C:/hooks/claude_hook_settings.json"),
             true,
             None,
+            "on",
+            true,
             fixed_stamp(),
         );
         let LayerReading::Known { value, source, .. } = armed else {
@@ -3373,7 +3429,15 @@ mod tests {
             "got {value}"
         );
         assert!(value.contains("on disk: true"), "got {value}");
-        assert!(value.contains("variant `registered`"), "got {value}");
+        assert!(
+            value.contains("variant `stop=registered bash_guard=registered`"),
+            "the row names the COMPOSITE variant: {value}"
+        );
+        assert!(
+            value.contains("command_safety_rewrite=on, coord has answered"),
+            "the guard dial's level and answered-ness ride beside the variant: {value}"
+        );
+        assert!(value.contains("no PreToolUse Bash guard"), "got {value}");
         assert!(
             value.contains("BOTH append `--settings` ONLY when that file exists (fail-open)"),
             "the row must state WHY existence is the load-bearing fact: {value}"
@@ -3390,25 +3454,41 @@ mod tests {
             source.contains("QONTINUI_STOP_HOOK_CONTINUATION"),
             "the source must name the env var the variant is read from: {source}"
         );
+        assert!(
+            source.contains("command_safety_rewrite fleet-policy dial"),
+            "the source must name the dial the guard switch is read from: {source}"
+        );
 
         // The dark variant writes a DIFFERENT file, and a missing one means
         // spawned sessions get no hook at all.
         let dark = claude_settings_carrier_reading(
-            StopHookRegistration::Omitted,
-            Path::new("C:/hooks/claude_hook_settings-nostop.json"),
+            CarrierVariant {
+                stop: StopHookRegistration::Omitted,
+                bash_guard: GuardRegistration::Omitted,
+            },
+            Path::new("C:/hooks/claude_hook_settings-nostop-noguard.json"),
             false,
             None,
+            "off",
+            false,
             fixed_stamp(),
         );
         let LayerReading::Known { value, .. } = dark else {
             panic!("layer 12 is never withheld");
         };
         assert!(
-            value.contains("claude_hook_settings-nostop.json"),
+            value.contains("claude_hook_settings-nostop-noguard.json"),
             "got {value}"
         );
         assert!(value.contains("on disk: false"), "got {value}");
-        assert!(value.contains("variant `omitted`"), "got {value}");
+        assert!(
+            value.contains("variant `stop=omitted bash_guard=omitted`"),
+            "got {value}"
+        );
+        assert!(
+            value.contains("command_safety_rewrite=off, coord has NOT answered"),
+            "got {value}"
+        );
         assert!(
             value.contains("a `false` here means spawned sessions get NO hook"),
             "got {value}"
@@ -3465,7 +3545,9 @@ mod tests {
     /// arm this test exists to pin.
     #[test]
     fn config_report_carrier_rows_withhold_a_credential_shaped_value() {
-        use crate::session::claude_hook::StopHookRegistration;
+        use crate::session::claude_hook::{
+            CarrierVariant, GuardRegistration, StopHookRegistration,
+        };
         use std::path::Path;
 
         let jwt = "eyJhbGciOiJFZERTQSJ9.cGF5bG9hZA.c2ln";
@@ -3486,10 +3568,15 @@ mod tests {
         );
 
         let LayerReading::Known { value, .. } = claude_settings_carrier_reading(
-            StopHookRegistration::Registered,
+            CarrierVariant {
+                stop: StopHookRegistration::Registered,
+                bash_guard: GuardRegistration::Registered,
+            },
             Path::new("C:/hooks/claude_hook_settings.json"),
             true,
             Some(jwt),
+            "on",
+            true,
             fixed_stamp(),
         ) else {
             panic!("layer 12 is never withheld");
