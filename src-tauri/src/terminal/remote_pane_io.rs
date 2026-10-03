@@ -42,6 +42,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -165,7 +166,55 @@ pub fn closed_marker(code: &str, message: &str) -> Vec<u8> {
 pub struct GrantIdent {
     pub jti: String,
     pub grant: String,
+    /// When coord says this grant expires. `None` when the mint did not say
+    /// (or said something unparseable): UNKNOWN, not "never" — such a grant
+    /// gets no scheduled renewal and relies on the reactive path alone.
+    pub expires_at: Option<DateTime<Utc>>,
 }
+
+/// Coord's `expires_at` on a grant mint, read as RFC 3339 (coord serialises a
+/// `DateTime<Utc>`). Anything else — absent, not a string, unparseable — is
+/// `None`, the UNKNOWN arm.
+pub fn parse_grant_expiry(raw: Option<&Value>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw?.as_str()?)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Shared between a pane and every writer it hands out: once the pane has
+/// finished, no frame but its detach may leave (plan
+/// `2026-10-03-a-live-remote-tab-dies-when-its-attach-grant-expires`, D2 — a
+/// closed tab kept sending keystrokes, flow and resizes under its dead grant,
+/// and the relay answered each one `attach_not_registered`).
+#[derive(Debug, Default)]
+struct CloseGate {
+    closed: AtomicBool,
+    /// Frames refused because the pane had closed. The first is logged at
+    /// WARN with its type, so the caller still sending is named once.
+    refused: AtomicU64,
+}
+
+impl CloseGate {
+    /// `Err` (and the frame is NOT sent) once the pane has closed.
+    fn admit(&self, frame_type: &str, grant_jti: &str, terminal_id: &str) -> Result<(), String> {
+        if !self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.refused.fetch_add(1, Ordering::AcqRel) == 0 {
+            warn!(
+                grant_jti,
+                terminal_id,
+                frame_type,
+                "remote pane: a frame was sent after the pane closed — refused, not queued \
+                 (further refusals on this pane are counted, not logged)"
+            );
+        }
+        Err(REMOTE_PANE_CLOSED.to_string())
+    }
+}
+
+/// The error a closed pane's writer, resize, flow and probe answer with.
+pub const REMOTE_PANE_CLOSED: &str = "remote pane is closed";
 
 /// Wall-clock milliseconds since the Unix epoch — the clock every
 /// [`RemoteInteractivity`] timestamp is on, so the frontend's "Ns ago" reads
@@ -303,6 +352,8 @@ pub struct RemotePaneIo {
     history_start: Option<u64>,
     /// Input seq + the read/write receipts. See [`RemoteInteractivity`].
     interactivity: Arc<Mutex<InteractivityState>>,
+    /// Shut in [`Self::mark_exit`]; every writer holds it too.
+    close_gate: Arc<CloseGate>,
 }
 
 impl RemotePaneIo {
@@ -334,6 +385,7 @@ impl RemotePaneIo {
             ident: Arc::new(RwLock::new(GrantIdent {
                 jti: grant_jti.into(),
                 grant: grant.into(),
+                expires_at: None,
             })),
             terminal_id: terminal_id.into(),
             session_id: None,
@@ -369,6 +421,7 @@ impl RemotePaneIo {
                     }),
                 },
             })),
+            close_gate: Arc::new(CloseGate::default()),
         }
     }
 
@@ -468,6 +521,11 @@ impl RemotePaneIo {
     /// phantom turns that slot exists to catch. Only a target that has ALREADY
     /// acked on this attachment is known to honour the flag.
     pub fn send_input_probe(&self) -> Result<u64, String> {
+        self.close_gate.admit(
+            "remote_terminal_input",
+            &self.grant_jti(),
+            &self.terminal_id,
+        )?;
         let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         if g.snapshot.acks_since_attach == 0 {
             return Err(format!(
@@ -535,6 +593,29 @@ impl RemotePaneIo {
         self.target_device_id.as_deref()
     }
 
+    /// Record when the pane's FIRST grant expires (see
+    /// [`GrantIdent::expires_at`]); a renewal replaces it via [`Self::set_grant`].
+    pub fn with_grant_expires_at(self, expires_at: Option<DateTime<Utc>>) -> Self {
+        self.ident
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .expires_at = expires_at;
+        self
+    }
+
+    /// When the CURRENT grant expires, if coord said.
+    pub fn grant_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.ident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .expires_at
+    }
+
+    /// Frames refused because the pane had already closed.
+    pub fn frames_refused_after_close(&self) -> u64 {
+        self.close_gate.refused.load(Ordering::Acquire)
+    }
+
     pub fn grant_jti(&self) -> String {
         self.ident
             .read()
@@ -554,10 +635,16 @@ impl RemotePaneIo {
     /// Replace the grant this pane presents (a renewal). Every frame built
     /// after this — input, resize, flow, detach, reattach — carries the new
     /// jti. Returns the jti it replaced.
-    pub fn set_grant(&self, jti: impl Into<String>, grant: impl Into<String>) -> String {
+    pub fn set_grant(
+        &self,
+        jti: impl Into<String>,
+        grant: impl Into<String>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> String {
         let mut g = self.ident.write().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::replace(&mut g.jti, jti.into());
         g.grant = grant.into();
+        g.expires_at = expires_at;
         old
     }
 
@@ -701,8 +788,10 @@ impl RemotePaneIo {
     }
 
     /// Settle the exit code (first writer wins) and close the output channel
-    /// so a reader blocked in `read()` sees EOF.
+    /// so a reader blocked in `read()` sees EOF. From here on the pane sends
+    /// nothing but its detach.
     pub fn mark_exit(&self, code: i32) {
+        self.close_gate.closed.store(true, Ordering::Release);
         if let Ok(mut slot) = self.exit.lock() {
             if slot.is_none() {
                 *slot = Some(code);
@@ -848,6 +937,7 @@ struct FrameWriter {
     terminal_id: String,
     sink: Arc<dyn RemoteFrameSink>,
     interactivity: Arc<Mutex<InteractivityState>>,
+    close_gate: Arc<CloseGate>,
 }
 
 impl Write for FrameWriter {
@@ -855,6 +945,17 @@ impl Write for FrameWriter {
         if buf.is_empty() {
             return Ok(0);
         }
+        let jti = self
+            .ident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .jti
+            .clone();
+        // What a local PTY's writer answers after exit, which the session
+        // layer already handles.
+        self.close_gate
+            .admit("remote_terminal_input", &jti, &self.terminal_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
         // The lock is held across the (non-blocking) queue attempt so seq
         // order on the wire is seq order here, whichever writer sends. A seq
         // whose frame failed to queue is consumed anyway: seq need only be
@@ -866,7 +967,7 @@ impl Write for FrameWriter {
         self.sink
             .send_frame(json!({
                 "type": "remote_terminal_input",
-                "grant_jti": self.ident.read().unwrap_or_else(|e| e.into_inner()).jti.clone(),
+                "grant_jti": jti,
                 "terminal_id": self.terminal_id,
                 "data": STANDARD.encode(buf),
                 "seq": seq,
@@ -906,12 +1007,18 @@ impl PaneIo for RemotePaneIo {
             terminal_id: self.terminal_id.clone(),
             sink: self.sink.clone(),
             interactivity: self.interactivity.clone(),
+            close_gate: self.close_gate.clone(),
         }))
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
+        self.close_gate.admit(
+            "remote_terminal_resize",
+            &self.grant_jti(),
+            &self.terminal_id,
+        )?;
         self.send(json!({
             "type": "remote_terminal_resize",
             "grant_jti": self.grant_jti(),
@@ -945,6 +1052,8 @@ impl PaneIo for RemotePaneIo {
     }
 
     fn set_paused(&self, paused: bool) -> Result<(), String> {
+        self.close_gate
+            .admit("remote_terminal_flow", &self.grant_jti(), &self.terminal_id)?;
         self.send(json!({
             "type": "remote_terminal_flow",
             "grant_jti": self.grant_jti(),
@@ -1471,7 +1580,7 @@ pub(crate) mod tests {
         let sink = Arc::new(RecordingSink::default());
         let pane = pane(&sink, AttachedRing::default());
         let mut w = pane.writer().unwrap();
-        assert_eq!(pane.set_grant("jti-2", "grant-2.jwt"), "jti-1");
+        assert_eq!(pane.set_grant("jti-2", "grant-2.jwt", None), "jti-1");
         assert_eq!(pane.grant_jti(), "jti-2");
         w.write_all(b"x").unwrap();
         pane.resize(90, 30).unwrap();
@@ -1480,6 +1589,62 @@ pub(crate) mod tests {
         for frame in sink.frames() {
             assert_eq!(frame["grant_jti"], "jti-2", "{frame}");
         }
+    }
+
+    /// Plan 2026-10-03 D2: once the pane has finished, its writer (taken
+    /// before the close), resize, flow and probe queue nothing and answer
+    /// "closed" — counted per pane — while its detach still goes out.
+    #[test]
+    fn a_finished_pane_sends_nothing_but_its_detach() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let mut w = pane.writer().unwrap();
+        pane.record_input_ack(&json!({"seq": 1, "accepted": true, "bytes": 1}));
+        pane.mark_exit(0);
+
+        let err = w
+            .write(b"ls\r")
+            .expect_err("a closed pane's writer refuses");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            pane.resize(90, 30).unwrap_err(),
+            REMOTE_PANE_CLOSED.to_string()
+        );
+        assert!(pane.set_paused(true).is_err());
+        assert!(pane.send_input_probe().is_err());
+        assert!(pane.writer().unwrap().write(b"x").is_err());
+        assert!(sink.frames().is_empty(), "{:?}", sink.frames());
+        assert_eq!(pane.frames_refused_after_close(), 5);
+
+        pane.release(Duration::from_millis(10)).unwrap();
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["type"], "remote_terminal_detach");
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+    }
+
+    /// Coord's `expires_at` is an RFC 3339 string; anything else is UNKNOWN,
+    /// never a guessed time.
+    #[test]
+    fn grant_expiry_parses_rfc3339_and_nothing_else() {
+        let at = parse_grant_expiry(Some(&json!("2026-10-03T11:30:16Z"))).unwrap();
+        assert_eq!(at.to_rfc3339(), "2026-10-03T11:30:16+00:00");
+        let offset = parse_grant_expiry(Some(&json!("2026-10-03T13:30:16.5+02:00"))).unwrap();
+        assert_eq!(offset.timestamp(), at.timestamp());
+        assert_eq!(parse_grant_expiry(None), None);
+        assert_eq!(parse_grant_expiry(Some(&json!(1_790_000_000))), None);
+        assert_eq!(parse_grant_expiry(Some(&json!("tomorrow"))), None);
+        assert_eq!(parse_grant_expiry(Some(&Value::Null)), None);
+
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default()).with_grant_expires_at(Some(at));
+        assert_eq!(pane.grant_expires_at(), Some(at));
+        pane.set_grant("jti-2", "g2", None);
+        assert_eq!(
+            pane.grant_expires_at(),
+            None,
+            "a renewal replaces the expiry"
+        );
     }
 
     /// Only one supervisor may claim a pane at a time.
