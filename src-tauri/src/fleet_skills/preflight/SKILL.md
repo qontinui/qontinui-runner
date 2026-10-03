@@ -313,10 +313,25 @@ about to take, in addition to step 0's whole-plan reserve — never instead of i
    of `kind: "semantic_resource"`, `plan:<plan-slug>:phase:<n>` in place of
    `plan:<plan-slug>`, same owner token (`machine_id:agent_session_id`):
    ```bash
+   . <workspace-root>/qontinui-claude-config/scripts/lib/envelope.sh
+   R=$(mktemp)
    curl -s --max-time 120 -X POST "$COORD_HTTP_URL/claims/acquire" \
      -H "Content-Type: application/json" \
      -d "{\"kind\":\"phase\",\"resource_key\":\"plan:<plan-slug>:phase:<n>\",\
-          \"machine_id\":\"$MACHINE_ID\",\"agent_session_id\":\"$AGENT_SESSION_ID\"}"
+          \"machine_id\":\"$MACHINE_ID\",\"agent_session_id\":\"$AGENT_SESSION_ID\"}" > "$R"
+   # claimed | renewed | held; topic_conflict / topic_unknown / invalid_topic /
+   # tenant_not_bound are surfaced verbatim (forking_sibling is retired and never sent).
+   # An absent `result` is UNKNOWN (exit 3), never "free".
+   RES=$(envelope_require claims_acquire result "$R"); rc=$?
+   echo "result=$RES"
+   case "$RES" in
+     '"claimed"'|'"renewed"') echo "ttl_seconds=$(envelope_require claims_acquire ttl_seconds "$R")" ;;  # step 4's --ttl
+     '"held"') # coord omits current_holder_session for a bare-machine (legacy) holder
+               echo "holder_session=$(envelope_require claims_acquire current_holder_session "$R" 2>/dev/null || echo '<absent: bare-machine holder>')"
+               echo "holder_machine=$(envelope_require claims_acquire current_holder "$R")" ;;
+     *) [ "$rc" -eq 0 ] && { cat "$R"; echo; } ;;
+   esac
+   rm -f "$R"; [ "$rc" -eq 0 ] || echo "UNKNOWN: phase reserve unanswered (rc=$rc)"
    ```
 3. **Treat a foreign `held` on step 0's PLAN key as advisory only** — name the
    holder, do not stop — and **STOP only on a foreign `held` of the SAME phase
