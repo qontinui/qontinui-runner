@@ -49,6 +49,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Replace the session registered under `task_run_id` with `session`,
+    /// atomically, only when `expected` approves the one registered now.
+    /// `Err` (nothing changed) when no session is registered or `expected`
+    /// refuses it — the caller's view of what it is replacing is stale.
+    pub fn replace_if(
+        &self,
+        task_run_id: &str,
+        session: Arc<ClaudeSession>,
+        expected: impl FnOnce(&ClaudeSession) -> bool,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("SessionManager lock poisoned: {}", e))?;
+        match guard.get(task_run_id) {
+            None => Err(format!(
+                "no session registered for {task_run_id} — it was closed"
+            )),
+            Some(current) if !expected(current) => Err(format!(
+                "the session registered for {task_run_id} is no longer the one being replaced"
+            )),
+            Some(_) => {
+                guard.insert(task_run_id.to_string(), session);
+                info!("SessionManager: replaced session for {}", task_run_id);
+                Ok(())
+            }
+        }
+    }
+
     /// Get a session by task_run_id.
     pub fn get(&self, task_run_id: &str) -> Option<Arc<ClaudeSession>> {
         self.sessions
