@@ -4234,9 +4234,20 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_primary_tree_branch_status",
+    // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
+    // Phase 4: the post-land re-verification lane's three coord tools. This one
+    // is also covered by the `coord_query_` read-family prefix; it is named here
+    // anyway so the lane's full tool set is visible in one place and survives a
+    // future narrowing of that prefix. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
+    // is the grant authority; this list only forwards.
+    "coord_query_verification_metrics",
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
+    // Plan 2026-09-20-trust-calibration-… Phase 4: the verdict write door the
+    // `/reverify-shipped` lane POSTs through (coord refuses a verifier that is
+    // the unit's author; this list only forwards).
+    "coord_record_verification",
     "coord_reevaluate",
     "coord_reevaluate_dry",
     "coord_register_gate",
@@ -4260,6 +4271,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_twin_catalog",
     "coord_typecheck_file",
     "coord_unmute_gate",
+    // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
+    "coord_verification_queue",
     "coord_who_is_working_on",
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
@@ -15403,6 +15416,39 @@ mod coord_mcp_body_gate_tests {
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously`
+    /// Phase 4: the re-verification lane's three tools forward, each sits in
+    /// sorted position (membership is a `binary_search`), and the source-text
+    /// parser `build_drift` runs over this file reads each exactly once — the
+    /// comments above them must not hide one or add a phantom.
+    #[test]
+    fn verification_lane_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_query_verification_metrics",
+            "coord_record_verification",
+            "coord_verification_queue",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position in COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also be a deliberate exclusion"
+            );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
                 1,
