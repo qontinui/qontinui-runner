@@ -46,8 +46,14 @@ rem ---- recursion guard: a nested invocation never re-signals ----------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
 
 rem ---- only a launch that can start a session signals (see the bash twin) ---
+rem The first argument is taken through a FOR variable, never as "%~1" inside
+rem an IF: a first argument carrying its own quotes (--config="a b") unbalances
+rem "%~1" and breaks the IF, while %%~A is substituted after the line is
+rem parsed. Compared with delayed expansion for the same reason.
+set "ARG1="
+for %%A in (%1) do if not defined ARG1 set "ARG1=%%~A"
 for %%S in (login logout mcp plugin app-server remote-control completion update doctor sandbox debug apply a queue archive delete migrate-rollouts unarchive cloud exec-server features agents help -h --help -V --version) do (
-  if /I "%~1"=="%%S" goto :passthrough
+  if /I "!ARG1!"=="%%S" goto :passthrough
 )
 
 rem ---- best-effort start signal (NO session_id). Never load-bearing. --------
@@ -63,10 +69,29 @@ if defined QONTINUI_INSTALL_INTERCEPT_PORT (
 
 :passthrough
 rem Run the REAL CLI with the user's args UNCHANGED.
-set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
-if defined REAL (
-  call "%REAL%" %*
-) else (
-  call %TOOL% %*
+rem
+rem Leave the delayed-expansion scope FIRST. With delayed expansion on, the
+rem line that expands %* strips every "!" from the user's arguments (and a
+rem caret before one), and CALL doubles their carets. REAL crosses ENDLOCAL
+rem through a FOR variable (the R prefix keeps an unresolved REAL non-empty);
+rem the guard is set in a fresh SETLOCAL so it reaches the child without
+rem leaking into the caller's cmd session.
+for /f "delims=" %%R in ("R!REAL!") do (
+  endlocal
+  setlocal DisableDelayedExpansion
+  set "QSHIM_REAL=%%R"
 )
-endlocal & exit /b %ERRORLEVEL%
+set "QSHIM_REAL=%QSHIM_REAL:~1%"
+set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
+if not defined QSHIM_REAL goto :run_by_name
+rem An .exe runs directly (no CALL: nothing doubles its arguments' carets);
+rem a .cmd/.bat needs CALL to come back with its exit code.
+if /I "%QSHIM_REAL:~-4%"==".exe" goto :run_exe
+call "%QSHIM_REAL%" %*
+exit /b %ERRORLEVEL%
+:run_exe
+"%QSHIM_REAL%" %*
+exit /b %ERRORLEVEL%
+:run_by_name
+@@TOOL@@ %*
+exit /b %ERRORLEVEL%
