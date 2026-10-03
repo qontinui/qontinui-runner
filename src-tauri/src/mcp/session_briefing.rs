@@ -416,7 +416,7 @@ pub(crate) fn validate_body(body: &str) -> Result<(), String> {
 /// single spawn, so an unkeyed `warn!` here would be one line per session.
 static LOGGED_REJECTIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-fn log_rejection_once(name: &str, version: i64, reason: &str) {
+pub(crate) fn log_rejection_once(name: &str, version: i64, reason: &str) {
     let key = format!("v{version}: {reason}");
     let Ok(mut seen) = LOGGED_REJECTIONS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1532,8 +1532,20 @@ mod tests {
         .expect("the builtin clause must validate — coord seeds it verbatim");
         validate_body(crate::terminal::PLAN_CAPTURE_CLAUSE_TEMPLATE)
             .expect("the clause's placeholder template IS the coord seed — it must validate");
-        validate_body(crate::mcp::ai_session::AI_SESSION_RULES_SUPERVISOR_AVAILABLE)
+        validate_body(crate::mcp::ai_session::AI_SESSION_RULES_TEMPLATE)
             .expect("the builtin ai-session rules must validate — coord seeds them verbatim");
+        let rules = crate::mcp::ai_session::builtin_rules_text("http://127.0.0.1:9876");
+        validate_body(&rules).expect("the rendered builtin ai-session rules must validate");
+        assert_eq!(
+            substitute(
+                crate::mcp::ai_session::AI_SESSION_RULES_TEMPLATE,
+                "http://127.0.0.1:9876",
+                "COORD",
+                "WEB"
+            ),
+            rules,
+            "the ai-session-rules seed must round-trip through substitution"
+        );
     }
 
     /// …and the placeholder-rewritten form coord will actually store. The seeds
