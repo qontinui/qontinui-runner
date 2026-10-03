@@ -361,7 +361,7 @@ pub(crate) enum SessionBus {
 /// non-UTF-8 value falls back too). One deliberate difference: zbus turns a
 /// set-but-BLANK value into `/bus`; this treats blank as unset. That only ever
 /// finds MORE sockets (`/run/user/<euid>/bus` exists on a lingering box,
-/// `/bus` never does), so it errs toward `Failed`, never toward a false
+/// `/bus` does not on any normal system), so it errs toward `Failed`, never toward a false
 /// "absent by design". PURE.
 pub(crate) fn session_bus_socket(xdg_runtime_dir: Option<&Path>, euid: u32) -> PathBuf {
     match xdg_runtime_dir.filter(|d| !d.as_os_str().is_empty()) {
@@ -371,15 +371,17 @@ pub(crate) fn session_bus_socket(xdg_runtime_dir: Option<&Path>, euid: u32) -> P
 }
 
 /// Whether a missing session-bus connection is "absent by design" rather than
-/// a failure: `DBUS_SESSION_BUS_ADDRESS` unset/blank AND nothing at the socket
-/// path zbus would try ([`session_bus_socket`]). Anything else is a bus that
-/// SHOULD have answered — a user-unit runner restarted while its bus was
-/// unreachable must not claim its own kind complete and delete its own rows.
+/// a failure: `DBUS_SESSION_BUS_ADDRESS` UNSET AND nothing at the socket path
+/// zbus would try ([`session_bus_socket`]). Anything else is a bus that SHOULD
+/// have answered — a user-unit runner restarted while its bus was unreachable
+/// must not claim its own kind complete and delete its own rows. A set-but-blank
+/// address counts as set: zbus does not treat it as unset (it fails to parse
+/// it), so it is a broken advertisement, not the absence of one.
 pub(crate) fn session_bus_absent_by_design(
     dbus_session_bus_address: Option<&str>,
     socket: &Path,
 ) -> bool {
-    dbus_session_bus_address.is_none_or(|a| a.trim().is_empty()) && !socket.exists()
+    dbus_session_bus_address.is_none() && !socket.exists()
 }
 
 /// The row key for a unit the D-Bus scan loaded under `listed` (the name it
@@ -1283,7 +1285,9 @@ DISPLAY_NAME: Print Spooler\r
         assert_eq!(socket, dir.join("bus"));
         // Nothing advertised and no socket: absent by design.
         assert!(session_bus_absent_by_design(None, &socket));
-        assert!(session_bus_absent_by_design(Some(" "), &socket));
+        // A blank address is a broken advertisement (zbus fails to parse it),
+        // never the absence of one.
+        assert!(!session_bus_absent_by_design(Some(" "), &socket));
         // An address is set: a bus that should have answered.
         assert!(!session_bus_absent_by_design(
             Some("unix:path=/run/user/4242/bus"),
@@ -1317,16 +1321,33 @@ DISPLAY_NAME: Print Spooler\r
     /// its target (or the reverse) collapses to the canonical name, once.
     #[test]
     fn dbus_rows_are_keyed_by_id_once() {
+        // Alias first: the row is keyed by the canonical Id, not the alias.
         let mut seen = std::collections::BTreeSet::new();
+        assert_eq!(
+            unit_row_key(
+                &mut seen,
+                Some("actions.runner.example-org.box.service".into()),
+                "actions.runner.example-alias.service".into()
+            ),
+            Some("actions.runner.example-org.box.service".to_string())
+        );
+        // Then the target itself: the same unit, no second row.
         assert_eq!(
             unit_row_key(
                 &mut seen,
                 Some("actions.runner.example-org.box.service".into()),
                 "actions.runner.example-org.box.service".into()
             ),
-            Some("actions.runner.example-org.box.service".to_string())
+            None
         );
-        // An alias name resolving to the same unit: no second row.
+        // Target first, then the alias: likewise one row.
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(unit_row_key(
+            &mut seen,
+            Some("actions.runner.example-org.box.service".into()),
+            "actions.runner.example-org.box.service".into()
+        )
+        .is_some());
         assert_eq!(
             unit_row_key(
                 &mut seen,
