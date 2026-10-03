@@ -21,23 +21,30 @@ HOSTED; nothing here can override them toward self-hosted.
      public-pool runner has passed onboarding (two consecutive forced runs green).
      Anything that is not one of the three words is UNKNOWN and routes hosted.
 
-  2. FORK CODE NEVER REACHES A FLEET HOST UNLESS THE APPROVAL GATE IS PROVEN. The
-     primary control for running a public repo's PR CI on our hardware is the repo's
-     fork-PR approval policy (`all_external_contributors`: every outside contributor's
-     run waits for the operator). decision_record/self-hosted-runners-on-public-repos
-     condition 1. A run whose head repo is not this repo routes self-hosted ONLY when this
-     script READ that policy and it says `all_external_contributors`. The read needs
-     repository-administration permission, which the GITHUB_TOKEN can never hold, so in
-     practice fork PRs stay hosted -- fail closed. Same-repo PRs need push access to exist
-     at all, so the approval gate is not what protects them; but if the policy IS
-     readable and reads anything weaker, EVERY run routes hosted (a weakened setting
-     fails closed for everyone, it never silently widens exposure).
+  2. FORK PRs ARE ROUTED HOSTED UNLESS THE APPROVAL GATE WAS READ. This is ROUTING, not a
+     security control: on `pull_request` GitHub runs the PR's own merge-commit workflow and
+     its own copy of this script, so a fork can target the pool directly by editing
+     `runs-on`. The security control is the repo's fork-PR approval policy
+     (`all_external_contributors`: every outside contributor's run waits for the operator --
+     decision_record/self-hosted-runners-on-public-repos condition 1) plus the isolation of
+     the pool host. What this rule buys is that an UNMODIFIED workflow never sends fork code
+     to the pool by accident. A run whose head repo is not this repo routes self-hosted only
+     when this script READ the policy as `all_external_contributors`; that read needs
+     repository-administration permission, which the GITHUB_TOKEN never holds, so in
+     practice forks stay hosted. If the policy IS readable (a future token) and reads
+     anything weaker, every run routes hosted. With the GITHUB_TOKEN that branch is
+     unreachable in production; the tests exercise it.
 
   3. A STALLED OR SATURATED POOL FALLS BACK. In `auto`, a matching self-hosted job in
      this repo queued >= RUNNER_PUBLIC_POOL_STALL_MINUTES (default 10), or >=
      RUNNER_PUBLIC_POOL_MAX_QUEUE_DEPTH (default 3) of them queued, routes hosted. Any
      read error, timeout or script fault is UNKNOWN and routes hosted. `self-hosted`
      skips this check (it is the trial/forcing lever) but never rules 1 and 2.
+     KNOWN LIMIT: a dead pool with NOTHING queued reads healthy, so the first job routed
+     to it waits (GitHub's queue limit, not timeout-minutes, bounds it) until a later
+     run sees it stalled. Only the 10 oldest in-flight runs are inspected; the reason
+     line says when more were skipped. Recovery for a stranded run: set the variable to
+     hosted and re-run ALL jobs (a failed-jobs re-run reuses the old route).
 
 WHAT IT NEVER ROUTES (D5), by construction rather than by this script: release.yml,
 build-python-executor.yml, published-parity.yml and reproducibility-gate.yml do not
@@ -94,6 +101,7 @@ class PoolObservation:
     queued: int = 0
     stalled: list[tuple[str, float]] = field(default_factory=list)
     runs_inspected: int = 0
+    runs_skipped: int = 0
 
 
 @dataclass
@@ -219,6 +227,7 @@ def decide(
     self_hosted.reason = (
         f"pool healthy: {pool.queued} {os_key} public-pool job(s) queued, none for >= {stall_minutes:g} min "
         f"across {pool.runs_inspected} in-flight run(s)"
+        + (f" ({pool.runs_skipped} newer run(s) not inspected)" if pool.runs_skipped else "")
     )
     return self_hosted
 
@@ -283,6 +292,7 @@ def gather_pool(api: Api, now: datetime, own_run_id: str, stall_minutes: float) 
         inspected += 1
     for pool_obs in obs.values():
         pool_obs.runs_inspected = inspected
+        pool_obs.runs_skipped = max(0, len(ordered) - inspected)
     return obs
 
 

@@ -15,6 +15,7 @@ or secret-bearing work reach a self-hosted host:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -199,10 +200,17 @@ class TreePins(unittest.TestCase):
                 self.assertNotIn("needs.route", text, f"{path.name}#{job_key} consumes the route")
 
     def test_secret_bearing_workflows_do_not_consume_the_route(self):
+        # Not just "no public-pool": a bare [self-hosted, Linux] would also match the
+        # pool runner, so these workflows may name no self-hosted label at all.
         for name in self.NEVER_ROUTED:
+            doc = self.load(WORKFLOWS / name)
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
             self.assertNotIn("route_pr_ci", text, name)
-            self.assertNotIn("public-pool", text, name)
+            self.assertNotIn("needs.route", text, name)
+            for job_key, job in (doc.get("jobs") or {}).items():
+                ro = str(job.get("runs-on", "")).lower()
+                for word in ("self-hosted", "public-pool", "qontinui"):
+                    self.assertNotIn(word, ro, f"{name}#{job_key} runs-on names {word!r}")
 
     def test_public_pool_labels_name_an_os_and_never_qontinui(self):
         for labels in r.POOL_LABELS.values():
@@ -222,15 +230,69 @@ class TreePins(unittest.TestCase):
             self.assertEqual(job.get("needs"), "route", key)
             self.assertEqual(str(job.get("if", "")).replace(" ", ""), "${{!cancelled()}}", key)
 
+    GUARD = "env.SELF_HOSTED_LANE != 'true'"
+    HOST_MUTATING_RUN = re.compile(r"\b(sudo|apt-get|apt|swapoff|swapon|mkswap|fallocate)\b")
+    HOSTED_ONLY_ACTIONS = ("Swatinem/rust-cache", "jlumbroso/free-disk-space", "al-cheb/configure-pagefile-action")
+
+    @staticmethod
+    def squash(text):
+        return " ".join(str(text).split())
+
     def test_routed_jobs_guard_host_mutating_steps(self):
-        hosted_only_actions = ("Swatinem/rust-cache", "jlumbroso/free-disk-space", "al-cheb/configure-pagefile-action")
+        # The guard must point the right way: `!= 'true'` (skip on the pool), never
+        # `== 'true'`, which would run the step ONLY on the pool.
         for key, job in self.routed_jobs().items():
             for step in job.get("steps", []):
                 uses = str(step.get("uses", ""))
                 run = str(step.get("run", ""))
-                needs_guard = any(a in uses for a in hosted_only_actions) or "sudo " in run
-                if needs_guard:
-                    self.assertIn("SELF_HOSTED_LANE", str(step.get("if", "")), f"{key}: step {step.get('name') or uses} is not lane-guarded")
+                if any(a in uses for a in self.HOSTED_ONLY_ACTIONS) or self.HOST_MUTATING_RUN.search(run):
+                    self.assertIn(self.GUARD, self.squash(step.get("if", "")),
+                                  f"{key}: step {step.get('name') or uses} is not skipped on the pool")
+
+    def test_routed_jobs_deliver_no_secret_to_the_pool(self):
+        # A step that names `secrets.` must either be skipped on the pool or blank the
+        # secret there in its own expression. (Workflow-level GITHUB_TOKEN is the
+        # run-scoped token and is out of scope.)
+        for key, job in self.routed_jobs().items():
+            for step in job.get("steps", []):
+                for env_key, value in (step.get("env") or {}).items():
+                    v = self.squash(value)
+                    if "secrets." not in v:
+                        continue
+                    guarded = self.GUARD in self.squash(step.get("if", "")) or (self.GUARD in v and "|| ''" in v)
+                    self.assertTrue(guarded, f"{key}: step {step.get('name')} delivers {env_key} to the pool")
+
+    def test_routed_runs_on_are_pinned(self):
+        pool = "'[\"self-hosted\",\"Linux\",\"public-pool\"]'"
+        want = {
+            "test": "${{ fromJSON(matrix.platform == 'ubuntu-22.04' && needs.route.outputs.linux_lane == 'self-hosted' && " + pool + " || toJSON(matrix.platform)) }}",
+            "holder-crates": "${{ fromJSON(matrix.platform == 'ubuntu-latest' && needs.route.outputs.linux_lane == 'self-hosted' && " + pool + " || toJSON(matrix.platform)) }}",
+            "frontend-tests": "${{ fromJSON(needs.route.outputs.linux_lane == 'self-hosted' && " + pool + " || '\"ubuntu-latest\"') }}",
+        }
+        jobs = self.routed_jobs()
+        self.assertEqual(set(jobs), set(want))
+        for key, expected in want.items():
+            self.assertEqual(self.squash(jobs[key]["runs-on"]), expected, key)
+            if key != "frontend-tests":
+                env = self.squash(jobs[key]["env"]["SELF_HOSTED_LANE"])
+                self.assertIn("needs.route.outputs.linux_lane == 'self-hosted'", env, key)
+
+    def test_prepare_step_clears_exactly_the_checked_out_siblings(self):
+        for key, job in self.routed_jobs().items():
+            steps = job.get("steps", [])
+            sibs = set()
+            for step in steps:
+                if "checkout-sibling" in str(step.get("uses", "")):
+                    repo = (step.get("with") or {}).get("repo", "qontinui/qontinui-schemas")
+                    sibs.add(repo.split("/")[-1])
+            prepares = [st for st in steps if "public-pool-prepare" in str(st.get("uses", ""))]
+            if not sibs:
+                continue
+            self.assertEqual(len(prepares), 1, key)
+            self.assertEqual(prepares[0]["if"], "env.SELF_HOSTED_LANE == 'true'", key)
+            self.assertEqual(set(prepares[0]["with"]["siblings"].split()), sibs, key)
+            first_sibling = min(i for i, st in enumerate(steps) if "checkout-sibling" in str(st.get("uses", "")))
+            self.assertLess(steps.index(prepares[0]), first_sibling, key)
 
     def test_route_job_is_hosted_and_cannot_fail_its_dependants(self):
         doc = self.load(WORKFLOWS / "ci.yml")

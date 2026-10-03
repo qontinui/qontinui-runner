@@ -25,11 +25,22 @@
 #      target dir is pointed OUTSIDE the workspace, at a per-host cache under the
 #      runner account's home, and wiped when it grows past `max-target-gb`.
 #
-# It also clears AMBIENT-STATE POISON left behind by a job that died between
-# ci.yml's `Poison ambient state` and `Unpoison ambient state` steps. `runner-
-# public` is a dedicated account with no qontinui state, so anything under
-# `~/.qontinui` other than the three poison files is unexpected real state: the
-# step refuses (fails) rather than delete it.
+#   4. A PER-JOB HOME. More than one runner listener can run as `runner-public`
+#      (qontinui-web's does today), so `$HOME` is shared between concurrent jobs.
+#      ci.yml's ambient-state poison bracket writes `~/.qontinui`, and tests read
+#      `dirs::home_dir()` -- which on Linux is `$HOME`. So the job gets its own
+#      `$HOME` under `$RUNNER_TEMP` (discarded with the job), with CARGO_HOME and
+#      RUSTUP_HOME pinned to the account's real home FIRST so the toolchain is still
+#      found. Linux only: on Windows `dirs::home_dir()` ignores `$HOME`
+#      (SHGetKnownFolderPath), so this would void the poison canary there.
+#
+# Prints /etc/os-release: on the pool, `test (ubuntu-22.04)` runs on the HOST's OS,
+# not an ubuntu-22.04 image -- a PR-head green there is a verdict about that host.
+# Merge-candidate pushes stay hosted, so the land verdict is unaffected.
+#
+# NOT a security boundary. Job code runs as `runner-public`; host isolation (an
+# ephemeral runner, a runner install the job cannot write, no reach to the host's
+# loopback/LAN services) is a host prerequisite, recorded in the plan's Phase 2.
 name: public-pool-prepare
 description: Prepare a persistent public-pool host for one routed job (self-hosted lane only).
 inputs:
@@ -55,13 +66,19 @@ runs:
         MAX_TARGET_GB: ${{ inputs.max-target-gb }}
       run: |
         set -euo pipefail
+        set -f   # no glob expansion of the sibling list
         echo "public-pool host: $(hostname) user=$(id -un) runner=${RUNNER_NAME:-?}"
+        if [ "${RUNNER_OS:-}" != "Linux" ]; then
+          echo "::error::public-pool-prepare is Linux-only today (per-job HOME is wrong on Windows)"
+          exit 1
+        fi
+        grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null || true
 
         # 1. Stale sibling checkouts -- exactly the named directories.
         parent="$(cd "${GITHUB_WORKSPACE}/.." && pwd)"
         for name in ${SIBLINGS}; do
           case "${name}" in
-            ''|*/*|.|..) echo "::error::refusing sibling name '${name}'"; exit 1 ;;
+            ''|*/*|.|..|*'*'*|*'?'*|*'['*) echo "::error::refusing sibling name '${name}'"; exit 1 ;;
           esac
           if [ "${parent}/${name}" = "${GITHUB_WORKSPACE}" ]; then
             echo "::error::sibling '${name}' is the workspace itself"; exit 1
@@ -89,29 +106,27 @@ runs:
           echo "build deps present"
         fi
 
-        # 3. Persistent target dir outside the cleaned workspace.
-        target="${HOME}/.cache/qontinui-runner-ci/target"
+        # 3. Persistent target dir outside the cleaned workspace (real home).
+        real_home="${HOME}"
+        target="${real_home}/.cache/qontinui-runner-ci/target"
         mkdir -p "${target}"
-        size_gb="$(du -s --block-size=1G "${target}" 2>/dev/null | cut -f1 || echo 0)"
-        if [ "${size_gb:-0}" -gt "${MAX_TARGET_GB}" ]; then
+        size_gb="$(du -s --block-size=1G "${target}" 2>/dev/null | awk 'NR==1{print $1}')"
+        size_gb="${size_gb:-0}"
+        case "${size_gb}" in *[!0-9]*|'') size_gb=0 ;; esac
+        if [ "${size_gb}" -gt "${MAX_TARGET_GB}" ]; then
           echo "persistent target ${target} is ${size_gb} GiB > ${MAX_TARGET_GB}; wiping"
           rm -rf -- "${target:?}"
           mkdir -p "${target}"
         fi
-        echo "CARGO_TARGET_DIR=${target}" >> "${GITHUB_ENV}"
-        echo "CARGO_TARGET_DIR=${target} (${size_gb:-0} GiB)"
 
-        # 4. Leftover ambient-state poison from a job that died mid-bracket.
-        q="${HOME}/.qontinui"
-        if [ -d "${q}" ]; then
-          unexpected="$(find "${q}" -mindepth 1 -maxdepth 1 \
-            ! -name machine.json ! -name profiles.json ! -name coord-device-jwt -print)"
-          if [ -n "${unexpected}" ]; then
-            echo "::error::${q} holds state that is not ci.yml's poison -- a public-pool account must have no qontinui state:"
-            echo "${unexpected}"
-            exit 1
-          fi
-          rm -f -- "${q}/machine.json" "${q}/profiles.json" "${q}/coord-device-jwt"
-          rmdir -- "${q}" 2>/dev/null || true
-          echo "cleared leftover poison in ${q}"
-        fi
+        # 4. Per-job HOME, toolchain homes pinned to the real one first.
+        job_home="${RUNNER_TEMP:?}/home"
+        rm -rf -- "${job_home:?}"
+        mkdir -p "${job_home}"
+        {
+          echo "CARGO_TARGET_DIR=${target}"
+          echo "CARGO_HOME=${CARGO_HOME:-${real_home}/.cargo}"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-${real_home}/.rustup}"
+          echo "HOME=${job_home}"
+        } >> "${GITHUB_ENV}"
+        echo "CARGO_TARGET_DIR=${target} (${size_gb} GiB); HOME=${job_home}; CARGO_HOME/RUSTUP_HOME pinned under ${real_home}"
