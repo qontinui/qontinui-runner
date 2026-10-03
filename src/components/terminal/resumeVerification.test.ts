@@ -667,6 +667,56 @@ describe("typeResumeAndVerify (does not type into a live claude)", () => {
     expect(writes).toEqual([]);
   });
 
+  it("onNotTyped names why nothing was typed — and stays silent when something was, or it verified", async () => {
+    const cases = [
+      {
+        probe: { state: "live", sessionIds: ["00000000-0000-4000-8000-000000000000"] },
+        want: ["pane-occupied"],
+      },
+      { probe: { state: "unknown", sessionIds: [] }, want: ["pane-unreadable"] },
+      { probe: { state: "live", sessionIds: [SID] }, want: [] },
+      { probe: { state: "absent", sessionIds: [] }, want: [] },
+    ] as const;
+    for (const { probe, want } of cases) {
+      const reasons: string[] = [];
+      const { writes, write } = recorder();
+      await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+        ...base,
+        write,
+        readTail: async () => "$ ",
+        probeClaude: async () => ({ state: probe.state, sessionIds: [...probe.sessionIds] }),
+        onNotTyped: (r) => reasons.push(r),
+      });
+      expect(reasons).toEqual(want);
+      if (want.length > 0) expect(writes).toEqual([]);
+    }
+  });
+
+  it("onNotTyped stays silent when attempt 1 already typed and only attempt 2's probe refuses", async () => {
+    // The claude found on attempt 2 may be the one the typed command launched
+    // (argv unrecognised) — "nothing was typed" would be a false claim.
+    for (const second of [
+      { state: "unknown", sessionIds: [] },
+      { state: "live", sessionIds: [] },
+    ] as const) {
+      const reasons: string[] = [];
+      const { writes, write } = recorder();
+      const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+        ...base,
+        write,
+        readTail: async () => "$ ",
+        probeClaude: async () =>
+          writes.length === 0
+            ? { state: "absent", sessionIds: [] }
+            : { state: second.state, sessionIds: [...second.sessionIds] },
+        onNotTyped: (r) => reasons.push(r),
+      });
+      expect(out).toBe("failed");
+      expect(writes).toEqual([CMD]);
+      expect(reasons).toEqual([]);
+    }
+  });
+
   it("a REMOTE pane (unprobeable) types exactly as before", async () => {
     const { writes, write } = recorder();
     const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {

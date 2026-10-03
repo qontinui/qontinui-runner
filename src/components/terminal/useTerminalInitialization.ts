@@ -9,6 +9,7 @@ import {
   getResumeSummaryPolicy,
   buildPickerAnswer,
   type ResumeSummaryPolicy,
+  type ResumeNotTypedReason,
   type ResumeOutcome,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
@@ -215,7 +216,11 @@ export async function runVerifiedResume(params: {
   provider?: string;
   updateTab: (
     id: string,
-    updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
+    updates: Partial<{
+      isReconnecting?: boolean;
+      resumeFailed?: boolean;
+      resumeFailedReason?: ResumeNotTypedReason;
+    }>,
   ) => void;
   /**
    * Registry re-assert payload for the VERIFIED branch (boot-restore item 3):
@@ -247,6 +252,11 @@ export async function runVerifiedResume(params: {
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
   // banners. Claude's descriptor mirrors the live `resumeVerification.ts` sets.
   const handshakePatterns = providerDescriptorFor(provider).handshakePatterns();
+  // Why nothing was typed, if that is why it failed — carried onto the tab so
+  // the banner can say so (`resumeFailedReason`). Composed with any caller
+  // hook rather than replacing it.
+  let notTypedReason: ResumeNotTypedReason | undefined;
+  const callerOnNotTyped = verifyOptions?.onNotTyped;
   const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, {
     // Fallback picker answerer (#548 item 3): under the default "full" policy
     // the env thresholds in `buildResumeCmd` already suppress the picker;
@@ -255,9 +265,13 @@ export async function runVerifiedResume(params: {
     handshakePatterns,
     sessionId: claudeSessionId,
     ...verifyOptions,
+    onNotTyped: (reason) => {
+      notTypedReason = reason;
+      callerOnNotTyped?.(reason);
+    },
   });
   if (outcome === "verified") {
-    updateTab(tabId, { isReconnecting: false, resumeFailed: false });
+    updateTab(tabId, { isReconnecting: false, resumeFailed: false, resumeFailedReason: undefined });
     // Verified handshake — NOW re-assert the OPEN record under the live
     // terminal id so the registry tracks this tab (the next restart
     // reconnect-matches on it). Deliberately after verification, never
@@ -296,9 +310,14 @@ export async function runVerifiedResume(params: {
     // `ResumeOutcome`). Surface an explicit retry affordance and KEEP the
     // restore-pending marker — the open record must survive for the retry.
     console.warn(
-      `[TerminalPage] resume verification failed for ${tabId} (session ${claudeSessionId})`,
+      `[TerminalPage] resume verification failed for ${tabId} (session ${claudeSessionId})` +
+        (notTypedReason ? ` — not typed: ${notTypedReason}` : ""),
     );
-    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    updateTab(tabId, {
+      isReconnecting: false,
+      resumeFailed: true,
+      resumeFailedReason: notTypedReason,
+    });
   }
   return outcome;
 }
@@ -770,6 +789,7 @@ interface UseTerminalInitializationParams {
       claudeConfigDir?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
+      resumeFailedReason?: ResumeNotTypedReason;
       restoreTerminalOnly?: boolean;
     }>,
   ) => void;

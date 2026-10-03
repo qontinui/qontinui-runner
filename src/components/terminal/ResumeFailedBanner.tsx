@@ -5,12 +5,17 @@
  * It distinguishes the restore outcomes that are NOT a silent, fully restored
  * conversation:
  *
- *   1. RESUME FAILED (`resumeFailed`) — a `--resume` WAS typed (the runner
- *      knows the id + the provider resumes the full conversation) but the
- *      provider UI handshake never appeared after one retry. Operator-clickable
- *      "Retry resume" re-runs the same type-and-verify path. The durable record
- *      keeps its restore-pending marker so the liveness poll can't flip it
- *      `poll-dead` while the operator decides.
+ *   1. RESUME FAILED (`resumeFailed`) — the runner knows the id and the
+ *      provider resumes the full conversation, but the resume is not provably
+ *      up. Usually the `--resume` was typed and the provider UI handshake never
+ *      appeared after one retry; `resumeFailedReason` marks the cases where it
+ *      was deliberately NOT typed — the pane already runs a claude that is not
+ *      provably this session (`pane-occupied`; Retry refuses again until that
+ *      claude exits, which the entry says) or its process table was
+ *      unreadable (`pane-unreadable`). Operator-clickable "Retry resume"
+ *      re-runs the same type-and-verify path. The durable record keeps its
+ *      restore-pending marker so the liveness poll can't flip it `poll-dead`
+ *      while the operator decides.
  *   2. TERMINAL-ONLY / fresh conversation (`restoreTerminalOnly`) — the terminal
  *      + cwd were restored but the CONVERSATION was NOT. Three causes land
  *      here, so the copy states the OUTCOME and not a cause: the provider's
@@ -37,6 +42,7 @@
 import { AlertTriangle, MessageSquareDashed, RotateCcw, X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { AdvisorySlot } from "./AdvisoryStack";
+import type { ResumeNotTypedReason } from "./resumeVerification";
 import type { TerminalTab } from "./useTerminalManager";
 
 export interface ResumeFailedBannerProps {
@@ -55,6 +61,22 @@ export interface ResumeFailedBannerProps {
 /** The failed-resume tabs this banner surfaces — exported for unit tests. */
 export function failedResumeTabs(tabs: TerminalTab[]): TerminalTab[] {
   return tabs.filter((t) => t.resumeFailed && t.isAlive !== false);
+}
+
+/**
+ * The one-line explanation shown under a failed-resume entry, or `null` when
+ * the resume was typed and simply never hand-shook (the heading says enough).
+ * Exported for unit tests.
+ */
+export function resumeFailedDetail(reason: ResumeNotTypedReason | undefined): string | null {
+  switch (reason) {
+    case "pane-occupied":
+      return "Claude is already running in this terminal, and it may not be this session — nothing was typed. Exit that Claude, then retry.";
+    case "pane-unreadable":
+      return "The terminal's processes could not be checked, so nothing was typed. Retry to check again.";
+    default:
+      return null;
+  }
 }
 
 /**
@@ -98,27 +120,43 @@ export function ResumeFailedBanner({
                   : `${failed.length} session resumes failed`}
               </div>
               <ul className="mt-1.5 space-y-1">
-                {failed.map((t) => (
-                  <li
-                    key={t.id}
-                    data-ui-bridge-id="terminal.resume-failed-banner-item"
-                    data-terminal-id={t.id}
-                    className="flex items-center gap-2 text-[11px] leading-snug"
-                  >
-                    <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
-                    <button
-                      type="button"
-                      data-ui-bridge-id="terminal.resume-failed-retry"
+                {failed.map((t) => {
+                  const detail = resumeFailedDetail(t.resumeFailedReason);
+                  return (
+                    <li
+                      key={t.id}
+                      data-ui-bridge-id="terminal.resume-failed-banner-item"
                       data-terminal-id={t.id}
-                      onClick={() => onRetryResume(t.id)}
-                      className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#f7768e]/40 text-[#f7768e] hover:bg-[#f7768e]/15 text-[10px]"
-                      title="Retype the resume command and re-verify the Claude UI handshake"
+                      data-resume-failed-reason={t.resumeFailedReason}
+                      className="text-[11px] leading-snug"
                     >
-                      <RotateCcw className="w-2.5 h-2.5" />
-                      Retry resume
-                    </button>
-                  </li>
-                ))}
+                      <div className="flex items-center gap-2">
+                        <span className="text-[#c0caf5] font-medium truncate flex-1">
+                          {t.title}
+                        </span>
+                        <button
+                          type="button"
+                          data-ui-bridge-id="terminal.resume-failed-retry"
+                          data-terminal-id={t.id}
+                          onClick={() => onRetryResume(t.id)}
+                          className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#f7768e]/40 text-[#f7768e] hover:bg-[#f7768e]/15 text-[10px]"
+                          title="Check the terminal, then type the resume command and re-verify the Claude UI handshake"
+                        >
+                          <RotateCcw className="w-2.5 h-2.5" />
+                          Retry resume
+                        </button>
+                      </div>
+                      {detail && (
+                        <div
+                          data-ui-bridge-id="terminal.resume-failed-detail"
+                          className="text-[10px] text-[#a9b1d6] mt-0.5"
+                        >
+                          {detail}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           </div>

@@ -992,7 +992,11 @@ function TerminalPageInner({
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab?.claudeSessionId) return;
-      updateTab(tabId, { resumeFailed: false, isReconnecting: true });
+      updateTab(tabId, {
+        resumeFailed: false,
+        resumeFailedReason: undefined,
+        isReconnecting: true,
+      });
       void runVerifiedResume({
         terminalRefs: terminalRefs.current,
         tabId,
