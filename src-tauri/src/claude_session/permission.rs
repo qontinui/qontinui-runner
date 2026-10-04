@@ -200,6 +200,11 @@ struct Parked {
     notice: PermissionRequestNotice,
     /// Dropping or sending wakes the request's timeout thread early.
     cancel: mpsc::Sender<()>,
+    /// Which parking this is. A timer expires only ITS parking: a request id
+    /// the CLI reuses gets a new generation, so the superseded request's
+    /// timer — already past `recv_timeout` when the cancel arrives — cannot
+    /// deny the new request.
+    generation: u64,
 }
 
 /// One structured session's control-request answerer and its parked
@@ -212,6 +217,8 @@ pub struct PermissionBroker {
     responder: Arc<dyn ControlResponder>,
     sink: Arc<dyn PermissionSink>,
     pending: Mutex<HashMap<String, Parked>>,
+    /// Source of [`Parked::generation`].
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for PermissionBroker {
@@ -242,6 +249,7 @@ impl PermissionBroker {
             responder,
             sink,
             pending: Mutex::new(HashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -320,11 +328,15 @@ impl PermissionBroker {
             timeout_secs: self.timeout.as_secs(),
         };
         let (cancel, cancelled) = mpsc::channel::<()>();
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let replaced = self.lock().insert(
             request_id.to_string(),
             Parked {
                 notice: notice.clone(),
                 cancel,
+                generation,
             },
         );
         if let Some(previous) = replaced {
@@ -357,13 +369,18 @@ impl PermissionBroker {
             "permission request parked for the operator"
         );
         self.sink.requested(&notice);
-        self.spawn_timeout(request_id, cancelled);
+        self.spawn_timeout(request_id, generation, cancelled);
         ControlHandling::Parked
     }
 
     /// Wait out the bound on a separate thread; deny if still parked. The
     /// thread holds only a weak reference, so a dropped session ends it.
-    fn spawn_timeout(self: &Arc<Self>, request_id: &str, cancelled: mpsc::Receiver<()>) {
+    fn spawn_timeout(
+        self: &Arc<Self>,
+        request_id: &str,
+        generation: u64,
+        cancelled: mpsc::Receiver<()>,
+    ) {
         let broker: Weak<Self> = Arc::downgrade(self);
         let timeout = self.timeout;
         let id = request_id.to_string();
@@ -372,7 +389,7 @@ impl PermissionBroker {
             .spawn(move || {
                 if let Err(mpsc::RecvTimeoutError::Timeout) = cancelled.recv_timeout(timeout) {
                     if let Some(broker) = broker.upgrade() {
-                        broker.expire(&id);
+                        broker.expire(&id, generation);
                     }
                 }
             });
@@ -381,22 +398,32 @@ impl PermissionBroker {
             warn!(session = %self.session_id, "could not start the permission timeout thread ({e}); denying now");
             self.expire_with(
                 request_id,
+                generation,
                 "The runner could not start the permission timer, so it denied this request (fail closed).",
             );
         }
     }
 
-    fn expire(&self, request_id: &str) {
+    fn expire(&self, request_id: &str, generation: u64) {
         let message = format!(
             "No permission decision within {}s — the runner denied this request (fail closed).",
             self.timeout.as_secs()
         );
-        self.expire_with(request_id, &message);
+        self.expire_with(request_id, generation, &message);
     }
 
-    fn expire_with(&self, request_id: &str, message: &str) {
-        let Some(parked) = self.lock().remove(request_id) else {
-            return; // answered in the meantime
+    fn expire_with(&self, request_id: &str, generation: u64, message: &str) {
+        let parked = {
+            let mut pending = self.lock();
+            // Only THIS parking: answered in the meantime, or superseded by a
+            // request reusing the id, leaves nothing for this timer to do.
+            if pending.get(request_id).map(|p| p.generation) != Some(generation) {
+                return;
+            }
+            pending.remove(request_id)
+        };
+        let Some(parked) = parked else {
+            return;
         };
         warn!(
             session = %self.session_id,
@@ -739,6 +766,26 @@ mod tests {
         let pending = b.pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool_name, "Edit");
+    }
+
+    /// The superseded request's timer, already past its wait when the new
+    /// request (same id) is parked, must not deny the NEW request.
+    #[test]
+    fn a_superseded_requests_timer_does_not_expire_the_reused_id() {
+        let (b, out, _sink) = broker(PermissionMode::Prompt, Duration::from_secs(60));
+        b.handle_control_request(&request(WRITE_REQ));
+        let first = b.lock().get("req-9").unwrap().generation;
+        b.handle_control_request(&request(WRITE_REQ));
+        let second = b.lock().get("req-9").unwrap().generation;
+        assert_ne!(first, second);
+
+        b.expire("req-9", first); // the old timer firing late
+        assert_eq!(b.pending().len(), 1, "the new request is still parked");
+        assert!(out.lines().is_empty(), "nothing denied");
+
+        b.expire("req-9", second);
+        assert!(b.pending().is_empty());
+        assert_eq!(out.lines().len(), 1, "its own timer denies it");
     }
 
     #[test]
