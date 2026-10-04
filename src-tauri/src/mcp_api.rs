@@ -12503,6 +12503,10 @@ pub fn create_router(
         // outside `/ui-bridge/...` because the surface is consumed
         // differently (IR + projection storage, not page-control RPC).
         .merge(crate::spec_api::routes())
+        // Journey twin ledger health — `/apps/{app_id}/journey/health`, beside
+        // the per-app spec routes (plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time).
+        .merge(crate::journey::routes())
         // Section 11 / Phase B2 — `/scenarios/...` scenario projection.
         // Static endpoint is pure Rust; runtime endpoint IPC's into the
         // webview to combine with the live registry. Both load the IR

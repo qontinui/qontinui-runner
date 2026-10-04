@@ -43,8 +43,23 @@ pub async fn ui_bridge_get_undo_state_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await)
 }
 
-/// Execute undo via the UI Bridge.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/undo` is an element action with no element id.
 pub async fn ui_bridge_undo_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_undo_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::untargeted_element("undo"),
+    );
+    result
+}
+
+/// Execute undo via the UI Bridge.
+async fn ui_bridge_undo_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Undo");
@@ -52,8 +67,23 @@ pub async fn ui_bridge_undo_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "undo", serde_json::json!({})).await)
 }
 
-/// Execute redo via the UI Bridge.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/redo` is an element action with no element id.
 pub async fn ui_bridge_redo_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_redo_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::untargeted_element("redo"),
+    );
+    result
+}
+
+/// Execute redo via the UI Bridge.
+async fn ui_bridge_redo_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Redo");
@@ -125,7 +155,25 @@ pub async fn ui_bridge_run_spec_handler(
 // directly affect rendered pixels, and annotation imports go through
 // the React layer whose own DOM changes will be picked up by the
 // frontend mutationOccurred signal.
-ipc_handler_post_bumps_mutation!(ui_bridge_navigate_tab_handler, "navigate_tab");
+ipc_handler_post_bumps_mutation!(ui_bridge_navigate_tab_handler_dispatch, "navigate_tab");
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/navigate-tab` is a `navigation` edge (`push`).
+pub async fn ui_bridge_navigate_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        "navigate_tab",
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result =
+        ui_bridge_navigate_tab_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
 
 // Component state
@@ -136,7 +184,21 @@ ipc_handler_path_get!(
 );
 
 // Page scroll: changes the viewport content → rendered pixels change.
-ipc_handler_post_bumps_mutation!(ui_bridge_scroll_page_handler, "scroll_page");
+ipc_handler_post_bumps_mutation!(ui_bridge_scroll_page_handler_dispatch, "scroll_page");
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/scroll` is an element action with no element id.
+pub async fn ui_bridge_scroll_page_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::untargeted_element("scroll");
+    let result =
+        ui_bridge_scroll_page_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
 
 // Performance entries
 ipc_handler_get!(
