@@ -1695,14 +1695,25 @@ mod tests {
         assert_eq!(backoff_delay(1), Duration::from_secs(60));
         assert_eq!(backoff_delay(2), Duration::from_secs(120));
 
+        // A LOCAL history: a far-future `now` against the process-global
+        // RESTART_HISTORY pruned every concurrently running test's slots.
+        let history: Mutex<Option<HashMap<String, Vec<Instant>>>> = Mutex::new(None);
+        let take = |now| {
+            take_slot(
+                &history,
+                "fr-test-backoff",
+                now,
+                STRUCTURED_RESTART_CAP,
+                STRUCTURED_RESTART_WINDOW,
+            )
+        };
         let t0 = Instant::now();
-        let key = "fr-test-backoff";
-        assert_eq!(take_restart_slot(key, t0), Some(0));
-        assert_eq!(take_restart_slot(key, t0), Some(1));
-        assert_eq!(take_restart_slot(key, t0), Some(2));
-        assert_eq!(take_restart_slot(key, t0), None);
+        assert_eq!(take(t0), Some(0));
+        assert_eq!(take(t0), Some(1));
+        assert_eq!(take(t0), Some(2));
+        assert_eq!(take(t0), None);
         assert_eq!(
-            take_restart_slot(key, t0 + STRUCTURED_RESTART_WINDOW + Duration::from_secs(1)),
+            take(t0 + STRUCTURED_RESTART_WINDOW + Duration::from_secs(1)),
             Some(0)
         );
     }
