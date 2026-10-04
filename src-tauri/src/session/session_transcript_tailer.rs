@@ -561,9 +561,11 @@ struct Coverage {
     /// "consent withheld" are different answers and a bare `false` conflates
     /// them.
     cloud_sync_enabled: Option<bool>,
-    /// Counter total at the last summary, so the reporter can stay quiet on an
+    /// Counters at the last summary, so the reporter can stay quiet on an
     /// idle fleet without losing the ability to say "still nothing bound".
-    last_reported_total: u64,
+    /// Compared field by field, not as a sum: a held batch moves one count
+    /// from `appends_emitted` to `held_batches`, which a sum cannot see.
+    last_reported: [u64; 5],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
@@ -1438,21 +1440,29 @@ impl SessionTranscriptTailer {
     }
 
     /// One summary emission. Split out from the loop so it is directly
-    /// testable without a timer.
-    fn report_coverage_once(&self) {
+    /// testable without a timer. Returns whether a line was logged.
+    ///
+    /// "Moved" counts holes and held batches as well as appends: a
+    /// `transcript_hole` is the one loss this module makes visible, so a
+    /// sample whose only change is a new hole must still be reported.
+    fn report_coverage_once(&self) -> bool {
         let report = self.coverage();
-        let total = report.appends_emitted
-            + report.appends_skipped_unbound
-            + report.appends_skipped_gate_off;
+        let counters = [
+            report.appends_emitted,
+            report.appends_skipped_unbound,
+            report.appends_skipped_gate_off,
+            report.transcript_holes,
+            report.held_batches,
+        ];
 
         let mut cov = self.lock_coverage();
-        let moved = total != cov.last_reported_total;
-        cov.last_reported_total = total;
+        let moved = counters != cov.last_reported;
+        cov.last_reported = counters;
         drop(cov);
 
         let blind = report.sessions_unbound > 0 && report.sessions_tailed == 0;
         if !moved && !blind {
-            return;
+            return false;
         }
 
         if blind {
@@ -1461,11 +1471,14 @@ impl SessionTranscriptTailer {
                 sessions_unbound = report.sessions_unbound,
                 unbound_session_ids = %report.unbound_session_ids.join(","),
                 appends_skipped_unbound = report.appends_skipped_unbound,
+                transcript_holes = report.transcript_holes,
+                held_batches = report.held_batches,
                 "session_transcript_tailer: RUNNING BUT REACHING NO PANE — every watched \
-                 transcript lacks a coord session binding, so nothing is being synced. The \
+                 transcript lacks a coord session binding, so nothing is being synced. A \
                  binding is written by the claude --resume sniffer \
-                 (claude_resume_sniff -> AiCoordRegistrar::register_sniffed_session); a pane \
-                 launched without a sniffable resume line never gets one."
+                 (claude_resume_sniff -> AiCoordRegistrar::register_sniffed_session) or on \
+                 request by POST /sessions/transcript-bind; a pane neither reaches is never \
+                 bound. GET /sessions/transcript-coverage serves these counts."
             );
         } else {
             tracing::info!(
@@ -1477,9 +1490,12 @@ impl SessionTranscriptTailer {
                 bytes_emitted = report.bytes_emitted,
                 appends_skipped_unbound = report.appends_skipped_unbound,
                 appends_skipped_gate_off = report.appends_skipped_gate_off,
+                transcript_holes = report.transcript_holes,
+                held_batches = report.held_batches,
                 "session_transcript_tailer: coverage"
             );
         }
+        true
     }
 
     fn lock_coverage(&self) -> std::sync::MutexGuard<'_, Coverage> {
@@ -2517,10 +2533,44 @@ mod tests {
     fn coverage_report_on_idle_ledger_is_quiet_and_safe() {
         let dir = tempdir().unwrap();
         let (t, _registrar, _outbox) = tailer(dir.path());
-        t.report_coverage_once();
+        assert!(!t.report_coverage_once(), "an idle ledger logs nothing");
         let r = t.coverage();
         assert_eq!(r.sessions_tailed, 0);
         assert_eq!(r.sessions_unbound, 0);
         assert_eq!(r.appends_emitted, 0);
+    }
+
+    /// A sample whose ONLY change is a new `transcript_hole` (or a held
+    /// batch) is still reported: a hole is the loss this module exists to
+    /// make visible, and an appends-only change detector would sit silent
+    /// on it.
+    #[test]
+    fn coverage_report_logs_a_hole_only_change_once() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
+        assert!(!t.report_coverage_once());
+
+        t.lock_coverage().transcript_holes += 1;
+        assert!(t.report_coverage_once(), "a new hole must be reported");
+        assert!(!t.report_coverage_once(), "an unchanged hole count is quiet");
+
+        t.lock_coverage().held_batches += 1;
+        assert!(t.report_coverage_once(), "a new held batch must be reported");
+        assert!(!t.report_coverage_once());
+
+        // An append counted at `admit` and then held moves one count from
+        // `appends_emitted` to `held_batches` — the sum is unchanged, and a
+        // report taken between the two must not hide the hold.
+        t.lock_coverage().appends_emitted += 1;
+        assert!(t.report_coverage_once());
+        {
+            let mut cov = t.lock_coverage();
+            cov.appends_emitted -= 1;
+            cov.held_batches += 1;
+        }
+        assert!(
+            t.report_coverage_once(),
+            "a count moving between counters must be reported"
+        );
     }
 }

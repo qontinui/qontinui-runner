@@ -1603,6 +1603,58 @@ async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageB
 }
 
 // =============================================================================
+// /sessions/transcript-coverage
+// =============================================================================
+
+/// `GET /sessions/transcript-coverage` — the interactive transcript tailer's
+/// [`CoverageReport`](crate::session::session_transcript_tailer::CoverageReport):
+/// how many panes it reaches, which ids it is dropping for want of a coord
+/// binding (the ones `POST /sessions/transcript-bind` exists to fix), and the
+/// `transcript_holes` / `held_batches` counts that make a lost or deferred
+/// range visible. Until now the report reached only the periodic log line.
+///
+/// - `200` — the report. Every counter is since this runner process started.
+/// - `503 {"error":"tailer_unavailable"}` — this runner booted without its
+///   session outbox, so it has no tailer and NO coverage answer: UNKNOWN, not
+///   zero.
+async fn transcript_coverage(
+    State(state): State<Arc<ApiState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tailer = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>()
+        .map(|s| s.inner().clone());
+    let (status, body) = transcript_coverage_body(tailer.as_deref());
+    (status, Json(body))
+}
+
+/// The route's answer for an optional tailer, split out so it is testable
+/// without a Tauri app.
+fn transcript_coverage_body(
+    tailer: Option<&crate::session::session_transcript_tailer::SessionTranscriptTailer>,
+) -> (StatusCode, serde_json::Value) {
+    match tailer {
+        Some(t) => match serde_json::to_value(t.coverage()) {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => bind_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "coverage_unserializable",
+                Some(e.to_string()),
+            ),
+        },
+        None => bind_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tailer_unavailable",
+            Some(
+                "this runner booted without its session outbox, so it has no transcript \
+                 tailer and no coverage to report (UNKNOWN, not zero)"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -1851,6 +1903,35 @@ mod tests {
                 Arc::new(SessionTranscriptTailer::new(emitter, registrar)),
                 outbox,
             )
+        }
+
+        /// `GET /sessions/transcript-coverage`: no tailer is UNKNOWN (503),
+        /// never a zero report; a tailer serves its report with the hole and
+        /// held-batch counters a client reads.
+        #[test]
+        fn coverage_route_is_unknown_without_a_tailer_and_serves_the_report() {
+            let (status, body) = transcript_coverage_body(None);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["error"], "tailer_unavailable");
+            assert!(body.get("appends_emitted").is_none());
+
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let (status, body) = transcript_coverage_body(Some(&t));
+            assert_eq!(status, StatusCode::OK);
+            for key in [
+                "cloud_sync_enabled",
+                "sessions_tailed",
+                "sessions_unbound",
+                "unbound_session_ids",
+                "appends_emitted",
+                "transcript_holes",
+                "held_batches",
+            ] {
+                assert!(body.get(key).is_some(), "missing {key}: {body}");
+            }
+            assert_eq!(body["transcript_holes"], 0);
+            assert!(body["cloud_sync_enabled"].is_null(), "no append observed yet");
         }
 
         /// A registered nonce and the workdir it is bound to, via the one
@@ -2392,4 +2473,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // credential door (`origin_guard::CREDENTIAL_DOORS`) that authorizes
         // on the coord-mcp proxy nonce — see `transcript_bind`.
         .route("/sessions/transcript-bind", post(transcript_bind))
+        // The tailer's coverage report — the read side of transcript-bind.
+        .route("/sessions/transcript-coverage", get(transcript_coverage))
 }
