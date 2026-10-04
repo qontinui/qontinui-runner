@@ -2031,11 +2031,12 @@ mod tests {
 
     /// M5: both identity `.cmd` shims hand the user's arguments to the real
     /// CLI OUTSIDE delayed expansion (which strips every `!` from `%*`), never
-    /// `call` an `.exe` (CALL doubles carets), and never test a quoted first
-    /// argument through `"%~1"`. Content assertions — the templates are only
-    /// executable on Windows — over the source on every OS.
+    /// through `call` — for an `.exe` or a `.cmd`/`.bat` target alike (CALL
+    /// doubles carets) — and never test a quoted first argument through
+    /// `"%~1"`. CONTENT assertions over the template source only: the
+    /// templates execute only on Windows, so this does not run them.
     #[test]
-    fn identity_cmd_shims_pass_arguments_through_unmangled() {
+    fn identity_cmd_shim_sources_launch_without_call_or_delayed_expansion() {
         for (name, body) in [
             (
                 "identity_shim.cmd",
@@ -2067,12 +2068,17 @@ mod tests {
             }
             assert!(
                 lines.iter().any(|l| l.starts_with("\"%QSHIM_REAL%\" %*")),
-                "{name}: an .exe runs without CALL"
+                "{name}: the real CLI runs without CALL"
             );
-            assert!(
-                !body.contains("call \"%REAL%\" %*"),
-                "{name}: the old CALL-everything passthrough is gone"
-            );
+            // No CALL on any launch line — the .cmd/.bat branch included.
+            for (i, line) in lines.iter().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                assert!(
+                    !(lower.starts_with("call ") && line.contains("%*")),
+                    "{name}:{}: `{line}` launches through CALL (doubles carets)",
+                    i + 1
+                );
+            }
             assert!(
                 !body.contains("\"%~1\"=="),
                 "{name}: no quote-fragile first-argument test"

@@ -84,12 +84,10 @@ for /f "delims=" %%R in ("R!REAL!") do (
 set "QSHIM_REAL=%QSHIM_REAL:~1%"
 set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
 if not defined QSHIM_REAL goto :run_by_name
-rem An .exe runs directly (no CALL: nothing doubles its arguments' carets);
-rem a .cmd/.bat needs CALL to come back with its exit code.
-if /I "%QSHIM_REAL:~-4%"==".exe" goto :run_exe
-call "%QSHIM_REAL%" %*
-exit /b %ERRORLEVEL%
-:run_exe
+rem No CALL, for any target: CALL doubles the arguments' carets. An .exe
+rem returns here with its exit code. A .cmd/.bat target takes control
+rem instead (batch chaining): nothing after this line runs, and the
+rem target's exit code is the shim's.
 "%QSHIM_REAL%" %*
 exit /b %ERRORLEVEL%
 :run_by_name
