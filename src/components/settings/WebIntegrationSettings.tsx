@@ -10,6 +10,8 @@
  *   - test_web_integration_connection
  *   - cognito_sign_in          (one-click browser connect)
  *   - redeem_pair_code         (browserless pair-code connect)
+ *   - get_binding_gaps / pair_all_tenants (per-workspace rows + "Connect all
+ *     my workspaces", via WorkspacesCredentialSection)
  *
  * Also listens to the "web-integration-changed" event so the UI refreshes
  * whenever the backing settings change.
@@ -39,6 +41,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { WorkspacesCredentialSection } from "./WorkspacesCredentialSection";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
 import {
@@ -1040,14 +1043,14 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           );
         }
         return (
-          <div className="flex items-center gap-1.5 text-xs text-green-500" title={testState.detail}>
+          <div
+            className="flex items-center gap-1.5 text-xs text-green-500"
+            title={testState.detail}
+          >
             <CheckCircle2 className="w-3.5 h-3.5" />
             Connected as device <code className="font-mono">{testState.deviceId}</code>
             {testState.tokenFormatValid === false && (
-              <span className="text-yellow-500">
-                {" "}
-                · saved runner token is malformed
-              </span>
+              <span className="text-yellow-500"> · saved runner token is malformed</span>
             )}
           </div>
         );
@@ -1175,6 +1178,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             )}
           </div>
         ))}
+
+      {/* WORKSPACES — the per-tenant truth beside the device line above.
+          "This device is connected" is a DEVICE fact; a workspace can still
+          hold no credential on a connected device (plan
+          2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command, D3). */}
+      {formEnabled && <WorkspacesCredentialSection />}
 
       {/* SECONDARY — Pair with a code. First-class (not hidden): the path for
           headless / remote / local-tier runners that can't open a browser. */}
@@ -1346,16 +1355,19 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           content sync above, which governs whether that shared content
           actually leaves the machine. Saves immediately, same as the two
           blocks above. */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-bridge-id="settings.share-terminal-output">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-bridge-id="settings.share-terminal-output"
+      >
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
             <div className="text-sm font-medium">Share terminal output</div>
             <div className="text-xs text-muted-foreground">
               Default for new sessions: stream this session&apos;s terminal output to your coord
-              tenant through the same warm/cold retention tiers as AI content sync above. Off: a
-              new session&apos;s output stays local, whether or not AI content sync is on.
-              Existing sessions keep whatever they started with — this sets the default for
-              sessions started after the change, not a live switch on open ones.
+              tenant through the same warm/cold retention tiers as AI content sync above. Off: a new
+              session&apos;s output stays local, whether or not AI content sync is on. Existing
+              sessions keep whatever they started with — this sets the default for sessions started
+              after the change, not a live switch on open ones.
             </div>
           </div>
           {perfCapsLoadState !== "loaded" ? (
@@ -1390,9 +1402,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <div className="px-3 space-y-1.5" data-ui-bridge-id="settings.redact-terminal-secrets">
           <div className="text-xs font-medium">Redact secrets in shared output</div>
           <div className="text-[10px] text-muted-foreground">
-            Scrubs shared terminal output for common secret patterns before it leaves this
-            machine — defense-in-depth, not a security boundary. Left on &quot;Follow
-            sharing&quot;, redaction tracks the toggle above (on whenever sharing is on).
+            Scrubs shared terminal output for common secret patterns before it leaves this machine —
+            defense-in-depth, not a security boundary. Left on &quot;Follow sharing&quot;, redaction
+            tracks the toggle above (on whenever sharing is on).
           </div>
           <div className="flex gap-2 pt-1">
             {(
@@ -1421,8 +1433,8 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
         {shareOutputError && (
           <p className="text-[10px] text-destructive px-3">
-            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been
-            changed — the runner is still using whatever you last saved.
+            Could not save this setting ({truncate(shareOutputError, 100)}). It has NOT been changed
+            — the runner is still using whatever you last saved.
           </p>
         )}
       </div>

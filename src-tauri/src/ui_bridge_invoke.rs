@@ -253,6 +253,15 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         observe_projection: None,
     },
     ProxyableCommand {
+        name: "get_binding_gaps",
+        dispatch: Dispatch::Frontend,
+        description: "READ-ONLY. The per-tenant credential state the Settings card's Workspaces rows and the binding-gap banner both render: the device-JWT refresher's published binding-gap cell, expanded to one row per tenant in coord_bound_tenants ∪ slots ∪ default. `status: \"unknown\"` (stale or unreadable coord_bound_tenants.json, unreadable slot store, or no refresher pass yet) renders every row `unknown`, never `connected`.",
+        args_schema: "{}",
+        response_schema: "{ \"status\": \"measured\" | \"unknown\", \"reason\": string | null, \"rows\": [{ \"tenant_id\": string, \"display_name\": string | null, \"state\": \"connected\" | \"no_credential\" | \"unknown\" }] } | null",
+        probe_with_empty_args: true,
+        observe_projection: None,
+    },
+    ProxyableCommand {
         name: "emit_extraction_script",
         dispatch: Dispatch::Frontend,
         description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 5s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",

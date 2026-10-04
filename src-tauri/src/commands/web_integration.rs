@@ -752,6 +752,122 @@ pub async fn test_web_integration_connection(
 // redeem_pair_code — paste-pair via single-use 5-min code (Phase 2a.3)
 // ---------------------------------------------------------------------------
 
+/// Everything an EXPLICIT, interactive pairing does after its credentials are
+/// persisted — shared by [`redeem_pair_code`] and [`pair_all_tenants`] so the
+/// two doors cannot drift. `tenants` are the tenants whose slots were just
+/// written; `command` labels the log lines.
+async fn finish_explicit_pairing(command: &str, tenants: &[uuid::Uuid]) {
+    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
+    // tenant is the default), so every rejection coord recorded against the OLD
+    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
+    // stores a working credential and the next refresher pass re-reads the stale
+    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
+    //
+    // Both steps below are blocking file I/O under locks (the streak file's
+    // lock; the credential store's cross-process lock, which may wait on a
+    // heartbeat reconcile), so they run OFF the async runtime — for every
+    // door that shares this helper.
+
+    // Redeeming a pair code IS an explicit interactive credential acquisition —
+    // the operator typed a code that a signed-in web session minted — so it ends
+    // any interactive logout, exactly like a Cognito sign-in does.
+    //
+    // Without this, an operator who used the autonomy-preserving logout and then
+    // re-paired by code was dead-ended: the device JWT is valid, the runner is
+    // Tier 2 with the relay online and autonomy running, but `check_auth_status`
+    // still short-circuits on the persisted marker and reports
+    // `authenticated:false` forever — so the App gate renders LoginScreen, with
+    // the very Settings pane where a pair code is entered unreachable behind it.
+    // (This command is allowlisted over the UI-Bridge HTTP surface for
+    // agent-driven pairing, so it is a live path, not a theoretical one.)
+    //
+    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
+    // must not un-logout the operator. Placed HERE rather than inside
+    // `persist_pairing` also on purpose: the background device-JWT refresher
+    // writes the same credential slots, and clearing on that path would silently
+    // un-logout the operator on the next refresh cycle.
+    let tenants_owned = tenants.to_vec();
+    let command_owned = command.to_string();
+    let blocking = spawn_blocking_tracked(move || {
+        let default_binding = crate::auth::default_binding_tenant();
+        for tenant_id in &tenants_owned {
+            crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+                *tenant_id,
+                default_binding,
+            );
+        }
+        if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
+            warn!("{command_owned}: could not clear the interactive sign-out marker: {e}");
+        }
+    })
+    .await;
+    if let Err(e) = blocking {
+        warn!("{command}: post-pairing streak/marker task failed: {e}");
+    }
+
+    // Promote to Tier 2 (qontinui_account) now that a device JWT is in
+    // hand. Redeeming a pair code IS a cloud-account bind, so the runner
+    // must leave Tier Local for the WS relay to come online. Defensive:
+    // the Settings UI also promotes after redeem, but a headless / UI-Bridge
+    // caller that doesn't run the FE path still ends up online. Idempotent —
+    // a no-op when already at Tier 2.
+    //
+    // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
+    // helper the headless CLI door (`qontinui_profile device pair`) calls —
+    // reached here through `settings::promote_tier_to_account`, the bin-side
+    // door that additionally drops this process's settings parse cache (the
+    // lib cannot: the cache is bin-side).
+    // That door used to write the pairing credentials and never touch the
+    // tier, so the box that most needs Tier 2 was the only one that could not
+    // reach it. One writer, two doors: they cannot drift again. The helper
+    // owns all three conditions of `settings::should_persist_migration` —
+    // nothing-to-persist, `!is_secondary`, and (structurally, via its
+    // `serde_json::Value` edit) an authoritative source.
+    match settings::promote_tier_to_account() {
+        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
+            info!(
+                "{command}: promoted runner to Tier QontinuiAccount in {}",
+                path.display()
+            );
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
+            debug!("{command}: runner already at Tier QontinuiAccount — no settings write");
+        }
+        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
+            // A secondary must never write the shared settings.json (it would
+            // demote the primary), but THIS process still holds a device JWT
+            // and needs Tier 2 to bring its relay online — so apply the tier
+            // as the in-memory-only overlay, which is never persisted.
+            // Guarded on there being no runtime override already: an explicit
+            // operator choice (`set_runner_tier`) is authoritative over an
+            // inferred promotion, and that precedence must not be inverted.
+            if settings::in_memory_tier().is_none() {
+                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
+                warn!("{command}: secondary runner — applying tier in-memory only, skipping the settings.json write");
+            } else {
+                warn!("{command}: secondary runner with an explicit runtime tier override — leaving it alone");
+            }
+        }
+        Err(e) => {
+            warn!("{command}: tier promotion persist failed (continuing): {e}");
+        }
+    }
+
+    // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
+    // only when the tier changed. `persist_pairing` above just wrote a fresh
+    // device-JWT into the slot the relay reads, but a re-pair on a runner that
+    // is ALREADY Tier 2 (the common case: an idle runner whose 4h JWT expired)
+    // used to skip these kicks entirely — they lived inside the `tier !=
+    // QontinuiAccount` branch. The result was a fresh JWT staged on disk that
+    // nothing ever told the live relay/refresher to pick up, so the runner sat
+    // `ws_connected:false` until a full restart despite a valid pairing.
+    // Idempotent: the refresher no-ops when the JWT is still fresh, and a kick
+    // to a connected relay just re-evaluates its idle gate.
+    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    info!("{command}: kicked relay + device-JWT refresher to pick up the fresh pairing");
+}
+
 /// Wire response for [`redeem_pair_code`].
 ///
 /// Mirrors the runner-side ``PairCompleteResponse`` shape so the frontend
@@ -858,101 +974,14 @@ pub async fn redeem_pair_code(
     let tenant_id = uuid::Uuid::parse_str(tenant_id_str.trim())
         .map_err(|e| format!("server returned malformed tenant_id: {e}"))?;
 
-    persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
+    // Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
+    let resp_for_persist = resp.clone();
+    spawn_blocking_tracked(move || persist_pairing(&resp_for_persist, tenant_id))
+        .await
+        .map_err(|e| format!("persist pairing task panicked: {e}"))?
+        .map_err(|e| format!("persist pairing: {}", e))?;
 
-    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
-    // tenant is the default), so every rejection coord recorded against the OLD
-    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
-    // stores a working credential and the next refresher pass re-reads the stale
-    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
-    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
-        tenant_id,
-        crate::auth::default_binding_tenant(),
-    );
-
-    // Redeeming a pair code IS an explicit interactive credential acquisition —
-    // the operator typed a code that a signed-in web session minted — so it ends
-    // any interactive logout, exactly like a Cognito sign-in does.
-    //
-    // Without this, an operator who used the autonomy-preserving logout and then
-    // re-paired by code was dead-ended: the device JWT is valid, the runner is
-    // Tier 2 with the relay online and autonomy running, but `check_auth_status`
-    // still short-circuits on the persisted marker and reports
-    // `authenticated:false` forever — so the App gate renders LoginScreen, with
-    // the very Settings pane where a pair code is entered unreachable behind it.
-    // (This command is allowlisted over the UI-Bridge HTTP surface for
-    // agent-driven pairing, so it is a live path, not a theoretical one.)
-    //
-    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
-    // must not un-logout the operator. Placed HERE rather than inside
-    // `persist_pairing` also on purpose: the background device-JWT refresher
-    // writes the same credential slots, and clearing on that path would silently
-    // un-logout the operator on the next refresh cycle.
-    if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
-        warn!("redeem_pair_code: could not clear the interactive sign-out marker: {e}");
-    }
-
-    // Promote to Tier 2 (qontinui_account) now that a device JWT is in
-    // hand. Redeeming a pair code IS a cloud-account bind, so the runner
-    // must leave Tier Local for the WS relay to come online. Defensive:
-    // the Settings UI also promotes after redeem, but a headless / UI-Bridge
-    // caller that doesn't run the FE path still ends up online. Idempotent —
-    // a no-op when already at Tier 2.
-    //
-    // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
-    // helper the headless CLI door (`qontinui_profile device pair`) calls —
-    // reached here through `settings::promote_tier_to_account`, the bin-side
-    // door that additionally drops this process's settings parse cache (the
-    // lib cannot: the cache is bin-side).
-    // That door used to write the pairing credentials and never touch the
-    // tier, so the box that most needs Tier 2 was the only one that could not
-    // reach it. One writer, two doors: they cannot drift again. The helper
-    // owns all three conditions of `settings::should_persist_migration` —
-    // nothing-to-persist, `!is_secondary`, and (structurally, via its
-    // `serde_json::Value` edit) an authoritative source.
-    match settings::promote_tier_to_account() {
-        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
-            info!(
-                "redeem_pair_code: promoted runner to Tier QontinuiAccount in {}",
-                path.display()
-            );
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
-            debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
-        }
-        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
-            // A secondary must never write the shared settings.json (it would
-            // demote the primary), but THIS process still holds a device JWT
-            // and needs Tier 2 to bring its relay online — so apply the tier
-            // as the in-memory-only overlay, which is never persisted.
-            // Guarded on there being no runtime override already: an explicit
-            // operator choice (`set_runner_tier`) is authoritative over an
-            // inferred promotion, and that precedence must not be inverted.
-            if settings::in_memory_tier().is_none() {
-                settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
-                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping the settings.json write");
-            } else {
-                warn!("redeem_pair_code: secondary runner with an explicit runtime tier override — leaving it alone");
-            }
-        }
-        Err(e) => {
-            warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
-        }
-    }
-
-    // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
-    // only when the tier changed. `persist_pairing` above just wrote a fresh
-    // device-JWT into the slot the relay reads, but a re-pair on a runner that
-    // is ALREADY Tier 2 (the common case: an idle runner whose 4h JWT expired)
-    // used to skip these kicks entirely — they lived inside the `tier !=
-    // QontinuiAccount` branch. The result was a fresh JWT staged on disk that
-    // nothing ever told the live relay/refresher to pick up, so the runner sat
-    // `ws_connected:false` until a full restart despite a valid pairing.
-    // Idempotent: the refresher no-ops when the JWT is still fresh, and a kick
-    // to a connected relay just re-evaluates its idle gate.
-    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-    info!("redeem_pair_code: kicked relay + device-JWT refresher to pick up the fresh pairing");
+    finish_explicit_pairing("redeem_pair_code", &[tenant_id]).await;
 
     let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
 
@@ -968,6 +997,447 @@ pub async fn redeem_pair_code(
     })
 }
 
+// ---------------------------------------------------------------------------
+// pair_all_tenants — "Connect all my workspaces" (plan
+// 2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command,
+// Phase 3 / D1)
+// ---------------------------------------------------------------------------
+
+/// Wire response for [`pair_all_tenants`]: one row per requested tenant.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairAllTenantsResponse {
+    pub results: Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
+}
+
+/// Progress of the ONE in-flight [`pair_all_tenants`] flow, emitted so every
+/// surface (the banner and the Settings card) shows the same state, and so a
+/// failed browser launch can be answered with an "Open this link" fallback.
+/// Payload `{phase, …}`: `waiting {tenant_ids}`, `browser {connect_url,
+/// launched}`, `collecting` (callback received — no longer cancellable),
+/// `done {results}`, `error {error}`, `cancelled`.
+pub const PAIR_ALL_PROGRESS_EVENT: &str = "pair-all-tenants-progress";
+
+static PAIR_ALL_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by [`cancel_pair_all_tenants`]; read by the browser round-trip's wait
+/// loop. Cleared whenever a new flow starts.
+static PAIR_ALL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where the in-flight flow is, for [`get_pair_all_status`] (a surface
+/// mounted mid-flow) and [`cancel_pair_all_tenants`] (cancel only while the
+/// browser has not called back yet).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PairAllStatus {
+    pub in_flight: bool,
+    /// `idle` | `waiting` (before the browser opens) | `browser` (waiting for
+    /// the sign-in) | `cancelling` (a cancel won; the flow is ending) |
+    /// `collecting` (the callback won; collecting + saving — no longer
+    /// cancellable).
+    pub phase: &'static str,
+    pub connect_url: Option<String>,
+    pub launched: bool,
+}
+
+impl PairAllStatus {
+    /// Cancel side of the arbiter: an in-flight flow still waiting on the
+    /// browser moves to `cancelling`. `false` once the capture won
+    /// (`collecting`), or when nothing is in flight.
+    pub(crate) fn try_cancel(&mut self) -> bool {
+        if self.in_flight && matches!(self.phase, "waiting" | "browser") {
+            self.phase = "cancelling";
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Capture side of the arbiter, called by the wait loop the moment the
+    /// browser callback lands: `waiting|browser` → `collecting` and `true`;
+    /// `false` when a cancel already won (`cancelling`), so the flow ends
+    /// cancelled even though the browser called back.
+    pub(crate) fn try_claim_capture(&mut self) -> bool {
+        if self.in_flight && matches!(self.phase, "waiting" | "browser") {
+            self.phase = "collecting";
+            self.connect_url = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+static PAIR_ALL_STATUS: std::sync::Mutex<PairAllStatus> = std::sync::Mutex::new(PairAllStatus {
+    in_flight: false,
+    phase: "idle",
+    connect_url: None,
+    launched: false,
+});
+
+fn set_pair_all_status(update: impl FnOnce(&mut PairAllStatus)) {
+    if let Ok(mut st) = PAIR_ALL_STATUS.lock() {
+        update(&mut st);
+    }
+}
+
+/// RAII claim on the single in-flight [`pair_all_tenants`] flow.
+struct PairAllInFlight;
+
+impl PairAllInFlight {
+    fn acquire() -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        PAIR_ALL_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| {
+                PAIR_ALL_CANCEL.store(false, Ordering::Release);
+                set_pair_all_status(|st| {
+                    *st = PairAllStatus {
+                        in_flight: true,
+                        phase: "waiting",
+                        connect_url: None,
+                        launched: false,
+                    }
+                });
+                PairAllInFlight
+            })
+            .map_err(|_| {
+                "a workspace sign-in is already in progress — finish it in your browser first"
+                    .to_string()
+            })
+    }
+}
+
+impl Drop for PairAllInFlight {
+    fn drop(&mut self) {
+        set_pair_all_status(|st| {
+            *st = PairAllStatus {
+                in_flight: false,
+                phase: "idle",
+                connect_url: None,
+                launched: false,
+            }
+        });
+        PAIR_ALL_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn emit_pair_all_progress<R: Runtime>(app: &AppHandle<R>, payload: serde_json::Value) {
+    if let Err(e) = app.emit(PAIR_ALL_PROGRESS_EVENT, payload) {
+        warn!("pair_all_tenants: progress event failed: {e}");
+    }
+}
+
+/// Pure: which tenants this flow may pair, and the rows it refuses.
+///
+/// Only a MEASURED view may drive a pairing: an unknown view cannot tell a
+/// bound-without-credential tenant from one coord has since unbound, and
+/// pairing the latter re-creates a binding coord removed. So:
+///
+/// - an unknown view refuses the whole call, with its reason;
+/// - no explicit ids → every `no_credential` row (none → refused);
+/// - explicit ids → only those whose row is `no_credential` or `connected`
+///   (a re-pair of a working tenant is harmless); every other id is returned
+///   as a `skipped` row naming why, and is never sent to coord.
+///
+/// Adding a workspace this device is not bound to yet needs a tenant picker —
+/// deferred to a follow-up (plan D1 step 2); this function never offers one.
+pub(crate) fn select_pair_tenants(
+    view: &crate::mcp::device_jwt_refresher::BindingGapView,
+    explicit: &[uuid::Uuid],
+) -> Result<
+    (
+        Vec<uuid::Uuid>,
+        Vec<qontinui_runner_lib::pair::TenantPairOutcome>,
+    ),
+    String,
+> {
+    use crate::mcp::device_jwt_refresher::TenantCredentialState as S;
+    use qontinui_runner_lib::pair::{TenantPairOutcome, TenantPairStatus};
+    if view.status != "measured" {
+        return Err(format!(
+            "which workspaces lack a credential is UNKNOWN ({}) — nothing is paired until it is known",
+            view.reason.as_deref().unwrap_or("no reason recorded")
+        ));
+    }
+    let state_of = |t: &uuid::Uuid| {
+        view.rows
+            .iter()
+            .find(|r| uuid::Uuid::parse_str(&r.tenant_id).ok() == Some(*t))
+            .map(|r| r.state)
+    };
+    if explicit.is_empty() {
+        let gaps: Vec<uuid::Uuid> = view
+            .rows
+            .iter()
+            .filter(|r| r.state == S::NoCredential)
+            .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
+            .collect();
+        if gaps.is_empty() {
+            return Err(
+                "every workspace this device is bound to already has a credential".to_string(),
+            );
+        }
+        return Ok((gaps, Vec::new()));
+    }
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    for t in explicit {
+        match state_of(t) {
+            Some(S::NoCredential) | Some(S::Connected) => {
+                if !allowed.contains(t) {
+                    allowed.push(*t)
+                }
+            }
+            other => refused.push(TenantPairOutcome {
+                tenant_id: t.to_string(),
+                status: TenantPairStatus::Skipped,
+                skipped_reason: Some(match other {
+                    Some(_) => "not_offered: this workspace's credential state is unknown, \
+                                so pairing it could re-create a binding coord removed"
+                        .to_string(),
+                    None => "not_offered: this device is not bound to this workspace".to_string(),
+                }),
+            }),
+        }
+    }
+    if allowed.is_empty() {
+        return Err(format!(
+            "none of the requested workspaces can be paired here: {}",
+            refused
+                .iter()
+                .map(|r| format!(
+                    "{} ({})",
+                    r.tenant_id,
+                    r.skipped_reason.as_deref().unwrap_or("")
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    Ok((allowed, refused))
+}
+
+/// "Connect all my workspaces": ONE attended browser sign-in that mints a
+/// device JWT for every selected tenant and persists each into its own slot.
+///
+/// - Selection: [`select_pair_tenants`] over the published binding-gap view —
+///   a measured view only; `tenant_ids` omitted or empty means every gap.
+/// - Goes through coord's `pair-start` / `pair-complete` / `pair-collect`
+///   ([`qontinui_runner_lib::pair::pair_via_browser_multi`]) — never web
+///   `pair-cli` and never `machine-credential/exchange`, and never names a
+///   home tenant ([`qontinui_runner_lib::pair::connect_all_start_inputs`]), so
+///   the device's HOME tenant does not move and its machine key is not rotated.
+/// - Persistence is additive ([`qontinui_runner_lib::pair::persist_collected_pairings`]);
+///   on a device with no local default, coord's home tenant is preferred.
+/// - One flow at a time; [`cancel_pair_all_tenants`] ends it; progress is
+///   emitted as [`PAIR_ALL_PROGRESS_EVENT`].
+///
+/// Afterwards: the shared post-pairing steps (rejection streaks retired per
+/// tenant, relay + refresher kicked), the binding-gap cell republished from
+/// disk, and the `autonomy-binding-gap` nudge emitted so the banner and the
+/// Settings card re-read `get_binding_gaps`.
+#[tauri::command]
+pub async fn pair_all_tenants<R: Runtime>(
+    app: AppHandle<R>,
+    tenant_ids: Option<Vec<String>>,
+) -> Result<PairAllTenantsResponse, String> {
+    // One browser flow at a time, process-wide: the banner and the Settings
+    // card each own a button, and two concurrent flows would open two sign-ins.
+    let _in_flight = PairAllInFlight::acquire()?;
+    let result = run_pair_all_tenants(&app, tenant_ids).await;
+    match &result {
+        Ok(resp) => emit_pair_all_progress(
+            &app,
+            serde_json::json!({"phase": "done", "results": resp.results}),
+        ),
+        Err(e) if e == "cancelled" => {
+            emit_pair_all_progress(&app, serde_json::json!({"phase": "cancelled"}))
+        }
+        Err(e) => emit_pair_all_progress(&app, serde_json::json!({"phase": "error", "error": e})),
+    }
+    result
+}
+
+async fn run_pair_all_tenants<R: Runtime>(
+    app: &AppHandle<R>,
+    tenant_ids: Option<Vec<String>>,
+) -> Result<PairAllTenantsResponse, String> {
+    use qontinui_runner_lib::pair::{
+        connect_all_start_inputs, pair_via_browser_multi, persist_collected_pairings,
+        read_device_id_from_disk, BrowserPairHooks, TenantPairStatus,
+    };
+
+    let explicit: Vec<uuid::Uuid> = tenant_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|t| {
+            uuid::Uuid::parse_str(t.trim()).map_err(|e| format!("malformed tenant id {t:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let view = spawn_blocking_tracked(|| {
+        crate::mcp::device_jwt_refresher::current_binding_gap_view(&crate::auth::AuthManager::new())
+    })
+    .await
+    .map_err(|e| format!("binding-gap read panicked: {e}"))?;
+    let (selection, refused) = select_pair_tenants(&view, &explicit)?;
+
+    let coord_base = qontinui_runner_lib::profiles::connected_coord_base()
+        .ok_or_else(|| "this runner is not connected to a coordinator".to_string())?;
+    let device_id =
+        read_device_id_from_disk().map_err(|e| format!("could not read device identity: {e}"))?;
+
+    info!(
+        "pair_all_tenants: opening one browser sign-in for {} tenant(s): {:?}",
+        selection.len(),
+        selection
+    );
+    emit_pair_all_progress(
+        app,
+        serde_json::json!({
+            "phase": "waiting",
+            "tenant_ids": selection.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        }),
+    );
+    let for_blocking = selection.clone();
+    let app_for_blocking = app.clone();
+    let mut results = spawn_blocking_tracked(move || {
+        let on_connect_url = |url: &str, launched: bool| {
+            set_pair_all_status(|st| {
+                // Never overwrite a `cancelling` a cancel already won.
+                if st.phase == "waiting" {
+                    st.phase = "browser";
+                }
+                st.connect_url = Some(url.to_string());
+                st.launched = launched;
+            });
+            emit_pair_all_progress(
+                &app_for_blocking,
+                serde_json::json!({"phase": "browser", "connect_url": url, "launched": launched}),
+            );
+        };
+        // The capture side of the capture-vs-cancel arbiter (see
+        // `PairAllStatus::try_claim_capture`).
+        let claim_capture = || {
+            let won = PAIR_ALL_STATUS
+                .lock()
+                .map(|mut st| st.try_claim_capture())
+                .unwrap_or(false);
+            if won {
+                emit_pair_all_progress(
+                    &app_for_blocking,
+                    serde_json::json!({"phase": "collecting"}),
+                );
+            }
+            won
+        };
+        let hooks = BrowserPairHooks {
+            on_connect_url: Some(&on_connect_url),
+            cancel: Some(&PAIR_ALL_CANCEL),
+            claim_capture: Some(&claim_capture),
+        };
+        let (ids, home) = connect_all_start_inputs(&for_blocking);
+        let collected = pair_via_browser_multi(&coord_base, &ids, home, &hooks)?;
+        // The flow was bound to THIS device's machine.json id at pair-start;
+        // persist under that id, never under an echo that disagrees with it.
+        if let Some(echoed) = collected.device_id.as_deref() {
+            if echoed.trim() != device_id {
+                warn!(
+                    "pair_all_tenants: coord echoed device_id {echoed} but this flow \
+                     was started for {device_id} — keeping the local id"
+                );
+            }
+        }
+        persist_collected_pairings(
+            &collected,
+            &ids,
+            &device_id,
+            qontinui_runner_lib::pair::coord_home_tenant(),
+        )
+    })
+    .await
+    .map_err(|e| format!("pair_all_tenants task panicked: {e}"))??;
+
+    let connected: Vec<uuid::Uuid> = results
+        .iter()
+        .filter(|r| r.status == TenantPairStatus::Connected)
+        .filter_map(|r| uuid::Uuid::parse_str(&r.tenant_id).ok())
+        .collect();
+    results.extend(refused);
+    for r in &results {
+        info!(
+            "pair_all_tenants: tenant {} -> {:?}{}",
+            r.tenant_id,
+            r.status,
+            r.skipped_reason
+                .as_deref()
+                .map(|why| format!(" ({why})"))
+                .unwrap_or_default()
+        );
+    }
+    if !connected.is_empty() {
+        finish_explicit_pairing("pair_all_tenants", &connected).await;
+    }
+
+    // Republish the gap cell from disk NOW rather than on the next refresher
+    // pass, then nudge the UI to re-read it (the event is only a nudge — the
+    // UI's state comes from `get_binding_gaps`).
+    let _ = spawn_blocking_tracked(|| {
+        crate::mcp::device_jwt_refresher::republish_binding_gaps_now(
+            &crate::auth::AuthManager::new(),
+        )
+    })
+    .await;
+    for r in &results {
+        let payload = serde_json::json!({
+            "tenant_id": r.tenant_id,
+            "open": r.status != TenantPairStatus::Connected,
+        });
+        if let Err(e) = app.emit(
+            crate::mcp::device_jwt_refresher::AUTONOMY_BINDING_GAP_EVENT,
+            payload,
+        ) {
+            warn!(
+                "pair_all_tenants: binding-gap nudge failed (the view stays readable by pull): {e}"
+            );
+        }
+    }
+
+    Ok(PairAllTenantsResponse { results })
+}
+
+/// End the in-flight [`pair_all_tenants`] flow while it is still waiting on
+/// the browser (an abandoned tab otherwise holds it for up to 5 minutes).
+/// Returns `true` only when that cancel will take effect: a flow is running
+/// AND the browser has not called back yet. Once the callback has landed the
+/// flow is collecting and saving credentials, cannot be cancelled, and this
+/// returns `false`. A cancelled flow ends with `Err("cancelled")` within
+/// ~200 ms and its loopback server shuts down.
+#[tauri::command]
+pub async fn cancel_pair_all_tenants() -> bool {
+    use std::sync::atomic::Ordering;
+    // Decided under the status mutex, against `try_claim_capture` on the flow's
+    // side: exactly one of cancel and capture wins, and each knows it.
+    let won = PAIR_ALL_STATUS
+        .lock()
+        .map(|mut st| st.try_cancel())
+        .unwrap_or(false);
+    if won {
+        PAIR_ALL_CANCEL.store(true, Ordering::Release);
+    }
+    won
+}
+
+/// PULL half of [`PAIR_ALL_PROGRESS_EVENT`]: where the in-flight flow is, so a
+/// surface mounted mid-flow shows "Waiting for browser…", the connect link and
+/// Cancel instead of an idle button.
+#[tauri::command]
+pub async fn get_pair_all_status() -> PairAllStatus {
+    PAIR_ALL_STATUS
+        .lock()
+        .map(|st| st.clone())
+        .unwrap_or_default()
+}
+
 /// Tauri plugin exposing all web-integration commands.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_web_integration")
@@ -977,6 +1447,9 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_web_integration_settings,
             test_web_integration_connection,
             redeem_pair_code,
+            pair_all_tenants,
+            cancel_pair_all_tenants,
+            get_pair_all_status,
         ])
         .build()
 }
@@ -1243,5 +1716,119 @@ mod ipc_wire_contract_tests {
         }
         assert!(health.ends_with("/api/v1/health/live"));
         assert!(me.ends_with("/api/v1/devices/me"));
+    }
+}
+
+/// The capture-vs-cancel arbiter: exactly one side wins, and the loser
+/// knows it.
+#[cfg(test)]
+mod pair_all_arbiter_tests {
+    use super::PairAllStatus;
+
+    fn browser() -> PairAllStatus {
+        PairAllStatus {
+            in_flight: true,
+            phase: "browser",
+            connect_url: Some("https://x/c".to_string()),
+            launched: true,
+        }
+    }
+
+    #[test]
+    fn a_cancel_after_the_capture_loses_and_the_flow_proceeds() {
+        let mut st = browser();
+        assert!(st.try_claim_capture(), "the capture wins");
+        assert!(!st.try_cancel(), "a cancel after the capture returns false");
+        assert_eq!(st.phase, "collecting", "the flow proceeds to done");
+    }
+
+    #[test]
+    fn a_capture_after_the_cancel_loses_and_the_flow_ends_cancelled() {
+        let mut st = browser();
+        assert!(st.try_cancel(), "the cancel wins");
+        assert!(!st.try_claim_capture(), "a capture after the cancel loses");
+        assert_eq!(st.phase, "cancelling");
+        assert!(!st.try_cancel(), "a second cancel is not a second win");
+    }
+
+    #[test]
+    fn nothing_in_flight_cannot_be_cancelled_or_claimed() {
+        let mut st = PairAllStatus::default();
+        assert!(!st.try_cancel());
+        assert!(!st.try_claim_capture());
+    }
+}
+
+/// `pair_all_tenants`' selection: only a measured view, only gaps by default,
+/// and never an unknown or unbound tenant.
+#[cfg(test)]
+mod select_pair_tenants_tests {
+    use super::select_pair_tenants;
+    use crate::mcp::device_jwt_refresher::{BindingGapRow, BindingGapView, TenantCredentialState};
+    use qontinui_runner_lib::pair::TenantPairStatus;
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    fn view(status: &'static str, rows: &[(u8, TenantCredentialState)]) -> BindingGapView {
+        BindingGapView {
+            status,
+            reason: (status != "measured").then(|| "sidecar stale".to_string()),
+            rows: rows
+                .iter()
+                .map(|(n, state)| BindingGapRow {
+                    tenant_id: t(*n).to_string(),
+                    display_name: None,
+                    state: *state,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_view_pairs_nothing() {
+        let v = view("unknown", &[(1, TenantCredentialState::Unknown)]);
+        let err = select_pair_tenants(&v, &[]).unwrap_err();
+        assert!(
+            err.contains("UNKNOWN") && err.contains("sidecar stale"),
+            "{err}"
+        );
+        assert!(select_pair_tenants(&v, &[t(1)]).is_err());
+    }
+
+    #[test]
+    fn the_default_is_the_gaps_only() {
+        use TenantCredentialState::*;
+        let v = view(
+            "measured",
+            &[(1, Connected), (2, NoCredential), (3, Unknown)],
+        );
+        assert_eq!(select_pair_tenants(&v, &[]).unwrap(), (vec![t(2)], vec![]));
+        let none = view("measured", &[(1, Connected), (3, Unknown)]);
+        assert!(select_pair_tenants(&none, &[]).is_err());
+    }
+
+    #[test]
+    fn explicit_ids_are_intersected_with_gap_and_connected_rows() {
+        use TenantCredentialState::*;
+        let v = view(
+            "measured",
+            &[(1, Connected), (2, NoCredential), (3, Unknown)],
+        );
+        let (allowed, refused) = select_pair_tenants(&v, &[t(2), t(1), t(3), t(9), t(2)]).unwrap();
+        assert_eq!(allowed, vec![t(2), t(1)]);
+        assert_eq!(
+            refused
+                .iter()
+                .map(|r| r.tenant_id.clone())
+                .collect::<Vec<_>>(),
+            vec![t(3).to_string(), t(9).to_string()]
+        );
+        assert!(refused.iter().all(|r| r.status == TenantPairStatus::Skipped
+            && r.skipped_reason
+                .as_deref()
+                .is_some_and(|w| w.starts_with("not_offered"))));
+        assert!(select_pair_tenants(&v, &[t(3), t(9)]).is_err());
     }
 }
