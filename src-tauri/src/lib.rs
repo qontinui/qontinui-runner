@@ -148,6 +148,13 @@ pub mod util {
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
 
+// Per-local-user connection guard for every runner TCP listener (plan
+// `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
+// loopback connection whose peer process runs as a different OS user. In the
+// LIB because the `:9876` API (bin) and the pairing / Cognito callback
+// listeners (lib) all wrap their listeners with it.
+pub mod peer_user_guard;
+
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
