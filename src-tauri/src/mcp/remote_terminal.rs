@@ -4969,7 +4969,7 @@ async fn supervise_once(
 /// Start a supervisor for every queued reattach request on the process-wide
 /// client. Needs a tokio runtime; without one the claim is released so a
 /// later reconnect can try again.
-fn spawn_reattach_supervisors(c: &'static RemoteAttachClient) {
+fn spawn_reattach_tasks(c: &'static RemoteAttachClient) {
     for req in c.take_reattach_requests() {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -5059,7 +5059,7 @@ pub const END_REPLY_TIMEOUT_CODE: &str = "end_reply_timeout";
 pub fn relay_connected() {
     let c = client();
     c.on_relay_connected();
-    spawn_reattach_supervisors(c);
+    spawn_reattach_tasks(c);
 }
 
 /// What the relay calls for every inbound remote-terminal frame: route it,
@@ -5067,7 +5067,7 @@ pub fn relay_connected() {
 pub fn route_inbound(msg_type: &str, data: &Value) -> bool {
     let c = client();
     let consumed = c.handle_inbound(msg_type, data);
-    spawn_reattach_supervisors(c);
+    spawn_reattach_tasks(c);
     consumed
 }
 
