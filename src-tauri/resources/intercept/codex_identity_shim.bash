@@ -100,7 +100,17 @@ notify_session_start() {
   local cwd_raw
   cwd_raw="$(pwd -W 2>/dev/null || printf '%s' "$PWD")"
   local body
-  body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"provider\":\"$TOOL\",\"source\":\"startup\",\"cwd\":\"$(json_escape "$cwd_raw")\""
+  # `codex resume [<id>]` continues an EXISTING rollout: say so, with the
+  # argv id when one is given, so the runner does not wait for a new one.
+  local source="startup" resume=""
+  if [ "${1:-}" = "resume" ]; then
+    source="resume"
+    case "${2:-}" in
+      ""|-*) ;;
+      *) resume=",\"resume_id\":\"$(json_escape "$2")\"" ;;
+    esac
+  fi
+  body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"provider\":\"$TOOL\",\"source\":\"$source\",\"cwd\":\"$(json_escape "$cwd_raw")\"$resume"
   if [ -n "${CODEX_HOME:-}" ]; then
     body="$body,\"config_dir\":\"$(json_escape "$CODEX_HOME")\""
   fi
@@ -119,6 +129,6 @@ case "${1:-}" in
   login|logout|mcp|plugin|app-server|remote-control|completion|update|doctor| \
   sandbox|debug|apply|a|queue|archive|delete|migrate-rollouts|unarchive| \
   cloud|exec-server|features|agents|help|-h|--help|-V|--version) ;;
-  *) notify_session_start ;;
+  *) notify_session_start "$@" ;;
 esac
 exec_real "$@"

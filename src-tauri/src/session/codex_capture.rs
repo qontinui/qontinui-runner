@@ -268,6 +268,59 @@ pub fn capture_session_id_by_cwd(
         .map(|(meta, _)| meta.id)
 }
 
+/// A rollout's last-modified time as epoch millis.
+fn modified_ms(path: &Path) -> Option<i64> {
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+/// The id of the session a RESUME launch (`codex resume …`) continued.
+///
+/// `codex resume <id>` appends to the EXISTING rollout, whose creation time
+/// predates the start — [`capture_session_id_by_cwd`] never sees it. So:
+///
+/// * with an argv id that passes the strict id charset
+///   ([`qontinui_runner_lib::cli_profile::is_valid_session_id`]), the rollout
+///   carrying that id, once it has been written since the start (the resume
+///   actually happened). Its recorded cwd is not required to match: a resume
+///   may run from anywhere.
+/// * without one (`resume --last`, the picker, or an id that fails the
+///   charset), the newest rollout in `want_cwd` WRITTEN since the start,
+///   whatever its creation time — a resume launch is expected to continue an
+///   older rollout.
+///
+/// An id `bound_elsewhere` claims is skipped either way.
+pub fn capture_resumed_session_id(
+    sessions_root: &Path,
+    started_ms: i64,
+    want_cwd: &str,
+    resume_id: Option<&str>,
+    bound_elsewhere: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let resume_id =
+        resume_id.filter(|id| qontinui_runner_lib::cli_profile::is_valid_session_id(id));
+    collect_rollouts(sessions_root)
+        .into_iter()
+        .filter_map(|path| {
+            let written_ms = modified_ms(&path)?;
+            if written_ms + CREATED_SKEW_MS < started_ms {
+                return None;
+            }
+            let meta = parse_meta(&read_first_line(&path)?)?;
+            Some((meta, written_ms))
+        })
+        .filter(|(meta, _)| match resume_id {
+            Some(id) => meta.id == id,
+            None => meta
+                .cwd
+                .as_deref()
+                .is_some_and(|c| cwd_matches(c, want_cwd)),
+        })
+        .filter(|(meta, _)| !bound_elsewhere(&meta.id))
+        .max_by_key(|(_, written_ms)| *written_ms)
+        .map(|(meta, _)| meta.id)
+}
+
 /// Record and confirm a captured Codex session for `terminal_id`, then close
 /// every other open record of that terminal.
 ///
@@ -350,6 +403,10 @@ pub struct CaptureStart {
     pub codex_home: Option<String>,
     /// When the signal arrived (epoch millis); older rollouts are ignored.
     pub started_ms: i64,
+    /// `Some` when the launch was `codex resume …`: it continues an existing
+    /// rollout rather than creating one ([`capture_resumed_session_id`]).
+    /// The inner value is the id from argv, unvalidated (validated at use).
+    pub resume: Option<Option<String>>,
 }
 
 /// Poll for the rollout of the session `start` describes and, on a match,
@@ -380,9 +437,19 @@ pub async fn capture_and_record_by_cwd(
             .is_some_and(|r| r.state == "open" && r.terminal_id != start.terminal_id)
     };
     loop {
-        if let Some(session_id) =
-            capture_session_id_by_cwd(&root, start.started_ms, &start.cwd, &bound_elsewhere)
-        {
+        let found = match &start.resume {
+            Some(resume_id) => capture_resumed_session_id(
+                &root,
+                start.started_ms,
+                &start.cwd,
+                resume_id.as_deref(),
+                &bound_elsewhere,
+            ),
+            None => {
+                capture_session_id_by_cwd(&root, start.started_ms, &start.cwd, &bound_elsewhere)
+            }
+        };
+        if let Some(session_id) = found {
             record_captured_session(
                 &store,
                 &session_id,
@@ -568,6 +635,64 @@ mod tests {
         // Started after every rollout was created: nothing qualifies.
         assert_eq!(
             capture_session_id_by_cwd(&root, T0 + 900_000, "C:/repos/widget", &nobody),
+            None
+        );
+    }
+
+    /// `codex resume <id>` appends to a rollout CREATED long before the start:
+    /// a resume launch captures it by its argv id (or, without a usable id,
+    /// by a post-start write in the cwd), while a fresh launch never would.
+    #[test]
+    fn a_resume_launch_captures_the_continued_older_rollout() {
+        let dir = tempdir().unwrap();
+        let day = sessions_root(dir.path()).join("2026").join("06").join("25");
+        fs::create_dir_all(&day).unwrap();
+        let written_after_start = T0 as u64 + 10_000;
+        write_rollout(
+            &day,
+            "rollout-old.jsonl",
+            &meta("old-uuid", "/work/proj", T0 - 3_600_000),
+            written_after_start,
+        );
+        // A same-cwd rollout NOT written since the start: not the resumed one.
+        write_rollout(
+            &day,
+            "rollout-idle.jsonl",
+            &meta("idle-uuid", "/work/proj", T0 - 7_200_000),
+            T0 as u64 - 600_000,
+        );
+        let root = sessions_root(dir.path());
+
+        // The fresh-launch rule cannot see it (created before the start).
+        assert_eq!(
+            capture_session_id_by_cwd(&root, T0, "/work/proj", &nobody),
+            None
+        );
+        // By argv id — from another cwd, too.
+        assert_eq!(
+            capture_resumed_session_id(&root, T0, "/elsewhere", Some("old-uuid"), &nobody),
+            Some("old-uuid".to_string())
+        );
+        // An idle rollout's id is not captured: it was not written since.
+        assert_eq!(
+            capture_resumed_session_id(&root, T0, "/work/proj", Some("idle-uuid"), &nobody),
+            None
+        );
+        // No usable id (`resume --last`, or one failing the charset): the
+        // post-start write in this cwd.
+        assert_eq!(
+            capture_resumed_session_id(&root, T0, "/work/proj", None, &nobody),
+            Some("old-uuid".to_string())
+        );
+        assert_eq!(
+            capture_resumed_session_id(&root, T0, "/work/proj", Some("x; rm -rf /"), &nobody),
+            Some("old-uuid".to_string())
+        );
+        // Bound to another terminal: skipped.
+        assert_eq!(
+            capture_resumed_session_id(&root, T0, "/work/proj", Some("old-uuid"), &|id| {
+                id == "old-uuid"
+            }),
             None
         );
     }
@@ -792,6 +917,7 @@ mod tests {
                 cwd: "/work/proj".to_string(),
                 codex_home: Some(home.to_string_lossy().into_owned()),
                 started_ms: 0,
+                resume: None,
             },
             Duration::from_millis(1),
             Duration::from_millis(200),
@@ -815,6 +941,7 @@ mod tests {
                 cwd: "/elsewhere".to_string(),
                 codex_home: Some(home.to_string_lossy().into_owned()),
                 started_ms: 0,
+                resume: None,
             },
             Duration::from_millis(1),
             Duration::from_millis(20),

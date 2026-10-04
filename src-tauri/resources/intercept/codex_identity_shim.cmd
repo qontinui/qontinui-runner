@@ -56,6 +56,18 @@ for %%S in (login logout mcp plugin app-server remote-control completion update 
   if /I "!ARG1!"=="%%S" goto :passthrough
 )
 
+rem ---- `codex resume [<id>]` continues an EXISTING rollout: say so, with
+rem the argv id when one is given (taken through a FOR variable like ARG1;
+rem quotes stripped so it cannot unbalance the JSON; the runner validates it).
+set "SRCJSON=startup"
+set "RESUMEJSON="
+if /I "!ARG1!"=="resume" (
+  set "SRCJSON=resume"
+  set "ARG2="
+  for %%B in (%2) do if not defined ARG2 set "ARG2=%%~B"
+  if defined ARG2 set "ARG2=!ARG2:"=!"
+  if defined ARG2 if not "!ARG2:~0,1!"=="-" set "RESUMEJSON=,\"resume_id\":\"!ARG2!\""
+)
 rem ---- best-effort start signal (NO session_id). Never load-bearing. --------
 if defined QONTINUI_INSTALL_INTERCEPT_PORT (
   where curl >nul 2>nul
@@ -63,7 +75,7 @@ if defined QONTINUI_INSTALL_INTERCEPT_PORT (
     set "CWDJSON=%CD:\=\\%"
     set "HOMEJSON="
     if defined CODEX_HOME set "HOMEJSON=,\"config_dir\":\"!CODEX_HOME:\=\\!\""
-    curl -fsS --connect-timeout 3 --max-time 10 -X POST "http://127.0.0.1:%QONTINUI_INSTALL_INTERCEPT_PORT%/control/session-open" -H "Content-Type: application/json" -d "{\"terminal_id\":\"%QONTINUI_TERMINAL_ID%\",\"provider\":\"%TOOL%\",\"source\":\"startup\",\"cwd\":\"!CWDJSON!\"!HOMEJSON!}" >nul 2>nul
+    curl -fsS --connect-timeout 3 --max-time 10 -X POST "http://127.0.0.1:%QONTINUI_INSTALL_INTERCEPT_PORT%/control/session-open" -H "Content-Type: application/json" -d "{\"terminal_id\":\"%QONTINUI_TERMINAL_ID%\",\"provider\":\"%TOOL%\",\"source\":\"!SRCJSON!\",\"cwd\":\"!CWDJSON!\"!HOMEJSON!!RESUMEJSON!}" >nul 2>nul
   )
 )
 

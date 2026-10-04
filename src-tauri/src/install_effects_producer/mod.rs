@@ -216,6 +216,11 @@ pub struct SessionOpenRequest {
     /// The session working dir, if the hook reports it.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The id a `codex resume <id>` launch named in argv, as the read-back
+    /// shim reports it with `source: "resume"`. UNVALIDATED here — the
+    /// capture validates it against the strict id charset before use.
+    #[serde(default)]
+    pub resume_id: Option<String>,
 }
 
 /// Why a `POST /control/session-open` body must be refused, or `None` to accept.
@@ -309,6 +314,7 @@ fn start_read_back(
         cwd: req.cwd.clone().unwrap_or_default(),
         codex_home: req.config_dir.clone().filter(|d| !d.trim().is_empty()),
         started_ms: chrono::Utc::now().timestamp_millis(),
+        resume: (req.source.as_deref() == Some("resume")).then(|| req.resume_id.clone()),
     };
     let app_handle = state.app_handle.clone();
     let terminal_id = req.terminal_id.clone();
@@ -2426,6 +2432,7 @@ mod tests {
             provider: None,
             config_dir: None,
             cwd: None,
+            resume_id: None,
         }
     }
 
@@ -3046,6 +3053,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: Some("C:/cfg".to_string()),
             cwd: Some("C:/repos/widget".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3142,6 +3150,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None, // hook may omit — must not erase the known one
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3440,6 +3449,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3526,6 +3536,7 @@ mod tests {
             provider: Some("claude".to_string()),
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
+            resume_id: None,
         };
         record_session_open_into(&store, &req, "claude");
 
@@ -3574,6 +3585,7 @@ mod tests {
             provider: None,
             config_dir: None,
             cwd: None,
+            resume_id: None,
         };
         // The handler computes `provider`; mirror its default here.
         record_session_open_into(&store, &req, "claude");
