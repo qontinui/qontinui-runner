@@ -1444,6 +1444,15 @@ struct LiveCloseEffects<'a> {
 pub const OWNERSHIP_REUSE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// PURE: may a re-check reuse an ownership read made at `read_at`?
+///
+/// The cost of reuse, stated: a worktree allocated to the session in the
+/// (at most 60 s) since the read is invisible to a re-check that reuses it,
+/// so its custody goes unjudged for that close. That is acceptable because
+/// the same re-check also re-establishes ELIGIBILITY immediately before the
+/// close — and allocating a worktree is work: a session doing it is not idle
+/// past its grace period with no live children, so it fails that re-check
+/// first. Past the age bound the read is fetched again, and a failed
+/// re-fetch is Unknown.
 pub fn ownership_reusable(read_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(read_at) <= OWNERSHIP_REUSE_MAX_AGE
 }
@@ -3475,6 +3484,9 @@ mod tests {
         probe: TreeProbe,
         published: std::sync::Mutex<Vec<Vec<(String, CustodyVerdict)>>>,
         effects: RecordingEffects,
+        /// When set, the ownership read answers exactly this instead of
+        /// marking every candidate's coord session live.
+        ownership_override: Option<OwnershipRead>,
     }
 
     impl FakeWorld {
@@ -3505,6 +3517,7 @@ mod tests {
                 probe: TreeProbe::default(),
                 published: std::sync::Mutex::new(Vec::new()),
                 effects,
+                ownership_override: None,
             }
         }
         fn tree(mut self, session_id: &str, state: wind_down::MemberState) -> Self {
@@ -3550,6 +3563,9 @@ mod tests {
             (&pass.0, &pass.1)
         }
         async fn ownership(&self, claude_session_ids: &[String]) -> OwnershipRead {
+            if let Some(read) = &self.ownership_override {
+                return read.clone();
+            }
             // Every candidate's coord session is live and holds no rows.
             let mut index = CoordOwnership::default();
             let live: Vec<String> = claude_session_ids
@@ -3702,76 +3718,16 @@ mod tests {
     /// known live (auto-closed) is never closed, whatever its trees show.
     #[tokio::test]
     async fn finished_close_tick_never_closes_a_session_whose_coord_row_is_not_live() {
-        struct ClosedCoordWorld(FakeWorld);
-        // Same world, but the ownership read marks nothing live.
-        let world = FakeWorld::with_sessions(&["t1"]);
-        let mut last = None;
-        let report = finished_close_tick(
-            &ClosedCoordWorld(world),
-            ClockVerdict::Trustworthy,
-            &mut last,
-            Instant::now(),
-            GRACE,
-        )
-        .await;
-        let FinishedCloseTick::Ran { judged, outcomes } = report else {
+        // A valid read that marks nothing live: the coord row was closed, or
+        // moved between states while the pages were read.
+        let mut world = FakeWorld::with_sessions(&["t1"]);
+        world.ownership_override = Some(Ok(CoordOwnership::default()));
+        let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
             panic!("the census should have run");
         };
         assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));
         assert!(outcomes.is_empty());
-
-        #[async_trait::async_trait]
-        impl FinishedCloseWorld for ClosedCoordWorld {
-            type Pass = <FakeWorld as FinishedCloseWorld>::Pass;
-            fn mode(&self) -> FinishedSessionClose {
-                self.0.mode()
-            }
-            fn open_terminal_records(&self) -> usize {
-                self.0.open_terminal_records()
-            }
-            async fn census(&self) -> Option<Self::Pass> {
-                self.0.census().await
-            }
-            fn census_view<'p>(
-                &self,
-                pass: &'p Self::Pass,
-            ) -> (
-                &'p [LiveClaudeProcess],
-                &'p wind_down_observer::ObservedInputs,
-            ) {
-                self.0.census_view(pass)
-            }
-            async fn ownership(&self, _ids: &[String]) -> OwnershipRead {
-                Ok(CoordOwnership::default())
-            }
-            fn workspace_root(&self) -> Option<PathBuf> {
-                self.0.workspace_root()
-            }
-            fn custody_context(
-                &self,
-                pass: &Self::Pass,
-                s: &str,
-                t: &str,
-            ) -> SessionCustodyContext {
-                self.0.custody_context(pass, s, t)
-            }
-            fn probe(&self) -> &dyn CustodyProbe {
-                self.0.probe()
-            }
-            fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
-                self.0.publish_custody(verdicts)
-            }
-            async fn close_clean(
-                &self,
-                pass: &Self::Pass,
-                clean: Vec<(String, String)>,
-                root: Option<PathBuf>,
-                ownership: &OwnershipRead,
-                at: Instant,
-            ) -> Option<Vec<CandidateOutcome>> {
-                self.0.close_clean(pass, clean, root, ownership, at).await
-            }
-        }
+        assert!(world.exits().is_empty());
     }
 
     /// Review item 9: custody probing stops once a batch's worth of clean

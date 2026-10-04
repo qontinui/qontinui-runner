@@ -614,9 +614,11 @@ pub struct AttributedWorktree {
 ///
 /// `Err` — which the gate reads as `Unknown` — when the index could not be
 /// read, when the pane carries no coord session id (its allocations cannot be
-/// looked up at all), when that session is not POSITIVELY known live (coord
-/// auto-closes idle sessions, and a closed session's rows are on no live page
-/// — so its absence is not "no worktrees"), or when a ledger path is relative
+/// looked up at all), when that session is not POSITIVELY known live (a
+/// session coord closed, or one that moved between states while the pages
+/// were read, is on no live page although its rows may exist — so its absence
+/// is not "no worktrees"; see `custody::coord::fetch_live_ownership`), or
+/// when a ledger path is relative
 /// and no workspace root resolves to anchor it.
 pub fn attributed_worktrees(
     ownership: &OwnershipRead,

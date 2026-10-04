@@ -1209,8 +1209,10 @@ pub mod coord {
         by_path: std::collections::HashMap<String, usize>,
         /// coord answered at all. `false` ⇒ absence is UNKNOWN, not "no owner".
         pub reachable: bool,
-        /// `coord.sessions.id`s (lowercased) POSITIVELY known to be in a live
-        /// state when this index was read — see [`fetch_live_ownership`].
+        /// `coord.sessions.id`s (lowercased) POSITIVELY known live for this
+        /// read: listed on a validated live page, or — holding no rows —
+        /// agreed live by both work-status reads around the pages. See
+        /// [`fetch_live_ownership`].
         /// Empty for an index built by [`Self::from_response`] alone, which
         /// asserts nothing about liveness.
         live_sessions: std::collections::HashSet<String>,
@@ -1251,7 +1253,8 @@ pub mod coord {
 
         /// Is `session_id` (a `coord.sessions.id`) positively known live? Only
         /// then does an absence of its rows mean "no worktrees" — a session
-        /// coord has CLOSED drops off every live page with its rows.
+        /// coord has closed, or one that moved between states while the pages
+        /// were read, is on no live page although its rows may exist.
         pub fn is_known_live(&self, session_id: &str) -> bool {
             self.live_sessions
                 .contains(&session_id.to_ascii_lowercase())
@@ -1427,18 +1430,21 @@ pub mod coord {
         Ok(index)
     }
 
-    /// PURE: the `coord.sessions.id`s a work-status read shows in a LIVE
-    /// state ([`LIVE_SESSION_STATES`]).
-    pub fn live_coord_sessions(
-        liveness: &std::collections::HashMap<
-            String,
-            crate::mcp::session_work_status::CoordLiveness,
-        >,
+    /// PURE: the `coord.sessions.id`s that BOTH work-status reads — one made
+    /// before the worktree pages, one after — name as the row answering for
+    /// the same Claude session, in the SAME live state ([`LIVE_SESSION_STATES`]).
+    ///
+    /// Only such a session may be taken as live-with-no-rows when it is on no
+    /// page. A read that failed carries no entries, so it agrees with nothing.
+    pub fn agreeing_live_sessions(
+        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
     ) -> Vec<String> {
-        liveness
-            .values()
-            .filter(|l| LIVE_SESSION_STATES.contains(&l.state.as_str()))
-            .map(|l| l.coord_session_id.clone())
+        before
+            .iter()
+            .filter(|(_, pre)| LIVE_SESSION_STATES.contains(&pre.state.as_str()))
+            .filter(|(claude_id, pre)| after.get(*claude_id) == Some(*pre))
+            .map(|(_, pre)| pre.coord_session_id.clone())
             .collect()
     }
 
@@ -1453,28 +1459,32 @@ pub mod coord {
     /// (`Err`) any page that is incomplete by [`validate_complete_page`], or
     /// any non-2xx or undecodable answer. `Err` is `Unknown` at the gate.
     ///
-    /// It is still a tenant-wide read to answer a one-session question. A
-    /// per-session filter on coord's route (`?session_id=`) would make it
-    /// complete by construction and cheap — a coord follow-up; until then a
-    /// tenant with more than 500 rows in one state reads as UNKNOWN here,
-    /// never as clean.
+    /// It is still a tenant-wide read to answer a one-session question.
     ///
     /// ## Liveness: why a session missing from every page is not "no rows"
     ///
     /// The route's ledger join is an INNER lateral off
     /// `coord.agent_worktrees`, so a session with no worktree rows is OMITTED,
-    /// not listed with an empty array — and coord auto-closes a `stale` /
-    /// `pending_resolution` session after `COORD_SESSION_AUTOCLOSE_SECS`
-    /// without a heartbeat ever reopening it, so a live pane can carry a
-    /// session id that is on no live page while its rows still exist. Absence
-    /// is therefore ambiguous. After the pages, this reads coord's
-    /// `/coord/sessions/work-status` for `claude_session_ids` and marks as
-    /// live (`CoordOwnership::is_known_live`) every row it shows in a live
-    /// state, on top of every session the pages listed. The order is
-    /// load-bearing: liveness only ever moves to `closed`, so a session live
-    /// AFTER the pages were read was live while they were, and its rows — if
-    /// it had any — are on them. A degraded work-status read marks nothing,
-    /// which leaves an absent session Unknown.
+    /// not listed with an empty array. And a session's state MOVES in both
+    /// directions: coord auto-closes an idle `stale` / `pending_resolution`
+    /// session, and an `UpdateSessionRequest { state: active }` — which the
+    /// runner's own `coord_sync` outbox sends — re-activates one and clears
+    /// its `closed_at`. The four state-filtered pages are four separate
+    /// snapshots, so a session can move from a state read LATER into one read
+    /// EARLIER between two of them and appear on no page while its rows exist.
+    /// Absence is therefore ambiguous, and no single liveness read settles it.
+    ///
+    /// So a session on a live page is live (its rows are on that page, which
+    /// is complete), and a session on NO page is taken as live-with-no-rows
+    /// only when `/coord/sessions/work-status` — read once BEFORE the pages and
+    /// once AFTER — names the same coord row in the same live state both times
+    /// ([`agreeing_live_sessions`]). Disagreement, an absent row, or a read
+    /// that failed leaves it Unknown. This NARROWS the window rather than
+    /// closing it: a session that leaves a state and returns to it between the
+    /// two reads still agrees. A coord read keyed on `claude_code_session_id`
+    /// with no state filter would answer in ONE snapshot and make this
+    /// complete by construction — a coord follow-up, as is a per-session
+    /// filter on this route.
     pub async fn fetch_live_ownership(
         claude_session_ids: &[String],
     ) -> Result<CoordOwnership, String> {
@@ -1488,6 +1498,7 @@ pub mod coord {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("build custody http client: {e}"))?;
+        let before = crate::mcp::session_work_status::fetch(claude_session_ids).await;
         let mut pages = Vec::new();
         for state in LIVE_SESSION_STATES {
             let url = format!(
@@ -1511,9 +1522,12 @@ pub mod coord {
             pages.push((state, page));
         }
         let mut index = ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)?;
-        let status = crate::mcp::session_work_status::fetch(claude_session_ids).await;
-        let live = live_coord_sessions(&status.liveness_by_session_id);
-        index.mark_live(live.iter().map(String::as_str));
+        let after = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        let rowless = agreeing_live_sessions(
+            &before.liveness_by_session_id,
+            &after.liveness_by_session_id,
+        );
+        index.mark_live(rowless.iter().map(String::as_str));
         Ok(index)
     }
 
@@ -1715,43 +1729,88 @@ pub mod coord {
             assert!(LIVE_SESSION_STATES.iter().all(|s| *s != "closed"));
         }
 
+        fn liveness(
+            rows: &[(&str, &str, &str)],
+        ) -> std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>
+        {
+            rows.iter()
+                .map(|(claude, coord, state)| {
+                    (
+                        claude.to_string(),
+                        crate::mcp::session_work_status::CoordLiveness {
+                            coord_session_id: coord.to_string(),
+                            state: state.to_string(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
         #[test]
-        fn sessions_on_live_pages_and_live_work_status_rows_are_known_live() {
-            use crate::mcp::session_work_status::CoordLiveness;
+        fn a_session_on_a_live_page_is_live_without_any_work_status_agreement() {
             let active = page(
                 r#"{"sessionBridgeColumnPresent":true,"sessions":[
                     {"sessionId":"S-PAGE","worktrees":[{"worktreePath":"wt/a"}]}]}"#,
             );
-            let mut idx = ownership_from_pages(vec![("active", active)], 500).unwrap();
+            let idx = ownership_from_pages(vec![("active", active)], 500).unwrap();
             assert!(idx.is_known_live("s-page"), "listed on a live page");
             assert!(!idx.is_known_live("s-rowless"));
-
-            let liveness: std::collections::HashMap<String, CoordLiveness> = [
-                ("claude-a", "s-rowless", "active"),
-                ("claude-b", "s-closed", "closed"),
-            ]
-            .into_iter()
-            .map(|(c, s, st)| {
-                (
-                    c.to_string(),
-                    CoordLiveness {
-                        coord_session_id: s.to_string(),
-                        state: st.to_string(),
-                    },
-                )
-            })
-            .collect();
-            let live = live_coord_sessions(&liveness);
-            idx.mark_live(live.iter().map(String::as_str));
-            assert!(
-                idx.is_known_live("s-rowless"),
-                "live, simply holding no rows"
-            );
-            assert!(!idx.is_known_live("s-closed"), "closed is never live");
             // An index built from a response alone asserts no liveness.
             assert!(
                 !CoordOwnership::from_response(page(r#"{"sessions":[]}"#)).is_known_live("s-page")
             );
+        }
+
+        /// Both reads name the same coord row in the same live state: rowless.
+        #[test]
+        fn a_pageless_session_both_reads_agree_is_live() {
+            let before = liveness(&[("claude-a", "s-rowless", "active")]);
+            let after = liveness(&[("claude-a", "s-rowless", "active")]);
+            assert_eq!(
+                agreeing_live_sessions(&before, &after),
+                vec!["s-rowless".to_string()]
+            );
+        }
+
+        /// The reactivation race: `stale` before the pages, `active` after —
+        /// it may have been on neither page while its rows existed. Unknown.
+        #[test]
+        fn a_pageless_session_whose_reads_disagree_is_unknown() {
+            let stale = liveness(&[("claude-a", "s-moved", "stale")]);
+            let active = liveness(&[("claude-a", "s-moved", "active")]);
+            assert!(agreeing_live_sessions(&stale, &active).is_empty());
+            // A different coord row answering is disagreement too.
+            let other_row = liveness(&[("claude-a", "s-other", "stale")]);
+            assert!(agreeing_live_sessions(&stale, &other_row).is_empty());
+            // And agreeing on `closed` is never live.
+            let closed = liveness(&[("claude-a", "s-moved", "closed")]);
+            assert!(agreeing_live_sessions(&closed, &closed).is_empty());
+        }
+
+        /// A failed work-status read carries no rows, so it agrees with
+        /// nothing — whichever of the two it was.
+        #[test]
+        fn a_pageless_session_with_one_failed_read_is_unknown() {
+            let ok = liveness(&[("claude-a", "s-rowless", "active")]);
+            let failed = std::collections::HashMap::new();
+            assert!(agreeing_live_sessions(&ok, &failed).is_empty());
+            assert!(agreeing_live_sessions(&failed, &ok).is_empty());
+
+            // End to end on the index: only the agreeing session is marked.
+            let mut idx = ownership_from_pages(
+                vec![(
+                    "active",
+                    page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
+                )],
+                500,
+            )
+            .unwrap();
+            idx.mark_live(
+                agreeing_live_sessions(&ok, &failed)
+                    .iter()
+                    .map(String::as_str),
+            );
+            assert!(!idx.is_known_live("s-rowless"));
         }
 
         #[test]
