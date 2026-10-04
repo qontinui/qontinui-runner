@@ -4888,6 +4888,35 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
 ///   default, precedence-aware re-derive, reversible by re-running).
 ///
+/// The overlord's four doors are IN, added WITH coord's grant rather than after a
+/// session hits `-32601` — the order the `coord_memory_supersede` paragraph above
+/// argues for. coord's grant (qontinui-coord#2913 for the proof reads,
+/// qontinui-coord#2957 for the ledger pair) puts all four on the device floor
+/// (`DEVICE_DEFAULT_TOOLS`), each
+/// with a `DoorAdmits::DeviceAgent` HTTP twin, so withholding them here would be
+/// a transport asymmetry rather than a boundary:
+///
+/// * proof reads (plan
+///   `2026-10-03-overlord-never-finishes-a-session-on-an-unproven-claim`) —
+///   `coord_watch_verdict` (twin `GET /coord/overlord/watch-verdict`)
+///   and `coord_session_obligations` (twin
+///   `GET /coord/overlord/session-obligations/:claude_code_session_id`). These are
+///   what lets `/next-move` PROVE a session owes nothing before it calls that
+///   session finished; a session that cannot read them can only assume, and an
+///   assumed "nothing owed" is precisely the false finish the plan exists to end.
+///   Both are reads and carry no authority a session lacks.
+/// * the intervention ledger (plan
+///   `2026-10-01-overlord-session-supervisor-classifies-stops-and-absorbs-avoidable-escalations`
+///   Phase 2) — `coord_overlord_record` (twin
+///   `POST /coord/overlord/interventions`) and `coord_overlord_interventions`
+///   (twin `GET` on the same route), `/next-move`'s store-of-record. The write is
+///   an append-only, self-attributed row about the caller's own intervention, the
+///   same shape as `coord_post_finding`: it records what an overlord did, and
+///   performs nothing.
+///
+/// Forwarding a name coord does not yet serve is harmless — coord answers it as
+/// an unknown tool — so these entries may land ahead of the coord side.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -4986,6 +5015,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_notify_sensitive_action",
     "coord_operator_touch_classify",
     "coord_orient",
+    "coord_overlord_interventions",
+    "coord_overlord_record",
     "coord_pending_agent_questions",
     "coord_post_finding",
     // The agent-facing coord:* PR-label door (plan
@@ -5023,6 +5054,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_session",
     "coord_secret_presence",
     "coord_send_message",
+    "coord_session_obligations",
     "coord_session_worktrees",
     "coord_set_gate_audience",
     "coord_signature",
@@ -5035,6 +5067,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_unmute_gate",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
+    "coord_watch_verdict",
     "coord_who_is_working_on",
     "coord_withdraw_agent_question",
     "coord_withdraw_gate",
@@ -16598,6 +16631,45 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 !coord_mcp_withholding_is_deliberate(tool),
                 "{tool} must not also be a deliberate exclusion"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// The overlord's proof reads (plan
+    /// `2026-10-03-overlord-never-finishes-a-session-on-an-unproven-claim`) and
+    /// its intervention-ledger pair (plan
+    /// `2026-10-01-overlord-session-supervisor-classifies-stops-and-absorbs-avoidable-escalations`
+    /// Phase 2): coord's grant (qontinui-coord#2913 for the proof reads,
+    /// qontinui-coord#2957 for the ledger pair) puts all four on the device
+    /// floor, so this door must forward
+    /// them — and the source-text parser the drift verdict runs must read each
+    /// back once.
+    #[test]
+    fn overlord_proof_and_ledger_tools_are_allowed_and_parse_from_source() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_watch_verdict",
+            "coord_session_obligations",
+            "coord_overlord_record",
+            "coord_overlord_interventions",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
