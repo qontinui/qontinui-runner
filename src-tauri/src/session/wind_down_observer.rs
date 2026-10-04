@@ -634,10 +634,17 @@ pub fn attributed_worktrees(
     workspace_root: Option<&Path>,
 ) -> Result<Vec<AttributedWorktree>, String> {
     let index = ownership.as_ref().map_err(String::clone)?;
-    let Some(session_id) = index
-        .coord_session_for_claude(claude_session_id)
-        .or(pane_coord_session_id)
-    else {
+    // The agreed row owns the Claude session's ledger rows; but when it is
+    // not known live and the pane's own row is, the pane's row is the one a
+    // live page listed them under, so prefer it rather than read Unknown.
+    let agreed = index.coord_session_for_claude(claude_session_id);
+    let resolved = match (agreed, pane_coord_session_id) {
+        (Some(agreed), Some(pane)) if !index.is_known_live(agreed) && index.is_known_live(pane) => {
+            Some(pane)
+        }
+        (agreed, pane) => agreed.or(pane),
+    };
+    let Some(session_id) = resolved else {
         return Err(
             "no coord session is known for this Claude session (coord's work-status reads did not \
              agree on one and the pane carries none), so its worktree allocations cannot be looked up"
@@ -1534,6 +1541,27 @@ mod tests {
         assert!(
             attributed_worktrees(&own, "claude-other", None, Some(Path::new("/ws"))).is_err(),
             "no agreed row and no pane id stays Unknown"
+        );
+
+        // The agreed (newest) row is closed while the pane's own row is live
+        // and holds the rows: the pane's row is used.
+        let mut index = CoordOwnership::from_response(
+            serde_json::from_str(
+                r#"{"sessions":[{"sessionId":"c-pane","worktrees":[{"worktreePath":"/abs/p"}]}]}"#,
+            )
+            .unwrap(),
+        );
+        index.mark_live(["c-pane"]);
+        index.record_coord_rows([("claude-y".to_string(), "c-closed".to_string())]);
+        let own: OwnershipRead = Ok(index);
+        assert_eq!(
+            attributed_worktrees(&own, "claude-y", Some("c-pane"), Some(Path::new("/ws"))).unwrap(),
+            vec![live("/abs/p")],
+            "a live pane row wins over a closed agreed row"
+        );
+        assert!(
+            attributed_worktrees(&own, "claude-y", None, Some(Path::new("/ws"))).is_err(),
+            "a closed agreed row with no live pane row stays Unknown"
         );
     }
 
