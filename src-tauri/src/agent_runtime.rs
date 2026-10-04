@@ -8774,25 +8774,7 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    match provision_agent_definitions(&primary_wt) {
-        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
-            // Still a ROW: an errored pass that leaves no record is exactly the
-            // invisible degradation this ledger exists to end.
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(primary_wt.clone());
-            report.skip(
-                primary_wt.clone(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            capability_manifest::record_provision(&primary_wt, report);
-        }
-    }
+    provision_agent_definitions_recorded(&primary_wt);
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
@@ -9126,6 +9108,51 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
         ));
     };
     provision_agent_definitions_from_root(&root, worktree_cwd)
+}
+
+/// Provision the named-subagent defs into `workdir` and RECORD both layers'
+/// session-ledger rows — [`provision_agent_definitions`]'s `agent_definitions`
+/// report here, and the embedded `fleet_agents` floor from inside
+/// [`provision_agent_definitions_from_root`].
+///
+/// Extracted from the spawn path so the capability-manifest provision probe
+/// (`POST /capability-manifest/provision-probe`, plan
+/// `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports`
+/// Phase 5, Fork B) drives the SAME function the real spawn drives rather than
+/// a copy of it. A second call path that can drift from the real one is the
+/// cost Fork B accepted only on that condition — so there is exactly one body,
+/// and both callers are one line.
+///
+/// Fail-soft, unchanged from the spawn path it came from: an errored pass still
+/// leaves a ROW, because an errored pass that leaves no record is the invisible
+/// degradation the ledger exists to end.
+///
+/// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
+/// `fleet_agents` floor is recorded from inside
+/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// is observable on the next manifest read rather than in this value. The spawn
+/// path ignores the return entirely.
+pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
+    let report = match provision_agent_definitions(workdir) {
+        Ok(report) => report,
+        Err(e) => {
+            warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(workdir.to_string());
+            report.skip(
+                workdir.to_string(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            report
+        }
+    };
+    let echo = report.clone();
+    capability_manifest::record_provision(workdir, report);
+    vec![echo]
 }
 
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in

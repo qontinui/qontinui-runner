@@ -620,3 +620,320 @@ function ConvertTo-ParityReportObject {
         rows = $rows
     }
 }
+
+# ---------------------------------------------------------------------------
+# The filesystem witness rules (plan
+# 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+# Phase 5).
+#
+# A capability manifest is a SELF-REPORT. The provisioning rows say which rung
+# answered, and nothing in them is evidence that a file landed. So after driving
+# the real provisioning doors the harness lists the directories itself, and these
+# two pure rules compare the claim against the listing.
+#
+# A disagreement is a finding ABOUT THE INSTRUMENT, never a parity defect: it is
+# counted and reported separately and is never folded into parity_defects or
+# unobserved. A harness that quietly reported its own blindness as parity is the
+# failure this whole plan exists to prevent.
+#
+# Pure: both take already-parsed data and touch no disk, so
+# scripts/tests/test-parity-diff.ps1 pins them without provisioning anything.
+# ---------------------------------------------------------------------------
+
+# Which directory each provisioning row's units land in. A row absent from this
+# map has no filesystem footprint to witness (workspace_root, spec_pages, ...)
+# and is skipped rather than guessed at.
+# `slash_commands` is DELIBERATELY ABSENT. It is not a provision-into-a-workdir
+# at all: capability_manifest.rs describes it as the IMPORT of
+# <workspace-root>/qontinui-claude-config/.claude/commands/*.md as runner
+# workflows, and slash_commands.rs points its report at that CHECKOUT directory.
+# It writes nothing into the session workdir, so the workdir listing can neither
+# confirm nor contradict it -- and mapping it here made every run emit a
+# `directory_has_units_but_row_is_unknown` finding whose note ("provisioning ran
+# and the ledger did not record it") was false in both halves. A row with no
+# footprint in the witnessed tree belongs with workspace_root and spec_pages:
+# outside this map.
+$script:ParityWitnessDirs = @{
+    'fleet_commands'          = 'commands'
+    'agent_commands_registry' = 'commands'
+    'fleet_skills'            = 'skills'
+    'agent_skills_registry'   = 'skills'
+    'fleet_agents'            = 'agents'
+    'agent_definitions'       = 'agents'
+}
+
+# Read one field from a witness that may be either a [PSCustomObject] (what
+# Get-ParityProvisionWitness returns) or a [hashtable] (what this file's own doc
+# comments describe, and what a caller is most likely to hand-build).
+#
+# The two need different accessors and the difference is SILENT: on a hashtable
+# `$w.PSObject.Properties.Name` enumerates IsReadOnly/Keys/Count/... and never
+# the keys, so a membership test written for one shape reports "absent" for the
+# other and the rules above resolve to "nothing to say". That is the false-clean
+# this file exists to prevent, so both shapes are handled here rather than in
+# each rule.
+#
+# Returns a 2-element tuple: ($present, $value). $present distinguishes "the key
+# is not there" from "the key is there and is $null" -- which is the whole
+# unknown-vs-zero distinction these rules turn on.
+function Get-ParityWitnessField {
+    param($Witness, [string]$Name)
+    if ($null -eq $Witness) { return @($false, $null) }
+    if ($Witness -is [System.Collections.IDictionary]) {
+        if ($Witness.Contains($Name)) { return @($true, $Witness[$Name]) }
+        return @($false, $null)
+    }
+    if ($Witness.PSObject.Properties.Name -contains $Name) {
+        return @($true, $Witness.$Name)
+    }
+    return @($false, $null)
+}
+
+function Get-ParityManifestRow {
+    param($Manifest, [string]$Id)
+    if ($null -eq $Manifest) { return $null }
+    if (-not ($Manifest.PSObject.Properties.Name -contains 'rows')) { return $null }
+    foreach ($r in @($Manifest.rows)) {
+        if ($r.id -eq $Id) { return $r }
+    }
+    return $null
+}
+
+# Compare each provisioning row's claim with what the directory listing shows.
+#
+# $Witness is the harness's own listing: @{ commands = <int>; skills = <int>;
+# agents = <int> } as file counts. A count that could not be taken must be
+# $null, NOT 0 -- "could not look" and "looked and found nothing" are different
+# findings and only the second one can contradict a row.
+#
+# Emits one record per disagreement, each naming the direction:
+#   row_claims_units_but_directory_is_empty     a rung that claims units, zero files
+#   directory_has_units_but_row_is_unknown      files present, row took no reading
+#   directory_has_units_but_row_is_unresolved   files present, row read and
+#                                               resolved NO source
+#
+# `unresolved` is special-cased HERE, and only here. For the parity count it is
+# an OBSERVED rung (a reading was taken; it found no source), so it stays out of
+# $script:ParityUnobservedRungs. But it claims NO units: agent_runtime's
+# agent-definitions resolver returns `unresolved` with zero files by design on
+# any install with no qontinui-claude-config checkout -- every normal published
+# leg. So `unresolved` over an empty directory is CONSISTENT, and `unresolved`
+# over N>0 files is the contradiction -- UNLESS a sibling row that shares the
+# directory claims units, because the directories are shared: on that same
+# published leg `fleet_agents` writes its embedded floor into the very
+# `.claude/agents` that `agent_definitions` reports `unresolved` for, so those
+# files are explained by the sibling and contradict nothing. Treating
+# `unresolved` as "claims units" (the first version of this rule, inherited from
+# #1844) inverted both answers; treating any file as contradicting it would have
+# fired on every normal published leg in the mirror-image direction.
+function Get-ParitySelfReportDisagreements {
+    param($Manifest, $Witness)
+
+    $out = @()
+    if ($null -eq $Manifest -or $null -eq $Witness) { return @($out) }
+
+    # Which directories have at least one row claiming units in them. An
+    # `unresolved` row's directory may legitimately hold a sibling's files.
+    $claimedDirs = @{}
+    foreach ($sid in $script:ParityWitnessDirs.Keys) {
+        $srung = Get-ParityRowRung -Row (Get-ParityManifestRow -Manifest $Manifest -Id $sid)
+        if ($null -ne $srung -and (Test-ParityRungObserved -Rung $srung) -and $srung -ne 'unresolved') {
+            $claimedDirs[$script:ParityWitnessDirs[$sid]] = $true
+        }
+    }
+
+    foreach ($id in ($script:ParityWitnessDirs.Keys | Sort-Object)) {
+        $dirKey = $script:ParityWitnessDirs[$id]
+        $field = Get-ParityWitnessField -Witness $Witness -Name $dirKey
+        if (-not $field[0]) { continue }
+        $count = $field[1]
+        # UNKNOWN count: a listing that could not be taken contradicts nothing.
+        if ($null -eq $count) { continue }
+
+        $row = Get-ParityManifestRow -Manifest $Manifest -Id $id
+        $rung = Get-ParityRowRung -Row $row
+        if ($null -eq $rung) { continue }
+        $observed = Test-ParityRungObserved -Rung $rung
+        $claimsUnits = $observed -and ($rung -ne 'unresolved')
+
+        if ($claimsUnits -and [int]$count -eq 0) {
+            $out += [PSCustomObject]@{
+                id          = $id
+                kind        = 'row_claims_units_but_directory_is_empty'
+                rung        = $rung
+                witness_dir = ".claude/$dirKey"
+                witness_files = 0
+                note        = ("the manifest row resolved to rung '$rung' while .claude/$dirKey " +
+                               "holds no files. The row is a self-report; the listing is the witness.")
+            }
+        } elseif ($observed -and -not $claimsUnits -and [int]$count -gt 0 -and -not $claimedDirs.ContainsKey($dirKey)) {
+            $out += [PSCustomObject]@{
+                id          = $id
+                kind        = 'directory_has_units_but_row_is_unresolved'
+                rung        = $rung
+                witness_dir = ".claude/$dirKey"
+                witness_files = [int]$count
+                note        = ("$count file(s) are present in .claude/$dirKey while the row reports " +
+                               "rung 'unresolved' -- a reading that found no source -- and no other row " +
+                               "sharing that directory claims units. The files are unaccounted for.")
+            }
+        } elseif (-not $observed -and [int]$count -gt 0) {
+            $out += [PSCustomObject]@{
+                id          = $id
+                kind        = 'directory_has_units_but_row_is_unknown'
+                rung        = $rung
+                witness_dir = ".claude/$dirKey"
+                witness_files = [int]$count
+                note        = ("$count file(s) are present in .claude/$dirKey while the row took no " +
+                               "reading at all. Provisioning ran and the ledger did not record it.")
+            }
+        }
+    }
+    return @($out)
+}
+
+# The typed slash-commands verdict the metric's baseline defect is stated in.
+#
+# WHAT IT IS MEASURED OVER, stated because the name invites the wrong reading:
+# the COMMAND BODIES PROVISIONED INTO A SESSION WORKDIR (`.claude/commands/*.md`
+# -- the `fleet_commands` bundle plus any `agent_commands_registry` overlay), on
+# each leg. That is the operator-facing question the metric asks ("does a
+# published install give a session the fleet commands"), and it is NOT the
+# `slash_commands` capability row, which is a different mechanism entirely (the
+# import of a checkout's commands as runner workflows -- see the note on
+# $script:ParityWitnessDirs). The artifact carries
+# `slash_commands_status_source` beside this value so no reader has to infer it.
+#
+# Exactly one of:
+#   provisioned_equal                  both legs provisioned the same count
+#   provisioned_fewer(dev=N,published=M)  published provisioned fewer
+#   provisioned_more(dev=N,published=M)   published provisioned MORE (stated,
+#                                         not silently folded into 'equal')
+#   none_provisioned                   both legs provisioned nothing
+#   unknown(<reason>)                  a count could not be taken on a leg
+#
+# Counts come from the WITNESS, not the manifest: the question "does a published
+# install get the fleet commands" is answered by files on disk.
+function Get-ParitySlashCommandsStatus {
+    param($DevWitness, $PublishedWitness)
+
+    $devField = Get-ParityWitnessField -Witness $DevWitness -Name 'commands'
+    $pubField = Get-ParityWitnessField -Witness $PublishedWitness -Name 'commands'
+    $devCount = $devField[1]
+    $pubCount = $pubField[1]
+
+    if ($null -eq $devCount -and $null -eq $pubCount) {
+        return 'unknown(no_command_listing_on_either_leg)'
+    }
+    if ($null -eq $devCount) { return 'unknown(no_command_listing_on_the_dev_leg)' }
+    if ($null -eq $pubCount) { return 'unknown(no_command_listing_on_the_published_leg)' }
+
+    $d = [int]$devCount
+    $p = [int]$pubCount
+    if ($d -eq 0 -and $p -eq 0) { return 'none_provisioned' }
+    if ($d -eq $p) { return 'provisioned_equal' }
+    if ($p -lt $d) { return "provisioned_fewer(dev=$d,published=$p)" }
+    return "provisioned_more(dev=$d,published=$p)"
+}
+
+# ---------------------------------------------------------------------------
+# The filesystem witness. The manifest is a self-report; this is the listing
+# that can contradict it. Counts are $null when the directory could not be
+# listed at all -- "could not look" is not "looked and found nothing", and only
+# the second can contradict a row (see Get-ParitySelfReportDisagreements).
+# ---------------------------------------------------------------------------
+function Get-ParityProvisionWitness {
+    # $ProbeWorkdir is where the provision-probe wrote, which is NOT $Workdir:
+    # the probe creates its own directory so a pre-placed .claude symlink cannot
+    # be followed. The commands and skills come from the terminal chokepoint and
+    # do land in $Workdir. Passing $null leaves the agents count $null (UNKNOWN),
+    # never 0 -- "the probe did not answer" is not "the probe wrote nothing".
+    #
+    # $TerminalOutcome is the drive's `terminal` field. The commands and skills
+    # are written ONLY by POST /terminals (acquire_for_terminal), so unless that
+    # door answered `created...` nothing was asked to write them, and an empty
+    # `.claude/commands` there is "never provisioned", not "provisioned zero".
+    # Counting it as 0 turned a refused terminal on one leg into a fabricated
+    # `provisioned_fewer(dev=N,published=0)` parity defect, and refusals on both
+    # legs into `none_provisioned` (a defect in #1844, corrected on adoption).
+    # Omitted or anything but `created*`, both counts are $null -- UNKNOWN --
+    # the same way the agents count already treats a probe that did not answer.
+    param([string]$Workdir, [string]$ProbeWorkdir = $null, [string]$TerminalOutcome = $null)
+
+    $count = {
+        param([string]$Dir, [string]$Filter, [bool]$Recurse)
+        try {
+            # A path this harness did not build itself can carry Rust's VERBATIM
+            # prefix: `std::fs::canonicalize` returns `\\?\C:\...` on Windows,
+            # and `provisioned_into` comes straight from it. Windows PowerShell
+            # 5.1's FileSystem provider does not interpret that prefix -- it
+            # parses the leading `\\` as UNC -- so `Test-Path` answers $false for
+            # a directory that plainly exists, and this scriptblock would return
+            # 0: "could not look" rendered as "looked and found nothing", which
+            # is the precise conflation this whole file exists to prevent. Two
+            # fabricated `row_claims_units_but_directory_is_empty` findings per
+            # leg, on every Windows run, about the instrument itself.
+            # Belt and braces: the boundary normalization in
+            # Invoke-ParityProvisioningDrive (published-parity.ps1) is what
+            # actually fixes this, but a path reaching here verbatim must not
+            # throw.
+            $Dir = ConvertFrom-VerbatimPath $Dir
+
+            # Test-Path lives INSIDE the try on purpose. $ErrorActionPreference
+            # is script-scope 'Stop', so a provider that cannot interpret the
+            # path throws a TERMINATING error; outside the try that escapes this
+            # scriptblock entirely, propagates through Get-ParityProvisionWitness
+            # into Get-ManifestOverHttp's catch, and loses the whole leg as a
+            # manifest-read failure.
+            if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
+            $items = Get-ChildItem -LiteralPath $Dir -Filter $Filter -File -Recurse:$Recurse -ErrorAction Stop
+            return @($items).Count
+        } catch {
+            # UNKNOWN, never 0.
+            return $null
+        }
+    }
+
+    $claude = Join-Path $Workdir '.claude'
+    $agentsCount = $null
+    if (-not [string]::IsNullOrWhiteSpace($ProbeWorkdir)) {
+        $agentsCount = & $count (Join-Path (Join-Path $ProbeWorkdir '.claude') 'agents') '*.md' $false
+    }
+    $commandsCount = $null
+    $skillsCount = $null
+    if ($TerminalOutcome -like 'created*') {
+        $commandsCount = & $count (Join-Path $claude 'commands') '*.md' $false
+        $skillsCount   = & $count (Join-Path $claude 'skills') 'SKILL.md' $true
+    }
+    return [PSCustomObject]@{
+        commands = $commandsCount
+        skills   = $skillsCount
+        agents   = $agentsCount
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Normalize a path that came from another process.
+#
+# Rust's `std::fs::canonicalize` returns a VERBATIM path on Windows
+# (`\\?\D:\a\...`, or `\\?\UNC\server\share\...`), and the probe's
+# `provisioned_into` is exactly that. Windows PowerShell 5.1 cannot carry those:
+# `Join-Path` fails with *"the value of argument \"drive\" is null"* because it
+# tries to resolve `\\?\D:` as a drive qualifier, and the FileSystem provider
+# reads the leading `\\` as UNC.
+#
+# MEASURED, not theorised: the first version of this harness stripped the prefix
+# inside the directory-counting scriptblock, which is too LATE -- the `Join-Path`
+# calls that build the path run before it. On CI run 36615500004 that threw out of
+# Get-ParityProvisionWitness, was caught as a manifest-read failure, and lost BOTH
+# legs of the negative control ("NEGATIVE-CONTROL-UNAVAILABLE manifest_read").
+# So normalization happens HERE, once, at the boundary where the foreign path
+# enters this script, and every consumer downstream sees a 5.1-usable path.
+# ---------------------------------------------------------------------------
+function ConvertFrom-VerbatimPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path -like '\\?\UNC\*') { return '\\' + $Path.Substring(8) }
+    if ($Path -like '\\?\*')      { return $Path.Substring(4) }
+    return $Path
+}
