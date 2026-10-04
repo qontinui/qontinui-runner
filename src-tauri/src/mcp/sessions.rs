@@ -1673,7 +1673,10 @@ mod tests {
                 assert!(body.get(key).is_some(), "missing {key}: {body}");
             }
             assert_eq!(body["transcript_holes"], 0);
-            assert!(body["cloud_sync_enabled"].is_null(), "no append observed yet");
+            assert!(
+                body["cloud_sync_enabled"].is_null(),
+                "no append observed yet"
+            );
         }
 
         /// A registered nonce and the workdir it is bound to, via the one
