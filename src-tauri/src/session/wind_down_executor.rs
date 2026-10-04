@@ -836,6 +836,7 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
 ) -> CustodyVerdict {
     let attributed = wind_down_observer::attributed_worktrees(
         ownership,
+        session_id,
         context.coord_session_id.as_deref(),
         workspace_root,
     );

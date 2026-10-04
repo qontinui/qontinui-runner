@@ -1216,6 +1216,13 @@ pub mod coord {
         /// Empty for an index built by [`Self::from_response`] alone, which
         /// asserts nothing about liveness.
         live_sessions: std::collections::HashSet<String>,
+        /// Claude session id (lowercased) → the `coord.sessions.id` that BOTH
+        /// work-status reads around the pages named as answering for it. This
+        /// is the row the route attributes that Claude session's ledger rows
+        /// to, so it is the lookup key even when the pane itself carries no
+        /// coord id (a plain terminal the runner never bound). Empty for an
+        /// index built by [`Self::from_response`] alone.
+        coord_row_by_claude: std::collections::HashMap<String, String>,
     }
 
     impl CoordOwnership {
@@ -1242,7 +1249,24 @@ pub mod coord {
                 by_path,
                 reachable: true,
                 live_sessions: std::collections::HashSet::new(),
+                coord_row_by_claude: std::collections::HashMap::new(),
             }
+        }
+
+        /// Record which `coord.sessions.id` answers for each Claude session id.
+        pub fn record_coord_rows(&mut self, rows: impl IntoIterator<Item = (String, String)>) {
+            self.coord_row_by_claude.extend(
+                rows.into_iter()
+                    .map(|(claude, coord)| (claude.to_ascii_lowercase(), coord)),
+            );
+        }
+
+        /// The `coord.sessions.id` both work-status reads named for
+        /// `claude_session_id`, when they agreed on one.
+        pub fn coord_session_for_claude(&self, claude_session_id: &str) -> Option<&str> {
+            self.coord_row_by_claude
+                .get(&claude_session_id.to_ascii_lowercase())
+                .map(String::as_str)
         }
 
         /// Record `session_ids` as positively live when this index was read.
@@ -1448,6 +1472,25 @@ pub mod coord {
             .collect()
     }
 
+    /// PURE: `(claude session id, coord.sessions.id)` for every Claude session
+    /// whose coord row BOTH work-status reads name identically, whatever its
+    /// state. A row that changed between the reads, or a read that failed,
+    /// yields no pair, so the caller cannot resolve a coord id from it.
+    pub fn agreeing_coord_rows(
+        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+    ) -> Vec<(String, String)> {
+        before
+            .iter()
+            .filter(|(claude_id, pre)| {
+                after
+                    .get(*claude_id)
+                    .is_some_and(|post| post.coord_session_id == pre.coord_session_id)
+            })
+            .map(|(claude_id, pre)| (claude_id.clone(), pre.coord_session_id.clone()))
+            .collect()
+    }
+
     /// Fetch the attributed-worktree index for every LIVE session, complete or
     /// not at all.
     ///
@@ -1528,6 +1571,10 @@ pub mod coord {
             &after.liveness_by_session_id,
         );
         index.mark_live(rowless.iter().map(String::as_str));
+        index.record_coord_rows(agreeing_coord_rows(
+            &before.liveness_by_session_id,
+            &after.liveness_by_session_id,
+        ));
         Ok(index)
     }
 
@@ -1770,6 +1817,20 @@ pub mod coord {
                 agreeing_live_sessions(&before, &after),
                 vec!["s-rowless".to_string()]
             );
+        }
+
+        /// The coord row is resolved from the work-status reads only when
+        /// both named the SAME row, in any state; a row that changed between
+        /// them, or a failed read, resolves nothing.
+        #[test]
+        fn a_coord_row_resolves_only_when_both_reads_name_it() {
+            let before = liveness(&[("claude-a", "s-1", "stale"), ("claude-b", "s-2", "active")]);
+            let after = liveness(&[("claude-a", "s-1", "active"), ("claude-b", "s-3", "active")]);
+            assert_eq!(
+                agreeing_coord_rows(&before, &after),
+                vec![("claude-a".to_string(), "s-1".to_string())]
+            );
+            assert!(agreeing_coord_rows(&before, &std::collections::HashMap::new()).is_empty());
         }
 
         /// The reactivation race: `stale` before the pages, `active` after —
