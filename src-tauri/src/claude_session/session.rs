@@ -2160,10 +2160,20 @@ impl ClaudeSession {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account, when the failure is the account's.
-        if rotate_account && !rotate_account_on_rate_limit() {
-            return Err("no alternative account available for restart".to_string());
-        }
+        let sm = app_handle
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .ok_or("SessionManager not available for restart")?
+            .inner()
+            .clone();
+
+        // 1. Rotate to another account, when the failure is the account's —
+        //    but never for a restart nobody wants any more: rotation moves the
+        //    whole runner's account, so an abandoned restart must not do it.
+        rotate_if_still_wanted(
+            rotate_account,
+            || Self::restart_still_wanted(&sm, session_id, dead_instance),
+            rotate_account_on_rate_limit,
+        )?;
 
         let (resolved_config_dir, _config_dir_source) =
             get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli);
@@ -2187,12 +2197,6 @@ impl ClaudeSession {
         };
 
         // 3. Spawn new session
-        let sm = app_handle
-            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
-            .ok_or("SessionManager not available for restart")?
-            .inner()
-            .clone();
-
         let new_session = match Self::spawn(
             working_dir,
             session_id,
@@ -2229,23 +2233,28 @@ impl ClaudeSession {
             }
         };
 
-        // Send replay prompt if we have conversation context
-        if let Some(ref replay_prompt) = conversation_context {
-            if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
-                warn!("Failed to send replay prompt: {}", e);
-            }
-        }
-
         // Swap the dead instance for the new one under the same id — only if
-        // the dead instance is STILL what is registered. The spawn above waits
-        // up to a minute for `initialize`; an operator who closed the session
-        // in that time must not find it resurrected.
-        if let Err(why) = sm.replace_if(session_id, new_session.clone(), |current| {
-            current.is_instance(dead_instance)
-        }) {
-            let _ = new_session.close();
-            return Err(why);
-        }
+        // the dead instance is STILL what is registered — and only THEN send
+        // the replay. The spawn above waits up to a minute for `initialize`;
+        // an operator who closed the session in that time must neither find
+        // it resurrected nor have it run one more turn.
+        commit_restart(
+            || {
+                sm.replace_if(session_id, new_session.clone(), |current| {
+                    current.is_instance(dead_instance)
+                })
+            },
+            || {
+                if let Some(ref replay_prompt) = conversation_context {
+                    if let Err(e) = new_session.send_initial_prompt(replay_prompt) {
+                        warn!("Failed to send replay prompt: {}", e);
+                    }
+                }
+            },
+            || {
+                let _ = new_session.close();
+            },
+        )?;
 
         // Emit state event so frontend knows the session is back
         crate::commands::ai_session::emit_session_state_ex(
@@ -2288,16 +2297,12 @@ impl ClaudeSession {
         session_id: &str,
         dead_instance: &SessionStateTracker,
     ) -> Result<(), String> {
-        if crate::drain::is_draining() {
-            return Err("the runner is draining".into());
-        }
-        match sm.get(session_id) {
-            None => Err("the session was closed".into()),
-            Some(current) if !current.is_instance(dead_instance) => {
-                Err("the session was already replaced".into())
-            }
-            Some(_) => Ok(()),
-        }
+        let registered = sm.get(session_id);
+        restart_verdict(
+            crate::drain::is_draining(),
+            registered.as_ref().map(|s| &s.state_tracker),
+            dead_instance,
+        )
     }
 
     /// Whether this session is the instance `tracker` belongs to.
@@ -2405,6 +2410,62 @@ impl std::fmt::Debug for ClaudeSession {
     }
 }
 
+/// The decision inside [`ClaudeSession::restart_still_wanted`]: `registered`
+/// is the state tracker of whatever `SessionManager` holds under the id now.
+fn restart_verdict(
+    draining: bool,
+    registered: Option<&SessionStateTracker>,
+    dead_instance: &SessionStateTracker,
+) -> Result<(), String> {
+    if draining {
+        return Err("the runner is draining".into());
+    }
+    match registered {
+        None => Err("the session was closed".into()),
+        Some(current) if !current.same_instance(dead_instance) => {
+            Err("the session was already replaced".into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Rotate the account (when asked) only while the restart is still wanted.
+fn rotate_if_still_wanted(
+    rotate_account: bool,
+    still_wanted: impl FnOnce() -> Result<(), String>,
+    rotate: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    if !rotate_account {
+        return Ok(());
+    }
+    still_wanted()?;
+    if !rotate() {
+        return Err("no alternative account available for restart".to_string());
+    }
+    Ok(())
+}
+
+/// The ordering of a restart's commit: `register` (the CAS) first; `replay`
+/// runs only when it succeeded, `abandon` (close the replacement) when it did
+/// not. Replaying before the CAS let a session closed during the restart
+/// spawn run one more turn (review round 2, M2-residual).
+fn commit_restart(
+    register: impl FnOnce() -> Result<(), String>,
+    replay: impl FnOnce(),
+    abandon: impl FnOnce(),
+) -> Result<(), String> {
+    match register() {
+        Ok(()) => {
+            replay();
+            Ok(())
+        }
+        Err(why) => {
+            abandon();
+            Err(why)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2422,6 +2483,66 @@ mod tests {
             *seen.lock().unwrap() = Some(state.get());
         });
         assert_eq!(*seen.lock().unwrap(), Some(SessionState::Closed));
+    }
+
+    #[test]
+    fn commit_restart_replays_only_after_the_cas_succeeds() {
+        use std::cell::RefCell;
+        let log = RefCell::new(Vec::new());
+        let r = super::commit_restart(
+            || {
+                log.borrow_mut().push("cas");
+                Err("closed".into())
+            },
+            || log.borrow_mut().push("replay"),
+            || log.borrow_mut().push("abandon"),
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            *log.borrow(),
+            vec!["cas", "abandon"],
+            "no turn for a closed session"
+        );
+
+        log.borrow_mut().clear();
+        super::commit_restart(
+            || {
+                log.borrow_mut().push("cas");
+                Ok(())
+            },
+            || log.borrow_mut().push("replay"),
+            || log.borrow_mut().push("abandon"),
+        )
+        .unwrap();
+        assert_eq!(*log.borrow(), vec!["cas", "replay"]);
+    }
+
+    #[test]
+    fn restart_still_wanted_refuses_closed_replaced_and_draining() {
+        use super::super::state::SessionStateTracker;
+        let dead = SessionStateTracker::new();
+        let other = SessionStateTracker::new();
+        assert!(super::restart_verdict(false, None, &dead).is_err());
+        assert!(super::restart_verdict(false, Some(&other), &dead).is_err());
+        assert!(super::restart_verdict(true, Some(&dead.clone()), &dead).is_err());
+        assert!(super::restart_verdict(false, Some(&dead.clone()), &dead).is_ok());
+    }
+
+    #[test]
+    fn an_abandoned_restart_does_not_rotate_the_account() {
+        let rotated = std::cell::Cell::new(false);
+        let r = super::rotate_if_still_wanted(
+            true,
+            || Err("the session was closed".into()),
+            || {
+                rotated.set(true);
+                true
+            },
+        );
+        assert!(r.is_err());
+        assert!(!rotated.get(), "an abandoned restart must not rotate");
+        assert!(super::rotate_if_still_wanted(true, || Ok(()), || true).is_ok());
+        assert!(super::rotate_if_still_wanted(true, || Ok(()), || false).is_err());
     }
 
     // =======================================================================
