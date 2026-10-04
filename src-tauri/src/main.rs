@@ -89,7 +89,7 @@ mod coord_doctor_cmd;
 mod coord_drain_state;
 mod coord_http;
 mod coord_mcp;
-mod coord_mcp_config;
+pub(crate) use qontinui_runner_lib::coord_mcp_config;
 // Plan 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant
 // Phase 2 — compare each coord answer's tenant with the session repo's tenant.
 mod coord_mcp_tenant;
@@ -145,8 +145,8 @@ mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
 mod follow_up;
-mod fs_atomic;
-mod fs_perms;
+pub(crate) use qontinui_runner_lib::fs_atomic;
+pub(crate) use qontinui_runner_lib::fs_perms;
 mod git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
@@ -187,7 +187,7 @@ mod logging;
 // covered by `cargo test --lib`.
 mod looping_agent_coord;
 mod looping_agent_supervisor;
-mod machine_identity;
+pub(crate) use qontinui_runner_lib::machine_identity;
 mod macros;
 mod mcp;
 mod mcp_api;
@@ -210,7 +210,7 @@ mod planning_bridge;
 mod playwright;
 mod pm_detect;
 mod process_capture;
-mod process_helpers;
+pub(crate) use qontinui_runner_lib::process_helpers;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -245,7 +245,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
-mod secure_storage;
+pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
 mod server_mode;
