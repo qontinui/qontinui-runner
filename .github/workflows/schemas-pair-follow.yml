@@ -242,6 +242,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # remove the stale form-2 label, post the one comment
+      actions: read # list this run's artifacts (the "No bundle" step)
     strategy:
       fail-fast: false
       matrix:
@@ -280,9 +281,16 @@ jobs:
           printf '%s' "$PLAN_ITEM" > "$RUNNER_TEMP/plan-item.json"
           bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/plan-item.json" "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
 
-      # No bundle means the compute leg skipped (merge conflict, already
-      # contained) or failed. Its own log names which; the verdict job reds on a
-      # failed compute leg.
+      # The download failing has two causes that must not look alike:
+      #  - the compute leg produced NO bundle (skipped: merge conflict, already
+      #    contained; or failed — its own log names which, and the verdict job
+      #    reds on a failed compute leg). That is the intended green path.
+      #  - a bundle WAS produced but could not be downloaded. Then the push
+      #    silently did not happen, so this step fails.
+      # Told apart by listing this run's artifacts for the item's exact name.
+      # (Not a compute-job output: compute is a matrix, and a matrix job's
+      # outputs keep only one leg's value, so they cannot say which PR's
+      # bundle exists.) A listing that cannot be read is UNKNOWN and fails.
       - name: No bundle for this PR
         if: steps.dl.outcome != 'success'
         shell: bash
@@ -292,9 +300,20 @@ jobs:
         # printing the note (found by actionlint/shellcheck). The PR number is
         # passed through env rather than spliced into the script.
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ matrix.item.pr }}
         run: |
-          echo "No pair-follow bundle for #${PR_NUMBER} — see the compute leg."
+          set -uo pipefail
+          name="pair-follow-${PR_NUMBER}"
+          if ! count="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=${name}" --jq '.total_count')"; then
+            echo "::error::Could not list this run's artifacts, so whether a bundle for #${PR_NUMBER} was produced is UNKNOWN; refusing to report a skip."
+            exit 1
+          fi
+          case "${count}" in
+            0) echo "No pair-follow bundle for #${PR_NUMBER} — see the compute leg." ;;
+            ''|*[!0-9]*) echo "::error::Unreadable artifact count '${count}' for ${name}."; exit 1 ;;
+            *) echo "::error::A pair-follow bundle for #${PR_NUMBER} exists (${name}) but could not be downloaded, so it was NOT pushed."; exit 1 ;;
+          esac
 
   verdict:
     name: Pair-follow verdict
