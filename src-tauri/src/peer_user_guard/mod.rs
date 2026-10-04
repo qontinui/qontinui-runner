@@ -17,10 +17,12 @@
 //! the PEER socket and refuses the connection when that user differs from the
 //! runner process's own:
 //!
-//! - **Linux** — the peer socket's uid from `/proc/net/tcp{,6}`, matched on the
-//!   full 4-tuple ([`linux`]). A socket's uid is fixed at creation, so there is
+//! - **Linux** — the peer socket's uid by an exact `NETLINK_SOCK_DIAG` lookup of
+//!   the full 4-tuple, accepted only for a CONNECTED socket whose echoed 4-tuple
+//!   matches; a `/proc/net/tcp{,6}` scan is the fallback when netlink is
+//!   unavailable ([`linux`]). A socket's uid is fixed at creation, so there is
 //!   no PID to recycle.
-//! - **Windows** — `GetExtendedTcpTable` → the row matching the full 4-tuple →
+//! - **Windows** — `GetExtendedTcpTable` → the live row matching the full 4-tuple →
 //!   owning PID → process token → user SID ([`windows`]). The resolved
 //!   process's creation time must precede the accept instant, so a recycled
 //!   PID is refused rather than trusted.
@@ -45,7 +47,9 @@
 //! refuses. Unset — or an unrecognised value, with a WARN — takes the platform
 //! default: `enforce` on Linux, `shadow` on Windows, where the runner's own
 //! WebView2 network-service process is a caller whose token readability is
-//! not yet measured (plan Phase 2). Read once, when a listener is wrapped. A platform with no resolver (macOS today) does not install the
+//! not yet measured (plan Phase 2). Read once, when a listener is wrapped.
+//!
+//! A platform with no resolver (macOS today) does not install the
 //! guard and says so on `/health` (`supported: false`) — "cannot resolve this
 //! one peer" fails closed, but "no resolver exists on this OS" would turn the
 //! API off entirely, which is an outage, not a control.
@@ -68,7 +72,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 /// Env var selecting the guard's [`Mode`]; `0` turns it off.
@@ -140,9 +144,6 @@ pub fn mode_from_env_value(value: Option<&str>) -> (Mode, bool) {
 /// Win32 calls; this bounds the blocking pool a connection storm can occupy.
 const MAX_INFLIGHT_RESOLUTIONS: usize = 64;
 
-/// Admitted connections buffered between the accept task and `axum::serve`.
-const ADMITTED_QUEUE: usize = 1024;
-
 /// Distinct (reason, owner) pairs logged at WARN before the log goes quiet.
 /// The counters keep counting past it.
 const WARN_BUDGET: usize = 512;
@@ -179,6 +180,11 @@ pub enum Unresolved {
     ProcessUnopenable,
     /// The owning process's token or user could not be read (Windows).
     TokenUnreadable,
+    /// `OpenProcessToken` was refused with ACCESS_DENIED — expected for an
+    /// ELEVATED caller of the same account seen from a non-elevated runner,
+    /// and for a protected process (Windows). Counted apart so shadow mode
+    /// measures it before Windows enforces.
+    TokenAccessDenied,
     /// The owning PID belongs to a process created after the connection was
     /// accepted — a recycled PID (Windows).
     PidRecycled,
@@ -196,6 +202,7 @@ impl Unresolved {
             Unresolved::SocketClosing => "socket_closing",
             Unresolved::ProcessUnopenable => "process_unopenable",
             Unresolved::TokenUnreadable => "token_unreadable",
+            Unresolved::TokenAccessDenied => "token_access_denied",
             Unresolved::PidRecycled => "pid_recycled",
             Unresolved::TableUnreadable => "table_unreadable",
             Unresolved::OwnUserUnknown => "own_user_unknown",
@@ -390,30 +397,29 @@ type Admitted = (TcpStream, SocketAddr);
 enum Inner {
     /// Guard off (kill switch) or unsupported platform: today's behaviour.
     Passthrough(TcpListener),
-    Guarded {
-        rx: mpsc::Receiver<Admitted>,
-        task: tokio::task::JoinHandle<()>,
-    },
+    Guarded(Box<Guarded>),
+}
+
+/// The guarded arm. The listener is OWNED here, not by a background task, so
+/// dropping the [`GuardedListener`] closes the socket synchronously (the
+/// Cognito callback re-binds its fixed port right after shutdown), and the
+/// in-flight resolutions live in a [`JoinSet`] that aborts them on drop.
+struct Guarded {
+    listener: TcpListener,
+    label: &'static str,
+    resolver: Arc<dyn OwnerResolver>,
+    own: Arc<Option<LocalUser>>,
+    mode: Mode,
+    pending: JoinSet<Option<Admitted>>,
 }
 
 /// A [`TcpListener`] that only yields connections whose peer runs as the
 /// runner's own OS user. Use it in place of the listener passed to
-/// `axum::serve`. Must be constructed inside a tokio runtime: the guarded arm
-/// spawns its accept task there.
+/// `axum::serve`. `accept` must be polled inside a tokio runtime (it spawns
+/// the per-connection resolutions there), which `axum::serve` always does.
 pub struct GuardedListener {
     inner: Inner,
     local: SocketAddr,
-}
-
-impl Drop for GuardedListener {
-    fn drop(&mut self) {
-        // The accept task owns the socket; aborting it releases the port when
-        // the server that held this listener shuts down (pairing / sign-in
-        // callbacks are short-lived).
-        if let Inner::Guarded { task, .. } = &self.inner {
-            task.abort();
-        }
-    }
 }
 
 impl GuardedListener {
@@ -501,75 +507,96 @@ impl GuardedListener {
         };
         STATS.installed.store(true, Ordering::Relaxed);
         STATS.mode.fetch_max(mode.as_u8(), Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(ADMITTED_QUEUE);
-        let task = tokio::spawn(accept_loop(listener, label, resolver, own, mode, tx));
         Ok(Self {
-            inner: Inner::Guarded { rx, task },
+            inner: Inner::Guarded(Box::new(Guarded {
+                listener,
+                label,
+                resolver,
+                own: Arc::new(own),
+                mode,
+                pending: JoinSet::new(),
+            })),
             local,
         })
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
+/// Resolve one accepted connection and return it when it is admitted.
+async fn resolve_one(
+    stream: TcpStream,
+    peer: SocketAddr,
+    accepted_at: SystemTime,
     label: &'static str,
     resolver: Arc<dyn OwnerResolver>,
-    own: Option<LocalUser>,
+    own: Arc<Option<LocalUser>>,
     mode: Mode,
-    tx: mpsc::Sender<Admitted>,
-) {
-    let own = Arc::new(own);
-    let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_RESOLUTIONS));
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Same policy as axum's own `TcpListener` accept: a per-
-                // connection error is skipped, anything else backs off.
-                if !is_connection_error(&e) {
-                    warn!(listener = label, error = %e, "peer user guard: accept error");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                continue;
-            }
-        };
-        // Stamp the accept instant BEFORE waiting for a permit, so the PID
-        // recycle check compares against when the connection existed.
-        let accepted_at = SystemTime::now();
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            return;
-        };
-        let (resolver, own, tx) = (resolver.clone(), own.clone(), tx.clone());
-        tokio::spawn(async move {
-            let _permit = permit;
-            let resolution = match (own.as_ref(), stream.local_addr()) {
-                // No own user: skip the lookup, the decision refuses anyway.
-                (None, _) => Resolution {
-                    owner: Err(Unresolved::OwnUserUnknown),
+) -> Option<Admitted> {
+    let resolution = match (own.as_ref(), stream.local_addr()) {
+        // No own user: skip the lookup, the decision refuses anyway.
+        (None, _) => Resolution {
+            owner: Err(Unresolved::OwnUserUnknown),
+            pid: None,
+        },
+        (Some(_), Err(_)) => Resolution {
+            owner: Err(Unresolved::NoMatchingSocket),
+            pid: None,
+        },
+        (Some(_), Ok(local)) => {
+            tokio::task::spawn_blocking(move || resolver.resolve(local, peer, accepted_at))
+                .await
+                .unwrap_or(Resolution {
+                    owner: Err(Unresolved::TableUnreadable),
                     pid: None,
-                },
-                (Some(_), Err(_)) => Resolution {
-                    owner: Err(Unresolved::NoMatchingSocket),
-                    pid: None,
-                },
-                (Some(_), Ok(local)) => {
-                    let r = resolver.clone();
-                    tokio::task::spawn_blocking(move || r.resolve(local, peer, accepted_at))
-                        .await
-                        .unwrap_or(Resolution {
-                            owner: Err(Unresolved::TableUnreadable),
-                            pid: None,
-                        })
+                })
+        }
+    };
+    let verdict = decide(own.as_ref().as_ref(), &resolution);
+    record(label, peer, &verdict, resolution.pid, mode);
+    // A refused stream is dropped here: the peer sees the connection close
+    // before a single byte.
+    (verdict == Verdict::Admit || mode == Mode::Shadow).then_some((stream, peer))
+}
+
+impl Guarded {
+    async fn accept(&mut self) -> Admitted {
+        loop {
+            tokio::select! {
+                // Collect a finished resolution first, so admitted peers are
+                // served before more work is taken on.
+                biased;
+                Some(done) = self.pending.join_next() => {
+                    // A resolution task that panicked is a refusal.
+                    if let Ok(Some(admitted)) = done {
+                        return admitted;
+                    }
                 }
-            };
-            let verdict = decide(own.as_ref().as_ref(), &resolution);
-            record(label, peer, &verdict, resolution.pid, mode);
-            if verdict == Verdict::Admit || mode == Mode::Shadow {
-                let _ = tx.send((stream, peer)).await;
+                accepted = self.listener.accept(), if self.pending.len() < MAX_INFLIGHT_RESOLUTIONS => {
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            // Stamp the accept instant now, so the PID-recycle
+                            // check compares against when the connection existed.
+                            let accepted_at = SystemTime::now();
+                            self.pending.spawn(resolve_one(
+                                stream,
+                                peer,
+                                accepted_at,
+                                self.label,
+                                self.resolver.clone(),
+                                self.own.clone(),
+                                self.mode,
+                            ));
+                        }
+                        // Same policy as axum's own `TcpListener` accept: a
+                        // per-connection error is skipped, anything else backs off.
+                        Err(e) if is_connection_error(&e) => {}
+                        Err(e) => {
+                            warn!(listener = self.label, error = %e, "peer user guard: accept error");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
             }
-            // A refused stream is dropped here: the peer sees the connection
-            // close before a single byte.
-        });
+        }
     }
 }
 
@@ -589,12 +616,7 @@ impl axum::serve::Listener for GuardedListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match &mut self.inner {
             Inner::Passthrough(l) => axum::serve::Listener::accept(l).await,
-            Inner::Guarded { rx, .. } => match rx.recv().await {
-                Some(pair) => pair,
-                // The accept task only ends when aborted (by our own Drop), so
-                // this is unreachable while `self` lives; never spin.
-                None => std::future::pending().await,
-            },
+            Inner::Guarded(g) => g.accept().await,
         }
     }
 

@@ -90,17 +90,24 @@ pub fn owner_uid<I: IntoIterator<Item = ProcRow>>(
     peer: SocketAddr,
 ) -> Result<u32, Unresolved> {
     let (local, peer) = (canonical(local), canonical(peer));
+    let mut closing = false;
     for row in rows {
         if canonical(row.local) == peer && canonical(row.remote) == local {
             // A TIME_WAIT or orphaned socket reports uid 0 and inode 0: its
-            // owner field is not the process that connected.
+            // owner field is not the process that connected. Keep scanning —
+            // a stale row with the same 4-tuple can precede the live one.
             if row.state == PROC_STATE_TIME_WAIT || row.inode == 0 {
-                return Err(Unresolved::SocketClosing);
+                closing = true;
+                continue;
             }
             return Ok(row.uid);
         }
     }
-    Err(Unresolved::NoMatchingSocket)
+    Err(if closing {
+        Unresolved::SocketClosing
+    } else {
+        Unresolved::NoMatchingSocket
+    })
 }
 
 /// A Windows `MIB_TCP*ROW_OWNER_PID` port field: the port in network byte
@@ -120,8 +127,13 @@ pub fn win_ipv4(dw: u32) -> Ipv4Addr {
 pub struct WinRow {
     pub local: SocketAddr,
     pub remote: SocketAddr,
+    /// `MIB_TCP_STATE` (`dwState`).
+    pub state: u32,
     pub pid: u32,
 }
+
+/// `MIB_TCP_STATE_TIME_WAIT`.
+pub const WIN_STATE_TIME_WAIT: u32 = 11;
 
 /// The PID owning the peer end of `peer → local` among `rows`.
 pub fn owner_pid<I: IntoIterator<Item = WinRow>>(
@@ -130,10 +142,23 @@ pub fn owner_pid<I: IntoIterator<Item = WinRow>>(
     peer: SocketAddr,
 ) -> Result<u32, Unresolved> {
     let (local, peer) = (canonical(local), canonical(peer));
-    rows.into_iter()
-        .find(|r| canonical(r.local) == peer && canonical(r.remote) == local)
-        .map(|r| r.pid)
-        .ok_or(Unresolved::NoMatchingSocket)
+    let mut closing = false;
+    for r in rows {
+        if canonical(r.local) == peer && canonical(r.remote) == local {
+            // A TIME_WAIT row, or one with no owning process (PID 0), is not
+            // the connector; keep scanning for a live row.
+            if r.state == WIN_STATE_TIME_WAIT || r.pid == 0 {
+                closing = true;
+                continue;
+            }
+            return Ok(r.pid);
+        }
+    }
+    Err(if closing {
+        Unresolved::SocketClosing
+    } else {
+        Unresolved::NoMatchingSocket
+    })
 }
 
 /// 100-ns intervals between 1601-01-01 and 1970-01-01.
@@ -227,8 +252,15 @@ pub fn sock_diag_request(local: SocketAddr, peer: SocketAddr, seq: u32) -> Vec<u
 /// What the kernel answered to one exact lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagReply {
-    /// The socket exists: its state, owner uid and inode.
-    Found { state: u8, uid: u32, inode: u32 },
+    /// A socket answered: its state, owner uid, inode and the 4-tuple the
+    /// kernel echoed (`(src, sport)` is the socket's local end).
+    Found {
+        state: u8,
+        uid: u32,
+        inode: u32,
+        src: SocketAddr,
+        dst: SocketAddr,
+    },
     /// `NLMSG_ERROR` with `-ENOENT`: no such socket.
     NotFound,
     /// `NLMSG_ERROR` with another errno (e.g. the family is unsupported).
@@ -254,21 +286,57 @@ pub fn parse_sock_diag_reply(buf: &[u8]) -> Option<DiagReply> {
                 DiagReply::Error(errno)
             })
         }
-        SOCK_DIAG_BY_FAMILY => Some(DiagReply::Found {
-            state: *payload.get(MSG_STATE_OFF)?,
-            uid: ne_u32(payload, MSG_UID_OFF)?,
-            inode: ne_u32(payload, MSG_INODE_OFF)?,
-        }),
+        SOCK_DIAG_BY_FAMILY => {
+            let family = *payload.first()?;
+            let sport = u16::from_be_bytes(payload.get(4..6)?.try_into().ok()?);
+            let dport = u16::from_be_bytes(payload.get(6..8)?.try_into().ok()?);
+            let ip = |at: usize| -> Option<IpAddr> {
+                let b: [u8; 16] = payload.get(at..at + 16)?.try_into().ok()?;
+                Some(if family == LINUX_AF_INET {
+                    IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+                } else {
+                    IpAddr::V6(Ipv6Addr::from(b))
+                })
+            };
+            Some(DiagReply::Found {
+                state: *payload.get(MSG_STATE_OFF)?,
+                uid: ne_u32(payload, MSG_UID_OFF)?,
+                inode: ne_u32(payload, MSG_INODE_OFF)?,
+                src: SocketAddr::new(ip(8)?, sport),
+                dst: SocketAddr::new(ip(24)?, dport),
+            })
+        }
         _ => None,
     }
 }
 
-/// The owner a decoded reply establishes, under the same rules as the `/proc`
-/// arm: a TIME_WAIT or orphaned (inode 0) socket's uid is not the connector's.
-pub fn owner_from_diag(reply: DiagReply) -> Result<u32, Unresolved> {
+/// Kernel TCP states in which a socket is a live connection end. LISTEN (10)
+/// is deliberately absent: `inet_diag_find_one_icsk` falls back to a listener
+/// when no connected socket matches, and a listener on the peer's port would
+/// otherwise vouch for a peer whose socket is already gone.
+const CONNECTED_STATES: [u8; 7] = [1, 2, 4, 5, 8, 9, 11];
+
+/// The owner a decoded reply establishes for the client socket of
+/// `peer → local`: the answering socket must be CONNECTED and its echoed
+/// 4-tuple must be exactly the one asked for. A TIME_WAIT or orphaned
+/// (inode 0) socket's uid is not the connector's.
+pub fn owner_from_diag(
+    reply: DiagReply,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> Result<u32, Unresolved> {
     match reply {
-        DiagReply::Found { state, inode, .. } if state == DIAG_STATE_TIME_WAIT || inode == 0 => {
+        DiagReply::Found { state, .. } if state == DIAG_STATE_TIME_WAIT => {
             Err(Unresolved::SocketClosing)
+        }
+        DiagReply::Found { inode: 0, .. } => Err(Unresolved::SocketClosing),
+        DiagReply::Found {
+            state, src, dst, ..
+        } if !CONNECTED_STATES.contains(&state)
+            || canonical(src) != canonical(peer)
+            || canonical(dst) != canonical(local) =>
+        {
+            Err(Unresolved::NoMatchingSocket)
         }
         DiagReply::Found { uid, .. } => Ok(uid),
         DiagReply::NotFound => Err(Unresolved::NoMatchingSocket),
