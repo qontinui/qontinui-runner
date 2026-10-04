@@ -11217,6 +11217,58 @@ CREATE TABLE project.iteration_logs (
 
 
 --
+-- Name: journey_edge_observations; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_edge_observations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    app_id text NOT NULL,
+    app_version text,
+    runner_build_id text NOT NULL,
+    runner_instance text NOT NULL,
+    run_id text,
+    run_kind text NOT NULL,
+    from_node jsonb NOT NULL,
+    to_node jsonb,
+    trigger jsonb NOT NULL,
+    outcome text NOT NULL,
+    timeline jsonb,
+    invalidated_at timestamp with time zone,
+    invalidated_reason text,
+    invalidated_by text,
+    invalidation_token text,
+    CONSTRAINT ck_journey_edge_observations_from_node_object CHECK ((jsonb_typeof(from_node) = 'object'::text)),
+    CONSTRAINT ck_journey_edge_observations_outcome CHECK ((outcome = ANY (ARRAY['changed'::text, 'no_change'::text, 'error'::text, 'settle_timeout'::text, 'to_node_unobserved'::text]))),
+    CONSTRAINT ck_journey_edge_observations_run_kind CHECK ((run_kind = ANY (ARRAY['agent_action'::text, 'explorer'::text, 'passive_session'::text]))),
+    CONSTRAINT ck_journey_edge_observations_to_node_iff_observed CHECK (((to_node IS NULL) = (outcome = 'to_node_unobserved'::text))),
+    CONSTRAINT ck_journey_edge_observations_to_node_object CHECK (((to_node IS NULL) OR (jsonb_typeof(to_node) = 'object'::text))),
+    CONSTRAINT ck_journey_edge_observations_trigger_object CHECK ((jsonb_typeof(trigger) = 'object'::text))
+);
+
+
+--
+-- Name: journey_frontier; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.journey_frontier (
+    app_id text NOT NULL,
+    node_key text NOT NULL,
+    node jsonb NOT NULL,
+    affordance_fingerprint text NOT NULL,
+    affordance_role text,
+    declared_effect text,
+    reason text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_run_id text,
+    CONSTRAINT ck_journey_frontier_declared_effect CHECK ((declared_effect = ANY (ARRAY['read'::text, 'write'::text, 'destructive'::text]))),
+    CONSTRAINT ck_journey_frontier_node_object CHECK ((jsonb_typeof(node) = 'object'::text)),
+    CONSTRAINT ck_journey_frontier_reason CHECK ((reason = ANY (ARRAY['not_yet_activated'::text, 'effect_undeclared'::text, 'effect_write'::text, 'effect_destructive'::text, 'budget_exhausted'::text, 'activation_failed'::text])))
+);
+
+
+--
 -- Name: known_issues; Type: TABLE; Schema: project; Owner: -
 --
 
@@ -20999,6 +21051,22 @@ ALTER TABLE ONLY project.issue_pattern_templates
 
 ALTER TABLE ONLY project.iteration_logs
     ADD CONSTRAINT iteration_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_edge_observations journey_edge_observations_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_edge_observations
+    ADD CONSTRAINT journey_edge_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journey_frontier journey_frontier_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.journey_frontier
+    ADD CONSTRAINT journey_frontier_pkey PRIMARY KEY (app_id, node_key, affordance_fingerprint);
 
 
 --
@@ -31523,6 +31591,20 @@ CREATE INDEX ix_input_events_timestamp_ms ON project.input_events USING btree (t
 --
 
 CREATE INDEX ix_input_events_video_capture_session_id ON project.input_events USING btree (video_capture_session_id);
+
+
+--
+-- Name: ix_journey_edge_observations_app_observed_at; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_observed_at ON project.journey_edge_observations USING btree (app_id, observed_at DESC) WHERE (invalidated_at IS NULL);
+
+
+--
+-- Name: ix_journey_edge_observations_app_run; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_journey_edge_observations_app_run ON project.journey_edge_observations USING btree (app_id, run_id);
 
 
 --
