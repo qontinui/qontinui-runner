@@ -313,13 +313,16 @@ pub struct LiveClaudeProcess {
     /// reader was `GET /restart-readiness`. Since Phase 4 the wind-down
     /// executor (`session::wind_down_executor`) reads the same field and ACTS
     /// on it — an `eligible` on a DRAINED device is a session the runner will
-    /// graceful-`/exit` on its next tick. Reading it costs nothing; writing a
-    /// wrong one closes a session.
+    /// graceful-`/exit` on its next tick, and an `eligible` FINISHED terminal
+    /// session is one its `finished_close` arm will close without a drain once
+    /// its custody is clean. Reading it costs nothing; writing a wrong one
+    /// closes a session.
     ///
     /// The two readers still differ, and the difference is the endpoint's, not
     /// this field's: `/restart-readiness` reports whatever the verdict says
     /// whether or not the runner is drained and closes nothing itself, while
-    /// the executor applies its own further gates (the drain, a wall-clock-jump
+    /// the executor applies its own further gates (the drain or the
+    /// `finished_close` switch, that arm's custody gate, a wall-clock-jump
     /// quarantine, a per-tick budget, and a re-check immediately before each
     /// close). So `eligible` here is a candidacy, never a prediction.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1024,6 +1027,7 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,

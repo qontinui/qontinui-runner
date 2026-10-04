@@ -1144,6 +1144,10 @@ pub mod coord {
         /// instead of failing the whole survey.
         #[serde(default)]
         pub work_unit_id: Option<String>,
+        /// `coord.agent_worktrees.status` — `allocated` | `active` | `merging`
+        /// | `merged` | `abandoned`. `None` from a coord that omits it.
+        #[serde(default)]
+        pub ledger_status: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -1162,6 +1166,12 @@ pub mod coord {
     pub struct CoordSessionWorktrees {
         #[serde(default)]
         pub sessions: Vec<CoordSessionRow>,
+        /// Whether `coord.sessions.claude_code_session_id` — the bridge the
+        /// ledger join runs through — exists on that database. Absent or
+        /// `false` makes `sessions: []` UNKNOWN rather than "no worktrees";
+        /// `None` from a coord that predates the field.
+        #[serde(default)]
+        pub session_bridge_column_present: Option<bool>,
     }
 
     /// Project coord's five-valued session state onto the tri-state
@@ -1199,6 +1209,13 @@ pub mod coord {
         by_path: std::collections::HashMap<String, usize>,
         /// coord answered at all. `false` ⇒ absence is UNKNOWN, not "no owner".
         pub reachable: bool,
+        /// `coord.sessions.id`s (lowercased) POSITIVELY known live for this
+        /// read: listed on a validated live page, or — holding no rows —
+        /// agreed live by both work-status reads around the pages. See
+        /// [`fetch_live_ownership`].
+        /// Empty for an index built by [`Self::from_response`] alone, which
+        /// asserts nothing about liveness.
+        live_sessions: std::collections::HashSet<String>,
     }
 
     impl CoordOwnership {
@@ -1224,7 +1241,23 @@ pub mod coord {
                 rows,
                 by_path,
                 reachable: true,
+                live_sessions: std::collections::HashSet::new(),
             }
+        }
+
+        /// Record `session_ids` as positively live when this index was read.
+        pub fn mark_live<'a>(&mut self, session_ids: impl IntoIterator<Item = &'a str>) {
+            self.live_sessions
+                .extend(session_ids.into_iter().map(str::to_ascii_lowercase));
+        }
+
+        /// Is `session_id` (a `coord.sessions.id`) positively known live? Only
+        /// then does an absence of its rows mean "no worktrees" — a session
+        /// coord has closed, or one that moved between states while the pages
+        /// were read, is on no live page although its rows may exist.
+        pub fn is_known_live(&self, session_id: &str) -> bool {
+            self.live_sessions
+                .contains(&session_id.to_ascii_lowercase())
         }
 
         pub fn len(&self) -> usize {
@@ -1233,6 +1266,24 @@ pub mod coord {
 
         pub fn is_empty(&self) -> bool {
             self.rows.is_empty()
+        }
+
+        /// Every ledger worktree row allocated to `session_id` — a
+        /// `coord.sessions.id`, which is what this route keys its sessions on
+        /// (NOT a Claude session id). Paths are verbatim, so a RELATIVE ledger
+        /// path is the caller's to resolve against the workspace root. One row
+        /// per path, the first in ledger order.
+        pub fn worktrees_for_session(&self, session_id: &str) -> Vec<&CoordWorktreeRow> {
+            let mut out: Vec<&CoordWorktreeRow> = Vec::new();
+            for (sid, _, row, _) in &self.rows {
+                if sid.eq_ignore_ascii_case(session_id)
+                    && !row.worktree_path.is_empty()
+                    && !out.iter().any(|r| r.worktree_path == row.worktree_path)
+                {
+                    out.push(row);
+                }
+            }
+            out
         }
 
         /// Look one worktree up. `census_path` is absolute; coord's ledger path
@@ -1317,6 +1368,167 @@ pub mod coord {
             .await
             .map_err(|e| format!("decode session-worktrees: {e}"))?;
         Ok(Some(CoordOwnership::from_response(parsed)))
+    }
+
+    /// The coord session states a session that can still be running is in —
+    /// every state but `closed`. The wind-down executor's custody gate reads
+    /// the attributed worktrees of a LIVE session, so these are the pages it
+    /// needs.
+    pub const LIVE_SESSION_STATES: [&str; 4] =
+        ["active", "pending_resolution", "stale", "expected"];
+
+    /// The ledger-row limit sent per page — coord's own clamp ceiling.
+    pub const SESSION_WORKTREES_PAGE_LIMIT: usize = 500;
+
+    /// PURE: a page is usable only when it is provably COMPLETE.
+    ///
+    /// * the session bridge column must be reported present — without it the
+    ///   join is inexpressible and `sessions: []` is unknown, not empty;
+    /// * the page must hold FEWER ledger rows than the limit sent: coord
+    ///   applies `LIMIT` to ledger rows tenant-wide, ordered by session id, so
+    ///   a page that reached it may have cut off the very session asked
+    ///   about — and a missing row would read as "nothing attributed".
+    pub fn validate_complete_page(
+        page: &CoordSessionWorktrees,
+        state: &str,
+        limit: usize,
+    ) -> Result<(), String> {
+        if page.session_bridge_column_present != Some(true) {
+            return Err(format!(
+                "coord's session-worktrees page for state={state} does not report the \
+                 claude_code_session_id bridge column present, so its rows cannot be trusted \
+                 as complete"
+            ));
+        }
+        let rows: usize = page.sessions.iter().map(|s| s.worktrees.len()).sum();
+        if rows >= limit {
+            return Err(format!(
+                "coord's session-worktrees page for state={state} returned {rows} ledger rows at \
+                 limit={limit}, so it may be truncated"
+            ));
+        }
+        Ok(())
+    }
+
+    /// PURE: validate every `(state, page)` and union them into one index.
+    pub fn ownership_from_pages(
+        pages: Vec<(&str, CoordSessionWorktrees)>,
+        limit: usize,
+    ) -> Result<CoordOwnership, String> {
+        let mut sessions: Vec<CoordSessionRow> = Vec::new();
+        for (state, page) in pages {
+            validate_complete_page(&page, state, limit)?;
+            sessions.extend(page.sessions);
+        }
+        let on_live_pages: Vec<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
+        let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
+            sessions,
+            session_bridge_column_present: Some(true),
+        });
+        // Every session on a validated live page was live when the page was read.
+        index.mark_live(on_live_pages.iter().map(String::as_str));
+        Ok(index)
+    }
+
+    /// PURE: the `coord.sessions.id`s that BOTH work-status reads — one made
+    /// before the worktree pages, one after — name as the row answering for
+    /// the same Claude session, in the SAME live state ([`LIVE_SESSION_STATES`]).
+    ///
+    /// Only such a session may be taken as live-with-no-rows when it is on no
+    /// page. A read that failed carries no entries, so it agrees with nothing.
+    pub fn agreeing_live_sessions(
+        before: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+        after: &std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>,
+    ) -> Vec<String> {
+        before
+            .iter()
+            .filter(|(_, pre)| LIVE_SESSION_STATES.contains(&pre.state.as_str()))
+            .filter(|(claude_id, pre)| after.get(*claude_id) == Some(*pre))
+            .map(|(_, pre)| pre.coord_session_id.clone())
+            .collect()
+    }
+
+    /// Fetch the attributed-worktree index for every LIVE session, complete or
+    /// not at all.
+    ///
+    /// [`fetch_ownership`] sends no `limit`, so coord serves its default 200
+    /// ledger rows TENANT-WIDE — on a fleet holding ~1,500 that silently
+    /// drops most sessions, and for a custody gate a dropped session reads as
+    /// "nothing attributed", i.e. clean. This reads one page per
+    /// [`LIVE_SESSION_STATES`] at [`SESSION_WORKTREES_PAGE_LIMIT`] and refuses
+    /// (`Err`) any page that is incomplete by [`validate_complete_page`], or
+    /// any non-2xx or undecodable answer. `Err` is `Unknown` at the gate.
+    ///
+    /// It is still a tenant-wide read to answer a one-session question.
+    ///
+    /// ## Liveness: why a session missing from every page is not "no rows"
+    ///
+    /// The route's ledger join is an INNER lateral off
+    /// `coord.agent_worktrees`, so a session with no worktree rows is OMITTED,
+    /// not listed with an empty array. And a session's state MOVES in both
+    /// directions: coord auto-closes an idle `stale` / `pending_resolution`
+    /// session, and an `UpdateSessionRequest { state: active }` — which the
+    /// runner's own `coord_sync` outbox sends — re-activates one and clears
+    /// its `closed_at`. The four state-filtered pages are four separate
+    /// snapshots, so a session can move from a state read LATER into one read
+    /// EARLIER between two of them and appear on no page while its rows exist.
+    /// Absence is therefore ambiguous, and no single liveness read settles it.
+    ///
+    /// So a session on a live page is live (its rows are on that page, which
+    /// is complete), and a session on NO page is taken as live-with-no-rows
+    /// only when `/coord/sessions/work-status` — read once BEFORE the pages and
+    /// once AFTER — names the same coord row in the same live state both times
+    /// ([`agreeing_live_sessions`]). Disagreement, an absent row, or a read
+    /// that failed leaves it Unknown. This NARROWS the window rather than
+    /// closing it: a session that leaves a state and returns to it between the
+    /// two reads still agrees. A coord read keyed on `claude_code_session_id`
+    /// with no state filter would answer in ONE snapshot and make this
+    /// complete by construction — a coord follow-up, as is a per-session
+    /// filter on this route.
+    pub async fn fetch_live_ownership(
+        claude_session_ids: &[String],
+    ) -> Result<CoordOwnership, String> {
+        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+            return Err(
+                "no coord base is configured, so the session's worktree allocations cannot be read"
+                    .to_string(),
+            );
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("build custody http client: {e}"))?;
+        let before = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        let mut pages = Vec::new();
+        for state in LIVE_SESSION_STATES {
+            let url = format!(
+                "{}/coord/sessions/worktrees?state={state}&limit={SESSION_WORKTREES_PAGE_LIMIT}",
+                base.trim_end_matches('/')
+            );
+            let resp = crate::coord_http::coord_get(&client, &url)
+                .send()
+                .await
+                .map_err(|e| format!("GET {url}: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let excerpt: String = body.chars().take(200).collect();
+                return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+            }
+            let page: CoordSessionWorktrees = resp
+                .json()
+                .await
+                .map_err(|e| format!("decode session-worktrees ({state}): {e}"))?;
+            pages.push((state, page));
+        }
+        let mut index = ownership_from_pages(pages, SESSION_WORKTREES_PAGE_LIMIT)?;
+        let after = crate::mcp::session_work_status::fetch(claude_session_ids).await;
+        let rowless = agreeing_live_sessions(
+            &before.liveness_by_session_id,
+            &after.liveness_by_session_id,
+        );
+        index.mark_live(rowless.iter().map(String::as_str));
+        Ok(index)
     }
 
     #[cfg(test)]
@@ -1450,6 +1662,182 @@ pub mod coord {
                 .owner_for("D:/x", "qontinui-runner", Some("b"))
                 .is_none());
             assert!(idx.reachable, "an EMPTY answer is still an answer");
+        }
+
+        fn page(json: &str) -> CoordSessionWorktrees {
+            serde_json::from_str(json).unwrap()
+        }
+
+        #[test]
+        fn a_page_at_the_limit_may_be_truncated_and_is_refused() {
+            let full = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"a","worktrees":[{"worktreePath":"w1"},{"worktreePath":"w2"}]},
+                    {"sessionId":"b","worktrees":[{"worktreePath":"w3"}]}]}"#,
+            );
+            assert!(
+                validate_complete_page(&full, "active", 3).is_err(),
+                "3 rows at limit 3"
+            );
+            assert!(
+                validate_complete_page(&full, "active", 4).is_ok(),
+                "3 rows under limit 4"
+            );
+            assert!(ownership_from_pages(vec![("active", full)], 3).is_err());
+        }
+
+        #[test]
+        fn a_missing_or_false_bridge_column_is_refused() {
+            for json in [
+                r#"{"sessions":[]}"#,
+                r#"{"sessionBridgeColumnPresent":false,"sessions":[]}"#,
+            ] {
+                let err = validate_complete_page(&page(json), "stale", 500).unwrap_err();
+                assert!(err.contains("bridge column"), "{err}");
+            }
+            assert!(validate_complete_page(
+                &page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
+                "stale",
+                500
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn the_live_states_are_unioned_into_one_index() {
+            let active = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"s-act","worktrees":[{"worktreePath":"wt/act","ledgerStatus":"active"}]}]}"#,
+            );
+            let stale = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"s-old","worktrees":[{"worktreePath":"wt/old","ledgerStatus":"merged"}]}]}"#,
+            );
+            let idx =
+                ownership_from_pages(vec![("active", active), ("stale", stale)], 500).unwrap();
+            assert_eq!(
+                idx.worktrees_for_session("s-act")[0].worktree_path,
+                "wt/act"
+            );
+            let old = idx.worktrees_for_session("s-old");
+            assert_eq!(old[0].ledger_status.as_deref(), Some("merged"));
+            // One bad page poisons the whole read: a union that dropped it would
+            // be exactly the silent short read this exists to refuse.
+            let bad = page(r#"{"sessions":[]}"#);
+            let good = page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
+            assert!(ownership_from_pages(vec![("active", good), ("expected", bad)], 500).is_err());
+            assert!(LIVE_SESSION_STATES.iter().all(|s| *s != "closed"));
+        }
+
+        fn liveness(
+            rows: &[(&str, &str, &str)],
+        ) -> std::collections::HashMap<String, crate::mcp::session_work_status::CoordLiveness>
+        {
+            rows.iter()
+                .map(|(claude, coord, state)| {
+                    (
+                        claude.to_string(),
+                        crate::mcp::session_work_status::CoordLiveness {
+                            coord_session_id: coord.to_string(),
+                            state: state.to_string(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_session_on_a_live_page_is_live_without_any_work_status_agreement() {
+            let active = page(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[
+                    {"sessionId":"S-PAGE","worktrees":[{"worktreePath":"wt/a"}]}]}"#,
+            );
+            let idx = ownership_from_pages(vec![("active", active)], 500).unwrap();
+            assert!(idx.is_known_live("s-page"), "listed on a live page");
+            assert!(!idx.is_known_live("s-rowless"));
+            // An index built from a response alone asserts no liveness.
+            assert!(
+                !CoordOwnership::from_response(page(r#"{"sessions":[]}"#)).is_known_live("s-page")
+            );
+        }
+
+        /// Both reads name the same coord row in the same live state: rowless.
+        #[test]
+        fn a_pageless_session_both_reads_agree_is_live() {
+            let before = liveness(&[("claude-a", "s-rowless", "active")]);
+            let after = liveness(&[("claude-a", "s-rowless", "active")]);
+            assert_eq!(
+                agreeing_live_sessions(&before, &after),
+                vec!["s-rowless".to_string()]
+            );
+        }
+
+        /// The reactivation race: `stale` before the pages, `active` after —
+        /// it may have been on neither page while its rows existed. Unknown.
+        #[test]
+        fn a_pageless_session_whose_reads_disagree_is_unknown() {
+            let stale = liveness(&[("claude-a", "s-moved", "stale")]);
+            let active = liveness(&[("claude-a", "s-moved", "active")]);
+            assert!(agreeing_live_sessions(&stale, &active).is_empty());
+            // A different coord row answering is disagreement too.
+            let other_row = liveness(&[("claude-a", "s-other", "stale")]);
+            assert!(agreeing_live_sessions(&stale, &other_row).is_empty());
+            // And agreeing on `closed` is never live.
+            let closed = liveness(&[("claude-a", "s-moved", "closed")]);
+            assert!(agreeing_live_sessions(&closed, &closed).is_empty());
+        }
+
+        /// A failed work-status read carries no rows, so it agrees with
+        /// nothing — whichever of the two it was.
+        #[test]
+        fn a_pageless_session_with_one_failed_read_is_unknown() {
+            let ok = liveness(&[("claude-a", "s-rowless", "active")]);
+            let failed = std::collections::HashMap::new();
+            assert!(agreeing_live_sessions(&ok, &failed).is_empty());
+            assert!(agreeing_live_sessions(&failed, &ok).is_empty());
+
+            // End to end on the index: only the agreeing session is marked.
+            let mut idx = ownership_from_pages(
+                vec![(
+                    "active",
+                    page(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#),
+                )],
+                500,
+            )
+            .unwrap();
+            idx.mark_live(
+                agreeing_live_sessions(&ok, &failed)
+                    .iter()
+                    .map(String::as_str),
+            );
+            assert!(!idx.is_known_live("s-rowless"));
+        }
+
+        #[test]
+        fn worktrees_for_session_lists_only_that_sessions_rows() {
+            let idx = index(
+                r#"{"sessions":[
+                    {"sessionId":"AAAA-1","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-schemas","repo":"qontinui-schemas"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"}]},
+                    {"sessionId":"bbbb-2","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/b/qontinui-web","repo":"qontinui-web"}]}]}"#,
+            );
+            let paths: Vec<&str> = idx
+                .worktrees_for_session("aaaa-1")
+                .into_iter()
+                .map(|r| r.worktree_path.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                vec![
+                    "agent-worktrees/a/qontinui-runner",
+                    "agent-worktrees/a/qontinui-schemas"
+                ],
+                "case-insensitive on the uuid, deduplicated, in ledger order"
+            );
+            assert!(idx.worktrees_for_session("cccc-3").is_empty());
         }
     }
 }
