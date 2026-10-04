@@ -276,17 +276,51 @@ fn upsert_at(key: &str, lane: Lane, mut failure: SessionFailure, now: Instant) -
 
 /// Remove every failure under `key` that `pred` selects; returns them.
 fn remove_where(key: &str, pred: impl Fn(&Stored) -> bool) -> Vec<SessionFailure> {
-    with_store(|store| {
-        let Some(entry) = store.get_mut(key) else {
-            return Vec::new();
-        };
-        let (gone, kept): (Vec<_>, Vec<_>) = entry.failures.drain(..).partition(|s| pred(s));
-        entry.failures = kept;
-        if entry.failures.is_empty() {
-            store.remove(key);
+    with_store(|store| remove_where_in(store, key, pred))
+}
+
+fn remove_where_in(
+    store: &mut HashMap<String, Entry>,
+    key: &str,
+    pred: impl Fn(&Stored) -> bool,
+) -> Vec<SessionFailure> {
+    let Some(entry) = store.get_mut(key) else {
+        return Vec::new();
+    };
+    let (gone, kept): (Vec<_>, Vec<_>) = entry.failures.drain(..).partition(|s| pred(s));
+    entry.failures = kept;
+    if entry.failures.is_empty() {
+        store.remove(key);
+    }
+    gone.into_iter().map(|s| s.failure).collect()
+}
+
+/// PTY panes whose provider `SessionStart` confirmed, and when. A replacement
+/// pane can confirm BEFORE [`hand_over`] moves the failures to it (the
+/// spawn returns after the CLI is already up); `hand_over` reads this so those
+/// failures clear at once instead of waiting for a confirm that already came.
+/// Only touched while holding [`STORE`] (lock order STORE → this), so a
+/// confirm and a hand-over cannot interleave between the move and the check.
+static CONFIRMED_PANES: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// How long a pane's confirmation is remembered for a late hand-over. A
+/// hand-over follows its pane's spawn by seconds; this only bounds the map.
+const CONFIRMED_PANE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Remember (`now = Some`) or ask about `terminal_id`'s confirmation, pruning
+/// expired entries. Call only while holding [`STORE`].
+fn confirmed_pane(terminal_id: &str, now: Option<Instant>) -> bool {
+    let mut guard = CONFIRMED_PANES.lock().unwrap_or_else(|e| e.into_inner());
+    let panes = guard.get_or_insert_with(HashMap::new);
+    let at = Instant::now();
+    panes.retain(|_, t| at.duration_since(*t) < CONFIRMED_PANE_TTL);
+    match now {
+        Some(t) => {
+            panes.insert(terminal_id.to_string(), t);
+            true
         }
-        gone.into_iter().map(|s| s.failure).collect()
-    })
+        None => panes.contains_key(terminal_id),
+    }
 }
 
 /// Replace `key`'s active failure `id` with `f(it)`; returns the new value.
@@ -422,9 +456,9 @@ fn declined(sink: &dyn FailureNoticeSink, key: &str, id: &str, why: &str) {
 /// wait for the replacement to prove itself. They clear on
 /// [`on_pty_session_confirmed`], never on the spawn.
 fn hand_over(sink: &dyn FailureNoticeSink, from: &str, to: &str) {
-    let moved: Vec<Stored> = with_store(|store| {
+    let (moved, cleared): (Vec<Stored>, Vec<SessionFailure>) = with_store(|store| {
         let Some(entry) = store.remove(from) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let target = store.entry(to.to_string()).or_insert_with(|| Entry {
             lane: Lane::Pty,
@@ -442,12 +476,28 @@ fn hand_over(sink: &dyn FailureNoticeSink, from: &str, to: &str) {
             });
             target.failures.push(s);
         }
-        moved
+        // The replacement already proved itself: its SessionStart arrived
+        // before this hand-over, and no second one is coming.
+        let cleared = if confirmed_pane(to, None) {
+            remove_where_in(store, to, |s| s.awaiting_replacement)
+        } else {
+            Vec::new()
+        };
+        (moved, cleared)
     });
     for s in moved {
         announce(sink, from, s.failure.clone(), false);
         announce(sink, to, s.failure, true);
     }
+    if !cleared.is_empty() {
+        info!(
+            terminal_id = to,
+            cleared = cleared.len(),
+            evidence = ?Evidence::SessionReplaced,
+            "replacement session had already confirmed — the failures it took over are over"
+        );
+    }
+    announce_cleared(sink, to, cleared);
 }
 
 /// A provider's `SessionStart` hook confirmed a session on PTY `terminal_id`.
@@ -460,7 +510,10 @@ pub fn on_pty_session_confirmed(terminal_id: &str) {
 }
 
 fn on_pty_session_confirmed_with(sink: &dyn FailureNoticeSink, terminal_id: &str) {
-    let gone = remove_where(terminal_id, |s| s.awaiting_replacement);
+    let gone = with_store(|store| {
+        confirmed_pane(terminal_id, Some(Instant::now()));
+        remove_where_in(store, terminal_id, |s| s.awaiting_replacement)
+    });
     if !gone.is_empty() {
         info!(
             terminal_id,
@@ -1868,6 +1921,42 @@ mod tests {
         on_pty_session_confirmed_with(&sink, new);
         assert_eq!(active(new).len(), 1);
         remove_where(new, |_| true);
+    }
+
+    /// A replacement whose SessionStart confirmed BEFORE the hand-over (the
+    /// spawn returned after the CLI was up) clears the failures it takes over
+    /// at once — no second confirm is coming to clear them.
+    #[test]
+    fn a_replacement_confirmed_before_the_hand_over_clears_at_once() {
+        let sink = Recorder::default();
+        let old = "fr-test-early-old";
+        let new = "fr-test-early-new";
+        record_and_announce(
+            &sink,
+            &pty(old),
+            provider(),
+            None,
+            &FailureSignal::Exit { code: Some(1) },
+        )
+        .unwrap();
+        sink.take();
+
+        on_pty_session_confirmed_with(&sink, new); // early: nothing there yet
+        assert!(sink.take().is_empty());
+        hand_over(&sink, old, new);
+        assert!(active(old).is_empty());
+        assert!(
+            active(new).is_empty(),
+            "not left awaiting a confirm that came already"
+        );
+        assert_eq!(
+            sink.take(),
+            vec![
+                (FailureKind::ProcessExited, false),
+                (FailureKind::ProcessExited, true),
+                (FailureKind::ProcessExited, false)
+            ]
+        );
     }
 
     /// A signal that reports no failure records and announces nothing.
