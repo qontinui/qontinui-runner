@@ -12497,10 +12497,8 @@ async fn serve_on_dedicated_runtime(
                  any other subsystem blocks the app runtime's workers."
             );
             let listener = tokio::net::TcpListener::from_std(std_listener)?;
-            let listener = qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(
-                listener,
-                "local-api",
-            )?;
+            let listener =
+                qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
             return axum::serve(listener, router).await.map_err(Into::into);
         }
     };
