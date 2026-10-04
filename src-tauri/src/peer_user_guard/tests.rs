@@ -75,6 +75,7 @@ fn every_unresolved_reason_is_refused() {
         Unresolved::SocketClosing,
         Unresolved::ProcessUnopenable,
         Unresolved::TokenUnreadable,
+        Unresolved::TokenAccessDenied,
         Unresolved::PidRecycled,
         Unresolved::TableUnreadable,
         Unresolved::OwnUserUnknown,
@@ -242,6 +243,22 @@ fn time_wait_and_orphan_rows_are_unresolved_not_root() {
 }
 
 #[test]
+fn a_stale_row_before_the_live_one_does_not_hide_it() {
+    let tw = row(
+        "127.0.0.1:41234",
+        "127.0.0.1:9876",
+        PROC_STATE_TIME_WAIT,
+        0,
+        0,
+    );
+    let live = row("127.0.0.1:41234", "127.0.0.1:9876", 0x01, 1001, 12);
+    assert_eq!(
+        owner_uid([tw, live], sa("127.0.0.1:9876"), sa("127.0.0.1:41234")),
+        Ok(1001)
+    );
+}
+
+#[test]
 fn empty_table_is_no_matching_socket() {
     assert_eq!(
         owner_uid(
@@ -268,19 +285,20 @@ fn win_ipv4_decodes_network_order() {
     assert_eq!(win_ipv4(0x0100_007F), Ipv4Addr::new(127, 0, 0, 1));
 }
 
+fn win(local: &str, remote: &str, state: u32, pid: u32) -> WinRow {
+    WinRow {
+        local: sa(local),
+        remote: sa(remote),
+        state,
+        pid,
+    }
+}
+
 #[test]
 fn win_owner_pid_matches_peer_row() {
     let rows = [
-        WinRow {
-            local: sa("127.0.0.1:9876"),
-            remote: sa("127.0.0.1:50000"),
-            pid: 100,
-        },
-        WinRow {
-            local: sa("127.0.0.1:50000"),
-            remote: sa("127.0.0.1:9876"),
-            pid: 200,
-        },
+        win("127.0.0.1:9876", "127.0.0.1:50000", 5, 100),
+        win("127.0.0.1:50000", "127.0.0.1:9876", 5, 200),
     ];
     assert_eq!(
         owner_pid(rows, sa("127.0.0.1:9876"), sa("127.0.0.1:50000")),
@@ -289,6 +307,21 @@ fn win_owner_pid_matches_peer_row() {
     assert_eq!(
         owner_pid(rows, sa("127.0.0.1:9876"), sa("127.0.0.1:50001")),
         Err(Unresolved::NoMatchingSocket)
+    );
+}
+
+#[test]
+fn win_time_wait_and_pid_zero_rows_are_skipped_not_trusted() {
+    let tw = win("127.0.0.1:50000", "127.0.0.1:9876", WIN_STATE_TIME_WAIT, 0);
+    let orphan = win("127.0.0.1:50000", "127.0.0.1:9876", 5, 0);
+    let live = win("127.0.0.1:50000", "127.0.0.1:9876", 5, 300);
+    assert_eq!(
+        owner_pid([tw, orphan], sa("127.0.0.1:9876"), sa("127.0.0.1:50000")),
+        Err(Unresolved::SocketClosing)
+    );
+    assert_eq!(
+        owner_pid([tw, live], sa("127.0.0.1:9876"), sa("127.0.0.1:50000")),
+        Ok(300)
     );
 }
 
@@ -331,52 +364,104 @@ fn sock_diag_request_encodes_the_client_socket_4_tuple() {
     assert_eq!(&req[64..72], &[0xff; 8], "INET_DIAG_NOCOOKIE");
 }
 
-fn diag_msg(state: u8, uid: u32, inode: u32) -> Vec<u8> {
+/// A `SOCK_DIAG_BY_FAMILY` reply echoing `src:sport -> dst:dport` (IPv4).
+fn diag_msg(state: u8, uid: u32, inode: u32, src: &str, dst: &str) -> Vec<u8> {
+    let (src, dst) = (sa(src), sa(dst));
     let mut b = vec![0u8; 16 + 72];
     b[0..4].copy_from_slice(&88u32.to_ne_bytes());
     b[4..6].copy_from_slice(&20u16.to_ne_bytes());
     b[16] = 2;
     b[17] = state;
+    b[16 + 4..16 + 6].copy_from_slice(&src.port().to_be_bytes());
+    b[16 + 6..16 + 8].copy_from_slice(&dst.port().to_be_bytes());
+    if let (IpAddr::V4(s4), IpAddr::V4(d4)) = (src.ip(), dst.ip()) {
+        b[16 + 8..16 + 12].copy_from_slice(&s4.octets());
+        b[16 + 24..16 + 28].copy_from_slice(&d4.octets());
+    }
     b[16 + 64..16 + 68].copy_from_slice(&uid.to_ne_bytes());
     b[16 + 68..16 + 72].copy_from_slice(&inode.to_ne_bytes());
     b
 }
 
+const C: &str = "127.0.0.1:41234"; // the client (peer) end
+const S: &str = "127.0.0.1:9876"; // the runner's end
+
+fn diag(state: u8, uid: u32, inode: u32, src: &str, dst: &str) -> Result<u32, Unresolved> {
+    owner_from_diag(
+        parse_sock_diag_reply(&diag_msg(state, uid, inode, src, dst)).unwrap(),
+        sa(S),
+        sa(C),
+    )
+}
+
 #[test]
-fn sock_diag_reply_decodes_found_and_errors() {
+fn sock_diag_reply_decodes_found_and_its_echoed_4_tuple() {
     assert_eq!(
-        parse_sock_diag_reply(&diag_msg(1, 1001, 555)),
+        parse_sock_diag_reply(&diag_msg(1, 1001, 555, C, S)),
         Some(DiagReply::Found {
             state: 1,
             uid: 1001,
-            inode: 555
+            inode: 555,
+            src: sa(C),
+            dst: sa(S)
         })
     );
     assert_eq!(
-        owner_from_diag(DiagReply::Found {
-            state: 1,
-            uid: 1001,
-            inode: 555
-        }),
-        Ok(1001)
+        diag(1, 1001, 555, C, S),
+        Ok(1001),
+        "ESTABLISHED client socket"
     );
     assert_eq!(
-        owner_from_diag(parse_sock_diag_reply(&diag_msg(6, 0, 0)).unwrap()),
+        diag(4, 1001, 555, C, S),
+        Ok(1001),
+        "FIN_WAIT1: sent and closed, still the connector"
+    );
+}
+
+#[test]
+fn sock_diag_refuses_a_listener_a_closing_socket_and_a_foreign_echo() {
+    // inet_diag_find_one_icsk falls back to a LISTENER on the peer's port when
+    // the client socket is gone; that must never vouch for the peer.
+    assert_eq!(
+        diag(10, 1000, 777, "127.0.0.1:41234", "0.0.0.0:0"),
+        Err(Unresolved::NoMatchingSocket)
+    );
+    assert_eq!(
+        diag(10, 1000, 777, C, S),
+        Err(Unresolved::NoMatchingSocket),
+        "LISTEN even with a matching echo"
+    );
+    assert_eq!(
+        diag(6, 0, 0, C, S),
         Err(Unresolved::SocketClosing),
         "TIME_WAIT is not owned by uid 0"
     );
+    assert_eq!(
+        diag(1, 1001, 0, C, S),
+        Err(Unresolved::SocketClosing),
+        "orphaned, inode 0"
+    );
+    assert_eq!(
+        diag(1, 1001, 555, "127.0.0.1:41299", S),
+        Err(Unresolved::NoMatchingSocket),
+        "echo names another socket"
+    );
+}
+
+#[test]
+fn sock_diag_errors_decode() {
     let mut err = vec![0u8; 20];
     err[0..4].copy_from_slice(&20u32.to_ne_bytes());
     err[4..6].copy_from_slice(&2u16.to_ne_bytes());
     err[16..20].copy_from_slice(&(-2i32).to_ne_bytes());
     assert_eq!(parse_sock_diag_reply(&err), Some(DiagReply::NotFound));
     assert_eq!(
-        owner_from_diag(DiagReply::NotFound),
+        owner_from_diag(DiagReply::NotFound, sa(S), sa(C)),
         Err(Unresolved::NoMatchingSocket)
     );
     err[16..20].copy_from_slice(&(-22i32).to_ne_bytes());
     assert_eq!(
-        owner_from_diag(parse_sock_diag_reply(&err).unwrap()),
+        owner_from_diag(parse_sock_diag_reply(&err).unwrap(), sa(S), sa(C)),
         Err(Unresolved::TableUnreadable)
     );
     assert_eq!(parse_sock_diag_reply(&[0u8; 3]), None, "truncated");
@@ -529,6 +614,26 @@ async fn shadow_admits_a_would_refuse_and_counts_it() {
     );
 }
 
+/// Review finding L1: dropping the listener must release the port at once —
+/// the Cognito callback re-binds its fixed port right after shutdown.
+#[tokio::test]
+async fn dropping_the_listener_releases_the_port_synchronously() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let guarded = GuardedListener::with_resolver(
+        listener,
+        "test-drop",
+        Arc::new(Fixed {
+            own: Ok(LocalUser::Uid(7)),
+            peer: Ok(LocalUser::Uid(7)),
+        }),
+        Mode::Enforce,
+    )
+    .unwrap();
+    let addr = axum::serve::Listener::local_addr(&guarded).unwrap();
+    drop(guarded);
+    std::net::TcpListener::bind(addr).expect("port free immediately after drop");
+}
+
 #[test]
 fn health_block_names_its_fields() {
     let v = health_json();
@@ -586,6 +691,26 @@ async fn netlink_and_proc_each_find_this_process_as_the_peer_owner() {
         .await
         .unwrap();
     assert_eq!(pr, Ok(me), "/proc fallback");
+}
+
+/// Review finding M1, reproduced live: with no client socket for the
+/// 4-tuple, the kernel's exact lookup falls back to a LISTENER bound on the
+/// peer's port. A listener owned by this very user must not vouch for it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_listener_on_the_peer_port_does_not_vouch_for_the_peer() {
+    let ours = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = ours.local_addr().unwrap();
+    let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ghost_peer = decoy.local_addr().unwrap();
+    assert_eq!(
+        linux::netlink_owner(local, ghost_peer),
+        Ok(Err(Unresolved::NoMatchingSocket))
+    );
+    assert_eq!(
+        linux::proc_owner(local, ghost_peer),
+        Err(Unresolved::NoMatchingSocket)
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -98,7 +98,7 @@ pub fn netlink_owner(
         return Err(NetlinkUnavailable);
     }
     match parse_sock_diag_reply(&buf[..n as usize]) {
-        Some(reply) => Ok(owner_from_diag(reply)),
+        Some(reply) => Ok(owner_from_diag(reply, local, peer)),
         None => Err(NetlinkUnavailable),
     }
 }

@@ -2,20 +2,27 @@
 //! token → user SID.
 //!
 //! The comparison is on the token USER SID, so an elevated and a
-//! non-elevated process of the same account compare equal. A process this
-//! runner cannot open, or whose token it cannot read, is refused (fail
-//! closed) — which is the outcome for another account's processes on a
-//! standard (non-admin) runner, and the reason this is not a weaker check.
+//! non-elevated process of the same account WOULD compare equal — but only
+//! when the token can be read, and a non-elevated runner is expected to be
+//! refused `OpenProcessToken` on an elevated caller's token (its DACL grants
+//! Administrators, not the user). That case resolves `TokenAccessDenied`,
+//! counted on its own so Windows' default `shadow` mode measures it before
+//! enforcing (plan Phase 2 check 2). A process this runner cannot open, or
+//! whose token it cannot read, is refused under `enforce` (fail closed) —
+//! which is the outcome for another account's processes on a standard
+//! (non-admin) runner.
 //!
 //! PID reuse: a row's owning PID is only trusted when that process was
 //! created no later than the accept instant. A process born after the
 //! connection existed cannot own it.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, NO_ERROR,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, FILETIME,
+    HANDLE, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
@@ -32,6 +39,7 @@ use super::decode::{filetime_to_system_time, owner_pid, win_ipv4, win_port, WinR
 use super::{LocalUser, OwnerResolver, Resolution, Unresolved};
 
 const AF_INET: u32 = 2;
+const CLOCK_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
 const AF_INET6: u32 = 23;
 
 pub struct TcpTableResolver;
@@ -49,8 +57,18 @@ impl Drop for Owned {
 }
 
 /// Read one family's owner-PID connection table into raw bytes.
+/// Last observed table size per family, so a steady stream of connections
+/// starts at the right buffer size instead of paying a size probe each time.
+static V4_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
+static V6_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
+
 fn read_table(family: u32) -> Result<Vec<u64>, Unresolved> {
-    let mut size: u32 = 0;
+    let hint = if family == AF_INET {
+        &V4_SIZE_HINT
+    } else {
+        &V6_SIZE_HINT
+    };
+    let mut size: u32 = hint.load(Ordering::Relaxed);
     for _ in 0..4 {
         // u64 backing store keeps the table 8-byte aligned.
         let mut buf: Vec<u64> = vec![0; (size as usize).div_ceil(8).max(1)];
@@ -68,6 +86,7 @@ fn read_table(family: u32) -> Result<Vec<u64>, Unresolved> {
             )
         };
         if rc == NO_ERROR {
+            hint.store(len.saturating_add(4096), Ordering::Relaxed);
             return Ok(buf);
         }
         if rc != ERROR_INSUFFICIENT_BUFFER {
@@ -100,6 +119,7 @@ fn rows_v4() -> Result<Vec<WinRow>, Unresolved> {
                     IpAddr::V4(win_ipv4(r.dwRemoteAddr)),
                     win_port(r.dwRemotePort),
                 ),
+                state: r.dwState,
                 pid: r.dwOwningPid,
             }
         })
@@ -126,6 +146,7 @@ fn rows_v6() -> Result<Vec<WinRow>, Unresolved> {
                     IpAddr::V6(Ipv6Addr::from(r.ucRemoteAddr)),
                     win_port(r.dwRemotePort),
                 ),
+                state: r.dwState,
                 pid: r.dwOwningPid,
             }
         })
@@ -138,7 +159,12 @@ fn token_user_sid(process: HANDLE) -> Result<String, Unresolved> {
     // SAFETY: `process` is a valid handle with query rights; `token` receives
     // a new handle we own.
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
-        return Err(Unresolved::TokenUnreadable);
+        // SAFETY: no preconditions; read immediately after the failing call.
+        return Err(if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+            Unresolved::TokenAccessDenied
+        } else {
+            Unresolved::TokenUnreadable
+        });
     }
     let token = Owned(token);
     let mut needed: u32 = 0;
@@ -241,7 +267,11 @@ impl OwnerResolver for TcpTableResolver {
             };
         }
         match creation_time(process.0) {
-            Some(created) if created <= accepted_at => {}
+            // A couple of seconds of slack absorbs a small backwards wall-clock
+            // step between the two readings; a recycled PID still has to be
+            // born after the connection existed, and its table row vanishes
+            // when the real owner dies, so the window this opens is nil.
+            Some(created) if created <= accepted_at + CLOCK_SLACK => {}
             // Born after the connection existed, or unreadable: not provably
             // the owner.
             _ => {
