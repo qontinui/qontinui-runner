@@ -380,6 +380,9 @@ fn details_for(kind: FailureKind, policy: RecoveryPolicy) -> String {
     let what = what_happened(kind);
     let then = match policy {
         RecoveryPolicy::Never => "The runner takes no automatic action.",
+        // The structured lane's wording: there the runner itself backs off
+        // and restarts. A PTY session's CLI retries on its own, and the
+        // runner says so instead ([`with_cli_retry`]).
         RecoveryPolicy::BackoffThenRetry => {
             "The runner waits a bounded backoff and retries on the same account."
         }
@@ -600,6 +603,17 @@ pub fn with_manual_recovery(mut failure: SessionFailure, why: &str) -> SessionFa
     failure.recovery_policy = RecoveryPolicy::Never;
     failure.details = Some(format!(
         "{} The runner is taking no automatic action: {why}.",
+        what_happened(failure.kind)
+    ));
+    failure
+}
+
+/// `failure` on a PTY session whose recovery is the CLI's own retry: the
+/// runner does nothing but keep the account, and the details say exactly
+/// that — never that the runner waits or retries.
+pub fn with_cli_retry(mut failure: SessionFailure) -> SessionFailure {
+    failure.details = Some(format!(
+        "{} The CLI retries on its own; the account is kept.",
         what_happened(failure.kind)
     ));
     failure

@@ -613,10 +613,7 @@ fn report_with(
         }
     };
     let plan = plan_for(&target, &failure, now);
-    let failure = match &plan {
-        Plan::Declined(why) => with_manual_recovery(failure, why),
-        _ => failure,
-    };
+    let failure = decided_failure(failure, &plan);
     let stored = upsert_at(target.key(), target.lane(), failure, now);
     info!(
         key = target.key(),
@@ -690,17 +687,47 @@ fn fold_precedence(kind: FailureKind) -> u8 {
     }
 }
 
+/// `failure` as announced once `plan` is decided: a declined plan is manual
+/// recovery, and a PTY hold says the CLI retries (the runner does not).
+fn decided_failure(failure: SessionFailure, plan: &Plan) -> SessionFailure {
+    match plan {
+        Plan::Declined(why) => with_manual_recovery(failure, why),
+        Plan::PtyHoldAccount => super::failure::with_cli_retry(failure),
+        _ => failure,
+    }
+}
+
 /// Decide what to do about `failure`, consuming a restart slot when the
 /// decision is to restart. Synchronous and cheap — everything that can refuse
 /// up front refuses here, so the failure is announced with the decision.
 fn plan_for(target: &RecoveryTarget, failure: &SessionFailure, now: Instant) -> Plan {
+    plan_for_with(
+        target,
+        failure,
+        now,
+        &crate::terminal::account_migration::migration_unavailable,
+    )
+}
+
+/// [`plan_for`] with the settings-derived migration precondition injected.
+fn plan_for_with(
+    target: &RecoveryTarget,
+    failure: &SessionFailure,
+    now: Instant,
+    migration_unavailable: &dyn Fn() -> Result<(), &'static str>,
+) -> Plan {
     let policy = failure.recovery_policy;
     match target {
         RecoveryTarget::Pty {
             terminal_id,
             record,
         } => match policy {
-            RecoveryPolicy::MigrateAccount => Plan::PtyMigrate,
+            // What settings alone rule out is known now: announce it as
+            // manual up front rather than after the asynchronous confirm.
+            RecoveryPolicy::MigrateAccount => match migration_unavailable() {
+                Ok(()) => Plan::PtyMigrate,
+                Err(why) => Plan::Declined(why.to_string()),
+            },
             RecoveryPolicy::HandoffNewSession => Plan::PtyHandoff,
             RecoveryPolicy::BackoffThenRetry => Plan::PtyHoldAccount,
             RecoveryPolicy::ResumeSameId => {
@@ -1956,6 +1983,60 @@ mod tests {
                 (FailureKind::ProcessExited, true),
                 (FailureKind::ProcessExited, false)
             ]
+        );
+    }
+
+    /// PTY lane: a backoff-then-retry failure says the CLI retries and the
+    /// account is kept — never that the runner waits or retries, since
+    /// `Plan::PtyHoldAccount` does nothing. A migration settings rule out is
+    /// declined (manual) at decision time.
+    #[test]
+    fn pty_plans_are_worded_and_declined_up_front() {
+        let f = classify_for(
+            &FailureSignal::Stderr("API error (529): overloaded".into()),
+            provider(),
+            qontinui_runner_lib::cli_profile::profile_for(provider()),
+        )
+        .unwrap();
+        assert_eq!(f.recovery_policy, RecoveryPolicy::BackoffThenRetry);
+        let now = Instant::now();
+        let plan = plan_for_with(&pty("fr-test-hold"), &f, now, &|| Ok(()));
+        assert!(matches!(plan, Plan::PtyHoldAccount));
+        let details = decided_failure(f, &plan).details.unwrap();
+        assert!(
+            details.contains("The CLI retries on its own; the account is kept."),
+            "{details}"
+        );
+        assert!(!details.contains("The runner waits"), "{details}");
+
+        let mut q = classify_for(
+            &grid("usage limit reached"),
+            provider(),
+            qontinui_runner_lib::cli_profile::profile_for(provider()),
+        )
+        .unwrap();
+        q.recovery_policy = RecoveryPolicy::MigrateAccount;
+        let plan = plan_for_with(&pty("fr-test-mig"), &q, now, &|| {
+            Err("fewer than two accounts")
+        });
+        assert!(matches!(&plan, Plan::Declined(why) if why == "fewer than two accounts"));
+        let manual = decided_failure(q.clone(), &plan);
+        assert_eq!(manual.recovery_policy, RecoveryPolicy::Never);
+        assert!(matches!(
+            plan_for_with(&pty("fr-test-mig"), &q, now, &|| Ok(())),
+            Plan::PtyMigrate
+        ));
+        assert_eq!(
+            crate::terminal::account_migration::migration_precondition(false, 3),
+            Err("auto-migration disabled")
+        );
+        assert_eq!(
+            crate::terminal::account_migration::migration_precondition(true, 1),
+            Err("fewer than two accounts")
+        );
+        assert_eq!(
+            crate::terminal::account_migration::migration_precondition(true, 2),
+            Ok(())
         );
     }
 
