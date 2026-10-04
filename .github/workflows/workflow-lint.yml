@@ -17,12 +17,16 @@
 #   There is deliberately NO `push: main` trigger: coord reads a failing push
 #   run on main as main-red and holds the train.
 #
-# ADVISORY: `continue-on-error: true` on the zizmor and actionlint STEPS (not
-# the job) until >= 5 observed runs with zero unexplained reds (plan Phase
+# ADVISORY: `continue-on-error: true` on EVERY step that can fail (the arch
+# guard, the install, zizmor, actionlint) — never on the job — until >= 5 observed runs with zero unexplained reds (plan Phase
 # 1.5), then this becomes a required check. Step-level on purpose: a job-level
 # continue-on-error still publishes a check run with conclusion=failure, which
 # coord's candidate classifier reads as red. With step-level the check stays
-# success and the findings stay visible in the step log and annotations.
+# success and the findings stay visible: zizmor emits GitHub annotations
+# (`--format github`), actionlint is formatted into `::warning` lines, and
+# each tool writes one PASS / FINDINGS(n) / ERROR line to the step summary.
+# An install failure (download blip, sha256 mismatch) is reported as ERROR
+# for both tools rather than failing the check.
 #
 # RUNNER: `[self-hosted, public-pool]` — the label set of merytshost-public,
 # the only runner registered to this repo (2026-10-04). Never a GitHub-hosted
@@ -50,7 +54,9 @@ jobs:
   workflow-lint:
     name: workflow-lint
     runs-on: [self-hosted, public-pool]
-    timeout-minutes: 5
+    # Backstop only: every step carries its own timeout + continue-on-error and
+    # their sum (9 min) is under this, so a slow step never reds the check.
+    timeout-minutes: 15
     env:
       ZIZMOR_VERSION: 1.30.1
       ZIZMOR_SHA256: e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
@@ -61,7 +67,23 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned binaries are x86_64 Linux builds. A soft guard, so a pool
+      # change that lands this job on another arch says so in the log instead
+      # of failing as an opaque exec error.
+      - name: Check runner architecture
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 1
+        run: |
+          arch="$(uname -m)"
+          if [ "$arch" != "x86_64" ]; then
+            echo "::warning title=workflow-lint::runner arch is ${arch}; the pinned zizmor/actionlint binaries are x86_64 and will not run here."
+            exit 1
+          fi
+
       - name: Install zizmor and actionlint (pinned, sha256-verified)
+        id: install
+        continue-on-error: true  # advisory; see header
+        timeout-minutes: 3
         run: |
           set -euo pipefail
           bin="${RUNNER_TEMP}/workflow-lint-bin"
@@ -78,17 +100,62 @@ jobs:
           rm -f zizmor.tar.gz actionlint.tar.gz
           echo "$bin" >> "$GITHUB_PATH"
 
+      - name: Report install failure
+        if: steps.install.outcome != 'success'
+        run: |
+          echo "::warning title=workflow-lint::installing the pinned linters failed; neither tool ran. This is UNKNOWN, not a pass."
+          {
+            echo "- zizmor: ERROR (install failed; not run)"
+            echo "- actionlint: ERROR (install failed; not run)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Exit codes (zizmor 1.30): 0 = clean, 10-14 = findings (by highest
+      # severity), anything else = the tool itself failed.
       - name: zizmor
+        if: steps.install.outcome == 'success'
         continue-on-error: true  # advisory; see header
+        timeout-minutes: 3
         env:
           # Online audits (impostor-commit, known-vulnerable-actions) read
           # public action repos; the job token is read-only.
           GH_TOKEN: ${{ github.token }}
-        run: zizmor --no-progress --config .github/zizmor.yml .github/workflows .github/actions
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/zizmor.out"
+          zizmor --no-progress --format github --config .github/zizmor.yml \
+            .github/workflows .github/actions | tee "$out"
+          rc=${PIPESTATUS[0]}
+          n=$(grep -c '^::' "$out" || true)
+          case "$rc" in
+            0) line="PASS" ;;
+            1[0-4]) line="FINDINGS(${n})" ;;
+            *) line="ERROR (exit ${rc})" ;;
+          esac
+          echo "- zizmor: ${line}" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
+      # Exit codes: 0 = clean, 1 = findings, 2/3 = the tool itself failed.
+      # `-shellcheck=` / `-pyflakes=` disable the external linters: the job
+      # must not depend on whatever each self-hosted host has installed
+      # (plan D2: exact pins, no floats). Config: .github/actionlint.yaml.
       - name: actionlint
+        if: steps.install.outcome == 'success'
         continue-on-error: true  # advisory; see header
-        # `-shellcheck=` / `-pyflakes=` disable the external linters: the job
-        # must not depend on whatever each self-hosted host has installed
-        # (plan D2: exact pins, no floats). Config: .github/actionlint.yaml.
-        run: actionlint -color -shellcheck= -pyflakes=
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/actionlint.out"
+          # actionlint itself unescapes `\n` in -format, so the newline is written
+          # bare: `{{"\n"}}` would become a raw newline inside a template string
+          # and fail to parse (exit 3, measured with 1.7.12).
+          fmt='{{range $err := .}}::warning file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}\n{{end}}'
+          actionlint -shellcheck= -pyflakes= -format "$fmt" | tee "$out"
+          rc=${PIPESTATUS[0]}
+          n=$(grep -c '^::warning' "$out" || true)
+          case "$rc" in
+            0) line="PASS" ;;
+            1) line="FINDINGS(${n})" ;;
+            *) line="ERROR (exit ${rc})" ;;
+          esac
+          echo "- actionlint: ${line}" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
